@@ -50,7 +50,7 @@ use querymt::{
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     plugin::HTTPLLMProviderFactory,
-    FunctionCall, HTTPLLMProvider, ToolCall,
+    FunctionCall, HTTPLLMProvider, ToolCall, Usage,
 };
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -170,6 +170,8 @@ struct GoogleThinkingConfig {
 struct GoogleChatResponse {
     /// Generated completion candidates
     candidates: Vec<GoogleCandidate>,
+    #[serde(rename = "usageMetadata")]
+    usage: Option<Usage>,
 }
 
 impl std::fmt::Display for GoogleChatResponse {
@@ -257,6 +259,10 @@ impl ChatResponse for GoogleChatResponse {
                 })
             }
         })
+    }
+
+    fn usage(&self) -> Option<Usage> {
+        self.usage.clone()
     }
 }
 

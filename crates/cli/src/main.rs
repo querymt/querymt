@@ -236,6 +236,14 @@ async fn handle_response(
     response: Box<dyn ChatResponse>,
     provider: &Box<dyn LLMProvider>,
 ) -> Result<(), LLMError> {
+    if let Some(usage) = response.usage() {
+        log::info!(
+            "Tokens usage (in/out): {}/{}",
+            usage.input_tokens,
+            usage.output_tokens
+        );
+    }
+
     print!("\r\x1B[K");
     if let Some(tool_calls) = response.tool_calls() {
         // Process each tool call

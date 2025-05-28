@@ -11,7 +11,7 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::{error::LLMError, ToolCall};
+use crate::{error::LLMError, ToolCall, Usage};
 
 pub mod http;
 
@@ -388,6 +388,7 @@ pub trait ChatResponse: std::fmt::Debug + std::fmt::Display + Send {
     fn thinking(&self) -> Option<String> {
         None
     }
+    fn usage(&self) -> Option<Usage>;
 }
 
 #[async_trait]

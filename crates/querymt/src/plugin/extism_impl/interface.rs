@@ -1,7 +1,7 @@
 use crate::{
     chat::{ChatMessage, ChatResponse, Tool},
     completion::CompletionRequest,
-    ToolCall,
+    ToolCall, Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -46,6 +46,7 @@ pub struct ExtismChatResponse {
     pub text: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
     pub thinking: Option<String>,
+    pub usage: Option<Usage>,
 }
 
 impl fmt::Display for ExtismChatResponse {
@@ -70,6 +71,9 @@ impl ChatResponse for ExtismChatResponse {
     fn thinking(&self) -> Option<String> {
         self.thinking.clone()
     }
+    fn usage(&self) -> Option<Usage> {
+        self.usage.clone()
+    }
 }
 
 impl From<Box<dyn ChatResponse>> for ExtismChatResponse {
@@ -78,6 +82,7 @@ impl From<Box<dyn ChatResponse>> for ExtismChatResponse {
             text: r.text(),
             tool_calls: r.tool_calls(),
             thinking: r.thinking(),
+            usage: r.usage(),
         }
     }
 }

@@ -14,7 +14,7 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    FunctionCall, HTTPLLMProvider, ToolCall,
+    FunctionCall, HTTPLLMProvider, ToolCall, Usage,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -131,6 +131,7 @@ struct ImageSource<'a> {
 #[derive(Deserialize, Debug)]
 struct AnthropicCompleteResponse {
     content: Vec<AnthropicContent>,
+    usage: Option<Usage>,
 }
 
 /// Content block within an Anthropic API response.
@@ -227,6 +228,10 @@ impl ChatResponse for AnthropicCompleteResponse {
             v if v.is_empty() => None,
             v => Some(v),
         }
+    }
+
+    fn usage(&self) -> Option<Usage> {
+        self.usage.clone()
     }
 }
 

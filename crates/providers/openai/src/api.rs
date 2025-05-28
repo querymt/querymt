@@ -8,7 +8,7 @@ use querymt::{
         ChatMessage, ChatResponse, ChatRole, MessageType, StructuredOutputFormat, Tool, ToolChoice,
     },
     error::LLMError,
-    FunctionCall, ToolCall,
+    FunctionCall, ToolCall, Usage,
 };
 use schemars::{
     gen::SchemaGenerator,
@@ -143,6 +143,7 @@ impl std::fmt::Display for DisplayableFunctionCall {
 #[derive(Deserialize, Debug)]
 struct OpenAIChatResponse {
     choices: Vec<OpenAIChatChoice>,
+    usage: Option<Usage>,
 }
 
 /// Individual choice within an OpenAI chat API response.
@@ -233,6 +234,10 @@ impl ChatResponse for OpenAIChatResponse {
         self.choices
             .first()
             .and_then(|c| c.message.tool_calls.clone())
+    }
+
+    fn usage(&self) -> Option<Usage> {
+        self.usage.clone()
     }
 }
 

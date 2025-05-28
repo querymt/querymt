@@ -13,7 +13,7 @@ use querymt::{
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     plugin::HTTPLLMProviderFactory,
-    FunctionCall, HTTPLLMProvider, ToolCall,
+    FunctionCall, HTTPLLMProvider, ToolCall, Usage,
 };
 use schemars::{
     gen::SchemaGenerator,
@@ -94,6 +94,8 @@ struct OllamaResponse {
     content: Option<String>,
     response: Option<String>,
     message: Option<OllamaChatResponseMessage>,
+    prompt_eval_count: Option<u32>,
+    eval_count: Option<u32>,
 }
 
 impl std::fmt::Display for OllamaResponse {
@@ -149,6 +151,17 @@ impl ChatResponse for OllamaResponse {
                 })
                 .collect(),
         )
+    }
+
+    fn usage(&self) -> Option<Usage> {
+        if let Some(input_tokens) = self.prompt_eval_count {
+            Some(Usage {
+                input_tokens,
+                output_tokens: self.eval_count.unwrap_or(0),
+            })
+        } else {
+            None
+        }
     }
 }
 
