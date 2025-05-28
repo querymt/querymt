@@ -15,7 +15,7 @@ use schemars::{
     schema::{InstanceType, Schema, SchemaObject, SingleOrVec},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use url::Url;
 
 pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
@@ -111,6 +111,8 @@ struct OpenAIChatRequest<'a> {
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<OpenAIResponseFormat>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    extra_body: Option<Map<String, Value>>,
 }
 
 pub struct DisplayableToolCall(pub ToolCall);
@@ -273,8 +275,13 @@ pub trait OpenAIProviderConfig {
     fn tool_choice(&self) -> Option<&ToolChoice>;
     fn embedding_encoding_format(&self) -> Option<&str>;
     fn embedding_dimensions(&self) -> Option<&u32>;
-    fn reasoning_effort(&self) -> Option<&String>;
+    fn reasoning_effort(&self) -> Option<&String> {
+        None
+    }
     fn json_schema(&self) -> Option<&StructuredOutputFormat>;
+    fn extra_body(&self) -> Option<Map<String, Value>> {
+        None
+    }
 }
 
 pub fn openai_embed_request<C: OpenAIProviderConfig>(
@@ -385,6 +392,7 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
         tool_choice: cfg.tool_choice().cloned(),
         reasoning_effort: cfg.reasoning_effort().cloned(),
         response_format,
+        extra_body: cfg.extra_body(),
     };
 
     let json_body = serde_json::to_vec(&body)?;
@@ -408,7 +416,7 @@ pub fn openai_parse_chat<C: OpenAIProviderConfig>(
     // If we got a non-200 response, let's get the error details
     if !response.status().is_success() {
         let status = response.status();
-        let error_text: String = "".to_string();
+        let error_text: String = serde_json::to_string(response.body())?;
         return Err(Box::new(LLMError::ResponseFormatError {
             message: format!("API returned error status: {}", status),
             raw_response: error_text,

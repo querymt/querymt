@@ -15,7 +15,7 @@ use querymt::{
 };
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use url::Url;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -41,6 +41,7 @@ pub struct Alibaba {
     pub reasoning_effort: Option<String>,
     /// JSON schema for structured output
     pub json_schema: Option<StructuredOutputFormat>,
+    pub thinking_budget: Option<u32>,
 }
 
 impl OpenAIProviderConfig for Alibaba {
@@ -100,12 +101,18 @@ impl OpenAIProviderConfig for Alibaba {
         self.embedding_dimensions.as_ref()
     }
 
-    fn reasoning_effort(&self) -> Option<&String> {
-        self.reasoning_effort.as_ref()
-    }
-
     fn json_schema(&self) -> Option<&StructuredOutputFormat> {
         self.json_schema.as_ref()
+    }
+
+    fn extra_body(&self) -> Option<serde_json::Map<String, Value>> {
+        if let Some(thinking_budget) = self.thinking_budget {
+            let mut map = Map::new();
+            map.insert("thinking_budget".into(), thinking_budget.into());
+            map.insert("enable_thinking".into(), true.into());
+            return Some(map);
+        }
+        None
     }
 }
 
