@@ -110,3 +110,24 @@ pub struct FunctionCall {
     /// The arguments to pass to the function, typically serialized as a JSON string.
     pub arguments: String,
 }
+
+/// Represents the usage of tokens in a tool call, supporting multiple JSON formats.
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub struct Usage {
+    /// Number of input tokens.
+    #[serde(
+        alias = "prompt_tokens",     // OpenAI, xAI, DeepSeek, Mistral
+        alias = "input_tokens",      // Anthropic
+        alias = "prompt_eval_count", // Ollama
+        alias = "promptTokenCount"   // Google
+    )]
+    pub input_tokens: u32,
+    /// Number of output tokens.
+    #[serde(
+        alias = "completion_tokens",   // OpenAI, xAI, DeepSeek, Mistral
+        alias = "output_tokens",       // Anthropic
+        alias = "eval_count",          // Ollama
+        alias = "candidatesTokenCount" // Google
+    )]
+    pub output_tokens: u32,
+}

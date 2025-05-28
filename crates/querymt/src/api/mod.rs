@@ -13,7 +13,7 @@ use tower_http::cors::CorsLayer;
 use crate::chain::LLMRegistry;
 use handlers::handle_chat;
 
-pub use types::{ChatRequest, ChatResponse, Message};
+pub use types::{ChatRequest, ChatResponse, Message, Usage};
 
 /// Main server struct that manages LLM registry and authentication
 pub struct Server {

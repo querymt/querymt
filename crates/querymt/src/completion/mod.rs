@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::{chat::ChatResponse, error::LLMError, ToolCall};
+use crate::{chat::ChatResponse, error::LLMError, ToolCall, Usage};
 use serde::{Deserialize, Serialize};
 
 pub mod http;
@@ -29,8 +29,10 @@ impl ChatResponse for CompletionResponse {
     fn text(&self) -> Option<String> {
         Some(self.text.clone())
     }
-
     fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+        None
+    }
+    fn usage(&self) -> Option<Usage> {
         None
     }
 }
