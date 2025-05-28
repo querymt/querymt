@@ -1,0 +1,27 @@
+[[providers]]
+name = "alibaba"
+path = "oci://ghcr.io/querymt/alibaba:latest"
+
+[[providers]]
+name = "anthropic"
+path = "oci://ghcr.io/querymt/anthropic:latest"
+
+[[providers]]
+name = "google"
+path = "oci://ghcr.io/querymt/google:latest"
+
+[[providers]]
+name = "mistral"
+path = "oci://ghcr.io/querymt/mistral:latest"
+
+[[providers]]
+name = "ollama"
+path = "oci://ghcr.io/querymt/ollama:latest"
+
+[[providers]]
+name = "openai"
+path = "oci://ghcr.io/querymt/opeanai:latest"
+
+[[providers]]
+name = "openrouter"
+path = "oci://ghcr.io/querymt/openrouter:latest"
