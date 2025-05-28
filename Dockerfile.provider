@@ -1,5 +1,7 @@
-ARG PLUGIN_NAME
+ARG PROVIDER_NAME
+
 FROM rust:1.86-slim AS builder
+ARG PROVIDER_NAME
 
 RUN rustup target add wasm32-wasip1 && \
     rustup component add rust-std --target wasm32-wasip1 && \
@@ -8,8 +10,9 @@ RUN rustup target add wasm32-wasip1 && \
 WORKDIR /workspace
 COPY . .
 RUN cargo fetch 
-RUN cargo auditable build --release --target wasm32-wasip1
+RUN cargo auditable build -p qmt-${PROVIDER_NAME} --release --target wasm32-wasip1
 
 FROM scratch
+ARG PROVIDER_NAME
 WORKDIR /
-COPY --from=builder /workspace/target/wasm32-wasip1/release/qmt-${PLUGIN_NAME}.wasm /plugin.wasm
+COPY --from=builder /workspace/target/wasm32-wasip1/release/qmt_${PROVIDER_NAME}.wasm /plugin.wasm

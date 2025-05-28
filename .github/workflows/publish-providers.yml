@@ -5,6 +5,7 @@ on:
     branches: [ main ]
     # (optional) add:
     # tags: [ 'v*.*.*' ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,7 +15,7 @@ jobs:
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.make-matrix.outputs.matrix }}
+      matrix: ${{ steps.compute.outputs.matrix }}
 
     steps:
       - name: Check out full history
@@ -23,56 +24,78 @@ jobs:
           fetch-depth: 0
 
       - name: Determine which plugins need rebuilding
-        id: changes
+        id: compute
         run: |
           BASE=${{ github.event.before }}
           HEAD=${{ github.sha }}
 
           # all subfolders under crates/, except 'querymt'
-          ALL=( $(find crates -maxdepth 1 -type d ! -path crates -printf '%f\n' | grep -v '^querymt$') )
+          mapfile -t ALL < <(find crates -maxdepth 1 -type d ! -path crates -printf '%f\n' | grep -v '^querymt$')
+          echo "All plugin crates: ${ALL[*]}"
+          echo "event name: ${GITHUB_EVENT_NAME}"
 
-          # files changed on this push
-          CHANGED=$(git diff --name-only $BASE $HEAD)
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "Manual dispatch or first-ever push: rebuild ALL plugins"            
+            PROVIDERS=( "${ALL[@]}" )
+          # if this is the very first commit (BASE is all zeros), rebuild everything
+          elif [[ "$BASE" == "0000000000000000000000000000000000000000" ]]; then
+            PROVIDERS=( "${ALL[@]}" )
+          else
+            # list changed files between BASE and HEAD
+            CHANGED=$(git diff --name-only $BASE $HEAD)
 
-          PROVIDERS=()
-          for f in $CHANGED; do
-            if [[ $f =~ ^crates/([^/]+)/ ]]; then
-              name=${BASH_REMATCH[1]}
-              if [[ "$name" == "querymt" ]]; then
-                PROVIDERS=( "${ALL[@]}" )
-                break
+            PROVIDERS=()
+            for f in $CHANGED; do
+              if [[ $f =~ ^crates/([^/]+)/ ]]; then
+                name=${BASH_REMATCH[1]}
+                # if the shared main-lib changed, rebuild everything
+                if [[ "$name" == "querymt" ]]; then
+                  PROVIDERS=( "${ALL[@]}" )
+                  break
+                fi
+                # otherwise add this crate if it's one of the plugins
+                if [[ " ${ALL[*]} " =~ " $name " ]] \
+                   && [[ ! " ${PROVIDERS[*]} " =~ " $name " ]]; then
+                  PROVIDERS+=( "$name" )
+                fi
               fi
-              if [[ " ${ALL[*]} " =~ " $name " ]] \
-                 && [[ ! " ${PROVIDERS[*]} " =~ " $name " ]]; then
-                PROVIDERS+=( "$name" )
-              fi
-            fi
-          done
+            done
+          fi
+
+          if [ ${#PROVIDERS[@]} -eq 0 ]; then
+            PROVIDERS=( "noop" )
+          fi
+
+          echo "Final plugin list: ${PROVIDERS[*]}"
 
           # format as JSON list for the matrix
-          includes=()
+          entries=()
           for p in "${PROVIDERS[@]}"; do
-            includes+=( "{\"crate\":\"$p\"}" )
+            entries+=( "{\"crate\":\"$p\"}" )
           done
-          matrix="{\"include\":[${includes[*]}]}"
+          # note: join on commas, not spaces
+          joined=$(IFS=, ; echo "${entries[*]}")
+          matrix="{\"include\":[${joined}]}"
+          echo "the generated matrix: ${matrix}"
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
-
-      - name: Set matrix output
-        id: make-matrix
-        run: echo "::set-output name=matrix::${{ steps.changes.outputs.matrix }}"
 
   publish-plugins:
     needs: detect-changes
     runs-on: ubuntu-latest
-    if: ${{ needs.detect-changes.outputs.matrix != '{"include":[]}' }}
     strategy:
       matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
 
     steps:
+      - name: No crates changed
+        if: matrix.crate == 'noop'
+        run: echo "✅ No plugin crates to build—skipping."
+
       - name: Check out code
+        if: matrix.crate != 'noop'
         uses: actions/checkout@v3
 
       - name: Read crate version
+        if: matrix.crate != 'noop'
         id: get-version
         run: |
           v=$(grep '^version' crates/${{ matrix.crate }}/Cargo.toml \
@@ -80,6 +103,7 @@ jobs:
           echo "VERSION=$v" >> $GITHUB_ENV
 
       - name: Log in to GHCR
+        if: matrix.crate != 'noop'
         uses: docker/login-action@v2
         with:
           registry: ghcr.io
@@ -87,13 +111,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & push Docker image
+        if: matrix.crate != 'noop'
         uses: docker/build-push-action@v4
         with:
-          context: crates/${{ matrix.crate }}
-          file: crates/Dockerfile.provider
+          context: .
+          file: Dockerfile.provider
           build-args: |
             PROVIDER_NAME=${{ matrix.crate }}
-          push:    true
+          push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:${{ env.VERSION }}
             ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:latest
