@@ -1,7 +1,3 @@
-//! Ollama API client implementation for chat and completion functionality.
-//!
-//! This module provides integration with Ollama's local LLM server through its API.
-
 use http::{header::CONTENT_TYPE, Method, Request, Response};
 use qmt_openai::api::{
     openai_chat_request, openai_embed_request, openai_parse_chat, openai_parse_embed, url_schema,

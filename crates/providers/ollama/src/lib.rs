@@ -425,8 +425,7 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::*;
-    use extism_pdk::*;
+    use super::{Ollama, OllamaFactory};
     use querymt::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {

@@ -31,14 +31,14 @@ pub struct Anthropic {
     pub model: String,
     pub max_tokens: u32,
     pub temperature: f32,
-    pub timeout_seconds: u64,
-    pub system: String,
-    pub stream: bool,
+    pub timeout_seconds: Option<u64>,
+    pub system: Option<String>,
+    pub stream: Option<bool>,
     pub top_p: Option<f32>,
     pub top_k: Option<u32>,
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<ToolChoice>,
-    pub reasoning: bool,
+    pub reasoning: Option<bool>,
     pub thinking_budget_tokens: Option<u32>,
 }
 
@@ -354,7 +354,7 @@ impl HTTPChatProvider for Anthropic {
             None => None,
         };
 
-        let thinking = if self.reasoning {
+        let thinking = if self.reasoning.unwrap_or(false) {
             Some(ThinkingConfig {
                 thinking_type: "enabled".to_string(),
                 budget_tokens: self.thinking_budget_tokens.unwrap_or(16000),
@@ -368,8 +368,8 @@ impl HTTPChatProvider for Anthropic {
             model: &self.model,
             max_tokens: Some(self.max_tokens),
             temperature: Some(self.temperature),
-            system: Some(&self.system),
-            stream: Some(self.stream),
+            system: self.system.as_deref(),
+            stream: self.stream,
             top_p: self.top_p,
             top_k: self.top_k,
             tools: anthropic_tools,
@@ -392,6 +392,15 @@ impl HTTPChatProvider for Anthropic {
         &self,
         resp: Response<Vec<u8>>,
     ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_text: String = "".to_string();
+            return Err(Box::new(LLMError::ResponseFormatError {
+                message: format!("API returned error status: {}", status),
+                raw_response: error_text,
+            }));
+        }
+
         let json_resp: AnthropicCompleteResponse = serde_json::from_slice(resp.body())
             .map_err(|e| LLMError::HttpError(format!("Failed to parse JSON: {}", e)))?;
 
