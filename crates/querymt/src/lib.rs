@@ -116,7 +116,7 @@ pub struct FunctionCall {
 pub struct Usage {
     /// Number of input tokens.
     #[serde(
-        alias = "prompt_tokens",     // OpenAI, xAI, DeepSeek, Mistral
+        alias = "prompt_tokens",     // OpenAI, xAI, DeepSeek, Mistral, OpenRouter, Alibaba
         alias = "input_tokens",      // Anthropic
         alias = "prompt_eval_count", // Ollama
         alias = "promptTokenCount"   // Google
@@ -124,7 +124,7 @@ pub struct Usage {
     pub input_tokens: u32,
     /// Number of output tokens.
     #[serde(
-        alias = "completion_tokens",   // OpenAI, xAI, DeepSeek, Mistral
+        alias = "completion_tokens",   // OpenAI, xAI, DeepSeek, Mistral, OpenRouter, Alibaba
         alias = "output_tokens",       // Anthropic
         alias = "eval_count",          // Ollama
         alias = "candidatesTokenCount" // Google
