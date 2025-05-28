@@ -29,13 +29,10 @@ jobs:
           BASE=${{ github.event.before }}
           HEAD=${{ github.sha }}
 
-          # all subfolders under crates/, except 'querymt'
-          mapfile -t ALL < <(find crates -maxdepth 1 -type d ! -path crates -printf '%f\n' | grep -v '^querymt$')
-          echo "All plugin crates: ${ALL[*]}"
-          echo "event name: ${GITHUB_EVENT_NAME}"
+          # all subfolders under crates/providers
+          mapfile -t ALL < <(find crates/providers -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
 
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            echo "Manual dispatch or first-ever push: rebuild ALL plugins"            
             PROVIDERS=( "${ALL[@]}" )
           # if this is the very first commit (BASE is all zeros), rebuild everything
           elif [[ "$BASE" == "0000000000000000000000000000000000000000" ]]; then
@@ -46,16 +43,17 @@ jobs:
 
             PROVIDERS=()
             for f in $CHANGED; do
-              if [[ $f =~ ^crates/([^/]+)/ ]]; then
+              # if the querymt library changed, rebuild/test all plugins
+              if [[ $f =~ ^crates/querymt/ ]]; then
+                PROVIDERS=( "${ALL[@]}" )
+                break
+              fi
+
+              # if a provider crate changed, pick it up
+              if [[ $f =~ ^crates/providers/([^/]+)/ ]]; then
                 name=${BASH_REMATCH[1]}
-                # if the shared main-lib changed, rebuild everything
-                if [[ "$name" == "querymt" ]]; then
-                  PROVIDERS=( "${ALL[@]}" )
-                  break
-                fi
-                # otherwise add this crate if it's one of the plugins
-                if [[ " ${ALL[*]} " =~ " $name " ]] \
-                   && [[ ! " ${PROVIDERS[*]} " =~ " $name " ]]; then
+                # de-dup
+                if [[ ! " ${PROVIDERS[*]} " =~ " $name " ]]; then
                   PROVIDERS+=( "$name" )
                 fi
               fi
@@ -76,7 +74,6 @@ jobs:
           # note: join on commas, not spaces
           joined=$(IFS=, ; echo "${entries[*]}")
           matrix="{\"include\":[${joined}]}"
-          echo "the generated matrix: ${matrix}"
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
 
   publish-plugins:
@@ -98,7 +95,7 @@ jobs:
         if: matrix.crate != 'noop'
         id: get-version
         run: |
-          v=$(grep '^version' crates/${{ matrix.crate }}/Cargo.toml \
+          v=$(grep '^version' crates/providers/${{ matrix.crate }}/Cargo.toml \
                 | head -n1 | cut -d'"' -f2)
           echo "VERSION=$v" >> $GITHUB_ENV
 

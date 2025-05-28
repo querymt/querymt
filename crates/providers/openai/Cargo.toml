@@ -1,10 +1,11 @@
 [package]
-name = "qmt-alibaba"
+name = "qmt-openai"
 version = "0.1.0"
 edition = "2021"
 
 [features]
 default = ["extism"]
+api = ["querymt"]
 native = ["querymt"]
 extism = ["extism-pdk", "querymt", "querymt/extism_plugin"]
 
@@ -12,13 +13,12 @@ extism = ["extism-pdk", "querymt", "querymt/extism_plugin"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-querymt = { path = "../querymt", default-features = false, optional = true }
-qmt-openai = { path = "../openai", default-features = false, features = ["api"] }
+querymt = { path = "../../querymt", default-features = false, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+either = { workspace = true }
 url = { workspace = true }
 schemars = { workspace = true }
-futures = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 extism-pdk = { workspace = true, optional = true }

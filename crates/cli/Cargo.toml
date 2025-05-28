@@ -1,0 +1,28 @@
+[package]
+name = "querymt-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for querymt."
+license = "MIT"
+authors = [
+    "Viktor Gal <me@query.mt>"
+]
+repository = "https://github.com/querymt/querymt"
+homepage = "https://query.mt"
+
+[dependencies]
+querymt = { git = "ssh://git@github.com/querymt/querymt.git", default-features = false, features = ["reqwest-client", "extism_host", "mcp"] }
+clap = { version = "4", features = ["derive"] }
+rustyline = { version = "15" }
+colored = { version = "3.0" }
+spinners = { version = "4.1" }
+tokio = { version = "1.0", features = ["full"] }
+serde_json = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+dirs = "6.0"
+async-recursion = "1.1"
+
+[[bin]]
+name = "qmt"
+path = "src/main.rs"
