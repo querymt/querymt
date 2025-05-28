@@ -2,10 +2,12 @@
 //!
 //! This module provides integration with Ollama's local LLM server through its API.
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use http::{header::CONTENT_TYPE, Method, Request, Response};
 use querymt::{
     chat::{
-        http::HTTPChatProvider, ChatMessage, ChatResponse, ChatRole, StructuredOutputFormat, Tool,
+        http::HTTPChatProvider, ChatMessage, ChatResponse, ChatRole, MessageType,
+        StructuredOutputFormat, Tool,
     },
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
@@ -80,6 +82,7 @@ struct OllamaOptions {
 struct OllamaChatMessage<'a> {
     role: &'a str,
     content: &'a str,
+    images: Option<Vec<String>>,
 }
 
 /// Response from Ollama's API endpoints.
@@ -235,6 +238,10 @@ impl HTTPChatProvider for Ollama {
                     ChatRole::Assistant => "assistant",
                 },
                 content: &msg.content,
+                images: match &msg.message_type {
+                    MessageType::Image((_mime_type, content)) => Some(vec![BASE64.encode(content)]),
+                    _ => None,
+                },
             })
             .collect();
 
@@ -244,6 +251,7 @@ impl HTTPChatProvider for Ollama {
                 OllamaChatMessage {
                     role: "system",
                     content: system,
+                    images: None,
                 },
             );
         }
