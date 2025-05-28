@@ -5,12 +5,7 @@ use std::{collections::HashMap, path::Path, process::Stdio};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
-    pub mcp: McpConfig,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct McpConfig {
-    pub server: Vec<McpServerConfig>,
+    pub mcp: Vec<McpServerConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -72,7 +67,7 @@ impl Config {
         &self,
     ) -> Result<HashMap<String, RunningService<RoleClient, ()>>> {
         let mut clients = HashMap::new();
-        for server in &self.mcp.server {
+        for server in &self.mcp {
             let client = server.transport.start().await?;
             clients.insert(server.name.clone(), client);
         }
