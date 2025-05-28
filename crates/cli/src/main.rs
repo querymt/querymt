@@ -209,8 +209,8 @@ async fn handle_response(
         let mut tool_results = Vec::new();
 
         for call in &tool_calls {
-            println!("Tool call: {}", call.function.name);
-            println!("Arguments: {}", call.function.arguments);
+            log::debug!("Tool call: {}", call.function.name);
+            log::debug!("Arguments: {}", call.function.arguments);
 
             let args: Value = serde_json::from_str(&call.function.arguments)
                 .map_err(|e| LLMError::InvalidRequest(format!("bad args JSON: {}", e)))?;
@@ -223,11 +223,11 @@ async fn handle_response(
             );
             let tool_res = match provider.call_tool(&call.function.name, args).await {
                 Ok(result) => {
-                    println!("Tool response: {}", serde_json::to_string_pretty(&result)?);
+                    log::debug!("Tool response: {}", serde_json::to_string_pretty(&result)?);
                     serde_json::to_string(&result)?
                 }
                 Err(e) => {
-                    println!("Error while calling tool: {}", e.to_string());
+                    log::error!("Error while calling tool: {}", e.to_string());
                     e.to_string()
                 }
             };
@@ -322,7 +322,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{} Secret '{}' has been set.", "✓".bright_green(), key);
                     return Ok(());
                 }
-                eprintln!("{} Usage: llm set <key> <value>", "Error:".bright_red());
+                eprintln!("{} Usage: qmt set <key> <value>", "Error:".bright_red());
                 return Ok(());
             }
             "get" => {
@@ -334,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     return Ok(());
                 }
-                eprintln!("{} Usage: llm get <key>", "Error:".bright_red());
+                eprintln!("{} Usage: qmt get <key>", "Error:".bright_red());
                 return Ok(());
             }
             "delete" => {
@@ -344,7 +344,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{} Secret '{}' has been deleted.", "✓".bright_green(), key);
                     return Ok(());
                 }
-                eprintln!("{} Usage: llm delete <key>", "Error:".bright_red());
+                eprintln!("{} Usage: qmt delete <key>", "Error:".bright_red());
                 return Ok(());
             }
             "chat" => {}
@@ -400,7 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
                 eprintln!(
-                    "{} Usage: llm default <provider:model>",
+                    "{} Usage: qmt default <provider:model>",
                     "Error:".bright_red()
                 );
                 return Ok(());
@@ -410,7 +410,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (provider_name, model_name) = get_provider_info(&args)
-        .ok_or_else(|| "No provider specified. Use --provider, provider:model argument, or set a default provider with 'llm default <provider:model>'")?;
+        .ok_or_else(|| "No provider specified. Use --provider, provider:model argument, or set a default provider with 'qmt default <provider:model>'")?;
 
     let mut builder = LLMBuilder::new().provider(provider_name.clone());
     if let Some(model) = model_name.or(args.model.clone()) {
@@ -490,7 +490,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("{}", "llm - Interactive Chat".bright_cyan());
+    println!("{}", "qmt - Interactive Chat".bright_cyan());
     println!("Provider: {}", provider_name.bright_green());
     println!("{}", "Type 'exit' to quit".bright_black());
     println!("{}", "─".repeat(50).bright_black());
