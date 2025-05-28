@@ -20,7 +20,7 @@ use tokio;
 mod secret_store;
 use secret_store::SecretStore;
 
-/// parse raw `key=val` into `(String, String)`
+/// parse raw `key=val` into `(String, Value)`
 fn parse_kv(s: &str) -> Result<(String, Value), String> {
     let (key, raw) = s
         .split_once('=')
@@ -32,7 +32,6 @@ fn parse_kv(s: &str) -> Result<(String, Value), String> {
             Ok((key.to_string(), Value::String(raw.to_string())))
         }
     }
-    //Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
 }
 
 /// Command line arguments for the LLM CLI
