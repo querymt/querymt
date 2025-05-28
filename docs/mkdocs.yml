@@ -1,0 +1,15 @@
+site_name: QueryMate
+site_url: https://docs.query.mt
+repo_url: https://github.com/querymt/querymt
+theme:
+  palette:
+    scheme: slate
+  name: material
+  features:
+    - navigation.instant
+    - navigation.sections
+    - navigation.tabs
+
+extra:
+  version:
+    provider: mike
