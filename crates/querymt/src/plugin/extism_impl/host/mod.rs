@@ -115,7 +115,7 @@ impl LLMProviderFactory for ExtismFactory {
     }
 
     fn from_config(&self, cfg: &Value) -> Result<Box<dyn LLMProvider>, LLMError> {
-        let x = self
+        let _from_cfg = self
             .call("from_config", cfg)
             .map_err(|e| LLMError::PluginError(e.to_string()))?;
 

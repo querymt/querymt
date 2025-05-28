@@ -78,7 +78,7 @@ impl LLMProvider for ValidatedLLM {}
 #[async_trait]
 impl BasicChatProvider for ValidatedLLM {
     async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
-        Err(LLMError::InvalidRequest("asdf".into()))
+        self.inner.chat_with_tools(messages, None).await
     }
 }
 
