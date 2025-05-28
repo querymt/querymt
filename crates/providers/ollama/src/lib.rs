@@ -82,6 +82,9 @@ struct OllamaOptions {
 struct OllamaChatMessage<'a> {
     role: &'a str,
     content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     images: Option<Vec<String>>,
 }
 
@@ -232,20 +235,43 @@ impl HTTPChatProvider for Ollama {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<Request<Vec<u8>>, LLMError> {
-        let mut chat_messages: Vec<OllamaChatMessage> = messages
-            .iter()
-            .map(|msg| OllamaChatMessage {
-                role: match msg.role {
-                    ChatRole::User => "user",
-                    ChatRole::Assistant => "assistant",
-                },
-                content: &msg.content,
-                images: match &msg.message_type {
-                    MessageType::Image((_mime_type, content)) => Some(vec![BASE64.encode(content)]),
-                    _ => None,
-                },
-            })
-            .collect();
+        let mut chat_messages: Vec<OllamaChatMessage> = vec![];
+
+        for msg in messages {
+            match &msg.message_type {
+                MessageType::Text => chat_messages.push(OllamaChatMessage {
+                    role: match msg.role {
+                        ChatRole::User => "user",
+                        ChatRole::Assistant => "assistant",
+                    },
+                    content: &msg.content,
+                    images: None,
+                    name: None,
+                }),
+                MessageType::ToolResult(results) => {
+                    for tool_result in results {
+                        chat_messages.push(OllamaChatMessage {
+                            role: "tool",
+                            name: Some(tool_result.function.name.clone()),
+                            content: &tool_result.function.arguments,
+                            images: None,
+                        })
+                    }
+                }
+                MessageType::Image((_mime_type, content)) => {
+                    chat_messages.push(OllamaChatMessage {
+                        role: match msg.role {
+                            ChatRole::User => "user",
+                            ChatRole::Assistant => "assistant",
+                        },
+                        content: &msg.content,
+                        images: Some(vec![BASE64.encode(content)]), // FIXME: this actually should be collected into MessageType::Text
+                        name: None,
+                    })
+                }
+                _ => (),
+            }
+        }
 
         if let Some(system) = &self.system {
             chat_messages.insert(
@@ -254,6 +280,7 @@ impl HTTPChatProvider for Ollama {
                     role: "system",
                     content: system,
                     images: None,
+                    name: None,
                 },
             );
         }
