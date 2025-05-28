@@ -1,6 +1,12 @@
 use async_recursion::async_recursion;
 use clap::Parser;
 use colored::*;
+use opentelemetry::{trace::TracerProvider, KeyValue};
+use opentelemetry_sdk::{
+    trace::{RandomIdGenerator, SdkTracerProvider},
+    Resource,
+};
+use opentelemetry_semantic_conventions::{resource::SERVICE_VERSION, SCHEMA_URL};
 use querymt::{
     builder::LLMBuilder,
     chat::{ChatMessage, ChatResponse, ImageMime},
@@ -16,6 +22,10 @@ use spinners::{Spinner, Spinners};
 use std::io::{self, IsTerminal, Read, Write};
 use std::{fs, path::PathBuf};
 use tokio;
+use tracing_log::LogTracer;
+use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{fmt, EnvFilter, Registry};
 
 mod secret_store;
 use secret_store::SecretStore;
@@ -320,13 +330,55 @@ async fn get_provider_registry(args: &CliArgs) -> Result<impl ProviderRegistry, 
     Ok(registry.map_err(|e| LLMError::PluginError(e.to_string()))?)
 }
 
+fn resource() -> Resource {
+    Resource::builder()
+        .with_service_name(env!("CARGO_PKG_NAME"))
+        .with_schema_url(
+            [KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION"))],
+            SCHEMA_URL,
+        )
+        .build()
+}
+
+fn init_tracer_provider() -> SdkTracerProvider {
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .build()
+        .unwrap();
+
+    SdkTracerProvider::builder()
+        .with_id_generator(RandomIdGenerator::default())
+        .with_resource(resource())
+        .with_batch_exporter(exporter)
+        .build()
+}
+
+/// setup tracing handling logs
+fn setup_logging() {
+    LogTracer::init().expect("Failed to set LogTracer");
+
+    let tracer_provider = init_tracer_provider();
+    let tracer = tracer_provider.tracer("tracing-otel-subscriber");
+
+    let fmt_layer = fmt::layer().with_target(true);
+    let filter_layer = EnvFilter::from_default_env();
+
+    let subscriber = Registry::default()
+        .with(filter_layer)
+        .with(fmt_layer)
+        .with(OpenTelemetryLayer::new(tracer));
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Failed to set global tracing subscriber");
+}
+
 /// Main entry point for the LLM CLI application
 ///
 /// Handles command parsing, provider configuration, and interactive chat functionality.
 /// Supports various commands for managing secrets and default providers.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    setup_logging();
+
     let args = CliArgs::parse();
 
     let registry = get_provider_registry(&args).await?;
@@ -533,7 +585,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         io::stdout().flush()?;
-        let readline = rl.readline("> ");
+        let readline = rl.readline(&":: ".bold().red().to_string());
         match readline {
             Ok(line) => {
                 let trimmed = line.trim();

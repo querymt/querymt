@@ -20,5 +20,4 @@ either = { workspace = true }
 url = { workspace = true }
 schemars = { workspace = true }
 http = { workspace = true }
-log = { workspace = true }
 extism-pdk = { workspace = true, optional = true }

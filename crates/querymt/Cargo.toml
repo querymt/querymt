@@ -11,13 +11,14 @@ repository = "https://github.com/querymt/querymt"
 homepage = "https://query.mt"
 
 [features]
-default = ["http-client", "mcp", "extism_host"]
+default = ["http-client", "mcp", "extism_host", "tracing"]
 http-client = []
 reqwest-client = ["reqwest", "tokio", "once_cell"]
 native = ["libloading", "once_cell"]
 mcp = ["rmcp", "toml", "tokio"]
 extism_host = ["extism", "docker_credential", "sigstore", "oci-client", "tar", "flate2", "sha2", "serde_yaml", "dirs", "hex"]
 extism_plugin = ["extism-pdk"]
+tracing = ["dep:tracing"]
             
 [dependencies]
 anyhow = "1.0"
@@ -32,7 +33,6 @@ futures = "0.3"
 either = { workspace = true }
 url = { workspace = true }
 http = { workspace = true }
-log = { workspace = true }
 libloading = { version = "0.8.6", optional = true}
 rmcp = { version = "0.1", features = ["client", "transport-sse", "transport-child-process"], optional = true }
 toml = { version = "0.8", optional = true}
@@ -49,6 +49,8 @@ sha2 = { version = "0.10.8", optional = true }
 serde_yaml = { version = "0.9.34", optional = true }
 dirs = { version ="6.0", optional = true }
 hex = { version = "0.4.3", optional = true }
+log = { workspace = true }
+tracing = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.0", features = ["full"], optional = true }

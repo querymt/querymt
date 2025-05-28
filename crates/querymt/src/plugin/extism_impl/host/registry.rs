@@ -12,6 +12,7 @@ use std::{
     path::Path,
     sync::{Arc, RwLock},
 };
+use tracing::instrument;
 
 pub struct ExtismProviderRegistry {
     config: ExtismConfig,
@@ -33,6 +34,7 @@ impl ExtismProviderRegistry {
         Ok(registry)
     }
 
+    #[instrument(skip(self))]
     async fn load_plugins(&self) -> Result<()> {
         for plugin_cfg in &self.config.providers {
             let wasm_content = if plugin_cfg.path.starts_with("http") {

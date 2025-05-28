@@ -20,5 +20,4 @@ url = { workspace = true }
 schemars = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
-log = { workspace = true }
 extism-pdk = { workspace = true, optional = true }
