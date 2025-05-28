@@ -44,7 +44,7 @@ use http::{header::CONTENT_TYPE, Method, Request, Response};
 use querymt::{
     chat::{
         http::HTTPChatProvider, ChatMessage, ChatResponse, ChatRole, MessageType,
-        StructuredOutputFormat, Tool,
+        StructuredOutputFormat, Tool, ToolChoice,
     },
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
@@ -86,6 +86,8 @@ pub struct Google {
     pub json_schema: Option<StructuredOutputFormat>,
     /// Available tools for function calling
     pub tools: Option<Vec<Tool>>,
+    pub tool_choice: Option<ToolChoice>, // FIXME: currently not being used
+    pub thinking_budget: Option<u32>,
 }
 
 /// Request body for chat completions
@@ -150,6 +152,17 @@ struct GoogleGenerationConfig {
     /// A schema for structured output
     #[serde(skip_serializing_if = "Option::is_none")]
     response_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
+    thinking_config: Option<GoogleThinkingConfig>,
+}
+
+/// Configuration parameters for text generation
+#[derive(Serialize)]
+struct GoogleThinkingConfig {
+    #[serde(skip_serializing_if = "Option::is_none", rename = "includeThoughts")]
+    include_thoughts: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingBudget")]
+    thinking_budget: Option<u32>,
 }
 
 /// Response from the chat completion API
@@ -500,6 +513,15 @@ impl HTTPChatProvider for Google {
                 (None, None)
             };
 
+            let thinking_config = if let Some(thinking_budget) = self.thinking_budget {
+                Some(GoogleThinkingConfig {
+                    include_thoughts: None, // TODO
+                    thinking_budget: Some(thinking_budget),
+                })
+            } else {
+                None
+            };
+
             Some(GoogleGenerationConfig {
                 max_output_tokens: self.max_tokens,
                 temperature: self.temperature,
@@ -507,6 +529,7 @@ impl HTTPChatProvider for Google {
                 top_k: self.top_k,
                 response_mime_type,
                 response_schema,
+                thinking_config,
             })
         };
 
