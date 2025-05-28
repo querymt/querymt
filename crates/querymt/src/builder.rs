@@ -324,10 +324,7 @@ impl LLMBuilder {
     /// - No backend is specified
     /// - Required backend feature is not enabled
     /// - Required configuration like API keys are missing
-    pub fn build(
-        self,
-        registry: &Box<dyn ProviderRegistry>,
-    ) -> Result<Box<dyn LLMProvider>, LLMError> {
+    pub fn build(self, registry: &dyn ProviderRegistry) -> Result<Box<dyn LLMProvider>, LLMError> {
         //        let (tools, tool_choice) = self.validate_tool_config()?;
 
         let provider_name = self

@@ -170,7 +170,7 @@ fn get_provider_info(args: &CliArgs) -> Option<(String, Option<String>)> {
 fn get_api_key(
     provider: &String,
     args: &CliArgs,
-    registry: &Box<dyn ProviderRegistry>,
+    registry: &dyn ProviderRegistry,
 ) -> Option<String> {
     args.api_key.clone().or_else(|| {
         if let Some(provider_factory) = registry.get(provider) {
@@ -286,7 +286,7 @@ async fn handle_response(
     Ok(())
 }
 
-async fn get_provider_registry(args: &CliArgs) -> Result<Box<dyn ProviderRegistry>, LLMError> {
+async fn get_provider_registry(args: &CliArgs) -> Result<impl ProviderRegistry, LLMError> {
     let registry = match args.provider_config.clone() {
         Some(cfg) => ExtismProviderRegistry::new(cfg).await,
         None => {
@@ -317,9 +317,7 @@ async fn get_provider_registry(args: &CliArgs) -> Result<Box<dyn ProviderRegistr
         }
     };
 
-    Ok(Box::new(
-        registry.map_err(|e| LLMError::PluginError(e.to_string()))?,
-    ))
+    Ok(registry.map_err(|e| LLMError::PluginError(e.to_string()))?)
 }
 
 /// Main entry point for the LLM CLI application
