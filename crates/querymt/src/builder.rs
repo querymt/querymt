@@ -118,6 +118,8 @@ pub struct LLMBuilder {
     json_schema: Option<StructuredOutputFormat>,
     #[serde(skip_serializing)]
     tool_registry: HashMap<String, Box<dyn CallFunctionTool>>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    custom_options: Option<HashMap<String, Value>>,
 }
 
 impl LLMBuilder {
@@ -127,8 +129,8 @@ impl LLMBuilder {
     }
 
     /// Sets the backend provider to use.
-    pub fn provider(mut self, provider: String) -> Self {
-        self.provider = Some(provider);
+    pub fn provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
         self
     }
 
@@ -305,6 +307,15 @@ impl LLMBuilder {
         self
     }
 
+    pub fn parameter<K>(mut self, key: K, value: Value) -> Self
+    where
+        K: Into<String>,
+    {
+        let map = self.custom_options.get_or_insert_with(HashMap::new);
+        map.insert(key.into(), value);
+        self
+    }
+
     /// Builds and returns a configured LLM provider instance.
     ///
     /// # Errors
@@ -315,7 +326,7 @@ impl LLMBuilder {
     /// - Required configuration like API keys are missing
     pub fn build(
         self,
-        registry: Box<dyn ProviderRegistry>,
+        registry: &Box<dyn ProviderRegistry>,
     ) -> Result<Box<dyn LLMProvider>, LLMError> {
         //        let (tools, tool_choice) = self.validate_tool_config()?;
 

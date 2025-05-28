@@ -20,6 +20,21 @@ use tokio;
 mod secret_store;
 use secret_store::SecretStore;
 
+/// parse raw `key=val` into `(String, String)`
+fn parse_kv(s: &str) -> Result<(String, Value), String> {
+    let (key, raw) = s
+        .split_once('=')
+        .ok_or_else(|| format!("custom-option must be KEY=VALUE, got `{}`", s))?;
+    match serde_json::from_str::<Value>(raw) {
+        Ok(v) => Ok((key.to_string(), v)),
+        Err(_) => {
+            // treat it as a plain string
+            Ok((key.to_string(), Value::String(raw.to_string())))
+        }
+    }
+    //Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
+}
+
 /// Command line arguments for the LLM CLI
 #[derive(Parser)]
 #[clap(
@@ -64,6 +79,12 @@ struct CliArgs {
     #[arg(long)]
     temperature: Option<f32>,
 
+    #[arg(long)]
+    top_p: Option<f32>,
+
+    #[arg(long)]
+    top_k: Option<u32>,
+
     /// Maximum tokens in the response
     #[arg(long)]
     max_tokens: Option<u32>,
@@ -73,6 +94,9 @@ struct CliArgs {
 
     #[arg(long)]
     provider_config: Option<String>,
+
+    #[arg(short='o', value_parser=parse_kv, num_args=1.., action=clap::ArgAction::Append)]
+    options: Vec<(String, Value)>,
 }
 
 /// Detects the MIME type of an image from its binary data
@@ -208,6 +232,12 @@ async fn handle_response(
         // Process each tool call
         let mut tool_results = Vec::new();
 
+        messages.push(
+            ChatMessage::assistant()
+                .tool_use(tool_calls.clone())
+                .content(response.text().unwrap_or_default())
+                .build(),
+        );
         for call in &tool_calls {
             log::debug!("Tool call: {}", call.function.name);
             log::debug!("Arguments: {}", call.function.arguments);
@@ -215,12 +245,6 @@ async fn handle_response(
             let args: Value = serde_json::from_str(&call.function.arguments)
                 .map_err(|e| LLMError::InvalidRequest(format!("bad args JSON: {}", e)))?;
 
-            messages.push(
-                ChatMessage::assistant()
-                    .tool_use(tool_calls.clone())
-                    .content(response.text().unwrap_or_default())
-                    .build(),
-            );
             let tool_res = match provider.call_tool(&call.function.name, args).await {
                 Ok(result) => {
                     log::debug!("Tool response: {}", serde_json::to_string_pretty(&result)?);
@@ -437,6 +461,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.max_tokens(mt);
     }
 
+    if let Some(tp) = args.top_p {
+        builder = builder.top_p(tp);
+    }
+
+    if let Some(tk) = args.top_k {
+        builder = builder.top_k(tk);
+    }
+
+    for (k, v) in args.options {
+        builder = builder.parameter(k, v);
+    }
+
     if let Some(mcp_cfg) = args.mcp_config {
         let c = McpConfig::load(mcp_cfg).await?;
         let mcp_clients = c.create_mcp_clients().await?;
@@ -460,7 +496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let provider = builder
-        .build(registry)
+        .build(&registry)
         .map_err(|e| format!("Failed to build provider: {}", e))?;
 
     let is_pipe = !io::stdin().is_terminal();
