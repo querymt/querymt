@@ -48,7 +48,11 @@ pub mod mcp;
 
 pub mod plugin;
 
+pub mod stt;
+
 pub mod tool_decorator;
+
+pub mod tts;
 
 /// Validation wrapper for LLM providers with retry capabilities
 #[cfg(any(feature = "http-client", feature = "extism_host"))]
