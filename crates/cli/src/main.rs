@@ -104,7 +104,7 @@ struct CliArgs {
     #[arg(long)]
     provider_config: Option<String>,
 
-    #[arg(short='o', value_parser=parse_kv, num_args=1.., action=clap::ArgAction::Append)]
+    #[arg(short='o', value_parser=parse_kv, action = clap::ArgAction::Append)]
     options: Vec<(String, Value)>,
 }
 
