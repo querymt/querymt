@@ -48,6 +48,9 @@ pub mod mcp;
 
 pub mod plugin;
 
+/// Session management and logging for continuous conversations
+pub mod session;
+
 pub mod tool_decorator;
 
 /// Validation wrapper for LLM providers with retry capabilities

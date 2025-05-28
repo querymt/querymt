@@ -77,7 +77,9 @@ impl ExtismProviderRegistry {
                 );
                 tokio::fs::read(local_output_path).await?
             } else {
-                tokio::fs::read(&plugin_cfg.path).await?
+                tokio::fs::read(&plugin_cfg.path)
+                    .await
+                    .expect(&format!("Error loading: {}", plugin_cfg.path))
             };
 
             match ExtismFactory::load(wasm_content, &plugin_cfg.config) {
