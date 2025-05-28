@@ -11,7 +11,7 @@ repository = "https://github.com/querymt/querymt"
 homepage = "https://query.mt"
 
 [dependencies]
-querymt = { git = "ssh://git@github.com/querymt/querymt.git", default-features = false, features = ["reqwest-client", "extism_host", "mcp"] }
+querymt = { path = "../querymt", default-features = false, features = ["reqwest-client", "extism_host", "mcp"] }
 clap = { version = "4", features = ["derive"] }
 rustyline = { version = "15" }
 colored = { version = "3.0" }
