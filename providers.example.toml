@@ -20,7 +20,7 @@ path = "oci://ghcr.io/querymt/ollama:latest"
 
 [[providers]]
 name = "openai"
-path = "oci://ghcr.io/querymt/opeanai:latest"
+path = "oci://ghcr.io/querymt/openai:latest"
 
 [[providers]]
 name = "openrouter"
