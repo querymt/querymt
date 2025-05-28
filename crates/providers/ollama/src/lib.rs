@@ -291,6 +291,14 @@ impl HTTPChatProvider for Ollama {
         &self,
         resp: Response<Vec<u8>>,
     ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_text: String = serde_json::to_string(resp.body())?;
+            return Err(Box::new(LLMError::ResponseFormatError {
+                message: format!("API returned error status: {}", status),
+                raw_response: error_text,
+            }));
+        }
         let json_resp: OllamaResponse = serde_json::from_slice(resp.body())?;
         Ok(Box::new(json_resp))
     }
