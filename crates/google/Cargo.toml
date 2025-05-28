@@ -1,0 +1,22 @@
+[package]
+name = "qmt-google"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["extism"]
+native = ["querymt"]
+extism = ["extism-pdk", "querymt", "querymt/extism_plugin"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+querymt = { path = "../querymt", default-features = false, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+base64 = { workspace = true }
+url = { workspace = true }
+http = { workspace = true }
+extism-pdk = { workspace = true, optional = true }

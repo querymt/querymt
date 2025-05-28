@@ -1,0 +1,99 @@
+name: Build & Publish Provider Plugins
+
+on:
+  push:
+    branches: [ main ]
+    # (optional) add:
+    # tags: [ 'v*.*.*' ]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.make-matrix.outputs.matrix }}
+
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Determine which plugins need rebuilding
+        id: changes
+        run: |
+          BASE=${{ github.event.before }}
+          HEAD=${{ github.sha }}
+
+          # all subfolders under crates/, except 'querymt'
+          ALL=( $(find crates -maxdepth 1 -type d ! -path crates -printf '%f\n' | grep -v '^querymt$') )
+
+          # files changed on this push
+          CHANGED=$(git diff --name-only $BASE $HEAD)
+
+          PROVIDERS=()
+          for f in $CHANGED; do
+            if [[ $f =~ ^crates/([^/]+)/ ]]; then
+              name=${BASH_REMATCH[1]}
+              if [[ "$name" == "querymt" ]]; then
+                PROVIDERS=( "${ALL[@]}" )
+                break
+              fi
+              if [[ " ${ALL[*]} " =~ " $name " ]] \
+                 && [[ ! " ${PROVIDERS[*]} " =~ " $name " ]]; then
+                PROVIDERS+=( "$name" )
+              fi
+            fi
+          done
+
+          # format as JSON list for the matrix
+          includes=()
+          for p in "${PROVIDERS[@]}"; do
+            includes+=( "{\"crate\":\"$p\"}" )
+          done
+          matrix="{\"include\":[${includes[*]}]}"
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+      - name: Set matrix output
+        id: make-matrix
+        run: echo "::set-output name=matrix::${{ steps.changes.outputs.matrix }}"
+
+  publish-plugins:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: ${{ needs.detect-changes.outputs.matrix != '{"include":[]}' }}
+    strategy:
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Read crate version
+        id: get-version
+        run: |
+          v=$(grep '^version' crates/${{ matrix.crate }}/Cargo.toml \
+                | head -n1 | cut -d'"' -f2)
+          echo "VERSION=$v" >> $GITHUB_ENV
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: crates/${{ matrix.crate }}
+          file: crates/Dockerfile.provider
+          build-args: |
+            PROVIDER_NAME=${{ matrix.crate }}
+          push:    true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:${{ env.VERSION }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:latest
