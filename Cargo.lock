@@ -3440,6 +3440,7 @@ dependencies = [
 name = "qmt-mistral"
 version = "0.1.0"
 dependencies = [
+ "either",
  "extism-pdk",
  "futures",
  "http 1.3.1",

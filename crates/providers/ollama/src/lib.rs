@@ -161,6 +161,8 @@ struct OllamaChatResponseMessage {
 struct OllamaGenerateRequest<'a> {
     model: String,
     prompt: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix: Option<&'a str>,
     raw: bool,
     stream: bool,
 }
@@ -311,6 +313,7 @@ impl HTTPCompletionProvider for Ollama {
         let req_body = OllamaGenerateRequest {
             model: self.model.clone(),
             prompt: &req.prompt,
+            suffix: req.suffix.as_deref(),
             raw: true,
             stream: false,
         };

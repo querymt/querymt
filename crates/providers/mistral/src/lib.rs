@@ -1,4 +1,8 @@
-use http::{Request, Response};
+use either::*;
+use http::{
+    header::{AUTHORIZATION, CONTENT_TYPE},
+    Method, Request, Response,
+};
 use qmt_openai::api::{
     openai_chat_request, openai_embed_request, openai_list_models_request, openai_parse_chat,
     openai_parse_embed, openai_parse_list_models, url_schema, OpenAIProviderConfig,
@@ -11,7 +15,7 @@ use querymt::{
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     plugin::HTTPLLMProviderFactory,
-    HTTPLLMProvider,
+    HTTPLLMProvider, LLMProvider, ToolCall,
 };
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -41,6 +45,38 @@ pub struct Mistral {
     pub reasoning_effort: Option<String>,
     /// JSON schema for structured output
     pub json_schema: Option<StructuredOutputFormat>,
+}
+
+#[derive(Serialize)]
+struct MistralCompletionRequest<'a> {
+    model: &'a str,
+    prompt: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<&'a u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<&'a f32>,
+}
+
+#[derive(Deserialize)]
+struct MistralCompletionResponse {
+    model: String,
+    choices: Vec<ChatCompletionChoice>,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionChoice {
+    index: u32,
+    message: AssistantMessage,
+    finish_reason: String,
+}
+
+#[derive(Deserialize)]
+struct AssistantMessage {
+    role: String,
+    tool_calls: Option<Vec<ToolCall>>,
+    content: String, //TODO: Either<String, Vec<String>>,
 }
 
 impl OpenAIProviderConfig for Mistral {
@@ -141,14 +177,54 @@ impl HTTPEmbeddingProvider for Mistral {
 
 impl HTTPCompletionProvider for Mistral {
     fn complete_request(&self, req: &CompletionRequest) -> Result<Request<Vec<u8>>, LLMError> {
-        !unimplemented!("feature is missing!")
+        let api_key = match self.api_key().into() {
+            Some(key) => key,
+            None => return Err(LLMError::AuthError("Missing API key".to_string())),
+        };
+
+        let body = MistralCompletionRequest {
+            model: self.model(),
+            prompt: &req.prompt,
+            suffix: req.suffix.as_deref(),
+            max_tokens: req.max_tokens.as_ref(),
+            temperature: req.temperature.as_ref(),
+        };
+
+        let json_body = serde_json::to_vec(&body)?;
+        let url = self
+            .base_url()
+            .join("fim/completions")
+            .map_err(|e| LLMError::HttpError(e.to_string()))?;
+
+        Ok(Request::builder()
+            .method(Method::POST)
+            .uri(url.to_string())
+            .header(AUTHORIZATION, format!("Bearer {}", api_key))
+            .header(CONTENT_TYPE, "application/json")
+            .body(json_body)?)
     }
 
     fn parse_complete(
         &self,
         resp: Response<Vec<u8>>,
     ) -> Result<CompletionResponse, Box<dyn std::error::Error>> {
-        !unimplemented!("feature is missing!")
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_text: String = serde_json::to_string(resp.body())?;
+            return Err(Box::new(LLMError::ResponseFormatError {
+                message: format!("API returned error status: {}", status),
+                raw_response: error_text,
+            }));
+        }
+
+        let json_resp: Result<MistralCompletionResponse, serde_json::Error> =
+            serde_json::from_slice(&resp.body());
+        match json_resp {
+            Ok(completion_response) => Ok(CompletionResponse {
+                text: completion_response.choices[0].message.content.clone(),
+            }),
+            Err(e) => Err(Box::new(LLMError::JsonError(e.to_string()))),
+        }
     }
 }
 

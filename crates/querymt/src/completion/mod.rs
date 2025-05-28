@@ -10,6 +10,8 @@ pub mod http;
 pub struct CompletionRequest {
     /// The input prompt text to complete
     pub prompt: String,
+    /// The input prompt text to complete
+    pub suffix: Option<String>,
     /// Optional maximum number of tokens to generate
     pub max_tokens: Option<u32>,
     /// Optional temperature parameter to control randomness (0.0-1.0)
@@ -42,6 +44,7 @@ impl CompletionRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: prompt.into(),
+            suffix: None, // FIXME
             max_tokens: None,
             temperature: None,
         }
@@ -55,6 +58,7 @@ impl CompletionRequest {
     pub fn builder(prompt: impl Into<String>) -> CompletionRequestBuilder {
         CompletionRequestBuilder {
             prompt: prompt.into(),
+            suffix: None,
             max_tokens: None,
             temperature: None,
         }
@@ -66,6 +70,7 @@ impl CompletionRequest {
 pub struct CompletionRequestBuilder {
     /// The input prompt text to complete
     pub prompt: String,
+    pub suffix: Option<String>,
     /// Optional maximum number of tokens to generate
     pub max_tokens: Option<u32>,
     /// Optional temperature parameter to control randomness (0.0-1.0)
@@ -85,10 +90,16 @@ impl CompletionRequestBuilder {
         self
     }
 
+    pub fn suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.suffix = Some(suffix.into());
+        self
+    }
+
     /// Builds the completion request with the configured parameters.
     pub fn build(self) -> CompletionRequest {
         CompletionRequest {
             prompt: self.prompt,
+            suffix: self.suffix,
             max_tokens: self.max_tokens,
             temperature: self.temperature,
         }
