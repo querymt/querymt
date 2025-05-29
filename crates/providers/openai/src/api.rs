@@ -272,18 +272,26 @@ pub trait OpenAIProviderConfig {
     fn max_tokens(&self) -> Option<&u32>;
     fn temperature(&self) -> Option<&f32>;
     fn system(&self) -> Option<&str>;
-    fn timeout_seconds(&self) -> Option<&u64>;
+    fn timeout_seconds(&self) -> Option<&u64> {
+        None
+    }
     fn stream(&self) -> Option<&bool>;
     fn top_p(&self) -> Option<&f32>;
     fn top_k(&self) -> Option<&u32>;
     fn tools(&self) -> Option<&[Tool]>;
     fn tool_choice(&self) -> Option<&ToolChoice>;
-    fn embedding_encoding_format(&self) -> Option<&str>;
-    fn embedding_dimensions(&self) -> Option<&u32>;
+    fn embedding_encoding_format(&self) -> Option<&str> {
+        None
+    }
+    fn embedding_dimensions(&self) -> Option<&u32> {
+        None
+    }
     fn reasoning_effort(&self) -> Option<&String> {
         None
     }
-    fn json_schema(&self) -> Option<&StructuredOutputFormat>;
+    fn json_schema(&self) -> Option<&StructuredOutputFormat> {
+        None
+    }
     fn extra_body(&self) -> Option<Map<String, Value>> {
         None
     }
