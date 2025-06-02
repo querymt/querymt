@@ -58,6 +58,8 @@ pub mod validated_llm;
 /// Evaluator for LLM providers
 pub mod evaluator;
 
+pub mod pricing;
+
 /// Core trait that all LLM providers must implement, combining chat, completion
 /// and embedding capabilities into a unified interface
 #[async_trait::async_trait]

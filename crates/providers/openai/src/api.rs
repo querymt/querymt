@@ -8,6 +8,7 @@ use querymt::{
         ChatMessage, ChatResponse, ChatRole, MessageType, StructuredOutputFormat, Tool, ToolChoice,
     },
     error::LLMError,
+    pricing::{get_model_pricing, Pricing},
     FunctionCall, ToolCall, Usage,
 };
 use schemars::{
@@ -16,19 +17,7 @@ use schemars::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
 use url::Url;
-
-/// Represents the pricing information for a model.
-#[derive(Debug, Clone)]
-pub struct ModelPricing {
-    /// Cost of input tokens.
-    pub input_token_cost: f64,
-    /// Cost of cached input tokens.
-    pub cached_input_token_cost: f64,
-    /// Cost of output tokens.
-    pub output_token_cost: f64,
-}
 
 pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
     Schema::Object(SchemaObject {
@@ -565,150 +554,60 @@ pub fn openai_parse_list_models(response: &Response<Vec<u8>>) -> Result<Vec<Stri
     Ok(names)
 }
 
-/// Returns the pricing information for a given OpenAI model.
-///
-/// Source: <https://platform.openai.com/docs/pricing>
-pub fn openai_get_model_pricing(model_name: &str) -> Option<ModelPricing> {
-    let model_pricing: HashMap<&'static str, ModelPricing> = vec![
-        (
-            "gpt-4.1",
-            ModelPricing {
-                input_token_cost: 0.0000020,
-                cached_input_token_cost: 0.0000005,
-                output_token_cost: 0.0000080,
-            },
-        ),
-        (
-            "gpt-4.1-mini",
-            ModelPricing {
-                input_token_cost: 0.0000004,
-                cached_input_token_cost: 0.0000001,
-                output_token_cost: 0.0000016,
-            },
-        ),
-        (
-            "gpt-4.1-nano",
-            ModelPricing {
-                input_token_cost: 0.0000001,
-                cached_input_token_cost: 0.000000025,
-                output_token_cost: 0.0000004,
-            },
-        ),
-        (
-            "gpt-4.5-preview",
-            ModelPricing {
-                input_token_cost: 0.00007500,
-                cached_input_token_cost: 0.00003750,
-                output_token_cost: 0.00015000,
-            },
-        ),
-        (
-            "gpt-4o",
-            ModelPricing {
-                input_token_cost: 0.0000025,
-                cached_input_token_cost: 0.00000125,
-                output_token_cost: 0.0000100,
-            },
-        ),
-        (
-            "gpt-4o-audio-preview",
-            ModelPricing {
-                input_token_cost: 0.0000025,
-                cached_input_token_cost: 0.0,
-                output_token_cost: 0.0000100,
-            },
-        ),
-        (
-            "gpt-4o-realtime-preview",
-            ModelPricing {
-                input_token_cost: 0.0000050,
-                cached_input_token_cost: 0.0000025,
-                output_token_cost: 0.0000200,
-            },
-        ),
-        (
-            "gpt-4o-mini",
-            ModelPricing {
-                input_token_cost: 0.00000015,
-                cached_input_token_cost: 0.000000075,
-                output_token_cost: 0.0000006,
-            },
-        ),
-        (
-            "gpt-4o-mini-audio-preview",
-            ModelPricing {
-                input_token_cost: 0.00000015,
-                cached_input_token_cost: 0.0,
-                output_token_cost: 0.0000006,
-            },
-        ),
-        (
-            "gpt-4o-mini-realtime-preview",
-            ModelPricing {
-                input_token_cost: 0.0000006,
-                cached_input_token_cost: 0.0000003,
-                output_token_cost: 0.0000024,
-            },
-        ),
-        (
-            "o1",
-            ModelPricing {
-                input_token_cost: 0.0000150,
-                cached_input_token_cost: 0.0000075,
-                output_token_cost: 0.0000600,
-            },
-        ),
-        (
-            "o1-pro",
-            ModelPricing {
-                input_token_cost: 0.0001500,
-                cached_input_token_cost: 0.0,
-                output_token_cost: 0.0006000,
-            },
-        ),
-        (
-            "o3",
-            ModelPricing {
-                input_token_cost: 0.0000100,
-                cached_input_token_cost: 0.0000025,
-                output_token_cost: 0.0000400,
-            },
-        ),
-        (
-            "o4-mini",
-            ModelPricing {
-                input_token_cost: 0.00000110,
-                cached_input_token_cost: 0.000000275,
-                output_token_cost: 0.00000440,
-            },
-        ),
-        (
-            "o3-mini",
-            ModelPricing {
-                input_token_cost: 0.00000110,
-                cached_input_token_cost: 0.00000055,
-                output_token_cost: 0.00000440,
-            },
-        ),
-        (
-            "o1-mini",
-            ModelPricing {
-                input_token_cost: 0.00000110,
-                cached_input_token_cost: 0.00000055,
-                output_token_cost: 0.00000440,
-            },
-        ),
-        (
-            "codex-mini-latest",
-            ModelPricing {
-                input_token_cost: 0.00000150,
-                cached_input_token_cost: 0.000000375,
-                output_token_cost: 0.00000600,
-            },
-        ),
-    ]
-    .into_iter()
-    .collect();
+pub async fn openai_get_model_pricing(model_name: &str) -> Option<Pricing> {
+    let model_name = match model_name {
+        "gpt-3.5-0301" => "gpt-3.5-turbo",
+        "gpt-3.5-turbo-16k-0613" => "gpt-3.5-turbo-16k",
+        "gpt-4-0125-preview" => "gpt-4-turbo",
+        "gpt-4-0613" => "gpt-4",
+        "gpt-4-1106-preview" => "gpt-4-turbo",
+        "gpt-4-1106-vision-preview" => "gpt-4-turbo",
+        "gpt-4.1-2025-04-14" => "gpt-4.1",
+        "gpt-4.1-mini-2025-04-14" => "gpt-4.1-mini",
+        "gpt-4.1-nano-2025-04-14" => "gpt-4.1-nano",
+        "gpt-4.5-preview-2025-02-27" => "gpt-4.5-preview",
+        "gpt-4o-mini-search-preview-2025-03-11" => "gpt-4o-mini-search-preview",
+        "gpt-4o-search-preview-2025-03-11" => "gpt-4o-search-preview",
+        "gpt-4-turbo-2024-04-09" => "gpt-4-turbo",
+        "o1-2024-12-17" => "o1",
+        "o1-pro-2025-03-19" => "o1-pro",
+        "o3-2025-04-16" => "o3",
+        "o3-mini-2025-01-31" => "o3-mini",
+        "o4-mini-2025-04-16" => "o4-mini",
+        _ => model_name,
+    };
 
-    model_pricing.get(model_name).cloned()
+    get_model_pricing(format!("openai/{}", model_name).as_str()).await
+}
+
+/// Calculates the cost of using an OpenAI model based on input and output tokens.
+///
+/// # Arguments
+/// * `model_name` - The name of the OpenAI model (e.g., "gpt-4o").
+/// * `input_tokens` - The number of input tokens.
+/// * `output_tokens` - The number of output tokens.
+///
+/// # Returns
+/// * `Some(f64)` - The total cost in dollars, calculated per million tokens.
+/// * `None` - If the model name is not recognized.
+///
+/// # Examples
+/// ```
+/// let cost = openai_calculate_token_cost("gpt-4o", 1000, 500);
+/// ```
+pub async fn openai_calculate_token_cost(
+    model_name: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Option<f64> {
+    if let Some(pricing) = openai_get_model_pricing(model_name).await {
+        Some({
+            let input_cost = input_tokens as f64 * pricing.prompt;
+            let output_cost = output_tokens as f64 * pricing.completion;
+
+            input_cost + output_cost
+        })
+    } else {
+        None
+    }
 }
