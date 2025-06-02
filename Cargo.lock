@@ -3619,6 +3619,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "which 7.0.3",
 ]
 
 [[package]]
