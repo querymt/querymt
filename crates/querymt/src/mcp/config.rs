@@ -2,6 +2,7 @@ use anyhow::Result;
 use rmcp::{service::RunningService, RoleClient, ServiceExt};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path, process::Stdio};
+use which::which;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -36,6 +37,11 @@ impl McpServerTransportConfig {
             McpServerTransportConfig::Sse { url } => {
                 let transport = rmcp::transport::sse::SseTransport::start(url).await?;
                 ().serve(transport).await?
+            }
+            McpServerTransportConfig::Stdio { command, .. }
+                if !(which(&command).is_ok() || std::path::Path::new(&command).exists()) =>
+            {
+                anyhow::bail!("Command not found: {}", command);
             }
             McpServerTransportConfig::Stdio {
                 command,
