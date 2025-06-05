@@ -74,7 +74,7 @@ struct CliArgs {
     model: Option<String>,
 
     /// System prompt to set context
-    #[arg(long)]
+    #[arg(short, long)]
     system: Option<String>,
 
     /// API key for the provider
@@ -251,7 +251,7 @@ fn visualize_tool_call(tool: &ToolCall, result: Option<bool>) {
         (base_name.bright_blue(), "calling...")
     };
 
-    println!("┌─ {}", tool_name);
+    println!("┌─ {}", styled_name);
     if log_enabled!(Level::Debug) {
         println!("│ {}", tool.function.arguments);
     }
