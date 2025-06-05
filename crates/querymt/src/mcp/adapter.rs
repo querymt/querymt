@@ -1,5 +1,5 @@
 use crate::{
-    chat::{FunctionTool, ParametersSchema, Tool},
+    chat::{FunctionTool, Tool},
     tool_decorator::CallFunctionTool,
 };
 use anyhow::Result;
@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use rmcp::model::CallToolRequestParam;
 use rmcp::model::Tool as RmcpTool;
 use rmcp::service::ServerSink;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::convert::TryFrom;
 
 /// Error type for when the schema in the RMCP Tool doesn't match your ParametersSchema.
@@ -25,25 +25,12 @@ impl TryFrom<RmcpTool> for FunctionTool {
     type Error = AdapterError;
 
     fn try_from(r: RmcpTool) -> Result<Self, Self::Error> {
-        let tool_name = r.name.into_owned();
-
-        let mut schema_map: Map<String, Value> = Map::new();
-        for (k, v) in r.input_schema.as_ref().iter() {
-            schema_map.insert(k.clone(), v.clone());
-        }
-
-        let params: ParametersSchema =
-            serde_json::from_value(Value::Object(schema_map)).map_err(|e| {
-                AdapterError::SerdeJson {
-                    tool_name: tool_name.clone(),
-                    source: e,
-                }
-            })?;
-
+        let tool_name = r.name.to_string();
+        log::debug!("adding mcp tool: {}", tool_name);
         Ok(FunctionTool {
             name: tool_name,
-            description: r.description.into_owned(),
-            parameters: params,
+            description: r.description.to_string(),
+            parameters: r.schema_as_json_value(),
         })
     }
 }

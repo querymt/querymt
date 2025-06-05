@@ -1,5 +1,8 @@
 use anyhow::Result;
-use rmcp::{service::RunningService, RoleClient, ServiceExt};
+use rmcp::{
+    service::{DynService, RunningService},
+    transport, RoleClient, ServiceExt,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path, process::Stdio};
 use which::which;

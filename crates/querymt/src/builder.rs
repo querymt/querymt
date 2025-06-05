@@ -440,6 +440,7 @@ pub struct FunctionBuilder {
     description: String,
     parameters: Vec<ParamBuilder>,
     required: Vec<String>,
+    raw_schema: Option<serde_json::Value>,
 }
 
 impl FunctionBuilder {
@@ -449,6 +450,7 @@ impl FunctionBuilder {
             description: String::new(),
             parameters: Vec::new(),
             required: Vec::new(),
+            raw_schema: None,
         }
     }
 
@@ -471,26 +473,39 @@ impl FunctionBuilder {
         self
     }
 
-    pub fn build(self) -> Tool {
-        let mut props = HashMap::new();
-        for pb in self.parameters {
-            let (key, prop) = pb.build();
-            props.insert(key, prop);
-        }
+    /// Provides a full JSON Schema for the parameters.  Using this method
+    /// bypasses the DSL and allows arbitrary complex schemas (nested arrays,
+    /// objects, oneOf, etc.).
+    pub fn json_schema(mut self, schema: serde_json::Value) -> Self {
+        self.raw_schema = Some(schema);
+        self
+    }
 
-        let function = FunctionTool {
-            name: self.name,
-            description: self.description,
-            parameters: ParametersSchema {
+    pub fn build(self) -> Tool {
+        let parameters_value = if let Some(schema) = self.raw_schema {
+            schema
+        } else {
+            let mut properties = HashMap::new();
+            for param in self.parameters {
+                let (name, prop) = param.build();
+                properties.insert(name, prop);
+            }
+
+            serde_json::to_value(ParametersSchema {
                 schema_type: "object".to_string(),
-                properties: props,
+                properties,
                 required: self.required,
-            },
+            })
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
         };
 
         Tool {
             tool_type: "function".to_string(),
-            function,
+            function: FunctionTool {
+                name: self.name,
+                description: self.description,
+                parameters: parameters_value,
+            },
         }
     }
 }

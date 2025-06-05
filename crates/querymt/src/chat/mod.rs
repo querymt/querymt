@@ -124,7 +124,7 @@ pub struct FunctionTool {
     /// Description of what the function does
     pub description: String,
     /// The parameters schema for the function
-    pub parameters: ParametersSchema,
+    pub parameters: Value,
 }
 
 /// Defines rules for structured output responses based on [OpenAI's structured output requirements](https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format).

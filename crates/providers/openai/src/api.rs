@@ -385,6 +385,16 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
     // Build the response format object
     let response_format: Option<OpenAIResponseFormat> = cfg.json_schema().cloned().map(Into::into);
 
+    let request_tools = tools
+        .map(|t| t.to_vec())
+        .or_else(|| cfg.tools().map(|t| t.to_vec()));
+
+    let request_tool_choice = if request_tools.is_some() {
+        cfg.tool_choice().cloned()
+    } else {
+        None
+    };
+
     let body = OpenAIChatRequest {
         model: &cfg.model(),
         messages: openai_msgs,
@@ -393,8 +403,8 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
         stream: *cfg.stream().unwrap_or(&false),
         top_p: cfg.top_p().copied(),
         top_k: cfg.top_k().copied(),
-        tools: tools.map(|t| t.to_vec()),
-        tool_choice: cfg.tool_choice().cloned(),
+        tools: request_tools,
+        tool_choice: request_tool_choice,
         reasoning_effort: cfg.reasoning_effort().cloned(),
         response_format,
         extra_body: cfg.extra_body(),
