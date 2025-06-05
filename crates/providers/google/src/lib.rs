@@ -179,14 +179,14 @@ impl std::fmt::Display for GoogleChatResponse {
         match (self.text(), self.tool_calls()) {
             (Some(text), Some(tool_calls)) => {
                 for call in tool_calls {
-                    write!(f, "{}", call)?;
+                    write!(f, "{:?}", call)?;
                 }
                 write!(f, "{}", text)
             }
             (Some(text), None) => write!(f, "{}", text),
             (None, Some(tool_calls)) => {
                 for call in tool_calls {
-                    write!(f, "{}", call)?;
+                    write!(f, "{:?}", call)?;
                 }
                 Ok(())
             }
@@ -599,7 +599,7 @@ impl HTTPChatProvider for Google {
     ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
         if !resp.status().is_success() {
             let status = resp.status();
-            let error_text: String = "".to_string();
+            let error_text: String = serde_json::to_string(resp.body())?;
             return Err(Box::new(LLMError::ResponseFormatError {
                 message: format!("API returned error status: {}", status),
                 raw_response: error_text,
