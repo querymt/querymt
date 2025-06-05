@@ -1,6 +1,7 @@
 use async_recursion::async_recursion;
 use clap::Parser;
 use colored::*;
+use log::{log_enabled, Level};
 use opentelemetry::{trace::TracerProvider, KeyValue};
 use opentelemetry_sdk::{
     trace::{RandomIdGenerator, SdkTracerProvider},
@@ -19,7 +20,7 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde_json::Value;
 use spinners::{Spinner, Spinners};
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, stdout, IsTerminal, Read, Write};
 use std::{fs, path::PathBuf};
 use tokio;
 use tracing_log::LogTracer;
@@ -230,6 +231,33 @@ fn process_input(input: &[u8], prompt: String) -> Vec<ChatMessage> {
     messages
 }
 
+fn visualize_tool_call(tool: &ToolCall, result: Option<bool>) {
+    fn clear_prev_line(debug: bool) {
+        let mut out = stdout();
+        let move_up = if debug { "\x1B[3A" } else { "\x1B[2A" };
+        write!(out, "{}\x1B[2K", move_up).unwrap();
+    }
+
+    let base_name = tool.function.name.bold();
+    let (styled_name, suffix) = if let Some(res) = result {
+        clear_prev_line(log_enabled!(Level::Debug));
+
+        if res {
+            (base_name.bright_green(), "generated")
+        } else {
+            (base_name.bright_red(), "failed")
+        }
+    } else {
+        (base_name.bright_blue(), "calling...")
+    };
+
+    println!("┌─ {}", tool_name);
+    if log_enabled!(Level::Debug) {
+        println!("│ {}", tool.function.arguments);
+    }
+    println!("└─ {}", suffix);
+}
+
 #[async_recursion]
 async fn handle_response(
     messages: &mut Vec<ChatMessage>,
@@ -256,18 +284,18 @@ async fn handle_response(
                 .build(),
         );
         for call in &tool_calls {
-            log::debug!("Tool call: {}", call.function.name);
-            log::debug!("Arguments: {}", call.function.arguments);
-
+            visualize_tool_call(&call, None);
             let args: Value = serde_json::from_str(&call.function.arguments)
                 .map_err(|e| LLMError::InvalidRequest(format!("bad args JSON: {}", e)))?;
 
             let tool_res = match provider.call_tool(&call.function.name, args).await {
                 Ok(result) => {
                     log::debug!("Tool response: {}", serde_json::to_string_pretty(&result)?);
+                    visualize_tool_call(&call, Some(true));
                     serde_json::to_string(&result)?
                 }
                 Err(e) => {
+                    visualize_tool_call(&call, Some(false));
                     log::error!("Error while calling tool: {}", e.to_string());
                     e.to_string()
                 }
@@ -583,7 +611,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("{}", "qmt - Interactive Chat".bright_cyan());
+    println!("{}", "qmt - Interactive Chat".bright_blue());
     println!("Provider: {}", provider_name.bright_green());
     println!("{}", "Type 'exit' to quit".bright_black());
     println!("{}", "─".repeat(50).bright_black());
@@ -598,7 +626,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(line) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() || trimmed.to_lowercase() == "exit" {
-                    println!("{}", "👋 Goodbye!".bright_cyan());
+                    println!("{}", "👋 Goodbye!".bright_blue());
                     break;
                 }
                 let _ = rl.add_history_entry(trimmed);
@@ -622,7 +650,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-                println!("\n{}", "👋 Goodbye!".bright_cyan());
+                println!("\n{}", "👋 Goodbye!".bright_blue());
                 break;
             }
             Err(err) => {
