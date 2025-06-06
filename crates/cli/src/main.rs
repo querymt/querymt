@@ -232,15 +232,19 @@ fn process_input(input: &[u8], prompt: String) -> Vec<ChatMessage> {
 }
 
 fn visualize_tool_call(tool: &ToolCall, result: Option<bool>) {
-    fn clear_prev_line(debug: bool) {
+    fn clear_prev_lines(n: u16) {
         let mut out = stdout();
-        let move_up = if debug { "\x1B[3A" } else { "\x1B[2A" };
-        write!(out, "{}\x1B[2K", move_up).unwrap();
+        write!(out, "\x1B[{}A", n).unwrap();
+        for _ in 0..n {
+            write!(out, "\x1B[2K\x1B[1B").unwrap();
+        }
+        write!(out, "\x1B[{}A", n).unwrap();
     }
 
     let base_name = tool.function.name.bold();
     let (styled_name, suffix) = if let Some(res) = result {
-        clear_prev_line(log_enabled!(Level::Debug));
+        let prev_lines = if log_enabled!(Level::Debug) { 3 } else { 2 };
+        clear_prev_lines(prev_lines);
 
         if res {
             (base_name.bright_green(), "generated")
