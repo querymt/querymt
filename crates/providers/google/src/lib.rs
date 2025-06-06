@@ -327,11 +327,35 @@ struct GoogleFunctionDeclaration {
 
 impl From<&Tool> for GoogleFunctionDeclaration {
     fn from(tool: &Tool) -> Self {
+        fn remove_additional(v: &mut Value) {
+            match v {
+                Value::Object(map) => {
+                    // Remove this object's `additionalProperties` key, if present.
+                    map.remove("additionalProperties");
+                    // Recurse into all remaining values
+                    for child in map.values_mut() {
+                        remove_additional(child);
+                    }
+                }
+                Value::Array(arr) => {
+                    // If it's an array, recurse into each element
+                    for child in arr.iter_mut() {
+                        remove_additional(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let properties_value = tool
             .function
             .parameters
             .get("properties")
-            .cloned()
+            .map(|p| {
+                let mut props = p.clone();
+                remove_additional(&mut props);
+                props
+            })
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
 
         GoogleFunctionDeclaration {
