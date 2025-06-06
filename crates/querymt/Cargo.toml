@@ -34,7 +34,7 @@ either = { workspace = true }
 url = { workspace = true }
 http = { workspace = true }
 libloading = { version = "0.8.6", optional = true}
-rmcp = { version = "0.1", features = ["client", "transport-sse", "transport-child-process"], optional = true }
+rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", branch = "main", features = ["client", "reqwest", "transport-child-process", "transport-streamable-http-client", "transport-sse-client"], optional = true }
 toml = { version = "0.8", optional = true}
 thiserror = "1.0"
 extism = { version = "1.10.0", optional = true}
@@ -55,7 +55,7 @@ which = "7.0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.0", features = ["full"], optional = true }
-reqwest = { version = "0.11", features = ["json"], optional = true}
+reqwest = { version = "0.12", features = ["json"], optional = true}
 once_cell = { version = "1.21.3", optional = true}
 
 #[target.'cfg(target_arch = "wasm32")'.dependencies]

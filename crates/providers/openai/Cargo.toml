@@ -14,10 +14,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 querymt = { path = "../../querymt", default-features = false, optional = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-either = { workspace = true }
-url = { workspace = true }
-schemars = { workspace = true }
-http = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+either.workspace = true
+url.workspace = true
+schemars.workspace = true
+http.workspace = true
 extism-pdk = { workspace = true, optional = true }

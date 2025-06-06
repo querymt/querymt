@@ -1,7 +1,13 @@
 use anyhow::Result;
+use http::{header::AUTHORIZATION, HeaderValue};
+use reqwest::header::HeaderMap;
 use rmcp::{
     service::{DynService, RunningService},
-    transport, RoleClient, ServiceExt,
+    transport::{
+        sse_client::SseClientConfig, streamable_http_client::StreamableHttpClientTransportConfig,
+        SseClientTransport, StreamableHttpClientTransport,
+    },
+    RoleClient, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path, process::Stdio};
@@ -22,8 +28,13 @@ pub struct McpServerConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "protocol", rename_all = "lowercase")]
 pub enum McpServerTransportConfig {
+    Http {
+        url: String,
+        token: Option<String>,
+    },
     Sse {
         url: String,
+        token: Option<String>,
     },
     Stdio {
         command: String,
@@ -35,11 +46,60 @@ pub enum McpServerTransportConfig {
 }
 
 impl McpServerTransportConfig {
-    pub async fn start(&self) -> Result<RunningService<RoleClient, ()>> {
+    pub async fn start(
+        &self,
+    ) -> Result<RunningService<RoleClient, Box<dyn DynService<RoleClient>>>> {
         let client = match self {
-            McpServerTransportConfig::Sse { url } => {
-                let transport = rmcp::transport::sse::SseTransport::start(url).await?;
-                ().serve(transport).await?
+            McpServerTransportConfig::Sse { url, token } => {
+                let transport = match token {
+                    Some(t) => {
+                        let mut default_headers = HeaderMap::new();
+                        default_headers.insert(
+                            AUTHORIZATION,
+                            HeaderValue::from_str(&format!("Bearer {t}"))?,
+                        );
+
+                        let client = reqwest::ClientBuilder::new()
+                            .default_headers(default_headers)
+                            .build()?;
+
+                        SseClientTransport::start_with_client(
+                            client,
+                            SseClientConfig {
+                                sse_endpoint: url.clone().into(),
+                                ..Default::default()
+                            },
+                        )
+                        .await?
+                    }
+                    None => SseClientTransport::start(url.as_str()).await?,
+                };
+                ().into_dyn().serve(transport).await?
+            }
+            McpServerTransportConfig::Http { url, token } => {
+                let transport = match token {
+                    Some(t) => {
+                        let mut default_headers = HeaderMap::new();
+                        default_headers.insert(
+                            AUTHORIZATION,
+                            HeaderValue::from_str(&format!("Bearer {t}"))?,
+                        );
+
+                        let client = reqwest::ClientBuilder::new()
+                            .default_headers(default_headers)
+                            .build()?;
+
+                        StreamableHttpClientTransport::with_client(
+                            client,
+                            StreamableHttpClientTransportConfig {
+                                uri: url.clone().into(),
+                                ..Default::default()
+                            },
+                        )
+                    }
+                    None => StreamableHttpClientTransport::from_uri(url.clone()),
+                };
+                ().into_dyn().serve(transport).await?
             }
             McpServerTransportConfig::Stdio { command, .. }
                 if !(which(&command).is_ok() || std::path::Path::new(&command).exists()) =>
@@ -51,16 +111,17 @@ impl McpServerTransportConfig {
                 args,
                 envs,
             } => {
-                let transport = rmcp::transport::child_process::TokioChildProcess::new(
-                    tokio::process::Command::new(command)
-                        .args(args)
-                        .envs(envs)
-                        .stderr(Stdio::inherit())
-                        .stdout(Stdio::inherit()),
-                )?;
-                ().serve(transport).await?
+                let mut cmd = tokio::process::Command::new(command);
+
+                cmd.args(args)
+                    .envs(envs)
+                    .stderr(Stdio::inherit())
+                    .stdout(Stdio::inherit());
+                let transport = rmcp::transport::child_process::TokioChildProcess::new(cmd)?;
+                ().into_dyn().serve(transport).await?
             }
         };
+        log::trace!("Connected to server: {:#?}", client.peer_info());
         Ok(client)
     }
 }
@@ -74,7 +135,7 @@ impl Config {
 
     pub async fn create_mcp_clients(
         &self,
-    ) -> Result<HashMap<String, RunningService<RoleClient, ()>>> {
+    ) -> Result<HashMap<String, RunningService<RoleClient, Box<dyn DynService<RoleClient>>>>> {
         let mut clients = HashMap::new();
         for server in &self.mcp {
             let client = server.transport.start().await?;

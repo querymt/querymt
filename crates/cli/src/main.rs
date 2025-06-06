@@ -562,11 +562,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.parameter(k, v);
     }
 
+    // need to keep the reference of the clients to keep them alive.
+    let mcp_clients;
     if let Some(mcp_cfg) = args.mcp_config {
         let c = McpConfig::load(mcp_cfg).await?;
-        let mcp_clients = c.create_mcp_clients().await?;
-        for (_, client) in mcp_clients {
-            let server = client.peer().clone();
+        mcp_clients = c.create_mcp_clients().await?;
+        for (_, client) in mcp_clients.iter() {
+            let server = client.peer();
             let tools = server.list_all_tools().await?;
             for tool in tools
                 .into_iter()

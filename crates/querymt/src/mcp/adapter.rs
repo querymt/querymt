@@ -4,9 +4,8 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use rmcp::model::CallToolRequestParam;
 use rmcp::model::Tool as RmcpTool;
-use rmcp::service::ServerSink;
+use rmcp::{model::CallToolRequestParam, service::ServerSink};
 use serde_json::Value;
 use std::convert::TryFrom;
 
@@ -29,7 +28,7 @@ impl TryFrom<RmcpTool> for FunctionTool {
         log::debug!("adding mcp tool: {}", tool_name);
         Ok(FunctionTool {
             name: tool_name,
-            description: r.description.to_string(),
+            description: r.description.clone().unwrap_or_default().to_string(),
             parameters: r.schema_as_json_value(),
         })
     }
