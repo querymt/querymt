@@ -69,8 +69,28 @@ jobs:
           # format as JSON list for the matrix
           entries=()
           for p in "${PROVIDERS[@]}"; do
-            entries+=( "{\"crate\":\"$p\"}" )
+            toml="crates/providers/$p/Cargo.toml"
+            detected_type=""
+            if [[ -f "$toml" ]]; then
+              detected_type=$(
+                awk -F'=' '
+                  $0 ~ /^\[package\.metadata\.qmt\]/ {in=1; next}
+                  in && $0 ~ /^\[/ {in=0}
+                  in && $1 ~ /^type$/ {
+                    gsub(/"/, "", $2); gsub(/ /, "", $2); print $2; exit
+                  }
+                ' "$toml"
+              )
+            fi
+            if [[ "$detected_type" == "wasm" ]]; then
+              entries+=( "{\"crate\":\"$p\",\"provider_type\":\"$detected_type\"}" )
+            fi
           done
+
+          if [ ${#entries[@]} -eq 0 ]; then
+            entries+=( "{\"crate\":\"noop\",\"provider_type\":\"noop\"}" )
+          fi
+
           # note: join on commas, not spaces
           joined=$(IFS=, ; echo "${entries[*]}")
           matrix="{\"include\":[${joined}]}"
@@ -100,18 +120,18 @@ jobs:
           echo "VERSION=$v" >> $GITHUB_ENV
 
       - name: Set up Rust toolchain
-        if: matrix.crate != 'noop'
+        if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           target: wasm32-wasip1
 
       - name: Build Wasm binary
-        if: matrix.crate != 'noop'
+        if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'
         run: cargo build -p qmt-${{ matrix.crate }} --release --target wasm32-wasip1
 
       - name: Log in to GHCR
-        if: matrix.crate != 'noop'
+        if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -119,15 +139,15 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Oras CLI
-        if: matrix.crate != 'noop'
+        if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'
         uses: oras-project/setup-oras@v1
 
       - name: Create Wasm OCI config file
-        if: matrix.crate != 'noop'
+        if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'
         run: echo '{}' > wasm-config.json
 
       - name: Push Wasm artifact to GHCR with Oras
-        if: matrix.crate != 'noop'
+        if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'
         run: |
           IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}"
 
