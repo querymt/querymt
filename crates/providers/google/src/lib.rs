@@ -88,6 +88,7 @@ pub struct Google {
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<ToolChoice>, // FIXME: currently not being used
     pub thinking_budget: Option<u32>,
+    pub cached_content: Option<String>,
 }
 
 /// Request body for chat completions
@@ -101,6 +102,14 @@ struct GoogleChatRequest<'a> {
     /// Tools that the model can use
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<GoogleTool>>,
+    /// Tools choice
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_config: Option<GoogleToolConfig>,
+    /// Tools choice
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cachedContent")]
+    cached_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<GoogleSystemInstruction<'a>>,
 }
 
 /// Individual message in a chat conversation
@@ -108,6 +117,12 @@ struct GoogleChatRequest<'a> {
 struct GoogleChatContent<'a> {
     /// Role of the message sender ("user", "model", or "system")
     role: &'a str,
+    /// Content parts of the message
+    parts: Vec<GoogleContentPart<'a>>,
+}
+
+#[derive(Serialize)]
+struct GoogleSystemInstruction<'a> {
     /// Content parts of the message
     parts: Vec<GoogleContentPart<'a>>,
 }
@@ -314,6 +329,27 @@ struct GoogleTool {
     function_declarations: Vec<GoogleFunctionDeclaration>,
 }
 
+/// Google's tool configuration
+#[derive(Serialize, Debug)]
+struct GoogleToolConfig {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "functionCallingConfig"
+    )]
+    function_calling_config: Option<FunctionCallingConfig>,
+}
+
+#[derive(Serialize, Debug)]
+struct FunctionCallingConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "allowedFunctionNames"
+    )]
+    allowed_function_names: Option<Vec<String>>,
+}
+
 /// Google function declaration, similar to OpenAI's function definition
 #[derive(Serialize, Debug)]
 struct GoogleFunctionDeclaration {
@@ -477,12 +513,10 @@ impl HTTPChatProvider for Google {
 
         let mut chat_contents = Vec::with_capacity(messages.len());
 
-        // Add system message if present
-        if let Some(system) = &self.system {
-            chat_contents.push(GoogleChatContent {
-                role: "user",
-                parts: vec![GoogleContentPart::Text(system)],
-            });
+        if self.cached_content.is_some() && self.tools().is_some() {
+            return Err(LLMError::InvalidRequest(format!(
+                "Cached content is set and tools as well!"
+            )));
         }
 
         // Add conversation messages in pairs to maintain context
@@ -543,6 +577,15 @@ impl HTTPChatProvider for Google {
             });
         }
 
+        // Add system message if present
+        let system_instruction = if let Some(system) = &self.system {
+            Some(GoogleSystemInstruction {
+                parts: vec![GoogleContentPart::Text(system)],
+            })
+        } else {
+            None
+        };
+
         // Convert tools to Google's format if provided
         let google_tools = tools.map(|t| {
             vec![GoogleTool {
@@ -596,6 +639,9 @@ impl HTTPChatProvider for Google {
             contents: chat_contents,
             generation_config,
             tools: google_tools,
+            tool_config: None, // FIXME
+            cached_content: self.cached_content.clone(),
+            system_instruction,
         };
 
         let json_body = serde_json::to_vec(&req_body)?;
