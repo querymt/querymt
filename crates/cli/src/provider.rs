@@ -1,0 +1,78 @@
+use dirs;
+use std::path::PathBuf;
+
+use crate::cli_args::CliArgs;
+use crate::secret_store::SecretStore;
+use querymt::error::LLMError;
+use querymt::plugin::{extism_impl::ExtismProviderRegistry, ProviderRegistry};
+
+/// Splits "provider:model" or just "provider" into (provider, Option<model>)
+fn split_provider(s: &str) -> (String, Option<String>) {
+    match s.split_once(':') {
+        Some((p, m)) => (p.to_string(), Some(m.to_string())),
+        None => (s.to_string(), None),
+    }
+}
+
+/// Retrieves provider and model information from CLI args or default store
+pub fn get_provider_info(args: &CliArgs) -> Option<(String, Option<String>)> {
+    if let Ok(store) = SecretStore::new() {
+        if let Some(default) = store.get_default_provider().cloned() {
+            return Some(split_provider(&default));
+        }
+    }
+    if let Some(s) = &args.backend {
+        return Some(split_provider(s));
+    }
+    args.backend.clone().map(|p| (p, args.model.clone()))
+}
+
+/// Try to resolve an API key from CLI args, secret store, or environment
+pub fn get_api_key(
+    provider: &str,
+    args: &CliArgs,
+    registry: &dyn ProviderRegistry,
+) -> Option<String> {
+    args.api_key.clone().or_else(|| {
+        registry.get(provider).and_then(|factory| {
+            factory.as_http()?.api_key_name().and_then(|name| {
+                SecretStore::new()
+                    .ok()
+                    .and_then(|store| store.get(&name).cloned())
+                    .or_else(|| std::env::var(name).ok())
+            })
+        })
+    })
+}
+
+/// Initializes provider registry (from config path or default ~/.qmt)
+pub async fn get_provider_registry(args: &CliArgs) -> Result<Box<dyn ProviderRegistry>, LLMError> {
+    // Determine config file path
+    let registry = if let Some(cfg) = &args.provider_config {
+        ExtismProviderRegistry::new(cfg.clone()).await
+    } else {
+        let mut config_file: Option<PathBuf> = None;
+        if let Some(home) = dirs::home_dir() {
+            let config_dir = home.join(".qmt");
+            if config_dir.exists() {
+                for name in &["providers.json", "providers.toml", "providers.yaml"] {
+                    let candidate = config_dir.join(name);
+                    if candidate.is_file() {
+                        config_file = Some(candidate);
+                        break;
+                    }
+                }
+            }
+        }
+        let cfg_file = config_file.ok_or_else(|| {
+            LLMError::InvalidRequest(
+                "Config file for providers is missing. Please provide one!".to_string(),
+            )
+        })?;
+        ExtismProviderRegistry::new(cfg_file).await
+    };
+
+    registry
+        .map_err(|e| LLMError::PluginError(e.to_string()))
+        .map(|r| Box::new(r) as Box<dyn ProviderRegistry>)
+}
