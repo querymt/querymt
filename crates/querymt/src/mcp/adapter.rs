@@ -9,6 +9,7 @@ use rmcp::model::Tool as RmcpTool;
 use rmcp::{model::CallToolRequestParam, service::ServerSink};
 use serde_json::Value;
 use std::convert::TryFrom;
+use tracing::instrument;
 
 /// Error type for when the schema in the RMCP Tool doesn't match your ParametersSchema.
 #[derive(thiserror::Error, Debug)]
@@ -30,6 +31,7 @@ pub enum AdapterError {
 impl TryFrom<RmcpTool> for FunctionTool {
     type Error = AdapterError;
 
+    #[instrument(name = "from_mcp_tool", skip(r))]
     fn try_from(r: RmcpTool) -> Result<Self, Self::Error> {
         let tool_name = r.name.to_string();
         log::debug!("adding mcp tool: {}", tool_name);
