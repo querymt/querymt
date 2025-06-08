@@ -26,15 +26,15 @@ impl LLMProviderFromHTTP {
         let req = self
             .inner
             .chat_request(messages, tools)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
 
         let resp = call_outbound(req)
             .await
-            .map_err(|e: Box<dyn std::error::Error>| LLMError::HttpError(e.to_string()))?;
+            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
 
         self.inner
             .parse_chat(resp)
-            .map_err(|e: Box<dyn std::error::Error>| LLMError::ProviderError(e.to_string()))
+            .map_err(|e: Box<dyn std::error::Error>| LLMError::ProviderError(format!("{:#}", e)))
     }
 }
 
@@ -63,10 +63,10 @@ impl EmbeddingProvider for LLMProviderFromHTTP {
         let req = self.inner.embed_request(&inputs)?;
         let resp = call_outbound(req)
             .await
-            .map_err(|e| LLMError::HttpError(e.to_string()))?;
+            .map_err(|e| LLMError::HttpError(format!("{:#}", e)))?;
         self.inner
             .parse_embed(resp)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))
+            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))
     }
 }
 
@@ -76,10 +76,10 @@ impl CompletionProvider for LLMProviderFromHTTP {
         let req = self.inner.complete_request(req_obj)?;
         let resp = call_outbound(req)
             .await
-            .map_err(|e| LLMError::HttpError(e.to_string()))?;
+            .map_err(|e| LLMError::HttpError(format!("{:#}", e)))?;
         self.inner
             .parse_complete(resp)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))
+            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))
     }
 }
 

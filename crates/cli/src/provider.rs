@@ -73,6 +73,6 @@ pub async fn get_provider_registry(args: &CliArgs) -> Result<Box<dyn ProviderReg
     };
 
     registry
-        .map_err(|e| LLMError::PluginError(e.to_string()))
+        .map_err(|e| LLMError::PluginError(format!("{:#}", e)))
         .map(|r| Box::new(r) as Box<dyn ProviderRegistry>)
 }

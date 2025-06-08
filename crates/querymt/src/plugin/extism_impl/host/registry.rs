@@ -5,7 +5,7 @@ use crate::{
         LLMProviderFactory, ProviderRegistry,
     },
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -75,16 +75,21 @@ impl ExtismProviderRegistry {
                     plugin_cfg.name,
                     local_output_path
                 );
-                tokio::fs::read(local_output_path).await?
+                tokio::fs::read(local_output_path).await.context(format!(
+                    "Error while loading {} from {}",
+                    plugin_cfg.path, local_output_path
+                ))?
             } else {
-                tokio::fs::read(&plugin_cfg.path).await?
+                tokio::fs::read(&plugin_cfg.path)
+                    .await
+                    .context(format!("Error while loading {}", plugin_cfg.path))?
             };
 
             match ExtismFactory::load(wasm_content, &plugin_cfg.config) {
                 Ok(provider) => {
                     self.factories
                         .write()
-                        .map_err(|e| LLMError::PluginError(e.to_string()))?
+                        .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?
                         .insert(plugin_cfg.name.clone(), Arc::new(provider));
                     log::info!("Loaded provider {}", plugin_cfg.name);
                 }

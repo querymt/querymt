@@ -35,11 +35,11 @@ macro_rules! impl_binary_codec {
             type Error = PdkError;
 
             fn to_bytes(&self) -> Result<Self::Bytes, Self::Error> {
-                serde_json::to_vec(self).map_err(|e| Error::msg(e.to_string()))
+                serde_json::to_vec(self).map_err(|e| Error::msg(format!("{:#}", e)))
             }
 
             fn from_bytes(bytes: &[u8]) -> Result<Self, Self::Error> {
-                serde_json::from_slice(bytes).map_err(|e| Error::msg(e.to_string()))
+                serde_json::from_slice(bytes).map_err(|e| Error::msg(format!("{:#}", e)))
             }
         }
 
@@ -60,11 +60,11 @@ macro_rules! impl_binary_codec {
             type Error = PdkError;
 
             fn to_bytes(&self) -> Result<Self::Bytes, Self::Error> {
-                serde_json::to_vec(self).map_err(|e| Error::msg(e.to_string()))
+                serde_json::to_vec(self).map_err(|e| Error::msg(format!("{:#}", e)))
             }
 
             fn from_bytes(bytes: &[u8]) -> Result<Self, Self::Error> {
-                serde_json::from_slice(bytes).map_err(|e| Error::msg(e.to_string()))
+                serde_json::from_slice(bytes).map_err(|e| Error::msg(format!("{:#}", e)))
             }
         }
 
@@ -144,7 +144,7 @@ macro_rules! impl_extism_http_plugin {
 
             let native_resp = http_response_to_native(resp);
             let models = HTTPLLMProviderFactory::parse_list_models(&$Factory, native_resp)
-                .map_err(|e| PdkError::msg(e.to_string()))?;
+                .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
             Ok(Json(models))
         }
 
@@ -163,7 +163,7 @@ macro_rules! impl_extism_http_plugin {
             let chat_response = input
                 .cfg
                 .parse_chat(native_resp)
-                .map_err(|e| PdkError::msg(e.to_string()))?;
+                .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
             let dto: ExtismChatResponse = chat_response.into();
             Ok(Json(dto))
         }
@@ -183,7 +183,7 @@ macro_rules! impl_extism_http_plugin {
             let embed_response = input
                 .cfg
                 .parse_embed(native_resp)
-                .map_err(|e| PdkError::msg(e.to_string()))?;
+                .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
             Ok(Json(embed_response))
         }
 
@@ -203,7 +203,7 @@ macro_rules! impl_extism_http_plugin {
             let complete_response = input
                 .cfg
                 .parse_complete(native_resp)
-                .map_err(|e| PdkError::msg(e.to_string()))?;
+                .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
             Ok(Json(complete_response))
         }
 

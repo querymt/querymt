@@ -117,7 +117,7 @@ impl LLMProviderFactory for ExtismFactory {
     fn from_config(&self, cfg: &Value) -> Result<Box<dyn LLMProvider>, LLMError> {
         let _from_cfg = self
             .call("from_config", cfg)
-            .map_err(|e| LLMError::PluginError(e.to_string()))?;
+            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
 
         let provider = ExtismProvider {
             plugin: self.plugin.clone(),
@@ -131,7 +131,7 @@ impl LLMProviderFactory for ExtismFactory {
         async move {
             let v = self
                 .call_json("list_models", &cfg_to)
-                .map_err(|e| LLMError::PluginError(e.to_string()))?;
+                .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
             let arr = v.as_array().ok_or(LLMError::ProviderError(
                 "Model list is not an array".to_string(),
             ))?;
@@ -205,7 +205,7 @@ impl BasicChatProvider for ExtismProvider {
         let mut plug = self.plugin.lock().unwrap();
         let out: Json<ExtismChatResponse> = plug
             .call("chat", Json(arg))
-            .map_err(|e| LLMError::PluginError(e.to_string()))?;
+            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
 
         Ok(Box::new(out.0) as Box<dyn ChatResponse>)
     }
@@ -227,7 +227,7 @@ impl ToolChatProvider for ExtismProvider {
         let mut plug = self.plugin.lock().unwrap();
         let out: Json<ExtismChatResponse> = plug
             .call("chat", Json(arg))
-            .map_err(|e| LLMError::PluginError(e.to_string()))?;
+            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
 
         Ok(Box::new(out.0) as Box<dyn ChatResponse>)
     }
@@ -244,7 +244,7 @@ impl EmbeddingProvider for ExtismProvider {
         let mut plug = self.plugin.lock().unwrap();
         let out: Result<Json<Vec<Vec<f32>>>, LLMError> = plug
             .call("embed", Json(arg))
-            .map_err(|e| LLMError::PluginError(e.to_string()));
+            .map_err(|e| LLMError::PluginError(format!("{:#}", e)));
         out.map(|v| v.0)
     }
 }
@@ -260,7 +260,7 @@ impl CompletionProvider for ExtismProvider {
         let mut plug = self.plugin.lock().unwrap();
         let out: Result<Json<CompletionResponse>, LLMError> = plug
             .call("complete", Json(arg))
-            .map_err(|e| LLMError::PluginError(e.to_string()));
+            .map_err(|e| LLMError::PluginError(format!("{:#}", e)));
         out.map(|v| v.0)
     }
 }

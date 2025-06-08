@@ -35,7 +35,7 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
         let sync_provider = self
             .inner
             .from_config(cfg)
-            .map_err(|e| LLMError::PluginError(e.to_string()))?;
+            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
 
         let arc_provider: Arc<dyn HTTPLLMProvider> = Arc::from(sync_provider);
         let adapter = LLMProviderFromHTTP::new(arc_provider);
@@ -52,11 +52,11 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
 
             let resp: Response<Vec<u8>> = call_outbound(req)
                 .await
-                .map_err(|e| LLMError::HttpError(e.to_string()))?;
+                .map_err(|e| LLMError::HttpError(format!("{:#}", e)))?;
 
             inner
                 .parse_list_models(resp)
-                .map_err(|e| LLMError::PluginError(e.to_string()))
+                .map_err(|e| LLMError::PluginError(format!("{:#}", e)))
         }
         .boxed()
     }
