@@ -4,6 +4,7 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use jsonschema::ValidationError;
 use rmcp::model::Tool as RmcpTool;
 use rmcp::{model::CallToolRequestParam, service::ServerSink};
 use serde_json::Value;
@@ -18,6 +19,12 @@ pub enum AdapterError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to validate RMCP schema for tool `{tool_name}`: {source}")]
+    ValidationError {
+        tool_name: String,
+        #[source] // Keep the original error!
+        source: jsonschema::ValidationError<'static>,
+    },
 }
 
 impl TryFrom<RmcpTool> for FunctionTool {
@@ -26,10 +33,21 @@ impl TryFrom<RmcpTool> for FunctionTool {
     fn try_from(r: RmcpTool) -> Result<Self, Self::Error> {
         let tool_name = r.name.to_string();
         log::debug!("adding mcp tool: {}", tool_name);
+
+        let schema = r.schema_as_json_value();
+        jsonschema::draft202012::meta::validate(&schema).map_err(|err| {
+            // Because lifetimes can be tricky, we take ownership of the error
+            let static_err: ValidationError<'static> = err.to_owned();
+            AdapterError::ValidationError {
+                tool_name: tool_name.clone(), // We need the tool_name here
+                source: static_err,
+            }
+        })?;
+
         Ok(FunctionTool {
             name: tool_name,
             description: r.description.clone().unwrap_or_default().to_string(),
-            parameters: r.schema_as_json_value(),
+            parameters: schema,
         })
     }
 }
