@@ -7,7 +7,7 @@ use querymt::error::LLMError;
 use querymt::plugin::{extism_impl::ExtismProviderRegistry, ProviderRegistry};
 
 /// Splits "provider:model" or just "provider" into (provider, Option<model>)
-fn split_provider(s: &str) -> (String, Option<String>) {
+pub fn split_provider(s: &str) -> (String, Option<String>) {
     match s.split_once(':') {
         Some((p, m)) => (p.to_string(), Some(m.to_string())),
         None => (s.to_string(), None),
@@ -17,14 +17,14 @@ fn split_provider(s: &str) -> (String, Option<String>) {
 /// Retrieves provider and model information from CLI args or default store
 pub fn get_provider_info(args: &CliArgs) -> Option<(String, Option<String>)> {
     if let Ok(store) = SecretStore::new() {
-        if let Some(default) = store.get_default_provider().cloned() {
-            return Some(split_provider(&default));
+        if let Some(default) = store.get_default_provider() {
+            return Some(split_provider(default));
         }
     }
-    if let Some(s) = &args.backend {
+    if let Some(ref s) = args.backend {
         return Some(split_provider(s));
     }
-    args.backend.clone().map(|p| (p, args.model.clone()))
+    None
 }
 
 /// Try to resolve an API key from CLI args, secret store, or environment

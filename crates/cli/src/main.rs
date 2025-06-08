@@ -1,15 +1,16 @@
-use std::io::{self, IsTerminal};
-
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use colored::*;
 use querymt::{
     builder::LLMBuilder, mcp::adapter::McpToolAdapter, mcp::config::Config as MCPConfig,
 };
 use serde_json::Value;
+use std::io::{self, IsTerminal};
 use tokio;
 
 mod chat;
 mod cli_args;
+mod embed;
 mod provider;
 mod secret_store;
 mod tracing;
@@ -17,10 +18,44 @@ mod utils;
 
 use chat::{chat_pipe, interactive_loop};
 use cli_args::{CliArgs, Commands};
-use provider::{get_api_key, get_provider_info, get_provider_registry};
+use embed::embed_pipe;
+use provider::{get_api_key, get_provider_info, get_provider_registry, split_provider};
 use secret_store::SecretStore;
 use tracing::setup_logging;
 use utils::get_provider_api_key;
+
+fn resolve_provider_and_model(
+    global: &CliArgs,
+    subcmd_provider: Option<&String>,
+    subcmd_model: Option<&String>,
+) -> Result<(String, Option<String>)> {
+    let mut provider: Option<String> = None;
+    let mut model: Option<String> = None;
+
+    if let Some((p, m)) = get_provider_info(global) {
+        provider = Some(p);
+        model = m;
+    }
+
+    if let Some(p) = subcmd_provider {
+        let (p2, m2) = split_provider(p);
+        provider = Some(p2);
+        if m2.is_some() {
+            model = m2;
+        }
+    }
+
+    if let Some(m) = subcmd_model {
+        model = Some(m.clone());
+    }
+
+    match provider {
+        Some(p) => Ok((p, model)),
+        None => Err(anyhow!(
+            "No provider specified. Use --provider or set a default"
+        )),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -107,20 +142,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 return Ok(());
             }
+            Commands::Embed {
+                encoding_format,
+                dimensions,
+                provider: sc_provider,
+                model: sc_model,
+                separator,
+                text,
+            } => {
+                let (prov_name, opt_model) =
+                    resolve_provider_and_model(&args, sc_provider.as_ref(), sc_model.as_ref())?;
+                let mut builder = LLMBuilder::new().provider(prov_name.clone());
+                if let Some(m) = opt_model {
+                    builder = builder.model(m);
+                }
+                if let Some(key) = get_api_key(&prov_name, &args, &*registry) {
+                    builder = builder.api_key(key);
+                }
+                if let Some(url) = &args.base_url {
+                    builder = builder.base_url(url.clone());
+                }
+                if let Some(ef) = encoding_format {
+                    builder = builder.embedding_encoding_format(ef);
+                }
+                if let Some(dim) = dimensions {
+                    builder = builder.embedding_dimensions(*dim);
+                }
+
+                let provider = builder.build(&*registry)?;
+                let embeddings = embed_pipe(&provider, text.as_ref(), separator.as_ref()).await?;
+
+                // pretty-print as JSON
+                println!("{}", serde_json::to_string_pretty(&embeddings)?);
+                return Ok(());
+            }
         }
     }
 
     // Build provider + LLMBuilder
-    let (provider_name, model_name) = get_provider_info(&args)
-        .ok_or("No provider specified. Use --provider or default provider.")?;
-    let mut builder = LLMBuilder::new().provider(provider_name.clone());
-    if let Some(m) = model_name.or(args.model.clone()) {
+    let (prov_name, opt_model) = resolve_provider_and_model(&args, None, None)?;
+    let mut builder = LLMBuilder::new().provider(prov_name.clone());
+    if let Some(m) = opt_model.or(args.model.clone()) {
         builder = builder.model(m);
     }
     if let Some(sys) = &args.system {
         builder = builder.system(sys.clone());
     }
-    if let Some(key) = get_api_key(&provider_name, &args, &*registry) {
+    if let Some(key) = get_api_key(&prov_name, &args, &*registry) {
         builder = builder.api_key(key);
     }
     if let Some(url) = &args.base_url {
@@ -164,5 +232,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return chat_pipe(&provider, args.prompt.as_ref()).await;
     }
 
-    interactive_loop(&provider, &provider_name).await
+    interactive_loop(&provider, &prov_name).await
 }

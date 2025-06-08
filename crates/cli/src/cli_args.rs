@@ -79,4 +79,24 @@ pub enum Commands {
         #[arg()]
         provider: Option<String>,
     },
+    /// Create an embedding for the provided text
+    Embed {
+        /// Document separator that marks the end of document
+        #[arg(long, default_value = "\n")]
+        separator: Option<String>,
+        #[arg(long)]
+        encoding_format: Option<String>,
+        /// Number of dimensions for the embedding
+        #[arg(short, long)]
+        dimensions: Option<u32>,
+        /// Provider override (e.g. "openai" or "openai:text-embedding-ada-002")
+        #[arg(short = 'p', long = "provider")]
+        provider: Option<String>,
+        /// Model override (e.g. "text-embedding-ada-002")
+        #[arg(short = 'm', long = "model")]
+        model: Option<String>,
+        /// Inline text to embed (otherwise read stdin)
+        #[arg()]
+        text: Option<String>,
+    },
 }

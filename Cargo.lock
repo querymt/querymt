@@ -3721,6 +3721,7 @@ dependencies = [
 name = "querymt-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "colored",
  "dirs 6.0.0",
