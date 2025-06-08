@@ -81,8 +81,8 @@ impl SecretStore {
     /// # Returns
     ///
     /// * `io::Result<()>` - Success or an IO error
-    pub fn set(&mut self, key: &str, value: &str) -> io::Result<()> {
-        self.secrets.insert(key.to_string(), value.to_string());
+    pub fn set(&mut self, key: impl Into<String>, value: impl Into<String>) -> io::Result<()> {
+        self.secrets.insert(key.into(), value.into());
         self.save()
     }
 

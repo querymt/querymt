@@ -1,4 +1,3 @@
-//! A
 //! Builder module for configuring and instantiating LLM providers.
 //!
 //! This module provides a flexible builder pattern for creating and configuring
