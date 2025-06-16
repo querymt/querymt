@@ -7,7 +7,7 @@ use crate::{
     chat::{ChatMessage, ChatRole, MessageType},
     completion::CompletionRequest,
     error::LLMError,
-    LLMProvider,
+    LLMProvider, ToolCall,
 };
 
 #[cfg(feature = "api")]
@@ -226,12 +226,92 @@ impl<'a> MultiPromptChain<'a> {
             // 3) Execute
             let mut response = match step.mode {
                 MultiChainStepMode::Chat => {
-                    let messages = vec![ChatMessage {
+                    let mut step_messages = vec![ChatMessage {
                         role: ChatRole::User,
                         message_type: MessageType::Text,
                         content: prompt_text,
                     }];
-                    llm.chat(&messages).await?.text().unwrap_or_default()
+
+                    let mut final_response_text = String::new();
+                    const MAX_TOOL_ITERATIONS: usize = 5;
+
+                    for _ in 0..MAX_TOOL_ITERATIONS {
+                        // Always use `chat_with_tools` to provide the tool definitions to the LLM.
+                        let response = llm.chat_with_tools(&step_messages, llm.tools()).await?;
+
+                        let response_text = response.text();
+                        let tool_calls = response.tool_calls();
+
+                        // Add the assistant's response to the conversation history for the next turn.
+                        step_messages.push(ChatMessage {
+                            role: ChatRole::Assistant,
+                            content: response_text.clone().unwrap_or_default(),
+                            message_type: if let Some(ref tcs) = tool_calls {
+                                if tcs.is_empty() {
+                                    MessageType::Text
+                                } else {
+                                    MessageType::ToolUse(tcs.clone())
+                                }
+                            } else {
+                                MessageType::Text
+                            },
+                        });
+
+                        // If there are tool calls, execute them. Otherwise, we're done.
+                        if let Some(calls) = tool_calls {
+                            if calls.is_empty() {
+                                final_response_text = response_text.unwrap_or_default();
+                                break;
+                            }
+
+                            let tool_futures = calls.iter().map(|call| async move {
+                                let args: serde_json::Value = serde_json::from_str(
+                                    &call.function.arguments,
+                                )
+                                .map_err(|e| {
+                                    LLMError::JsonError(format!(
+                                        "Failed to parse tool arguments: {}",
+                                        e
+                                    ))
+                                })?;
+
+                                let result_content =
+                                    llm.call_tool(&call.function.name, args).await?;
+
+                                // Repurpose `ToolCall` to carry the result. This is a workaround due to
+                                // the existing `MessageType::ToolResult` definition. The result from the
+                                // tool is placed into the `arguments` field.
+                                Ok(ToolCall {
+                                    id: call.id.clone(),
+                                    call_type: "function".to_string(),
+                                    function: crate::FunctionCall {
+                                        name: call.function.name.clone(),
+                                        arguments: result_content,
+                                    },
+                                })
+                            });
+
+                            let tool_results = futures::future::join_all(tool_futures)
+                                .await
+                                .into_iter()
+                                .collect::<Result<Vec<ToolCall>, LLMError>>()?;
+
+                            // Add tool results back into the conversation history. The 'User' role is
+                            // used as a substitute for the standard 'tool' role, which is not defined.
+                            step_messages.push(ChatMessage {
+                                role: ChatRole::User,
+                                content: String::new(),
+                                message_type: MessageType::ToolResult(tool_results),
+                            });
+
+                            // Continue the loop to allow the LLM to process the tool results.
+                        } else {
+                            // The model did not return any tool calls, so this is the final response.
+                            final_response_text = response_text.unwrap_or_default();
+                            break;
+                        }
+                    }
+                    final_response_text
                 }
                 MultiChainStepMode::Completion => {
                     let mut req = CompletionRequest::new(prompt_text);
