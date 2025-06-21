@@ -99,6 +99,10 @@ jobs:
                 | head -n1 | cut -d'"' -f2)
           echo "VERSION=$v" >> $GITHUB_ENV
 
+      - name: Set up Docker Buildx
+        if: matrix.crate != 'noop'
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to GHCR
         if: matrix.crate != 'noop'
         uses: docker/login-action@v2
@@ -115,6 +119,9 @@ jobs:
           file: Dockerfile.provider
           build-args: |
             PROVIDER_NAME=${{ matrix.crate }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:latest
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:${{ env.VERSION }}
           annotations: |
             mt.query.plugin.type=extism
-          outputs: type=registry,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:${{ env.VERSION }},name=ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:latest,push=true,oci-mediatypes=true
+          outputs: type=registry,oci-mediatypes=true
