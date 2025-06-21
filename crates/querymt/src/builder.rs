@@ -9,7 +9,7 @@ use crate::{
         Tool, ToolChoice,
     },
     error::LLMError,
-    plugin::{LLMProviderFactory, ProviderRegistry},
+    plugin::{host::PluginRegistry, LLMProviderFactory},
     tool_decorator::{CallFunctionTool, ToolEnabledProvider},
     LLMProvider,
 };
@@ -323,7 +323,7 @@ impl LLMBuilder {
     /// - No backend is specified
     /// - Required backend feature is not enabled
     /// - Required configuration like API keys are missing
-    pub fn build(self, registry: &dyn ProviderRegistry) -> Result<Box<dyn LLMProvider>, LLMError> {
+    pub fn build(self, registry: &PluginRegistry) -> Result<Box<dyn LLMProvider>, LLMError> {
         //        let (tools, tool_choice) = self.validate_tool_config()?;
 
         let provider_name = self

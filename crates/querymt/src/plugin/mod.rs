@@ -1,7 +1,6 @@
 use crate::{error::LLMError, LLMProvider};
 use futures::future::BoxFuture;
 use serde_json::Value;
-use std::sync::Arc;
 
 #[cfg(feature = "http-client")]
 pub mod adapters;
@@ -10,16 +9,11 @@ pub mod http;
 pub use http::HTTPFactoryCtor;
 pub use http::HTTPLLMProviderFactory;
 
-#[cfg(feature = "native")]
-pub mod native;
+#[cfg(any(feature = "extism_host", feature = "native"))]
+pub mod host;
 
 #[cfg(any(feature = "extism_host", feature = "extism_plugin"))]
 pub mod extism_impl;
-
-pub trait ProviderRegistry {
-    fn get(&self, provider: &str) -> Option<Arc<dyn LLMProviderFactory>>;
-    fn list(&self) -> Vec<Arc<dyn LLMProviderFactory>>;
-}
 
 pub type Fut<'a, T> = BoxFuture<'a, T>;
 

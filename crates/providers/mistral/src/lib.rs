@@ -223,7 +223,7 @@ impl HTTPCompletionProvider for Mistral {
             Ok(completion_response) => Ok(CompletionResponse {
                 text: completion_response.choices[0].message.content.clone(), // FIXME
             }),
-            Err(e) => Err(Box::new(LLMError::JsonError(e.to_string()))),
+            Err(e) => Err(Box::new(LLMError::JsonError(e))),
         }
     }
 }

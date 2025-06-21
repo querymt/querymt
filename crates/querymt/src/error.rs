@@ -1,58 +1,55 @@
-use std::fmt;
+use thiserror::Error;
 
 /// Error types that can occur when interacting with LLM providers.
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum LLMError {
-    /// HTTP request/response errors
-    HttpError(String),
-    /// Authentication and authorization errors
-    AuthError(String),
-    /// Invalid request parameters or format
-    InvalidRequest(String),
-    /// Errors returned by the LLM provider
+    /// A wrapper for a generic, user-created error message.
+    #[error("Generic Error: {0}")]
+    GenericError(String),
+
+    /// A wrapper for provider-specific error messages.
+    #[error("LLM Provider Error: {0}")]
     ProviderError(String),
-    /// API response parsing or format error
+
+    /// A wrapper for authentication/authorization errors.
+    #[error("Auth Error: {0}")]
+    AuthError(String),
+
+    /// A wrapper for tool configuration errors.
+    #[error("Tool Configuration Error: {0}")]
+    ToolConfigError(String),
+
+    /// A wrapper for plugin-related errors.
+    #[error("Plugin Error: {0}")]
+    PluginError(String),
+
+    /// Errors related to malformed requests.
+    #[error("Invalid Request: {0}")]
+    InvalidRequest(String),
+
+    /// Errors related to malformed response bodies.
+    #[error("Response Format Error: {message}. Raw response: '{raw_response}'")]
     ResponseFormatError {
         message: String,
         raw_response: String,
     },
-    /// JSON serialization/deserialization errors
-    JsonError(String),
-    /// Tool configuration error
-    ToolConfigError(String),
-    /// Plugin error
-    PluginError(String),
+
+    #[error("HTTP Error: {0}")]
+    HttpError(String),
+
+    /// Handles JSON serialization and deserialization errors.
+    #[error("JSON Error")]
+    JsonError(#[from] serde_json::Error),
+
+    /// Handles errors from parsing URLs.
+    #[error("Invalid URL")]
+    InvalidUrl(#[from] url::ParseError),
+
+    /// Handles standard I/O errors.
+    #[error("I/O Error")]
+    IoError(#[from] std::io::Error),
 }
 
-impl fmt::Display for LLMError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LLMError::HttpError(e) => write!(f, "HTTP Error: {}", e),
-            LLMError::AuthError(e) => write!(f, "Auth Error: {}", e),
-            LLMError::InvalidRequest(e) => write!(f, "Invalid Request: {}", e),
-            LLMError::ProviderError(e) => write!(f, "Provider Error: {}", e),
-            LLMError::ResponseFormatError {
-                message,
-                raw_response,
-            } => {
-                write!(
-                    f,
-                    "Response Format Error: {}. Raw response: {}",
-                    message, raw_response
-                )
-            }
-            LLMError::JsonError(e) => write!(f, "JSON Parse Error: {}", e),
-            LLMError::ToolConfigError(e) => write!(f, "Tool Configuration Error: {}", e),
-            LLMError::PluginError(e) => {
-                write!(f, "Plugin Error: {}", e)
-            }
-        }
-    }
-}
-
-impl std::error::Error for LLMError {}
-
-/// Converts reqwest HTTP errors into LlmErrors
 #[cfg(feature = "reqwest-client")]
 impl From<reqwest::Error> for LLMError {
     fn from(err: reqwest::Error) -> Self {
@@ -63,22 +60,5 @@ impl From<reqwest::Error> for LLMError {
 impl From<http::Error> for LLMError {
     fn from(err: http::Error) -> Self {
         LLMError::HttpError(err.to_string())
-    }
-}
-
-impl From<serde_json::Error> for LLMError {
-    fn from(err: serde_json::Error) -> Self {
-        LLMError::JsonError(format!(
-            "{} at line {} column {}",
-            err,
-            err.line(),
-            err.column()
-        ))
-    }
-}
-
-impl From<url::ParseError> for LLMError {
-    fn from(err: url::ParseError) -> Self {
-        LLMError::InvalidRequest(format!("Error parsing provided url: {}", err))
     }
 }

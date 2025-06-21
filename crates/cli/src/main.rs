@@ -2,7 +2,8 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use colored::*;
 use querymt::{
-    builder::LLMBuilder, mcp::adapter::McpToolAdapter, mcp::config::Config as MCPConfig,
+    builder::LLMBuilder,
+    mcp::{adapter::McpToolAdapter, config::Config as MCPConfig},
 };
 use serde_json::Value;
 use std::io::{self, IsTerminal};
@@ -156,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(m) = opt_model {
                     builder = builder.model(m);
                 }
-                if let Some(key) = get_api_key(&prov_name, &args, &*registry) {
+                if let Some(key) = get_api_key(&prov_name, &args, &registry) {
                     builder = builder.api_key(key);
                 }
                 if let Some(url) = &args.base_url {
@@ -169,7 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     builder = builder.embedding_dimensions(*dim);
                 }
 
-                let provider = builder.build(&*registry)?;
+                let provider = builder.build(&registry)?;
                 let embeddings = embed_pipe(&provider, text.as_ref(), separator.as_ref()).await?;
 
                 // pretty-print as JSON
@@ -188,7 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(sys) = &args.system {
         builder = builder.system(sys.clone());
     }
-    if let Some(key) = get_api_key(&prov_name, &args, &*registry) {
+    if let Some(key) = get_api_key(&prov_name, &args, &registry) {
         builder = builder.api_key(key);
     }
     if let Some(url) = &args.base_url {
@@ -225,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let provider = builder.build(&*registry)?;
+    let provider = builder.build(&registry)?;
     let is_pipe = !io::stdin().is_terminal();
 
     if is_pipe || args.prompt.is_some() {

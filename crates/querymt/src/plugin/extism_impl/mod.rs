@@ -8,5 +8,3 @@ pub mod wrapper;
 
 #[cfg(feature = "extism_host")]
 pub mod host;
-#[cfg(feature = "extism_host")]
-pub use host::{ExtismConfig, ExtismProviderRegistry};

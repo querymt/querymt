@@ -1,24 +1,23 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{collections::HashMap, fs, path::Path};
-use toml;
 
 use super::oci::OciDownloaderConfig;
 
 #[derive(Debug, Deserialize)]
-pub struct ExtismConfig {
-    pub providers: Vec<PluginConfig>,
+pub struct PluginConfig {
+    pub providers: Vec<ProviderConfig>,
     pub oci: Option<OciDownloaderConfig>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PluginConfig {
+pub struct ProviderConfig {
     pub name: String,
     pub path: String,
     pub config: Option<HashMap<String, toml::Value>>,
 }
 
-impl ExtismConfig {
+impl PluginConfig {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let p: &Path = path.as_ref();
         if !p.exists() {

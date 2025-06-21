@@ -1,10 +1,12 @@
 use dirs;
+use querymt::plugin::{
+    extism_impl::host::ExtismLoader, host::native::NativeLoader, host::PluginRegistry,
+};
 use std::path::PathBuf;
 
 use crate::cli_args::CliArgs;
 use crate::secret_store::SecretStore;
 use querymt::error::LLMError;
-use querymt::plugin::{extism_impl::ExtismProviderRegistry, ProviderRegistry};
 
 /// Splits "provider:model" or just "provider" into (provider, Option<model>)
 pub fn split_provider(s: &str) -> (String, Option<String>) {
@@ -28,11 +30,7 @@ pub fn get_provider_info(args: &CliArgs) -> Option<(String, Option<String>)> {
 }
 
 /// Try to resolve an API key from CLI args, secret store, or environment
-pub fn get_api_key(
-    provider: &str,
-    args: &CliArgs,
-    registry: &dyn ProviderRegistry,
-) -> Option<String> {
+pub fn get_api_key(provider: &str, args: &CliArgs, registry: &PluginRegistry) -> Option<String> {
     args.api_key.clone().or_else(|| {
         registry.get(provider).and_then(|factory| {
             factory.as_http()?.api_key_name().and_then(|name| {
@@ -46,10 +44,10 @@ pub fn get_api_key(
 }
 
 /// Initializes provider registry (from config path or default ~/.qmt)
-pub async fn get_provider_registry(args: &CliArgs) -> Result<Box<dyn ProviderRegistry>, LLMError> {
+pub async fn get_provider_registry(args: &CliArgs) -> Result<PluginRegistry, LLMError> {
     // Determine config file path
-    let registry = if let Some(cfg) = &args.provider_config {
-        ExtismProviderRegistry::new(cfg.clone()).await
+    let mut registry = if let Some(cfg) = &args.provider_config {
+        PluginRegistry::from_path(cfg)?
     } else {
         let mut config_file: Option<PathBuf> = None;
         if let Some(home) = dirs::home_dir() {
@@ -69,10 +67,12 @@ pub async fn get_provider_registry(args: &CliArgs) -> Result<Box<dyn ProviderReg
                 "Config file for providers is missing. Please provide one!".to_string(),
             )
         })?;
-        ExtismProviderRegistry::new(cfg_file).await
+        PluginRegistry::from_path(cfg_file)?
     };
 
-    registry
-        .map_err(|e| LLMError::PluginError(format!("{:#}", e)))
-        .map(|r| Box::new(r) as Box<dyn ProviderRegistry>)
+    registry.register_loader(Box::new(ExtismLoader));
+    registry.register_loader(Box::new(NativeLoader));
+    registry.load_all_plugins().await;
+
+    Ok(registry)
 }

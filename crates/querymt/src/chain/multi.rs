@@ -265,15 +265,8 @@ impl<'a> MultiPromptChain<'a> {
                             }
 
                             let tool_futures = calls.iter().map(|call| async move {
-                                let args: serde_json::Value = serde_json::from_str(
-                                    &call.function.arguments,
-                                )
-                                .map_err(|e| {
-                                    LLMError::JsonError(format!(
-                                        "Failed to parse tool arguments: {}",
-                                        e
-                                    ))
-                                })?;
+                                let args: serde_json::Value =
+                                    serde_json::from_str(&call.function.arguments)?;
 
                                 let result_content =
                                     llm.call_tool(&call.function.name, args).await?;

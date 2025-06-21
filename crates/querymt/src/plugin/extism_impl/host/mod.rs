@@ -20,14 +20,8 @@ use std::{
 };
 use url::Url;
 
-mod config;
-pub use config::ExtismConfig;
-
-mod oci;
-pub use oci::OciDownloader;
-
-mod registry;
-pub use registry::ExtismProviderRegistry;
+mod loader;
+pub use loader::ExtismLoader;
 
 use super::ExtismCompleteRequest;
 
@@ -55,7 +49,7 @@ impl ExtismFactory {
     pub fn load(
         wasm_content: Vec<u8>,
         config: &Option<HashMap<String, toml::Value>>,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, LLMError> {
         let env_map: HashMap<_, _> = std::env::vars().collect();
         let initial_manifest =
             Manifest::new([Wasm::data(wasm_content.clone())]).with_config(env_map.iter());
@@ -63,17 +57,24 @@ impl ExtismFactory {
         let init_plugin = Arc::new(Mutex::new(
             (PluginBuilder::new(initial_manifest))
                 .with_wasi(true)
-                .build()?,
+                .build()
+                .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?,
         ));
 
         let mut allowed_hosts: Vec<String> = Vec::new();
         if let Some(runtime_cfg) = config {
             if let Some(hosts) = runtime_cfg.get("allowed_hosts") {
-                allowed_hosts.append(&mut hosts.clone().try_into()?);
+                allowed_hosts.append(
+                    &mut hosts
+                        .clone()
+                        .try_into()
+                        .map_err(|e| LLMError::GenericError(format!("{:#}", e)))?,
+                );
             }
         }
 
-        let name = call_plugin_str(init_plugin.clone(), "name", &Value::Null)?;
+        let name = call_plugin_str(init_plugin.clone(), "name", &Value::Null)
+            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
         if let Some(base_url) = call_plugin_str(init_plugin.clone(), "base_url", &Value::Null)
             .ok()
             .and_then(|v| Url::parse(&v).ok())
@@ -89,7 +90,10 @@ impl ExtismFactory {
             .with_config(env_map.into_iter());
 
         let plugin = Arc::new(Mutex::new(
-            (PluginBuilder::new(manifest)).with_wasi(true).build()?,
+            (PluginBuilder::new(manifest))
+                .with_wasi(true)
+                .build()
+                .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?,
         ));
 
         Ok(Self { plugin, name })

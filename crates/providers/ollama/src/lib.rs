@@ -370,8 +370,7 @@ impl HTTPCompletionProvider for Ollama {
         &self,
         resp: Response<Vec<u8>>,
     ) -> Result<CompletionResponse, Box<dyn std::error::Error>> {
-        let ollama_response: OllamaResponse = serde_json::from_slice(resp.body())
-            .map_err(|e| Box::new(LLMError::JsonError(e.to_string())))?;
+        let ollama_response: OllamaResponse = serde_json::from_slice(resp.body())?;
 
         if let Some(prompt_response) = ollama_response.response {
             Ok(CompletionResponse {
