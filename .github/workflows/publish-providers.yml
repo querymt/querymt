@@ -115,9 +115,11 @@ jobs:
           file: Dockerfile.provider
           build-args: |
             PROVIDER_NAME=${{ matrix.crate }}
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:${{ env.VERSION }}
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:latest
           annotations: |
             mt.query.plugin.type=extism
-          outputs: type=registry,oci-mediatypes=true
+          outputs: |
+            type=registry,\
+        name=ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:${{ env.VERSION }},\
+        name=ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:latest,\
+        push=true,\
+        oci-mediatypes=true
