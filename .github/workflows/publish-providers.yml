@@ -109,7 +109,7 @@ jobs:
 
       - name: Build & push Docker image
         if: matrix.crate != 'noop'
-        uses: docker/build-push-action@v4
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.provider
