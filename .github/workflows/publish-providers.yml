@@ -117,9 +117,4 @@ jobs:
             PROVIDER_NAME=${{ matrix.crate }}
           annotations: |
             mt.query.plugin.type=extism
-          outputs: |
-            type=registry,\
-            name=ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:${{ env.VERSION }},\
-            name=ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:latest,\
-            push=true,\
-            oci-mediatypes=true
+          outputs: type=registry,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:${{ env.VERSION }},name=ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:latest,push=true,oci-mediatypes=true
