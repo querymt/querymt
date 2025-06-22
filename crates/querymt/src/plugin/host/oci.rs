@@ -13,13 +13,14 @@ use sigstore::errors::SigstoreVerifyConstraintsError;
 use sigstore::registry::{Auth, OciReference};
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 use sigstore::trust::{ManualTrustRoot, TrustRoot};
-use std::collections::BTreeMap;
 use std::env::consts::{ARCH, OS};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::error::LLMError;
 
 use super::{PluginType, ProviderPlugin};
 
@@ -263,27 +264,6 @@ async fn verify_image_signature(
     }
 }
 
-fn get_type_from_annotations(
-    annotations: &Option<BTreeMap<String, String>>,
-) -> anyhow::Result<PluginType> {
-    if let Some(ann) = annotations {
-        if let Some(plugin_type) = ann.get(PLUGIN_TYPE_ANNOTATION) {
-            return match plugin_type.as_str() {
-                "extism" => Ok(PluginType::Wasm),
-                "native" => Ok(PluginType::Native),
-                _ => Err(
-                    anyhow::anyhow!("Unknown plugin type in annotation: {}", plugin_type).into(),
-                ),
-            };
-        }
-    }
-    Err(anyhow::anyhow!(
-        "Image is missing the required annotation: '{}'",
-        PLUGIN_TYPE_ANNOTATION
-    )
-    .into())
-}
-
 async fn extract_file_and_content(
     client: &Client,
     reference: &Reference,
@@ -291,35 +271,45 @@ async fn extract_file_and_content(
     filename: Option<&str>,
 ) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
     for layer in &image_manifest.layers {
-        let mut buf = Vec::new();
-        client.pull_blob(reference, layer, &mut buf).await?;
-
-        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&buf[..]));
-        for entry_result in archive.entries()? {
-            let mut entry = entry_result?;
-
-            if !entry.header().entry_type().is_file() {
-                continue; // Skip directories, symlinks, etc.
+        match layer.media_type.as_str() {
+            "application/vnd.wasm.v1.layer+wasm" => {
+                log::debug!("Found a Wasm layer. Treating blob as raw content.");
+                let mut wasm_bytes = Vec::new();
+                client.pull_blob(reference, layer, &mut wasm_bytes).await?;
+                let filename = filename.unwrap_or("plugin.wasm").to_string();
+                return Ok((filename, wasm_bytes));
             }
+            "application/vnd.oci.image.layer.v1.tar+gzip" => {
+                log::debug!("Found a standard .tar.gzip layer. Extracting...");
+                let mut buf = Vec::new();
+                client.pull_blob(reference, layer, &mut buf).await?;
 
-            let path = entry.path()?.to_string_lossy().to_string();
-            // Get just the filename from the path inside the tarball.
-            let current_filename = Path::new(&path)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
+                let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&buf[..]));
+                for entry_result in archive.entries()? {
+                    let mut entry = entry_result?;
+                    if entry.header().entry_type().is_file() {
+                        let path = entry.path()?.to_string_lossy().to_string();
+                        let current_filename = Path::new(&path)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy();
 
-            let matches = match filename {
-                // Case 1: We are looking for a specific file.
-                Some(target_name) => current_filename == target_name,
-                // Case 2: Auto-discovery. Any file is a match.
-                None => true,
-            };
+                        let matches = match filename {
+                            Some(target_name) => current_filename == target_name,
+                            None => true, // Auto-discovery case
+                        };
 
-            if matches {
-                let mut content = Vec::new();
-                entry.read_to_end(&mut content)?;
-                return Ok((current_filename.to_string(), content));
+                        if matches {
+                            let mut content = Vec::new();
+                            entry.read_to_end(&mut content)?;
+                            return Ok((current_filename.to_string(), content));
+                        }
+                    }
+                }
+            }
+            unknown_type => {
+                log::debug!("Ignoring unknown layer media type: {}", unknown_type);
+                continue;
             }
         }
     }
@@ -353,6 +343,35 @@ fn load_from_cache(
         plugin_type,
         file_path: blob_path.to_path_buf(),
     })
+}
+
+/// The heuristic logic for determining plugin type from a manifest.
+fn determine_plugin_type(image_manifest: &OciImageManifest) -> Result<PluginType, LLMError> {
+    for layer in &image_manifest.layers {
+        if layer.media_type == "application/vnd.wasm.v1.layer+wasm" {
+            return Ok(PluginType::Wasm);
+        }
+    }
+
+    if let Some(annotations) = &image_manifest.annotations {
+        if let Some(plugin_type_str) = annotations.get(PLUGIN_TYPE_ANNOTATION) {
+            return match plugin_type_str.as_str() {
+                "extism" => Ok(PluginType::Wasm),
+                "native" => Ok(PluginType::Native),
+                _ => todo!(),
+            };
+        }
+    }
+
+    for layer in &image_manifest.layers {
+        if layer.media_type == "application/vnd.oci.image.layer.v1.tar+gzip" {
+            return Ok(PluginType::Native);
+        }
+    }
+
+    Err(LLMError::PluginError(
+        "Could not determine plugin type from manifest layers or annotations.".into(),
+    ))
 }
 
 #[derive(Default, Deserialize, Debug, Clone)]
@@ -492,13 +511,13 @@ impl OciDownloader {
                 match live_manifest {
                     OciManifest::Image(img) => {
                         log::debug!("Found a single image manifest.");
-                        discovered_type = get_type_from_annotations(&img.annotations)?;
+                        discovered_type = determine_plugin_type(&img)?;
                         image_manifest = img;
                     }
                     OciManifest::ImageIndex(index) => {
                         log::debug!("Found a multi-platform image index.");
 
-                        let target_platform = Platform {
+                        let native_platform = Platform {
                             os: OS.into(),
                             architecture: ARCH.into(),
                             os_version: None,
@@ -508,20 +527,57 @@ impl OciDownloader {
                         };
                         log::debug!(
                             "Searching for platform: {}/{}",
-                            target_platform.os,
-                            target_platform.architecture
+                            native_platform.os,
+                            native_platform.architecture
                         );
 
-                        // Find the descriptor for our target platform
-                        let manifest_descriptor = index
+                        let maybe_descriptor = index
                             .manifests
                             .iter()
-                            .find(|m| m.platform.as_ref() == Some(&target_platform))
-                            .ok_or_else(|| format!("No manifest found for platform {OS}/{ARCH}"))?;
+                            .find(|m| m.platform.as_ref() == Some(&native_platform));
 
-                        // The annotation is on the DESCRIPTOR within the index
-                        discovered_type =
-                            get_type_from_annotations(&manifest_descriptor.annotations)?;
+                        let manifest_descriptor;
+
+                        if let Some(descriptor) = maybe_descriptor {
+                            log::debug!(
+                                "Native version found. Using digest: {}",
+                                descriptor.digest
+                            );
+                            manifest_descriptor = descriptor;
+                            discovered_type = PluginType::Native;
+                        } else {
+                            log::debug!(
+                                "Native version not found. Checking for wasi/wasm fallback..."
+                            );
+
+                            let wasm_platform = Platform {
+                                os: "wasi".to_string(),
+                                architecture: "wasm".to_string(),
+                                os_version: None,
+                                os_features: None,
+                                variant: None,
+                                features: None,
+                            };
+
+                            let maybe_wasm_descriptor = index
+                                .manifests
+                                .iter()
+                                .find(|m| m.platform.as_ref() == Some(&wasm_platform));
+
+                            if let Some(descriptor) = maybe_wasm_descriptor {
+                                log::debug!(
+                                    "Wasm fallback found. Using digest: {}",
+                                    descriptor.digest
+                                );
+                                manifest_descriptor = descriptor;
+                                discovered_type = PluginType::Wasm;
+                            } else {
+                                // --- Failure Case: Neither native nor Wasm was found ---
+                                return Err(format!("Image index contains no manifest for the host platform ({}/{}) and no wasi/wasm fallback was found.",
+                                    OS, ARCH
+                                ).into());
+                            }
+                        }
 
                         let manifest_reference =
                             reference.clone_with_digest(manifest_descriptor.digest.clone());

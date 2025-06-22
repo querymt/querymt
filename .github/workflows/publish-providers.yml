@@ -99,29 +99,44 @@ jobs:
                 | head -n1 | cut -d'"' -f2)
           echo "VERSION=$v" >> $GITHUB_ENV
 
-      - name: Set up Docker Buildx
+      - name: Set up Rust toolchain
         if: matrix.crate != 'noop'
-        uses: docker/setup-buildx-action@v3
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: wasm32-wasip1
+
+      - name: Build Wasm binary
+        if: matrix.crate != 'noop'
+        run: cargo build -p qmt-${{ matrix.crate }} --release --target wasm32-wasip1
 
       - name: Log in to GHCR
         if: matrix.crate != 'noop'
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push Docker image
+      - name: Install Oras CLI
         if: matrix.crate != 'noop'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.provider
-          build-args: |
-            PROVIDER_NAME=${{ matrix.crate }}
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:latest
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:${{ env.VERSION }}
-          annotations: |
-            mt.query.plugin.type=extism
-          outputs: type=registry,oci-mediatypes=true
+        uses: oras-project/setup-oras@v1
+
+      - name: Create Wasm OCI config file
+        if: matrix.crate != 'noop'
+        run: echo '{}' > wasm-config.json
+
+      - name: Push Wasm artifact to GHCR with Oras
+        if: matrix.crate != 'noop'
+        run: |
+          IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}"
+
+          echo "Pushing Wasm artifact to ${IMAGE_BASE} with tags ${{ env.VERSION }} and latest"
+
+          cp "target/wasm32-wasip1/release/qmt_${{ matrix.crate }}.wasm" "plugin.wasm"
+
+          oras push "${IMAGE_BASE}:${{ env.VERSION }},latest" \
+            --config wasm-config.json:application/vnd.wasm.v1.config+json \
+            --annotation "mt.query.plugin.type=extism" \
+            --annotation "org.opencontainers.image.version=${{ env.VERSION }}" \
+            plugin.wasm:application/vnd.wasm.v1.layer+wasm
