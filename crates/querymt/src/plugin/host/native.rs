@@ -11,6 +11,34 @@ use libloading::Library;
 use std::path::Path;
 use std::sync::Arc;
 
+struct NativeFactoryWrapper {
+    factory_impl: Box<dyn LLMProviderFactory>,
+    _library: Arc<Library>, // The underscore indicates we hold it just for its lifetime
+}
+
+// Manually implement the trait for your wrapper
+impl LLMProviderFactory for NativeFactoryWrapper {
+    fn name(&self) -> &str {
+        self.factory_impl.name()
+    }
+    fn config_schema(&self) -> serde_json::Value {
+        self.factory_impl.config_schema()
+    }
+    fn from_config(
+        &self,
+        cfg: &serde_json::Value,
+    ) -> Result<Box<dyn crate::LLMProvider>, LLMError> {
+        self.factory_impl.from_config(cfg)
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        cfg: &serde_json::Value,
+    ) -> crate::plugin::Fut<'a, Result<Vec<String>, LLMError>> {
+        self.factory_impl.list_models(cfg)
+    }
+}
+
 pub struct NativeLoader;
 
 #[async_trait]
@@ -41,10 +69,11 @@ impl NativeLoader {
         name: &str,
         path: &Path,
     ) -> Result<Arc<dyn LLMProviderFactory>, LLMError> {
-        let lib =
-            unsafe { Library::new(path).map_err(|e| LLMError::PluginError(format!("{:#}", e)))? };
+        let lib = unsafe {
+            Arc::new(Library::new(path).map_err(|e| LLMError::PluginError(format!("{:#}", e)))?)
+        };
 
-        let factory: Arc<dyn LLMProviderFactory> = unsafe {
+        let factory: Box<dyn LLMProviderFactory> = unsafe {
             if let Ok(async_ctor) = lib.get::<FactoryCtor>(b"plugin_factory") {
                 let raw = async_ctor();
                 if raw.is_null() {
@@ -53,7 +82,7 @@ impl NativeLoader {
                         path.display()
                     )));
                 }
-                Arc::from_raw(raw)
+                Box::from_raw(raw)
             } else if let Ok(sync_ctor) = lib.get::<HTTPFactoryCtor>(b"plugin_http_factory") {
                 let raw: *mut dyn HTTPLLMProviderFactory = sync_ctor();
                 if raw.is_null() {
@@ -64,7 +93,7 @@ impl NativeLoader {
                 }
                 let sync_fact: Box<dyn HTTPLLMProviderFactory> = Box::from_raw(raw);
                 let async_fact = HTTPFactoryAdapter::new(Arc::from(sync_fact));
-                Arc::new(async_fact)
+                Box::new(async_fact)
             } else {
                 return Err(LLMError::PluginError(format!(
                     "no plugin_factory or plugin_http_factory in {}",
@@ -82,9 +111,9 @@ impl NativeLoader {
                 factory_name
             );
         }
-
-        // The library must remain loaded for the duration of the program.
-        std::mem::forget(lib);
-        Ok(factory)
+        Ok(Arc::new(NativeFactoryWrapper {
+            factory_impl: factory,
+            _library: Arc::clone(&lib),
+        }))
     }
 }
