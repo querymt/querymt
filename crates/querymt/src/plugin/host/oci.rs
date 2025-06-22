@@ -1,3 +1,4 @@
+use crate::error::LLMError;
 use anyhow::anyhow;
 use docker_credential::{CredentialRetrievalError, DockerCredential};
 use oci_client::manifest::{OciImageManifest, OciManifest, Platform};
@@ -19,8 +20,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use crate::error::LLMError;
 
 use super::{PluginType, ProviderPlugin};
 
@@ -268,57 +267,54 @@ async fn extract_file_and_content(
     client: &Client,
     reference: &Reference,
     image_manifest: &OciImageManifest,
+    plugin_type: PluginType,
     filename: Option<&str>,
 ) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
-    for layer in &image_manifest.layers {
-        match layer.media_type.as_str() {
-            "application/vnd.wasm.v1.layer+wasm" => {
-                log::debug!("Found a Wasm layer. Treating blob as raw content.");
-                let mut wasm_bytes = Vec::new();
-                client.pull_blob(reference, layer, &mut wasm_bytes).await?;
-                let filename = filename.unwrap_or("plugin.wasm").to_string();
-                return Ok((filename, wasm_bytes));
+    match plugin_type {
+        PluginType::Wasm => {
+            // Find the wasm layer and extract it.
+            for layer in &image_manifest.layers {
+                if layer.media_type == "application/vnd.wasm.v1.layer+wasm" {
+                    let mut wasm_bytes = Vec::new();
+                    client.pull_blob(reference, layer, &mut wasm_bytes).await?;
+                    let filename = filename.unwrap_or("plugin.wasm").to_string();
+                    return Ok((filename, wasm_bytes));
+                }
             }
-            "application/vnd.oci.image.layer.v1.tar+gzip" => {
-                log::debug!("Found a standard .tar.gzip layer. Extracting...");
-                let mut buf = Vec::new();
-                client.pull_blob(reference, layer, &mut buf).await?;
+            Err("Wasm plugin type was determined, but no Wasm layer was found.".into())
+        }
+        PluginType::Native => {
+            // Find the native tarball layer and extract the file from it.
+            for layer in &image_manifest.layers {
+                if layer.media_type == "application/vnd.oci.image.layer.v1.tar+gzip" {
+                    let mut buf = Vec::new();
+                    client.pull_blob(reference, layer, &mut buf).await?;
+                    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&buf[..]));
 
-                let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&buf[..]));
-                for entry_result in archive.entries()? {
-                    let mut entry = entry_result?;
-                    if entry.header().entry_type().is_file() {
-                        let path = entry.path()?.to_string_lossy().to_string();
-                        let current_filename = Path::new(&path)
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
+                    for entry_result in archive.entries()? {
+                        let mut entry = entry_result?;
+                        if entry.header().entry_type().is_file() {
+                            let path = entry.path()?.to_string_lossy().to_string();
+                            let current_filename = Path::new(&path)
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy();
 
-                        let matches = match filename {
-                            Some(target_name) => current_filename == target_name,
-                            None => true, // Auto-discovery case
-                        };
+                            let matches =
+                                filename.map_or(true, |target| current_filename == target);
 
-                        if matches {
-                            let mut content = Vec::new();
-                            entry.read_to_end(&mut content)?;
-                            return Ok((current_filename.to_string(), content));
+                            if matches {
+                                let mut content = Vec::new();
+                                entry.read_to_end(&mut content)?;
+                                return Ok((current_filename.to_string(), content));
+                            }
                         }
                     }
                 }
             }
-            unknown_type => {
-                log::debug!("Ignoring unknown layer media type: {}", unknown_type);
-                continue;
-            }
+            Err("Native plugin type was determined, but no .tar.gzip layer was found.".into())
         }
     }
-
-    let error_message = match filename {
-        Some(name) => format!("Could not find the specified file '{}' in any layer.", name),
-        None => "Auto-discovery failed: No files found in any layer.".to_string(),
-    };
-    Err(error_message.into())
 }
 
 fn get_blob_path(cache_root: &Path, digest: &str, filename: &str) -> PathBuf {
@@ -596,6 +592,7 @@ impl OciDownloader {
                     &client,
                     &reference,
                     &image_manifest,
+                    discovered_type,
                     target_file_path,
                 )
                 .await?;
