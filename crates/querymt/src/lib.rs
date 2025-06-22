@@ -46,6 +46,8 @@ pub mod outbound;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
+pub mod model;
+
 pub mod plugin;
 
 pub mod tool_decorator;

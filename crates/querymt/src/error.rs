@@ -48,17 +48,20 @@ pub enum LLMError {
     /// Handles standard I/O errors.
     #[error("I/O Error")]
     IoError(#[from] std::io::Error),
+
+    #[error("Failed to parse YAML: {0}")]
+    YamlParse(#[from] serde_yml::Error),
 }
 
 #[cfg(feature = "reqwest-client")]
 impl From<reqwest::Error> for LLMError {
     fn from(err: reqwest::Error) -> Self {
-        LLMError::HttpError(err.to_string())
+        LLMError::HttpError(format!("{:#}", err))
     }
 }
 
 impl From<http::Error> for LLMError {
     fn from(err: http::Error) -> Self {
-        LLMError::HttpError(err.to_string())
+        LLMError::HttpError(format!("{:#}", err))
     }
 }
