@@ -62,6 +62,19 @@ fn resolve_provider_and_model(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     let args = CliArgs::parse();
+
+    match querymt::pricing::update_models_pricing_if_stale().await {
+        Ok(true) => {
+            log::info!("Models pricing - downloaded and cached new data");
+        }
+        Ok(false) => {
+            log::info!("Models pricing - using existing cached data");
+        }
+        Err(e) => {
+            log::error!("Failed to update models pricing data: {}", e);
+        }
+    }
+
     let registry = get_provider_registry(&args).await?;
 
     if let Some(cmd) = &args.command {
