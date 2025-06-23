@@ -1,15 +1,14 @@
 [package]
-name = "qmt-anthropic"
+name = "qmt-mrs"
 version = "0.1.0"
 edition = "2021"
 
 [package.metadata.qmt]
-type = "wasm"
+type = "native"
 
 [features]
-default = ["extism"]
+default = ["native"]
 native = ["querymt"]
-extism = ["extism-pdk", "querymt", "querymt/extism_plugin"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -18,8 +17,9 @@ crate-type = ["cdylib", "rlib"]
 querymt = { path = "../../querymt", default-features = false, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-base64 = { workspace = true }
 url = { workspace = true }
-http = { workspace = true }
 schemars = { workspace = true }
-extism-pdk = { workspace = true, optional = true }
+futures = { workspace = true }
+mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs.git", tag = "v0.6.0", features = ["metal"]}
+async-trait = { workspace = true }
+tokio = { version = "1", features = ["full"] }

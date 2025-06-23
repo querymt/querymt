@@ -3,6 +3,9 @@ name = "qmt-openrouter"
 version = "0.1.0"
 edition = "2021"
 
+[package.metadata.qmt]
+type = "wasm"
+
 [features]
 default = ["extism"]
 native = ["querymt"]

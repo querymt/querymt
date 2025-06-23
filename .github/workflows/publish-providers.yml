@@ -3,8 +3,7 @@ name: Build & Publish Provider Plugins
 on:
   push:
     branches: [ main ]
-    # (optional) add:
-    # tags: [ 'v*.*.*' ]
+    tags: [ 'v*.*.*' ]
   workflow_dispatch:
 
 permissions:
@@ -15,7 +14,8 @@ jobs:
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.compute.outputs.matrix }}
+      matrix_wasm: ${{ steps.compute.outputs.matrix_wasm }}
+      matrix_native: ${{ steps.compute.outputs.matrix_native }}
 
     steps:
       - name: Check out full history
@@ -32,27 +32,18 @@ jobs:
           # all subfolders under crates/providers
           mapfile -t ALL < <(find crates/providers -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
 
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            PROVIDERS=( "${ALL[@]}" )
-          # if this is the very first commit (BASE is all zeros), rebuild everything
-          elif [[ "$BASE" == "0000000000000000000000000000000000000000" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" || "$BASE" == "0000000000000000000000000000000000000000" ]]; then
             PROVIDERS=( "${ALL[@]}" )
           else
-            # list changed files between BASE and HEAD
             CHANGED=$(git diff --name-only $BASE $HEAD)
-
             PROVIDERS=()
             for f in $CHANGED; do
-              # if the querymt library changed, rebuild/test all plugins
               if [[ $f =~ ^crates/querymt/ ]]; then
                 PROVIDERS=( "${ALL[@]}" )
                 break
               fi
-
-              # if a provider crate changed, pick it up
               if [[ $f =~ ^crates/providers/([^/]+)/ ]]; then
                 name=${BASH_REMATCH[1]}
-                # de-dup
                 if [[ ! " ${PROVIDERS[*]} " =~ " $name " ]]; then
                   PROVIDERS+=( "$name" )
                 fi
@@ -61,54 +52,195 @@ jobs:
           fi
 
           if [ ${#PROVIDERS[@]} -eq 0 ]; then
-            PROVIDERS=( "noop" )
+            echo "matrix_wasm={\"include\":[{\"crate\":\"noop\"}]}" >> $GITHUB_OUTPUT
+            echo "matrix_native={\"include\":[{\"crate\":\"noop\"}]}" >> $GITHUB_OUTPUT
+            echo "✅ No plugin crates to build."
+            exit 0
           fi
 
-          echo "Final plugin list: ${PROVIDERS[*]}"
+          echo "Changed/selected plugins: ${PROVIDERS[*]}"
 
-          # format as JSON list for the matrix
-          entries=()
+          wasm_entries=()
+          native_entries=()
           for p in "${PROVIDERS[@]}"; do
-            entries+=( "{\"crate\":\"$p\"}" )
-          done
-          # note: join on commas, not spaces
-          joined=$(IFS=, ; echo "${entries[*]}")
-          matrix="{\"include\":[${joined}]}"
-          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+            # Read the provider type from its Cargo.toml, defaulting to "wasm" for backward compatibility
+            type=$(grep -A 2 '\[package.metadata.qmt\]' "crates/providers/$p/Cargo.toml" | grep 'type' | cut -d'"' -f2 || echo "wasm")
 
-  publish-plugins:
+            echo "Provider '$p' is of type '$type'"
+            if [[ "$type" == "native" ]]; then
+              native_entries+=( "{\"crate\":\"$p\"}" )
+            else
+              wasm_entries+=( "{\"crate\":\"$p\"}" )
+            fi
+          done
+
+          # Format WASM matrix
+          if [ ${#wasm_entries[@]} -eq 0 ]; then wasm_entries+=( "{\"crate\":\"noop\"}" ); fi
+          joined_wasm=$(IFS=, ; echo "${wasm_entries[*]}")
+          matrix_wasm="{\"include\":[${joined_wasm}]}"
+          echo "matrix_wasm=$matrix_wasm" >> $GITHUB_OUTPUT
+          echo "Wasm matrix: $matrix_wasm"
+
+          # Format NATIVE matrix
+          if [ ${#native_entries[@]} -eq 0 ]; then native_entries+=( "{\"crate\":\"noop\"}" ); fi
+          joined_native=$(IFS=, ; echo "${native_entries[*]}")
+          matrix_native="{\"include\":[${joined_native}]}"
+          echo "matrix_native=$matrix_native" >> $GITHUB_OUTPUT
+          echo "Native matrix: $matrix_native"
+
+  build-and-publish-wasm:
     needs: detect-changes
+    if: needs.detect-changes.outputs.matrix_wasm != '{"include":[{"crate":"noop"}]}'
     runs-on: ubuntu-latest
     strategy:
-      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix_wasm) }}
 
     steps:
-      - name: No crates changed
-        if: matrix.crate == 'noop'
-        run: echo "✅ No plugin crates to build—skipping."
-
       - name: Check out code
-        if: matrix.crate != 'noop'
         uses: actions/checkout@v3
 
       - name: Read crate version
-        if: matrix.crate != 'noop'
         id: get-version
         run: |
-          v=$(grep '^version' crates/providers/${{ matrix.crate }}/Cargo.toml \
-                | head -n1 | cut -d'"' -f2)
+          v=$(grep '^version' crates/providers/${{ matrix.crate }}/Cargo.toml | head -n1 | cut -d'"' -f2)
           echo "VERSION=$v" >> $GITHUB_ENV
 
       - name: Set up Rust toolchain
-        if: matrix.crate != 'noop'
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           target: wasm32-wasip1
 
       - name: Build Wasm binary
-        if: matrix.crate != 'noop'
         run: cargo build -p qmt-${{ matrix.crate }} --release --target wasm32-wasip1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Oras CLI
+        uses: oras-project/setup-oras@v1
+
+      - name: Create Wasm OCI config file
+        run: echo '{}' > wasm-config.json
+
+      - name: Push Wasm artifact to GHCR
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}:${{ env.VERSION }}"
+          echo "Pushing Wasm artifact to ${IMAGE}"
+          cp "target/wasm32-wasip1/release/qmt_${{ matrix.crate }}.wasm" "plugin.wasm"
+          oras push "$IMAGE" \
+            --config wasm-config.json:application/vnd.wasm.v1.config+json \
+            --annotation "mt.query.plugin.type=extism" \
+            --annotation "org.opencontainers.image.version=${{ env.VERSION }}" \
+            plugin.wasm:application/vnd.wasm.v1.layer+wasm
+
+  build-native-platform:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.matrix_native != '{"include":[{"crate":"noop"}]}'
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: ${{ fromJson(needs.detect-changes.outputs.matrix_native) }}
+        platform:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: libqmt_${{ matrix.crate.crate }}.so
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: libqmt_${{ matrix.crate.crate }}.so
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: qmt_${{ matrix.crate.crate }}.dll
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: libqmt_${{ matrix.crate.crate }}.dylib
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: libqmt_${{ matrix.crate.crate }}.dylib
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Read crate version
+        id: get-version
+        run: |
+          v=$(grep '^version' crates/providers/${{ matrix.crate.crate }}/Cargo.toml | head -n1 | cut -d'"' -f2)
+          echo "VERSION=$v" >> $GITHUB_ENV
+
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.platform.target }}
+
+      - name: Set up cross-compilation for Linux aarch64
+        if: runner.os == 'Linux' && matrix.platform.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build Shared Library
+        run: cargo build -p qmt-${{ matrix.crate.crate }} --release --target ${{ matrix.platform.target }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Oras CLI
+        uses: oras-project/setup-oras@v1
+
+      - name: Push Native Platform Artifact to GHCR
+        run: |
+          ARCH=$(echo ${{ matrix.platform.target }} | cut -d'-' -f1)
+          OS_NAME=$(echo ${{ matrix.platform.target }} | cut -d'-' -f3)
+          IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/${{ matrix.crate.crate }}"
+          # Platform-specific tag, e.g., 0.1.0-x86_64-unknown-linux-gnu
+          PLATFORM_TAG="${{ env.VERSION }}-${{ matrix.platform.target }}"
+
+          ARTIFACT_PATH="target/${{ matrix.platform.target }}/release/${{ matrix.platform.artifact_name }}"
+
+          echo "Pushing native artifact ${ARTIFACT_PATH} to ${IMAGE_BASE}:${PLATFORM_TAG}"
+
+          # Create a platform-specific OCI config
+          echo '{"os":"'${OS_NAME}'", "architecture":"'${ARCH}'"}' > config.json
+
+          oras push "${IMAGE_BASE}:${PLATFORM_TAG}" \
+            --config config.json:application/vnd.oci.image.config.v1+json \
+            "${ARTIFACT_PATH}:application/vnd.qmt.plugin.v1.native.c-sharedlib"
+
+  publish-native-manifest:
+    needs: build-native-platform
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix_native) }}
+
+    steps:
+      - name: No-op
+        if: matrix.crate == 'noop'
+        run: echo "No native crates to publish."
+
+      - name: Read crate version
+        if: matrix.crate != 'noop'
+        uses: actions/checkout@v3 # Checkout is needed to read the version
+        with:
+          sparse-checkout: |
+            crates/providers/${{ matrix.crate }}/Cargo.toml
+      - run: |
+          v=$(grep '^version' crates/providers/${{ matrix.crate }}/Cargo.toml | head -n1 | cut -d'"' -f2)
+          echo "VERSION=$v" >> $GITHUB_ENV
+        if: matrix.crate != 'noop'
 
       - name: Log in to GHCR
         if: matrix.crate != 'noop'
@@ -122,21 +254,30 @@ jobs:
         if: matrix.crate != 'noop'
         uses: oras-project/setup-oras@v1
 
-      - name: Create Wasm OCI config file
-        if: matrix.crate != 'noop'
-        run: echo '{}' > wasm-config.json
-
-      - name: Push Wasm artifact to GHCR with Oras
+      - name: Push Multi-Arch Manifest
         if: matrix.crate != 'noop'
         run: |
           IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}"
+          VERSION_TAG="${IMAGE_BASE}:${{ env.VERSION }}"
+          LATEST_TAG="${IMAGE_BASE}:latest"
 
-          echo "Pushing Wasm artifact to ${IMAGE_BASE} with tags ${{ env.VERSION }} and latest"
+          # List all the platform-specific images we just pushed
+          PLATFORM_IMAGES=(
+            "${IMAGE_BASE}:${{ env.VERSION }}-x86_64-unknown-linux-gnu"
+            "${IMAGE_BASE}:${{ env.VERSION }}-aarch64-unknown-linux-gnu"
+            "${IMAGE_BASE}:${{ env.VERSION }}-x86_64-pc-windows-msvc"
+            "${IMAGE_BASE}:${{ env.VERSION }}-x86_64-apple-darwin"
+            "${IMAGE_BASE}:${{ env.VERSION }}-aarch64-apple-darwin"
+          )
 
-          cp "target/wasm32-wasip1/release/qmt_${{ matrix.crate }}.wasm" "plugin.wasm"
+          echo "Creating manifest ${VERSION_TAG} pointing to:"
+          printf "  %s\n" "${PLATFORM_IMAGES[@]}"
 
-          oras push "${IMAGE_BASE}:${{ env.VERSION }},latest" \
-            --config wasm-config.json:application/vnd.wasm.v1.config+json \
-            --annotation "mt.query.plugin.type=extism" \
-            --annotation "org.opencontainers.image.version=${{ env.VERSION }}" \
-            plugin.wasm:application/vnd.wasm.v1.layer+wasm
+          # Create the version-specific manifest list
+          oras manifest push "$VERSION_TAG" ${PLATFORM_IMAGES[@]}
+
+          # Also tag it as 'latest' if this is a push to the main branch
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "Creating manifest ${LATEST_TAG}"
+            oras manifest push "$LATEST_TAG" ${PLATFORM_IMAGES[@]}
+          fi
