@@ -49,8 +49,9 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
+    get_env_var,
     plugin::HTTPLLMProviderFactory,
-    pricing::{get_model_pricing, Pricing},
+    pricing::{calculate_cost, ModelsPricingData, Pricing},
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
 };
 use schemars::{schema_for, JsonSchema};
@@ -676,6 +677,16 @@ impl HTTPChatProvider for Google {
         let json_resp: Result<GoogleChatResponse, serde_json::Error> =
             serde_json::from_slice(&resp.body());
 
+        // TODO: Cleanup before finish PR
+        let json_resp2: Result<GoogleChatResponse, serde_json::Error> =
+            serde_json::from_slice(&resp.clone().body());
+
+        let p = calculate_cost(
+            json_resp2.unwrap().usage().unwrap(),
+            get_pricing(&self.model, false).unwrap(),
+        );
+
+        println!("[google calculated cost] -> {}", p);
         match json_resp {
             Ok(response) => Ok(Box::new(response)),
             Err(e) => {
@@ -819,84 +830,63 @@ impl HTTPLLMProviderFactory for GoogleFactory {
     }
 }
 
-pub async fn google_get_model_pricing(model_name: &str, is_thinking: bool) -> Option<Pricing> {
-    let model_name = match model_name {
-        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.0-flash
-        "gemini-2.0-flash" | "gemini-2.0-flash-exp" => "gemini-2.0-flash-001",
-        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.0-flash-lite
-        "gemini-2.0-flash-lite" => "gemini-2.0-flash-lite-001",
+fn get_pricing(model: &str, thinking: bool) -> Option<Pricing> {
+    if let Some(models) = get_env_var!("MODEL_PRICING_DATA") {
+        if let Ok(models) = serde_json::from_str::<ModelsPricingData>(&models) {
+            let model = match model {
+                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.0-flash
+                "gemini-2.0-flash" | "gemini-2.0-flash-exp" => "gemini-2.0-flash-001",
+                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.0-flash-lite
+                "gemini-2.0-flash-lite" => "gemini-2.0-flash-lite-001",
 
-        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-1.5-flash
-        "gemini-1.5-flash-latest"
-        | "gemini-1.5-flash"
-        | "gemini-1.5-flash-001"
-        | "gemini-1.5-flash-002" => "gemini-flash-1.5",
-        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-1.5-flash-8b
-        "gemini-1.5-flash-8b-latest" | "gemini-1.5-flash-8b" | "gemini-1.5-flash-8b-001" => {
-            "gemini-flash-1.5-8b"
+                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-1.5-flash
+                "gemini-1.5-flash-latest"
+                | "gemini-1.5-flash"
+                | "gemini-1.5-flash-001"
+                | "gemini-1.5-flash-002" => "gemini-flash-1.5",
+                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-1.5-flash-8b
+                "gemini-1.5-flash-8b-latest"
+                | "gemini-1.5-flash-8b"
+                | "gemini-1.5-flash-8b-001" => "gemini-flash-1.5-8b",
+                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-1.5-pro
+                "gemini-1.5-pro-latest"
+                | "gemini-1.5-pro"
+                | "gemini-1.5-pro-001"
+                | "gemini-1.5-pro-002" => "gemini-pro-1.5",
+                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.5-pro-preview-05-06
+                "gemini-2.5-pro-preview-05-06" => "gemini-2.5-pro-preview",
+                "gemini-2.5-pro-preview-03-25" => "gemini-2.5-pro-exp-03-25",
+                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.5-flash-preview
+                "gemini-2.5-flash-preview" => {
+                    if thinking {
+                        "gemini-2.5-flash-preview:thinking"
+                    } else {
+                        "gemini-2.5-flash-preview"
+                    }
+                }
+
+                "gemini-2.5-flash-preview-05-20" => {
+                    if thinking {
+                        "gemini-2.5-flash-preview-05-20:thinking"
+                    } else {
+                        "gemini-2.5-flash-preview-05-20"
+                    }
+                }
+                _ => model,
+            };
+
+            let model = format!("google/{}", model);
+
+            return models
+                .data
+                .iter()
+                .find(|m| m.id == model)
+                .map(|m| m.pricing.clone());
         }
-        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-1.5-pro
-        "gemini-1.5-pro-latest"
-        | "gemini-1.5-pro"
-        | "gemini-1.5-pro-001"
-        | "gemini-1.5-pro-002" => "gemini-pro-1.5",
-        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.5-pro-preview-05-06
-        "gemini-2.5-pro-preview-05-06" => "gemini-2.5-pro-preview",
-        "gemini-2.5-pro-preview-03-25" => "gemini-2.5-pro-exp-03-25",
-        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.5-flash-preview
-        "gemini-2.5-flash-preview" => {
-            if is_thinking {
-                "gemini-2.5-flash-preview:thinking"
-            } else {
-                "gemini-2.5-flash-preview"
-            }
-        }
-
-        "gemini-2.5-flash-preview-05-20" => {
-            if is_thinking {
-                "gemini-2.5-flash-preview-05-20:thinking"
-            } else {
-                "gemini-2.5-flash-preview-05-20"
-            }
-        }
-        _ => model_name,
-    };
-
-    get_model_pricing(format!("google/{}", model_name).as_str()).await
-}
-
-/// Calculates the cost of using a Google model based on input and output tokens.
-///
-/// # Arguments
-/// * `model_name` - The name of the Google model (e.g., "gpt-4o").
-/// * `input_tokens` - The number of input tokens.
-/// * `output_tokens` - The number of output tokens.
-///
-/// # Returns
-/// * `Some(f64)` - The total cost in dollars, calculated per million tokens.
-/// * `None` - If the model name is not recognized.
-///
-/// # Examples
-/// ```
-/// let cost = google_calculate_token_cost("gpt-4o", 1000, 500);
-/// ```
-pub async fn google_calculate_token_cost(
-    model_name: &str,
-    input_tokens: u64,
-    output_tokens: u64,
-    is_thinking: bool,
-) -> Option<f64> {
-    if let Some(pricing) = google_get_model_pricing(model_name, is_thinking).await {
-        Some({
-            let input_cost = input_tokens as f64 * pricing.prompt;
-            let output_cost = output_tokens as f64 * pricing.completion;
-
-            input_cost + output_cost
-        })
-    } else {
-        None
     }
+    None
 }
+
 #[cfg(feature = "native")]
 #[no_mangle]
 pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {

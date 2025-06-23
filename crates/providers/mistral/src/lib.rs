@@ -1,4 +1,3 @@
-use either::*;
 use http::{
     header::{AUTHORIZATION, CONTENT_TYPE},
     Method, Request, Response,
@@ -15,6 +14,7 @@ use querymt::{
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     plugin::HTTPLLMProviderFactory,
+    pricing::{calculate_cost, Pricing},
     HTTPLLMProvider, LLMProvider, ToolCall,
 };
 use schemars::{schema_for, JsonSchema};
@@ -154,7 +154,18 @@ impl HTTPChatProvider for Mistral {
         openai_chat_request(self, messages, tools)
     }
 
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(
+        &self,
+        response: Response<Vec<u8>>,
+    ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
+        // TODO: Cleanup before finish PR
+        let x = openai_parse_chat(self, response.clone());
+        let p = calculate_cost(
+            x.unwrap().usage().unwrap(),
+            get_pricing(&self.model, false).unwrap(),
+        );
+        println!("[mistral calculated cost] -> {}", p);
+
         openai_parse_chat(self, response)
     }
 }
@@ -210,6 +221,21 @@ impl HTTPCompletionProvider for Mistral {
 
         let json_resp: Result<MistralCompletionResponse, serde_json::Error> =
             serde_json::from_slice(&resp.body());
+
+        let json_resp2: Result<MistralCompletionResponse, serde_json::Error> =
+            serde_json::from_slice(&resp.body());
+
+        let comp = CompletionResponse {
+            text: json_resp2.unwrap().choices[0].message.content.clone(),
+        };
+
+        let p = calculate_cost(
+            comp.usage().unwrap(),
+            get_pricing(&self.model, false).unwrap(),
+        );
+
+        println!("[calculated cost] -> {}", p);
+
         match json_resp {
             Ok(completion_response) => Ok(CompletionResponse {
                 text: completion_response.choices[0].message.content.clone(), // FIXME
@@ -229,6 +255,165 @@ impl Mistral {
     fn default_base_url() -> Url {
         Url::parse("https://api.mistral.ai/v1/").unwrap()
     }
+}
+
+fn get_pricing(model: &str, thinking: bool) -> Option<Pricing> {
+    // NOTE: thinking, don't have effect for mistrla models as for now.
+    // NOTE: On OpenRouter not all models priced in the same way for MistralAI as in direct API, so
+    // prices can differ if using data from OpenRouter.
+    Some(match model {
+        "mistral-medium"
+        | "mistral-medium-2505"
+        | "mistral-medium-2312"
+        | "mistral-medium-latest" => Pricing {
+            prompt: 0.0000004,
+            completion: 0.000002,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "magistral-medium" | "magistral-medium-2506" | "magistral-medium-latest" => Pricing {
+            prompt: 0.000002,
+            completion: 0.000005,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "codestral" | "codestral-latest" | "codestral-2501" | "codestral-2412"
+        | "codestral-2411-rc5" | "codestral-2405" => Pricing {
+            prompt: 0.0000003,
+            completion: 0.0000009,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "mistral-saba" | "mistral-saba-2502" | "mistral-saba-latest" => Pricing {
+            prompt: 0.0000002,
+            completion: 0.0000006,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "mistral-large"
+        | "mistral-large-2411"
+        | "mistral-large-latest"
+        | "mistral-large-2407"
+        | "mistral-large-2402" => Pricing {
+            prompt: 0.000002,
+            completion: 0.000006,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "pixtral-large"
+        | "pixtral-large-2411"
+        | "pixtral-large-latest"
+        | "mistral-large-pixtral-2411" => Pricing {
+            prompt: 0.000002,
+            completion: 0.000006,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "ministral-8b" | "ministral-8b-2410" | "ministral-8b-latest" => Pricing {
+            prompt: 0.0000001,
+            completion: 0.0000001,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "ministral-3b" | "ministral-3b-2410" | "ministral-3b-latest" => Pricing {
+            prompt: 0.00000004,
+            completion: 0.00000004,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "mistral-small"
+        | "mistral-small-latest"
+        | "mistral-small-2503"
+        | "mistral-small-2402"
+        | "mistral-small-2312" => Pricing {
+            prompt: 0.0000001,
+            completion: 0.0000003,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "magistral-small" | "magistral-small-2506" | "magistral-small-latest" => Pricing {
+            prompt: 0.0000005,
+            completion: 0.0000015,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "devstral" | "devstral-small-2505" | "devstral-small-latest" => Pricing {
+            prompt: 0.0000001,
+            completion: 0.0000003,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "pixtral-12b" | "pixtral-12b-2409" | "pixtral-12b-latest" => Pricing {
+            prompt: 0.00000015,
+            completion: 0.00000015,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "mistral-nemo"
+        | "open-mistral-nemo"
+        | "open-mistral-nemo-2407"
+        | "mistral-tiny-2407"
+        | "mistral-tiny-latest" => Pricing {
+            prompt: 0.00000015,
+            completion: 0.00000015,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "mistral-7b" | "open-mistral-7b" | "mistral-tiny" | "mistral-tiny-2312" => Pricing {
+            prompt: 0.00000025,
+            completion: 0.00000025,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        // NOTE: In some places in MistralAI API models alliases assigned to different models,
+        // what might lead to issues whrn some prices are calculated incorrectly.
+        // Model `mistral-small-2312` is used once more above.
+        "mixtral-8x7b" | "open-mixtral-8x7b" /* | "mistral-small-2312" */ => Pricing {
+            prompt: 0.0000007,
+            completion: 0.0000007,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        "mixtral-8x22b" | "open-mixtral-8x22b" | "open-mixtral-8x22b-2404" => Pricing {
+            prompt: 0.000002,
+            completion: 0.000006,
+            request: 0.0,
+            image: 0.0,
+            web_search: 0.0,
+            internal_reasoning: 0.0,
+        },
+        _ => Pricing::default(),
+    })
 }
 
 struct MistralFactory;
