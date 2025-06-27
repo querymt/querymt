@@ -43,7 +43,9 @@ jobs:
       - name: Deploy documentation for main branch
         # This step runs ONLY on a push to the main branch
         if: github.ref == 'refs/heads/main'
-        run: mike deploy --push --update-aliases latest
+        run: |
+          mike deploy --push --update-aliases latest
+          mike set-default --push latest
         working-directory: ./docs
 
       - name: Deploy documentation for tagged release
