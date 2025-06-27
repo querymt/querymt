@@ -71,6 +71,11 @@
     <label class="md-overlay" for="__drawer"></label>
     <div data-md-component="skip">
       
+        
+        <a href="#querymt-command-line-interface-qmt" class="md-skip">
+          Skip to content
+        </a>
+      
     </div>
     <div data-md-component="announce">
       
@@ -1004,6 +1009,21 @@
       <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
       
       
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    CLI
+    
+  </span>
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
       
       <a href="./" class="md-nav__link md-nav__link--active">
         
@@ -1016,6 +1036,262 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#key-features" class="md-nav__link">
+    <span class="md-ellipsis">
+      Key Features
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      Configuration
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#core-commands" class="md-nav__link">
+    <span class="md-ellipsis">
+      Core Commands
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Core Commands">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#chatting-with-llms" class="md-nav__link">
+    <span class="md-ellipsis">
+      Chatting with LLMs
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Chatting with LLMs">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#interactive-mode-repl" class="md-nav__link">
+    <span class="md-ellipsis">
+      Interactive Mode (REPL)
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#single-shot-prompt" class="md-nav__link">
+    <span class="md-ellipsis">
+      Single-Shot Prompt
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#piped-input" class="md-nav__link">
+    <span class="md-ellipsis">
+      Piped Input
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#generating-embeddings" class="md-nav__link">
+    <span class="md-ellipsis">
+      Generating Embeddings
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#managing-configuration-secrets" class="md-nav__link">
+    <span class="md-ellipsis">
+      Managing Configuration &amp; Secrets
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Managing Configuration &amp; Secrets">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#setting-the-default-provider" class="md-nav__link">
+    <span class="md-ellipsis">
+      Setting the Default Provider
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#storing-api-keys" class="md-nav__link">
+    <span class="md-ellipsis">
+      Storing API Keys
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#discovering-providers-models" class="md-nav__link">
+    <span class="md-ellipsis">
+      Discovering Providers &amp; Models
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#examples-advanced-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      Examples &amp; Advanced Usage
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Examples &amp; Advanced Usage">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#specifying-a-provider-and-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      Specifying a Provider and Model
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#using-a-local-model-via-a-proxylocal-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      Using a Local Model via a Proxy/Local Server
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#setting-a-system-prompt" class="md-nav__link">
+    <span class="md-ellipsis">
+      Setting a System Prompt
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#controlling-generation-parameters" class="md-nav__link">
+    <span class="md-ellipsis">
+      Controlling Generation Parameters
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#passing-custom-provider-specific-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      Passing Custom Provider-Specific Options
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#embedding-with-specific-dimensions" class="md-nav__link">
+    <span class="md-ellipsis">
+      Embedding with Specific Dimensions
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#using-tools-via-mcp" class="md-nav__link">
+    <span class="md-ellipsis">
+      Using Tools via MCP
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#command-line-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      Command-Line Reference
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Command-Line Reference">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#global-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      Global Options
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#subcommands" class="md-nav__link">
+    <span class="md-ellipsis">
+      Subcommands
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
       
     </li>
   
@@ -1062,9 +1338,330 @@
   
 
 
-  <h1>CLI</h1>
-
-
+<h1 id="querymt-command-line-interface-qmt">QueryMT Command-Line Interface (qmt)</h1>
+<p>The QueryMT Command-Line Interface (<code>qmt</code>) is a powerful and versatile tool for interacting with Large Language Models directly from your terminal. It leverages the full power of the QueryMT library, providing a unified interface for chat, text embedding, tool usage, and configuration management across various LLM providers.</p>
+<h2 id="key-features">Key Features</h2>
+<ul>
+<li><strong>Interactive Chat:</strong> A REPL-style interface for conversational AI.</li>
+<li><strong>Piped &amp; Single-Shot Commands:</strong> Seamlessly integrate <code>qmt</code> into your shell scripts and workflows.</li>
+<li><strong>Unified Provider Management:</strong> Interact with any provider configured in your <code>providers.toml</code>, from OpenAI and Anthropic to local models via Ollama.</li>
+<li><strong>Text Embeddings:</strong> Generate vector embeddings for text, with support for multiple documents and custom dimensions.</li>
+<li><strong>Secure Credential Storage:</strong> Manage API keys and other secrets securely.</li>
+<li><strong>Tool &amp; Function Calling:</strong> Connect LLMs to external tools, including those exposed via the Model Context Protocol (MCP).</li>
+</ul>
+<h2 id="configuration">Configuration</h2>
+<p><code>qmt</code> relies on two primary configuration sources, typically located in <code>~/.qmt/</code>:</p>
+<ol>
+<li>
+<p><strong>Provider Configuration (<code>~/.qmt/providers.toml</code>):</strong> This file defines all the available LLM provider plugins. You can specify the path to local Wasm or native plugins, or reference them from an OCI registry. This can be overridden with the <code>--provider-config</code> flag.</p>
+<ul>
+<li><em>For more details, see <a href="../plugins/configuration/">Plugin Configuration</a>.</em></li>
+</ul>
+</li>
+<li>
+<p><strong>Secret Storage (<code>~/.qmt/secrets.json</code>):</strong> This file stores sensitive information like API keys and the default provider setting. It is automatically created and managed by the <code>qmt</code> CLI and should not be edited manually.</p>
+</li>
+</ol>
+<h2 id="core-commands">Core Commands</h2>
+<h3 id="chatting-with-llms">Chatting with LLMs</h3>
+<p><code>qmt</code> offers several ways to chat with your configured models.</p>
+<h4 id="interactive-mode-repl">Interactive Mode (REPL)</h4>
+<p>For a conversational experience, simply run <code>qmt</code> without any prompt.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>$<span class="w"> </span>qmt
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>qmt<span class="w"> </span>-<span class="w"> </span>Interactive<span class="w"> </span>Chat
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>Provider:<span class="w"> </span>openai
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>Type<span class="w"> </span><span class="s1">&#39;exit&#39;</span><span class="w"> </span>to<span class="w"> </span>quit
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>──────────────────────────────────────────────────
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>::<span class="w"> </span>What<span class="w"> </span>is<span class="w"> </span>the<span class="w"> </span>QueryMT<span class="w"> </span>project?
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>Thinking...
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>QueryMT<span class="w"> </span>is<span class="w"> </span>a<span class="w"> </span>versatile<span class="w"> </span>Rust<span class="w"> </span>library<span class="w"> </span>designed<span class="w"> </span>to<span class="w"> </span>provide<span class="w"> </span>a<span class="w"> </span>unified<span class="w"> </span>and<span class="w"> </span>extensible<span class="w"> </span>interface<span class="w"> </span><span class="k">for</span><span class="w"> </span>interacting<span class="w"> </span>with<span class="w"> </span>various<span class="w"> </span>Large<span class="w"> </span>Language<span class="w"> </span>Models<span class="w"> </span><span class="o">(</span>LLMs<span class="o">)</span>.
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>──────────────────────────────────────────────────
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>::<span class="w"> </span><span class="nb">exit</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>👋<span class="w"> </span>Goodbye!
+</code></pre></div>
+<h4 id="single-shot-prompt">Single-Shot Prompt</h4>
+<p>Pass a prompt directly as an argument for a quick question and answer.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>$<span class="w"> </span>qmt<span class="w"> </span><span class="s2">&quot;What is the capital of France?&quot;</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>The<span class="w"> </span>capital<span class="w"> </span>of<span class="w"> </span>France<span class="w"> </span>is<span class="w"> </span>Paris.
+</code></pre></div>
+<h4 id="piped-input">Piped Input</h4>
+<p>Use standard shell pipes to provide context to the LLM. This is ideal for summarizing files, analyzing logs, or processing text and image content.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Summarize a text file</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>$<span class="w"> </span>cat<span class="w"> </span>report.txt<span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span><span class="s2">&quot;Please provide a 3-sentence summary of the following text.&quot;</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="c1"># Analyze a log file</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>$<span class="w"> </span>cat<span class="w"> </span>server.log<span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span><span class="s2">&quot;Are there any &#39;ERROR&#39; level messages in this log?&quot;</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="c1"># Analyze an image&#39;s content (requires a provider that supports vision)</span>
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>$<span class="w"> </span>cat<span class="w"> </span>my_image.jpg<span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span><span class="s2">&quot;Describe what is happening in this image.&quot;</span>
+</code></pre></div>
+<h3 id="generating-embeddings">Generating Embeddings</h3>
+<p>The <code>embed</code> subcommand generates vector embeddings. It can read from an argument or from stdin, and it outputs the results as a JSON array.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1"># Embed a single string</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>embed<span class="w"> </span><span class="s2">&quot;This is a test sentence.&quot;</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="o">[[</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span>-0.0189,
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">  </span><span class="m">0</span>.0234,
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">  </span>...
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">  </span>-0.0056
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="o">]]</span>
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="c1"># Embed a file&#39;s content</span>
+<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a>$<span class="w"> </span>cat<span class="w"> </span>document.txt<span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span>embed
+</code></pre></div>
+<p>You can also embed multiple documents at once by specifying a separator.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># Embed two documents separated by &quot;---&quot;</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>$<span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;First document.---Second document.&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span>embed<span class="w"> </span>--separator<span class="w"> </span><span class="s2">&quot;---&quot;</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="o">[</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">  </span><span class="o">[</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">    </span>-0.01,<span class="w"> </span>...
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">  </span><span class="o">]</span>,
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="w">  </span><span class="o">[</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="w">    </span><span class="m">0</span>.02,<span class="w"> </span>...
+<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="w">  </span><span class="o">]</span>
+<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="o">]</span>
+</code></pre></div>
+<h3 id="managing-configuration-secrets">Managing Configuration &amp; Secrets</h3>
+<p><code>qmt</code> includes commands to manage your settings without manually editing files.</p>
+<h4 id="setting-the-default-provider">Setting the Default Provider</h4>
+<p>Set your most-used provider and model combination as the default.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1"># Set the default provider to OpenAI&#39;s gpt-4-turbo model</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>default<span class="w"> </span>openai:gpt-4-turbo
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="c1"># Check the current default</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>$<span class="w"> </span>qmt<span class="w"> </span>default
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>Default<span class="w"> </span>provider:<span class="w"> </span>openai:gpt-4-turbo
+</code></pre></div>
+<h4 id="storing-api-keys">Storing API Keys</h4>
+<p>Securely store API keys. The <code>key</code> should match the <code>api_key_name</code> defined by the provider plugin (e.g., <code>OPENAI_API_KEY</code>, <code>ANTHROPIC_API_KEY</code>).</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1"># Store your OpenAI API key</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>$<span class="w"> </span>qmt<span class="w"> </span><span class="nb">set</span><span class="w"> </span>OPENAI_API_KEY<span class="w"> </span><span class="s2">&quot;sk-...&quot;</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>✓<span class="w"> </span>Secret<span class="w"> </span><span class="s1">&#39;OPENAI_API_KEY&#39;</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>set.
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="c1"># Retrieve a stored key (for verification)</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>$<span class="w"> </span>qmt<span class="w"> </span>get<span class="w"> </span>OPENAI_API_KEY
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>OPENAI_API_KEY:<span class="w"> </span>sk-...
+<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>
+<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="c1"># Delete a key</span>
+<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>$<span class="w"> </span>qmt<span class="w"> </span>delete<span class="w"> </span>OPENAI_API_KEY
+<a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>✓<span class="w"> </span>Secret<span class="w"> </span><span class="s1">&#39;OPENAI_API_KEY&#39;</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>deleted.
+</code></pre></div>
+<h3 id="discovering-providers-models">Discovering Providers &amp; Models</h3>
+<p>List the providers and models that <code>qmt</code> has loaded from your configuration.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="c1"># List all configured provider plugins</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>providers
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>-<span class="w"> </span>openai
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>-<span class="w"> </span>anthropic
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>-<span class="w"> </span>ollama-plugin
+<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a>
+<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="c1"># List all available models for each provider</span>
+<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>$<span class="w"> </span>qmt<span class="w"> </span>models
+<a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a>openai:
+<a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a><span class="w">  </span>-<span class="w"> </span>openai:gpt-4-turbo
+<a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a><span class="w">  </span>-<span class="w"> </span>openai:gpt-3.5-turbo
+<a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a>anthropic:
+<a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a><span class="w">  </span>-<span class="w"> </span>anthropic:claude-3-opus-20240229
+<a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a><span class="w">  </span>-<span class="w"> </span>anthropic:claude-3-sonnet-20240229
+<a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a>ollama-plugin:
+<a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a><span class="w">  </span>-<span class="w"> </span>ollama-plugin:llama3
+<a id="__codelineno-7-17" name="__codelineno-7-17" href="#__codelineno-7-17"></a><span class="w">  </span>-<span class="w"> </span>ollama-plugin:mistral
+</code></pre></div>
+<h2 id="examples-advanced-usage">Examples &amp; Advanced Usage</h2>
+<p>Combine flags to customize LLM interactions.</p>
+<h4 id="specifying-a-provider-and-model">Specifying a Provider and Model</h4>
+<p>Use the <code>--provider</code> (<code>-p</code>) and <code>--model</code> flags, or combine them in the format <code>provider:model</code>.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="c1"># Use the anthropic provider with the claude-3-sonnet model</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>anthropic<span class="w"> </span>--model<span class="w"> </span>claude-3-sonnet-20240229<span class="w"> </span><span class="s2">&quot;Explain the concept of emergence.&quot;</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="c1"># A more concise way to do the same</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>anthropic:claude-3-sonnet-20240229<span class="w"> </span><span class="s2">&quot;Explain the concept of emergence.&quot;</span>
+</code></pre></div>
+<h4 id="using-a-local-model-via-a-proxylocal-server">Using a Local Model via a Proxy/Local Server</h4>
+<p>Override the <code>--base-url</code> to point to a local service like Ollama.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="c1"># Assuming you have an &#39;ollama&#39; provider configured that works with OpenAI&#39;s API format</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>ollama:llama3<span class="w"> </span>--base-url<span class="w"> </span>http://localhost:11434<span class="w"> </span><span class="s2">&quot;Who are you?&quot;</span>
+</code></pre></div>
+<h4 id="setting-a-system-prompt">Setting a System Prompt</h4>
+<p>Guide the model's behavior with a system prompt using <code>--system</code> (<code>-s</code>).</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;You are a helpful assistant that only speaks in rhyme.&quot;</span><span class="w"> </span><span class="s2">&quot;What is a computer?&quot;</span>
+</code></pre></div>
+<h4 id="controlling-generation-parameters">Controlling Generation Parameters</h4>
+<p>Adjust temperature, max tokens, and other parameters for more creative or controlled output.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>--temperature<span class="w"> </span><span class="m">1</span>.2<span class="w"> </span>--max-tokens<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="s2">&quot;Write a short, creative opening line for a fantasy novel.&quot;</span>
+</code></pre></div>
+<h4 id="passing-custom-provider-specific-options">Passing Custom Provider-Specific Options</h4>
+<p>Use the <code>--options</code> (<code>-o</code>) flag to pass arbitrary key-value pairs that a specific plugin might support. Values are parsed as JSON if possible, otherwise as strings.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>some-custom-provider<span class="w"> </span>-o<span class="w"> </span><span class="nv">vision_mode</span><span class="o">=</span><span class="nb">true</span><span class="w"> </span>-o<span class="w"> </span><span class="nv">response_format</span><span class="o">=</span><span class="s1">&#39;{&quot;type&quot;: &quot;json_object&quot;}&#39;</span><span class="w"> </span><span class="s2">&quot;Analyze this image&quot;</span>
+</code></pre></div>
+<h4 id="embedding-with-specific-dimensions">Embedding with Specific Dimensions</h4>
+<p>Some embedding models support custom dimensions.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>embed<span class="w"> </span><span class="s2">&quot;This is a test&quot;</span><span class="w"> </span>-p<span class="w"> </span>openai:text-embedding-3-small<span class="w"> </span>--dimensions<span class="w"> </span><span class="m">512</span>
+</code></pre></div>
+<h4 id="using-tools-via-mcp">Using Tools via MCP</h4>
+<p>Create a file named <code>mcp-config.toml</code>. This file tells QueryMT how to launch and communicate with the tool server.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="c1"># mcp-config.toml</span>
+<a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="k">[[mcp]]</span>
+<a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mem_server&quot;</span>
+<a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="n">protocol</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;stdio&quot;</span>
+<a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a><span class="n">command</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;npx&quot;</span>
+<a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a><span class="n">args</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;-y&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;@modelcontextprotocol/server-memory&quot;</span><span class="p">]</span>
+</code></pre></div>
+<p>When you ask a question that requires a tool, the LLM will request to use it, and <code>qmt</code> will handle the communication.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="c1"># Ask the LLM to use the &#39;set&#39; tool from our stdio server</span>
+<a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>--provider<span class="w"> </span>openai:gpt-4o-mini<span class="w"> </span>--mcp-config<span class="w"> </span>./mcp-config.toml
+<a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a>qmt<span class="w"> </span>-<span class="w"> </span>Interactive<span class="w"> </span>Chat
+<a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a>Provider:<span class="w"> </span>openai
+<a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a>Type<span class="w"> </span><span class="s1">&#39;exit&#39;</span><span class="w"> </span>to<span class="w"> </span>quit
+<a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a>──────────────────────────────────────────────────
+<a id="__codelineno-15-7" name="__codelineno-15-7" href="#__codelineno-15-7"></a>::<span class="w"> </span>create<span class="w"> </span>two<span class="w"> </span>entities:<span class="w"> </span>qmt<span class="w"> </span>and<span class="w"> </span>awesome<span class="w"> </span>and<span class="w"> </span>connect<span class="w"> </span>qmt<span class="w"> </span>with<span class="w"> </span>an<span class="w"> </span>isa<span class="w"> </span>relation<span class="w"> </span>to<span class="w"> </span>awesome
+<a id="__codelineno-15-8" name="__codelineno-15-8" href="#__codelineno-15-8"></a>┌─<span class="w"> </span>create_entities
+<a id="__codelineno-15-9" name="__codelineno-15-9" href="#__codelineno-15-9"></a>└─<span class="w"> </span>calling...
+<a id="__codelineno-15-10" name="__codelineno-15-10" href="#__codelineno-15-10"></a>┌─<span class="w"> </span>create_entities
+<a id="__codelineno-15-11" name="__codelineno-15-11" href="#__codelineno-15-11"></a>└─<span class="w"> </span>generated
+<a id="__codelineno-15-12" name="__codelineno-15-12" href="#__codelineno-15-12"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>The<span class="w"> </span>entities<span class="w"> </span><span class="s2">&quot;qmt&quot;</span><span class="w"> </span>and<span class="w"> </span><span class="s2">&quot;awesome&quot;</span><span class="w"> </span>have<span class="w"> </span>been<span class="w"> </span>successfully<span class="w"> </span>created,<span class="w"> </span>and<span class="w"> </span>the<span class="w"> </span>relation<span class="w"> </span><span class="s2">&quot;isa&quot;</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>established<span class="w"> </span>from<span class="w"> </span><span class="s2">&quot;qmt&quot;</span><span class="w"> </span>to<span class="w"> </span><span class="s2">&quot;awesome.&quot;</span><span class="w"> </span>If<span class="w"> </span>you<span class="w"> </span>need<span class="w"> </span>any<span class="w"> </span>further<span class="w"> </span>modifications<span class="w"> </span>or<span class="w"> </span>additional<span class="w"> </span>actions,<span class="w"> </span>just<span class="w"> </span><span class="nb">let</span><span class="w"> </span>me<span class="w"> </span>know!
+<a id="__codelineno-15-13" name="__codelineno-15-13" href="#__codelineno-15-13"></a>──────────────────────────────────────────────────
+<a id="__codelineno-15-14" name="__codelineno-15-14" href="#__codelineno-15-14"></a>::<span class="w"> </span>what<span class="w"> </span>is<span class="w"> </span>qmt?
+<a id="__codelineno-15-15" name="__codelineno-15-15" href="#__codelineno-15-15"></a>┌─<span class="w"> </span>open_nodes
+<a id="__codelineno-15-16" name="__codelineno-15-16" href="#__codelineno-15-16"></a>└─<span class="w"> </span>generated
+<a id="__codelineno-15-17" name="__codelineno-15-17" href="#__codelineno-15-17"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>The<span class="w"> </span>entity<span class="w"> </span><span class="s2">&quot;qmt&quot;</span><span class="w"> </span>is<span class="w"> </span>of<span class="w"> </span><span class="nb">type</span><span class="w"> </span><span class="s2">&quot;type1&quot;</span><span class="w"> </span>and<span class="w"> </span>currently<span class="w"> </span>has<span class="w"> </span>no<span class="w"> </span>associated<span class="w"> </span>observations<span class="w"> </span>or<span class="w"> </span>relations<span class="w"> </span>other<span class="w"> </span>than<span class="w"> </span>the<span class="w"> </span>relation<span class="w"> </span>to<span class="w"> </span><span class="s2">&quot;awesome&quot;</span><span class="w"> </span>established<span class="w"> </span>earlier.<span class="w"> </span>If<span class="w"> </span>you<span class="w"> </span>need<span class="w"> </span>more<span class="w"> </span>information<span class="w"> </span>or<span class="w"> </span>to<span class="w"> </span>add<span class="w"> </span>observations,<span class="w"> </span>feel<span class="w"> </span>free<span class="w"> </span>to<span class="w"> </span>ask!
+<a id="__codelineno-15-18" name="__codelineno-15-18" href="#__codelineno-15-18"></a>──────────────────────────────────────────────────
+<a id="__codelineno-15-19" name="__codelineno-15-19" href="#__codelineno-15-19"></a>::
+<a id="__codelineno-15-20" name="__codelineno-15-20" href="#__codelineno-15-20"></a>👋<span class="w"> </span>Goodbye!
+</code></pre></div>
+<h2 id="command-line-reference">Command-Line Reference</h2>
+<h3 id="global-options">Global Options</h3>
+<p>These options can be used with the main chat command.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Alias</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--provider &lt;NAME&gt;</code></td>
+<td><code>-p</code></td>
+<td>The name of the provider to use (e.g., <code>openai</code>, <code>anthropic:claude-3</code>).</td>
+</tr>
+<tr>
+<td><code>--model &lt;NAME&gt;</code></td>
+<td></td>
+<td>The specific model to use (e.g., <code>gpt-4-turbo</code>).</td>
+</tr>
+<tr>
+<td><code>--system &lt;PROMPT&gt;</code></td>
+<td><code>-s</code></td>
+<td>The system prompt to set the context for the conversation.</td>
+</tr>
+<tr>
+<td><code>--api-key &lt;KEY&gt;</code></td>
+<td></td>
+<td>Directly provide an API key, overriding stored secrets or environment vars.</td>
+</tr>
+<tr>
+<td><code>--base-url &lt;URL&gt;</code></td>
+<td></td>
+<td>The base URL for the LLM API, for use with proxies or local models.</td>
+</tr>
+<tr>
+<td><code>--temperature &lt;FLOAT&gt;</code></td>
+<td></td>
+<td>Controls randomness (e.g., <code>0.7</code>).</td>
+</tr>
+<tr>
+<td><code>--top-p &lt;FLOAT&gt;</code></td>
+<td></td>
+<td>Nucleus sampling parameter.</td>
+</tr>
+<tr>
+<td><code>--top-k &lt;INT&gt;</code></td>
+<td></td>
+<td>Top-k sampling parameter.</td>
+</tr>
+<tr>
+<td><code>--max-tokens &lt;INT&gt;</code></td>
+<td></td>
+<td>The maximum number of tokens to generate in the response.</td>
+</tr>
+<tr>
+<td><code>--mcp-config &lt;PATH&gt;</code></td>
+<td></td>
+<td>Path to a TOML configuration file for MCP tool servers.</td>
+</tr>
+<tr>
+<td><code>--provider-config &lt;PATH&gt;</code></td>
+<td></td>
+<td>Path to the provider plugins configuration file (e.g., <code>plugins.toml</code>).</td>
+</tr>
+<tr>
+<td><code>--options &lt;KEY=VALUE&gt;</code></td>
+<td><code>-o</code></td>
+<td>Set a provider-specific parameter. Can be used multiple times.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="subcommands">Subcommands</h3>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>qmt set &lt;KEY&gt; &lt;VALUE&gt;</code></td>
+<td>Set a secret key-value pair in the secure store.</td>
+</tr>
+<tr>
+<td><code>qmt get &lt;KEY&gt;</code></td>
+<td>Get a secret value by its key.</td>
+</tr>
+<tr>
+<td><code>qmt delete &lt;KEY&gt;</code></td>
+<td>Delete a secret by its key.</td>
+</tr>
+<tr>
+<td><code>qmt providers</code></td>
+<td>List all available provider plugins loaded from the configuration.</td>
+</tr>
+<tr>
+<td><code>qmt models</code></td>
+<td>List all available models for each provider.</td>
+</tr>
+<tr>
+<td><code>qmt default [PROVIDER]</code></td>
+<td>Get or set the default provider (e.g., <code>qmt default openai:gpt-4</code>).</td>
+</tr>
+<tr>
+<td><code>qmt embed [TEXT]</code></td>
+<td>Generate embeddings for the given text or for text from stdin.</td>
+</tr>
+<tr>
+<td>&nbsp;&nbsp;<code>--separator &lt;STR&gt;</code></td>
+<td>Document separator for embedding multiple texts from a single stream.</td>
+</tr>
+<tr>
+<td>&nbsp;&nbsp;<code>--dimensions &lt;INT&gt;</code></td>
+<td>Request a specific number of dimensions for the embedding vector.</td>
+</tr>
+<tr>
+<td>&nbsp;&nbsp;<code>--encoding-format &lt;FMT&gt;</code></td>
+<td>Specify the embedding encoding format (e.g., <code>float</code>, <code>base64</code>).</td>
+</tr>
+<tr>
+<td>&nbsp;&nbsp;<code>--provider &lt;NAME&gt;</code></td>
+<td>Override the provider for this embedding task.</td>
+</tr>
+<tr>
+<td>&nbsp;&nbsp;<code>--model &lt;NAME&gt;</code></td>
+<td>Override the model for this embedding task.</td>
+</tr>
+</tbody>
+</table>
 
 
 
