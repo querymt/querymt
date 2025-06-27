@@ -33,7 +33,7 @@ impl PluginConfig {
 
         let config = match ext {
             "json" => serde_json::from_str(&content)?,
-            "yaml" | "yml" => serde_yaml::from_str(&content)?,
+            "yaml" | "yml" => serde_yml::from_str(&content)?,
             "toml" => toml::from_str(&content)?,
             _ => return Err(anyhow::anyhow!("Unsupported config format: {}", ext)),
         };

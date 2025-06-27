@@ -16,7 +16,7 @@ http-client = []
 reqwest-client = ["reqwest", "tokio", "once_cell"]
 native = ["libloading", "once_cell"]
 mcp = ["rmcp", "toml", "tokio", "jsonschema"]
-extism_host = ["extism", "docker_credential", "sigstore", "oci-client", "tar", "flate2", "sha2", "serde_yaml", "dirs", "hex"]
+extism_host = ["extism", "docker_credential", "sigstore", "oci-client", "tar", "flate2", "sha2", "dirs", "hex"]
 extism_plugin = ["extism-pdk"]
 tracing = ["dep:tracing"]
 
@@ -25,6 +25,7 @@ anyhow = "1.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde-value = { workspace = true }
+serde_yml = "0.0.12"
 async-trait = { workspace = true }
 uuid = { version = "1.0", optional = true, features = ["v4"] }
 schemars = { workspace = true}
@@ -45,7 +46,6 @@ oci-client = { version = "0.14.0", optional = true }
 flate2 = { version = "1.1.1", optional = true }
 tar = { version = "0.4.44", optional = true }
 sha2 = { version = "0.10.8", optional = true }
-serde_yaml = { version = "0.9.34", optional = true }
 dirs = { version ="6.0", optional = true }
 hex = { version = "0.4.3", optional = true }
 log = { workspace = true }
