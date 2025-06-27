@@ -11,16 +11,15 @@ env:
   APP_NAME: qmt
 
 jobs:
-  # ==================================================================
-  #  Build Job: Compiles the executable for each target in the matrix
-  # ==================================================================
   build:
     name: Build for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+
     strategy:
+      fail-fast: false
       matrix:
         include:
-          # --- Linux Targets ---
+          # ─── Linux ─────────────────────────────────────────────────────────
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin_name: qmt
@@ -30,7 +29,7 @@ jobs:
             bin_name: qmt
             archive_ext: tar.gz
 
-          # --- macOS Targets (Consolidated on Apple Silicon Runner) ---
+          # ─── macOS ─────────────────────────────────────────────────────────
           - os: macos-14
             target: x86_64-apple-darwin
             bin_name: qmt
@@ -40,7 +39,7 @@ jobs:
             bin_name: qmt
             archive_ext: tar.gz
 
-          # --- Windows Targets ---
+          # ─── Windows ────────────────────────────────────────────────────────
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin_name: qmt.exe
@@ -54,49 +53,48 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain & targets
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-
-      - name: Setup cross-compilation for Linux aarch64
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Cache Cargo dependencies
         uses: swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Build executable
-        run: cargo build --release --package ${{ env.APP_NAME }} --target ${{ matrix.target }}
+      - name: Install & cache `cross` for AArch64
+        if: runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          cargo install cross --locked --force
+
+      - name: Build with cross
+        if: ${{ runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu' }}
+        run: cross build --release --bin ${{ env.APP_NAME }} --target ${{ matrix.target }}
+
+      - name: Build natively
+        if: ${{ runner.os != 'Linux' || matrix.target != 'aarch64-unknown-linux-gnu' }}
+        run: cargo build --release --bin ${{ env.APP_NAME }} --target ${{ matrix.target }}
 
       - name: Prepare artifact for upload
         shell: bash
         run: |
           ARTIFACT_DIR="dist"
-          PACKAGE_NAME="${{ env.APP_NAME }}-${{ github.ref_name }}-${{ matrix.target }}"
-          STAGING_PATH="${ARTIFACT_DIR}/${PACKAGE_NAME}"
-          mkdir -p "${STAGING_PATH}"
+          PKG="${{ env.APP_NAME }}-${{ github.ref_name }}-${{ matrix.target }}"
+          STAGING="$ARTIFACT_DIR/$PKG"
+          mkdir -p "$STAGING"
 
-          # Copy files into the staging directory
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "${STAGING_PATH}/"
-          cp README.md "${STAGING_PATH}/"
-          cp LICENSE "${STAGING_PATH}/" || true # Allow LICENSE to be optional
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$STAGING/"
+          cp README.md LICENSE "$STAGING/"
 
-          # Create the archive from the staging directory's contents
-          ARCHIVE_PATH="${ARTIFACT_DIR}/${PACKAGE_NAME}.${{ matrix.archive_ext }}"
-          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            (cd "${STAGING_PATH}" && zip -r "../${PACKAGE_NAME}.zip" .)
+          if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
+            (cd "$STAGING" && zip -r "../${PKG}.zip" .)
           else
-            tar -czf "${ARCHIVE_PATH}" -C "${STAGING_PATH}" .
+            tar -czf "$ARTIFACT_DIR/${PKG}.tar.gz" -C "$ARTIFACT_DIR" "$PKG"
           fi
 
-          echo "ASSET_PATH=${ARCHIVE_PATH}" >> $GITHUB_ENV
+          echo "ASSET_PATH=$ARTIFACT_DIR/${PKG}.${{ matrix.archive_ext }}" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -104,9 +102,6 @@ jobs:
           name: ${{ env.APP_NAME }}-${{ matrix.target }}
           path: ${{ env.ASSET_PATH }}
 
-  # ==================================================================
-  #  Release Job: Creates a GitHub Release and uploads all artifacts
-  # ==================================================================
   release:
     name: Create GitHub Release
     needs: build
