@@ -1,0 +1,92 @@
+site_name: QueryMate
+site_url: https://docs.query.mt
+repo_url: https://github.com/querymt/querymt
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.tracking
+    - toc.integrate
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.tabs.link
+    - content.code.annotation
+    - content.code.copy
+  language: en
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+      primary: black
+      accent: indigo
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+      primary: black
+      accent: deep orange
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - admonition
+  - pymdownx.arithmatex:
+      generic: true
+  - footnotes
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.mark
+  - attr_list
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Core Concepts:
+    - Overview: core/index.md
+    - LLM Providers: core/providers.md
+    - Chat Interactions: core/chat.md
+    - Text Completion: core/completion.md
+    - Embeddings: core/embeddings.md
+    - Tools & Function Calling: core/tools.md
+    - Building Providers (LLMBuilder): core/builder.md
+    - Chaining Prompts: core/chaining.md
+  - Plugins:
+    - Overview: plugins/index.md
+    - 'Configuration': 'plugins/configuration.md'
+    - 'Using the Registry': 'plugins/usage.md'
+    - 'Plugin Development':
+      - 'Getting Started': 'plugins/development.md'
+      - 'Plugin Interface': 'plugins/interface_spec.md'
+      - 'Helper Macros': 'plugins/helper_macros.md'
+      - 'Data Structures': 'plugins/data_structures.md'
+    - 'OCI Plugins': 'plugins/oci_plugins.md'
+  - MCP Integration: mcp.md
+  - CLI: 'cli/index.md'
+  - Blog: https://log.query.mt
+
+extra:
+  consent:
+    title: Cookie consent
+    description: >-
+      We use cookies to recognize your repeated visits and preferences, as well
+      as to measure the effectiveness of our documentation and whether users
+      find what they're searching for. With your consent, you're helping us to
+      make our documentation better.
+
+extra:
+  version:
+    provider: mike
+    default: stable

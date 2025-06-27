@@ -1,0 +1,114 @@
+name: Documentation Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Job to build and deploy the preview for opened/updated PRs
+  deploy_preview:
+    name: Deploy Preview
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch all history for all branches and tags
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        working-directory: ./docs
+
+      - name: Configure Git User
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Deploy preview documentation
+        run: mike deploy --push pr-${{ github.event.number }}
+        working-directory: ./docs
+      
+      - name: Post preview link comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const docsUrl = 'https://docs.query.mt';
+            
+            // 2. Find a previous comment to update
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && comment.body.includes('📚 Documentation Preview')
+            );
+
+            // 3. Construct the new comment body
+            const previewUrl = `${docsUrl}/pr-${context.issue.number}`;
+            const commentBody = `
+              ### 📚 Documentation Preview
+              
+              A preview for this pull request has been built and is available at:
+              
+              **[${previewUrl}](${previewUrl})**
+              
+              *This preview will be automatically deleted when the pull request is closed.*
+            `;
+
+            // 4. Update an existing comment or create a new one
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody
+              });
+            }
+
+  # Job to delete the preview when the PR is closed
+  cleanup_preview:
+    name: Cleanup Preview
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gh-pages branch
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install MkDocs and Mike
+        run: pip install mkdocs-material mike
+
+      - name: Configure Git User
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+      - name: Delete preview directory
+        run: mike delete --push pr-${{ github.event.number }}
