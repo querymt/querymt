@@ -8,63 +8,62 @@ Many of these types are defined in `querymt::chat`, `querymt::completion`, and `
 
 These structures are used as the direct input/output for the main plugin functions (`chat`, `embed`, `complete`). They bundle the plugin-specific configuration (`cfg`) with the actual request payload.
 
--   **`ExtismChatRequest<C>`**
+-   **`querymt::plugin::extism_impl::ExtismChatRequest<C>`**
     -   `cfg: C`: Plugin-specific configuration (type `C` is your plugin's config struct).
     -   `messages: Vec<ChatMessage>`: The history of chat messages.
     -   `tools: Option<Vec<Tool>>`: Optional list of tools the model can use.
 
--   **`ExtismEmbedRequest<C>`**
+-   **`querymt::plugin::extism_impl::ExtismEmbedRequest<C>`**
     -   `cfg: C`: Plugin-specific configuration.
     -   `inputs: Vec<String>`: List of texts to embed.
 
--   **`ExtismCompleteRequest<C>`**
+-   **`querymt::plugin::extism_impl::ExtismCompleteRequest<C>`**
     -   `cfg: C`: Plugin-specific configuration.
     -   `req: CompletionRequest`: The core completion request.
 
--   **`ExtismChatResponse`** (implements `querymt::chat::ChatResponse`)
+-   **`querymt::plugin::extism_impl::ExtismChatResponse`** (implements `querymt::chat::ChatResponse`)
     -   `text: Option<String>`: The main textual response from the LLM.
     -   `tool_calls: Option<Vec<ToolCall>>`: If the LLM decides to call tools.
     -   `thinking: Option<String>`: Optional intermediate "thinking" messages.
+    -   `usage: Option<Usage>`: Optional token usage statistics.
 
 ## Common Data Types
 
 These are used within the request/response wrappers.
 
--   **`ChatMessage`** (`querymt::chat::ChatMessage`)
-    -   `role: ChatRole`: Enum (`System`, `User`, `Assistant`, `Tool`).
-    -   `content: Option<String>`: Text content of the message.
-    -   `name: Option<String>`: Name of the speaker (especially for `Tool` role).
-    -   `tool_calls: Option<Vec<ToolCall>>`: For `Assistant` role, if it calls tools.
-    -   `tool_call_id: Option<String>`: For `Tool` role, the ID of the tool call it's responding to.
+-   **`querymt::chat::ChatMessage`**
+    -   `role: ChatRole`: Enum (`User`, `Assistant`).
+    -   `message_type: MessageType`: An enum that determines the message content type.
+    -   `content: String`: The primary text content of the message.
+    -   **Note on Tool Calls**: Tool-related information is carried within the `message_type` field.
+        -   `MessageType::ToolUse(Vec<ToolCall>)`: Used in an `Assistant` message to indicate the model's decision to call tools.
+        -   `MessageType::ToolResult(Vec<ToolCall>)`: Used in a `User` message to provide the results of tool executions back to the model. In this case, the `arguments` field of each `ToolCall` contains the JSON string result of the function.
 
--   **`Tool`** (`querymt::chat::Tool`)
-    -   `type: ToolType`: Enum (currently only `Function`).
-    -   `function: ToolFunction`: Describes the function tool.
+-   **`querymt::chat::Tool`**
+    -   `tool_type: String`: Typically `"function"`.
+    -   `function: FunctionTool`: Describes the function tool.
 
--   **`ToolFunction`** (`querymt::chat::ToolFunction`)
+-   **`querymt::chat::FunctionTool`**
     -   `name: String`: Name of the function.
-    -   `description: Option<String>`: Description of the function.
+    -   `description: String`: Description of the function.
     -   `parameters: serde_json::Value`: JSON schema defining the function's parameters.
 
--   **`ToolCall`** (`querymt::ToolCall`)
+-   **`querymt::ToolCall`**
     -   `id: String`: Unique ID for the tool call.
-    -   `type: ToolType`: Enum (currently only `Function`).
-    -   `function: ToolCallFunction`: Details of the function to be called.
+    -   `call_type: String`: Typically `"function"`.
+    -   `function: FunctionCall`: Details of the function to be called.
 
--   **`ToolCallFunction`** (`querymt::ToolCallFunction`)
+-   **`querymt::FunctionCall`**
     -   `name: String`: Name of the function called.
-    -   `arguments: String`: JSON string of arguments for the function.
+    -   `arguments: String`: JSON string of arguments for the function (or the result of the function, in a `ToolResult` message).
 
--   **`CompletionRequest`** (`querymt::completion::CompletionRequest`)
+-   **`querymt::completion::CompletionRequest`**
     -   `prompt: String`: The prompt for completion.
+    *   `suffix: Option<String>`
     -   `max_tokens: Option<u32>`
     -   `temperature: Option<f32>`
-    -   `stop_sequences: Option<Vec<String>>`
-    -   *(Other common completion parameters)*
 
--   **`CompletionResponse`** (`querymt::completion::CompletionResponse`)
+-   **`querymt::completion::CompletionResponse`**
     -   `text: String`: The completed text.
-    -   *(Other relevant fields, e.g., finish reason, tokens used)*
 
 For plugin developers using Rust, these types are readily available. When interacting via raw JSON, ensure your data conforms to these structures. The `config_schema()` export of a plugin should define the structure for the generic `C` (plugin configuration) part of the `Extism*Request` types.
-

@@ -1,0 +1,62 @@
+# .github/workflows/deploy.yml
+
+name: Deploy Versioned Documentation
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch: # Allows manual runs from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    name: Deploy Docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch all history for all branches and tags
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        # Assumes your requirements.txt is in the /docs folder
+        working-directory: ./docs
+
+      - name: Configure Git User
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Deploy documentation for main branch
+        # This step runs ONLY on a push to the main branch
+        if: github.ref == 'refs/heads/main'
+        run: mike deploy --push --update-aliases latest
+        working-directory: ./docs
+
+      - name: Deploy documentation for tagged release
+        # This step runs ONLY when you push a tag like 'v1.2.0'
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # Extracts the major.minor version from the tag (e.g., v1.2.3 -> 1.2)
+          # This groups patch releases under the same version number in the docs
+          VERSION=$(echo $GITHUB_REF_NAME | sed -e 's/^v//' | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')
+
+          # Deploy the numbered version and update the 'stable' alias to point to it
+          mike deploy --push --update-aliases $VERSION stable
+
+          # Set this new stable version as the site's default page
+          mike set-default --push stable
+        working-directory: ./docs

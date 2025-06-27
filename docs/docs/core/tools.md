@@ -4,39 +4,43 @@ One of the powerful features of modern Large Language Models is their ability to
 
 ## Key Concepts
 
-*   **`Tool`**: A struct representing a tool that the LLM can use. It primarily describes a function.
+*   **`querymt::chat::Tool`**: A struct representing a tool that the LLM can use. It primarily describes a function.
     *   `tool_type`: Currently, this is typically `"function"`.
-    *   `function`: A `FunctionTool` struct detailing the function.
+    *   `function`: A `querymt::chat::FunctionTool` detailing the function.
     *   Source: `crates/querymt/src/chat/mod.rs`
 
-*   **`FunctionTool`**: Describes a specific function the LLM can call.
+*   **`querymt::chat::FunctionTool`**: Describes a specific function the LLM can call.
     *   `name`: The name of the function.
     *   `description`: A natural language description of what the function does, its parameters, and when to use it. This is crucial for the LLM to understand the tool's purpose.
-    *   `parameters`: A `ParametersSchema` defining the expected input arguments for the function, typically in JSON Schema format.
+    *   `parameters`: A `serde_json::Value` defining the expected input arguments for the function, typically in JSON Schema format.
     *   Source: `crates/querymt/src/chat/mod.rs`
 
-*   **`ToolCall`**: When an LLM decides to use a tool, its response will include one or more `ToolCall` objects.
+*   **`querymt::ToolCall`**: When an LLM decides to use a tool, its response will include one or more `ToolCall` objects.
     *   `id`: A unique ID for this specific tool call instance.
     *   `call_type`: Usually `"function"`.
-    *   `function`: A `FunctionCall` struct.
+    *   `function`: A `querymt::FunctionCall`.
     *   Source: `crates/querymt/src/lib.rs`
 
-*   **`FunctionCall`**: Details of the function the LLM wants to invoke.
+*   **`querymt::FunctionCall`**: Details of the function the LLM wants to invoke.
     *   `name`: The name of the function to call.
     *   `arguments`: A string containing the arguments for the function, typically as a JSON object.
     *   Source: `crates/querymt/src/lib.rs`
 
-*   **`ToolChoice`**: An enum that allows you to specify how the LLM should use the provided tools (e.g., `Auto` to let the model decide, `Any` to force tool use, `Tool(name)` to force a specific tool, or `None` to disable tools).
+*   **`querymt::chat::ToolChoice`**: An enum that allows you to specify how the LLM should use the provided tools.
+    *   `Auto`: The model can choose to call a tool or not (default).
+    *   `Any`: The model *must* call at least one of the available tools.
+    *   `Tool(name)`: The model *must* call the specific tool with the given name.
+    *   `None`: The model is forbidden from calling any tools.
     *   Source: `crates/querymt/src/chat/mod.rs`
 
-*   **`CallFunctionTool`**: A trait that your *host-side Rust code* must implement for each function you want to make available to the LLM.
+*   **`querymt::tool_decorator::CallFunctionTool`**: A trait that your *host-side Rust code* must implement for each function you want to make available to the LLM.
     *   `descriptor()`: Returns the `Tool` definition (schema) for this function.
     *   `call(&self, args: Value)`: The actual Rust async function that gets executed when the LLM calls this tool. It receives parsed JSON arguments and should return a string result.
     *   Source: `crates/querymt/src/tool_decorator.rs`
 
-*   **`ToolEnabledProvider`**: A decorator struct that wraps an `LLMProvider`. When you register tools using `LLMBuilder::add_tool()`, the builder automatically wraps the base provider with `ToolEnabledProvider`. This wrapper manages the registered tools and handles the two-way communication:
+*   **`querymt::tool_decorator::ToolEnabledProvider`**: A decorator struct that wraps an `LLMProvider`. When you register tools using `LLMBuilder::add_tool()`, the builder automatically wraps the base provider with `ToolEnabledProvider`. This wrapper manages the registered tools and handles the two-way communication:
     1.  It passes the tool descriptors to the LLM during a `chat_with_tools` call.
-    2.  If the LLM responds with a `ToolCall`, `ToolEnabledProvider` looks up the corresponding `CallFunctionTool` implementation by name and invokes its `call` method.
+    2.  If the LLM responds with a `ToolCall`, `ToolEnabledProvider` can dispatch the call to the appropriate `CallFunctionTool` implementation via its `call_tool` method.
     *   Source: `crates/querymt/src/tool_decorator.rs`
 
 ## Workflow
@@ -57,55 +61,45 @@ One of the powerful features of modern Large Language Models is their ability to
 
 5.  **Application Executes Tool:**
     *   Your application receives the `ToolCall`s.
-    *   The `LLMProvider` itself (if it's a `ToolEnabledProvider`) can handle the dispatch via its `call_tool(name, args)` method, or your application can manage this explicitly. This involves:
+    *   The `LLMProvider` itself (if it's a `ToolEnabledProvider`) can handle the dispatch via its `call_tool(name, args)` method. This involves:
         *   Parsing the `arguments` string (usually JSON) into the expected types for your Rust function.
         *   Calling the actual Rust function logic.
 
 6.  **Return Tool Result to LLM:**
-    *   Construct a new `ChatMessage` with `MessageType::ToolResult`. This message should include the `id` from the original `ToolCall` and the string result of the function execution.
+    *   For each tool call that was executed, create a corresponding `ToolCall` struct that contains the result. The result string is placed into the `function.arguments` field.
+    *   Construct a new `ChatMessage` using the builder: `ChatMessage::user().tool_result(vec_of_result_tool_calls).build()`.
     *   Send this message (along with the conversation history) back to the LLM using `chat_with_tools()`.
 
 7.  **LLM Continues:**
-    *   The LLM uses the tool's output to formulate its final response or decide on further actions (which might include calling another tool).
+    *   The LLM uses the tool's output to formulate its final response or decide on further actions.
 
 ## Example (Conceptual `CallFunctionTool` Implementation)
 
 ```rust
 use querymt::tool_decorator::CallFunctionTool;
-use querymt::chat::{Tool, FunctionTool, ParametersSchema, ParameterProperty};
+use querymt::chat::{Tool, FunctionTool};
+use querymt::builder::FunctionBuilder;
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 
 struct GetWeatherTool;
 
 #[async_trait]
 impl CallFunctionTool for GetWeatherTool {
     fn descriptor(&self) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: FunctionTool {
-                name: "get_current_weather".to_string(),
-                description: "Get the current weather in a given location".to_string(),
-                parameters: ParametersSchema {
-                    schema_type: "object".to_string(),
-                    properties: {
-                        let mut props = HashMap::new();
-                        props.insert(
-                            "location".to_string(),
-                            ParameterProperty {
-                                property_type: "string".to_string(),
-                                description: "The city and state, e.g. San Francisco, CA".to_string(),
-                                items: None,
-                                enum_list: None,
-                            },
-                        );
-                        props
-                    },
-                    required: vec!["location".to_string()],
+        FunctionBuilder::new("get_current_weather")
+            .description("Get the current weather in a given location")
+            .json_schema(json!({
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city and state, e.g. San Francisco, CA"
+                    }
                 },
-            },
-        }
+                "required": ["location"]
+            }))
+            .build()
     }
 
     async fn call(&self, args: Value) -> anyhow::Result<String> {
@@ -122,4 +116,3 @@ impl CallFunctionTool for GetWeatherTool {
 ```
 
 Tool usage significantly enhances the capabilities of LLMs, allowing them to perform complex tasks that require external information or actions. QueryMT's system provides a structured way to integrate these tools into your LLM applications.
-

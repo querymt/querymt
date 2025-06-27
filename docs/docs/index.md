@@ -12,6 +12,7 @@ QueryMT offers a comprehensive suite of features for LLM interactions:
 *   **Tool Usage & Function Calling:** Enable LLMs to interact with external systems and data sources by defining and calling functions based on the conversation context.
 *   **Extensible Plugin System:** Easily add support for new LLM providers or custom logic through native shared libraries or sandboxed WebAssembly (WASM) modules via Extism.
 *   **Prompt Chaining:** Orchestrate complex workflows by linking multiple LLM calls, potentially across different providers.
+*   **Response Evaluation:** Compare and score responses from multiple LLM providers in parallel to select the best result based on custom criteria.
 *   **MCP Integration:** Connect with Model Context Protocol (MCP) servers to leverage external tools and services.
 
 ## Key Benefits

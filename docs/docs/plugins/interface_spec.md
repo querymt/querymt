@@ -1,70 +1,84 @@
 # Plugin Interface Specification
 
-QueryMT Extism plugins must export a specific set of functions to be compatible with the host system. If you use the `impl_extism_http_plugin!` macro, these are generated for you. However, understanding them is useful.
+To be compatible with QueryMT, a plugin must conform to a specific interface. The interface differs depending on whether you are building a **Native Plugin** (a shared library) or an **Extism Plugin** (a Wasm module).
 
-All interaction with the plugin happens by calling these exported Wasm functions. Data is typically passed as JSON-encoded byte arrays.
+---
 
-## Core Exported Functions
+## 1. Native Plugin Interface
 
-1.  **`name() -> String`**
-    -   **Input**: None
-    -   **Output**: `String` - The human-readable name of the plugin.
-    -   **Description**: Returns the display name of the LLM provider.
+Native plugins are Rust `cdylib` crates that implement traits from the `querymt` library and export a factory function with a C ABI. This allows the host to load the library and construct a provider instance with type safety and high performance.
 
-2.  **`api_key_name() -> Option<String>`**
-    -   **Input**: None
-    -   **Output**: `Option<String>` - The name of an environment variable the plugin expects for an API key.
-    -   **Description**: If the plugin requires an API key passed via an environment variable, this function should return the name of that variable (e.g., "OPENAI_API_KEY"). The host can use this to inform the user or to potentially pre-populate configurations. If no such environment variable is used (e.g., API key is part of the `config` struct), return `None` or an empty string.
+### Core Traits
 
-3.  **`config_schema() -> String`**
-    -   **Input**: None
-    -   **Output**: `String` - A JSON string representing the JSON schema for the plugin's specific configuration.
-    -   **Description**: Provides a schema for the `cfg` field within `ExtismChatRequest`, `ExtismEmbedRequest`, and `ExtismCompleteRequest`, and for the configuration passed to `from_config` and `list_models`. The host can use this for validation or generating UI for plugin configuration.
-        The `impl_extism_http_plugin!` macro generates this from your `$Config` struct if it derives `schemars::JsonSchema`.
+Your plugin must implement one of the following factory traits:
 
-4.  **`from_config(config: Json<YourConfigType>) -> Result<Json<YourConfigType>, Error>`**
-    -   **Input**: `Json<YourConfigType>` - Plugin-specific configuration as a JSON object. `YourConfigType` is the concrete type for this plugin's config.
-    -   **Output**: `Json<YourConfigType>` - The validated configuration (usually the same as input), or an error if validation fails.
-    -   **Description**: Called by the host to validate the plugin-specific configuration. The plugin should deserialize the input, perform any necessary checks (e.g., required fields, value ranges), and return the configuration if valid. The `impl_extism_http_plugin!` macro handles basic deserialization; you can add custom validation logic if needed by implementing `HTTPLLMProviderFactory::from_config` on your factory struct.
+-   **`querymt::plugin::http::HTTPLLMProviderFactory`**: The **recommended** and simplest approach for providers that communicate over HTTP. The host will wrap this in an adapter to handle the async HTTP calls.
+-   **`querymt::plugin::LLMProviderFactory`**: A more advanced, fully async trait for providers that have non-standard communication needs or do not use HTTP.
 
-5.  **`list_models(config: Json<serde_json::Value>) -> Result<Json<Vec<String>>, Error>`**
-    -   **Input**: `Json<serde_json::Value>` - Plugin-specific configuration as a JSON object.
-    -   **Output**: `Json<Vec<String>>` - A list of model names available through this provider with the given configuration.
-    -   **Description**: Dynamically lists available models. For HTTP plugins, this usually involves making an API call.
+### Exported Factory Function
 
-6.  **`base_url() -> String`**
-    -   **Input**: None
-    -   **Output**: `String` - The default base URL for the provider.
-    -   **Description**: Returns a default base URL associated with the LLM provider (e.g., "https://api.openai.com/v1"). This can be used by the host to set up network permissions (allowed hosts).
+Your library **must** export one of the following C-ABI functions. The host looks for these in order.
 
-## LLM Operations Functions
+1.  **`plugin_http_factory`** (if you implement `HTTPLLMProviderFactory`)
+    ```rust
+    use querymt::plugin::http::{HTTPLLMProviderFactory, HTTPFactoryCtor};
 
-These functions handle the core LLM tasks. Their inputs are wrapper structs (`ExtismChatRequest`, etc.) that include both the plugin-specific configuration (`cfg`) and the actual request data. These structs are serialized as JSON by the host and deserialized by the plugin (handled by `BinaryCodec` and `extism-pdk`).
+    struct MyFactory;
+    // ... impl HTTPLLMProviderFactory for MyFactory ...
 
-7.  **`chat(input: ExtismChatRequest<YourConfigType>) -> Result<Json<ExtismChatResponse>, Error>`**
-    -   **Input**: `ExtismChatRequest<YourConfigType>` (serialized as JSON bytes by host). Contains:
-        -   `cfg: YourConfigType`
-        -   `messages: Vec<ChatMessage>`
-        -   `tools: Option<Vec<Tool>>`
-    -   **Output**: `Json<ExtismChatResponse>` (serialized to JSON bytes by plugin). Contains:
-        -   `text: Option<String>`
-        -   `tool_calls: Option<Vec<ToolCall>>`
-        -   `thinking: Option<String>`
-    -   **Description**: Handles chat completion requests.
+    #[no_mangle]
+    pub unsafe extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
+        Box::into_raw(Box::new(MyFactory))
+    }
+    ```
 
-8.  **`embed(input: ExtismEmbedRequest<YourConfigType>) -> Result<Json<Vec<Vec<f32>>>, Error>`**
-    -   **Input**: `ExtismEmbedRequest<YourConfigType>` (serialized as JSON bytes). Contains:
-        -   `cfg: YourConfigType`
-        -   `inputs: Vec<String>`
-    -   **Output**: `Json<Vec<Vec<f32>>>` (serialized to JSON bytes).
-    -   **Description**: Generates embeddings for a list of input strings.
+2.  **`plugin_factory`** (if you implement `LLMProviderFactory`)
+    ```rust
+    use querymt::plugin::{LLMProviderFactory, FactoryCtor};
 
-9.  **`complete(input: ExtismCompleteRequest<YourConfigType>) -> Result<Json<CompletionResponse>, Error>`**
-    -   **Input**: `ExtismCompleteRequest<YourConfigType>` (serialized as JSON bytes). Contains:
-        -   `cfg: YourConfigType`
-        -   `req: CompletionRequest`
-    -   **Output**: `Json<CompletionResponse>` (serialized to JSON bytes).
-    -   **Description**: Handles standard text completion requests.
+    struct MyAsyncFactory;
+    // ... impl LLMProviderFactory for MyAsyncFactory ...
 
-See [Data Structures](data_structures.md) for details on the request/response types.
+    #[no_mangle]
+    pub unsafe extern "C" fn plugin_factory() -> *mut dyn LLMProviderFactory {
+        Box::into_raw(Box::new(MyAsyncFactory))
+    }
+    ```
 
+### `HTTPLLMProviderFactory` Trait Methods
+
+When using the recommended HTTP-based approach, you need to implement these methods:
+
+-   `name() -> &str`: Returns the display name of the provider.
+-   `config_schema() -> Value`: Returns a `serde_json::Value` representing the JSON schema for the plugin's configuration.
+-   `from_config(&Value) -> Result<Box<dyn HTTPLLMProvider>, Box<dyn Error>>`: Validates the user's configuration and creates an instance of your provider struct that implements the `HTTPLLMProvider` trait.
+-   `list_models_request(&Value) -> Result<Request<Vec<u8>>, LLMError>`: Constructs an `http::Request` to fetch the list of available models.
+-   `parse_list_models(Response<Vec<u8>>) -> Result<Vec<String>, Box<dyn Error>>`: Parses the `http::Response` from the models list request into a vector of model names.
+-   `api_key_name() -> Option<String>`: (Optional) Returns the name of an environment variable for an API key.
+
+Your provider struct created in `from_config` will then need to implement `HTTPChatProvider`, `HTTPEmbeddingProvider`, and `HTTPCompletionProvider`. See the [Native Plugin Development Guide](development.md#developing-native-plugins) for a full example.
+
+---
+
+## 2. Extism (Wasm) Plugin Interface
+
+Extism plugins are Wasm modules that export a set of functions that the host calls. Data is passed between the host and plugin as JSON-encoded byte arrays. The `impl_extism_http_plugin!` macro can generate all of these exports for you.
+
+### Core Exported Functions
+
+1.  **`name() -> String`**: Returns the human-readable name of the plugin.
+2.  **`api_key_name() -> Option<String>`**: Returns the name of an environment variable for an API key.
+3.  **`config_schema() -> String`**: Returns a JSON string representing the JSON Schema for the plugin's configuration.
+4.  **`from_config(config: Json<YourConfigType>) -> Result<Json<YourConfigType>, Error>`**: Validates the plugin-specific configuration.
+5.  **`list_models(config: Json<serde_json::Value>) -> Result<Json<Vec<String>>, Error>`**: Dynamically lists available models, usually by making an HTTP request from within the Wasm module.
+6.  **`base_url() -> String`**: Returns the default base URL for the provider, used by the host to configure network access for the sandbox.
+
+### LLM Operation Functions
+
+These functions handle the core LLM tasks. Their inputs are wrapper structs that bundle the configuration with the request data.
+
+7.  **`chat(input: ExtismChatRequest<YourConfigType>) -> Result<Json<ExtismChatResponse>, Error>`**: Handles chat completion requests.
+8.  **`embed(input: ExtismEmbedRequest<YourConfigType>) -> Result<Json<Vec<Vec<f32>>>, Error>`**: Generates embeddings.
+9.  **`complete(input: ExtismCompleteRequest<YourConfigType>) -> Result<Json<CompletionResponse>, Error>`**: Handles text completion.
+
+See [Data Structures](data_structures.md) for details on the `Extism*` request/response types.

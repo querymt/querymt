@@ -1,6 +1,6 @@
 # Building Providers (LLMBuilder)
 
-QueryMT uses a fluent builder pattern, embodied by the `LLMBuilder` struct, to simplify the configuration and instantiation of `LLMProvider` instances. This approach allows you to chain configuration methods in a readable and expressive way.
+QueryMT uses a fluent builder pattern, embodied by the `querymt::builder::LLMBuilder`, to simplify the configuration and instantiation of `LLMProvider` instances. This approach allows you to chain configuration methods in a readable and expressive way.
 
 The `LLMBuilder` is defined in `crates/querymt/src/builder.rs`.
 
@@ -10,7 +10,7 @@ The `LLMBuilder` allows you to set various common and provider-specific paramete
 
 ### Common Configuration Options:
 
-*   **`provider(name: String)`**: Specifies the name of the LLM provider to use (e.g., "openai", "anthropic", "my-custom-plugin"). This name is used to look up the corresponding `LLMProviderFactory` from a `ProviderRegistry`.
+*   **`provider(name: String)`**: Specifies the name of the LLM provider to use (e.g., "openai", "anthropic", "my-custom-plugin"). This name is used to look up the corresponding `LLMProviderFactory` from a `PluginRegistry`.
 *   **`api_key(key: String)`**: Sets the API key for authentication with the provider.
 *   **`base_url(url: String)`**: Sets a custom base URL, often used for self-hosted models or proxies.
 *   **`model(model_id: String)`**: Specifies the model identifier to use (e.g., "gpt-4", "claude-2.1").
@@ -26,18 +26,22 @@ The `LLMBuilder` allows you to set various common and provider-specific paramete
 *   **`validator_attempts(attempts: usize)`**: Sets the number of retries if validation fails.
 *   **`add_tool(tool: T)`**: Registers a tool (an implementation of `CallFunctionTool`) to be made available to the LLM. See [Tools & Function Calling](./tools.md).
 *   **`tool_choice(choice: ToolChoice)`**: Specifies how the LLM should use tools (e.g., auto, force specific tool).
+*   **`enable_parallel_tool_use(enable: bool)`**: Allows the model to call multiple tools in parallel, if supported.
+*   **`reasoning(enable: bool)`**: Enables the model to output its reasoning or "thinking" steps.
+*   **`reasoning_effort(effort: ReasoningEffort)`**: Specifies the desired level of reasoning effort (`Low`, `Medium`, `High`).
+*   **`reasoning_budget_tokens(tokens: u32)`**: Allocates a token budget for the model's reasoning process.
 *   **`parameter(key: String, value: Value)`**: Allows setting arbitrary provider-specific parameters.
 
 ### Building the Provider
 
-*   **`build(self, registry: &dyn ProviderRegistry) -> Result<Box<dyn LLMProvider>, LLMError>`**:
-    This is the final step. It takes a reference to a `ProviderRegistry` (which knows how to create different providers).
+*   **`build(self, registry: &PluginRegistry) -> Result<Box<dyn LLMProvider>, LLMError>`**:
+    This is the final step. It takes a reference to a `querymt::plugin::host::PluginRegistry` (which knows how to create different providers).
     1.  It serializes the builder's configuration into a JSON `Value`.
     2.  It retrieves the appropriate `LLMProviderFactory` from the `registry` based on the `provider` name set earlier.
     3.  It prunes the full configuration based on the schema provided by the factory, so only relevant options are passed.
     4.  It calls `factory.from_config()` with the pruned configuration to get a base `LLMProvider`.
-    5.  If tools were added via `add_tool()`, it wraps the base provider in a `ToolEnabledProvider`.
-    6.  If a `validator` was set, it further wraps the provider in a `ValidatedLLM`.
+    5.  If tools were added via `add_tool()`, it wraps the base provider in a `querymt::tool_decorator::ToolEnabledProvider`.
+    6.  If a `validator` was set, it further wraps the provider in a `querymt::validated_llm::ValidatedLLM`.
     7.  Returns the fully configured `LLMProvider` instance, boxed as a trait object.
 
 ## Example Usage (Conceptual)
@@ -45,11 +49,11 @@ The `LLMBuilder` allows you to set various common and provider-specific paramete
 ```rust
 use querymt::builder::LLMBuilder;
 use querymt::chat::ToolChoice;
-use querymt::plugin::ProviderRegistry; // Assuming you have a registry instance
+use querymt::plugin::host::PluginRegistry; // Assuming you have a registry instance
 // Assume GetWeatherTool is an impl CallFunctionTool
 // use my_tools::GetWeatherTool;
 
-async fn setup_llm_provider(registry: &dyn ProviderRegistry) -> Result<Box<dyn querymt::LLMProvider>, querymt::error::LLMError> {
+async fn setup_llm_provider(registry: &PluginRegistry) -> Result<Box<dyn querymt::LLMProvider>, querymt::error::LLMError> {
     let llm = LLMBuilder::new()
         .provider("openai") // Or your plugin's name
         .model("gpt-4-turbo")
@@ -74,4 +78,3 @@ async fn setup_llm_provider(registry: &dyn ProviderRegistry) -> Result<Box<dyn q
 ```
 
 The `LLMBuilder` provides a convenient and type-safe way to configure diverse LLM providers with a wide range of options, abstracting away the underlying factory and wrapping logic.
-

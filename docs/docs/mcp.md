@@ -7,14 +7,15 @@ Key components for MCP integration are found in the `crates/querymt/src/mcp/` di
 ## Core Concepts
 
 *   **MCP Server:** An external process or service implementing the MCP protocol (as defined by `rmcp`). It exposes a set of "tools" (in the MCP sense, which are similar to functions) that can be invoked.
-*   **`McpServerConfig`**: A configuration struct in QueryMT (defined in `crates/querymt/src/mcp/config.rs`) that specifies how to connect to an MCP server.
+*   **`querymt::mcp::config::McpServerConfig`**: A configuration struct in QueryMT that specifies how to connect to an MCP server.
     *   `name`: A unique name for this MCP server configuration.
-    *   `transport`: Defines the communication protocol and parameters. Supported transports include:
-        *   **`Sse` (Server-Sent Events):** Connects to an MCP server over HTTP using SSE. Requires a `url`.
+    *   `transport`: An `enum@querymt::mcp::config::McpServerTransportConfig` that defines the communication protocol and parameters. Supported transports include:
+        *   **`Http`**: Connects to an MCP server over standard HTTP. Requires a `url` and optional `token`.
+        *   **`Sse` (Server-Sent Events):** Connects to an MCP server over HTTP using SSE. Requires a `url` and optional `token`.
         *   **`Stdio`:** Spawns an MCP server as a child process and communicates with it over `stdin`/`stdout`. Requires the `command` to execute, optional `args`, and `envs`.
 *   **`rmcp::RoleClient`**: The `rmcp` client used by QueryMT to communicate with an MCP server.
-*   **`McpToolAdapter`**: A crucial adapter (in `crates/querymt/src/mcp/adapter.rs`) that bridges the gap between an MCP tool (an `rmcp::model::Tool`) and QueryMT's tool system (`querymt::chat::Tool` and `querymt::tool_decorator::CallFunctionTool`).
-    *   It converts the MCP tool's input schema into a `ParametersSchema` that QueryMT's LLMs can understand.
+*   **`querymt::mcp::adapter::McpToolAdapter`**: A crucial adapter that bridges the gap between an MCP tool (`rmcp::model::Tool`) and QueryMT's tool system (`struct@querymt::chat::Tool` and `trait@querymt::tool_decorator::CallFunctionTool`).
+    *   It converts the MCP tool's input schema into a `serde_json::Value` that QueryMT's LLMs can understand.
     *   It implements `CallFunctionTool`, so an MCP tool can be registered with `LLMBuilder` just like any other native Rust tool. When the LLM decides to call this tool, the `McpToolAdapter` forwards the call to the actual MCP server via the `rmcp` client.
 
 ## Workflow
@@ -26,19 +27,19 @@ Key components for MCP integration are found in the `crates/querymt/src/mcp/` di
     # Example mcp_config.toml
     [[mcp]]
     name = "my_calculator_service"
-    protocol = "stdio" # or "sse"
+    protocol = "stdio" # or "sse" or "http"
     command = "/path/to/mcp_calculator_server_binary"
     # args = ["--port", "8080"] # if needed
-    # url = "http://localhost:8000/mcp_events" # for sse
 
     [[mcp]]
     name = "external_data_api"
     protocol = "sse"
     url = "https://api.example.com/mcp_endpoint"
+    token = "some-secret-token"
     ```
 
 2.  **Start MCP Clients:**
-    *   Your application uses `mcp::config::Config::create_mcp_clients()` to establish connections to all configured MCP servers. This returns a map of server names to `RunningService<RoleClient, ()>` instances.
+    *   Your application uses `mcp::config::Config::create_mcp_clients()` to establish connections to all configured MCP servers. This returns a map of server names to `RunningService<RoleClient, Box<dyn DynService<RoleClient>>>` instances.
 
 3.  **Discover Tools from MCP Server:**
     *   Once connected, you can query an MCP server for the list of tools it provides. The `rmcp` client would typically have a method like `list_tools()`. Each tool returned will be an `rmcp::model::Tool`.
@@ -56,22 +57,22 @@ Key components for MCP integration are found in the `crates/querymt/src/mcp/` di
     use querymt::mcp::{config::Config as McpConfig, adapter::McpToolAdapter};
     // ... other imports ...
 
-    // let mcp_config = McpConfig::load("mcp_config.toml").await?;
-    // let mcp_clients = mcp_config.create_mcp_clients().await?;
+    let mcp_config = McpConfig::load("mcp_config.toml").await?;
+    let mcp_clients = mcp_config.create_mcp_clients().await?;
 
-    // let calculator_client_service = mcp_clients.get("my_calculator_service").unwrap();
-    // let mcp_calc_tool_description = calculator_client_service.client().list_tools().await?.into_iter().find(|t| t.name == "add").unwrap();
+    let calculator_client_service = mcp_clients.get("my_calculator_service").unwrap();
+    let mcp_calc_tool_description = calculator_client_service.client().list_tools().await?.into_iter().find(|t| t.name == "add").unwrap();
 
-    // let adapted_calc_tool = McpToolAdapter::try_new(
-    //     mcp_calc_tool_description,
-    //     calculator_client_service.client().sink().clone()
-    // )?;
+    let adapted_calc_tool = McpToolAdapter::try_new(
+        mcp_calc_tool_description,
+        calculator_client_service.client().sink().clone()
+    )?;
 
-    // let llm = LLMBuilder::new()
-    //     .provider("some_provider")
-    //     // ... other configs ...
-    //     .add_tool(adapted_calc_tool) // Register the MCP tool adapter
-    //     .build(&provider_registry)?;
+    let llm = LLMBuilder::new()
+        .provider("some_provider")
+        // ... other configs ...
+        .add_tool(adapted_calc_tool) // Register the MCP tool adapter
+        .build(&provider_registry)?;
     ```
 
 6.  **LLM Interaction:**
@@ -90,4 +91,3 @@ Key components for MCP integration are found in the `crates/querymt/src/mcp/` di
 *   **Language Independence (for MCP servers):** MCP servers can be written in any language, as long as they implement the MCP protocol.
 
 By integrating with MCP servers, QueryMT allows LLMs to leverage a broader ecosystem of tools and services in a structured and maintainable way.
-

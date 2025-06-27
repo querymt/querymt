@@ -6,16 +6,16 @@ These are primarily defined in `crates/querymt/src/chain/mod.rs` and `crates/que
 
 ## `PromptChain` (Single Provider)
 
-A `PromptChain` executes a sequence of steps using a single `LLMProvider` instance.
+A `querymt::chain::PromptChain` executes a sequence of steps using a single `LLMProvider` instance.
 
 ### Key Components:
 
-*   **`ChainStep`**: Defines a single step in the chain.
+*   **`querymt::chain::ChainStep`**: Defines a single step in the chain.
     *   `id`: A unique identifier for this step. The output of this step will be stored in memory using this ID.
     *   `template`: A prompt template string. It can contain placeholders like `{{variable_name}}`, which will be replaced by outputs from previous steps (stored in memory).
-    *   `mode`: `ChainStepMode::Chat` or `ChainStepMode::Completion`, indicating how this step should be executed.
+    *   `mode`: `enum@querymt::chain::ChainStepMode::Chat` or `enum@querymt::chain::ChainStepMode::Completion`, indicating how this step should be executed.
     *   Optional parameters like `temperature`, `max_tokens`, `top_p`.
-*   **`PromptChain<'a>`**: Manages the sequence of `ChainStep`s.
+*   **`querymt::chain::PromptChain<'a>`**: Manages the sequence of `ChainStep`s.
     *   It holds a reference to an `LLMProvider` and a `memory` (HashMap) to store the outputs of each step.
     *   `new(llm: &'a dyn LLMProvider)`: Creates a new chain.
     *   `step(step: ChainStep)`: Adds a step to the chain.
@@ -48,25 +48,26 @@ println!("Generated Plot: {}", results.get("step2_plot").unwrap_or_default());
 
 ## `MultiPromptChain` (Multiple Providers)
 
-A `MultiPromptChain` allows you to define steps that can be executed by different LLM providers, registered in an `LLMRegistry`.
+A `querymt::chain::MultiPromptChain` allows you to define steps that can be executed by different LLM providers, registered in an `querymt::chain::LLMRegistry`. It also supports complex, iterative tool-calling within each step.
 
 ### Key Components:
 
-*   **`LLMRegistry`**: A collection (`HashMap`) that stores multiple `LLMProvider` instances, each identified by a unique string key (e.g., "openai", "anthropic-haiku").
-    *   `LLMRegistryBuilder` provides a fluent way to construct this registry.
-*   **`MultiChainStep`**: Similar to `ChainStep`, but includes:
+*   **`querymt::chain::LLMRegistry`**: A collection (`HashMap`) that stores multiple `LLMProvider` instances, each identified by a unique string key (e.g., "openai", "anthropic-haiku").
+    *   `querymt::chain::LLMRegistryBuilder` provides a fluent way to construct this registry.
+*   **`querymt::chain::multi::MultiChainStep`**: Similar to `ChainStep`, but includes:
     *   `provider_id`: The string key of the `LLMProvider` in the `LLMRegistry` that should execute this step.
     *   `response_transform`: An optional function `Box<dyn Fn(String) -> String + Send + Sync>` to transform the raw string output of the LLM before storing it in memory.
-*   **`MultiChainStepBuilder`**: Builder for `MultiChainStep`.
-*   **`MultiPromptChain<'a>`**: Manages the sequence of `MultiChainStep`s.
+*   **`querymt::chain::multi::MultiChainStepBuilder`**: Builder for `MultiChainStep`.
+*   **`querymt::chain::MultiPromptChain<'a>`**: Manages the sequence of `MultiChainStep`s.
     *   Holds a reference to an `LLMRegistry`.
     *   The `run()` method works similarly to `PromptChain`, but for each step, it retrieves the specified `LLMProvider` from the registry before execution.
+    *   **Tool Calling Loop**: Within a single chat step, `MultiPromptChain` can handle iterative tool calls. If the LLM responds with a request to call a tool, the chain will execute the tool via the provider's `call_tool` method, append the result to the conversation history, and send it back to the LLM. This loop continues until the LLM provides a final text response without any tool calls.
 
 ### Example (Conceptual `MultiPromptChain`):
 
 ```rust
 // Assuming 'registry' is an LLMRegistry with providers "fast_model" and "creative_model"
-use querymt::chain::{MultiPromptChain, MultiChainStepBuilder, MultiChainStepMode, LLMRegistryBuilder};
+use querymt::chain::{MultiPromptChain, multi::{MultiChainStepBuilder, MultiChainStepMode}, LLMRegistryBuilder};
 
 // let registry = LLMRegistryBuilder::new()
 //     .register("fast_model", fast_llm_provider)
@@ -95,5 +96,4 @@ let results = chain.run().await?;
 println!("Generated Tagline: {}", results.get("step2_tagline").unwrap_or_default());
 ```
 
-Prompt chaining is a powerful technique for building more sophisticated LLM applications by decomposing tasks and leveraging the strengths of different models or configurations for different parts of a workflow. QueryMT's chaining mechanisms provide the tools to implement these complex interactions.
-
+Prompt chaining is a powerful technique for building more sophisticated LLM applications by decomposing tasks and leveraging the strengths of different models or configurations for different parts of a workflow.

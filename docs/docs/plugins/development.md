@@ -1,68 +1,65 @@
-# Getting Started with Plugin Development
+# Plugin Development
 
-Developing an Extism plugin for QueryMT involves creating a WebAssembly (Wasm) module that implements a specific interface. Rust is a recommended language due to its strong Wasm support and the availability of helper crates like `extism-pdk` and QueryMT's own plugin utilities.
+This guide provides instructions for developing both **Native** and **Extism (Wasm)** plugins for QueryMT.
 
-## Prerequisites
+---
 
-- **Rust Toolchain**: Install Rust from [rust-lang.org](https://www.rust-lang.org/).
-- **Wasm Target**: Add the Wasm target: `rustup target add wasm32-wasip1`.
-- **Extism PDK**: Familiarize yourself with the [Extism PDK for Rust](https://extism.org/docs/category/pdk-for-rust).
+## Developing Native Plugins
 
-## Project Setup
+Native plugins offer the best performance by running as shared libraries directly within the host process. They are recommended for trusted, performance-critical integrations.
+
+### 1. Prerequisites
+
+-   Rust Toolchain: Install Rust from [rust-lang.org](https://www.rust-lang.org/).
+
+### 2. Project Setup
 
 1.  **Create a new Rust library project**:
     ```bash
-    cargo new my_llm_plugin --lib
-    cd my_llm_plugin
+    cargo new my_native_plugin --lib
+    cd my_native_plugin
     ```
 
 2.  **Update `Cargo.toml`**:
-    Add necessary dependencies. For an HTTP-based plugin using QueryMT helpers:
+    Configure the crate to build a dynamic system library (`cdylib`).
 
     ```toml
     [package]
-    name = "my_llm_plugin"
+    name = "my_native_plugin"
     version = "0.1.0"
     edition = "2021"
 
     [lib]
-    crate-type = ["cdylib"] # Important for Wasm shared libraries
+    crate-type = ["cdylib"] # Important for shared libraries
 
     [dependencies]
-    extism-pdk = "1.0.0" # Or latest version
+    querymt = { path = "../../..", features = ["http-client"] } # Adjust path
     serde = { version = "1.0", features = ["derive"] }
     serde_json = "1.0"
-    schemars = "0.8" # For generating JSON schemas for config
-
-    # QueryMT dependency (assuming it's published or path-based)
-    # Replace with actual path or crates.io version when available
-    querymt = { path = "../../..", features = ["extism_plugin"] }
-    # or querymt = { version = "x.y.z", features = ["extism_plugin"] }
-
-    [profile.release]
-    lto = true
-    opt-level = 'z' # Optimize for size
-    strip = true
+    schemars = "0.8"
+    http = "0.2"
+    # Add any other dependencies your provider needs
     ```
-    *Note: The `querymt` dependency path/version needs to be adjusted based on your project structure or if it's published to crates.io. Ensure the `extism_plugin_impl` feature is enabled.*
+    *Note: The `querymt` dependency does **not** use the `extism_plugin` feature.*
 
-## Implementing the Plugin
+### 3. Implementing the Plugin
 
-The easiest way to create an HTTP-based LLM plugin is by using the `impl_extism_http_plugin!` macro provided by QueryMT. This macro scaffolds most of the required boilerplate.
-
-### Example: Simple HTTP Plugin
+You will implement the `HTTPLLMProviderFactory` trait and export it via the `plugin_http_factory` function.
 
 ```rust
 // src/lib.rs
-use querymt::plugin::extism_impl::impl_extism_http_plugin;
-use querymt::chat::http::HTTPChatProvider; // Traits for HTTP provider logic
+use querymt::plugin::http::{HTTPLLMProviderFactory, HTTPFactoryCtor};
+use querymt::chat::http::HTTPChatProvider;
 use querymt::completion::http::HTTPCompletionProvider;
 use querymt::embedding::http::HTTPEmbeddingProvider;
-use querymt::plugin::http::HTTPLLMProviderFactory; // Trait for factory logic
-use querymt::{CompletionRequest, CompletionResponse, ChatMessage, ChatResponse, Tool, ToolCall};
+use querymt::{
+    HTTPLLMProvider, CompletionRequest, CompletionResponse,
+    ChatMessage, ChatResponse, Tool, ToolCall, LLMError
+};
 use serde::{Serialize, Deserialize};
-use schemars::JsonSchema; // For config schema generation
-use std::collections::HashMap; // For http::Request headers
+use schemars::{JsonSchema, schema_for};
+use std::collections::HashMap;
+use std::error::Error;
 
 // 1. Define your plugin's configuration structure
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug)]
@@ -72,159 +69,150 @@ pub struct MyPluginConfig {
     #[serde(default = "default_base_url")]
     pub base_url: String,
 }
+fn default_base_url() -> String { "https://api.examplellm.com/v1".to_string() }
 
-fn default_base_url() -> String {
-    "https://api.examplellm.com/v1".to_string()
+// 2. Define your provider struct. It holds the config.
+#[derive(Clone)]
+pub struct MyProvider {
+    config: MyPluginConfig,
 }
 
-// Implement default for config if needed by the factory or for simplicity
-impl Default for MyPluginConfig {
-    fn default() -> Self {
-        Self {
-            api_key: String::new(), // Typically fetched from env var specified by api_key_name
-            model_name: Some("default-model".to_string()),
-            base_url: default_base_url(),
-        }
+// 3. Implement the core HTTP provider traits for your provider struct.
+// This defines how to build requests and parse responses.
+impl HTTPChatProvider for MyProvider {
+    // ... implement chat_request() and parse_chat() ...
+    fn chat_request(&self, messages: &[ChatMessage], _tools: Option<&[Tool]>) -> Result<http::Request<Vec<u8>>, LLMError> { /* ... */ Ok(http::Request::default()) }
+    fn parse_chat(&self, resp: http::Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, Box<dyn Error>> { /* ... */ Ok(Box::new(querymt::completion::CompletionResponse{text:"...".into()})) }
+}
+impl HTTPEmbeddingProvider for MyProvider { /* ... */
+    fn embed_request(&self, inputs: &[String]) -> Result<http::Request<Vec<u8>>, LLMError> { Ok(http::Request::default()) }
+    fn parse_embed(&self, resp: http::Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, Box<dyn Error>> { Ok(vec![]) }
+}
+impl HTTPCompletionProvider for MyProvider { /* ... */
+    fn complete_request(&self, req: &CompletionRequest) -> Result<http::Request<Vec<u8>>, LLMError> { Ok(http::Request::default()) }
+    fn parse_complete(&self, resp: http::Response<Vec<u8>>) -> Result<CompletionResponse, Box<dyn Error>> { Ok(CompletionResponse{text:"...".into()}) }
+}
+
+// This blanket impl turns your provider struct into an HTTPLLMProvider
+impl HTTPLLMProvider for MyProvider {}
+
+// 4. Implement the factory, which knows how to create your provider.
+pub struct MyFactory;
+
+impl HTTPLLMProviderFactory for MyFactory {
+    fn name(&self) -> &str {
+        "My Native HTTP Plugin"
     }
+
+    fn config_schema(&self) -> serde_json::Value {
+        serde_json::to_value(schema_for!(MyPluginConfig)).unwrap()
+    }
+
+    fn from_config(&self, cfg: &serde_json::Value) -> Result<Box<dyn HTTPLLMProvider>, Box<dyn Error>> {
+        let config: MyPluginConfig = serde_json::from_value(cfg.clone())?;
+        let provider = MyProvider { config };
+        Ok(Box::new(provider))
+    }
+
+    // Implement list_models_request, parse_list_models, api_key_name...
+    fn list_models_request(&self, cfg: &serde_json::Value) -> Result<http::Request<Vec<u8>>, LLMError> { Ok(http::Request::default()) }
+    fn parse_list_models(&self, resp: http::Response<Vec<u8>>) -> Result<Vec<String>, Box<dyn Error>> { Ok(vec![]) }
 }
 
-// 2. Implement the necessary provider traits for your config
-// These traits define how to construct HTTP requests and parse responses.
+// 5. Export the factory constructor function. This is the entry point for the host.
+#[no_mangle]
+pub unsafe extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
+    Box::into_raw(Box::new(MyFactory))
+}
+```
 
-// This is a marker struct for your factory implementation
+### 4. Building the Plugin
+
+Compile your Rust library into a shared object:
+```bash
+cargo build --release
+```
+The compiled library will be at `target/release/libmy_native_plugin.so` (or `.dll`/`.dylib`). This is the file you configure in `plugins.toml`.
+
+---
+
+## Developing Extism (Wasm) Plugins
+
+Extism plugins provide security and portability by running in a Wasm sandbox.
+
+### 1. Prerequisites
+
+-   Rust Toolchain: Install Rust from [rust-lang.org](https://www.rust-lang.org/).
+-   Wasm Target: Add the Wasm target: `rustup target add wasm32-wasip1`.
+
+### 2. Project Setup
+
+1.  **Create a new Rust library project**:
+    ```bash
+    cargo new my_extism_plugin --lib
+    cd my_extism_plugin
+    ```
+
+2.  **Update `Cargo.toml`**:
+    ```toml
+    [package]
+    name = "my_extism_plugin"
+    # ...
+
+    [lib]
+    crate-type = ["cdylib"]
+
+    [dependencies]
+    extism-pdk = "1.0.0"
+    serde = { version = "1.0", features = ["derive"] }
+    serde_json = "1.0"
+    schemars = "0.8"
+    querymt = { path = "../../..", features = ["extism_plugin"] } # Note the feature
+
+    [profile.release]
+    lto = true
+    opt-level = 'z'
+    strip = true
+    ```
+
+### 3. Implementing the Plugin
+
+The easiest way to create an HTTP-based Wasm plugin is using the `impl_extism_http_plugin!` macro. The implementation logic for the HTTP traits is identical to the native plugin example, but it's all wrapped in the macro.
+
+```rust
+// src/lib.rs
+use querymt::plugin::extism_impl::impl_extism_http_plugin;
+use querymt::chat::http::HTTPChatProvider;
+use querymt::plugin::http::HTTPLLMProviderFactory;
+// ... other trait imports
+
+// 1. Define your config struct (same as native example)
+#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema, Clone, Debug)]
+pub struct MyPluginConfig { /* ... */ }
+// ... with default_base_url() function
+
+// 2. Implement the HTTP provider traits for your config struct
+impl HTTPChatProvider for MyPluginConfig { /* ... */ }
+// ... HTTPEmbeddingProvider, HTTPCompletionProvider ...
+
+// 3. Create a marker struct for your factory logic
 struct MyPluginFactory;
 
-impl HTTPLLMProviderFactory for MyPluginFactory {
-    // Implement methods like api_key_name(), list_models_request(), parse_list_models()
-    // For example:
-    fn api_key_name(&self) -> Option<String> {
-        Some("EXAMPLE_LLM_API_KEY".to_string())
-    }
+// 4. Implement the factory trait for the marker struct
+impl HTTPLLMProviderFactory for MyPluginFactory { /* ... */ }
 
-    fn list_models_request(&self, cfg: &serde_json::Value) -> Result<http::Request<Vec<u8>>, querymt::error::LLMError> {
-        let config: MyPluginConfig = serde_json::from_value(cfg.clone())?;
-        let request = http::Request::builder()
-            .method("GET")
-            .uri(format!("{}/models", config.base_url))
-            .header("Authorization", format!("Bearer {}", config.api_key))
-            .body(Vec::new())?;
-        Ok(request)
-    }
-
-    fn parse_list_models(&self, resp: http::Response<Vec<u8>>) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        // Parse the HTTP response body (e.g., JSON) into Vec<String>
-        // Example:
-        // let body = serde_json::from_slice::<serde_json::Value>(resp.body())?;
-        // let models = body["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_string()).collect();
-        // Ok(models)
-        Ok(vec!["example-model-1".to_string(), "example-model-2".to_string()])
-    }
-}
-
-impl HTTPChatProvider for MyPluginConfig {
-    // Implement chat_request() and parse_chat()
-    fn chat_request(
-        &self,
-        messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
-    ) -> Result<http::Request<Vec<u8>>, querymt::error::LLMError> {
-        let body = serde_json::json!({
-            "model": self.model_name.as_deref().unwrap_or("default-model"),
-            "messages": messages,
-            // Add tools if your API supports them
-        });
-        let request = http::Request::builder()
-            .method("POST")
-            .uri(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .body(serde_json::to_vec(&body)?)?;
-        Ok(request)
-    }
-
-    fn parse_chat(
-        &self,
-        resp: http::Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, querymt::error::LLMError> {
-        // Parse the HTTP response and adapt it to Box<dyn ChatResponse>
-        // Example:
-        // let body = serde_json::from_slice::<serde_json::Value>(resp.body())?;
-        // let text = body["choices"][0]["message"]["content"].as_str().map(String::from);
-        // Ok(Box::new(querymt::plugin::extism_impl::ExtismChatResponse { text, tool_calls: None, thinking: None }))
-        struct MyChatResponse { text: Option<String> }
-        impl ChatResponse for MyChatResponse {
-            fn text(&self) -> Option<String> { self.text.clone() }
-            fn tool_calls(&self) -> Option<Vec<ToolCall>> { None }
-            fn thinking(&self) -> Option<String> { None }
-        }
-        Ok(Box::new(MyChatResponse { text: Some(String::from_utf8_lossy(resp.body()).to_string()) }))
-    }
-}
-
-// Implement HTTPEmbeddingProvider and HTTPCompletionProvider similarly if needed...
-impl HTTPEmbeddingProvider for MyPluginConfig {
-    fn embed_request(&self, inputs: &[String]) -> Result<http::Request<Vec<u8>>, querymt::error::LLMError> {
-        // ... construct embedding request ...
-        let body = serde_json::json!({ "inputs": inputs });
-        let request = http::Request::builder()
-            .method("POST")
-            .uri(format!("{}/embeddings", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .body(serde_json::to_vec(&body)?)?;
-        Ok(request)
-    }
-
-    fn parse_embed(&self, resp: http::Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, querymt::error::LLMError> {
-        // ... parse embedding response ...
-        // Example: let embeddings = serde_json::from_slice(resp.body())?;
-        // Ok(embeddings)
-        Ok(serde_json::from_slice(resp.body())?)
-    }
-}
-
-impl HTTPCompletionProvider for MyPluginConfig {
-    fn complete_request(&self, req: &CompletionRequest) -> Result<http::Request<Vec<u8>>, querymt::error::LLMError> {
-        // ... construct completion request ...
-        let body = serde_json::json!({ "prompt": req.prompt });
-        let request = http::Request::builder()
-            .method("POST")
-            .uri(format!("{}/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .body(serde_json::to_vec(&body)?)?;
-        Ok(request)
-    }
-
-    fn parse_complete(&self, resp: http::Response<Vec<u8>>) -> Result<CompletionResponse, querymt::error::LLMError> {
-        // ... parse completion response ...
-        // Example: let completion_response = serde_json::from_slice(resp.body())?;
-        // Ok(completion_response)
-        Ok(serde_json::from_slice(resp.body())?)
-    }
-}
-
-
-// 3. Use the macro to export all necessary Extism functions
+// 5. Use the macro to export all necessary Extism functions
 impl_extism_http_plugin!(
-    config = MyPluginConfig,  // Your config struct
-    factory = MyPluginFactory, // Your factory struct
-    name = "My Example LLM HTTP Plugin" // Display name for the plugin
+    config = MyPluginConfig,
+    factory = MyPluginFactory,
+    name = "My Example Extism HTTP Plugin"
 );
 ```
-This example uses placeholder implementations for parsing. You'll need to adapt them to the specific API of the LLM provider you are integrating.
 
-## Building the Plugin
+### 4. Building the Plugin
 
 Compile your Rust library to Wasm:
 ```bash
 cargo build --target wasm32-wasip1 --release
 ```
-The Wasm file will be located at `target/wasm32-wasip1/release/my_llm_plugin.wasm`. This is the file you'll configure QueryMT to load.
-
-## Debuging the Plugin
-
-In case you would like to have the logging information printed to stdout/stderr you need to enable the wasi output for the plugin by setting the following
-environmential variable `EXTISM_ENABLE_WASI_OUTPUT=1`.
-
-Next, learn more about the [Plugin Interface](interface_spec.md) and [Helper Macros](helper_macros.md).
+The Wasm file will be at `target/wasm32-wasip1/release/my_extism_plugin.wasm`. This is the file you configure in `plugins.toml`.
