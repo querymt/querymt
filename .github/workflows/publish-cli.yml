@@ -83,40 +83,29 @@ jobs:
       - name: Build executable
         run: cargo build --release --package ${{ env.APP_NAME }} --target ${{ matrix.target }}
 
-      # Prepare the binary and other files (README, LICENSE) for packaging.
       - name: Prepare artifact for upload
         shell: bash
         run: |
-          # Define source and artifact names
-          SRC_DIR="target/${{ matrix.target }}/release"
-          ARTIFACT_NAME="${{ env.APP_NAME }}-${{ github.ref_name }}-${{ matrix.target }}"
+          ARTIFACT_DIR="dist"
+          PACKAGE_NAME="${{ env.APP_NAME }}-${{ github.ref_name }}-${{ matrix.target }}"
+          STAGING_PATH="${ARTIFACT_DIR}/${PACKAGE_NAME}"
+          mkdir -p "${STAGING_PATH}"
 
-          # Create a directory to stage the files
-          mkdir -p "dist/${ARTIFACT_NAME}"
+          # Copy files into the staging directory
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "${STAGING_PATH}/"
+          cp README.md "${STAGING_PATH}/"
+          cp LICENSE "${STAGING_PATH}/" || true
 
-          # Copy the compiled binary
-          cp "${SRC_DIR}/${{ matrix.bin_name }}" "dist/${ARTIFACT_NAME}/"
-
-          # Copy documentation and license files into the package
-          cp README.md "dist/${ARTIFACT_NAME}/"
-          # Use '|| true' to prevent failure if LICENSE file doesn't exist
-          cp LICENSE "dist/${ARTIFACT_NAME}/" || true
-
-          # Create the archive (.zip for Windows, .tar.gz for others)
-          echo "Creating archive for ${ARTIFACT_NAME}"
+          # Create the archive from the staging directory
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            cd dist
-            zip -r "${ARTIFACT_NAME}.zip" "${ARTIFACT_NAME}"
-            cd ..
-            echo "ASSET_PATH=dist/${ARTIFACT_NAME}.zip" >> $GITHUB_ENV
+            ARCHIVE_PATH="${ARTIFACT_DIR}/${PACKAGE_NAME}.zip"
+            (cd "${STAGING_PATH}" && zip -r "../${PACKAGE_NAME}.zip" .)
           else
-            cd dist
-            tar -czf "${ARTIFACT_NAME}.tar.gz" "${ARTIFACT_NAME}"
-            cd ..
-            echo "ASSET_PATH=dist/${ARTIFACT_NAME}.tar.gz" >> $GITHUB_ENV
+            ARCHIVE_PATH="${ARTIFACT_DIR}/${PACKAGE_NAME}.tar.gz"
+            tar -czf "${ARCHIVE_PATH}" -C "${ARTIFACT_DIR}" "${PACKAGE_NAME}"
           fi
 
-          echo "Asset path is ${{ env.ASSET_PATH }}"
+          echo "ASSET_PATH=${ARCHIVE_PATH}" >> $GITHUB_ENV
 
       # Upload the packaged executable as a build artifact.
       # This will be downloaded by the 'release' job later.
@@ -126,34 +115,35 @@ jobs:
           name: ${{ env.APP_NAME }}-${{ matrix.target }}
           path: ${{ env.ASSET_PATH }}
 
-  # =================================================================
-  #  Release Job: Creates the GitHub release after all builds succeed
-  # =================================================================
   release:
     name: Create GitHub Release
-    # This job depends on all 'build' jobs completing successfully
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      # Required to create a release and upload assets
       contents: write
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
-          # The destination path for downloaded artifacts
           path: artifacts/
-          # A pattern to match artifacts from the matrix build
           pattern: ${{ env.APP_NAME }}-*
-          # Merge artifacts from different jobs into a single directory
           merge-multiple: true
 
+      - name: List downloaded artifacts
+        run: ls -l artifacts/
+
       - name: Create Release and Upload Assets
+        id: create_release # Add an ID to reference this step's outputs
         uses: softprops/action-gh-release@v2
-        # Only run this step if the ref is a tag
-        if: startsWith(github.ref, 'refs/tags/')
         with:
-          # Globs of files to upload to the release
           files: artifacts/*
-          # Automatically generate release notes from commits since the last tag
           generate_release_notes: true
+          # Create a draft release if the trigger was not a tag push.
+          # Otherwise, create a full, published release.
+          draft: ${{ github.ref_type != 'tag' }}
+          # Mark non-tag releases as pre-releases for clarity.
+          prerelease: ${{ github.ref_type != 'tag' }}
+
+      - name: Print Release URL
+        if: github.ref_type != 'tag'
+        run: echo "Draft release URL: ${{ steps.create_release.outputs.html_url }}"
