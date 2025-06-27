@@ -1,0 +1,159 @@
+name: Release qmt Executable
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_NAME: qmt
+
+jobs:
+  # ==================================================================
+  #  Build Job: Compiles the executable for each target in the matrix
+  # ==================================================================
+  build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          # --- Linux Targets ---
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_name: qmt
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            bin_name: qmt
+            archive_ext: tar.gz
+
+          # --- macOS Targets ---
+          - os: macos-latest # Intel-based runner
+            target: x86_64-apple-darwin
+            bin_name: qmt
+            archive_ext: tar.gz
+          - os: macos-14 # Apple Silicon (ARM64) runner
+            target: aarch64-apple-darwin
+            bin_name: qmt
+            archive_ext: tar.gz
+
+          # --- Windows Targets ---
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: qmt.exe
+            archive_ext: zip
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            bin_name: qmt.exe
+            archive_ext: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      # For cross-compiling on Linux from x86_64 to aarch64, we need the appropriate C linker.
+      - name: Setup cross-compilation for Linux aarch64
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      # Cache Cargo dependencies to speed up future builds
+      - name: Setup Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build executable
+        run: cargo build --release --package ${{ env.APP_NAME }} --target ${{ matrix.target }}
+
+      # Prepare the binary and other files (README, LICENSE) for packaging.
+      - name: Prepare artifact for upload
+        shell: bash
+        run: |
+          # Define source and artifact names
+          SRC_DIR="target/${{ matrix.target }}/release"
+          ARTIFACT_NAME="${{ env.APP_NAME }}-${{ github.ref_name }}-${{ matrix.target }}"
+
+          # Create a directory to stage the files
+          mkdir -p "dist/${ARTIFACT_NAME}"
+
+          # Copy the compiled binary
+          cp "${SRC_DIR}/${{ matrix.bin_name }}" "dist/${ARTIFACT_NAME}/"
+
+          # Copy documentation and license files into the package
+          cp README.md "dist/${ARTIFACT_NAME}/"
+          # Use '|| true' to prevent failure if LICENSE file doesn't exist
+          cp LICENSE "dist/${ARTIFACT_NAME}/" || true
+
+          # Create the archive (.zip for Windows, .tar.gz for others)
+          echo "Creating archive for ${ARTIFACT_NAME}"
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            cd dist
+            zip -r "${ARTIFACT_NAME}.zip" "${ARTIFACT_NAME}"
+            cd ..
+            echo "ASSET_PATH=dist/${ARTIFACT_NAME}.zip" >> $GITHUB_ENV
+          else
+            cd dist
+            tar -czf "${ARTIFACT_NAME}.tar.gz" "${ARTIFACT_NAME}"
+            cd ..
+            echo "ASSET_PATH=dist/${ARTIFACT_NAME}.tar.gz" >> $GITHUB_ENV
+          fi
+
+          echo "Asset path is ${{ env.ASSET_PATH }}"
+
+      # Upload the packaged executable as a build artifact.
+      # This will be downloaded by the 'release' job later.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ matrix.target }}
+          path: ${{ env.ASSET_PATH }}
+
+  # =================================================================
+  #  Release Job: Creates the GitHub release after all builds succeed
+  # =================================================================
+  release:
+    name: Create GitHub Release
+    # This job depends on all 'build' jobs completing successfully
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to create a release and upload assets
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # The destination path for downloaded artifacts
+          path: artifacts/
+          # A pattern to match artifacts from the matrix build
+          pattern: ${{ env.APP_NAME }}-*
+          # Merge artifacts from different jobs into a single directory
+          merge-multiple: true
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        # Only run this step if the ref is a tag
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          # Globs of files to upload to the release
+          files: artifacts/*
+          # Automatically generate release notes from commits since the last tag
+          generate_release_notes: true
