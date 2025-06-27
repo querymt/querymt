@@ -5,9 +5,10 @@ QueryMT supports loading plugins distributed as OCI (Open Container Initiative) 
 ## Distributing Native and Wasm Plugins
 
 OCI registries can be used to distribute both Native and Wasm plugins. The QueryMT host determines which type of plugin an image contains using the following logic:
- 1.  **Platform Matching**: It first checks the image index for a manifest matching the host's operating system and architecture (e.g., `linux/amd64`). If a match is found, it's treated as a **Native Plugin**.
- 2.  **Wasm Fallback**: If no native platform matches, it looks for a `wasi/wasm` platform. If found, it's treated as an **Extism (Wasm) Plugin**.
- 3.  **Layer Type/Annotations**: As a fallback, it can inspect layer media types (`application/vnd.oci.image.layer.v1.tar+gzip` for native, `application/vnd.wasm.v1.layer+wasm` for Wasm) or an annotation (`mt.query.plugin.type`) to determine the type.
+
+1.  **Platform Matching**: It first checks the image index for a manifest matching the host's operating system and architecture (e.g., `linux/amd64`). If a match is found, it's treated as a **Native Plugin**.
+2.  **Wasm Fallback**: If no native platform matches, it looks for a `wasi/wasm` platform. If found, it's treated as an **Extism (Wasm) Plugin**.
+3.  **Layer Type/Annotations**: As a fallback, it can inspect layer media types (`application/vnd.oci.image.layer.v1.tar+gzip` for native, `application/vnd.wasm.v1.layer+wasm` for Wasm) or an annotation (`mt.query.plugin.type`) to determine the type.
 
 When publishing, ensure your image is built for the correct target platform(s).
 
