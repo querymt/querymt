@@ -5,6 +5,8 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::LLMError;
+
 use super::types::{ModelPricing, ModelsPricingData};
 const CACHE_FILE: &str = "openrouter_models.json";
 const CACHE_DURATION: u64 = 86_400; // 24 hours in seconds
@@ -23,14 +25,14 @@ fn is_cache_fresh(file_path: &Path) -> bool {
     false
 }
 
-async fn download_and_cache_models(
-    file_path: &Path,
-) -> Result<Vec<ModelPricing>, Box<dyn std::error::Error>> {
+async fn download_and_cache_models(file_path: &Path) -> Result<Vec<ModelPricing>, LLMError> {
     let client = Client::new();
     let response = client.get(API_URL).send().await?;
 
     if !response.status().is_success() {
-        return Err(format!("HTTP Error: {}", response.status()).into());
+        return Err(LLMError::ProviderError(
+            format!("HTTP Error: {}", response.status()).into(),
+        ));
     }
 
     let response: ModelsPricingData = response.json::<ModelsPricingData>().await?;
@@ -43,7 +45,7 @@ async fn download_and_cache_models(
     Ok(response.data)
 }
 
-pub fn read_models_pricing_from_cache() -> Result<ModelsPricingData, Box<dyn std::error::Error>> {
+pub fn read_models_pricing_from_cache() -> Result<ModelsPricingData, LLMError> {
     let home_dir = dirs::home_dir().expect("Could not find home directory");
     let file_path = home_dir.join(".qmt").join(CACHE_FILE);
 
@@ -54,7 +56,7 @@ pub fn read_models_pricing_from_cache() -> Result<ModelsPricingData, Box<dyn std
     Ok(response)
 }
 
-pub async fn update_models_pricing_if_stale() -> Result<bool, Box<dyn std::error::Error>> {
+pub async fn update_models_pricing_if_stale() -> Result<bool, LLMError> {
     let home_dir = dirs::home_dir().expect("Could not find home directory");
     let file_path = home_dir.join(".qmt").join(CACHE_FILE);
 
