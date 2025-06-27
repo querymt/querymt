@@ -3817,6 +3817,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "qmt-xai"
+version = "0.1.0"
+dependencies = [
+ "either",
+ "extism-pdk",
+ "futures",
+ "http",
+ "qmt-openai",
+ "querymt",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "querymt"
 version = "0.1.0"
 dependencies = [
