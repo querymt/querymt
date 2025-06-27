@@ -1174,10 +1174,12 @@
 <h1 id="oci-plugins">OCI Plugins</h1>
 <p>QueryMT supports loading plugins distributed as OCI (Open Container Initiative) images from container registries like Docker Hub, GitHub Container Registry (GHCR), etc. This provides a standardized way to package and distribute plugins.</p>
 <h2 id="distributing-native-and-wasm-plugins">Distributing Native and Wasm Plugins</h2>
-<p>OCI registries can be used to distribute both Native and Wasm plugins. The QueryMT host determines which type of plugin an image contains using the following logic:
- 1.  <strong>Platform Matching</strong>: It first checks the image index for a manifest matching the host's operating system and architecture (e.g., <code>linux/amd64</code>). If a match is found, it's treated as a <strong>Native Plugin</strong>.
- 2.  <strong>Wasm Fallback</strong>: If no native platform matches, it looks for a <code>wasi/wasm</code> platform. If found, it's treated as an <strong>Extism (Wasm) Plugin</strong>.
- 3.  <strong>Layer Type/Annotations</strong>: As a fallback, it can inspect layer media types (<code>application/vnd.oci.image.layer.v1.tar+gzip</code> for native, <code>application/vnd.wasm.v1.layer+wasm</code> for Wasm) or an annotation (<code>mt.query.plugin.type</code>) to determine the type.</p>
+<p>OCI registries can be used to distribute both Native and Wasm plugins. The QueryMT host determines which type of plugin an image contains using the following logic:</p>
+<ol>
+<li><strong>Platform Matching</strong>: It first checks the image index for a manifest matching the host's operating system and architecture (e.g., <code>linux/amd64</code>). If a match is found, it's treated as a <strong>Native Plugin</strong>.</li>
+<li><strong>Wasm Fallback</strong>: If no native platform matches, it looks for a <code>wasi/wasm</code> platform. If found, it's treated as an <strong>Extism (Wasm) Plugin</strong>.</li>
+<li><strong>Layer Type/Annotations</strong>: As a fallback, it can inspect layer media types (<code>application/vnd.oci.image.layer.v1.tar+gzip</code> for native, <code>application/vnd.wasm.v1.layer+wasm</code> for Wasm) or an annotation (<code>mt.query.plugin.type</code>) to determine the type.</li>
+</ol>
 <p>When publishing, ensure your image is built for the correct target platform(s).</p>
 <h2 id="configuration">Configuration</h2>
 <p>To use an OCI plugin, specify its path in the <code>extism_plugins.toml</code> (or equivalent JSON/YAML) configuration file using the <code>oci://</code> prefix:</p>
