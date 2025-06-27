@@ -30,12 +30,12 @@ jobs:
             bin_name: qmt
             archive_ext: tar.gz
 
-          # --- macOS Targets ---
-          - os: macos-latest # Intel-based runner
+          # --- macOS Targets (Consolidated on Apple Silicon Runner) ---
+          - os: macos-14
             target: x86_64-apple-darwin
             bin_name: qmt
             archive_ext: tar.gz
-          - os: macos-14 # Apple Silicon (ARM64) runner
+          - os: macos-14
             target: aarch64-apple-darwin
             bin_name: qmt
             archive_ext: tar.gz
@@ -60,7 +60,6 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      # For cross-compiling on Linux from x86_64 to aarch64, we need the appropriate C linker.
       - name: Setup cross-compilation for Linux aarch64
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
@@ -68,17 +67,10 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
-      # Cache Cargo dependencies to speed up future builds
-      - name: Setup Cache
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.target }}
 
       - name: Build executable
         run: cargo build --release --package ${{ env.APP_NAME }} --target ${{ matrix.target }}
@@ -94,27 +86,27 @@ jobs:
           # Copy files into the staging directory
           cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "${STAGING_PATH}/"
           cp README.md "${STAGING_PATH}/"
-          cp LICENSE "${STAGING_PATH}/" || true
+          cp LICENSE "${STAGING_PATH}/" || true # Allow LICENSE to be optional
 
-          # Create the archive from the staging directory
+          # Create the archive from the staging directory's contents
+          ARCHIVE_PATH="${ARTIFACT_DIR}/${PACKAGE_NAME}.${{ matrix.archive_ext }}"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            ARCHIVE_PATH="${ARTIFACT_DIR}/${PACKAGE_NAME}.zip"
             (cd "${STAGING_PATH}" && zip -r "../${PACKAGE_NAME}.zip" .)
           else
-            ARCHIVE_PATH="${ARTIFACT_DIR}/${PACKAGE_NAME}.tar.gz"
-            tar -czf "${ARCHIVE_PATH}" -C "${ARTIFACT_DIR}" "${PACKAGE_NAME}"
+            tar -czf "${ARCHIVE_PATH}" -C "${STAGING_PATH}" .
           fi
 
           echo "ASSET_PATH=${ARCHIVE_PATH}" >> $GITHUB_ENV
 
-      # Upload the packaged executable as a build artifact.
-      # This will be downloaded by the 'release' job later.
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.APP_NAME }}-${{ matrix.target }}
           path: ${{ env.ASSET_PATH }}
 
+  # ==================================================================
+  #  Release Job: Creates a GitHub Release and uploads all artifacts
+  # ==================================================================
   release:
     name: Create GitHub Release
     needs: build
@@ -129,21 +121,10 @@ jobs:
           pattern: ${{ env.APP_NAME }}-*
           merge-multiple: true
 
-      - name: List downloaded artifacts
-        run: ls -l artifacts/
-
       - name: Create Release and Upload Assets
-        id: create_release # Add an ID to reference this step's outputs
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
           generate_release_notes: true
-          # Create a draft release if the trigger was not a tag push.
-          # Otherwise, create a full, published release.
           draft: ${{ github.ref_type != 'tag' }}
-          # Mark non-tag releases as pre-releases for clarity.
           prerelease: ${{ github.ref_type != 'tag' }}
-
-      - name: Print Release URL
-        if: github.ref_type != 'tag'
-        run: echo "Draft release URL: ${{ steps.create_release.outputs.html_url }}"
