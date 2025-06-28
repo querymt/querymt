@@ -77,24 +77,32 @@ jobs:
         if: ${{ runner.os != 'Linux' || matrix.target != 'aarch64-unknown-linux-gnu' }}
         run: cargo build --release --bin ${{ env.APP_NAME }} --target ${{ matrix.target }}
 
-      - name: Prepare artifact for upload
+      - name: Prepare artifact for upload (Linux & macOS)
+        if: ${{ runner.os != 'Windows' }}
         shell: bash
         run: |
           ARTIFACT_DIR="dist"
           PKG="${{ env.APP_NAME }}-${{ github.ref_name }}-${{ matrix.target }}"
           STAGING="$ARTIFACT_DIR/$PKG"
           mkdir -p "$STAGING"
-
           cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$STAGING/"
           cp README.md LICENSE "$STAGING/"
+          tar -czf "$ARTIFACT_DIR/${PKG}.tar.gz" -C "$ARTIFACT_DIR" "$PKG"
+          echo "ASSET_PATH=$ARTIFACT_DIR/${PKG}.tar.gz" >> $GITHUB_ENV
 
-          if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
-            (cd "$STAGING" && zip -r "../${PKG}.zip" .)
-          else
-            tar -czf "$ARTIFACT_DIR/${PKG}.tar.gz" -C "$ARTIFACT_DIR" "$PKG"
-          fi
-
-          echo "ASSET_PATH=$ARTIFACT_DIR/${PKG}.${{ matrix.archive_ext }}" >> $GITHUB_ENV
+      - name: Prepare artifact for upload (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $ARTIFACT_DIR = "dist"
+          $PKG = "${{ env.APP_NAME }}-${{ github.ref_name }}-${{ matrix.target }}"
+          $STAGING = Join-Path $ARTIFACT_DIR $PKG
+          New-Item -ItemType Directory -Force -Path $STAGING
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -Destination $STAGING
+          Copy-Item README.md, LICENSE -Destination $STAGING
+          $ZIP_PATH = "$ARTIFACT_DIR/${PKG}.zip"
+          Compress-Archive -Path (Join-Path $STAGING '*') -DestinationPath $ZIP_PATH -Force
+          echo "ASSET_PATH=${ZIP_PATH}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

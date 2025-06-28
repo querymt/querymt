@@ -7,13 +7,14 @@ edition = "2021"
 default = ["extism"]
 api = ["querymt"]
 native = ["querymt"]
-extism = ["extism-pdk", "querymt", "querymt/extism_plugin"]
+extism = ["extism-pdk", "querymt", "querymt-extism-macros"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 querymt = { path = "../../querymt", default-features = false, optional = true }
+querymt-extism-macros = { path = "../../querymt-extism-macros", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 either.workspace = true

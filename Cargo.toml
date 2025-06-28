@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/querymt",
     "crates/cli",
-    "crates/providers/*",
+    "crates/providers/*", "crates/querymt-extism-macros",
 ]
 
 [workspace.dependencies]

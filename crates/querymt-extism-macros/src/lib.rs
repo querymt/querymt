@@ -1,6 +1,7 @@
-use crate::plugin::extism_impl::{
+use querymt::plugin::extism_impl::{
     BinaryCodec, ExtismChatRequest, ExtismCompleteRequest, ExtismEmbedRequest,
 };
+
 use extism_pdk::Error as PdkError;
 use extism_pdk::*;
 
@@ -88,19 +89,19 @@ macro_rules! impl_extism_http_plugin {
         factory = $Factory:path,
         name = $name:expr,
     ) => {
-        use extism_pdk::{plugin_fn, Error as PdkError, FnResult, FromBytes, Json, ToBytes};
+        use extism_pdk::{Error as PdkError, FnResult, FromBytes, Json, ToBytes, plugin_fn};
         use serde_json::Value;
         use $crate::{
             chat::http::HTTPChatProvider,
-            completion::{http::HTTPCompletionProvider, CompletionResponse},
+            completion::{CompletionResponse, http::HTTPCompletionProvider},
             embedding::http::HTTPEmbeddingProvider,
             plugin::{
+                HTTPLLMProviderFactory,
                 extism_impl::{
-                    wrapper::{http_response_to_native, to_pdk_request},
                     BinaryCodec, ExtismChatRequest, ExtismChatResponse, ExtismCompleteRequest,
                     ExtismEmbedRequest,
+                    wrapper::{http_response_to_native, to_pdk_request},
                 },
-                HTTPLLMProviderFactory,
             },
         };
 

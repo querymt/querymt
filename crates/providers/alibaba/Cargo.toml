@@ -6,18 +6,19 @@ edition = "2021"
 [features]
 default = ["extism"]
 native = ["querymt"]
-extism = ["extism-pdk", "querymt", "querymt/extism_plugin"]
+extism = ["extism-pdk", "querymt", "querymt-extism-macros"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 querymt = { path = "../../querymt", default-features = false, optional = true }
+querymt-extism-macros = { path = "../../querymt-extism-macros", optional = true }
 qmt-openai = { path = "../openai", default-features = false, features = ["api"] }
-serde = { workspace = true }
-serde_json = { workspace = true }
-url = { workspace = true }
-schemars = { workspace = true }
-futures = { workspace = true }
-http = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+schemars.workspace = true
+futures.workspace = true
+http.workspace = true
 extism-pdk = { workspace = true, optional = true }
