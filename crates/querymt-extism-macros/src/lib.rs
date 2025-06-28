@@ -1,7 +1,3 @@
-use crate::plugin::extism_impl::{
-    BinaryCodec, ExtismChatRequest, ExtismCompleteRequest, ExtismEmbedRequest,
-};
-use extism_pdk::Error as PdkError;
 use extism_pdk::*;
 
 pub fn to_pdk_request(req: &::http::Request<Vec<u8>>) -> HttpRequest {
@@ -23,63 +19,6 @@ pub fn http_response_to_native(resp: HttpResponse) -> ::http::Response<Vec<u8>> 
     builder.body(body).expect("failed to build http::Response")
 }
 
-#[macro_export]
-macro_rules! impl_binary_codec {
-    // Generic types like MyType<C>
-    ($ty:ident<$cfg:ident>) => {
-        impl<$cfg> BinaryCodec for $ty<$cfg>
-        where
-            $cfg: serde::de::DeserializeOwned + serde::Serialize,
-        {
-            type Bytes = Vec<u8>;
-            type Error = PdkError;
-
-            fn to_bytes(&self) -> Result<Self::Bytes, Self::Error> {
-                serde_json::to_vec(self).map_err(|e| Error::msg(format!("{:#}", e)))
-            }
-
-            fn from_bytes(bytes: &[u8]) -> Result<Self, Self::Error> {
-                serde_json::from_slice(bytes).map_err(|e| Error::msg(format!("{:#}", e)))
-            }
-        }
-
-        impl<$cfg> FromBytesOwned for $ty<$cfg>
-        where
-            $cfg: serde::de::DeserializeOwned + serde::Serialize,
-        {
-            fn from_bytes_owned(bytes: &[u8]) -> Result<Self, PdkError> {
-                <Self as BinaryCodec>::from_bytes(bytes)
-            }
-        }
-    };
-
-    // Non-generic types like MyConfig
-    ($ty:ident) => {
-        impl BinaryCodec for $ty {
-            type Bytes = Vec<u8>;
-            type Error = PdkError;
-
-            fn to_bytes(&self) -> Result<Self::Bytes, Self::Error> {
-                serde_json::to_vec(self).map_err(|e| Error::msg(format!("{:#}", e)))
-            }
-
-            fn from_bytes(bytes: &[u8]) -> Result<Self, Self::Error> {
-                serde_json::from_slice(bytes).map_err(|e| Error::msg(format!("{:#}", e)))
-            }
-        }
-
-        impl FromBytesOwned for $ty {
-            fn from_bytes_owned(bytes: &[u8]) -> Result<Self, PdkError> {
-                <Self as BinaryCodec>::from_bytes(bytes)
-            }
-        }
-    };
-}
-
-impl_binary_codec!(ExtismEmbedRequest<C>);
-impl_binary_codec!(ExtismChatRequest<C>);
-impl_binary_codec!(ExtismCompleteRequest<C>);
-
 /// Macro to generate all the Extism exports for an HTTP‐based LLM plugin
 #[macro_export]
 macro_rules! impl_extism_http_plugin {
@@ -88,21 +27,21 @@ macro_rules! impl_extism_http_plugin {
         factory = $Factory:path,
         name = $name:expr,
     ) => {
-        use extism_pdk::{plugin_fn, Error as PdkError, FnResult, FromBytes, Json, ToBytes};
-        use serde_json::Value;
-        use $crate::{
+        use extism_pdk::{Error as PdkError, FnResult, FromBytes, Json, ToBytes, plugin_fn};
+        use querymt::{
             chat::http::HTTPChatProvider,
-            completion::{http::HTTPCompletionProvider, CompletionResponse},
+            completion::{CompletionResponse, http::HTTPCompletionProvider},
             embedding::http::HTTPEmbeddingProvider,
             plugin::{
+                HTTPLLMProviderFactory,
                 extism_impl::{
-                    wrapper::{http_response_to_native, to_pdk_request},
                     BinaryCodec, ExtismChatRequest, ExtismChatResponse, ExtismCompleteRequest,
                     ExtismEmbedRequest,
                 },
-                HTTPLLMProviderFactory,
             },
         };
+        use serde_json::Value;
+        use $crate::{http_response_to_native, to_pdk_request};
 
         // Export the factory name
         #[plugin_fn]
@@ -150,7 +89,9 @@ macro_rules! impl_extism_http_plugin {
 
         // chat_request wrapper
         #[plugin_fn]
-        pub fn chat(input: ExtismChatRequest<$Config>) -> FnResult<Json<ExtismChatResponse>> {
+        pub fn chat(
+            Json(input): Json<ExtismChatRequest<$Config>>,
+        ) -> FnResult<Json<ExtismChatResponse>> {
             let req = input
                 .cfg
                 .chat_request(&input.messages, input.tools.as_deref())
@@ -170,7 +111,9 @@ macro_rules! impl_extism_http_plugin {
 
         // embed wrapper
         #[plugin_fn]
-        pub fn embed(input: ExtismEmbedRequest<$Config>) -> FnResult<Json<Vec<Vec<f32>>>> {
+        pub fn embed(
+            Json(input): Json<ExtismEmbedRequest<$Config>>,
+        ) -> FnResult<Json<Vec<Vec<f32>>>> {
             let req = input
                 .cfg
                 .embed_request(&input.inputs)
@@ -189,7 +132,7 @@ macro_rules! impl_extism_http_plugin {
 
         #[plugin_fn]
         pub fn complete(
-            input: ExtismCompleteRequest<$Config>,
+            Json(input): Json<ExtismCompleteRequest<$Config>>,
         ) -> FnResult<Json<CompletionResponse>> {
             let req = input
                 .cfg
