@@ -261,7 +261,7 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 #[cfg(feature = "extism")]
 mod extism_exports {
     use super::{Alibaba, AlibabaFactory};
-    use querymt::impl_extism_http_plugin;
+    use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = Alibaba,

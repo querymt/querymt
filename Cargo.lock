@@ -3533,6 +3533,7 @@ dependencies = [
  "http",
  "qmt-openai",
  "querymt",
+ "querymt-extism-macros",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -3547,6 +3548,7 @@ dependencies = [
  "extism-pdk",
  "http",
  "querymt",
+ "querymt-extism-macros",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -3561,6 +3563,7 @@ dependencies = [
  "extism-pdk",
  "http",
  "querymt",
+ "querymt-extism-macros",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -3577,6 +3580,7 @@ dependencies = [
  "http",
  "qmt-openai",
  "querymt",
+ "querymt-extism-macros",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -3593,6 +3597,7 @@ dependencies = [
  "http",
  "qmt-openai",
  "querymt",
+ "querymt-extism-macros",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -3608,6 +3613,7 @@ dependencies = [
  "futures",
  "http",
  "querymt",
+ "querymt-extism-macros",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -3622,6 +3628,7 @@ dependencies = [
  "extism-pdk",
  "http",
  "querymt",
+ "querymt-extism-macros",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -3637,6 +3644,7 @@ dependencies = [
  "http",
  "qmt-openai",
  "querymt",
+ "querymt-extism-macros",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -3653,6 +3661,7 @@ dependencies = [
  "http",
  "qmt-openai",
  "querymt",
+ "querymt-extism-macros",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -3670,7 +3679,6 @@ dependencies = [
  "docker_credential",
  "either",
  "extism",
- "extism-pdk",
  "flate2",
  "futures",
  "hex",
@@ -3722,6 +3730,17 @@ dependencies = [
  "tracing-log",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "querymt-extism-macros"
+version = "0.1.0"
+dependencies = [
+ "extism-pdk",
+ "http",
+ "querymt",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

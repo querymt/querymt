@@ -1,0 +1,11 @@
+[package]
+name = "querymt-extism-macros"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+querymt = { path = "../querymt", default-features = false, features = ["extism_plugin"] }
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+extism-pdk.workspace = true
