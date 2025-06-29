@@ -1,0 +1,5 @@
+[toolchain]
+channel = "stable"
+components = ["rustc", "rust-std", "cargo", "clippy", "rustfmt"]
+targets = ["wasm32-wasip1"]
+
