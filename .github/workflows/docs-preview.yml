@@ -3,6 +3,8 @@ name: Documentation Preview
 on:
   pull_request:
     types: [opened, synchronize, reopened, closed]
+    paths:
+      - 'docs/**'
 
 permissions:
   contents: write
@@ -46,7 +48,7 @@ jobs:
           script: |
             const docsUrl = 'https://docs.query.mt';
             
-            // 2. Find a previous comment to update
+            // Find a previous comment to update
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -56,7 +58,7 @@ jobs:
               comment.user.type === 'Bot' && comment.body.includes('📚 Documentation Preview')
             );
 
-            // 3. Construct the new comment body
+            // Construct the new comment body
             const previewUrl = `${docsUrl}/pr-${context.issue.number}`;
             const commentBody = `
               ### 📚 Documentation Preview
@@ -68,7 +70,7 @@ jobs:
               *This preview will be automatically deleted when the pull request is closed.*
             `;
 
-            // 4. Update an existing comment or create a new one
+            // Update an existing comment or create a new one
             if (botComment) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
@@ -100,7 +102,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install MkDocs and Mike
         run: pip install mkdocs-material mike
