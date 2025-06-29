@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 querymt = { path = "../../querymt", default-features = false, optional = true }
-qmt-openai = { path = "../openai", default-features = false, features = ["api"] }
+qmt-openai = { path = "../openai", default-features = false, features = ["api", "extism"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }

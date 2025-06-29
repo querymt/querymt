@@ -13,6 +13,8 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
+    get_env_var,
+    pricing::{calculate_cost, ModelsPricingData, Pricing},
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
 };
 use schemars::JsonSchema;
@@ -417,6 +419,17 @@ impl HTTPChatProvider for Anthropic {
         let json_resp: AnthropicCompleteResponse = serde_json::from_slice(resp.body())
             .map_err(|e| LLMError::HttpError(format!("Failed to parse JSON: {}", e)))?;
 
+        // TODO: Cleanup before finish PR
+        let json_resp2: AnthropicCompleteResponse = serde_json::from_slice(resp.clone().body())
+            .map_err(|e| LLMError::HttpError(format!("Failed to parse JSON: {}", e)))?;
+
+        let p = calculate_cost(
+            json_resp2.usage().unwrap(),
+            get_pricing(&self.model, false).unwrap(),
+        );
+
+        println!("[anthropic calculated cost] -> {}", p);
+
         Ok(Box::new(json_resp))
     }
 }
@@ -455,6 +468,43 @@ impl HTTPLLMProvider for Anthropic {
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }
+}
+
+fn get_pricing(model: &str, thinking: bool) -> Option<Pricing> {
+    if let Some(models) = get_env_var!("MODEL_PRICING_DATA") {
+        if let Ok(models) = serde_json::from_str::<ModelsPricingData>(&models) {
+            let model = match model {
+                // Source: https://docs.anthropic.com/en/docs/about-claude/models/overview#model-names
+                "claude-opus-4-0" | "claude-opus-4-20250514" => "claude-opus-4",
+                "claude-sonnet-4-0" | "claude-sonnet-4-20250514" => "claude-sonnet-4",
+                "claude-3-7-sonnet-latest" | "claude-3-7-sonnet-20250219" => {
+                    if thinking {
+                        "claude-3.7-sonnet:thinking"
+                    } else {
+                        "claude-3.7-sonnet"
+                    }
+                }
+                "claude-3-5-sonnet-latest"
+                | "claude-3-5-sonnet-20241022"
+                | "claude-3-5-sonnet-20240620" => "claude-3.5-sonnet",
+                "claude-3-5-haiku-latest" => "claude-3.5-haiku",
+                "claude-3-haiku-20240307" => "claude-3-haiku",
+                "claude-3-opus-latest" | "claude-3-opus-20240229" => "claude-3-opus",
+                "claude-3-sonnet-20240229" => "claude-3-sonnet",
+
+                _ => model,
+            };
+
+            let model = format!("anthropic/{}", model);
+
+            return models
+                .data
+                .iter()
+                .find(|m| m.id == model)
+                .map(|m| m.pricing.clone());
+        }
+    }
+    None
 }
 
 mod factory;
