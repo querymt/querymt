@@ -96,7 +96,8 @@ jobs:
       - name: Checkout gh-pages branch
         uses: actions/checkout@v4
         with:
-          ref: gh-pages
+          # Fetch all history for all branches and tags
+          fetch-depth: 0
       
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -113,3 +114,4 @@ jobs:
           
       - name: Delete preview directory
         run: mike delete --push pr-${{ github.event.number }}
+        working-directory: ./docs
