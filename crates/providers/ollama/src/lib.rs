@@ -53,6 +53,7 @@ pub struct Ollama {
     pub stream: Option<bool>,
     pub top_p: Option<f32>,
     pub top_k: Option<u32>,
+    pub think: Option<bool>,
     /// JSON schema for structured output
     pub json_schema: Option<StructuredOutputFormat>,
     /// Available tools for function calling
@@ -65,6 +66,7 @@ struct OllamaChatRequest<'a> {
     model: String,
     messages: Vec<OllamaChatMessage<'a>>,
     stream: bool,
+    think: bool,
     options: Option<OllamaOptions>,
     format: Option<OllamaResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -311,6 +313,7 @@ impl HTTPChatProvider for Ollama {
             model: self.model.clone(),
             messages: chat_messages,
             stream: self.stream.unwrap_or(false),
+            think: self.think.unwrap_or(false),
             options: Some(OllamaOptions {
                 top_p: self.top_p,
                 top_k: self.top_k,
