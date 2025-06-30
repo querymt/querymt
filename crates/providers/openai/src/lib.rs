@@ -12,7 +12,7 @@ use querymt::{
     error::LLMError,
     get_env_var,
     plugin::HTTPLLMProviderFactory,
-    pricing::{calculate_cost, ModelsPricingData, Pricing},
+    pricing::{ModelsPricingData, Pricing},
     HTTPLLMProvider,
 };
 use schemars::{schema_for, JsonSchema};
@@ -135,14 +135,6 @@ impl HTTPChatProvider for OpenAI {
         &self,
         response: Response<Vec<u8>>,
     ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
-        // TODO: Cleanup before finish PR
-        let q = api::openai_parse_chat(self, response.clone());
-        let p = calculate_cost(
-            q.unwrap().usage().unwrap(),
-            get_pricing(&self.model, false).unwrap(),
-        );
-        println!("[openai calculated cost] -> {}", p);
-
         api::openai_parse_chat(self, response)
     }
 }
@@ -223,9 +215,7 @@ fn get_pricing(model: &str, _thinking: bool) -> Option<Pricing> {
                         "gpt-4.1-mini-2025-04-14" => "gpt-4.1-mini",
                         "gpt-4.1-nano-2025-04-14" => "gpt-4.1-nano",
                         "gpt-4.5-preview-2025-02-27" => "gpt-4.5-preview",
-                        "gpt-4o-mini-search-preview-2025-03-11" => {
-                            "gpt-4o-mini-search-preview"
-                        }
+                        "gpt-4o-mini-search-preview-2025-03-11" => "gpt-4o-mini-search-preview",
                         "gpt-4o-search-preview-2025-03-11" => "gpt-4o-search-preview",
                         "gpt-4-turbo-2024-04-09" => "gpt-4-turbo",
                         "o1-2024-12-17" => "o1",
