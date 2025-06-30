@@ -344,12 +344,12 @@ fn get_pricing(model: &str, thinking: bool) -> Option<Pricing> {
                         _ => model,
                     };
 
-                    let openrouter_model_name = format!("mistralai/{}", remapped_model);
+                    let model_id = format!("mistralai/{}", remapped_model);
 
                     models
                         .data
                         .iter()
-                        .find(|m| m.id == openrouter_model_name)
+                        .find(|m| m.id == model_id)
                         .map(|m| m.pricing.clone())
                 }
             };

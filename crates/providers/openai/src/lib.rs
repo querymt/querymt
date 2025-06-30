@@ -139,7 +139,7 @@ impl HTTPChatProvider for OpenAI {
         let q = api::openai_parse_chat(self, response.clone());
         let p = calculate_cost(
             q.unwrap().usage().unwrap(),
-            get_pricing(&self.model).unwrap(),
+            get_pricing(&self.model, false).unwrap(),
         );
         println!("[openai calculated cost] -> {}", p);
 
@@ -207,38 +207,43 @@ impl HTTPLLMProviderFactory for OpenAIFactory {
     }
 }
 
-fn get_pricing(model: &str) -> Option<Pricing> {
+fn get_pricing(model: &str, _thinking: bool) -> Option<Pricing> {
     if let Some(models) = get_env_var!("MODEL_PRICING_DATA") {
         if let Ok(models) = serde_json::from_str::<ModelsPricingData>(&models) {
-            let model = match model {
-                "gpt-3.5-0301" => "gpt-3.5-turbo",
-                "gpt-3.5-turbo-16k-0613" => "gpt-3.5-turbo-16k",
-                "gpt-4-0125-preview" => "gpt-4-turbo",
-                "gpt-4-0613" => "gpt-4",
-                "gpt-4-1106-preview" => "gpt-4-turbo",
-                "gpt-4-1106-vision-preview" => "gpt-4-turbo",
-                "gpt-4.1-2025-04-14" => "gpt-4.1",
-                "gpt-4.1-mini-2025-04-14" => "gpt-4.1-mini",
-                "gpt-4.1-nano-2025-04-14" => "gpt-4.1-nano",
-                "gpt-4.5-preview-2025-02-27" => "gpt-4.5-preview",
-                "gpt-4o-mini-search-preview-2025-03-11" => "gpt-4o-mini-search-preview",
-                "gpt-4o-search-preview-2025-03-11" => "gpt-4o-search-preview",
-                "gpt-4-turbo-2024-04-09" => "gpt-4-turbo",
-                "o1-2024-12-17" => "o1",
-                "o1-pro-2025-03-19" => "o1-pro",
-                "o3-2025-04-16" => "o3",
-                "o3-mini-2025-01-31" => "o3-mini",
-                "o4-mini-2025-04-16" => "o4-mini",
-                _ => model,
+            return match model {
+                _ => {
+                    let remapped_model = match model {
+                        "gpt-3.5-0301" => "gpt-3.5-turbo",
+                        "gpt-3.5-turbo-16k-0613" => "gpt-3.5-turbo-16k",
+                        "gpt-4-0125-preview" => "gpt-4-turbo",
+                        "gpt-4-0613" => "gpt-4",
+                        "gpt-4-1106-preview" => "gpt-4-turbo",
+                        "gpt-4-1106-vision-preview" => "gpt-4-turbo",
+                        "gpt-4.1-2025-04-14" => "gpt-4.1",
+                        "gpt-4.1-mini-2025-04-14" => "gpt-4.1-mini",
+                        "gpt-4.1-nano-2025-04-14" => "gpt-4.1-nano",
+                        "gpt-4.5-preview-2025-02-27" => "gpt-4.5-preview",
+                        "gpt-4o-mini-search-preview-2025-03-11" => {
+                            "gpt-4o-mini-search-preview"
+                        }
+                        "gpt-4o-search-preview-2025-03-11" => "gpt-4o-search-preview",
+                        "gpt-4-turbo-2024-04-09" => "gpt-4-turbo",
+                        "o1-2024-12-17" => "o1",
+                        "o1-pro-2025-03-19" => "o1-pro",
+                        "o3-2025-04-16" => "o3",
+                        "o3-mini-2025-01-31" => "o3-mini",
+                        "o4-mini-2025-04-16" => "o4-mini",
+                        _ => model,
+                    };
+                    let model_id = format!("openai/{}", remapped_model);
+
+                    models
+                        .data
+                        .iter()
+                        .find(|m| m.id == model_id)
+                        .map(|m| m.pricing.clone())
+                }
             };
-
-            let model = format!("openai/{}", model);
-
-            return models
-                .data
-                .iter()
-                .find(|m| m.id == model)
-                .map(|m| m.pricing.clone());
         }
     }
     None
