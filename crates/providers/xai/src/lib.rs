@@ -309,12 +309,12 @@ fn get_pricing(model: &str, thinking: bool) -> Option<Pricing> {
                         "grok-2" | "grok-2-latest" => "grok-2-1212",
                         _ => model,
                     };
-                    let openrouter_model_name = format!("x-ai/{}", remapped_model);
+                    let model_id = format!("x-ai/{}", remapped_model);
 
                     models
                         .data
                         .iter()
-                        .find(|m| m.id == openrouter_model_name)
+                        .find(|m| m.id == model_id)
                         .map(|m| m.pricing.clone())
                 }
             };

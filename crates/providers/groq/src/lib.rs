@@ -281,7 +281,7 @@ impl HTTPLLMProviderFactory for GroqFactory {
     }
 }
 #[warn(dead_code)]
-fn get_pricing(model: &str, thinking: bool) -> Option<Pricing> {
+fn get_pricing(model: &str, _thinking: bool) -> Option<Pricing> {
     // Source: https://groq.com/pricing/
     // NOTE: Models for personal use available for free with limited (but good) amount of request per day.
     return match model {

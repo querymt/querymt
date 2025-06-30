@@ -833,55 +833,59 @@ impl HTTPLLMProviderFactory for GoogleFactory {
 fn get_pricing(model: &str, thinking: bool) -> Option<Pricing> {
     if let Some(models) = get_env_var!("MODEL_PRICING_DATA") {
         if let Ok(models) = serde_json::from_str::<ModelsPricingData>(&models) {
-            let model = match model {
-                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.0-flash
-                "gemini-2.0-flash" | "gemini-2.0-flash-exp" => "gemini-2.0-flash-001",
-                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.0-flash-lite
-                "gemini-2.0-flash-lite" => "gemini-2.0-flash-lite-001",
+            return match model {
+                _ => {
+                    let remapped_model = match model {
+                        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.0-flash
+                        "gemini-2.0-flash" | "gemini-2.0-flash-exp" => "gemini-2.0-flash-001",
+                        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.0-flash-lite
+                        "gemini-2.0-flash-lite" => "gemini-2.0-flash-lite-001",
 
-                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-1.5-flash
-                "gemini-1.5-flash-latest"
-                | "gemini-1.5-flash"
-                | "gemini-1.5-flash-001"
-                | "gemini-1.5-flash-002" => "gemini-flash-1.5",
-                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-1.5-flash-8b
-                "gemini-1.5-flash-8b-latest"
-                | "gemini-1.5-flash-8b"
-                | "gemini-1.5-flash-8b-001" => "gemini-flash-1.5-8b",
-                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-1.5-pro
-                "gemini-1.5-pro-latest"
-                | "gemini-1.5-pro"
-                | "gemini-1.5-pro-001"
-                | "gemini-1.5-pro-002" => "gemini-pro-1.5",
-                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.5-pro-preview-05-06
-                "gemini-2.5-pro-preview-05-06" => "gemini-2.5-pro-preview",
-                "gemini-2.5-pro-preview-03-25" => "gemini-2.5-pro-exp-03-25",
-                // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.5-flash-preview
-                "gemini-2.5-flash-preview" => {
-                    if thinking {
-                        "gemini-2.5-flash-preview:thinking"
-                    } else {
-                        "gemini-2.5-flash-preview"
-                    }
-                }
+                        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-1.5-flash
+                        "gemini-1.5-flash-latest"
+                        | "gemini-1.5-flash"
+                        | "gemini-1.5-flash-001"
+                        | "gemini-1.5-flash-002" => "gemini-flash-1.5",
+                        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-1.5-flash-8b
+                        "gemini-1.5-flash-8b-latest"
+                        | "gemini-1.5-flash-8b"
+                        | "gemini-1.5-flash-8b-001" => "gemini-flash-1.5-8b",
+                        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-1.5-pro
+                        "gemini-1.5-pro-latest"
+                        | "gemini-1.5-pro"
+                        | "gemini-1.5-pro-001"
+                        | "gemini-1.5-pro-002" => "gemini-pro-1.5",
+                        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.5-pro-preview-05-06
+                        "gemini-2.5-pro-preview-05-06" => "gemini-2.5-pro-preview",
+                        "gemini-2.5-pro-preview-03-25" => "gemini-2.5-pro-exp-03-25",
+                        // Source: https://ai.google.dev/gemini-api/docs/models#gemini-2.5-flash-preview
+                        "gemini-2.5-flash-preview" => {
+                            if thinking {
+                                "gemini-2.5-flash-preview:thinking"
+                            } else {
+                                "gemini-2.5-flash-preview"
+                            }
+                        }
 
-                "gemini-2.5-flash-preview-05-20" => {
-                    if thinking {
-                        "gemini-2.5-flash-preview-05-20:thinking"
-                    } else {
-                        "gemini-2.5-flash-preview-05-20"
-                    }
+                        "gemini-2.5-flash-preview-05-20" => {
+                            if thinking {
+                                "gemini-2.5-flash-preview-05-20:thinking"
+                            } else {
+                                "gemini-2.5-flash-preview-05-20"
+                            }
+                        }
+                        _ => model,
+                    };
+
+                    let model_id = format!("google/{}", remapped_model);
+
+                    models
+                        .data
+                        .iter()
+                        .find(|m| m.id == model_id)
+                        .map(|m| m.pricing.clone())
                 }
-                _ => model,
             };
-
-            let model = format!("google/{}", model);
-
-            return models
-                .data
-                .iter()
-                .find(|m| m.id == model)
-                .map(|m| m.pricing.clone());
         }
     }
     None
