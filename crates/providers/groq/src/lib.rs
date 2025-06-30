@@ -15,7 +15,7 @@ use querymt::{
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     plugin::HTTPLLMProviderFactory,
-    pricing::{calculate_cost, Pricing},
+    pricing::Pricing,
     HTTPLLMProvider, ToolCall,
 };
 use schemars::{schema_for, JsonSchema};
@@ -159,14 +159,6 @@ impl HTTPChatProvider for Groq {
         &self,
         response: Response<Vec<u8>>,
     ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
-        // TODO: Cleanup before finish PR
-        let q = openai_parse_chat(self, response.clone());
-        let p = calculate_cost(
-            q.unwrap().usage().unwrap(),
-            get_pricing(&self.model, false).unwrap(),
-        );
-        println!("[groq calculated cost] -> {}", p);
-
         openai_parse_chat(self, response)
     }
 }
