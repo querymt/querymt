@@ -15,7 +15,7 @@ use querymt::{
     error::LLMError,
     get_env_var,
     plugin::HTTPLLMProviderFactory,
-    pricing::{calculate_cost, ModelsPricingData, Pricing},
+    pricing::{ModelsPricingData, Pricing},
     HTTPLLMProvider, ToolCall,
 };
 use schemars::{schema_for, JsonSchema};
@@ -159,14 +159,6 @@ impl HTTPChatProvider for Mistral {
         &self,
         response: Response<Vec<u8>>,
     ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
-        // TODO: Cleanup before finish PR
-        let x = openai_parse_chat(self, response.clone());
-        let p = calculate_cost(
-            x.unwrap().usage().unwrap(),
-            get_pricing(&self.model, false).unwrap(),
-        );
-        println!("[mistral calculated cost] -> {}", p);
-
         openai_parse_chat(self, response)
     }
 }
@@ -222,20 +214,6 @@ impl HTTPCompletionProvider for Mistral {
 
         let json_resp: Result<MistralCompletionResponse, serde_json::Error> =
             serde_json::from_slice(&resp.body());
-
-        let json_resp2: Result<MistralCompletionResponse, serde_json::Error> =
-            serde_json::from_slice(&resp.body());
-
-        let comp = CompletionResponse {
-            text: json_resp2.unwrap().choices[0].message.content.clone(),
-        };
-
-        let p = calculate_cost(
-            comp.usage().unwrap(),
-            get_pricing(&self.model, false).unwrap(),
-        );
-
-        println!("[calculated cost] -> {}", p);
 
         match json_resp {
             Ok(completion_response) => Ok(CompletionResponse {

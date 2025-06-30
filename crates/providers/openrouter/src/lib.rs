@@ -12,7 +12,7 @@ use querymt::{
     error::LLMError,
     get_env_var,
     plugin::HTTPLLMProviderFactory,
-    pricing::{calculate_cost, ModelsPricingData, Pricing},
+    pricing::{ModelsPricingData, Pricing},
     HTTPLLMProvider,
 };
 use schemars::{schema_for, JsonSchema};
@@ -124,14 +124,6 @@ impl HTTPChatProvider for OpenRouter {
         &self,
         response: Response<Vec<u8>>,
     ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
-        // TODO: Cleanup before finish PR
-        let x = openai_parse_chat(self, response.clone());
-        let p = calculate_cost(
-            x.unwrap().usage().unwrap(),
-            get_pricing(&self.model).unwrap(),
-        );
-
-        println!("[OpenRouter calculated cost] -> {}", p);
         openai_parse_chat(self, response)
     }
 }

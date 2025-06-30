@@ -51,7 +51,7 @@ use querymt::{
     error::LLMError,
     get_env_var,
     plugin::HTTPLLMProviderFactory,
-    pricing::{calculate_cost, ModelsPricingData, Pricing},
+    pricing::{ModelsPricingData, Pricing},
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
 };
 use schemars::{schema_for, JsonSchema};
@@ -677,16 +677,6 @@ impl HTTPChatProvider for Google {
         let json_resp: Result<GoogleChatResponse, serde_json::Error> =
             serde_json::from_slice(&resp.body());
 
-        // TODO: Cleanup before finish PR
-        let json_resp2: Result<GoogleChatResponse, serde_json::Error> =
-            serde_json::from_slice(&resp.clone().body());
-
-        let p = calculate_cost(
-            json_resp2.unwrap().usage().unwrap(),
-            get_pricing(&self.model, false).unwrap(),
-        );
-
-        println!("[google calculated cost] -> {}", p);
         match json_resp {
             Ok(response) => Ok(Box::new(response)),
             Err(e) => {

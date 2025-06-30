@@ -15,7 +15,7 @@ use querymt::{
     error::LLMError,
     get_env_var,
     plugin::HTTPLLMProviderFactory,
-    pricing::{calculate_cost, ModelsPricingData, Pricing},
+    pricing::{ModelsPricingData, Pricing},
     HTTPLLMProvider, ToolCall,
 };
 use schemars::{schema_for, JsonSchema};
@@ -159,14 +159,6 @@ impl HTTPChatProvider for Xai {
         &self,
         response: Response<Vec<u8>>,
     ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
-        // TODO: Cleanup before finish PR
-        let q = openai_parse_chat(self, response.clone());
-        let p = calculate_cost(
-            q.unwrap().usage().unwrap(),
-            get_pricing(&self.model, false).unwrap(),
-        );
-        println!("[xai calculated cost] -> {}", p);
-
         openai_parse_chat(self, response)
     }
 }

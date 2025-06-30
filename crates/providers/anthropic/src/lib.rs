@@ -14,7 +14,7 @@ use querymt::{
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     get_env_var,
-    pricing::{calculate_cost, ModelsPricingData, Pricing},
+    pricing::{ModelsPricingData, Pricing},
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
 };
 use schemars::JsonSchema;
@@ -421,17 +421,6 @@ impl HTTPChatProvider for Anthropic {
 
         let json_resp: AnthropicCompleteResponse = serde_json::from_slice(resp.body())
             .map_err(|e| LLMError::HttpError(format!("Failed to parse JSON: {}", e)))?;
-
-        // TODO: Cleanup before finish PR
-        let json_resp2: AnthropicCompleteResponse = serde_json::from_slice(resp.clone().body())
-            .map_err(|e| LLMError::HttpError(format!("Failed to parse JSON: {}", e)))?;
-
-        let p = calculate_cost(
-            json_resp2.usage().unwrap(),
-            get_pricing(&self.model, false).unwrap(),
-        );
-
-        println!("[anthropic calculated cost] -> {}", p);
 
         Ok(Box::new(json_resp))
     }
