@@ -380,7 +380,13 @@ impl HTTPChatProvider for Anthropic {
             messages: anthropic_messages,
             model: &self.model,
             max_tokens: Some(self.max_tokens),
-            temperature: Some(self.temperature),
+            temperature: Some(if self.reasoning.unwrap_or(false) {
+                // NOTE: Ignoring temperature when reasoning is enabled. Temperature in this cases
+                // should always be set to `1.0`.
+                1.0
+            } else {
+                self.temperature
+            }),
             system: self.system.as_deref(),
             stream: self.stream,
             top_p: self.top_p,
