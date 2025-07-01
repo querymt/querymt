@@ -6,7 +6,7 @@ use querymt::{
     mcp::{adapter::McpToolAdapter, config::Config as MCPConfig},
 };
 use serde_json::Value;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use tokio;
 
 mod chat;
@@ -175,6 +175,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // pretty-print as JSON
                 println!("{}", serde_json::to_string_pretty(&embeddings)?);
+                return Ok(());
+            }
+            Commands::Update => {
+                println!("{}", "Updating OCI provider plugins...".bright_blue());
+                for provider_cfg in &registry.config.providers {
+                    if provider_cfg.path.starts_with("oci://") {
+                        print!("Updating {}... ", provider_cfg.name.bold());
+                        io::stdout().flush()?;
+                        let image_reference = provider_cfg.path.strip_prefix("oci://").unwrap();
+                        match registry
+                            .oci_downloader
+                            .pull_and_extract(image_reference, None, &registry.cache_path, true)
+                            .await
+                        {
+                            Ok(_) => println!("{}", "✓ Done".bright_green()),
+                            Err(e) => {
+                                println!("{}", "✗ Failed".bright_red());
+                                eprintln!("  Error: {}", e);
+                            }
+                        }
+                    }
+                }
+                println!("{}", "Update check complete.".bright_blue());
                 return Ok(());
             }
         }

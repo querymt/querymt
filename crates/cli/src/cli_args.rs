@@ -99,4 +99,6 @@ pub enum Commands {
         #[arg()]
         text: Option<String>,
     },
+    /// Update provider plugins
+    Update,
 }
