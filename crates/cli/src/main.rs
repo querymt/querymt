@@ -6,6 +6,7 @@ use querymt::{
     mcp::{adapter::McpToolAdapter, config::Config as MCPConfig},
 };
 use serde_json::Value;
+use spinners::{Spinner, Spinners};
 use std::io::{self, IsTerminal};
 use tokio;
 
@@ -175,6 +176,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // pretty-print as JSON
                 println!("{}", serde_json::to_string_pretty(&embeddings)?);
+                return Ok(());
+            }
+            Commands::Update => {
+                println!("{}", "Updating OCI provider plugins...".bright_blue());
+                for provider_cfg in &registry.config.providers {
+                    if provider_cfg.path.starts_with("oci://") {
+                        let name = provider_cfg.name.clone();
+                        // start spinner (choose preset you like)
+                        let mut spinner =
+                            Spinner::new(Spinners::Dots, format!("Updating {}...", name.bold()));
+
+                        let image_reference = provider_cfg
+                            .path
+                            .strip_prefix("oci://")
+                            .unwrap()
+                            .to_string();
+                        match registry
+                            .oci_downloader
+                            .pull_and_extract(&image_reference, None, &registry.cache_path, true)
+                            .await
+                        {
+                            Ok(_) => {
+                                // stop and show success
+                                spinner.stop_and_persist(
+                                    "🚀",
+                                    format!("{} has been updated.", name.bold()),
+                                );
+                            }
+                            Err(e) => {
+                                spinner.stop_and_persist(
+                                    "💥",
+                                    format!("Failed updating {}", name.bold()),
+                                );
+                                eprintln!("  {} {}", "Error:".bright_red(), e);
+                            }
+                        }
+                    }
+                }
+                println!("{}", "Update check complete.".bright_blue());
                 return Ok(());
             }
         }

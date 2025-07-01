@@ -381,47 +381,16 @@ pub struct OciDownloaderConfig {
     use_sigstore_tuf_data: bool,
     rekor_pub_keys: Option<PathBuf>,
     fulcio_certs: Option<PathBuf>,
-    update_interval: Option<String>,
 }
 
 pub struct OciDownloader {
     config: OciDownloaderConfig,
-    cache_ttl_seconds: u64,
 }
 
 impl OciDownloader {
     pub fn new(config: Option<OciDownloaderConfig>) -> Self {
-        let cfg = config.unwrap_or_default();
-        let cache_ttl_seconds = match cfg.update_interval.as_deref().unwrap_or("1d") {
-            // Default to 1 day
-            "never" => u64::MAX,
-            s => {
-                let s = s.trim();
-                let (numeric_part, multiplier) = if let Some(part) = s.strip_suffix('d') {
-                    (part, 86400) // days
-                } else if let Some(part) = s.strip_suffix('h') {
-                    (part, 3600) // hours
-                } else if let Some(part) = s.strip_suffix('m') {
-                    (part, 60) // minutes
-                } else if let Some(part) = s.strip_suffix('s') {
-                    (part, 1) // seconds
-                } else {
-                    (s, 1) // default to seconds if no suffix
-                };
-
-                // Attempt to parse the numeric part. If it fails, default to 1 day (86400 seconds).
-                // This is a safe default in case of malformed input like "m" or "foo".
-                numeric_part
-                    .trim()
-                    .parse::<u64>()
-                    .map(|val| val * multiplier)
-                    .unwrap_or(86400)
-            }
-        };
-
         Self {
-            config: cfg,
-            cache_ttl_seconds,
+            config: config.unwrap_or_default(),
         }
     }
 
@@ -431,6 +400,7 @@ impl OciDownloader {
         image_reference: &str,
         target_file_path: Option<&str>,
         cache_path: &Path,
+        force_update: bool,
     ) -> Result<ProviderPlugin, Box<dyn std::error::Error>> {
         let sanitized_tag_path = image_reference.replace(['/', ':'], "_");
         let manifests_cache_dir = cache_path.join("manifests");
@@ -441,26 +411,12 @@ impl OciDownloader {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
 
-        if let Some(meta) = &local_metadata {
-            let blob_path = get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
-            if blob_path.exists() {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-                let cache_age = now.saturating_sub(meta.retrieved_at_unix);
-
-                // If TTL is u64::MAX ("never"), this check will always be false
-                if cache_age < self.cache_ttl_seconds {
-                    log::debug!(
-                        "OCI cache is fresh (age: {}s, TTL: {}s). Using local version.",
-                        cache_age,
-                        self.cache_ttl_seconds
-                    );
+        if !force_update {
+            if let Some(meta) = &local_metadata {
+                let blob_path = get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
+                if blob_path.exists() {
+                    log::debug!("Found cached OCI plugin. Using local version.");
                     return load_from_cache(meta, &blob_path);
-                } else {
-                    log::info!(
-                        "OCI Cache is stale (age: {}s, TTL: {}s). Checking for updates.",
-                        cache_age,
-                        self.cache_ttl_seconds
-                    );
                 }
             }
         }

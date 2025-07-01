@@ -39,9 +39,9 @@ pub mod native;
 pub struct PluginRegistry {
     loaders: HashMap<PluginType, Box<dyn PluginLoader>>,
     factories: RwLock<HashMap<String, Arc<dyn LLMProviderFactory>>>,
-    oci_downloader: Arc<oci::OciDownloader>,
-    config: config::PluginConfig,
-    cache_path: PathBuf,
+    pub oci_downloader: Arc<oci::OciDownloader>,
+    pub config: config::PluginConfig,
+    pub cache_path: PathBuf,
 }
 
 impl PluginRegistry {
@@ -100,7 +100,7 @@ impl PluginRegistry {
             let image_reference = provider_cfg.path.strip_prefix("oci://").unwrap();
             provider_plugin = self
                 .oci_downloader
-                .pull_and_extract(image_reference, None, &self.cache_path)
+                .pull_and_extract(image_reference, None, &self.cache_path, false)
                 .await
                 .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
             log::debug!(
