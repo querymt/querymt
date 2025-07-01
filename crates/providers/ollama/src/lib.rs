@@ -12,6 +12,7 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
+    get_env_var,
     plugin::HTTPLLMProviderFactory,
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
 };
@@ -224,22 +225,9 @@ struct OllamaFunctionToolCall {
     arguments: Value,
 }
 
-#[cfg(feature = "extism")]
-fn get_env_var(key: &str) -> Option<String> {
-    match extism_pdk::config::get(key) {
-        Ok(value) => value,
-        _ => None,
-    }
-}
-
-#[cfg(not(feature = "extism"))]
-fn get_env_var(key: &str) -> Option<String> {
-    std::env::var(key).ok()
-}
-
 impl Ollama {
     fn default_base_url() -> Url {
-        let base_url = get_env_var("OLLAMA_HOST").unwrap_or("http://localhost:11434".to_string());
+        let base_url = get_env_var!("OLLAMA_HOST").unwrap_or("http://localhost:11434".to_string());
         Url::parse(&base_url).unwrap()
     }
 }

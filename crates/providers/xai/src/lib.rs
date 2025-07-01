@@ -14,7 +14,9 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
+    get_env_var,
     plugin::HTTPLLMProviderFactory,
+    pricing::{ModelsPricingData, Pricing},
     HTTPLLMProvider, ToolCall,
 };
 use schemars::{schema_for, JsonSchema};
@@ -280,6 +282,51 @@ impl HTTPLLMProviderFactory for XaiFactory {
 
         Ok(Box::new(provider))
     }
+}
+
+#[warn(dead_code)]
+fn get_pricing(model: &str, thinking: bool) -> Option<Pricing> {
+    // Source: https://docs.x.ai/docs/models
+    if let Some(models) = get_env_var!("MODEL_PRICING_DATA") {
+        if let Ok(models) = serde_json::from_str::<ModelsPricingData>(&models) {
+            return match model {
+                "grok-3-fast" | "grok-3-fast-latest" => Some(Pricing {
+                    prompt: 0.000005,
+                    completion: 0.000025,
+                    request: 0.0,
+                    image: 0.0,
+                    web_search: 0.0,
+                    internal_reasoning: 0.0,
+                }),
+                "grok-3-mini-fast" | "grok-3-mini-fast-latest" => Some(Pricing {
+                    prompt: 0.0000006,
+                    completion: 0.000004,
+                    request: 0.0,
+                    image: 0.0,
+                    web_search: 0.0,
+                    internal_reasoning: 0.0,
+                }),
+
+                _ => {
+                    let remapped_model = match model {
+                        "grok-3-latest" => "grok-3",
+                        "grok-3-mini-latest" => "grok-3-mini",
+                        "grok-2-vision" | "grok-2-vision-latest" => "grok-2-vision-1212",
+                        "grok-2" | "grok-2-latest" => "grok-2-1212",
+                        _ => model,
+                    };
+                    let model_id = format!("x-ai/{}", remapped_model);
+
+                    models
+                        .data
+                        .iter()
+                        .find(|m| m.id == model_id)
+                        .map(|m| m.pricing.clone())
+                }
+            };
+        }
+    }
+    None
 }
 
 #[cfg(feature = "native")]

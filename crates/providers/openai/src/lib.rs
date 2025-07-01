@@ -2,7 +2,7 @@
 //!
 //! This module provides integration with OpenAI's GPT models through their API.
 
-use http::{Request, Response};
+use http::{response, Request, Response};
 use querymt::{
     chat::{
         http::HTTPChatProvider, ChatMessage, ChatResponse, StructuredOutputFormat, Tool, ToolChoice,
@@ -10,7 +10,9 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
+    get_env_var,
     plugin::HTTPLLMProviderFactory,
+    pricing::{ModelsPricingData, Pricing},
     HTTPLLMProvider,
 };
 use schemars::{schema_for, JsonSchema};
@@ -209,6 +211,46 @@ impl HTTPLLMProviderFactory for OpenAIFactory {
 
         Ok(Box::new(provider))
     }
+}
+
+fn get_pricing(model: &str, _thinking: bool) -> Option<Pricing> {
+    if let Some(models) = get_env_var!("MODEL_PRICING_DATA") {
+        if let Ok(models) = serde_json::from_str::<ModelsPricingData>(&models) {
+            return match model {
+                _ => {
+                    let remapped_model = match model {
+                        "gpt-3.5-0301" => "gpt-3.5-turbo",
+                        "gpt-3.5-turbo-16k-0613" => "gpt-3.5-turbo-16k",
+                        "gpt-4-0125-preview" => "gpt-4-turbo",
+                        "gpt-4-0613" => "gpt-4",
+                        "gpt-4-1106-preview" => "gpt-4-turbo",
+                        "gpt-4-1106-vision-preview" => "gpt-4-turbo",
+                        "gpt-4.1-2025-04-14" => "gpt-4.1",
+                        "gpt-4.1-mini-2025-04-14" => "gpt-4.1-mini",
+                        "gpt-4.1-nano-2025-04-14" => "gpt-4.1-nano",
+                        "gpt-4.5-preview-2025-02-27" => "gpt-4.5-preview",
+                        "gpt-4o-mini-search-preview-2025-03-11" => "gpt-4o-mini-search-preview",
+                        "gpt-4o-search-preview-2025-03-11" => "gpt-4o-search-preview",
+                        "gpt-4-turbo-2024-04-09" => "gpt-4-turbo",
+                        "o1-2024-12-17" => "o1",
+                        "o1-pro-2025-03-19" => "o1-pro",
+                        "o3-2025-04-16" => "o3",
+                        "o3-mini-2025-01-31" => "o3-mini",
+                        "o4-mini-2025-04-16" => "o4-mini",
+                        _ => model,
+                    };
+                    let model_id = format!("openai/{}", remapped_model);
+
+                    models
+                        .data
+                        .iter()
+                        .find(|m| m.id == model_id)
+                        .map(|m| m.pricing.clone())
+                }
+            };
+        }
+    }
+    None
 }
 
 #[cfg(feature = "native")]
