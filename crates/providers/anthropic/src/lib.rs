@@ -407,17 +407,14 @@ impl HTTPChatProvider for Anthropic {
             .body(json_req)?)
     }
 
-    fn parse_chat(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
+    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text: String = "".to_string();
-            return Err(Box::new(LLMError::ResponseFormatError {
+            return Err(LLMError::ResponseFormatError {
                 message: format!("API returned error status: {}", status),
                 raw_response: error_text,
-            }));
+            });
         }
 
         let json_resp: AnthropicCompleteResponse = serde_json::from_slice(resp.body())
@@ -432,10 +429,7 @@ impl HTTPCompletionProvider for Anthropic {
         unimplemented!()
     }
 
-    fn parse_complete(
-        &self,
-        _resp: Response<Vec<u8>>,
-    ) -> Result<CompletionResponse, Box<dyn std::error::Error>> {
+    fn parse_complete(&self, _resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
         unimplemented!()
     }
 }
@@ -447,13 +441,10 @@ impl HTTPEmbeddingProvider for Anthropic {
         ))
     }
 
-    fn parse_embed(
-        &self,
-        _resp: Response<Vec<u8>>,
-    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
-        Err(Box::new(LLMError::ProviderError(
+    fn parse_embed(&self, _resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
+        Err(LLMError::ProviderError(
             "Embedding not supported".to_string(),
-        )))
+        ))
     }
 }
 

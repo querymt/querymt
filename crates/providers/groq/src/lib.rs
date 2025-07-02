@@ -154,10 +154,7 @@ impl HTTPChatProvider for Groq {
         openai_chat_request(self, messages, tools)
     }
 
-    fn parse_chat(
-        &self,
-        response: Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         openai_parse_chat(self, response)
     }
 }
@@ -167,10 +164,7 @@ impl HTTPEmbeddingProvider for Groq {
         openai_embed_request(self, inputs)
     }
 
-    fn parse_embed(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    fn parse_embed(&self, resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
         openai_parse_embed(self, resp)
     }
 }
@@ -204,17 +198,14 @@ impl HTTPCompletionProvider for Groq {
             .body(json_body)?)
     }
 
-    fn parse_complete(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<CompletionResponse, Box<dyn std::error::Error>> {
+    fn parse_complete(&self, resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text: String = serde_json::to_string(resp.body())?;
-            return Err(Box::new(LLMError::ResponseFormatError {
+            return Err(LLMError::ResponseFormatError {
                 message: format!("API returned error status: {}", status),
                 raw_response: error_text,
-            }));
+            });
         }
 
         let json_resp: Result<GroqCompletionResponse, serde_json::Error> =
@@ -223,7 +214,7 @@ impl HTTPCompletionProvider for Groq {
             Ok(completion_response) => Ok(CompletionResponse {
                 text: completion_response.choices[0].message.content.clone(), // FIXME
             }),
-            Err(e) => Err(Box::new(LLMError::JsonError(e))),
+            Err(e) => Err(LLMError::JsonError(e)),
         }
     }
 }
@@ -259,10 +250,7 @@ impl HTTPLLMProviderFactory for GroqFactory {
         openai_list_models_request(&base_url, cfg)
     }
 
-    fn parse_list_models(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
         let models = openai_parse_list_models(&resp)?;
         println!("->> {:?}", models);
 
@@ -274,12 +262,8 @@ impl HTTPLLMProviderFactory for GroqFactory {
         serde_json::to_value(&schema.schema).expect("Groq JSON Schema should always serialize")
     }
 
-    fn from_config(
-        &self,
-        cfg: &Value,
-    ) -> Result<Box<dyn HTTPLLMProvider>, Box<dyn std::error::Error>> {
-        let provider: Groq = serde_json::from_value(cfg.clone())
-            .map_err(|e| LLMError::PluginError(format!("Groq config error: {}", e)))?;
+    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
+        let provider: Groq = serde_json::from_value(cfg.clone())?;
 
         Ok(Box::new(provider))
     }

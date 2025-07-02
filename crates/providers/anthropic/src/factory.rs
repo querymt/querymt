@@ -39,10 +39,7 @@ impl HTTPLLMProviderFactory for AnthropicFactory {
         }
     }
 
-    fn parse_list_models(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
         let resp_json: Value = serde_json::from_slice(&resp.body())?;
         let arr = resp_json
             .get("data")
@@ -63,12 +60,8 @@ impl HTTPLLMProviderFactory for AnthropicFactory {
         serde_json::to_value(&schema.schema).expect("Anthropic JSON Schema should always serialize")
     }
 
-    fn from_config(
-        &self,
-        cfg: &Value,
-    ) -> Result<Box<dyn HTTPLLMProvider>, Box<dyn std::error::Error>> {
-        let provider: Anthropic = serde_json::from_value(cfg.clone())
-            .map_err(|e| LLMError::PluginError(format!("Anthropic config error: {}", e)))?;
+    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
+        let provider: Anthropic = serde_json::from_value(cfg.clone())?;
         Ok(Box::new(provider))
     }
 }

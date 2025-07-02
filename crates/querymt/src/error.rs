@@ -1,3 +1,5 @@
+use std::string::FromUtf8Error;
+
 use thiserror::Error;
 
 /// Error types that can occur when interacting with LLM providers.
@@ -60,5 +62,11 @@ impl From<reqwest::Error> for LLMError {
 impl From<http::Error> for LLMError {
     fn from(err: http::Error) -> Self {
         LLMError::HttpError(err.to_string())
+    }
+}
+
+impl From<FromUtf8Error> for LLMError {
+    fn from(value: FromUtf8Error) -> Self {
+        LLMError::GenericError(format!("Error decoding string: {:#}", value))
     }
 }

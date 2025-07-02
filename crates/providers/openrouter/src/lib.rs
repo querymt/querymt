@@ -118,10 +118,7 @@ impl HTTPChatProvider for OpenRouter {
         openai_chat_request(self, messages, tools)
     }
 
-    fn parse_chat(
-        &self,
-        response: Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         openai_parse_chat(self, response)
     }
 }
@@ -131,10 +128,7 @@ impl HTTPEmbeddingProvider for OpenRouter {
         openai_embed_request(self, inputs)
     }
 
-    fn parse_embed(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    fn parse_embed(&self, resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
         openai_parse_embed(self, resp)
     }
 }
@@ -144,10 +138,7 @@ impl HTTPCompletionProvider for OpenRouter {
         !unimplemented!("feature is missing!")
     }
 
-    fn parse_complete(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<CompletionResponse, Box<dyn std::error::Error>> {
+    fn parse_complete(&self, resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
         !unimplemented!("feature is missing!")
     }
 }
@@ -188,10 +179,7 @@ impl HTTPLLMProviderFactory for OpenRouterFactory {
             .body(Vec::new())?)
     }
 
-    fn parse_list_models(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
         let resp_json: Value = serde_json::from_slice(&resp.body())?;
         let arr = resp_json
             .get("data")
@@ -215,10 +203,7 @@ impl HTTPLLMProviderFactory for OpenRouterFactory {
             .expect("OpenRouter JSON Schema should always serialize")
     }
 
-    fn from_config(
-        &self,
-        cfg: &Value,
-    ) -> Result<Box<dyn HTTPLLMProvider>, Box<dyn std::error::Error>> {
+    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
         let provider: OpenRouter = serde_json::from_value(cfg.clone())
             .map_err(|e| LLMError::PluginError(format!("OpenRouter config error: {}", e)))?;
 

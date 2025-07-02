@@ -32,9 +32,7 @@ impl LLMProviderFromHTTP {
             .await
             .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
 
-        self.inner
-            .parse_chat(resp)
-            .map_err(|e: Box<dyn std::error::Error>| LLMError::ProviderError(format!("{:#}", e)))
+        self.inner.parse_chat(resp)
     }
 }
 

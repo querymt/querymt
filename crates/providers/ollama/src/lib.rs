@@ -332,17 +332,14 @@ impl HTTPChatProvider for Ollama {
             .body(req_json)?)
     }
 
-    fn parse_chat(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
+    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text: String = serde_json::to_string(resp.body())?;
-            return Err(Box::new(LLMError::ResponseFormatError {
+            return Err(LLMError::ResponseFormatError {
                 message: format!("API returned error status: {}", status),
                 raw_response: error_text,
-            }));
+            });
         }
         let json_resp: OllamaResponse = serde_json::from_slice(resp.body())?;
         Ok(Box::new(json_resp))
@@ -369,10 +366,7 @@ impl HTTPCompletionProvider for Ollama {
             ?)
     }
 
-    fn parse_complete(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<CompletionResponse, Box<dyn std::error::Error>> {
+    fn parse_complete(&self, resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
         let ollama_response: OllamaResponse = serde_json::from_slice(resp.body())?;
 
         if let Some(prompt_response) = ollama_response.response {
@@ -380,9 +374,9 @@ impl HTTPCompletionProvider for Ollama {
                 text: prompt_response,
             })
         } else {
-            Err(Box::new(LLMError::ProviderError(
+            Err(LLMError::ProviderError(
                 "No answer returned by Ollama".to_string(),
-            )))
+            ))
         }
     }
 }
@@ -403,10 +397,7 @@ impl HTTPEmbeddingProvider for Ollama {
             .body(serde_json::to_vec(&body)?)?)
     }
 
-    fn parse_embed(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    fn parse_embed(&self, resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
         let json_resp: OllamaEmbeddingResponse = serde_json::from_slice(resp.body())?;
         Ok(json_resp.embeddings)
     }
@@ -440,10 +431,7 @@ impl HTTPLLMProviderFactory for OllamaFactory {
             .body(Vec::new())?)
     }
 
-    fn parse_list_models(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
         let resp_json: Value = serde_json::from_slice(&resp.body())?;
 
         let arr = resp_json
@@ -465,12 +453,8 @@ impl HTTPLLMProviderFactory for OllamaFactory {
         serde_json::to_value(&schema.schema).expect("Ollama JSON Schema should always serialize")
     }
 
-    fn from_config(
-        &self,
-        cfg: &Value,
-    ) -> Result<Box<dyn HTTPLLMProvider>, Box<dyn std::error::Error>> {
-        let provider: Ollama = serde_json::from_value(cfg.clone())
-            .map_err(|e| LLMError::PluginError(format!("Ollama config error: {}", e)))?;
+    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
+        let provider: Ollama = serde_json::from_value(cfg.clone())?;
         Ok(Box::new(provider))
     }
 }

@@ -663,17 +663,14 @@ impl HTTPChatProvider for Google {
             .body(json_body)?)
     }
 
-    fn parse_chat(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
+    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_text: String = serde_json::to_string(resp.body())?;
-            return Err(Box::new(LLMError::ResponseFormatError {
+            return Err(LLMError::ResponseFormatError {
                 message: format!("API returned error status: {}", status),
                 raw_response: error_text,
-            }));
+            });
         }
 
         let json_resp: Result<GoogleChatResponse, serde_json::Error> =
@@ -683,10 +680,10 @@ impl HTTPChatProvider for Google {
             Ok(response) => Ok(Box::new(response)),
             Err(e) => {
                 // Return a more descriptive error with the raw response
-                Err(Box::new(LLMError::ResponseFormatError {
+                Err(LLMError::ResponseFormatError {
                     message: format!("Failed to decode Google API response: {}", e),
                     raw_response: String::from_utf8(resp.into_body())?,
-                }))
+                })
             }
         }
     }
@@ -698,17 +695,14 @@ impl HTTPCompletionProvider for Google {
         self.chat_request(&[chat_message], None)
     }
 
-    fn parse_complete(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<CompletionResponse, Box<dyn std::error::Error>> {
+    fn parse_complete(&self, resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
         let chat_response = self.parse_chat(resp)?;
         if let Some(text) = chat_response.text() {
             Ok(CompletionResponse { text })
         } else {
-            Err(Box::new(LLMError::ProviderError(
+            Err(LLMError::ProviderError(
                 "No answer returned by Google".to_string(),
-            )))
+            ))
         }
     }
 }
@@ -741,6 +735,7 @@ impl HTTPEmbeddingProvider for Google {
             .map_err(|e| LLMError::HttpError(e.to_string()))?;
         url.set_query(Some(&format!("key={}", &self.api_key)));
 
+        unimplemented!();
         Err(LLMError::ProviderError("asd".to_string()))
         /*
         Ok(Request::builder()
@@ -751,14 +746,12 @@ impl HTTPEmbeddingProvider for Google {
             */
     }
 
-    fn parse_embed(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    fn parse_embed(&self, resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
         let embedding_resp: GoogleEmbeddingResponse = serde_json::from_slice(resp.body())?;
         let x = embedding_resp.embedding.values;
         //Ok(embedding_resp.embedding.values)
-        Err(Box::new(LLMError::ProviderError("asd".to_string())))
+        todo!("finish google embedding");
+        Err(LLMError::ProviderError("asd".to_string()))
     }
 }
 
@@ -798,10 +791,7 @@ impl HTTPLLMProviderFactory for GoogleFactory {
         }
     }
 
-    fn parse_list_models(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
         let resp_json: Value = serde_json::from_slice(&resp.body())?;
         let arr = resp_json
             .get("models")
@@ -823,12 +813,8 @@ impl HTTPLLMProviderFactory for GoogleFactory {
         serde_json::to_value(&schema.schema).expect("Google JSON Schema should always serialize")
     }
 
-    fn from_config(
-        &self,
-        cfg: &Value,
-    ) -> Result<Box<dyn HTTPLLMProvider>, Box<dyn std::error::Error>> {
-        let provider: Google = serde_json::from_value(cfg.clone())
-            .map_err(|e| LLMError::PluginError(format!("Google config error: {}", e)))?;
+    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
+        let provider: Google = serde_json::from_value(cfg.clone())?;
         Ok(Box::new(provider))
     }
 }

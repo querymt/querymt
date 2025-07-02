@@ -161,13 +161,10 @@ impl HTTPLLMProviderFactory for ExtismFactory {
         (self as &dyn LLMProviderFactory).config_schema()
     }
 
-    fn from_config(
-        &self,
-        _cfg: &Value,
-    ) -> Result<Box<dyn crate::HTTPLLMProvider>, Box<dyn std::error::Error>> {
-        Err(Box::new(LLMError::PluginError(
+    fn from_config(&self, _cfg: &Value) -> Result<Box<dyn crate::HTTPLLMProvider>, LLMError> {
+        Err(LLMError::PluginError(
             "ExtismProvider should not be used as HTTPLLMProviderFactory".into(),
-        )))
+        ))
     }
 
     fn list_models_request(&self, _cfg: &Value) -> Result<http::Request<Vec<u8>>, LLMError> {
@@ -176,13 +173,10 @@ impl HTTPLLMProviderFactory for ExtismFactory {
         ))
     }
 
-    fn parse_list_models(
-        &self,
-        _resp: http::Response<Vec<u8>>,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        Err(Box::new(LLMError::PluginError(
+    fn parse_list_models(&self, _resp: http::Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
+        Err(LLMError::PluginError(
             "ExtismProvider should not be used as HTTPLLMProviderFactory".into(),
-        )))
+        ))
     }
 
     fn api_key_name(&self) -> Option<String> {

@@ -125,10 +125,7 @@ impl HTTPChatProvider for Alibaba {
         openai_chat_request(self, messages, tools)
     }
 
-    fn parse_chat(
-        &self,
-        response: Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         openai_parse_chat(self, response)
     }
 }
@@ -138,10 +135,7 @@ impl HTTPEmbeddingProvider for Alibaba {
         openai_embed_request(self, inputs)
     }
 
-    fn parse_embed(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    fn parse_embed(&self, resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
         openai_parse_embed(self, resp)
     }
 }
@@ -151,10 +145,7 @@ impl HTTPCompletionProvider for Alibaba {
         !unimplemented!("feature is missing!")
     }
 
-    fn parse_complete(
-        &self,
-        _resp: Response<Vec<u8>>,
-    ) -> Result<CompletionResponse, Box<dyn std::error::Error>> {
+    fn parse_complete(&self, _resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
         !unimplemented!("feature is missing!")
     }
 }
@@ -190,10 +181,7 @@ impl HTTPLLMProviderFactory for AlibabaFactory {
             .body(Vec::new())?)
     }
 
-    fn parse_list_models(
-        &self,
-        _resp: Response<Vec<u8>>,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    fn parse_list_models(&self, _resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
         Ok(vec![
             "qwq-plus",
             "qwen-max",
@@ -240,14 +228,9 @@ impl HTTPLLMProviderFactory for AlibabaFactory {
             .expect("OpenRouter JSON Schema should always serialize")
     }
 
-    fn from_config(
-        &self,
-        cfg: &Value,
-    ) -> Result<Box<dyn HTTPLLMProvider>, Box<dyn std::error::Error>> {
-        let provider: Alibaba = serde_json::from_value(cfg.clone())
-            .map_err(|e| LLMError::PluginError(format!("OpenRouter config error: {}", e)))?;
+    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
+        let provider: Alibaba = serde_json::from_value(cfg.clone())?;
 
-        // 2) Done—our OpenAI::send/chat/etc methods will lazily build the Client
         Ok(Box::new(provider))
     }
 }

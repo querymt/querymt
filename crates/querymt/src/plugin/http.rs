@@ -1,7 +1,6 @@
 use crate::{error::LLMError, HTTPLLMProvider};
 use http::{Request, Response};
 use serde_json::Value;
-use std::error::Error;
 
 pub trait HTTPLLMProviderFactory: Send + Sync {
     fn name(&self) -> &str;
@@ -17,10 +16,10 @@ pub trait HTTPLLMProviderFactory: Send + Sync {
     fn list_models_request(&self, cfg: &Value) -> Result<Request<Vec<u8>>, LLMError>;
 
     /// Turn the raw HTTP response into a Vec<String>.
-    fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, Box<dyn Error>>;
+    fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError>;
 
     /// Given a chosen model name, build a sync `HttpLLMProvider`
-    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, Box<dyn Error>>;
+    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError>;
 }
 
 pub type HTTPFactoryCtor = unsafe extern "C" fn() -> *mut dyn HTTPLLMProviderFactory;

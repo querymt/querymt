@@ -129,10 +129,7 @@ impl HTTPChatProvider for OpenAI {
         api::openai_chat_request(self, messages, tools)
     }
 
-    fn parse_chat(
-        &self,
-        response: Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         api::openai_parse_chat(self, response)
     }
 }
@@ -142,10 +139,7 @@ impl HTTPEmbeddingProvider for OpenAI {
         api::openai_embed_request(self, inputs)
     }
 
-    fn parse_embed(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    fn parse_embed(&self, resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
         api::openai_parse_embed(self, resp)
     }
 }
@@ -155,10 +149,7 @@ impl HTTPCompletionProvider for OpenAI {
         !unimplemented!("feature is missing!")
     }
 
-    fn parse_complete(
-        &self,
-        _resp: Response<Vec<u8>>,
-    ) -> Result<CompletionResponse, Box<dyn std::error::Error>> {
+    fn parse_complete(&self, _resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
         !unimplemented!("feature is missing!")
     }
 }
@@ -187,10 +178,7 @@ impl HTTPLLMProviderFactory for OpenAIFactory {
         api::openai_list_models_request(&base_url, cfg)
     }
 
-    fn parse_list_models(
-        &self,
-        resp: Response<Vec<u8>>,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
         api::openai_parse_list_models(&resp)
     }
 
@@ -200,13 +188,8 @@ impl HTTPLLMProviderFactory for OpenAIFactory {
         serde_json::to_value(&schema.schema).expect("OpenAI JSON Schema should always serialize")
     }
 
-    fn from_config(
-        &self,
-        cfg: &Value,
-    ) -> Result<Box<dyn HTTPLLMProvider>, Box<dyn std::error::Error>> {
-        let provider: OpenAI = serde_json::from_value(cfg.clone())
-            .map_err(|e| LLMError::PluginError(format!("OpenAI config error: {}", e)))?;
-
+    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
+        let provider: OpenAI = serde_json::from_value(cfg.clone())?;
         Ok(Box::new(provider))
     }
 }

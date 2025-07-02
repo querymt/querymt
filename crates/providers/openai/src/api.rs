@@ -325,7 +325,7 @@ pub fn openai_embed_request<C: OpenAIProviderConfig>(
 pub fn openai_parse_embed<C: OpenAIProviderConfig>(
     _cfg: &C,
     resp: Response<Vec<u8>>,
-) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+) -> Result<Vec<Vec<f32>>, LLMError> {
     let json_resp: OpenAIEmbeddingResponse = serde_json::from_slice(resp.body())?;
     let embeddings = json_resp.data.into_iter().map(|d| d.embedding).collect();
     Ok(embeddings)
@@ -427,15 +427,15 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
 pub fn openai_parse_chat<C: OpenAIProviderConfig>(
     _cfg: &C,
     response: Response<Vec<u8>>,
-) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
+) -> Result<Box<dyn ChatResponse>, LLMError> {
     // If we got a non-200 response, let's get the error details
     if !response.status().is_success() {
         let status = response.status();
         let error_text: String = serde_json::to_string(response.body())?;
-        return Err(Box::new(LLMError::ResponseFormatError {
+        return Err(LLMError::ResponseFormatError {
             message: format!("API returned error status: {}", status),
             raw_response: error_text,
-        }));
+        });
     }
 
     // Parse the successful response
@@ -445,10 +445,10 @@ pub fn openai_parse_chat<C: OpenAIProviderConfig>(
     let resp_text: String = "".to_string();
     match json_resp {
         Ok(response) => Ok(Box::new(response)),
-        Err(e) => Err(Box::new(LLMError::ResponseFormatError {
+        Err(e) => Err(LLMError::ResponseFormatError {
             message: format!("Failed to decode API response: {}", e),
             raw_response: resp_text,
-        })),
+        }),
     }
 }
 
@@ -536,9 +536,7 @@ pub fn openai_list_models_request(
         .body(Vec::new())?)
 }
 
-pub fn openai_parse_list_models(
-    response: &Response<Vec<u8>>,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+pub fn openai_parse_list_models(response: &Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
     let resp_json: Value = serde_json::from_slice(response.body())?;
     let arr = resp_json
         .get("data")
