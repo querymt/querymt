@@ -26,6 +26,7 @@ pub mod adapters;
 pub mod builder;
 
 /// Chain multiple LLM providers together for complex workflows
+#[cfg(not(feature = "extism_plugin"))]
 pub mod chain;
 
 /// Chat-based interactions with language models (e.g. ChatGPT style)
