@@ -1,15 +1,14 @@
-use std::collections::HashMap;
-use std::fmt;
-
 use async_trait::async_trait;
 use schemars::schema::{
     InstanceType, Metadata, ObjectValidation, Schema, SchemaObject, SingleOrVec,
 };
 use schemars::{gen::SchemaGenerator, JsonSchema};
-
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::fmt;
+use tracing::instrument;
 
 use crate::{error::LLMError, ToolCall, Usage};
 
@@ -398,6 +397,7 @@ pub trait BasicChatProvider: Sync + Send {
 
 #[async_trait]
 pub trait ToolChatProvider: BasicChatProvider + Sync + Send {
+    #[instrument(name = "tool_chat_provider.chat_with_tools", skip_all)]
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],

@@ -18,6 +18,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+use tracing::instrument;
 use url::Url;
 
 mod loader;
@@ -46,6 +47,7 @@ fn call_plugin_json(plugin: Arc<Mutex<Plugin>>, func: &str, arg: &Value) -> anyh
 }
 
 impl ExtismFactory {
+    #[instrument(name = "extism_factory.load", skip_all)]
     pub fn load(
         wasm_content: Vec<u8>,
         config: &Option<HashMap<String, toml::Value>>,
@@ -194,6 +196,7 @@ pub struct ExtismProvider {
 
 #[async_trait]
 impl BasicChatProvider for ExtismProvider {
+    #[instrument(name = "extism_provider.chat", skip_all)]
     async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
         let arg = ExtismChatRequest {
             cfg: self.config.clone(),
@@ -211,6 +214,7 @@ impl BasicChatProvider for ExtismProvider {
 
 #[async_trait]
 impl ToolChatProvider for ExtismProvider {
+    #[instrument(name = "extism_provider.chat_with_tools", skip_all)]
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -233,6 +237,7 @@ impl ToolChatProvider for ExtismProvider {
 
 #[async_trait]
 impl EmbeddingProvider for ExtismProvider {
+    #[instrument(name = "extism_provider.embed", skip_all)]
     async fn embed(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
         let arg = ExtismEmbedRequest {
             cfg: self.config.clone(),
@@ -249,6 +254,7 @@ impl EmbeddingProvider for ExtismProvider {
 
 #[async_trait]
 impl CompletionProvider for ExtismProvider {
+    #[instrument(name = "extism_provider.complete", skip_all)]
     async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
         let arg = ExtismCompleteRequest {
             cfg: self.config.clone(),

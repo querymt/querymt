@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::{collections::HashMap, path::PathBuf};
+use tracing::instrument;
 
 pub mod config;
 pub use config::{PluginConfig, ProviderConfig};
@@ -70,6 +71,7 @@ impl PluginRegistry {
         self.loaders.insert(loader.supported_type(), loader);
     }
 
+    #[instrument(name = "plugin_registry.load_all_plugins", skip_all)]
     pub async fn load_all_plugins(&self) {
         log::debug!("Loading all configured plugins...");
         for provider_cfg in &self.config.providers {
@@ -86,6 +88,7 @@ impl PluginRegistry {
         }
     }
 
+    #[instrument(name = "plugin_registry.load_and_process_plugin", skip_all, fields(provider = %provider_cfg.name))]
     pub async fn load_and_process_plugin(
         &self,
         provider_cfg: &ProviderConfig,

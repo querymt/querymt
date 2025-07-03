@@ -20,6 +20,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::instrument;
 
 use super::{PluginType, ProviderPlugin};
 
@@ -157,6 +158,7 @@ async fn setup_trust_repository(
     Ok(Box::new(data))
 }
 
+#[instrument(name = "oci.verify_image_signature", skip_all, fields(image = %image_reference))]
 async fn verify_image_signature(
     config: &OciDownloaderConfig,
     image_reference: &str,
@@ -423,6 +425,7 @@ impl OciDownloader {
         }
     }
 
+    #[instrument(name = "oci.pull_and_extract", skip_all, fields(image = %image_reference))]
     pub async fn pull_and_extract(
         &self,
         image_reference: &str,

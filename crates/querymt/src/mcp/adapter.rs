@@ -89,6 +89,7 @@ impl CallFunctionTool for McpToolAdapter {
         self.tool.clone()
     }
 
+    #[instrument(name = "mcp_tool.call", skip_all, fields(name = %self.mcp_tool.name))]
     async fn call(&self, args: Value) -> Result<String> {
         let arguments = match args {
             Value::Object(map) => Some(map),

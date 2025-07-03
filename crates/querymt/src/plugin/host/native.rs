@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use libloading::Library;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::instrument;
 
 struct NativeFactoryWrapper {
     factory_impl: Box<dyn LLMProviderFactory>,
@@ -47,6 +48,7 @@ impl PluginLoader for NativeLoader {
         PluginType::Native
     }
 
+    #[instrument(name = "native_loader.load_plugin", skip_all, fields(plugin = %plugin.file_path.display(), name = %plugin_cfg.name))]
     async fn load_plugin(
         &self,
         plugin: ProviderPlugin,

@@ -1,14 +1,14 @@
 //! Module for chaining multiple LLM backends in a single prompt sequence.
 //! Each step can reference a distinct provider_id ("openai", "anthro", etc.).
 
-use std::collections::HashMap;
-
 use crate::{
     chat::{ChatMessage, ChatRole, MessageType},
     completion::CompletionRequest,
     error::LLMError,
     LLMProvider, ToolCall,
 };
+use std::collections::HashMap;
+use tracing::instrument;
 
 #[cfg(feature = "api")]
 use crate::api::Server;
@@ -210,6 +210,7 @@ impl<'a> MultiPromptChain<'a> {
     }
 
     /// Executes all steps
+    #[instrument(name = "multi_prompt_chain.run", skip_all)]
     pub async fn run(mut self) -> Result<HashMap<String, String>, LLMError> {
         for step in &self.steps {
             // 1) Replace {{xyz}} in template with existing memory

@@ -8,6 +8,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::sync::Arc;
+use tracing::instrument;
 
 pub struct LLMProviderFromHTTP {
     inner: Arc<dyn HTTPLLMProvider>,
@@ -38,6 +39,7 @@ impl LLMProviderFromHTTP {
 
 #[async_trait]
 impl BasicChatProvider for LLMProviderFromHTTP {
+    #[instrument(name = "http_adapter.chat", skip_all)]
     async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
         // no tools by default
         self.do_chat(messages, None).await
@@ -46,6 +48,7 @@ impl BasicChatProvider for LLMProviderFromHTTP {
 
 #[async_trait]
 impl ToolChatProvider for LLMProviderFromHTTP {
+    #[instrument(name = "http_adapter.chat_with_tools", skip_all)]
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -57,6 +60,7 @@ impl ToolChatProvider for LLMProviderFromHTTP {
 
 #[async_trait]
 impl EmbeddingProvider for LLMProviderFromHTTP {
+    #[instrument(name = "http_adapter.embed", skip_all)]
     async fn embed(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
         let req = self.inner.embed_request(&inputs)?;
         let resp = call_outbound(req)
@@ -70,6 +74,7 @@ impl EmbeddingProvider for LLMProviderFromHTTP {
 
 #[async_trait]
 impl CompletionProvider for LLMProviderFromHTTP {
+    #[instrument(name = "http_adapter.complete", skip_all)]
     async fn complete(&self, req_obj: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
         let req = self.inner.complete_request(req_obj)?;
         let resp = call_outbound(req)

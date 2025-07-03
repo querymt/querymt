@@ -16,6 +16,7 @@ use crate::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::{collections::HashMap, sync::Arc};
+use tracing::instrument;
 
 /// A function type for validating LLM provider outputs.
 /// Takes a response string and returns Ok(()) if valid, or Err with an error message if invalid.
@@ -323,6 +324,7 @@ impl LLMBuilder {
     /// - No backend is specified
     /// - Required backend feature is not enabled
     /// - Required configuration like API keys are missing
+    #[instrument(name = "llm_builder.build", skip(self, registry), fields(provider = self.provider.as_deref().unwrap_or("unknown")))]
     pub fn build(self, registry: &PluginRegistry) -> Result<Box<dyn LLMProvider>, LLMError> {
         //        let (tools, tool_choice) = self.validate_tool_config()?;
 
