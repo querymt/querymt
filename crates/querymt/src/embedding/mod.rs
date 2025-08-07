@@ -1,6 +1,5 @@
-use async_trait::async_trait;
-
 use crate::error::LLMError;
+use async_trait::async_trait;
 
 pub mod http;
 
