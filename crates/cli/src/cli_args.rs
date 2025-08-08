@@ -7,8 +7,7 @@ use serde_json::Value;
 #[clap(
     name = "qmt",
     about = "Interactive CLI interface for chatting with LLM providers",
-    allow_hyphen_values = true,
-    args_conflicts_with_subcommands = true
+    allow_hyphen_values = true
 )]
 pub struct CliArgs {
     #[command(subcommand)]
@@ -55,7 +54,8 @@ pub struct CliArgs {
     #[arg(long)]
     pub mcp_config: Option<String>,
 
-    #[arg(long)]
+    /// Custom providers config path
+    #[arg(long, global = true)]
     pub provider_config: Option<String>,
 
     #[arg(short = 'o', value_parser = parse_kv, action = clap::ArgAction::Append)]
@@ -99,4 +99,6 @@ pub enum Commands {
         #[arg()]
         text: Option<String>,
     },
+    /// Update provider plugins
+    Update,
 }
