@@ -158,8 +158,8 @@ impl HTTPChatProvider for Mistral {
     fn parse_chat(
         &self,
         response: Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
-        openai_parse_chat(self, response)
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        Ok(openai_parse_chat(self, response)?)
     }
 }
 
