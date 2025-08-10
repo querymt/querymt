@@ -134,8 +134,8 @@ impl HTTPChatProvider for OpenAI {
     fn parse_chat(
         &self,
         response: Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, Box<dyn std::error::Error>> {
-        api::openai_parse_chat(self, response)
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        Ok(api::openai_parse_chat(self, response)?)
     }
 }
 
