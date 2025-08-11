@@ -15,7 +15,7 @@ use querymt::{
     error::LLMError,
     get_env_var,
     plugin::HTTPLLMProviderFactory,
-    pricing::{ModelsPricingData, Pricing},
+    providers::{ModelPricing, ProvidersRegistry},
     HTTPLLMProvider, ToolCall,
 };
 use schemars::{schema_for, JsonSchema};
@@ -155,10 +155,7 @@ impl HTTPChatProvider for Xai {
         openai_chat_request(self, messages, tools)
     }
 
-    fn parse_chat(
-        &self,
-        response: Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         Ok(openai_parse_chat(self, response)?)
     }
 }
@@ -271,45 +268,10 @@ impl HTTPLLMProviderFactory for XaiFactory {
 }
 
 #[warn(dead_code)]
-fn get_pricing(model: &str, thinking: bool) -> Option<Pricing> {
-    // Source: https://docs.x.ai/docs/models
-    if let Some(models) = get_env_var!("MODEL_PRICING_DATA") {
-        if let Ok(models) = serde_json::from_str::<ModelsPricingData>(&models) {
-            return match model {
-                "grok-3-fast" | "grok-3-fast-latest" => Some(Pricing {
-                    prompt: 0.000005,
-                    completion: 0.000025,
-                    request: 0.0,
-                    image: 0.0,
-                    web_search: 0.0,
-                    internal_reasoning: 0.0,
-                }),
-                "grok-3-mini-fast" | "grok-3-mini-fast-latest" => Some(Pricing {
-                    prompt: 0.0000006,
-                    completion: 0.000004,
-                    request: 0.0,
-                    image: 0.0,
-                    web_search: 0.0,
-                    internal_reasoning: 0.0,
-                }),
-
-                _ => {
-                    let remapped_model = match model {
-                        "grok-3-latest" => "grok-3",
-                        "grok-3-mini-latest" => "grok-3-mini",
-                        "grok-2-vision" | "grok-2-vision-latest" => "grok-2-vision-1212",
-                        "grok-2" | "grok-2-latest" => "grok-2-1212",
-                        _ => model,
-                    };
-                    let model_id = format!("x-ai/{}", remapped_model);
-
-                    models
-                        .data
-                        .iter()
-                        .find(|m| m.id == model_id)
-                        .map(|m| m.pricing.clone())
-                }
-            };
+fn get_pricing(model: &str) -> Option<ModelPricing> {
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
+        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
+            return registry.get_pricing("xai", model).cloned();
         }
     }
     None

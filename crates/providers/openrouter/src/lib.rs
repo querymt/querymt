@@ -12,7 +12,7 @@ use querymt::{
     error::LLMError,
     get_env_var,
     plugin::HTTPLLMProviderFactory,
-    pricing::{ModelsPricingData, Pricing},
+    providers::{ModelPricing, ProvidersRegistry},
     HTTPLLMProvider,
 };
 use schemars::{schema_for, JsonSchema};
@@ -120,10 +120,7 @@ impl HTTPChatProvider for OpenRouter {
         openai_chat_request(self, messages, tools)
     }
 
-    fn parse_chat(
-        &self,
-        response: Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         Ok(openai_parse_chat(self, response)?)
     }
 }
@@ -217,16 +214,11 @@ impl HTTPLLMProviderFactory for OpenRouterFactory {
     }
 }
 
-fn get_pricing(model: &str) -> Option<Pricing> {
-    // NOTE: This fn do not need `thinking` param because `thinking` goes as a part of model name on
-    // OpenRouter.
-    if let Some(models) = get_env_var!("MODEL_PRICING_DATA") {
-        if let Ok(models) = serde_json::from_str::<ModelsPricingData>(&models) {
-            return models
-                .data
-                .iter()
-                .find(|m| m.id == model)
-                .map(|m| m.pricing.clone());
+#[warn(dead_code)]
+fn get_pricing(model: &str) -> Option<ModelPricing> {
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
+        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
+            return registry.get_pricing("openrouter", model).cloned();
         }
     }
     None

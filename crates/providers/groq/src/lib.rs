@@ -14,8 +14,9 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
+    get_env_var,
     plugin::HTTPLLMProviderFactory,
-    pricing::Pricing,
+    providers::{ModelPricing, ProvidersRegistry},
     HTTPLLMProvider, ToolCall,
 };
 use schemars::{schema_for, JsonSchema};
@@ -155,10 +156,7 @@ impl HTTPChatProvider for Groq {
         openai_chat_request(self, messages, tools)
     }
 
-    fn parse_chat(
-        &self,
-        response: Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         Ok(openai_parse_chat(self, response)?)
     }
 }
@@ -272,112 +270,15 @@ impl HTTPLLMProviderFactory for GroqFactory {
         Ok(Box::new(provider))
     }
 }
+
 #[warn(dead_code)]
-fn get_pricing(model: &str, _thinking: bool) -> Option<Pricing> {
-    // Source: https://groq.com/pricing/
-    // NOTE: Models for personal use available for free with limited (but good) amount of request per day.
-    return match model {
-        "meta-llama/llama-4-scout-17b-16e" => Some(Pricing {
-            prompt: 0.00000011,
-            completion: 0.00000034,
-            request: 0.0,
-            image: 0.0,
-            web_search: 0.0,
-            internal_reasoning: 0.0,
-        }),
-        "meta-llama/llama-4-maverick-17b-128e" => Some(Pricing {
-            prompt: 0.0000002,
-            completion: 0.0000006,
-            request: 0.0,
-            image: 0.0,
-            web_search: 0.0,
-            internal_reasoning: 0.0,
-        }),
-        "meta-llama/llama-guard-4-12b" => Some(Pricing {
-            prompt: 0.0000002,
-            completion: 0.0000002,
-            request: 0.0,
-            image: 0.0,
-            web_search: 0.0,
-            internal_reasoning: 0.0,
-        }),
-        "deepseek-r1-distill-llama-70b" => Some(Pricing {
-            prompt: 0.00000075,
-            completion: 0.00000099,
-            request: 0.0,
-            image: 0.0,
-            web_search: 0.0,
-            internal_reasoning: 0.0,
-        }),
-        "qwen/qwen3-32b" => Some(Pricing {
-            prompt: 0.00000029,
-            completion: 0.00000059,
-            request: 0.0,
-            image: 0.0,
-            web_search: 0.0,
-            internal_reasoning: 0.0,
-        }),
-        "qwen-qwq-32b" => Some(Pricing {
-            prompt: 0.00000029,
-            completion: 0.00000039,
-            request: 0.0,
-            image: 0.0,
-            web_search: 0.0,
-            internal_reasoning: 0.0,
-        }),
-        "mistral-saba-24b" => Some(Pricing {
-            prompt: 0.00000079,
-            completion: 0.00000079,
-            request: 0.0,
-            image: 0.0,
-            web_search: 0.0,
-            internal_reasoning: 0.0,
-        }),
-        "llama-3.3-70b-versatile" => Some(Pricing {
-            prompt: 0.00000059,
-            completion: 0.00000079,
-            request: 0.0,
-            image: 0.0,
-            web_search: 0.0,
-            internal_reasoning: 0.0,
-        }),
-        "llama-3.1-8b-instant" => Some(Pricing {
-            prompt: 0.00000005,
-            completion: 0.00000008,
-            request: 0.0,
-            image: 0.0,
-            web_search: 0.0,
-            internal_reasoning: 0.0,
-        }),
-        "llama3-70b-8192" => Some(Pricing {
-            prompt: 0.00000059,
-            completion: 0.00000079,
-            request: 0.0,
-            image: 0.0,
-            web_search: 0.0,
-            internal_reasoning: 0.0,
-        }),
-        "llama3-8b-8192" => Some(Pricing {
-            prompt: 0.00000005,
-            completion: 0.00000008,
-            request: 0.0,
-            image: 0.0,
-            web_search: 0.0,
-            internal_reasoning: 0.0,
-        }),
-        "gemma2-9b-it" => Some(Pricing {
-            prompt: 0.0000002,
-            completion: 0.0000002,
-            request: 0.0,
-            image: 0.0,
-            web_search: 0.0,
-            internal_reasoning: 0.0,
-        }),
-
-        "compound-beta" | "compound-beta-mini" => Some(Pricing::default()),
-
-        _ => None,
-    };
+fn get_pricing(model: &str) -> Option<ModelPricing> {
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
+        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
+            return registry.get_pricing("groq", model).cloned();
+        }
+    }
+    None
 }
 
 #[cfg(feature = "native")]

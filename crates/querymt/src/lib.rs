@@ -58,7 +58,7 @@ pub mod validated_llm;
 /// Evaluator for LLM providers
 pub mod evaluator;
 
-pub mod pricing;
+pub mod providers;
 
 /// Core trait that all LLM providers must implement, combining chat, completion
 /// and embedding capabilities into a unified interface

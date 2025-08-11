@@ -71,15 +71,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    match querymt::pricing::update_models_pricing_if_stale().await {
+    match querymt::providers::update_providers_if_stale().await {
         Ok(true) => {
-            log::info!("Models pricing - downloaded and cached new data");
+            log::info!("Providers - downloaded and cached new data");
         }
         Ok(false) => {
-            log::info!("Models pricing - using existing cached data");
+            log::info!("Providers - using existing cached data");
         }
         Err(e) => {
-            log::error!("Failed to update models pricing data: {}", e);
+            log::error!("Failed to update providers data: {}", e);
         }
     }
 
