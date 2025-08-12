@@ -1,9 +1,12 @@
 use crate::error::LLMError;
 use anyhow::anyhow;
 use docker_credential::{CredentialRetrievalError, DockerCredential};
-use oci_client::manifest::{OciImageManifest, OciManifest, Platform};
-use oci_client::Reference;
-use oci_client::{secrets::RegistryAuth, Client};
+use oci_client::{
+    errors::{OciDistributionError, OciErrorCode},
+    manifest::{OciImageManifest, OciManifest, Platform},
+    secrets::RegistryAuth,
+    Client, Reference,
+};
 use serde::{Deserialize, Serialize};
 use sigstore::cosign::verification_constraint::cert_subject_email_verifier::StringVerifier;
 use sigstore::cosign::verification_constraint::{
@@ -578,10 +581,38 @@ impl OciDownloader {
                 })
             }
             Err(e) => {
-                log::warn!(
-                    "Network error while fetching OCI plugin, assuming offline: {}",
-                    e
-                );
+                match e {
+                    OciDistributionError::RegistryError { envelope, url } => {
+                        for e in envelope.errors {
+                            if e.code == OciErrorCode::Denied {
+                                return Err(format!(
+                                    "Access denied for '{:?}': {}",
+                                    url, e.message
+                                )
+                                .into());
+                            } else if e.code == OciErrorCode::Unauthorized {
+                                return Err(format!(
+                                    "Unauthorized access to '{:?}': {}",
+                                    url, e.message
+                                )
+                                .into());
+                            } else {
+                                return Err(format!(
+                                    "Error while accessing '{:?}': {}",
+                                    url, e.message
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    OciDistributionError::UnauthorizedError { url } => {
+                        return Err(format!("Unauthorized access to {:?}", url).into());
+                    }
+                    OciDistributionError::AuthenticationFailure(err) => {
+                        return Err(format!("Authentication failure: {:?}", err).into());
+                    }
+                    _ => todo!("{:?}", e),
+                }
 
                 if let Some(meta) = local_metadata {
                     let blob_path =
