@@ -46,9 +46,17 @@ impl TryFrom<RmcpTool> for FunctionTool {
             }
         })?;
 
+        let mut description = r.description.clone().unwrap_or_default().to_string();
+        if let Some(output_schema) = r.output_schema {
+            match serde_json::to_string(&output_schema) {
+                Ok(os_str) => description = format!("{}. Returns {}", description, os_str),
+                _ => (),
+            }
+        }
+
         Ok(FunctionTool {
             name: tool_name,
-            description: r.description.clone().unwrap_or_default().to_string(),
+            description: description,
             parameters: schema,
         })
     }
