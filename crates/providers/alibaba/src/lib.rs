@@ -10,7 +10,9 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
+    get_env_var,
     plugin::HTTPLLMProviderFactory,
+    providers::{ModelPricing, ProvidersRegistry},
     HTTPLLMProvider,
 };
 use schemars::{schema_for, JsonSchema};
@@ -190,16 +192,19 @@ impl HTTPLLMProviderFactory for AlibabaFactory {
             "qwen-plus",
             "qwen-plus-latest",
             "qwen-plus-2025-01-25",
+            "qwen-plus-2025-04-28",
             "qwen-turbo",
             "qwen-turbo-latest",
             "qwen-turbo-2024-11-01",
-            "qwen3-235b-A22b",
+            "qwen-turbo-2025-04-28",
+            "qwen3-235b-a22b",
             "qwen3-32b",
             "qwen3-30b-a3b",
             "qwen3-14b",
             "qwen3-8b",
             "qwen3-4b",
             "qwen3-1.7b",
+            "qwen3-0.6b",
             "qwen2.5-14b-instruct-1m",
             "qwen2.5-7b-instruct-1m",
             "qwen2.5-72b-instruct",
@@ -215,6 +220,9 @@ impl HTTPLLMProviderFactory for AlibabaFactory {
             "qwen1.5-14b-chat",
             "qwen1.5-7b-chat",
             "qwen2.5-omni-7b",
+            "qvq-max",
+            "qvq-max-latest",
+            "qvq-max-2025-03-25",
         ]
         .into_iter()
         .map(String::from)
@@ -233,6 +241,16 @@ impl HTTPLLMProviderFactory for AlibabaFactory {
 
         Ok(Box::new(provider))
     }
+}
+
+#[warn(dead_code)]
+fn get_pricing(model: &str) -> Option<ModelPricing> {
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
+        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
+            return registry.get_pricing("alibaba", model).cloned();
+        }
+    }
+    None
 }
 
 #[cfg(feature = "native")]

@@ -1,4 +1,3 @@
-use either::*;
 use http::{
     header::{AUTHORIZATION, CONTENT_TYPE},
     Method, Request, Response,
@@ -14,8 +13,10 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
+    get_env_var,
     plugin::HTTPLLMProviderFactory,
-    HTTPLLMProvider, LLMProvider, ToolCall,
+    providers::{ModelPricing, ProvidersRegistry},
+    HTTPLLMProvider, ToolCall,
 };
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -155,7 +156,7 @@ impl HTTPChatProvider for Mistral {
     }
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        openai_parse_chat(self, response)
+        Ok(openai_parse_chat(self, response)?)
     }
 }
 
@@ -210,6 +211,7 @@ impl HTTPCompletionProvider for Mistral {
 
         let json_resp: Result<MistralCompletionResponse, serde_json::Error> =
             serde_json::from_slice(&resp.body());
+
         match json_resp {
             Ok(completion_response) => Ok(CompletionResponse {
                 text: completion_response.choices[0].message.content.clone(), // FIXME
@@ -229,6 +231,16 @@ impl Mistral {
     fn default_base_url() -> Url {
         Url::parse("https://api.mistral.ai/v1/").unwrap()
     }
+}
+
+#[warn(dead_code)]
+fn get_pricing(model: &str) -> Option<ModelPricing> {
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
+        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
+            return registry.get_pricing("mistral", model).cloned();
+        }
+    }
+    None
 }
 
 struct MistralFactory;
