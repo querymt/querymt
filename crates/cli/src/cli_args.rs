@@ -1,5 +1,6 @@
 use crate::utils::parse_kv;
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 use serde_json::Value;
 
 /// Command line arguments for the LLM CLI
@@ -101,4 +102,9 @@ pub enum Commands {
     },
     /// Update provider plugins
     Update,
+    /// Generate shell completions
+    Completion {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }

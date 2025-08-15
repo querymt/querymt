@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use colored::*;
 use querymt::{
     builder::LLMBuilder,
@@ -63,6 +63,14 @@ fn resolve_provider_and_model(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logging();
     let args = CliArgs::parse();
+
+    // Handle completion generation and exit early.
+    if let Some(Commands::Completion { shell }) = &args.command {
+        let mut cmd = CliArgs::command();
+        clap_complete::generate(*shell, &mut cmd, "qmt", &mut io::stdout());
+        return Ok(());
+    }
+
     let registry = get_provider_registry(&args).await?;
 
     if let Some(cmd) = &args.command {
@@ -217,6 +225,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", "Update check complete.".bright_blue());
                 return Ok(());
             }
+            // This command is handled before the match statement
+            Commands::Completion { .. } => unreachable!(),
         }
     }
 
