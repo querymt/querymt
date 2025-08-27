@@ -2,7 +2,7 @@
 //!
 //! This module provides integration with OpenAI's GPT models through their API.
 
-use http::{response, Request, Response};
+use http::{Request, Response};
 use querymt::{
     chat::{
         http::HTTPChatProvider, ChatMessage, ChatResponse, StructuredOutputFormat, Tool, ToolChoice,
@@ -196,6 +196,7 @@ impl HTTPLLMProviderFactory for OpenAIFactory {
     }
 }
 
+#[cfg(not(feature = "api"))]
 #[warn(dead_code)]
 fn get_pricing(model: &str) -> Option<ModelPricing> {
     if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
