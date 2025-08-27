@@ -49,7 +49,7 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    get_env_var,
+    get_env_var, handle_http_error,
     plugin::HTTPLLMProviderFactory,
     providers::{ModelPricing, ProvidersRegistry},
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
@@ -665,14 +665,7 @@ impl HTTPChatProvider for Google {
     }
 
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_text: String = serde_json::to_string(resp.body())?;
-            return Err(LLMError::ResponseFormatError {
-                message: format!("API returned error status: {}", status),
-                raw_response: error_text,
-            });
-        }
+        handle_http_error!(resp);
 
         let json_resp: Result<GoogleChatResponse, serde_json::Error> =
             serde_json::from_slice(&resp.body());

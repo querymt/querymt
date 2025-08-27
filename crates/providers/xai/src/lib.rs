@@ -13,7 +13,7 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    get_env_var,
+    get_env_var, handle_http_error,
     plugin::HTTPLLMProviderFactory,
     providers::{ModelPricing, ProvidersRegistry},
     HTTPLLMProvider, ToolCall,
@@ -200,14 +200,7 @@ impl HTTPCompletionProvider for Xai {
     }
 
     fn parse_complete(&self, resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_text: String = serde_json::to_string(resp.body())?;
-            return Err(LLMError::ResponseFormatError {
-                message: format!("API returned error status: {}", status),
-                raw_response: error_text,
-            });
-        }
+        handle_http_error!(resp);
 
         let json_resp: Result<XaiCompletionResponse, serde_json::Error> =
             serde_json::from_slice(&resp.body());

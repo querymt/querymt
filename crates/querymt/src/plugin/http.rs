@@ -23,3 +23,17 @@ pub trait HTTPLLMProviderFactory: Send + Sync {
 }
 
 pub type HTTPFactoryCtor = unsafe extern "C" fn() -> *mut dyn HTTPLLMProviderFactory;
+
+#[macro_export]
+macro_rules! handle_http_error {
+    ($key:expr) => {{
+        if !$key.status().is_success() {
+            let status = $key.status();
+            let error_text: String = String::from_utf8($key.into_body())?;
+            return Err(LLMError::ResponseFormatError {
+                message: format!("API returned error status: {}", status),
+                raw_response: error_text,
+            });
+        }
+    }};
+}

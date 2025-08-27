@@ -8,7 +8,7 @@ use querymt::{
         ChatMessage, ChatResponse, ChatRole, MessageType, StructuredOutputFormat, Tool, ToolChoice,
     },
     error::LLMError,
-    FunctionCall, ToolCall, Usage,
+    handle_http_error, FunctionCall, ToolCall, Usage,
 };
 use schemars::{
     gen::SchemaGenerator,
@@ -429,14 +429,7 @@ pub fn openai_parse_chat<C: OpenAIProviderConfig>(
     response: Response<Vec<u8>>,
 ) -> Result<Box<dyn ChatResponse>, LLMError> {
     // If we got a non-200 response, let's get the error details
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text: String = serde_json::to_string(response.body())?;
-        return Err(LLMError::ResponseFormatError {
-            message: format!("API returned error status: {}", status),
-            raw_response: error_text,
-        });
-    }
+    handle_http_error!(response);
 
     // Parse the successful response
     let json_resp: Result<OpenAIChatResponse, serde_json::Error> =
