@@ -71,6 +71,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    match querymt::providers::update_providers_if_stale().await {
+        Ok(true) => {
+            log::info!("Providers - downloaded and cached new data");
+        }
+        Ok(false) => {
+            log::info!("Providers - using existing cached data");
+        }
+        Err(e) => {
+            log::error!("Failed to update providers data: {}", e);
+        }
+    }
+
     let registry = get_provider_registry(&args).await?;
 
     if let Some(cmd) = &args.command {

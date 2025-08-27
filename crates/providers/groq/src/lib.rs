@@ -14,7 +14,9 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
+    get_env_var,
     plugin::HTTPLLMProviderFactory,
+    providers::{ModelPricing, ProvidersRegistry},
     HTTPLLMProvider, ToolCall,
 };
 use schemars::{schema_for, JsonSchema};
@@ -155,7 +157,7 @@ impl HTTPChatProvider for Groq {
     }
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        openai_parse_chat(self, response)
+        Ok(openai_parse_chat(self, response)?)
     }
 }
 
@@ -267,6 +269,16 @@ impl HTTPLLMProviderFactory for GroqFactory {
 
         Ok(Box::new(provider))
     }
+}
+
+#[warn(dead_code)]
+fn get_pricing(model: &str) -> Option<ModelPricing> {
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
+        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
+            return registry.get_pricing("groq", model).cloned();
+        }
+    }
+    None
 }
 
 #[cfg(feature = "native")]

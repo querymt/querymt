@@ -58,6 +58,8 @@ pub mod validated_llm;
 /// Evaluator for LLM providers
 pub mod evaluator;
 
+pub mod providers;
+
 /// Core trait that all LLM providers must implement, combining chat, completion
 /// and embedding capabilities into a unified interface
 #[async_trait::async_trait]
@@ -131,4 +133,21 @@ pub struct Usage {
         alias = "candidatesTokenCount" // Google
     )]
     pub output_tokens: u32,
+}
+
+// NOTE: We need this part to be a macro instead two separate function for specific implementations
+// like native and wasm, because in other way functions need to be in each provider to get
+// configuration from extism_pdk.
+#[macro_export]
+macro_rules! get_env_var {
+    ($key:expr) => {{
+        if cfg!(feature = "extism") {
+            match extism_pdk::config::get($key) {
+                Ok(value) => value,
+                _ => None,
+            }
+        } else {
+            std::env::var($key).ok()
+        }
+    }};
 }

@@ -17,6 +17,7 @@ use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use url::Url;
+use querymt::{get_env_var, providers::{ModelPricing, ProvidersRegistry}};
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -223,4 +224,17 @@ mod extism_exports {
         factory = MoonshotAIFactory,
         name   = "moonshot",
     }
+}
+
+#[allow(dead_code)]
+fn get_pricing(model: &str) -> Option<querymt::providers::ModelPricing> {
+    use querymt::get_env_var;
+    use querymt::providers::ProvidersRegistry;
+
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
+        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
+            return registry.get_pricing("moonshot", model).cloned();
+        }
+    }
+    None
 }

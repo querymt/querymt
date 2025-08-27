@@ -7,6 +7,7 @@ use crate::{
         extism_impl::{ExtismChatRequest, ExtismChatResponse, ExtismEmbedRequest},
         Fut, HTTPLLMProviderFactory, LLMProviderFactory,
     },
+    providers::{read_providers_from_cache, ProviderInfo},
     LLMProvider,
 };
 
@@ -52,7 +53,13 @@ impl ExtismFactory {
         wasm_content: Vec<u8>,
         config: &Option<HashMap<String, toml::Value>>,
     ) -> Result<Self, LLMError> {
-        let env_map: HashMap<_, _> = std::env::vars().collect();
+        let mut env_map: HashMap<_, _> = std::env::vars().collect();
+
+        let v = read_providers_from_cache()?;
+        // NOTE: adding pricing data into current plugin as JSON string which should be deserialized
+        // from another side
+        env_map.insert("PROVIDERS_REGISTRY_DATA".to_string(), serde_json::to_string(&v)?);
+
         let initial_manifest =
             Manifest::new([Wasm::data(wasm_content.clone())]).with_config(env_map.iter());
 

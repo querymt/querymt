@@ -49,7 +49,9 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
+    get_env_var,
     plugin::HTTPLLMProviderFactory,
+    providers::{ModelPricing, ProvidersRegistry},
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
 };
 use schemars::{schema_for, JsonSchema};
@@ -91,7 +93,6 @@ pub struct Google {
     pub cached_content: Option<String>,
 }
 
-/// Request body for chat completions
 #[derive(Serialize)]
 struct GoogleChatRequest<'a> {
     /// List of conversation messages
@@ -817,6 +818,16 @@ impl HTTPLLMProviderFactory for GoogleFactory {
         let provider: Google = serde_json::from_value(cfg.clone())?;
         Ok(Box::new(provider))
     }
+}
+
+#[warn(dead_code)]
+fn get_pricing(model: &str) -> Option<ModelPricing> {
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
+        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
+            return registry.get_pricing("google", model).cloned();
+        }
+    }
+    None
 }
 
 #[cfg(feature = "native")]

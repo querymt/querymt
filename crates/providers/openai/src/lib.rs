@@ -10,7 +10,9 @@ use querymt::{
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
+    get_env_var,
     plugin::HTTPLLMProviderFactory,
+    providers::{ModelPricing, ProvidersRegistry},
     HTTPLLMProvider,
 };
 use schemars::{schema_for, JsonSchema};
@@ -130,7 +132,7 @@ impl HTTPChatProvider for OpenAI {
     }
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        api::openai_parse_chat(self, response)
+        Ok(api::openai_parse_chat(self, response)?)
     }
 }
 
@@ -192,6 +194,17 @@ impl HTTPLLMProviderFactory for OpenAIFactory {
         let provider: OpenAI = serde_json::from_value(cfg.clone())?;
         Ok(Box::new(provider))
     }
+}
+
+#[cfg(not(feature = "api"))]
+#[warn(dead_code)]
+fn get_pricing(model: &str) -> Option<ModelPricing> {
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
+        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
+            return registry.get_pricing("openai", model).cloned();
+        }
+    }
+    None
 }
 
 #[cfg(feature = "native")]
