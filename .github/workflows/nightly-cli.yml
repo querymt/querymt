@@ -1,9 +1,6 @@
-name: Nightly Release
+name: Nightly CLI Release
 
 on:
-  push:
-    branches:
-      - main
   schedule:
     # Runs at 03:00 UTC every day
     - cron: '0 3 * * *'
@@ -79,7 +76,7 @@ jobs:
       - name: Cache Cargo dependencies
         uses: swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build with Cargo
         env:
