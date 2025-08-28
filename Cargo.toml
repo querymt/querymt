@@ -15,7 +15,7 @@ either = { version = "1.15.0", features = ["serde"] }
 http = "1.0"
 base64 = "0.22.1"
 url = { version = "2.5", features = ["serde"] }
-schemars = "0.8"
+schemars = "0.9"
 futures = "0.3"
 log = "0.4"
 extism-pdk = "1.4"
