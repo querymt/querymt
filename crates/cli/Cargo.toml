@@ -15,7 +15,7 @@ anyhow = "1.0"
 querymt = { path = "../querymt", default-features = false, features = ["reqwest-client", "extism_host", "mcp", "native"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-rustyline = "15"
+rustyline = "17"
 colored = "3.0"
 spinners = "4.1"
 tokio = { version = "1.0", features = ["full"] }
