@@ -1,11 +1,11 @@
 [package]
 name = "querymt"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "A Rust library unifying multiple LLM backends."
 license = "MIT"
 authors = [
-    "Viktor Gal <me@wik.ing>"
+    "Viktor Gal <viktor@query.mt>"
 ]
 repository = "https://github.com/querymt/querymt"
 homepage = "https://query.mt"

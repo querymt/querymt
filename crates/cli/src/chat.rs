@@ -6,9 +6,58 @@ use querymt::{
     error::LLMError,
     FunctionCall, LLMProvider, ToolCall,
 };
-use rustyline::error::ReadlineError;
+use rustyline::{
+    completion::FilenameCompleter,
+    error::ReadlineError,
+    highlight::{CmdKind, Highlighter, MatchingBracketHighlighter},
+    hint::HistoryHinter,
+    validate::MatchingBracketValidator,
+    Cmd, Config, Editor, EventHandler, KeyCode, KeyEvent, Modifiers,
+};
+use rustyline_derive::{Completer, Helper, Hinter, Validator};
 use spinners::{Spinner, Spinners};
-use std::io::{self, Read, Write};
+use std::{
+    borrow::Cow,
+    io::{self, Read, Write},
+};
+
+#[derive(Helper, Completer, Hinter, Validator)]
+struct QmtHelper {
+    #[rustyline(Completer)]
+    completer: FilenameCompleter,
+    highlighter: MatchingBracketHighlighter,
+    #[rustyline(Validator)]
+    validator: MatchingBracketValidator,
+    #[rustyline(Hinter)]
+    hinter: HistoryHinter,
+    colored_prompt: String,
+}
+
+impl Highlighter for QmtHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        default: bool,
+    ) -> Cow<'b, str> {
+        if default {
+            Cow::Borrowed(&self.colored_prompt)
+        } else {
+            Cow::Borrowed(prompt)
+        }
+    }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned("\x1b[1m".to_owned() + hint + "\x1b[m")
+    }
+
+    fn highlight<'l>(&self, line: &'l str, pos: usize) -> Cow<'l, str> {
+        self.highlighter.highlight(line, pos)
+    }
+
+    fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
+        self.highlighter.highlight_char(line, pos, kind)
+    }
+}
 
 pub async fn handle_response(
     messages: &mut Vec<ChatMessage>,
@@ -148,12 +197,30 @@ pub async fn interactive_loop(
     println!("{}", "Type 'exit' to quit".bright_black());
     print_separator();
 
-    let mut rl = rustyline::DefaultEditor::new()?;
+    let prompt_prefix = ":: ".bold().red().to_string();
+    let helper = QmtHelper {
+        completer: FilenameCompleter::new(),
+        highlighter: MatchingBracketHighlighter::new(),
+        validator: MatchingBracketValidator::new(),
+        hinter: HistoryHinter::new(),
+        colored_prompt: prompt_prefix.clone(),
+    };
+
+    let config = Config::builder()
+        .history_ignore_space(true)
+        .completion_type(rustyline::CompletionType::List)
+        .build();
+    let mut rl = Editor::with_config(config)?;
+    rl.set_helper(Some(helper));
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Enter, Modifiers::ALT),
+        EventHandler::Simple(Cmd::Newline),
+    );
     let mut messages: Vec<ChatMessage> = Vec::new();
 
     loop {
         io::stdout().flush()?;
-        let readline = rl.readline(&":: ".bold().red().to_string());
+        let readline = rl.readline(&prompt_prefix);
         match readline {
             Ok(line) => {
                 let trimmed = line.trim();
