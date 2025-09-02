@@ -11,6 +11,7 @@ repository = "https://github.com/querymt/querymt"
 homepage = "https://query.mt"
 
 [dependencies]
+async-trait.workspace = true
 anyhow = "1.0"
 querymt = { path = "../querymt", default-features = false, features = ["reqwest-client", "extism_host", "mcp", "native"] }
 clap = { version = "4", features = ["derive"] }
@@ -20,10 +21,15 @@ rustyline-derive = "0.11"
 colored = "3.0"
 spinners = "4.1"
 tokio = { version = "1.0", features = ["full"] }
-serde_json = { workspace = true }
-log = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
 dirs = "6.0"
 futures = "0.3"
+rusqlite = { version = "0.37", features = ["bundled", "uuid", "time"] }
+rusqlite_migration = "2.3"
+time = { version = "0.3", features = ["serde"] }
+uuid = "1.18"
 
 tracing = { workspace = true }
 tracing-log = "0.2"

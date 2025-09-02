@@ -3,11 +3,16 @@ use clap::{CommandFactory, Parser};
 use colored::*;
 use querymt::{
     builder::LLMBuilder,
+    error::LLMError,
     mcp::{adapter::McpToolAdapter, config::Config as MCPConfig},
 };
 use serde_json::Value;
 use spinners::{Spinner, Spinners};
-use std::io::{self, IsTerminal};
+use std::{
+    fs,
+    io::{self, IsTerminal},
+    sync::Arc,
+};
 use tokio;
 
 mod chat;
@@ -15,6 +20,7 @@ mod cli_args;
 mod embed;
 mod provider;
 mod secret_store;
+mod session;
 mod tracing;
 mod utils;
 
@@ -23,8 +29,11 @@ use cli_args::{CliArgs, Commands};
 use embed::embed_pipe;
 use provider::{get_api_key, get_provider_info, get_provider_registry, split_provider};
 use secret_store::SecretStore;
+use session::SessionProvider;
 use tracing::setup_logging;
 use utils::get_provider_api_key;
+
+use crate::session::SqliteSessionStore;
 
 fn resolve_provider_and_model(
     global: &CliArgs,
@@ -288,12 +297,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
     let provider = builder.build(&registry)?;
+
+    let data_dir = dirs::data_local_dir()
+        .ok_or_else(|| LLMError::GenericError("Could not find local data dir for user!".into()))?
+        .join("qmt");
+    fs::create_dir_all(&data_dir)?;
+    let db_path = data_dir.join("qmt.db");
+    let store = Arc::new(SqliteSessionStore::connect(db_path).await?);
+    let session_provider = SessionProvider::new(provider, store);
+    let session = session_provider.with_session(args.session).await?;
+
     let is_pipe = !io::stdin().is_terminal();
 
     if is_pipe || args.prompt.is_some() {
-        return chat_pipe(&provider, args.prompt.as_ref()).await;
+        return chat_pipe(&session, args.prompt.as_ref()).await;
     }
 
-    interactive_loop(&provider, &prov_name).await
+    interactive_loop(&session, &prov_name).await
 }

@@ -52,8 +52,13 @@ pub struct CliArgs {
     #[arg(long)]
     pub max_tokens: Option<u32>,
 
+    /// MCP config
     #[arg(long)]
     pub mcp_config: Option<String>,
+
+    /// Session ID
+    #[arg(long)]
+    pub session: Option<String>,
 
     /// Custom providers config path
     #[arg(long, global = true)]
