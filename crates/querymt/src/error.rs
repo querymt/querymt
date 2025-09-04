@@ -1,4 +1,7 @@
-use std::string::FromUtf8Error;
+use std::{
+    string::FromUtf8Error,
+    sync::{PoisonError, RwLockReadGuard, RwLockWriteGuard},
+};
 
 use thiserror::Error;
 
@@ -68,5 +71,17 @@ impl From<http::Error> for LLMError {
 impl From<FromUtf8Error> for LLMError {
     fn from(value: FromUtf8Error) -> Self {
         LLMError::GenericError(format!("Error decoding string: {:#}", value))
+    }
+}
+
+impl<T> From<PoisonError<RwLockWriteGuard<'_, T>>> for LLMError {
+    fn from(err: PoisonError<RwLockWriteGuard<'_, T>>) -> Self {
+        LLMError::GenericError(format!("Write lock poisoned: {:#}", err))
+    }
+}
+
+impl<T> From<PoisonError<RwLockReadGuard<'_, T>>> for LLMError {
+    fn from(err: PoisonError<RwLockReadGuard<'_, T>>) -> Self {
+        LLMError::GenericError(format!("Read lock poisoned: {:#}", err))
     }
 }

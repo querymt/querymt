@@ -280,7 +280,7 @@ impl HTTPChatProvider for Anthropic {
                             image_url: None,
                             source: Some(ImageSource {
                                 source_type: "base64",
-                                media_type: image_mime.mime_type(),
+                                media_type: image_mime.as_str(),
                                 data: BASE64.encode(raw_bytes),
                             }),
                             tool_use_id: None,

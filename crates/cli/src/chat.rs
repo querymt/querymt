@@ -1,10 +1,13 @@
-use crate::utils::{print_separator, process_input, visualize_tool_call};
+use crate::{
+    session::SessionContext,
+    utils::{print_separator, process_input, visualize_tool_call},
+};
 use colored::*;
 use futures::future::join_all;
 use querymt::{
-    chat::{ChatMessage, ChatResponse},
+    chat::{ChatMessage, ChatResponse, ChatRole},
     error::LLMError,
-    FunctionCall, LLMProvider, ToolCall,
+    FunctionCall, ToolCall,
 };
 use rustyline::{
     completion::FilenameCompleter,
@@ -60,9 +63,8 @@ impl Highlighter for QmtHelper {
 }
 
 pub async fn handle_response(
-    messages: &mut Vec<ChatMessage>,
     initial_response: Box<dyn ChatResponse>,
-    provider: &Box<dyn LLMProvider>,
+    session: &SessionContext,
 ) -> Result<(), LLMError> {
     let mut current_response = initial_response;
 
@@ -78,13 +80,6 @@ pub async fn handle_response(
         print!("\r\x1B[K");
 
         if let Some(tool_calls) = current_response.tool_calls() {
-            messages.push(
-                ChatMessage::assistant()
-                    .tool_use(tool_calls.clone())
-                    .content(current_response.text().unwrap_or_default())
-                    .build(),
-            );
-
             let tool_futures = tool_calls.into_iter().map(|call| async {
                 visualize_tool_call(&call, None);
                 let args: serde_json::Value = match serde_json::from_str(&call.function.arguments) {
@@ -97,7 +92,7 @@ pub async fn handle_response(
                     }
                 };
 
-                match provider.call_tool(&call.function.name, args).await {
+                match session.call_tool(&call.function.name, args).await {
                     Ok(result) => {
                         log::debug!(
                             "Tool response: {}",
@@ -137,9 +132,10 @@ pub async fn handle_response(
                 })
                 .collect::<Vec<_>>();
 
-            messages.push(ChatMessage::user().tool_result(tool_results).build());
+            let message = ChatMessage::user().tool_result(tool_results).build();
+
             let mut sp = Spinner::new(Spinners::Dots12, "Thinking...".bright_magenta().to_string());
-            match provider.chat(&messages).await {
+            match session.chat(&[message]).await {
                 Ok(resp) => {
                     sp.stop();
                     current_response = resp;
@@ -152,7 +148,6 @@ pub async fn handle_response(
             }
         } else if let Some(text) = current_response.text() {
             println!("{} {}", "> Assistant:".bright_green(), text);
-            messages.push(ChatMessage::assistant().content(text).build());
             break;
         } else {
             println!("{}", "> Assistant: (no response)".bright_red());
@@ -165,7 +160,7 @@ pub async fn handle_response(
 
 /// Handle piped input or single-shot chat
 pub async fn chat_pipe(
-    provider: &Box<dyn LLMProvider>,
+    session: &SessionContext,
     prompt: Option<&String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = Vec::new();
@@ -177,10 +172,10 @@ pub async fn chat_pipe(
         String::from_utf8_lossy(&input).to_string()
     };
 
-    let mut messages = process_input(&input, prompt);
-    match provider.chat_with_tools(&messages, provider.tools()).await {
+    let messages = process_input(&input, prompt);
+    match session.chat(&messages.as_slice()).await {
         Ok(response) => {
-            handle_response(&mut messages, response, provider).await?;
+            handle_response(response, session).await?;
         }
         Err(e) => eprintln!("Error: {}", e),
     }
@@ -189,7 +184,7 @@ pub async fn chat_pipe(
 
 /// Interactive REPL loop
 pub async fn interactive_loop(
-    provider: &Box<dyn LLMProvider>,
+    session: &SessionContext,
     provider_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "qmt - Interactive Chat".bright_blue());
@@ -216,7 +211,13 @@ pub async fn interactive_loop(
         KeyEvent(KeyCode::Enter, Modifiers::ALT),
         EventHandler::Simple(Cmd::Newline),
     );
-    let mut messages: Vec<ChatMessage> = Vec::new();
+
+    session
+        .history()
+        .await
+        .into_iter()
+        .filter(|m| m.role == ChatRole::User)
+        .try_for_each(|message| rl.add_history_entry(&message.content).map(|_| ()))?;
 
     loop {
         io::stdout().flush()?;
@@ -230,13 +231,13 @@ pub async fn interactive_loop(
                 }
                 let _ = rl.add_history_entry(trimmed);
 
-                messages.push(ChatMessage::user().content(trimmed.to_string()).build());
+                let message = ChatMessage::user().content(trimmed.to_string()).build();
                 let mut sp =
                     Spinner::new(Spinners::Dots12, "Thinking...".bright_magenta().to_string());
-                match provider.chat(&messages).await {
+                match session.chat(&[message]).await {
                     Ok(response) => {
                         sp.stop();
-                        handle_response(&mut messages, response, provider).await?;
+                        handle_response(response, session).await?;
                     }
                     Err(e) => {
                         sp.stop();

@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
+use std::str::FromStr;
 
 use crate::{error::LLMError, ToolCall, Usage};
 
@@ -37,12 +38,29 @@ pub enum ImageMime {
 }
 
 impl ImageMime {
-    pub fn mime_type(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             ImageMime::JPEG => "image/jpeg",
             ImageMime::PNG => "image/png",
             ImageMime::GIF => "image/gif",
             ImageMime::WEBP => "image/webp",
+        }
+    }
+}
+
+impl FromStr for ImageMime {
+    type Err = LLMError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "image/png" => Ok(ImageMime::PNG),
+            "image/jpeg" => Ok(ImageMime::JPEG),
+            "image/gif" => Ok(ImageMime::GIF),
+            "image/webp" => Ok(ImageMime::WEBP),
+            _ => Err(LLMError::InvalidRequest(format!(
+                "Unknown MIME type: {}",
+                s
+            ))),
         }
     }
 }
@@ -380,7 +398,7 @@ impl JsonSchema for ToolChoice {
     }
 }
 
-pub trait ChatResponse: std::fmt::Debug + std::fmt::Display + Send {
+pub trait ChatResponse: std::fmt::Debug + std::fmt::Display + Send + Sync {
     fn text(&self) -> Option<String>;
     fn tool_calls(&self) -> Option<Vec<ToolCall>>;
     fn thinking(&self) -> Option<String> {
@@ -487,6 +505,22 @@ impl ChatMessageBuilder {
             role: self.role,
             message_type: self.message_type,
             content: self.content,
+        }
+    }
+}
+
+impl From<&dyn ChatResponse> for ChatMessage {
+    fn from(response: &dyn ChatResponse) -> Self {
+        let tool_calls = response.tool_calls();
+        let assistant_msg_type = if tool_calls.is_some() {
+            MessageType::ToolUse(tool_calls.unwrap())
+        } else {
+            MessageType::Text
+        };
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: response.text().unwrap_or_default(),
+            message_type: assistant_msg_type,
         }
     }
 }
