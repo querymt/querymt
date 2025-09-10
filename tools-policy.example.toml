@@ -1,0 +1,46 @@
+# Tool Policy Configuration
+# This file defines tool access policies for various tools.
+#
+# Behavior:
+# - allow: Permits the tool action without any prompts or restrictions.
+# - deny: Blocks the tool entirely - denied tools are not loaded and will not appear in the available tools list.
+# - ask: Prompts the user for confirmation before allowing the action.
+#
+# The 'default' setting applies to any tools not explicitly configured below.
+
+default = "ask"
+
+[tools.time]
+# Example OCI plugin: oci://ghcr.io/tuananh/time-plugin:latest
+time = "allow"
+
+[tools.hash]
+# Example OCI plugin: oci://ghcr.io/tuananh/hash-plugin:latest
+hash = "ask"
+
+[tools.fs]
+# Example OCI plugin: oci://ghcr.io/tuananh/fs-plugin:latest
+# Runtime config example: allowed_paths = ["/tmp"]
+read_file = "allow"
+read_multiple_files = "allow"
+write_file = "ask"
+edit_file = "ask"
+create_dir = "ask"
+list_dir = "allow"
+move_file = "ask"
+search_files = "allow"
+get_file_info = "allow"
+
+# [tools.myip]
+# Example OCI plugin: oci://ghcr.io/tuananh/myip-plugin:latest
+# Runtime config example: allowed_hosts = ["1.1.1.1"]
+# myip = "ask"
+
+# [tools.python]
+# Example OCI plugin: oci://ghcr.io/tuananh/eval-py-plugin:latest
+# python = "ask"
+
+# [tools.memory]
+# Example OCI plugin: oci://ghcr.io/tuananh/memory-plugin:latest
+# Runtime config example: allowed_paths = ["/tmp"], env_vars = { db_path = "/tmp/memory.db" }
+# memory = "ask"

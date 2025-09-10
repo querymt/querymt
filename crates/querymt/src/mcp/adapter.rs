@@ -77,17 +77,23 @@ impl TryFrom<RmcpTool> for Tool {
 pub struct McpToolAdapter {
     mcp_tool: RmcpTool,
     server: ServerSink,
+    server_name: String,
     tool: Tool,
 }
 
 impl McpToolAdapter {
-    pub fn try_new(mcp_tool: RmcpTool, server: ServerSink) -> Result<Self, AdapterError> {
+    pub fn try_new(mcp_tool: RmcpTool, server: ServerSink, server_name: String) -> Result<Self, AdapterError> {
         let tool = Tool::try_from(mcp_tool.clone())?;
         Ok(Self {
             mcp_tool,
             server,
+            server_name,
             tool,
         })
+    }
+
+    pub fn server_name(&self) -> &str {
+        &self.server_name
     }
 }
 
@@ -95,6 +101,10 @@ impl McpToolAdapter {
 impl CallFunctionTool for McpToolAdapter {
     fn descriptor(&self) -> Tool {
         self.tool.clone()
+    }
+
+    fn server_name(&self) -> Option<&str> {
+        Some(&self.server_name)
     }
 
     #[instrument(name = "mcp_tool.call", skip_all, fields(name = %self.mcp_tool.name))]
