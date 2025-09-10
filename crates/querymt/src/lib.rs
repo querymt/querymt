@@ -78,6 +78,12 @@ pub trait LLMProvider:
             "tool calling not supported".into(),
         ))
     }
+
+    /// Returns the server name for a tool if available (e.g., for MCP tools).
+    /// Returns None if the tool doesn't exist or doesn't have server information.
+    fn tool_server_name(&self, _name: &str) -> Option<&str> {
+        None
+    }
 }
 
 pub trait HTTPLLMProvider:

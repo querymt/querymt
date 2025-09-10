@@ -20,6 +20,12 @@ use std::sync::Arc;
 pub trait CallFunctionTool: Send + Sync {
     fn descriptor(&self) -> Tool;
     async fn call(&self, args: Value) -> anyhow::Result<String>;
+
+    /// Returns the server name for server-aware tools (e.g., MCP tools).
+    /// Returns None for tools that don't have server information.
+    fn server_name(&self) -> Option<&str> {
+        None
+    }
 }
 
 /*
@@ -129,5 +135,9 @@ impl LLMProvider for ToolEnabledProvider {
         tool.call(args)
             .await
             .map_err(|e| LLMError::InvalidRequest(e.to_string()))
+    }
+
+    fn tool_server_name(&self, name: &str) -> Option<&str> {
+        self.registry.get(name).and_then(|tool| tool.server_name())
     }
 }

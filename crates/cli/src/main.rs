@@ -7,6 +7,7 @@ use querymt::{
 };
 use serde_json::Value;
 use spinners::{Spinner, Spinners};
+use std::fs;
 use std::io::{self, IsTerminal};
 use tokio;
 
@@ -19,12 +20,30 @@ mod tracing;
 mod utils;
 
 use chat::{chat_pipe, interactive_loop};
-use cli_args::{CliArgs, Commands};
+use cli_args::{CliArgs, Commands, ToolConfig, ToolPolicyState};
 use embed::embed_pipe;
 use provider::{get_api_key, get_provider_info, get_provider_registry, split_provider};
 use secret_store::SecretStore;
 use tracing::setup_logging;
-use utils::get_provider_api_key;
+use utils::{find_config_in_home, get_provider_api_key, parse_tool_names, ToolLoadingStats};
+
+fn load_tool_config() -> Result<ToolConfig, Box<dyn std::error::Error>> {
+    match find_config_in_home(&["tools-policy.toml"]) {
+        Ok(cfg_file) => {
+            let content = fs::read_to_string(cfg_file)?;
+            // TODO: Generalize to use `yaml`, `json` and `jsonc`
+            let config: ToolConfig = toml::from_str(&content)?;
+            Ok(config)
+        }
+        Err(_) => {
+            // Default config if file not found
+            Ok(ToolConfig {
+                default: Some(ToolPolicyState::Ask),
+                tools: None,
+            })
+        }
+    }
+}
 
 fn resolve_provider_and_model(
     global: &CliArgs,
@@ -84,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let registry = get_provider_registry(&args).await?;
+    let tool_config = load_tool_config()?;
 
     if let Some(cmd) = &args.command {
         match cmd {
@@ -274,26 +294,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // MCP tools injection
+    let mut tool_stats = ToolLoadingStats::new();
     let mcp_clients;
     if let Some(cfg) = &args.mcp_config {
         let cfg = MCPConfig::load(cfg.clone()).await?;
         mcp_clients = cfg.create_mcp_clients().await?;
-        for (_name, client) in mcp_clients.iter() {
+        for (server_name, client) in mcp_clients.iter() {
+            tool_stats.increment_server();
             let server = client.peer();
             let tools = server.list_all_tools().await?;
             for t in tools {
-                if let Ok(adapter) = McpToolAdapter::try_new(t, server.clone()) {
+                let Some((effective_server, effective_tool)) = parse_tool_names(server_name, &t.name) else {
+                    tool_stats.increment_tool(false);
+                    log::warn!("Invalid tool name format for server {}: {}", server_name, t.name);
+                    continue;
+                };
+
+                let state = tool_config.tools.as_ref()
+                    .and_then(|tools| tools.get(effective_server))
+                    .and_then(|server_tools| server_tools.get(effective_tool))
+                    .or_else(|| tool_config.default.as_ref())
+                    .unwrap_or(&ToolPolicyState::Ask);
+
+                if *state == ToolPolicyState::Deny {
+                    tool_stats.increment_tool(false);
+                    log::debug!("Skipping denied tool: {}::{}", effective_server, effective_tool);
+                    continue;
+                }
+
+                tool_stats.increment_tool(true);
+                if let Ok(adapter) = McpToolAdapter::try_new(t, server.clone(), server_name.clone()) {
                     builder = builder.add_tool(adapter);
                 }
             }
         }
     }
+    tool_stats.log_summary();
     let provider = builder.build(&registry)?;
     let is_pipe = !io::stdin().is_terminal();
 
     if is_pipe || args.prompt.is_some() {
-        return chat_pipe(&provider, args.prompt.as_ref()).await;
+        return chat_pipe(&provider, args.prompt.as_ref(), &tool_config).await;
     }
 
-    interactive_loop(&provider, &prov_name).await
+    interactive_loop(&provider, &prov_name, &tool_config).await
 }

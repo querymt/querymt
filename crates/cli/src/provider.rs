@@ -1,4 +1,3 @@
-use dirs;
 use querymt::plugin::{
     extism_impl::host::ExtismLoader, host::native::NativeLoader, host::PluginRegistry,
 };
@@ -6,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::cli_args::CliArgs;
 use crate::secret_store::SecretStore;
+use crate::utils::find_config_in_home;
 use querymt::error::LLMError;
 
 /// Splits "provider:model" or just "provider" into (provider, Option<model>)
@@ -46,29 +46,16 @@ pub fn get_api_key(provider: &str, args: &CliArgs, registry: &PluginRegistry) ->
 /// Initializes provider registry (from config path or default ~/.qmt)
 pub async fn get_provider_registry(args: &CliArgs) -> Result<PluginRegistry, LLMError> {
     // Determine config file path
-    let mut registry = if let Some(cfg) = &args.provider_config {
-        PluginRegistry::from_path(cfg)?
+    let cfg_file = if let Some(cfg) = &args.provider_config {
+        PathBuf::from(cfg)
     } else {
-        let mut config_file: Option<PathBuf> = None;
-        if let Some(home) = dirs::home_dir() {
-            let config_dir = home.join(".qmt");
-            if config_dir.exists() {
-                for name in &["providers.json", "providers.toml", "providers.yaml"] {
-                    let candidate = config_dir.join(name);
-                    if candidate.is_file() {
-                        config_file = Some(candidate);
-                        break;
-                    }
-                }
-            }
-        }
-        let cfg_file = config_file.ok_or_else(|| {
-            LLMError::InvalidRequest(
+        find_config_in_home(&["providers.json", "providers.toml", "providers.yaml"])
+            .map_err(|_| LLMError::InvalidRequest(
                 "Config file for providers is missing. Please provide one!".to_string(),
-            )
-        })?;
-        PluginRegistry::from_path(cfg_file)?
+            ))?
     };
+
+    let mut registry = PluginRegistry::from_path(cfg_file)?;
 
     registry.register_loader(Box::new(ExtismLoader));
     registry.register_loader(Box::new(NativeLoader));

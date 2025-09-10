@@ -1,4 +1,5 @@
-use crate::utils::{print_separator, process_input, visualize_tool_call};
+use crate::cli_args::{ToolConfig, ToolPolicyState};
+use crate::utils::{print_separator, process_input, prompt_tool_execution, parse_tool_names};
 use colored::*;
 use futures::future::join_all;
 use querymt::{
@@ -63,6 +64,7 @@ pub async fn handle_response(
     messages: &mut Vec<ChatMessage>,
     initial_response: Box<dyn ChatResponse>,
     provider: &Box<dyn LLMProvider>,
+    tool_config: &ToolConfig,
 ) -> Result<(), LLMError> {
     let mut current_response = initial_response;
 
@@ -86,7 +88,76 @@ pub async fn handle_response(
             );
 
             let tool_futures = tool_calls.into_iter().map(|call| async {
-                visualize_tool_call(&call, None);
+                // Security check for tool execution
+                let tool_name = call.function.name.clone();
+
+                // Get server name from the tool for security checking
+                let server_name = match provider.tool_server_name(&tool_name) {
+                    Some(s) => s,
+                    None => return (call, Err(LLMError::ToolConfigError(format!("Server name can't be get from tool `{}`.", tool_name)))),
+                };
+
+                let (effective_server, effective_tool) = match parse_tool_names(server_name, &tool_name) {
+                    Some((s, t)) => (s, t),
+                    None => return (call, Err(LLMError::ToolConfigError(format!("Invalid tool format for server {}", server_name)))),
+                };
+
+                log::debug!("serve: {}, tool: {}", effective_server, effective_tool);
+
+                let state = tool_config.tools.as_ref()
+                    .and_then(|tools| tools.get(effective_server))
+                    .and_then(|server_tools| server_tools.get(effective_tool))
+                    .or_else(|| tool_config.default.as_ref())
+                    .unwrap_or(&ToolPolicyState::Ask);
+
+                match state {
+                    ToolPolicyState::Ask => {
+                        match prompt_tool_execution(&call) {
+                            Ok((true, _)) => {
+                                // User approved, continue with execution
+                            }
+                            Ok((false, reason)) => {
+                                // User denied, provide informative response to LLM
+                                let denial_message = match reason {
+                                    Some(r) =>
+                                        format!("Reason: {}.", r),
+
+                                    None =>
+
+                                    "".to_string()
+                                };
+                                let name = call.function.name.clone();
+                                return (
+                                    call,
+                                    Ok(format!(
+                                        "Tool execution denied by user. The user chose not to execute the '{}' tool. {}",
+                                        name,denial_message
+                                    ).trim().to_string()),
+                                );
+                            }
+                            Err(e) => {
+                                return (
+                                    call,
+                                    Err(LLMError::InvalidRequest(format!("Failed to read user input: {}", e))),
+                                );
+                            }
+                        }
+                    }
+                    ToolPolicyState::Allow => {
+                        // No prompt, proceed directly
+                    }
+                    ToolPolicyState::Deny => {
+                        let denial_message = format!(
+                            "Tool execution denied by configuration. The '{}' tool is not allowed.",
+                            call.function.name
+                        );
+                        return (
+                            call,
+                            Ok(denial_message),
+                        );
+                    }
+                }
+
                 let args: serde_json::Value = match serde_json::from_str(&call.function.arguments) {
                     Ok(args) => args,
                     Err(e) => {
@@ -103,14 +174,18 @@ pub async fn handle_response(
                             "Tool response: {}",
                             serde_json::to_string_pretty(&result).unwrap_or_default()
                         );
-                        visualize_tool_call(&call, Some(true));
-                        (
-                            call,
-                            serde_json::to_string(&result).map_err(|e| LLMError::from(e)),
-                        )
+                        {
+                            let result_str = match serde_json::to_string(&result) {
+                                Ok(s) => s,
+                                Err(e) => return (call, Err(LLMError::from(e))),
+                            };
+                            (
+                                call,
+                                Ok(result_str),
+                            )
+                        }
                     }
                     Err(e) => {
-                        visualize_tool_call(&call, Some(false));
                         log::error!("Error while calling tool: {}", e);
                         (call, Err(e))
                     }
@@ -167,6 +242,7 @@ pub async fn handle_response(
 pub async fn chat_pipe(
     provider: &Box<dyn LLMProvider>,
     prompt: Option<&String>,
+    tool_config: &ToolConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
@@ -180,7 +256,7 @@ pub async fn chat_pipe(
     let mut messages = process_input(&input, prompt);
     match provider.chat_with_tools(&messages, provider.tools()).await {
         Ok(response) => {
-            handle_response(&mut messages, response, provider).await?;
+            handle_response(&mut messages, response, provider, tool_config).await?;
         }
         Err(e) => eprintln!("Error: {}", e),
     }
@@ -191,6 +267,7 @@ pub async fn chat_pipe(
 pub async fn interactive_loop(
     provider: &Box<dyn LLMProvider>,
     provider_name: &str,
+    tool_config: &ToolConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "qmt - Interactive Chat".bright_blue());
     println!("Provider: {}", provider_name.bright_green());
@@ -236,7 +313,7 @@ pub async fn interactive_loop(
                 match provider.chat(&messages).await {
                     Ok(response) => {
                         sp.stop();
-                        handle_response(&mut messages, response, provider).await?;
+                        handle_response(&mut messages, response, provider, tool_config).await?;
                     }
                     Err(e) => {
                         sp.stop();

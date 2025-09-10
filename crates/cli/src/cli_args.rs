@@ -1,7 +1,23 @@
 use crate::utils::parse_kv;
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolPolicyState {
+    Ask,
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ToolConfig {
+    pub default: Option<ToolPolicyState>,
+    pub tools: Option<HashMap<String, HashMap<String, ToolPolicyState>>>,
+}
 
 /// Command line arguments for the LLM CLI
 #[derive(Parser, Debug)]
