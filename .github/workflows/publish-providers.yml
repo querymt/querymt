@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Check out full history
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -89,7 +89,7 @@ jobs:
 
       - name: Check out code
         if: matrix.crate != 'noop'
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
 
       - name: Read crate version
         if: matrix.crate != 'noop'
