@@ -34,7 +34,7 @@ either.workspace = true
 url.workspace = true
 http.workspace = true
 libloading = { version = "0.8", optional = true}
-rmcp = { version = "0.6.1", features = ["client", "reqwest", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-sse-client-reqwest"], optional = true }
+rmcp = { version = "0.8", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-sse-client-reqwest"], optional = true }
 toml = { version = "0.8", optional = true}
 thiserror = "1.0"
 extism = { version = "1.11", optional = true}
