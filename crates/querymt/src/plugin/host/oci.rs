@@ -120,8 +120,10 @@ async fn setup_trust_repository(
         if rekor_keys_path.exists() {
             match fs::read(rekor_keys_path) {
                 Ok(content) => {
-                    log::info!("Added Rekor public key");
-                    data.rekor_keys.push(content);
+                    if let Some(path_str) = rekor_keys_path.to_str() {
+                        log::info!("Added Rekor public key");
+                        data.rekor_keys.insert(path_str.to_string(), content);
+                    }
                 }
                 Err(e) => log::warn!("Failed to read Rekor public keys file: {}", e),
             }
