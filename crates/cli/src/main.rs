@@ -304,13 +304,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let server = client.peer();
             let tools = server.list_all_tools().await?;
             for t in tools {
-                let Some((effective_server, effective_tool)) = parse_tool_names(server_name, &t.name) else {
+                let Some((effective_server, effective_tool)) =
+                    parse_tool_names(server_name, &t.name)
+                else {
                     tool_stats.increment_tool(false);
-                    log::warn!("Invalid tool name format for server {}: {}", server_name, t.name);
+                    log::warn!(
+                        "Invalid tool name format for server {}: {}",
+                        server_name,
+                        t.name
+                    );
                     continue;
                 };
 
-                let state = tool_config.tools.as_ref()
+                let state = tool_config
+                    .tools
+                    .as_ref()
                     .and_then(|tools| tools.get(effective_server))
                     .and_then(|server_tools| server_tools.get(effective_tool))
                     .or_else(|| tool_config.default.as_ref())
@@ -318,12 +326,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if *state == ToolPolicyState::Deny {
                     tool_stats.increment_tool(false);
-                    log::debug!("Skipping denied tool: {}::{}", effective_server, effective_tool);
+                    log::debug!(
+                        "Skipping denied tool: {}::{}",
+                        effective_server,
+                        effective_tool
+                    );
                     continue;
                 }
 
                 tool_stats.increment_tool(true);
-                if let Ok(adapter) = McpToolAdapter::try_new(t, server.clone(), server_name.clone()) {
+                if let Ok(adapter) = McpToolAdapter::try_new(t, server.clone(), server_name.clone())
+                {
                     builder = builder.add_tool(adapter);
                 }
             }

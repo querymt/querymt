@@ -1,6 +1,5 @@
 use dirs;
 use reqwest::Client;
-use std::fmt::Debug;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -31,9 +30,10 @@ async fn download_and_cache_providers(file_path: &Path) -> Result<ProvidersRegis
     let response = client.get(API_URL).send().await?;
 
     if !response.status().is_success() {
-        return Err(LLMError::ProviderError(
-            format!("HTTP Error: {}", response.status()).into(),
-        ));
+        return Err(LLMError::ProviderError(format!(
+            "HTTP Error: {}",
+            response.status()
+        )));
     }
 
     // API returns a top-level map of providers, convert into ProvidersRegistry
@@ -79,4 +79,3 @@ pub async fn update_providers_if_stale() -> Result<bool, LLMError> {
     download_and_cache_providers(&file_path).await?;
     Ok(true)
 }
-

@@ -102,7 +102,7 @@ impl McpServerTransportConfig {
                 ().into_dyn().serve(transport).await?
             }
             McpServerTransportConfig::Stdio { command, .. }
-                if !(which(&command).is_ok() || std::path::Path::new(&command).exists()) =>
+                if !(which(command).is_ok() || std::path::Path::new(&command).exists()) =>
             {
                 anyhow::bail!("Command not found: {}", command);
             }

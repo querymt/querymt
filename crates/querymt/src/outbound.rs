@@ -19,7 +19,7 @@ mod http_client {
                 .method()
                 .as_str()
                 .parse::<reqwest::Method>()
-                .map_err(|e| Box::<dyn Error>::try_from(e).unwrap())?;
+                .map_err(Box::<dyn Error>::from)?;
 
             let mut rb = client.request(method, req.uri().to_string());
 

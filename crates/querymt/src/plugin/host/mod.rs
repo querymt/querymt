@@ -110,9 +110,10 @@ impl PluginRegistry {
         } else {
             let file_path = Path::new(&provider_cfg.path);
             if !file_path.exists() {
-                return Err(LLMError::PluginError(
-                    format!("Local file not found at path: {}", provider_cfg.path).into(),
-                ));
+                return Err(LLMError::PluginError(format!(
+                    "Local file not found at path: {}",
+                    provider_cfg.path
+                )));
             }
 
             let plugin_type = if provider_cfg.path.ends_with("wasm") {

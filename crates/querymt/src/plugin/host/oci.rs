@@ -305,8 +305,7 @@ async fn extract_file_and_content(
                                 .unwrap_or_default()
                                 .to_string_lossy();
 
-                            let matches =
-                                filename.map_or(true, |target| current_filename == target);
+                            let matches = filename.is_none_or(|target| current_filename == target);
 
                             if matches {
                                 let mut content = Vec::new();
@@ -583,6 +582,7 @@ impl OciDownloader {
             Err(e) => {
                 match e {
                     OciDistributionError::RegistryError { envelope, url } => {
+                        // FIXME: errors is a Vec<> so need to check the others
                         for e in envelope.errors {
                             if e.code == OciErrorCode::Denied {
                                 return Err(format!(
