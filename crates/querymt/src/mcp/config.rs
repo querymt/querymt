@@ -10,19 +10,93 @@ use rmcp::{
     RoleClient, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::Path, process::Stdio};
+use std::{collections::HashMap, path::Path, process::Stdio, time::Duration};
 use which::which;
+
+use super::cache::RegistryCache;
+use super::registry::{PackageType, RegistryClient};
+
+/// Registry configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryConfig {
+    /// Registry base URL
+    #[serde(default = "default_registry_url")]
+    pub url: String,
+
+    /// Whether to use caching
+    #[serde(default = "default_use_cache")]
+    pub use_cache: bool,
+
+    /// Cache TTL in hours (None = no expiration)
+    pub cache_ttl_hours: Option<u64>,
+}
+
+fn default_registry_url() -> String {
+    "https://registry.modelcontextprotocol.io".to_string()
+}
+
+fn default_use_cache() -> bool {
+    true
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            url: default_registry_url(),
+            use_cache: default_use_cache(),
+            cache_ttl_hours: Some(24),
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub mcp: Vec<McpServerConfig>,
+
+    /// Global registry configuration
+    #[serde(default)]
+    pub registry: RegistryConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct McpServerConfig {
     pub name: String,
+
     #[serde(flatten)]
-    pub transport: McpServerTransportConfig,
+    pub source: McpServerSource,
+}
+
+/// Source of an MCP server configuration
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "source", rename_all = "lowercase")]
+pub enum McpServerSource {
+    /// Direct transport configuration
+    Direct {
+        #[serde(flatten)]
+        transport: McpServerTransportConfig,
+    },
+
+    /// Registry-sourced server
+    Registry {
+        /// Registry server ID (e.g., "@modelcontextprotocol/server-filesystem")
+        registry_id: String,
+
+        /// Version to use (e.g., "latest" or "0.5.1")
+        #[serde(default = "default_version")]
+        version: String,
+
+        /// Override global registry configuration
+        #[serde(skip_serializing_if = "Option::is_none")]
+        registry_config: Option<RegistryConfig>,
+
+        /// Environment variable overrides
+        #[serde(skip_serializing_if = "Option::is_none")]
+        env_overrides: Option<HashMap<String, String>>,
+    },
+}
+
+fn default_version() -> String {
+    "latest".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -138,10 +212,196 @@ impl Config {
     ) -> Result<HashMap<String, RunningService<RoleClient, Box<dyn DynService<RoleClient>>>>> {
         let mut clients = HashMap::new();
         for server in &self.mcp {
-            let client = server.transport.start().await?;
+            // Resolve transport configuration based on source
+            let transport = match &server.source {
+                McpServerSource::Direct { transport } => transport.clone(),
+                McpServerSource::Registry {
+                    registry_id,
+                    version,
+                    registry_config,
+                    env_overrides,
+                } => {
+                    // Use server-specific registry config or fall back to global
+                    let reg_cfg = registry_config.as_ref().unwrap_or(&self.registry);
+                    self.resolve_registry_server(
+                        registry_id,
+                        version,
+                        reg_cfg,
+                        env_overrides.as_ref(),
+                    )
+                    .await?
+                }
+            };
+
+            let client = transport.start().await?;
             clients.insert(server.name.clone(), client);
         }
 
         Ok(clients)
+    }
+
+    /// Resolve a registry server reference into a transport configuration
+    async fn resolve_registry_server(
+        &self,
+        registry_id: &str,
+        version: &str,
+        registry_cfg: &RegistryConfig,
+        env_overrides: Option<&HashMap<String, String>>,
+    ) -> Result<McpServerTransportConfig> {
+        let client = RegistryClient::new(registry_cfg.url.clone());
+
+        // Try cache first if enabled
+        let server_version = if registry_cfg.use_cache {
+            let cache = match registry_cfg.cache_ttl_hours {
+                Some(hours) => RegistryCache::new(
+                    dirs::cache_dir()
+                        .map(|mut p| {
+                            p.push("querymt");
+                            p.push("mcp-registries");
+                            p
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("Could not find cache directory"))?,
+                    Some(Duration::from_secs(hours * 3600)),
+                ),
+                None => RegistryCache::permanent_cache(
+                    dirs::cache_dir()
+                        .map(|mut p| {
+                            p.push("querymt");
+                            p.push("mcp-registries");
+                            p
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("Could not find cache directory"))?,
+                ),
+            };
+
+            // Try to get from cache
+            match cache.get_cached_version(&registry_cfg.url, registry_id, version) {
+                Ok(v) => v,
+                Err(_) => {
+                    // Cache miss or stale, fetch from registry
+                    let v = client.get_server_version(registry_id, version).await?;
+                    let _ = cache.cache_version(&registry_cfg.url, registry_id, version, v.clone());
+                    v
+                }
+            }
+        } else {
+            // No caching, fetch directly
+            client.get_server_version(registry_id, version).await?
+        };
+
+        // Convert ServerResponse to McpServerTransportConfig
+        Self::server_response_to_transport(server_version, env_overrides)
+    }
+
+    /// Convert a registry ServerResponse to a transport configuration
+    fn server_response_to_transport(
+        server_response: super::registry::ServerResponse,
+        env_overrides: Option<&HashMap<String, String>>,
+    ) -> Result<McpServerTransportConfig> {
+        // Get the first package from the server (typically there's only one)
+        let package = server_response
+            .server
+            .packages
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Server has no packages defined"))?;
+
+        // Currently, we primarily support stdio-based servers from npm/pypi packages
+        match package.registry_type {
+            PackageType::Npm => {
+                // For npm packages, we typically use npx to run them
+                let command = "npx".to_string();
+                let mut args = vec!["-y".to_string(), package.identifier.clone()];
+
+                // Add any additional args from the package
+                if let Some(extra_args) = &package.args {
+                    args.extend(extra_args.clone());
+                }
+
+                // Merge environment variables
+                let mut envs = HashMap::new();
+                if let Some(env_vars) = &package.environment_variables {
+                    for env_var in env_vars {
+                        // Only set if not already provided in overrides
+                        if let Some(overrides) = env_overrides {
+                            if !overrides.contains_key(&env_var.name) {
+                                // Leave unset - user must provide
+                                envs.insert(env_var.name.clone(), String::new());
+                            }
+                        }
+                    }
+                }
+                if let Some(overrides) = env_overrides {
+                    envs.extend(overrides.clone());
+                }
+
+                Ok(McpServerTransportConfig::Stdio {
+                    command,
+                    args,
+                    envs,
+                })
+            }
+            PackageType::Pypi => {
+                // For Python packages, use pip run or python -m
+                let command = "python".to_string();
+                let mut args = vec!["-m".to_string(), package.identifier.clone()];
+
+                // Add any additional args from the package
+                if let Some(extra_args) = &package.args {
+                    args.extend(extra_args.clone());
+                }
+
+                // Merge environment variables
+                let mut envs = HashMap::new();
+                if let Some(env_vars) = &package.environment_variables {
+                    for env_var in env_vars {
+                        if let Some(overrides) = env_overrides {
+                            if !overrides.contains_key(&env_var.name) {
+                                envs.insert(env_var.name.clone(), String::new());
+                            }
+                        }
+                    }
+                }
+                if let Some(overrides) = env_overrides {
+                    envs.extend(overrides.clone());
+                }
+
+                Ok(McpServerTransportConfig::Stdio {
+                    command,
+                    args,
+                    envs,
+                })
+            }
+            PackageType::Binary => {
+                // For binaries, use the identifier as the command
+                let command = package.identifier.clone();
+                let args = package.args.clone().unwrap_or_default();
+
+                let mut envs = HashMap::new();
+                if let Some(env_vars) = &package.environment_variables {
+                    for env_var in env_vars {
+                        if let Some(overrides) = env_overrides {
+                            if !overrides.contains_key(&env_var.name) {
+                                envs.insert(env_var.name.clone(), String::new());
+                            }
+                        }
+                    }
+                }
+                if let Some(overrides) = env_overrides {
+                    envs.extend(overrides.clone());
+                }
+
+                Ok(McpServerTransportConfig::Stdio {
+                    command,
+                    args,
+                    envs,
+                })
+            }
+            PackageType::Docker | PackageType::Other => {
+                anyhow::bail!(
+                    "Unsupported package type: {:?}. Only npm, pypi, and binary are supported.",
+                    package.registry_type
+                )
+            }
+        }
     }
 }

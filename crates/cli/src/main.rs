@@ -14,13 +14,14 @@ use tokio;
 mod chat;
 mod cli_args;
 mod embed;
+mod mcp_registry;
 mod provider;
 mod secret_store;
 mod tracing;
 mod utils;
 
 use chat::{chat_pipe, interactive_loop};
-use cli_args::{CliArgs, Commands, ToolConfig, ToolPolicyState};
+use cli_args::{CliArgs, Commands, McpCommands, RegistryCommands, ToolConfig, ToolPolicyState};
 use embed::embed_pipe;
 use provider::{get_api_key, get_provider_info, get_provider_registry, split_provider};
 use secret_store::SecretStore;
@@ -259,6 +260,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // This command is handled before the match statement
             Commands::Completion { .. } => unreachable!(),
+            Commands::Mcp(mcp_cmd) => {
+                match mcp_cmd {
+                    McpCommands::Registry(registry_cmd) => {
+                        return handle_registry_command(registry_cmd).await;
+                    }
+                }
+            }
         }
     }
 
@@ -351,4 +359,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     interactive_loop(&provider, &prov_name, &tool_config).await
+}
+
+async fn handle_registry_command(cmd: &RegistryCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        RegistryCommands::List {
+            registry_url,
+            limit,
+            no_cache,
+        } => {
+            mcp_registry::handle_list(registry_url.clone(), *limit, *no_cache)
+                .await?;
+        }
+        RegistryCommands::Search {
+            query,
+            registry_url,
+            no_cache,
+        } => {
+            mcp_registry::handle_search(query.clone(), registry_url.clone(), *no_cache).await?;
+        }
+        RegistryCommands::Info {
+            server_id,
+            version,
+            registry_url,
+            no_cache,
+        } => {
+            mcp_registry::handle_info(
+                server_id.clone(),
+                version.clone(),
+                registry_url.clone(),
+                *no_cache,
+            )
+            .await?;
+        }
+        RegistryCommands::Refresh { registry_url } => {
+            mcp_registry::handle_refresh(registry_url.clone()).await?;
+        }
+    }
+
+    Ok(())
 }
