@@ -1,10 +1,9 @@
 use anyhow::Result;
 use querymt::mcp::{
-    cache::RegistryCache,
     config::RegistryConfig,
     registry::{RegistryClient, ServerResponse},
 };
-use std::time::Duration;
+use crate::mcp_cache::RegistryCache;
 
 /// Load registry configuration (use provided URL or default)
 fn get_registry_config(registry_url: Option<String>) -> RegistryConfig {
@@ -20,68 +19,255 @@ fn get_registry_config(registry_url: Option<String>) -> RegistryConfig {
 
 /// Create a cache instance based on registry config
 fn create_cache(config: &RegistryConfig) -> Result<RegistryCache> {
-    match config.cache_ttl_hours {
-        Some(hours) => {
-            let cache_dir = dirs::cache_dir()
-                .map(|mut p| {
-                    p.push("querymt");
-                    p.push("mcp-registries");
-                    p
-                })
-                .ok_or_else(|| anyhow::anyhow!("Could not find cache directory"))?;
+    let cache_dir = dirs::cache_dir()
+        .map(|mut p| {
+            p.push("querymt");
+            p.push("mcp-registries");
+            p
+        })
+        .ok_or_else(|| anyhow::anyhow!("Could not find cache directory"))?;
 
-            std::fs::create_dir_all(&cache_dir)?;
-            Ok(RegistryCache::new(
-                cache_dir,
-                Some(Duration::from_secs(hours * 3600)),
-            ))
-        }
-        None => {
-            let cache_dir = dirs::cache_dir()
-                .map(|mut p| {
-                    p.push("querymt");
-                    p.push("mcp-registries");
-                    p
-                })
-                .ok_or_else(|| anyhow::anyhow!("Could not find cache directory"))?;
+    std::fs::create_dir_all(&cache_dir)?;
 
-            std::fs::create_dir_all(&cache_dir)?;
-            Ok(RegistryCache::permanent_cache(cache_dir))
-        }
-    }
+    let cache_path = cache_dir.join("registry.db");
+    let ttl = config.cache_ttl_hours.map(|hours| std::time::Duration::from_secs(hours * 3600));
+
+    RegistryCache::new(cache_path, ttl)
 }
 
-/// Handle the list command with automatic pagination
+/// Handle the list command with interactive pagination
 pub async fn handle_list(
     registry_url: Option<String>,
-    limit: u32,
     no_cache: bool,
+    refresh: bool,
 ) -> Result<()> {
     let config = get_registry_config(registry_url);
     let client = RegistryClient::new(config.url.clone());
 
-    let servers = if !no_cache && config.use_cache {
+    if refresh {
+        // Refresh mode: fetch everything and populate cache
+        return handle_refresh_cache(&config, &client).await;
+    }
+
+    if !no_cache && config.use_cache {
+        // Try to serve from cache
         let cache = create_cache(&config)?;
 
-        // Try cache first
         match cache.get_cached_servers(&config.url) {
-            Ok(cached_servers) => {
-                // Return cached results, truncated to limit
-                cached_servers.into_iter().take(limit as usize).collect()
+            Ok(cached_servers) if !cached_servers.is_empty() => {
+                // Serve from cache with interactive pagination
+                display_servers_paginated(&cached_servers)?;
+                return Ok(());
             }
-            Err(_) => {
-                // Cache miss or stale, fetch from registry with pagination
-                fetch_servers_with_pagination(&client, limit).await?
+            _ => {
+                // Cache miss or empty, fall through to fetch
+                log::info!("Cache miss or empty, fetching from registry");
             }
         }
-    } else {
-        // No caching, fetch directly with pagination
-        fetch_servers_with_pagination(&client, limit).await?
-    };
+    }
 
-    display_servers_table(&servers);
+    // Fetch with interactive pagination (no cache or cache miss)
+    fetch_and_display_interactive(&client, &config, no_cache).await
+}
+
+/// Refresh the entire cache by fetching all servers
+async fn handle_refresh_cache(
+    config: &querymt::mcp::config::RegistryConfig,
+    client: &RegistryClient,
+) -> Result<()> {
+    use colored::Colorize;
+    use spinners::{Spinner, Spinners};
+
+    let mut sp = Spinner::new(
+        Spinners::Dots12,
+        "Refreshing cache, fetching all servers...".bright_blue().to_string(),
+    );
+
+    let mut all_servers = Vec::new();
+    let mut cursor = None;
+    const PAGE_SIZE: u32 = 100;
+
+    loop {
+        let response = client
+            .list_servers(Some(PAGE_SIZE), cursor, None, None, None)
+            .await?;
+
+        let fetched_count = response.servers.len();
+        all_servers.extend(response.servers);
+
+        // Update spinner message with progress
+        sp.stop();
+        sp = Spinner::new(
+            Spinners::Dots12,
+            format!("Fetching servers... ({})", all_servers.len()).bright_blue().to_string(),
+        );
+
+        if response.metadata.next_cursor.is_none() || fetched_count == 0 {
+            break;
+        }
+
+        cursor = response.metadata.next_cursor;
+    }
+
+    sp.stop();
+
+    // Update cache with all servers
+    if config.use_cache {
+        let mut cache = create_cache(config)?;
+        cache.cache_servers(&config.url, &all_servers)?;
+        println!("{}", format!("✓ Cache updated with {} servers", all_servers.len()).bright_green());
+    }
+
+    // Display with pagination
+    display_servers_paginated(&all_servers)?;
 
     Ok(())
+}
+
+/// Fetch and display servers with interactive pagination
+async fn fetch_and_display_interactive(
+    client: &RegistryClient,
+    config: &querymt::mcp::config::RegistryConfig,
+    no_cache: bool,
+) -> Result<()> {
+    use colored::Colorize;
+    use std::io::{self, Write};
+
+    const PAGE_SIZE: u32 = 50;
+    let mut all_servers = Vec::new();
+    let mut cursor = None;
+
+    loop {
+        // Fetch next page
+        let response = client
+            .list_servers(Some(PAGE_SIZE), cursor, None, None, None)
+            .await?;
+
+        let fetched_count = response.servers.len();
+        cursor = response.metadata.next_cursor.clone();
+
+        all_servers.extend(response.servers);
+
+        // Display current batch
+        display_servers_table(&all_servers[(all_servers.len() - fetched_count)..]);
+
+        // Check if there are more results
+        if cursor.is_none() || fetched_count == 0 {
+            println!("\n{}", "End of results".bright_black());
+            break;
+        }
+
+        // Ask user if they want to continue (single keypress)
+        print!("\n{} ", format!("Showing {} of more servers. Continue? [c/q/Esc]:", all_servers.len()).bright_yellow());
+        io::stdout().flush()?;
+
+        if !wait_for_continue()? {
+            println!("\n{}", "Stopped listing".bright_black());
+            break;
+        }
+    }
+
+    // Cache all fetched servers if caching is enabled
+    if !no_cache && config.use_cache {
+        let mut cache = create_cache(config)?;
+        let _ = cache.cache_servers(&config.url, &all_servers);
+        println!("{}", format!("Cached {} servers", all_servers.len()).bright_black());
+    }
+
+    Ok(())
+}
+
+/// Display servers with pagination (for already-loaded data)
+fn display_servers_paginated(servers: &[ServerResponse]) -> Result<()> {
+    use colored::Colorize;
+    use std::io::{self, Write};
+
+    const PAGE_SIZE: usize = 50;
+    let total = servers.len();
+
+    for (page_num, chunk) in servers.chunks(PAGE_SIZE).enumerate() {
+        let start = page_num * PAGE_SIZE;
+        let end = (start + chunk.len()).min(total);
+
+        display_servers_table(chunk);
+
+        if end < total {
+            print!("\n{} ", format!("Showing {}-{} of {}. Continue? [c/q/Esc]:", start + 1, end, total).bright_yellow());
+            io::stdout().flush()?;
+
+            if !wait_for_continue()? {
+                println!("\n{}", "Stopped listing".bright_black());
+                break;
+            }
+        } else {
+            println!("\n{}", format!("Showing all {} servers", total).bright_green());
+        }
+    }
+
+    Ok(())
+}
+
+/// Wait for user to press a key (c to continue, q/Esc to quit)
+/// Returns true to continue, false to quit
+fn wait_for_continue() -> Result<bool> {
+    use std::io::{self, Read};
+
+    // Try to enable raw mode for single keypress
+    // If it fails, fall back to line input
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let stdin_fd = io::stdin().as_raw_fd();
+
+        // Try to get terminal attributes
+        let original_termios = match termios::Termios::from_fd(stdin_fd) {
+            Ok(t) => t,
+            Err(_) => {
+                // Fallback to line input
+                return fallback_wait_for_continue();
+            }
+        };
+
+        // Set raw mode
+        let mut raw = original_termios.clone();
+        raw.c_lflag &= !(termios::ICANON | termios::ECHO);
+        if termios::tcsetattr(stdin_fd, termios::TCSANOW, &raw).is_err() {
+            return fallback_wait_for_continue();
+        }
+
+        // Read single character
+        let mut buffer = [0u8; 1];
+        let result = io::stdin().read_exact(&mut buffer);
+
+        // Restore terminal
+        let _ = termios::tcsetattr(stdin_fd, termios::TCSANOW, &original_termios);
+
+        match result {
+            Ok(_) => {
+                let ch = buffer[0] as char;
+                // c, C, Enter, Space = continue
+                // q, Q, Esc = quit
+                Ok(ch != 'q' && ch != 'Q' && ch as u8 != 27)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        fallback_wait_for_continue()
+    }
+}
+
+/// Fallback to line-based input if raw mode isn't available
+fn fallback_wait_for_continue() -> Result<bool> {
+    use std::io;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_lowercase();
+
+    Ok(input != "q" && input != "quit")
 }
 
 /// Fetch servers with automatic pagination until reaching the desired limit
@@ -128,41 +314,44 @@ pub async fn handle_search(
     let config = get_registry_config(registry_url);
     let client = RegistryClient::new(config.url.clone());
 
-    // Use the API's search parameter for efficient server-side filtering
+    // Use FTS5 fuzzy search on cached data, or fall back to API search
     let servers = if !no_cache && config.use_cache {
         let cache = create_cache(&config)?;
 
-        match cache.get_cached_servers(&config.url) {
-            Ok(servers) => {
-                // Filter cached servers locally
-                let query_lower = query.to_lowercase();
-                servers
-                    .into_iter()
-                    .filter(|s| {
-                        s.server.name.to_lowercase().contains(&query_lower)
-                            || s.server.description.to_lowercase().contains(&query_lower)
-                    })
-                    .collect()
-            }
-            Err(_) => {
-                // Cache miss - use API search
-                let mut all_servers = Vec::new();
-                let mut cursor = None;
+        // Try FTS5 full-text search first
+        match cache.search_servers(&query, Some(&config.url), None) {
+            Ok(results) if !results.is_empty() => results,
+            _ => {
+                // Try simple substring search as fallback
+                match cache.simple_search(&query, Some(&config.url), None) {
+                    Ok(results) if !results.is_empty() => results,
+                    _ => {
+                        // Cache miss or no results - fetch from API and update cache
+                        let mut all_servers = Vec::new();
+                        let mut cursor = None;
 
-                // Fetch all pages with search filter
-                loop {
-                    let response = client
-                        .list_servers(Some(100), cursor, Some(query.clone()), None, None)
-                        .await?;
-                    all_servers.extend(response.servers);
+                        // Fetch all pages with search filter
+                        loop {
+                            let response = client
+                                .list_servers(Some(100), cursor, Some(query.clone()), None, None)
+                                .await?;
+                            all_servers.extend(response.servers);
 
-                    if response.metadata.next_cursor.is_none() {
-                        break;
+                            if response.metadata.next_cursor.is_none() {
+                                break;
+                            }
+                            cursor = response.metadata.next_cursor;
+                        }
+
+                        // Update cache with fetched results
+                        if !all_servers.is_empty() {
+                            let mut cache_mut = cache;
+                            let _ = cache_mut.cache_servers(&config.url, &all_servers);
+                        }
+
+                        all_servers
                     }
-                    cursor = response.metadata.next_cursor;
                 }
-
-                all_servers
             }
         }
     } else {
@@ -209,11 +398,13 @@ pub async fn handle_info(
     let server_version = if !no_cache && config.use_cache {
         let cache = create_cache(&config)?;
 
-        match cache.get_cached_version(&config.url, &server_id, version_str) {
-            Ok(v) => v,
-            Err(_) => {
+        match cache.get_cached_version(&config.url, &server_id, version_str)? {
+            Some(v) => v,
+            None => {
                 let v = client.get_server_version(&server_id, version_str).await?;
-                let _ = cache.cache_version(&config.url, &server_id, version_str, v.clone());
+                // Update cache with the fetched version
+                let mut cache_mut = cache;
+                let _ = cache_mut.cache_servers(&config.url, &[v.clone()]);
                 v
             }
         }
@@ -228,7 +419,7 @@ pub async fn handle_info(
 
 /// Handle the refresh command
 pub async fn handle_refresh(registry_url: Option<String>) -> Result<()> {
-    let cache = create_cache(&RegistryConfig::default())?;
+    let mut cache = create_cache(&RegistryConfig::default())?;
 
     if let Some(url) = registry_url {
         println!("Clearing cache for registry: {}", url);

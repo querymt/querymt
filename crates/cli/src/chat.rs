@@ -1,5 +1,8 @@
 use crate::cli_args::{ToolConfig, ToolPolicyState};
-use crate::utils::{print_separator, process_input, prompt_tool_execution, parse_tool_names};
+use crate::commands::{
+    builtin::*, completer::QmtCompleter, CommandLoader, CommandRegistry, CommandResult,
+};
+use crate::utils::{parse_tool_names, print_separator, process_input, prompt_tool_execution};
 use colored::*;
 use futures::future::join_all;
 use querymt::{
@@ -7,56 +10,54 @@ use querymt::{
     error::LLMError,
     FunctionCall, LLMProvider, ToolCall,
 };
-use rustyline::{
-    completion::FilenameCompleter,
-    error::ReadlineError,
-    highlight::{CmdKind, Highlighter, MatchingBracketHighlighter},
-    hint::HistoryHinter,
-    validate::MatchingBracketValidator,
-    Cmd, Config, Editor, EventHandler, KeyCode, KeyEvent, Modifiers,
+use reedline::{
+    default_emacs_keybindings, ColumnarMenu, EditCommand, Emacs, FileBackedHistory, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, Signal,
 };
-use rustyline_derive::{Completer, Helper, Hinter, Validator};
 use spinners::{Spinner, Spinners};
 use std::{
     borrow::Cow,
     io::{self, Read, Write},
+    sync::Arc,
 };
 
-#[derive(Helper, Completer, Hinter, Validator)]
-struct QmtHelper {
-    #[rustyline(Completer)]
-    completer: FilenameCompleter,
-    highlighter: MatchingBracketHighlighter,
-    #[rustyline(Validator)]
-    validator: MatchingBracketValidator,
-    #[rustyline(Hinter)]
-    hinter: HistoryHinter,
-    colored_prompt: String,
+/// Custom prompt for querymt CLI
+struct QmtPrompt {
+    prompt_text: String,
 }
 
-impl Highlighter for QmtHelper {
-    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
-        &'s self,
-        prompt: &'p str,
-        default: bool,
-    ) -> Cow<'b, str> {
-        if default {
-            Cow::Borrowed(&self.colored_prompt)
-        } else {
-            Cow::Borrowed(prompt)
+impl QmtPrompt {
+    fn new() -> Self {
+        Self {
+            prompt_text: ":: ".to_string(),
         }
     }
+}
 
-    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        Cow::Owned("\x1b[1m".to_owned() + hint + "\x1b[m")
+impl Prompt for QmtPrompt {
+    fn render_prompt_left(&self) -> Cow<str> {
+        Cow::Borrowed(&self.prompt_text)
     }
 
-    fn highlight<'l>(&self, line: &'l str, pos: usize) -> Cow<'l, str> {
-        self.highlighter.highlight(line, pos)
+    fn render_prompt_right(&self) -> Cow<str> {
+        Cow::Borrowed("")
     }
 
-    fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
-        self.highlighter.highlight_char(line, pos, kind)
+    fn render_prompt_indicator(&self, _prompt_mode: reedline::PromptEditMode) -> Cow<str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_multiline_indicator(&self) -> Cow<str> {
+        Cow::Borrowed("... ")
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        history_search: PromptHistorySearch,
+    ) -> Cow<str> {
+        match history_search.status {
+            reedline::PromptHistorySearchStatus::Passing => Cow::Borrowed("(search) "),
+            reedline::PromptHistorySearchStatus::Failing => Cow::Borrowed("(failing search) "),
+        }
     }
 }
 
@@ -271,42 +272,148 @@ pub async fn interactive_loop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "qmt - Interactive Chat".bright_blue());
     println!("Provider: {}", provider_name.bright_green());
-    println!("{}", "Type 'exit' to quit".bright_black());
+    println!("{}", "Type 'exit' or '/exit' to quit".bright_black());
+    println!("{}", "Type '/help' for available commands".bright_black());
     print_separator();
 
-    let prompt_prefix = ":: ".bold().red().to_string();
-    let helper = QmtHelper {
-        completer: FilenameCompleter::new(),
-        highlighter: MatchingBracketHighlighter::new(),
-        validator: MatchingBracketValidator::new(),
-        hinter: HistoryHinter::new(),
-        colored_prompt: prompt_prefix.clone(),
-    };
+    // Initialize command registry
+    let mut registry = CommandRegistry::new();
 
-    let config = Config::builder()
-        .history_ignore_space(true)
-        .completion_type(rustyline::CompletionType::List)
-        .build();
-    let mut rl = Editor::with_config(config)?;
-    rl.set_helper(Some(helper));
-    rl.bind_sequence(
-        KeyEvent(KeyCode::Enter, Modifiers::ALT),
-        EventHandler::Simple(Cmd::Newline),
+    // Register built-in commands
+    registry.register_builtin(Arc::new(HelpCommand));
+    registry.register_builtin(Arc::new(McpCommand));
+    registry.register_builtin(Arc::new(ClearCommand));
+    registry.register_builtin(Arc::new(ExitCommand));
+
+    // Load markdown commands
+    match CommandLoader::new() {
+        Ok(loader) => match loader.load_commands() {
+            Ok(commands) => {
+                for cmd in commands {
+                    log::info!("Loaded custom command: /{}", cmd.name());
+                    registry.register_markdown(cmd);
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to load custom commands: {}", e);
+            }
+        },
+        Err(e) => {
+            log::warn!("Failed to initialize command loader: {}", e);
+        }
+    }
+
+    let registry_arc = Arc::new(registry);
+
+    // Setup reedline with completion menu
+    let completer = Box::new(QmtCompleter::new(registry_arc.clone()));
+
+    let completion_menu = Box::new(
+        ColumnarMenu::default()
+            .with_name("completion_menu")
+            .with_columns(1)
+            .with_column_width(None)
+            .with_column_padding(2)
     );
+
+    let mut keybindings = default_emacs_keybindings();
+    // Ctrl+Enter or Alt+Enter inserts a newline for multiline input
+    keybindings.add_binding(
+        KeyModifiers::CONTROL,
+        KeyCode::Enter,
+        ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+    );
+    keybindings.add_binding(
+        KeyModifiers::ALT,
+        KeyCode::Enter,
+        ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+    );
+    // Bind Tab to activate completion menu
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::Menu("completion_menu".to_string()),
+    );
+    // Bind Shift+Tab to go backwards in menu
+    keybindings.add_binding(
+        KeyModifiers::SHIFT,
+        KeyCode::BackTab,
+        ReedlineEvent::MenuPrevious,
+    );
+
+    let edit_mode = Box::new(Emacs::new(keybindings));
+
+    // Setup history
+    let history = Box::new(
+        FileBackedHistory::with_file(1000, dirs::cache_dir()
+            .map(|mut p| {
+                p.push("querymt");
+                std::fs::create_dir_all(&p).ok();
+                p.push("history.txt");
+                p
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("history.txt")))
+            .expect("Failed to create history file"),
+    );
+
+    let mut line_editor = Reedline::create()
+        .with_completer(completer)
+        .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+        .with_edit_mode(edit_mode)
+        .with_history(history);
+
+    let prompt = QmtPrompt::new();
     let mut messages: Vec<ChatMessage> = Vec::new();
 
     loop {
         io::stdout().flush()?;
-        let readline = rl.readline(&prompt_prefix);
-        match readline {
-            Ok(line) => {
+        let sig = line_editor.read_line(&prompt);
+        match sig {
+            Ok(Signal::Success(line)) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("exit") {
                     println!("{}", "👋 Goodbye!".bright_blue());
                     break;
                 }
-                let _ = rl.add_history_entry(trimmed);
 
+                // Check if this is a slash command
+                if let Some((cmd_name, args)) = CommandRegistry::parse_command_line(trimmed) {
+                    match handle_slash_command(
+                        &registry_arc,
+                        cmd_name,
+                        args,
+                        provider,
+                        &mut messages,
+                    )
+                    .await
+                    {
+                        Ok(CommandResult::Exit) => {
+                            println!("{}", "👋 Goodbye!".bright_blue());
+                            break;
+                        }
+                        Ok(CommandResult::Success(output)) => {
+                            if !output.is_empty() {
+                                println!("{}", output);
+                            }
+                            print_separator();
+                        }
+                        Ok(CommandResult::Error(err)) => {
+                            eprintln!("{} {}", "Error:".bright_red(), err);
+                            print_separator();
+                        }
+                        Ok(CommandResult::Continue) => {
+                            // Command wants to continue with normal chat flow
+                            // This shouldn't happen in the current implementation
+                        }
+                        Err(e) => {
+                            eprintln!("{} {}", "Command error:".bright_red(), e);
+                            print_separator();
+                        }
+                    }
+                    continue;
+                }
+
+                // Normal chat flow
                 messages.push(ChatMessage::user().content(trimmed.to_string()).build());
                 let mut sp =
                     Spinner::new(Spinners::Dots12, "Thinking...".bright_magenta().to_string());
@@ -322,7 +429,11 @@ pub async fn interactive_loop(
                     }
                 }
             }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+            Ok(Signal::CtrlC) => {
+                println!("\n{}", "👋 Goodbye!".bright_blue());
+                break;
+            }
+            Ok(Signal::CtrlD) => {
                 println!("\n{}", "👋 Goodbye!".bright_blue());
                 break;
             }
@@ -333,4 +444,56 @@ pub async fn interactive_loop(
         }
     }
     Ok(())
+}
+
+/// Handle slash command execution (built-in and markdown)
+async fn handle_slash_command(
+    registry: &Arc<CommandRegistry>,
+    cmd_name: &str,
+    args: Vec<String>,
+    provider: &Box<dyn LLMProvider>,
+    messages: &mut Vec<ChatMessage>,
+) -> Result<CommandResult, Box<dyn std::error::Error>> {
+    use crate::commands::CommandSource;
+
+    match registry.get(cmd_name) {
+        Some(CommandSource::BuiltIn(cmd)) => {
+            // Check if command requires async execution
+            if cmd.is_async() {
+                Ok(cmd.execute_async(args).await?)
+            } else {
+                Ok(cmd.execute(args)?)
+            }
+        }
+        Some(CommandSource::Markdown(md_cmd)) => {
+            // Execute markdown command by sending to LLM
+            let prompt = md_cmd.substitute_arguments(&args);
+
+            // Add the prompt as a user message
+            messages.push(ChatMessage::user().content(prompt.clone()).build());
+
+            let mut sp =
+                Spinner::new(Spinners::Dots12, "Executing command...".bright_magenta().to_string());
+
+            match provider.chat(messages).await {
+                Ok(response) => {
+                    sp.stop();
+                    // Display the response
+                    if let Some(text) = response.text() {
+                        messages.push(ChatMessage::assistant().content(text.clone()).build());
+                        println!("{}", text);
+                    }
+                    Ok(CommandResult::Success(String::new()))
+                }
+                Err(e) => {
+                    sp.stop();
+                    Ok(CommandResult::Error(format!("{}", e)))
+                }
+            }
+        }
+        None => Ok(CommandResult::Error(format!(
+            "Unknown command: /{}. Type '/help' for available commands.",
+            cmd_name
+        ))),
+    }
 }

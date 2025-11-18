@@ -143,13 +143,13 @@ pub enum RegistryCommands {
         #[arg(long)]
         registry_url: Option<String>,
 
-        /// Maximum number of total results to fetch (pagination handled automatically)
-        #[arg(long, default_value = "50")]
-        limit: u32,
-
-        /// Disable cache
+        /// Disable cache (fetch fresh data with interactive pagination)
         #[arg(long)]
         no_cache: bool,
+
+        /// Refresh cache (fetch ALL servers and update cache)
+        #[arg(long)]
+        refresh: bool,
     },
 
     /// Search servers by keyword

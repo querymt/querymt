@@ -13,7 +13,9 @@ use tokio;
 
 mod chat;
 mod cli_args;
+mod commands;
 mod embed;
+mod mcp_cache;
 mod mcp_registry;
 mod provider;
 mod secret_store;
@@ -365,10 +367,10 @@ async fn handle_registry_command(cmd: &RegistryCommands) -> Result<(), Box<dyn s
     match cmd {
         RegistryCommands::List {
             registry_url,
-            limit,
             no_cache,
+            refresh,
         } => {
-            mcp_registry::handle_list(registry_url.clone(), *limit, *no_cache)
+            mcp_registry::handle_list(registry_url.clone(), *no_cache, *refresh)
                 .await?;
         }
         RegistryCommands::Search {

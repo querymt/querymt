@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path, process::Stdio, time::Duration};
 use which::which;
 
-use super::cache::RegistryCache;
 use super::registry::{PackageType, RegistryClient};
 
 /// Registry configuration
@@ -250,44 +249,9 @@ impl Config {
     ) -> Result<McpServerTransportConfig> {
         let client = RegistryClient::new(registry_cfg.url.clone());
 
-        // Try cache first if enabled
-        let server_version = if registry_cfg.use_cache {
-            let cache = match registry_cfg.cache_ttl_hours {
-                Some(hours) => RegistryCache::new(
-                    dirs::cache_dir()
-                        .map(|mut p| {
-                            p.push("querymt");
-                            p.push("mcp-registries");
-                            p
-                        })
-                        .ok_or_else(|| anyhow::anyhow!("Could not find cache directory"))?,
-                    Some(Duration::from_secs(hours * 3600)),
-                ),
-                None => RegistryCache::permanent_cache(
-                    dirs::cache_dir()
-                        .map(|mut p| {
-                            p.push("querymt");
-                            p.push("mcp-registries");
-                            p
-                        })
-                        .ok_or_else(|| anyhow::anyhow!("Could not find cache directory"))?,
-                ),
-            };
-
-            // Try to get from cache
-            match cache.get_cached_version(&registry_cfg.url, registry_id, version) {
-                Ok(v) => v,
-                Err(_) => {
-                    // Cache miss or stale, fetch from registry
-                    let v = client.get_server_version(registry_id, version).await?;
-                    let _ = cache.cache_version(&registry_cfg.url, registry_id, version, v.clone());
-                    v
-                }
-            }
-        } else {
-            // No caching, fetch directly
-            client.get_server_version(registry_id, version).await?
-        };
+        // Fetch server version from registry
+        // Note: Caching is now handled at the CLI layer for better search capabilities
+        let server_version = client.get_server_version(registry_id, version).await?;
 
         // Convert ServerResponse to McpServerTransportConfig
         Self::server_response_to_transport(server_version, env_overrides)
