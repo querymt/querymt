@@ -123,4 +123,71 @@ pub enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
+    /// MCP registry operations
+    #[command(subcommand)]
+    Mcp(McpCommands),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum McpCommands {
+    /// Registry operations
+    #[command(subcommand)]
+    Registry(RegistryCommands),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RegistryCommands {
+    /// List all servers from registry
+    List {
+        /// Registry URL (overrides config)
+        #[arg(long)]
+        registry_url: Option<String>,
+
+        /// Disable cache (fetch fresh data with interactive pagination)
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Refresh cache (fetch ALL servers and update cache)
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// Search servers by keyword
+    Search {
+        /// Search query
+        query: String,
+
+        /// Registry URL
+        #[arg(long)]
+        registry_url: Option<String>,
+
+        /// Disable cache
+        #[arg(long)]
+        no_cache: bool,
+    },
+
+    /// Show detailed server information
+    Info {
+        /// Server ID (e.g., @modelcontextprotocol/server-filesystem)
+        server_id: String,
+
+        /// Specific version (defaults to latest)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Registry URL
+        #[arg(long)]
+        registry_url: Option<String>,
+
+        /// Disable cache
+        #[arg(long)]
+        no_cache: bool,
+    },
+
+    /// Refresh registry cache
+    Refresh {
+        /// Registry URL (if not specified, refreshes all)
+        #[arg(long)]
+        registry_url: Option<String>,
+    },
 }

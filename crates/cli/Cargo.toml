@@ -12,11 +12,10 @@ homepage = "https://query.mt"
 
 [dependencies]
 anyhow = "1.0"
-querymt = { path = "../querymt", default-features = false, features = ["reqwest-client", "extism_host", "mcp", "native"] }
+querymt = { path = "../querymt", default-features = false, features = ["reqwest-client", "extism_host", "mcp", "native", "tracing", "http-client"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-rustyline = "17"
-rustyline-derive = "0.11"
+reedline = "0.43"
 colored = "3.0"
 spinners = "4.1"
 tokio = { version = "1.0", features = ["full"] }
@@ -26,6 +25,12 @@ log = { workspace = true }
 dirs = "6.0"
 toml = "0.9"
 futures = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_yaml = "0.9"
+async-trait = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+termios = "0.3"
 
 tracing = { workspace = true }
 tracing-log = "0.2"

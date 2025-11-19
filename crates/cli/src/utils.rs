@@ -3,7 +3,7 @@ use log::{log_enabled, Level};
 use querymt::chat::{ChatMessage, ImageMime};
 use querymt::plugin::HTTPLLMProviderFactory;
 use querymt::ToolCall;
-use rustyline::{error::ReadlineError, Config, Editor};
+use std::io::{self, BufRead};
 use serde_json::Value;
 use std::io::{stdout, Write};
 use std::path::PathBuf;
@@ -176,48 +176,31 @@ pub fn prompt_tool_execution(tool: &ToolCall) -> Result<(bool, Option<String>), 
     println!("{}", prompt_line);
     println!("{}", display_colored_prompt());
 
-    // Create rustyline editor with config
-    let config = Config::builder()
-        .history_ignore_space(true)
-        .completion_type(rustyline::CompletionType::List)
-        .edit_mode(rustyline::EditMode::Emacs)
-        .build();
+    // Read input from stdin
+    let stdin = io::stdin();
+    let mut input = String::new();
+    stdin.lock().read_line(&mut input)?;
 
-    let mut rl: Editor<(), rustyline::history::DefaultHistory> = Editor::with_config(config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-    let readline = rl.readline("");
     clear_prev_lines(3);
-    match readline {
-        Ok(input) => {
-            let key = input.chars().next().unwrap_or(' ');
-            match ToolAction::from_key(key) {
-                Some(ToolAction::Accept) => Ok((true, None)),
-                Some(ToolAction::Deny) => Ok((false, Some("Stop immediately.".to_string()))),
-                Some(ToolAction::DenyWithReason) => {
-                    match rl.readline(format!("{}: ", "reason".bright_yellow().bold()).as_str()) {
-                        Ok(reason_input) => {
-                            clear_prev_lines(1);
-                            let reason = reason_input.trim();
-                            if reason.is_empty() {
-                                Ok((false, Some("No reason provided".to_string())))
-                            } else {
-                                Ok((false, Some(reason.to_string())))
-                            }
-                        }
-                        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-                            Ok((false, Some("User cancelled".to_string())))
-                        }
-                        Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
-                    }
-                }
-                None => Ok((false, None)),
+    let key = input.trim().chars().next().unwrap_or(' ');
+
+    match ToolAction::from_key(key) {
+        Some(ToolAction::Accept) => Ok((true, None)),
+        Some(ToolAction::Deny) => Ok((false, Some("Stop immediately.".to_string()))),
+        Some(ToolAction::DenyWithReason) => {
+            print!("{}: ", "reason".bright_yellow().bold());
+            stdout().flush()?;
+            let mut reason_input = String::new();
+            stdin.lock().read_line(&mut reason_input)?;
+            clear_prev_lines(1);
+            let reason = reason_input.trim();
+            if reason.is_empty() {
+                Ok((false, Some("No reason provided".to_string())))
+            } else {
+                Ok((false, Some(reason.to_string())))
             }
         }
-        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-            Ok((false, Some("User cancelled".to_string())))
-        }
-        Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+        None => Ok((false, None)),
     }
 }
 
