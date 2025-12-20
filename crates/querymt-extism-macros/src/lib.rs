@@ -1,22 +1,35 @@
 use extism_pdk::*;
+use serde::{Deserialize, Serialize};
 
-pub fn to_pdk_request(req: &::http::Request<Vec<u8>>) -> HttpRequest {
-    let mut p = HttpRequest::new(req.uri().to_string()).with_method(req.method().as_str());
-    for (k, v) in req.headers().iter() {
-        let v = v.to_str().unwrap_or_default();
-        p = p.with_header(k.as_str(), v);
-    }
-    p
+// Import base serializable types from querymt
+use querymt::plugin::extism_impl::{SerializableHttpRequest as BaseHttpRequest, SerializableHttpResponse as BaseHttpResponse};
+
+// Create plugin-side wrappers that implement ToBytes/FromBytes
+#[derive(Serialize, Deserialize, ToBytes, FromBytes, Clone)]
+#[encoding(Json)]
+pub struct HttpRequest(pub BaseHttpRequest);
+
+#[derive(Serialize, Deserialize, ToBytes, FromBytes, Clone)]
+#[encoding(Json)]
+pub struct HttpResponse(pub BaseHttpResponse);
+
+// Declare the custom host function
+#[host_fn("extism:host/user")]
+extern "ExtismHost" {
+    fn qmt_http_request(req: HttpRequest) -> HttpResponse;
 }
 
-pub fn http_response_to_native(resp: HttpResponse) -> ::http::Response<Vec<u8>> {
-    let status = resp.status_code();
-    let body = resp.body(); // clones the bytes out of Wasm memory
-    let mut builder = ::http::Response::builder().status(status);
-    for (k, v) in resp.headers().iter() {
-        builder = builder.header(k.as_str(), v.as_str());
-    }
-    builder.body(body).expect("failed to build http::Response")
+/// Call custom qmt_http_request host function using http-serde-ext
+pub fn qmt_http_request_wrapper(req: &::http::Request<Vec<u8>>) -> Result<::http::Response<Vec<u8>>, Error> {
+    // Wrap request in serializable types
+    let ser_req = BaseHttpRequest { req: req.clone() };
+    let wrapped_req = HttpRequest(ser_req);
+    
+    // Call host function
+    let wrapped_resp = unsafe { qmt_http_request(wrapped_req)? };
+    
+    // Extract the response
+    Ok(wrapped_resp.0.resp)
 }
 
 /// Macro to generate all the Extism exports for an HTTP‐based LLM plugin
@@ -41,7 +54,7 @@ macro_rules! impl_extism_http_plugin {
             },
         };
         use serde_json::Value;
-        use $crate::{http_response_to_native, to_pdk_request};
+        use $crate::qmt_http_request_wrapper;
 
         // Export the factory name
         #[plugin_fn]
@@ -77,11 +90,8 @@ macro_rules! impl_extism_http_plugin {
         pub fn list_models(cfg: Json<Value>) -> FnResult<Json<Vec<String>>> {
             let req = HTTPLLMProviderFactory::list_models_request(&$Factory, &cfg.0)
                 .map_err(PdkError::new)?;
-            let pdk_req = to_pdk_request(&req);
-            let resp: extism_pdk::http::HttpResponse =
-                extism_pdk::http::request(&pdk_req, Some(req.body()))?;
+            let native_resp = qmt_http_request_wrapper(&req)?;
 
-            let native_resp = http_response_to_native(resp);
             let models = HTTPLLMProviderFactory::parse_list_models(&$Factory, native_resp)
                 .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
             Ok(Json(models))
@@ -96,11 +106,8 @@ macro_rules! impl_extism_http_plugin {
                 .cfg
                 .chat_request(&input.messages, input.tools.as_deref())
                 .map_err(PdkError::new)?;
-            let pdk_req = to_pdk_request(&req);
-            let resp: extism_pdk::http::HttpResponse =
-                extism_pdk::http::request(&pdk_req, Some(req.body()))?;
+            let native_resp = qmt_http_request_wrapper(&req)?;
 
-            let native_resp = http_response_to_native(resp);
             let chat_response = input
                 .cfg
                 .parse_chat(native_resp)
@@ -118,11 +125,8 @@ macro_rules! impl_extism_http_plugin {
                 .cfg
                 .embed_request(&input.inputs)
                 .map_err(PdkError::new)?;
-            let pdk_req = to_pdk_request(&req);
-            let resp: extism_pdk::http::HttpResponse =
-                extism_pdk::http::request(&pdk_req, Some(req.body()))?;
+            let native_resp = qmt_http_request_wrapper(&req)?;
 
-            let native_resp = http_response_to_native(resp);
             let embed_response = input
                 .cfg
                 .parse_embed(native_resp)
@@ -138,11 +142,8 @@ macro_rules! impl_extism_http_plugin {
                 .cfg
                 .complete_request(&input.req)
                 .map_err(PdkError::new)?;
-            let pdk_req = to_pdk_request(&req);
-            let resp: extism_pdk::http::HttpResponse =
-                extism_pdk::http::request(&pdk_req, Some(req.body()))?;
+            let native_resp = qmt_http_request_wrapper(&req)?;
 
-            let native_resp = http_response_to_native(resp);
             let complete_response = input
                 .cfg
                 .parse_complete(native_resp)

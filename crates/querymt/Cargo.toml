@@ -1,6 +1,6 @@
 [package]
 name = "querymt"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 description = "A Rust library unifying multiple LLM backends."
 license = "MIT"
@@ -12,12 +12,12 @@ homepage = "https://query.mt"
 
 [features]
 default = ["http-client", "mcp", "extism_host", "tracing"]
-http-client = []
-reqwest-client = ["reqwest", "tokio", "once_cell"]
+http-client = ["reqwest", "tokio", "once_cell", "http-serde-ext"]
+reqwest-client = ["http-client"]
 native = ["libloading", "once_cell"]
-mcp = ["rmcp", "toml", "tokio", "jsonschema"]
-extism_host = ["dep:extism", "docker_credential", "sigstore", "oci-client", "tar", "flate2", "sha2", "serde_yaml", "dirs", "hex"]
-extism_plugin = []
+mcp = ["rmcp", "toml", "tokio", "jsonschema", "reqwest"]
+extism_host = ["dep:extism", "docker_credential", "sigstore", "oci-client", "tar", "flate2", "sha2", "serde_yaml", "dirs", "hex", "reqwest-client"]
+extism_plugin = ["http-serde-ext"]
 tracing = ["dep:tracing"]
 
 [dependencies]
@@ -51,6 +51,7 @@ log.workspace = true
 tracing = { workspace = true, optional = true }
 which = "8.0.0"
 jsonschema = { version = "0.36", optional = true }
+http-serde-ext = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.0", features = ["full"], optional = true }

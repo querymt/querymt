@@ -24,7 +24,7 @@ impl PluginLoader for ExtismLoader {
         plugin: ProviderPlugin,
         plugin_cfg: &ProviderConfig,
     ) -> Result<Arc<dyn LLMProviderFactory>, LLMError> {
-        let bytes = std::fs::read(plugin.file_path)?;
+        let bytes = std::fs::read(&plugin.file_path)?;
         let provider = ExtismFactory::load(bytes, &plugin_cfg.config)?;
         Ok(Arc::new(provider))
     }

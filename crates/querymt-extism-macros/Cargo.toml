@@ -9,3 +9,4 @@ http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 extism-pdk.workspace = true
+http-serde-ext.workspace = true

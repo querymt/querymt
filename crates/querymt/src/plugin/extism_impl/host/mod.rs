@@ -22,8 +22,13 @@ use std::{
 use tracing::instrument;
 use url::Url;
 
+#[cfg(feature = "http-client")]
+use extism::Function;
+
 mod loader;
 pub use loader::ExtismLoader;
+
+mod functions;
 
 use super::ExtismCompleteRequest;
 
@@ -63,9 +68,24 @@ impl ExtismFactory {
         let initial_manifest =
             Manifest::new([Wasm::data(wasm_content.clone())]).with_config(env_map.iter());
 
-        let init_plugin = Arc::new(Mutex::new(
-            (PluginBuilder::new(initial_manifest))
+        #[cfg(feature = "http-client")]
+        let init_builder = {
+            PluginBuilder::new(initial_manifest)
                 .with_wasi(true)
+                .with_function_in_namespace(
+                    "extism:host/user",
+                    "qmt_http_request",
+                    [extism::PTR],
+                    [extism::PTR],
+                    extism::UserData::new(Vec::<String>::new()),
+                    functions::reqwest_http
+                )
+        };
+        #[cfg(not(feature = "http-client"))]
+        let init_builder = PluginBuilder::new(initial_manifest).with_wasi(true);
+
+        let init_plugin = Arc::new(Mutex::new(
+            init_builder
                 .build()
                 .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?,
         ));
@@ -95,13 +115,29 @@ impl ExtismFactory {
         //        drop(init_plugin)
 
         let manifest = Manifest::new([Wasm::data(wasm_content.clone())])
-            .with_allowed_hosts(allowed_hosts.into_iter())
+            .with_allowed_hosts(allowed_hosts.clone().into_iter())
             .with_config(env_map.into_iter());
 
-        let plugin = Arc::new(Mutex::new(
-            (PluginBuilder::new(manifest))
+        #[cfg(feature = "http-client")]
+        let builder = {
+            // Register custom HTTP host function that uses reqwest
+            PluginBuilder::new(manifest)
                 .with_wasi(true)
-                .build()
+                .with_function_in_namespace(
+                    "extism:host/user",
+                    "qmt_http_request",
+                    [extism::PTR],
+                    [extism::PTR],
+                    extism::UserData::new(allowed_hosts), // Pass allowed_hosts as UserData
+                    functions::reqwest_http
+                )
+        };
+        
+        #[cfg(not(feature = "http-client"))]
+        let builder = PluginBuilder::new(manifest).with_wasi(true);
+
+        let plugin = Arc::new(Mutex::new(
+            builder.build()
                 .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?,
         ));
 

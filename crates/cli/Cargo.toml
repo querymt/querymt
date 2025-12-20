@@ -12,7 +12,7 @@ homepage = "https://query.mt"
 
 [dependencies]
 anyhow = "1.0"
-querymt = { path = "../querymt", default-features = false, features = ["reqwest-client", "extism_host", "mcp", "native"] }
+querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 rustyline = "17"

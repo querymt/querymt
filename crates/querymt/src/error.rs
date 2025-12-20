@@ -52,7 +52,7 @@ pub enum LLMError {
     IoError(#[from] std::io::Error),
 }
 
-#[cfg(feature = "reqwest-client")]
+#[cfg(feature = "http-client")]
 impl From<reqwest::Error> for LLMError {
     fn from(err: reqwest::Error) -> Self {
         LLMError::HttpError(err.to_string())
