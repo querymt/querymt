@@ -97,7 +97,7 @@ impl ParallelEvaluator {
             .collect::<Vec<_>>();
 
         let results = join_all(futures).await;
-        
+
         let mut eval_results = Vec::new();
         for (id, result, elapsed) in results {
             match result {
@@ -143,7 +143,9 @@ impl ParallelEvaluator {
                 let tools_clone = tools.map(|t| t.to_vec());
                 async move {
                     let start = Instant::now();
-                    let result = provider.chat_with_tools(&messages, tools_clone.as_deref()).await;
+                    let result = provider
+                        .chat_with_tools(&messages, tools_clone.as_deref())
+                        .await;
                     let elapsed = start.elapsed().as_millis();
                     (id, result, elapsed)
                 }
@@ -151,7 +153,7 @@ impl ParallelEvaluator {
             .collect::<Vec<_>>();
 
         let results = join_all(futures).await;
-        
+
         let mut eval_results = Vec::new();
         for (id, result, elapsed) in results {
             match result {
@@ -202,7 +204,7 @@ impl ParallelEvaluator {
             .collect::<Vec<_>>();
 
         let results = join_all(futures).await;
-        
+
         let mut eval_results = Vec::new();
         for (id, result, elapsed) in results {
             match result {
@@ -232,12 +234,19 @@ impl ParallelEvaluator {
     ///
     /// # Returns
     /// The best result or None if no results are available
-    pub fn best_response<'a>(&self, results: &'a [ParallelEvalResult]) -> Option<&'a ParallelEvalResult> {
+    pub fn best_response<'a>(
+        &self,
+        results: &'a [ParallelEvalResult],
+    ) -> Option<&'a ParallelEvalResult> {
         if results.is_empty() {
             return None;
         }
-        
-        results.iter().max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
+
+        results.iter().max_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     /// Computes the score for a given response
@@ -254,4 +263,4 @@ impl ParallelEvaluator {
         }
         total
     }
-} 
+}

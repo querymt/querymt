@@ -64,10 +64,7 @@ pub mod providers;
 /// and embedding capabilities into a unified interface
 #[async_trait::async_trait]
 pub trait LLMProvider:
-    chat::BasicChatProvider
-    + chat::ToolChatProvider
-    + completion::CompletionProvider
-    + embedding::EmbeddingProvider
+    chat::ChatProvider + completion::CompletionProvider + embedding::EmbeddingProvider
 {
     fn tools(&self) -> Option<&[Tool]> {
         None

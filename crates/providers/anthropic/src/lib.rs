@@ -136,6 +136,47 @@ struct AnthropicCompleteResponse {
     usage: Option<Usage>,
 }
 
+#[derive(Deserialize, Debug)]
+struct AnthropicStreamResponse {
+    #[serde(rename = "type")]
+    response_type: String,
+    /// Index of the content block (for content_block_start, content_block_delta, content_block_stop)
+    index: Option<usize>,
+    /// Content block for content_block_start events
+    content_block: Option<AnthropicStreamContentBlock>,
+    /// Delta for content_block_delta and message_delta events
+    delta: Option<AnthropicDelta>,
+}
+
+/// Content block within an Anthropic streaming content_block_start event.
+#[derive(Deserialize, Debug)]
+struct AnthropicStreamContentBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    /// Tool use ID (for tool_use blocks)
+    id: Option<String>,
+    /// Tool name (for tool_use blocks)
+    name: Option<String>,
+    /// Initial text (for text blocks, usually empty)
+    #[allow(dead_code)]
+    text: Option<String>,
+}
+
+/// Delta content within an Anthropic streaming response.
+#[derive(Deserialize, Debug)]
+struct AnthropicDelta {
+    #[serde(rename = "type")]
+    delta_type: Option<String>,
+    /// Text content (for text_delta)
+    text: Option<String>,
+    /// Partial JSON string (for input_json_delta)
+    partial_json: Option<String>,
+    /// Thinking content (for thinking_delta)
+    thinking: Option<String>,
+    /// Stop reason (for message_delta)
+    stop_reason: Option<String>,
+}
+
 /// Content block within an Anthropic API response.
 #[derive(Serialize, Deserialize, Debug)]
 struct AnthropicContent {
@@ -255,7 +296,8 @@ impl HTTPChatProvider for Anthropic {
 
         let anthropic_messages: Vec<AnthropicMessage> = messages
             .iter()
-            .map(|m| AnthropicMessage {
+            .enumerate()
+            .map(|(i, m)| AnthropicMessage {
                 role: match m.role {
                     ChatRole::User => "user",
                     ChatRole::Assistant => "assistant",
@@ -317,23 +359,39 @@ impl HTTPChatProvider for Anthropic {
                         tool_result_id: None,
                         tool_output: None,
                     }],
-                    MessageType::ToolUse(calls) => calls
-                        .iter()
-                        .map(|c| MessageContent {
-                            message_type: Some("tool_use"),
-                            text: None,
-                            image_url: None,
-                            source: None,
-                            tool_use_id: Some(c.id.clone()),
-                            tool_input: Some(
-                                serde_json::from_str(&c.function.arguments)
-                                    .unwrap_or(c.function.arguments.clone().into()),
-                            ),
-                            tool_name: Some(c.function.name.clone()),
-                            tool_result_id: None,
-                            tool_output: None,
-                        })
-                        .collect(),
+                    MessageType::ToolUse(calls) => {
+                        let mut content = Vec::new();
+                        if !m.content.is_empty() {
+                            content.push(MessageContent {
+                                message_type: Some("text"),
+                                text: Some(&m.content),
+                                image_url: None,
+                                source: None,
+                                tool_use_id: None,
+                                tool_input: None,
+                                tool_name: None,
+                                tool_result_id: None,
+                                tool_output: None,
+                            });
+                        }
+                        content.extend(calls.iter().map(|c| {
+                            MessageContent {
+                                message_type: Some("tool_use"),
+                                text: None,
+                                image_url: None,
+                                source: None,
+                                tool_use_id: Some(c.id.clone()),
+                                tool_input: Some(
+                                    serde_json::from_str(&c.function.arguments)
+                                        .unwrap_or_else(|_| serde_json::json!({})),
+                                ),
+                                tool_name: Some(c.function.name.clone()),
+                                tool_result_id: None,
+                                tool_output: None,
+                            }
+                        }));
+                        content
+                    }
                     MessageType::ToolResult(responses) => responses
                         .iter()
                         .map(|r| MessageContent {
@@ -439,6 +497,72 @@ impl HTTPChatProvider for Anthropic {
             .map_err(|e| LLMError::HttpError(format!("Failed to parse JSON: {}", e)))?;
 
         Ok(Box::new(json_resp))
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn parse_chat_stream_chunk(
+        &self,
+        chunk: &[u8],
+    ) -> Result<Vec<querymt::chat::StreamChunk>, LLMError> {
+        let text = std::str::from_utf8(chunk).map_err(|e| LLMError::GenericError(e.to_string()))?;
+        let mut chunks = Vec::new();
+
+        for line in text.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                let data = data.trim();
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+
+                let stream_resp: AnthropicStreamResponse =
+                    serde_json::from_str(data).map_err(|e| LLMError::ResponseFormatError {
+                        message: format!("Failed to parse Anthropic stream data: {}", e),
+                        raw_response: data.to_string(),
+                    })?;
+
+                match stream_resp.response_type.as_str() {
+                    "content_block_start" => {
+                        if let (Some(index), Some(block)) =
+                            (stream_resp.index, stream_resp.content_block)
+                        {
+                            if block.block_type == "tool_use" {
+                                chunks.push(querymt::chat::StreamChunk::ToolUseStart {
+                                    index,
+                                    id: block.id.unwrap_or_default(),
+                                    name: block.name.unwrap_or_default(),
+                                });
+                            }
+                        }
+                    }
+                    "content_block_delta" => {
+                        if let (Some(index), Some(delta)) = (stream_resp.index, stream_resp.delta) {
+                            if let Some(text) = delta.text {
+                                chunks.push(querymt::chat::StreamChunk::Text(text));
+                            } else if let Some(thinking) = delta.thinking {
+                                chunks.push(querymt::chat::StreamChunk::Text(thinking));
+                            } else if let Some(partial_json) = delta.partial_json {
+                                chunks.push(querymt::chat::StreamChunk::ToolUseInputDelta {
+                                    index,
+                                    partial_json,
+                                });
+                            }
+                        }
+                    }
+                    "message_delta" => {
+                        if let Some(delta) = stream_resp.delta {
+                            if let Some(stop_reason) = delta.stop_reason {
+                                chunks.push(querymt::chat::StreamChunk::Done { stop_reason });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(chunks)
     }
 }
 

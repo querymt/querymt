@@ -49,6 +49,12 @@ pub struct ExtismChatResponse {
     pub usage: Option<Usage>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExtismChatChunk {
+    pub chunk: crate::chat::StreamChunk,
+    pub usage: Option<Usage>,
+}
+
 impl fmt::Display for ExtismChatResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // If there’s a top‐level `text`, show that…

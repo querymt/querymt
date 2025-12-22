@@ -12,4 +12,17 @@ pub trait HTTPChatProvider: Send + Sync {
         tools: Option<&[Tool]>,
     ) -> Result<Request<Vec<u8>>, LLMError>;
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError>;
+
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    fn parse_chat_stream_chunk(
+        &self,
+        _chunk: &[u8],
+    ) -> Result<Vec<crate::chat::StreamChunk>, LLMError> {
+        Err(LLMError::NotImplemented(
+            "Streaming not supported by this HTTP provider".into(),
+        ))
+    }
 }

@@ -26,7 +26,7 @@
 use async_trait::async_trait;
 
 use crate::chat::{
-    BasicChatProvider, ChatMessage, ChatResponse, ChatRole, MessageType, Tool, ToolChatProvider,
+    ChatMessage, ChatProvider, ChatResponse, ChatRole, MessageType, StreamChunk, Tool,
 };
 use crate::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use crate::embedding::EmbeddingProvider;
@@ -73,17 +73,27 @@ impl ValidatedLLM {
     }
 }
 
-impl LLMProvider for ValidatedLLM {}
-
 #[async_trait]
-impl BasicChatProvider for ValidatedLLM {
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
-        self.inner.chat_with_tools(messages, None).await
+impl LLMProvider for ValidatedLLM {
+    fn tools(&self) -> Option<&[Tool]> {
+        self.inner.tools()
+    }
+
+    async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<String, LLMError> {
+        self.inner.call_tool(name, args).await
+    }
+
+    fn tool_server_name(&self, name: &str) -> Option<&str> {
+        self.inner.tool_server_name(name)
     }
 }
 
 #[async_trait]
-impl ToolChatProvider for ValidatedLLM {
+impl ChatProvider for ValidatedLLM {
+    fn supports_streaming(&self) -> bool {
+        self.inner.supports_streaming()
+    }
+
     /// Sends a chat request and validates the response.
     ///
     /// If validation fails, retries with feedback to the model about the validation error.
@@ -136,6 +146,17 @@ impl ToolChatProvider for ValidatedLLM {
                 }
             }
         }
+    }
+
+    async fn chat_stream_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
+        LLMError,
+    > {
+        self.inner.chat_stream_with_tools(messages, tools).await
     }
 }
 

@@ -1,5 +1,5 @@
 use crate::{
-    chat::{BasicChatProvider, ChatMessage, ChatResponse, FunctionTool, ToolChatProvider},
+    chat::{ChatMessage, ChatProvider, ChatResponse, StreamChunk},
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
@@ -7,13 +7,10 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use schemars::JsonSchema;
-use serde::Serialize;
+use futures::Stream;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 /// Adapter interface for your host‐side implementations
 #[async_trait]
@@ -102,15 +99,11 @@ impl EmbeddingProvider for ToolEnabledProvider {
 }
 
 #[async_trait]
-impl BasicChatProvider for ToolEnabledProvider {
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
-        self.inner
-            .chat_with_tools(messages, Some(&self.tool_list))
-            .await
+impl ChatProvider for ToolEnabledProvider {
+    fn supports_streaming(&self) -> bool {
+        self.inner.supports_streaming()
     }
-}
-#[async_trait]
-impl ToolChatProvider for ToolEnabledProvider {
+
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -118,6 +111,17 @@ impl ToolChatProvider for ToolEnabledProvider {
     ) -> Result<Box<dyn ChatResponse>, LLMError> {
         let to_send = tools.unwrap_or(&self.tool_list);
         self.inner.chat_with_tools(messages, Some(to_send)).await
+    }
+
+    async fn chat_stream_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
+        let to_send = tools.unwrap_or(&self.tool_list);
+        self.inner
+            .chat_stream_with_tools(messages, Some(to_send))
+            .await
     }
 }
 
