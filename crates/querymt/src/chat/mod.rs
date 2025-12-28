@@ -421,6 +421,9 @@ pub enum StreamChunk {
         tool_call: ToolCall,
     },
 
+    /// Usage metadata containing token counts
+    Usage(Usage),
+
     /// Stream ended with stop reason
     Done {
         /// The reason the stream stopped (e.g., "end_turn", "tool_use")

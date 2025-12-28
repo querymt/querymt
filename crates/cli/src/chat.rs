@@ -169,6 +169,13 @@ pub async fn handle_any_response(
                         StreamChunk::ToolUseComplete { .. } => {
                             log::debug!("Received tool use complete");
                         }
+                        StreamChunk::Usage(usage) => {
+                            log::debug!(
+                                "Usage: input={}, output={}",
+                                usage.input_tokens,
+                                usage.output_tokens
+                            );
+                        }
                         StreamChunk::Done { stop_reason } => {
                             log::debug!("Stream done: stop_reason={}", stop_reason);
                             println!();

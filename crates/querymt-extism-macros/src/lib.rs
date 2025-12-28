@@ -188,7 +188,15 @@ macro_rules! impl_extism_http_plugin {
                         PdkError::msg(format!("parse_chat_stream_chunk failed: {}", e))
                     })?;
                     for chunk in chunks {
-                        qmt_yield_chunk_wrapper(&ExtismChatChunk { chunk, usage: None })?;
+                        // Extract usage if this is a Usage chunk
+                        let usage_to_send = match &chunk {
+                            StreamChunk::Usage(usage) => Some(usage.clone()),
+                            _ => None,
+                        };
+                        qmt_yield_chunk_wrapper(&ExtismChatChunk {
+                            chunk,
+                            usage: usage_to_send,
+                        })?;
                     }
                     buffer.drain(..=last_newline_pos);
                 }
@@ -203,7 +211,15 @@ macro_rules! impl_extism_http_plugin {
                     ))
                 })?;
                 for chunk in chunks {
-                    qmt_yield_chunk_wrapper(&ExtismChatChunk { chunk, usage: None })?;
+                    // Extract usage if this is a Usage chunk
+                    let usage_to_send = match &chunk {
+                        StreamChunk::Usage(usage) => Some(usage.clone()),
+                        _ => None,
+                    };
+                    qmt_yield_chunk_wrapper(&ExtismChatChunk {
+                        chunk,
+                        usage: usage_to_send,
+                    })?;
                 }
             }
 

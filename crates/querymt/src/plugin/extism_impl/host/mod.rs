@@ -119,7 +119,8 @@ impl ExtismFactory {
             Vec::<String>::new(),
             tokio_handle.clone(),
         ));
-        let init_builder = with_host_functions!(PluginBuilder::new(initial_manifest), init_user_data);
+        let init_builder =
+            with_host_functions!(PluginBuilder::new(initial_manifest), init_user_data);
 
         let init_plugin = Arc::new(Mutex::new(
             init_builder

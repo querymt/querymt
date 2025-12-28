@@ -63,7 +63,7 @@ use url::Url;
 ///
 /// This struct holds the configuration and state needed to make requests to the Gemini API.
 /// It implements the [`ChatProvider`], [`CompletionProvider`], and [`EmbeddingProvider`] traits.
-#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Google {
     /// API key for authentication with Google's API
@@ -91,6 +91,39 @@ pub struct Google {
     pub tool_choice: Option<ToolChoice>, // FIXME: currently not being used
     pub thinking_budget: Option<u32>,
     pub cached_content: Option<String>,
+    /// Buffer for accumulating incomplete streaming JSON chunks
+    /// This field is not serialized and uses interior mutability to allow
+    /// buffering across multiple parse_chat_stream_chunk calls
+    #[serde(skip, default = "default_stream_buffer")]
+    #[schemars(skip)]
+    stream_buffer: std::sync::Mutex<String>,
+}
+
+fn default_stream_buffer() -> std::sync::Mutex<String> {
+    std::sync::Mutex::new(String::new())
+}
+
+impl Clone for Google {
+    fn clone(&self) -> Self {
+        Self {
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            system: self.system.clone(),
+            timeout_seconds: self.timeout_seconds,
+            stream: self.stream,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            json_schema: self.json_schema.clone(),
+            tools: self.tools.clone(),
+            tool_choice: self.tool_choice.clone(),
+            thinking_budget: self.thinking_budget,
+            cached_content: self.cached_content.clone(),
+            // Create a new empty buffer for the cloned instance
+            stream_buffer: std::sync::Mutex::new(String::new()),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -216,6 +249,11 @@ impl std::fmt::Display for GoogleChatResponse {
 struct GoogleCandidate {
     /// Content of the candidate response
     content: GoogleResponseContent,
+    /// Finish reason (only present in final streaming chunk or complete response)
+    #[serde(rename = "finishReason")]
+    finish_reason: Option<String>,
+    /// Index of this candidate
+    index: usize,
 }
 
 /// Content block within a response
@@ -647,10 +685,18 @@ impl HTTPChatProvider for Google {
 
         let json_body = serde_json::to_vec(&req_body)?;
 
+        // Use streamGenerateContent endpoint when streaming is enabled
+        let endpoint = if self.stream.unwrap_or(false) {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        };
+
         let path = format!(
-            "{}{}:generateContent",
+            "{}{}:{}",
             Google::default_base_url().path(),
-            &self.model
+            &self.model,
+            endpoint
         );
         let mut url = Google::default_base_url()
             .join(&path)
@@ -680,6 +726,42 @@ impl HTTPChatProvider for Google {
                 })
             }
         }
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn parse_chat_stream_chunk(
+        &self,
+        chunk: &[u8],
+    ) -> Result<Vec<querymt::chat::StreamChunk>, LLMError> {
+        let text =
+            std::str::from_utf8(chunk).map_err(|e| LLMError::GenericError(format!("{:#}", e)))?;
+
+        // Get mutable access to buffer
+        let mut buffer = self.stream_buffer.lock().unwrap();
+
+        // Append new chunk to buffer
+        buffer.push_str(text);
+
+        // Process the buffer to extract complete JSON objects
+        let (extracted_chunks, bytes_consumed) = extract_complete_json_objects(&buffer)?;
+
+        if bytes_consumed > 0 {
+            // Remove the consumed portion from the buffer
+            buffer.drain(..bytes_consumed);
+        }
+
+        // If we found a finish_reason, clear the buffer for next request
+        for chunk in &extracted_chunks {
+            if matches!(chunk, querymt::chat::StreamChunk::Done { .. }) {
+                buffer.clear();
+                break;
+            }
+        }
+
+        Ok(extracted_chunks)
     }
 }
 
@@ -753,6 +835,184 @@ impl HTTPLLMProvider for Google {
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }
+}
+
+/// Extract complete JSON objects from a buffer containing Google's streaming array format
+/// Returns (extracted StreamChunks, number of bytes consumed from buffer)
+fn extract_complete_json_objects(
+    buffer: &str,
+) -> Result<(Vec<querymt::chat::StreamChunk>, usize), LLMError> {
+    use serde_json::Deserializer;
+
+    let mut result_chunks: Vec<querymt::chat::StreamChunk> = Vec::new();
+    let mut bytes_consumed = 0;
+
+    // Strip leading whitespace and array opening bracket
+    let trimmed = buffer.trim_start();
+    let working_text = if trimmed.starts_with('[') {
+        bytes_consumed += buffer.len() - trimmed.len() + 1; // whitespace + '['
+        &trimmed[1..]
+    } else {
+        trimmed
+    };
+
+    // Strip leading comma and whitespace (between array elements)
+    let working_text = working_text.trim_start();
+    if working_text.starts_with(',') {
+        bytes_consumed += 1;
+        let working_text = &working_text[1..];
+        let working_text = working_text.trim_start();
+        bytes_consumed +=
+            working_text.as_ptr() as usize - (buffer.as_ptr() as usize + bytes_consumed);
+
+        // Now try to parse JSON objects from the working text
+        return try_parse_json_objects(buffer, bytes_consumed, working_text);
+    }
+
+    try_parse_json_objects(buffer, bytes_consumed, working_text)
+}
+
+fn try_parse_json_objects(
+    original_buffer: &str,
+    initial_offset: usize,
+    text: &str,
+) -> Result<(Vec<querymt::chat::StreamChunk>, usize), LLMError> {
+    use serde_json::Deserializer;
+
+    let mut result_chunks = Vec::new();
+    let mut total_consumed = initial_offset;
+
+    // Try to parse JSON objects using StreamDeserializer
+    let mut deserializer = Deserializer::from_str(text).into_iter::<GoogleChatResponse>();
+
+    while let Some(result) = deserializer.next() {
+        match result {
+            Ok(response) => {
+                // Track how many bytes we consumed
+                let byte_offset = deserializer.byte_offset();
+                total_consumed = initial_offset + byte_offset;
+
+                // Extract StreamChunks from this response
+                let chunks = extract_google_stream_chunks(response);
+                result_chunks.extend(chunks);
+            }
+            Err(_e) => {
+                // Parse error - likely incomplete JSON
+                // Don't consume any more bytes - leave the rest in the buffer
+                break;
+            }
+        }
+    }
+
+    // Check if there's a trailing ] (end of array)
+    if total_consumed < original_buffer.len() {
+        let remaining = &original_buffer[total_consumed..];
+        let trimmed_remaining = remaining.trim_start();
+        if trimmed_remaining.starts_with(']') {
+            // Consume the closing bracket and any whitespace before it
+            total_consumed += remaining.len() - trimmed_remaining.len() + 1;
+        }
+    }
+
+    Ok((result_chunks, total_consumed))
+}
+
+/// Extract StreamChunks from a GoogleChatResponse
+fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::chat::StreamChunk> {
+    let mut chunks = Vec::new();
+
+    if let Some(candidate) = response.candidates.first() {
+        // Extract text from parts
+        for (index, part) in candidate.content.parts.iter().enumerate() {
+            if !part.text.is_empty() {
+                chunks.push(querymt::chat::StreamChunk::Text(part.text.clone()));
+            }
+
+            // Extract tool calls
+            if let Some(function_call) = &part.function_call {
+                chunks.push(querymt::chat::StreamChunk::ToolUseStart {
+                    index,
+                    id: format!("call_{}", function_call.name),
+                    name: function_call.name.clone(),
+                });
+
+                chunks.push(querymt::chat::StreamChunk::ToolUseComplete {
+                    index,
+                    tool_call: querymt::ToolCall {
+                        id: format!("call_{}", function_call.name),
+                        call_type: "function".to_string(),
+                        function: querymt::FunctionCall {
+                            name: function_call.name.clone(),
+                            arguments: serde_json::to_string(&function_call.args)
+                                .unwrap_or_default(),
+                        },
+                    },
+                });
+            }
+        }
+
+        // Handle content-level function calls
+        if let Some(fc) = &candidate.content.function_call {
+            chunks.push(querymt::chat::StreamChunk::ToolUseStart {
+                index: 0,
+                id: format!("call_{}", fc.name),
+                name: fc.name.clone(),
+            });
+            chunks.push(querymt::chat::StreamChunk::ToolUseComplete {
+                index: 0,
+                tool_call: querymt::ToolCall {
+                    id: format!("call_{}", fc.name),
+                    call_type: "function".to_string(),
+                    function: querymt::FunctionCall {
+                        name: fc.name.clone(),
+                        arguments: serde_json::to_string(&fc.args).unwrap_or_default(),
+                    },
+                },
+            });
+        }
+
+        if let Some(fcs) = &candidate.content.function_calls {
+            for (index, fc) in fcs.iter().enumerate() {
+                chunks.push(querymt::chat::StreamChunk::ToolUseStart {
+                    index,
+                    id: format!("call_{}", fc.name),
+                    name: fc.name.clone(),
+                });
+                chunks.push(querymt::chat::StreamChunk::ToolUseComplete {
+                    index,
+                    tool_call: querymt::ToolCall {
+                        id: format!("call_{}", fc.name),
+                        call_type: "function".to_string(),
+                        function: querymt::FunctionCall {
+                            name: fc.name.clone(),
+                            arguments: serde_json::to_string(&fc.args).unwrap_or_default(),
+                        },
+                    },
+                });
+            }
+        }
+
+        // Check for finish reason (only in final chunk)
+        if let Some(finish_reason) = &candidate.finish_reason {
+            chunks.push(querymt::chat::StreamChunk::Done {
+                stop_reason: finish_reason.clone(),
+            });
+        }
+    }
+
+    // Extract usage metadata - only emit with finish_reason (final chunk)
+    if let Some(usage) = response.usage {
+        if response
+            .candidates
+            .first()
+            .and_then(|c| c.finish_reason.as_ref())
+            .is_some()
+        {
+            chunks.push(querymt::chat::StreamChunk::Usage(usage));
+        }
+    }
+
+    chunks
 }
 
 struct GoogleFactory;
