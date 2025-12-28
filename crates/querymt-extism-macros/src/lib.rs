@@ -178,6 +178,8 @@ macro_rules! impl_extism_http_plugin {
             let stream_id = qmt_http_stream_open_wrapper(&req)?.0;
 
             let mut buffer = Vec::new();
+            let mut done_received = false;
+
             while let Some(raw_chunk) = qmt_http_stream_next_wrapper(stream_id)? {
                 buffer.extend_from_slice(&raw_chunk);
 
@@ -187,29 +189,42 @@ macro_rules! impl_extism_http_plugin {
                     let chunks = input.cfg.parse_chat_stream_chunk(to_process).map_err(|e| {
                         PdkError::msg(format!("parse_chat_stream_chunk failed: {}", e))
                     })?;
-                    for chunk in chunks {
+
+                    for chunk in chunks.iter() {
                         // Extract usage if this is a Usage chunk
                         let usage_to_send = match &chunk {
                             StreamChunk::Usage(usage) => Some(usage.clone()),
                             _ => None,
                         };
+
                         qmt_yield_chunk_wrapper(&ExtismChatChunk {
-                            chunk,
+                            chunk: chunk.clone(),
                             usage: usage_to_send,
                         })?;
+
+                        // Check for Done AFTER yielding it
+                        if matches!(chunk, StreamChunk::Done { .. }) {
+                            done_received = true;
+                            break; // Stop yielding more chunks after Done
+                        }
                     }
                     buffer.drain(..=last_newline_pos);
+                }
+
+                if done_received {
+                    break;
                 }
             }
 
             // Process any remaining data in the buffer after the stream ends
-            if !buffer.is_empty() {
+            if !buffer.is_empty() && !done_received {
                 let chunks = input.cfg.parse_chat_stream_chunk(&buffer).map_err(|e| {
                     PdkError::msg(format!(
                         "parse_chat_stream_chunk failed on remaining buffer: {}",
                         e
                     ))
                 })?;
+
                 for chunk in chunks {
                     // Extract usage if this is a Usage chunk
                     let usage_to_send = match &chunk {
