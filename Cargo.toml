@@ -10,7 +10,7 @@ members = [
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde-value = "0.7 "
+serde-value = "0.7"
 either = { version = "1.15.0", features = ["serde"] }
 http = "1.0"
 base64 = "0.22.1"
@@ -20,4 +20,4 @@ futures = "0.3"
 log = "0.4"
 extism-pdk = "1.4"
 tracing = "0.1"
-http-serde-ext = "1.0.2"
+http-serde-ext = "1.0"
