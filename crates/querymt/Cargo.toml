@@ -50,7 +50,7 @@ hex = { version = "0.4", optional = true }
 log.workspace = true
 tracing = { workspace = true, optional = true }
 which = "8.0.0"
-jsonschema = { version = "0.36", optional = true }
+jsonschema = { version = "0.38", optional = true }
 http-serde-ext = { workspace = true, optional = true }
 bytes = "1.10"
 
