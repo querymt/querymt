@@ -1,5 +1,5 @@
 use crate::{
-    chat::{BasicChatProvider, ChatMessage, ChatResponse, Tool, ToolChatProvider},
+    chat::{ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool},
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
@@ -7,7 +7,7 @@ use crate::{
         extism_impl::{ExtismChatRequest, ExtismChatResponse, ExtismEmbedRequest},
         Fut, HTTPLLMProviderFactory, LLMProviderFactory,
     },
-    providers::{read_providers_from_cache, ProviderInfo},
+    providers::read_providers_from_cache,
     LLMProvider,
 };
 
@@ -25,12 +25,62 @@ use url::Url;
 mod loader;
 pub use loader::ExtismLoader;
 
+mod functions;
+
 use super::ExtismCompleteRequest;
+
+macro_rules! with_host_functions {
+    ($builder:expr, $user_data:expr) => {
+        $builder
+            .with_wasi(true)
+            .with_function_in_namespace(
+                "extism:host/user",
+                "qmt_http_request",
+                [extism::PTR],
+                [extism::PTR],
+                $user_data.clone(),
+                functions::qmt_http_request,
+            )
+            .with_function_in_namespace(
+                "extism:host/user",
+                "qmt_http_stream_open",
+                [extism::PTR],
+                [extism::PTR],
+                $user_data.clone(),
+                functions::qmt_http_stream_open,
+            )
+            .with_function_in_namespace(
+                "extism:host/user",
+                "qmt_http_stream_next",
+                [extism::PTR],
+                [extism::PTR],
+                $user_data.clone(),
+                functions::qmt_http_stream_next,
+            )
+            .with_function_in_namespace(
+                "extism:host/user",
+                "qmt_http_stream_close",
+                [extism::PTR],
+                [],
+                $user_data.clone(),
+                functions::qmt_http_stream_close,
+            )
+            .with_function_in_namespace(
+                "extism:host/user",
+                "qmt_yield_chunk",
+                [extism::PTR],
+                [],
+                $user_data.clone(),
+                functions::qmt_yield_chunk,
+            )
+    };
+}
 
 #[derive(Clone)]
 pub struct ExtismFactory {
     plugin: Arc<Mutex<Plugin>>,
     name: String,
+    user_data: Option<extism::UserData<functions::HostState>>,
 }
 
 fn call_plugin_str(plugin: Arc<Mutex<Plugin>>, func: &str, arg: &Value) -> anyhow::Result<String> {
@@ -56,16 +106,24 @@ impl ExtismFactory {
         let mut env_map: HashMap<_, _> = std::env::vars().collect();
 
         let v = read_providers_from_cache()?;
-        // NOTE: adding pricing data into current plugin as JSON string which should be deserialized
-        // from another side
-        env_map.insert("PROVIDERS_REGISTRY_DATA".to_string(), serde_json::to_string(&v)?);
+        env_map.insert(
+            "PROVIDERS_REGISTRY_DATA".to_string(),
+            serde_json::to_string(&v)?,
+        );
 
         let initial_manifest =
             Manifest::new([Wasm::data(wasm_content.clone())]).with_config(env_map.iter());
 
+        let tokio_handle = tokio::runtime::Handle::current();
+        let init_user_data = extism::UserData::new(functions::HostState::new(
+            Vec::<String>::new(),
+            tokio_handle.clone(),
+        ));
+        let init_builder =
+            with_host_functions!(PluginBuilder::new(initial_manifest), init_user_data);
+
         let init_plugin = Arc::new(Mutex::new(
-            (PluginBuilder::new(initial_manifest))
-                .with_wasi(true)
+            init_builder
                 .build()
                 .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?,
         ));
@@ -92,20 +150,26 @@ impl ExtismFactory {
             allowed_hosts.push(base_url);
         }
         drop(init_plugin);
-        //        drop(init_plugin)
 
         let manifest = Manifest::new([Wasm::data(wasm_content.clone())])
-            .with_allowed_hosts(allowed_hosts.into_iter())
+            .with_allowed_hosts(allowed_hosts.clone().into_iter())
             .with_config(env_map.into_iter());
 
+        let user_data =
+            extism::UserData::new(functions::HostState::new(allowed_hosts, tokio_handle));
+        let builder = with_host_functions!(PluginBuilder::new(manifest), user_data);
+
         let plugin = Arc::new(Mutex::new(
-            (PluginBuilder::new(manifest))
-                .with_wasi(true)
+            builder
                 .build()
                 .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?,
         ));
 
-        Ok(Self { plugin, name })
+        Ok(Self {
+            plugin,
+            name,
+            user_data: Some(user_data),
+        })
     }
 
     fn call(&self, func: &str, arg: &Value) -> anyhow::Result<String> {
@@ -135,6 +199,7 @@ impl LLMProviderFactory for ExtismFactory {
         let provider = ExtismProvider {
             plugin: self.plugin.clone(),
             config: cfg.clone(),
+            user_data: self.user_data.clone(),
         };
         Ok(Box::new(provider))
     }
@@ -195,32 +260,26 @@ impl HTTPLLMProviderFactory for ExtismFactory {
     }
 }
 
-/// A single LLMProvider that delegates to the plugin's LLMProvider trait functions
 pub struct ExtismProvider {
     plugin: Arc<Mutex<Plugin>>,
     config: Value,
+    user_data: Option<extism::UserData<functions::HostState>>,
 }
 
 #[async_trait]
-impl BasicChatProvider for ExtismProvider {
-    #[instrument(name = "extism_provider.chat", skip_all)]
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
-        let arg = ExtismChatRequest {
-            cfg: self.config.clone(),
-            messages: messages.to_vec(),
-            tools: None,
-        };
+impl ChatProvider for ExtismProvider {
+    fn supports_streaming(&self) -> bool {
         let mut plug = self.plugin.lock().unwrap();
-        let out: Json<ExtismChatResponse> = plug
-            .call("chat", Json(arg))
-            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
-
-        Ok(Box::new(out.0) as Box<dyn ChatResponse>)
+        if !plug.function_exists("supports_streaming") {
+            return false;
+        }
+        let res: Result<Json<bool>, _> = plug.call("supports_streaming", Json(self.config.clone()));
+        match res {
+            Ok(Json(supported)) => supported,
+            Err(_) => false,
+        }
     }
-}
 
-#[async_trait]
-impl ToolChatProvider for ExtismProvider {
     #[instrument(name = "extism_provider.chat_with_tools", skip_all)]
     async fn chat_with_tools(
         &self,
@@ -232,13 +291,82 @@ impl ToolChatProvider for ExtismProvider {
             messages: messages.to_vec(),
             tools: tools.map(|v| v.to_vec()),
         };
-
         let mut plug = self.plugin.lock().unwrap();
         let out: Json<ExtismChatResponse> = plug
             .call("chat", Json(arg))
             .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
 
         Ok(Box::new(out.0) as Box<dyn ChatResponse>)
+    }
+
+    #[instrument(name = "extism_provider.chat_stream_with_tools", skip_all)]
+    async fn chat_stream_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
+        LLMError,
+    > {
+        if !self.supports_streaming() {
+            return Err(LLMError::NotImplemented(
+                "Streaming not supported by this plugin".into(),
+            ));
+        }
+
+        use crate::plugin::extism_impl::ExtismChatChunk;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        if let Some(user_data) = &self.user_data {
+            let state = user_data
+                .get()
+                .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
+            let mut state_guard = state.lock().unwrap();
+            state_guard.yield_tx = Some(tx);
+        } else {
+            return Err(LLMError::PluginError(
+                "No UserData found for streaming".into(),
+            ));
+        }
+
+        let plugin = self.plugin.clone();
+        let user_data_clone = self.user_data.clone().unwrap();
+        let mut cfg = self.config.clone();
+        if let Some(obj) = cfg.as_object_mut() {
+            obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+        }
+        let arg = ExtismChatRequest {
+            cfg,
+            messages: messages.to_vec(),
+            tools: tools.map(|v| v.to_vec()),
+        };
+
+        std::thread::spawn(move || {
+            log::debug!("Extism plugin chat_stream thread started");
+            let mut plug = plugin.lock().unwrap();
+            let res: Result<(), _> = plug.call("chat_stream", Json(arg));
+            if let Err(e) = res {
+                log::error!("chat_stream plugin call failed: {:?}", e);
+            }
+            log::debug!("Extism plugin chat_stream thread finished, clearing yield_tx");
+            if let Ok(state) = user_data_clone.get() {
+                let mut state_guard = state.lock().unwrap();
+                state_guard.yield_tx = None;
+            }
+        });
+
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|bytes| {
+                let chunk_res: Result<StreamChunk, LLMError> = serde_json::from_slice::<
+                    ExtismChatChunk,
+                >(&bytes)
+                .map(|c| c.chunk)
+                .map_err(|e| LLMError::PluginError(format!("Failed to deserialize chunk: {}", e)));
+                (chunk_res, rx)
+            })
+        });
+
+        Ok(Box::pin(stream))
     }
 }
 

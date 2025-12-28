@@ -1,9 +1,11 @@
 use crate::cli_args::{ToolConfig, ToolPolicyState};
-use crate::utils::{print_separator, process_input, prompt_tool_execution, parse_tool_names};
+use crate::utils::{parse_tool_names, print_separator, process_input, prompt_tool_execution};
 use colored::*;
 use futures::future::join_all;
+use futures::Stream;
+use futures::StreamExt;
 use querymt::{
-    chat::{ChatMessage, ChatResponse},
+    chat::{ChatMessage, ChatResponse, StreamChunk},
     error::LLMError,
     FunctionCall, LLMProvider, ToolCall,
 };
@@ -17,10 +19,39 @@ use rustyline::{
 };
 use rustyline_derive::{Completer, Helper, Hinter, Validator};
 use spinners::{Spinner, Spinners};
+use std::collections::HashMap;
+use std::pin::Pin;
 use std::{
     borrow::Cow,
     io::{self, Read, Write},
 };
+
+#[derive(Debug)]
+struct SyntheticResponse {
+    text: Option<String>,
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+impl std::fmt::Display for SyntheticResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(ref text) = self.text {
+            write!(f, "{}", text)?;
+        }
+        Ok(())
+    }
+}
+
+impl ChatResponse for SyntheticResponse {
+    fn text(&self) -> Option<String> {
+        self.text.clone()
+    }
+    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+        self.tool_calls.clone()
+    }
+    fn usage(&self) -> Option<querymt::Usage> {
+        None
+    }
+}
 
 #[derive(Helper, Completer, Hinter, Validator)]
 struct QmtHelper {
@@ -60,140 +91,269 @@ impl Highlighter for QmtHelper {
     }
 }
 
-pub async fn handle_response(
+pub(crate) enum StreamOrResponse {
+    Stream(Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>),
+    Response(Box<dyn ChatResponse>),
+}
+
+async fn unified_chat(
+    messages: &[ChatMessage],
+    provider: &Box<dyn LLMProvider>,
+) -> Result<StreamOrResponse, LLMError> {
+    if provider.supports_streaming() {
+        match provider
+            .chat_stream_with_tools(messages, provider.tools())
+            .await
+        {
+            Ok(stream) => return Ok(StreamOrResponse::Stream(stream)),
+            Err(LLMError::NotImplemented(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let resp = provider.chat_with_tools(messages, provider.tools()).await?;
+    Ok(StreamOrResponse::Response(resp))
+}
+
+pub async fn handle_any_response(
     messages: &mut Vec<ChatMessage>,
-    initial_response: Box<dyn ChatResponse>,
+    initial: StreamOrResponse,
     provider: &Box<dyn LLMProvider>,
     tool_config: &ToolConfig,
+    mut spinner: Option<Spinner>,
 ) -> Result<(), LLMError> {
-    let mut current_response = initial_response;
+    let mut current = initial;
+    let mut header_printed = false;
 
     loop {
-        if let Some(usage) = current_response.usage() {
-            log::info!(
-                "Tokens usage (in/out): {}/{}",
-                usage.input_tokens,
-                usage.output_tokens
-            );
-        }
-        // Clear the current line
-        print!("\r\x1B[K");
+        let is_stream = matches!(current, StreamOrResponse::Stream(_));
+        let (text, tool_calls, _usage) = match current {
+            StreamOrResponse::Stream(mut stream) => {
+                let mut full_text = String::new();
+                let mut tool_calls_map: HashMap<usize, (String, String, String)> = HashMap::new();
 
-        if let Some(tool_calls) = current_response.tool_calls() {
+                if let Some(mut sp) = spinner.take() {
+                    sp.stop();
+                    print!("\r\x1B[K");
+                    if !header_printed {
+                        print!("{}", "> Assistant: ".bright_green());
+                        io::stdout().flush().ok();
+                        header_printed = true;
+                    }
+                }
+
+                while let Some(chunk_res) = stream.next().await {
+                    match chunk_res? {
+                        StreamChunk::Text(t) => {
+                            log::trace!("Received stream text chunk: {} bytes", t.len());
+                            print!("{}", t);
+                            io::stdout().flush().ok();
+                            full_text.push_str(&t);
+                        }
+                        StreamChunk::ToolUseStart { index, id, name } => {
+                            log::debug!("Received tool use start: {} (idx {})", name, index);
+                            tool_calls_map.insert(index, (id, name, String::new()));
+                        }
+                        StreamChunk::ToolUseInputDelta {
+                            index,
+                            partial_json,
+                        } => {
+                            log::trace!(
+                                "Received tool use input delta: {} bytes (idx {})",
+                                partial_json.len(),
+                                index
+                            );
+                            if let Some(entry) = tool_calls_map.get_mut(&index) {
+                                entry.2.push_str(&partial_json);
+                            }
+                        }
+                        StreamChunk::ToolUseComplete { .. } => {
+                            log::debug!("Received tool use complete");
+                        }
+                        StreamChunk::Usage(usage) => {
+                            log::debug!(
+                                "Usage: input={}, output={}",
+                                usage.input_tokens,
+                                usage.output_tokens
+                            );
+                        }
+                        StreamChunk::Done { stop_reason } => {
+                            log::debug!("Stream done: stop_reason={}", stop_reason);
+                            println!();
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(mut sp) = spinner.take() {
+                    sp.stop();
+                    print!("\r\x1B[K");
+                }
+
+                let tool_calls = if tool_calls_map.is_empty() {
+                    None
+                } else {
+                    let mut calls: Vec<_> = tool_calls_map.into_iter().collect();
+                    calls.sort_by_key(|(idx, _)| *idx);
+                    Some(
+                        calls
+                            .into_iter()
+                            .map(|(_, (id, name, arguments))| ToolCall {
+                                id,
+                                call_type: "function".to_string(),
+                                function: FunctionCall { name, arguments },
+                            })
+                            .collect(),
+                    )
+                };
+
+                (Some(full_text), tool_calls, None)
+            }
+            StreamOrResponse::Response(resp) => {
+                if let Some(mut sp) = spinner.take() {
+                    sp.stop();
+                    print!("\r\x1B[K");
+                }
+
+                if let Some(usage) = resp.usage() {
+                    log::info!(
+                        "Tokens usage (in/out): {}/{}",
+                        usage.input_tokens,
+                        usage.output_tokens
+                    );
+                }
+                (resp.text(), resp.tool_calls(), resp.usage())
+            }
+        };
+
+        if let Some(ref tcalls) = tool_calls {
             messages.push(
                 ChatMessage::assistant()
-                    .tool_use(tool_calls.clone())
-                    .content(current_response.text().unwrap_or_default())
+                    .tool_use(tcalls.clone())
+                    .content(text.clone().unwrap_or_default())
                     .build(),
             );
 
-            let tool_futures = tool_calls.into_iter().map(|call| async {
-                // Security check for tool execution
+            let tool_futures = tcalls.clone().into_iter().map(|call| async {
                 let tool_name = call.function.name.clone();
-
-                // Get server name from the tool for security checking
                 let server_name = match provider.tool_server_name(&tool_name) {
                     Some(s) => s,
-                    None => return (call, Err(LLMError::ToolConfigError(format!("Server name can't be get from tool `{}`.", tool_name)))),
+                    None => {
+                        return (
+                            call,
+                            Err(LLMError::ToolConfigError(format!(
+                                "Server name can't be get from tool `{}`.",
+                                tool_name
+                            ))),
+                        )
+                    }
                 };
 
-                let (effective_server, effective_tool) = match parse_tool_names(server_name, &tool_name) {
-                    Some((s, t)) => (s, t),
-                    None => return (call, Err(LLMError::ToolConfigError(format!("Invalid tool format for server {}", server_name)))),
-                };
+                let (effective_server, effective_tool) =
+                    match parse_tool_names(server_name, &tool_name) {
+                        Some((s, t)) => (s, t),
+                        None => {
+                            return (
+                                call,
+                                Err(LLMError::ToolConfigError(format!(
+                                    "Invalid tool format for server {}",
+                                    server_name
+                                ))),
+                            )
+                        }
+                    };
 
-                log::debug!("serve: {}, tool: {}", effective_server, effective_tool);
-
-                let state = tool_config.tools.as_ref()
+                let state = tool_config
+                    .tools
+                    .as_ref()
                     .and_then(|tools| tools.get(effective_server))
                     .and_then(|server_tools| server_tools.get(effective_tool))
                     .or_else(|| tool_config.default.as_ref())
                     .unwrap_or(&ToolPolicyState::Ask);
 
                 match state {
-                    ToolPolicyState::Ask => {
-                        match prompt_tool_execution(&call) {
-                            Ok((true, _)) => {
-                                // User approved, continue with execution
-                            }
-                            Ok((false, reason)) => {
-                                // User denied, provide informative response to LLM
-                                let denial_message = match reason {
-                                    Some(r) =>
-                                        format!("Reason: {}.", r),
-
-                                    None =>
-
-                                    "".to_string()
-                                };
-                                let name = call.function.name.clone();
-                                return (
-                                    call,
-                                    Ok(format!(
-                                        "Tool execution denied by user. The user chose not to execute the '{}' tool. {}",
-                                        name,denial_message
-                                    ).trim().to_string()),
-                                );
-                            }
-                            Err(e) => {
-                                return (
-                                    call,
-                                    Err(LLMError::InvalidRequest(format!("Failed to read user input: {}", e))),
-                                );
-                            }
+                    ToolPolicyState::Ask => match prompt_tool_execution(&call) {
+                        Ok((true, _)) => {}
+                        Ok((false, reason)) => {
+                            let denial_message = match reason {
+                                Some(r) => format!("Reason: {}.", r),
+                                None => "".to_string(),
+                            };
+                            return (
+                                call,
+                                Ok(format!(
+                                    "Tool execution denied by user. The user chose not to execute the '{}' tool. {}",
+                                    tool_name, denial_message
+                                )
+                                .trim()
+                                .to_string()),
+                            );
                         }
-                    }
-                    ToolPolicyState::Allow => {
-                        // No prompt, proceed directly
-                    }
+                        Err(e) => {
+                            return (
+                                call,
+                                Err(LLMError::InvalidRequest(format!(
+                                    "Failed to read user input: {}",
+                                    e
+                                ))),
+                            );
+                        }
+                    },
+                    ToolPolicyState::Allow => {}
                     ToolPolicyState::Deny => {
-                        let denial_message = format!(
-                            "Tool execution denied by configuration. The '{}' tool is not allowed.",
-                            call.function.name
-                        );
                         return (
                             call,
-                            Ok(denial_message),
+                            Ok(format!(
+                                "Tool execution denied by configuration. The '{}' tool is not allowed.",
+                                tool_name
+                            )),
                         );
                     }
                 }
 
-                let args: serde_json::Value = match serde_json::from_str(&call.function.arguments) {
+                let args_str = if call.function.arguments.is_empty() {
+                    "{}".to_string()
+                } else {
+                    call.function.arguments.clone()
+                };
+
+                let args: serde_json::Value = match serde_json::from_str(&args_str) {
                     Ok(args) => args,
                     Err(e) => {
                         return (
                             call,
-                            Err(LLMError::InvalidRequest(format!("bad args JSON: {}", e))),
+                            Err(LLMError::InvalidRequest(format!("bad args JSON (input: '{}'): {}", args_str, e))),
                         )
                     }
                 };
 
                 match provider.call_tool(&call.function.name, args).await {
                     Ok(result) => {
-                        log::debug!(
-                            "Tool response: {}",
-                            serde_json::to_string_pretty(&result).unwrap_or_default()
-                        );
-                        {
-                            let result_str = match serde_json::to_string(&result) {
-                                Ok(s) => s,
-                                Err(e) => return (call, Err(LLMError::from(e))),
-                            };
-                            (
-                                call,
-                                Ok(result_str),
-                            )
-                        }
+                        let result_str = match serde_json::to_string(&result) {
+                            Ok(s) => s,
+                            Err(e) => return (call, Err(LLMError::from(e))),
+                        };
+                        (call, Ok(result_str))
                     }
-                    Err(e) => {
-                        log::error!("Error while calling tool: {}", e);
-                        (call, Err(e))
-                    }
+                    Err(e) => (call, Err(e)),
                 }
             });
 
-            let tool_results_from_futures = join_all(tool_futures).await;
-
+            let tool_results_from_futures = {
+                if let Some(mut sp) = spinner.take() {
+                    sp.stop();
+                    print!("\r\x1B[K");
+                }
+                spinner = Some(Spinner::new(
+                    Spinners::Dots12,
+                    "Executing tools...".bright_cyan().to_string(),
+                ));
+                let res = join_all(tool_futures).await;
+                if let Some(mut sp) = spinner.take() {
+                    sp.stop();
+                    print!("\r\x1B[K");
+                }
+                res
+            };
             let tool_results = tool_results_from_futures
                 .into_iter()
                 .map(|(call, result)| {
@@ -201,6 +361,7 @@ pub async fn handle_response(
                         Ok(res_str) => res_str,
                         Err(e) => e.to_string(),
                     };
+                    log::debug!("Tool {} result: {}", call.function.name, tool_res_str);
                     ToolCall {
                         id: call.id.clone(),
                         call_type: "function".to_string(),
@@ -213,24 +374,34 @@ pub async fn handle_response(
                 .collect::<Vec<_>>();
 
             messages.push(ChatMessage::user().tool_result(tool_results).build());
-            let mut sp = Spinner::new(Spinners::Dots12, "Thinking...".bright_magenta().to_string());
-            match provider.chat(&messages).await {
-                Ok(resp) => {
-                    sp.stop();
-                    current_response = resp;
-                }
-                Err(e) => {
-                    sp.stop();
-                    println!("{}", "> Assistant: (no response)".bright_red());
-                    return Err(e);
+
+            // For the next turn, show thinking spinner if not streaming
+            spinner = Some(Spinner::new(
+                Spinners::Dots12,
+                "Thinking...".bright_magenta().to_string(),
+            ));
+            current = unified_chat(messages, provider).await?;
+        } else {
+            if let Some(mut sp) = spinner.take() {
+                sp.stop();
+                print!("\r\x1B[K");
+            }
+            if !is_stream {
+                if !header_printed {
+                    println!(
+                        "{} {}",
+                        "> Assistant:".bright_green(),
+                        text.as_deref().unwrap_or_default()
+                    );
+                } else {
+                    println!("{}", text.as_deref().unwrap_or_default());
                 }
             }
-        } else if let Some(text) = current_response.text() {
-            println!("{} {}", "> Assistant:".bright_green(), text);
-            messages.push(ChatMessage::assistant().content(text).build());
-            break;
-        } else {
-            println!("{}", "> Assistant: (no response)".bright_red());
+            messages.push(
+                ChatMessage::assistant()
+                    .content(text.unwrap_or_default())
+                    .build(),
+            );
             break;
         }
     }
@@ -254,12 +425,8 @@ pub async fn chat_pipe(
     };
 
     let mut messages = process_input(&input, prompt);
-    match provider.chat_with_tools(&messages, provider.tools()).await {
-        Ok(response) => {
-            handle_response(&mut messages, response, provider, tool_config).await?;
-        }
-        Err(e) => eprintln!("Error: {}", e),
-    }
+    let initial = unified_chat(&messages, provider).await?;
+    handle_any_response(&mut messages, initial, provider, tool_config, None).await?;
     Ok(())
 }
 
@@ -310,10 +477,16 @@ pub async fn interactive_loop(
                 messages.push(ChatMessage::user().content(trimmed.to_string()).build());
                 let mut sp =
                     Spinner::new(Spinners::Dots12, "Thinking...".bright_magenta().to_string());
-                match provider.chat(&messages).await {
-                    Ok(response) => {
-                        sp.stop();
-                        handle_response(&mut messages, response, provider, tool_config).await?;
+                match unified_chat(&messages, provider).await {
+                    Ok(initial) => {
+                        handle_any_response(
+                            &mut messages,
+                            initial,
+                            provider,
+                            tool_config,
+                            Some(sp),
+                        )
+                        .await?;
                     }
                     Err(e) => {
                         sp.stop();

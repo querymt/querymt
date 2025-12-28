@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::{error::LLMError, ToolCall, Usage};
+use futures::Stream;
+use std::pin::Pin;
 
 pub mod http;
 
@@ -266,7 +268,6 @@ impl<'de> Deserialize<'de> for ToolChoice {
             where
                 M: MapAccess<'de>,
             {
-                let mut seen_type: Option<String> = None;
                 let mut seen_name: Option<String> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
@@ -279,7 +280,6 @@ impl<'de> Deserialize<'de> for ToolChoice {
                                     &"function",
                                 ));
                             }
-                            seen_type = Some(t);
                         }
                         "function" => {
                             // function is an object with a `name` field
@@ -312,7 +312,7 @@ impl JsonSchema for ToolChoice {
         "ToolChoice".to_string()
     }
 
-    fn json_schema(gen: &mut SchemaGenerator) -> Schema {
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
         // string variant schema
         let mut str_schema = SchemaObject::default();
         str_schema.instance_type = Some(SingleOrVec::Single(Box::new(InstanceType::String)));
@@ -389,19 +389,133 @@ pub trait ChatResponse: std::fmt::Debug + std::fmt::Display + Send {
     fn usage(&self) -> Option<Usage>;
 }
 
-#[async_trait]
-pub trait BasicChatProvider: Sync + Send {
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError>;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamChunk {
+    /// Text content delta
+    Text(String),
+
+    /// Tool use block started (contains tool id and name)
+    ToolUseStart {
+        /// The index of this content block in the response
+        index: usize,
+        /// The unique ID for this tool use
+        id: String,
+        /// The name of the tool being called
+        name: String,
+    },
+
+    /// Tool use input JSON delta (partial JSON string)
+    ToolUseInputDelta {
+        /// The index of this content block
+        index: usize,
+        /// Partial JSON string for the tool input
+        partial_json: String,
+    },
+
+    /// Tool use block complete with assembled ToolCall
+    ToolUseComplete {
+        /// The index of this content block
+        index: usize,
+        /// The complete tool call with id, name, and parsed arguments
+        tool_call: ToolCall,
+    },
+
+    /// Usage metadata containing token counts
+    Usage(Usage),
+
+    /// Stream ended with stop reason
+    Done {
+        /// The reason the stream stopped (e.g., "end_turn", "tool_use")
+        stop_reason: String,
+    },
 }
 
+/// Unified ChatProvider trait that combines all chat capabilities.
+///
+/// This trait provides a single interface for both synchronous and streaming chat interactions,
+/// with or without tool support. Providers can implement the methods they support and rely on
+/// default implementations for others.
+///
+/// # Examples
+///
+/// ## Basic usage without tools
+/// ```rust,ignore
+/// let response = provider.chat(&messages).await?;
+/// ```
+///
+/// ## With tools
+/// ```rust,ignore
+/// let response = provider.chat_with_tools(&messages, Some(&tools)).await?;
+/// ```
+///
+/// ## Streaming
+/// ```rust,ignore
+/// let mut stream = provider.chat_stream(&messages).await?;
+/// while let Some(chunk) = stream.next().await {
+///     // Process chunk
+/// }
+/// ```
 #[async_trait]
-pub trait ToolChatProvider: BasicChatProvider + Sync + Send {
+pub trait ChatProvider: Send + Sync {
+    /// Returns true if the provider supports streaming responses.
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    /// Basic chat interaction without tools.
+    ///
+    /// This is a convenience method that delegates to `chat_with_tools` with `None` for tools.
+    async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
+        self.chat_with_tools(messages, None).await
+    }
+
+    /// Chat interaction with tools.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - The conversation history
+    /// * `tools` - Optional list of tools available to the model. Pass `None` to disable tools
+    ///   for this specific call, even if the provider has tools configured.
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
-        BasicChatProvider::chat(self, messages).await
+        tools: Option<&[Tool]>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError>;
+
+    /// Basic streaming chat interaction.
+    ///
+    /// This is a convenience method that delegates to `chat_stream_with_tools` with `None` for tools.
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
+        self.chat_stream_with_tools(messages, None).await
+    }
+
+    /// Streaming chat interaction with tools.
+    ///
+    /// Returns a stream of `StreamChunk` events which can include text deltas, tool use events,
+    /// and completion signals.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - The conversation history
+    /// * `tools` - Optional list of tools available to the model
+    ///
+    /// # Default Implementation
+    ///
+    /// By default, this returns a `NotImplemented` error. Providers that support streaming
+    /// should override this method.
+    async fn chat_stream_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
+        let _ = (messages, tools);
+        Err(LLMError::NotImplemented(
+            "Streaming with tools not supported by this provider".into(),
+        ))
     }
 }
 

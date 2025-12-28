@@ -39,6 +39,10 @@ pub enum LLMError {
     #[error("HTTP Error: {0}")]
     HttpError(String),
 
+    /// Feature or functionality not implemented by this provider.
+    #[error("Not Implemented: {0}")]
+    NotImplemented(String),
+
     /// Handles JSON serialization and deserialization errors.
     #[error("JSON Error")]
     JsonError(#[from] serde_json::Error),
@@ -52,7 +56,7 @@ pub enum LLMError {
     IoError(#[from] std::io::Error),
 }
 
-#[cfg(feature = "reqwest-client")]
+#[cfg(feature = "http-client")]
 impl From<reqwest::Error> for LLMError {
     fn from(err: reqwest::Error) -> Self {
         LLMError::HttpError(err.to_string())

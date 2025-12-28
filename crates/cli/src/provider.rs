@@ -49,10 +49,13 @@ pub async fn get_provider_registry(args: &CliArgs) -> Result<PluginRegistry, LLM
     let cfg_file = if let Some(cfg) = &args.provider_config {
         PathBuf::from(cfg)
     } else {
-        find_config_in_home(&["providers.json", "providers.toml", "providers.yaml"])
-            .map_err(|_| LLMError::InvalidRequest(
-                "Config file for providers is missing. Please provide one!".to_string(),
-            ))?
+        find_config_in_home(&["providers.json", "providers.toml", "providers.yaml"]).map_err(
+            |_| {
+                LLMError::InvalidRequest(
+                    "Config file for providers is missing. Please provide one!".to_string(),
+                )
+            },
+        )?
     };
 
     let mut registry = PluginRegistry::from_path(cfg_file)?;

@@ -5,7 +5,8 @@
 use http::{Request, Response};
 use querymt::{
     chat::{
-        http::HTTPChatProvider, ChatMessage, ChatResponse, StructuredOutputFormat, Tool, ToolChoice,
+        http::HTTPChatProvider, ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat,
+        Tool, ToolChoice,
     },
     completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
@@ -18,6 +19,8 @@ use querymt::{
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use url::Url;
 
 /// Client for interacting with OpenAI's API.
@@ -46,11 +49,20 @@ pub struct OpenAI {
     pub reasoning_effort: Option<String>,
     /// JSON schema for structured output
     pub json_schema: Option<StructuredOutputFormat>,
+    /// Internal buffer for streaming tool state (not serialized)
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[serde(default = "OpenAI::default_tool_state_buffer")]
+    pub tool_state_buffer: Arc<Mutex<HashMap<usize, api::OpenAIToolUseState>>>,
 }
 
 impl OpenAI {
     fn default_base_url() -> Url {
         Url::parse("https://api.openai.com/v1/").unwrap()
+    }
+
+    fn default_tool_state_buffer() -> Arc<Mutex<HashMap<usize, api::OpenAIToolUseState>>> {
+        Arc::new(Mutex::new(HashMap::new()))
     }
 }
 
@@ -133,6 +145,15 @@ impl HTTPChatProvider for OpenAI {
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         Ok(api::openai_parse_chat(self, response)?)
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn parse_chat_stream_chunk(&self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+        let mut tool_states = self.tool_state_buffer.lock().unwrap();
+        api::parse_openai_sse_chunk(chunk, &mut tool_states)
     }
 }
 

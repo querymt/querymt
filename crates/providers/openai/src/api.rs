@@ -5,7 +5,8 @@ use http::{
 };
 use querymt::{
     chat::{
-        ChatMessage, ChatResponse, ChatRole, MessageType, StructuredOutputFormat, Tool, ToolChoice,
+        ChatMessage, ChatResponse, ChatRole, MessageType, StreamChunk, StructuredOutputFormat,
+        Tool, ToolChoice,
     },
     error::LLMError,
     handle_http_error, FunctionCall, ToolCall, Usage,
@@ -16,6 +17,7 @@ use schemars::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use url::Url;
 
 pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
@@ -544,4 +546,217 @@ pub fn openai_parse_list_models(response: &Response<Vec<u8>>) -> Result<Vec<Stri
         .collect();
 
     Ok(names)
+}
+
+// ============================================================================
+// Streaming Support
+// ============================================================================
+
+/// Streaming response chunk from OpenAI's API
+#[derive(Deserialize, Debug)]
+pub struct OpenAIStreamChunk {
+    pub choices: Vec<OpenAIStreamChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+/// Individual choice in a streaming response
+#[derive(Deserialize, Debug)]
+pub struct OpenAIStreamChoice {
+    pub index: usize,
+    pub delta: OpenAIStreamDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+/// Delta content in a streaming response
+#[derive(Deserialize, Debug)]
+pub struct OpenAIStreamDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OpenAIStreamToolCall>>,
+}
+
+/// Tool call in a streaming response (fields are optional for incremental updates)
+#[derive(Deserialize, Debug)]
+pub struct OpenAIStreamToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<String>,
+    pub function: OpenAIStreamFunction,
+}
+
+/// Function call in a streaming response
+#[derive(Deserialize, Debug)]
+pub struct OpenAIStreamFunction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Arguments are always present but may be an empty string
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// State for tracking incremental tool call assembly
+#[derive(Default, Debug)]
+pub struct OpenAIToolUseState {
+    pub id: String,
+    pub name: String,
+    pub arguments_buffer: String,
+    pub started: bool,
+}
+
+/// Parse an OpenAI SSE chunk into StreamChunk events
+pub fn parse_openai_sse_chunk(
+    chunk: &[u8],
+    tool_states: &mut HashMap<usize, OpenAIToolUseState>,
+) -> Result<Vec<StreamChunk>, LLMError> {
+    // Skip empty chunks
+    if chunk.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let text = String::from_utf8_lossy(chunk);
+    let mut results = Vec::new();
+    let mut done_emitted = false;
+
+    for line in text.lines() {
+        // Stop processing if we've already emitted Done
+        if done_emitted {
+            break;
+        }
+
+        let line = line.trim();
+
+        // Skip empty lines
+        if line.is_empty() {
+            continue;
+        }
+
+        // Extract SSE data payload
+        let data = match line.strip_prefix("data: ") {
+            Some(d) => d,
+            None => continue, // Skip non-data lines
+        };
+
+        // Handle stream end
+        if data == "[DONE]" {
+            // Emit remaining tool completions
+            for (index, state) in tool_states.drain() {
+                if state.started {
+                    results.push(StreamChunk::ToolUseComplete {
+                        index,
+                        tool_call: ToolCall {
+                            id: state.id,
+                            call_type: "function".to_string(),
+                            function: FunctionCall {
+                                name: state.name,
+                                arguments: state.arguments_buffer,
+                            },
+                        },
+                    });
+                }
+            }
+            results.push(StreamChunk::Done {
+                stop_reason: "end_turn".to_string(),
+            });
+            done_emitted = true;
+            continue;
+        }
+
+        // Parse JSON chunk
+        let stream_chunk: OpenAIStreamChunk =
+            serde_json::from_str(data).map_err(|e| LLMError::ResponseFormatError {
+                message: format!("Failed to parse OpenAI stream chunk: {}", e),
+                raw_response: data.to_string(),
+            })?;
+
+        // Process each choice
+        for choice in &stream_chunk.choices {
+            // Handle text content
+            if let Some(content) = &choice.delta.content {
+                if !content.is_empty() {
+                    results.push(StreamChunk::Text(content.clone()));
+                }
+            }
+
+            // Handle tool calls
+            if let Some(tool_calls) = &choice.delta.tool_calls {
+                for tc in tool_calls {
+                    let index = tc.index.unwrap_or(0);
+                    let state = tool_states.entry(index).or_default();
+
+                    // First chunk: has id and name
+                    if let Some(id) = &tc.id {
+                        state.id = id.clone();
+                    }
+                    if let Some(name) = &tc.function.name {
+                        state.name = name.clone();
+
+                        // Emit ToolUseStart on first occurrence
+                        if !state.started {
+                            state.started = true;
+                            results.push(StreamChunk::ToolUseStart {
+                                index,
+                                id: state.id.clone(),
+                                name: state.name.clone(),
+                            });
+                        }
+                    }
+
+                    // Accumulate arguments
+                    if !tc.function.arguments.is_empty() {
+                        state.arguments_buffer.push_str(&tc.function.arguments);
+                        results.push(StreamChunk::ToolUseInputDelta {
+                            index,
+                            partial_json: tc.function.arguments.clone(),
+                        });
+                    }
+                }
+            }
+
+            // Handle finish_reason
+            if let Some(finish_reason) = &choice.finish_reason {
+                // Emit tool completions before done
+                for (index, state) in tool_states.drain() {
+                    if state.started {
+                        results.push(StreamChunk::ToolUseComplete {
+                            index,
+                            tool_call: ToolCall {
+                                id: state.id,
+                                call_type: "function".to_string(),
+                                function: FunctionCall {
+                                    name: state.name,
+                                    arguments: state.arguments_buffer,
+                                },
+                            },
+                        });
+                    }
+                }
+
+                // Map finish_reason to unified stop_reason
+                let stop_reason = match finish_reason.as_str() {
+                    "tool_calls" => "tool_use",
+                    "stop" => "end_turn",
+                    "length" => "max_tokens",
+                    other => other,
+                };
+
+                results.push(StreamChunk::Done {
+                    stop_reason: stop_reason.to_string(),
+                });
+                done_emitted = true;
+            }
+        }
+
+        // Handle usage metadata (typically in final chunk)
+        if let Some(usage) = stream_chunk.usage {
+            results.push(StreamChunk::Usage(usage));
+        }
+    }
+
+    Ok(results)
 }

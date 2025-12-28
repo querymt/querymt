@@ -1,6 +1,6 @@
 [package]
 name = "querymt-extism-macros"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -9,3 +9,4 @@ http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 extism-pdk.workspace = true
+http-serde-ext.workspace = true

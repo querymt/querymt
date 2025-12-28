@@ -260,7 +260,10 @@ pub fn clear_prev_lines(n: u16) {
 /// Parse server and tool names for proxied servers
 /// If proxied through `hyper-mcp`, it uses scoped tools separated by `::` (e.g., "server::tool").
 /// Returns Some((effective_server, effective_tool)) or None if invalid format
-pub fn parse_tool_names<'a>(server_name: &'a str, tool_name: &'a str) -> Option<(&'a str, &'a str)> {
+pub fn parse_tool_names<'a>(
+    server_name: &'a str,
+    tool_name: &'a str,
+) -> Option<(&'a str, &'a str)> {
     match server_name {
         "hyper-mcp" => {
             let parts: Vec<&str> = tool_name.split("::").collect();
@@ -303,7 +306,10 @@ impl ToolLoadingStats {
     pub fn log_summary(&self) {
         log::info!(
             "MCP tools loaded: {} servers, {} total tools ({} enabled, {} disabled)",
-            self.total_servers, self.total_tools, self.enabled_tools, self.disabled_tools
+            self.total_servers,
+            self.total_tools,
+            self.enabled_tools,
+            self.disabled_tools
         );
     }
 }

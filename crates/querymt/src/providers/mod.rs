@@ -9,4 +9,3 @@ pub use types::{
     Modalities, ModelCapabilities, ModelConstraints, ModelInfo, ModelPricing, ProviderInfo,
     ProvidersRegistry,
 };
-

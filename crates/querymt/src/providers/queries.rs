@@ -42,4 +42,3 @@ impl ProvidersRegistry {
         self.get_model(provider, model).map(|m| &m.capabilities)
     }
 }
-

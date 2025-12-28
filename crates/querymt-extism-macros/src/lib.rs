@@ -1,22 +1,74 @@
 use extism_pdk::*;
+use serde::{Deserialize, Serialize};
 
-pub fn to_pdk_request(req: &::http::Request<Vec<u8>>) -> HttpRequest {
-    let mut p = HttpRequest::new(req.uri().to_string()).with_method(req.method().as_str());
-    for (k, v) in req.headers().iter() {
-        let v = v.to_str().unwrap_or_default();
-        p = p.with_header(k.as_str(), v);
-    }
-    p
+// Import base serializable types from querymt
+use querymt::plugin::extism_impl::{
+    SerializableHttpRequest as BaseHttpRequest, SerializableHttpResponse as BaseHttpResponse,
+};
+
+// Create plugin-side wrappers that implement ToBytes/FromBytes
+#[derive(Serialize, Deserialize, ToBytes, FromBytes, Clone)]
+#[encoding(Json)]
+pub struct HttpRequest(pub BaseHttpRequest);
+
+#[derive(Serialize, Deserialize, ToBytes, FromBytes, Clone)]
+#[encoding(Json)]
+pub struct HttpResponse(pub BaseHttpResponse);
+
+// Declare the custom host function
+#[host_fn("extism:host/user")]
+extern "ExtismHost" {
+    fn qmt_http_request(req: HttpRequest) -> HttpResponse;
+    fn qmt_http_stream_open(req: HttpRequest) -> Json<i64>;
+    fn qmt_http_stream_next(stream_id: Json<i64>) -> Vec<u8>;
+    fn qmt_http_stream_close(stream_id: Json<i64>);
+    fn qmt_yield_chunk(chunk: Vec<u8>);
 }
 
-pub fn http_response_to_native(resp: HttpResponse) -> ::http::Response<Vec<u8>> {
-    let status = resp.status_code();
-    let body = resp.body(); // clones the bytes out of Wasm memory
-    let mut builder = ::http::Response::builder().status(status);
-    for (k, v) in resp.headers().iter() {
-        builder = builder.header(k.as_str(), v.as_str());
+/// Call custom qmt_http_request host function using http-serde-ext
+pub fn qmt_http_request_wrapper(
+    req: &::http::Request<Vec<u8>>,
+) -> Result<::http::Response<Vec<u8>>, Error> {
+    // Wrap request in serializable types
+    let ser_req = BaseHttpRequest { req: req.clone() };
+    let wrapped_req = HttpRequest(ser_req);
+
+    // Call host function
+    let wrapped_resp = unsafe { qmt_http_request(wrapped_req)? };
+
+    // Extract the response
+    Ok(wrapped_resp.0.resp)
+}
+
+/// Open an HTTP stream using the host function
+pub fn qmt_http_stream_open_wrapper(req: &::http::Request<Vec<u8>>) -> Result<Json<i64>, Error> {
+    let ser_req = BaseHttpRequest { req: req.clone() };
+    let wrapped_req = HttpRequest(ser_req);
+    unsafe { qmt_http_stream_open(wrapped_req) }
+    //    Ok(x?.0)
+}
+
+/// Get the next chunk from an HTTP stream
+pub fn qmt_http_stream_next_wrapper(stream_id: i64) -> Result<Option<Vec<u8>>, Error> {
+    let res = unsafe { qmt_http_stream_next(Json(stream_id))? };
+    if res.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(res))
     }
-    builder.body(body).expect("failed to build http::Response")
+}
+
+/// Close an HTTP stream
+pub fn qmt_http_stream_close_wrapper(stream_id: i64) -> Result<(), Error> {
+    unsafe { qmt_http_stream_close(Json(stream_id)) }
+}
+
+/// Yield a chat chunk back to the host
+pub fn qmt_yield_chunk_wrapper(
+    chunk: &querymt::plugin::extism_impl::ExtismChatChunk,
+) -> Result<(), Error> {
+    let bytes = serde_json::to_vec(chunk).map_err(|e| Error::msg(e.to_string()))?;
+    unsafe { qmt_yield_chunk(bytes) }
 }
 
 /// Macro to generate all the Extism exports for an HTTP‐based LLM plugin
@@ -41,12 +93,17 @@ macro_rules! impl_extism_http_plugin {
             },
         };
         use serde_json::Value;
-        use $crate::{http_response_to_native, to_pdk_request};
+        use $crate::qmt_http_request_wrapper;
 
         // Export the factory name
         #[plugin_fn]
         pub fn name() -> FnResult<String> {
             Ok($name.to_string())
+        }
+
+        #[plugin_fn]
+        pub fn supports_streaming(Json(cfg): Json<$Config>) -> FnResult<Json<bool>> {
+            Ok(Json(cfg.supports_streaming()))
         }
 
         // Export the API key env var name
@@ -77,11 +134,8 @@ macro_rules! impl_extism_http_plugin {
         pub fn list_models(cfg: Json<Value>) -> FnResult<Json<Vec<String>>> {
             let req = HTTPLLMProviderFactory::list_models_request(&$Factory, &cfg.0)
                 .map_err(PdkError::new)?;
-            let pdk_req = to_pdk_request(&req);
-            let resp: extism_pdk::http::HttpResponse =
-                extism_pdk::http::request(&pdk_req, Some(req.body()))?;
+            let native_resp = qmt_http_request_wrapper(&req)?;
 
-            let native_resp = http_response_to_native(resp);
             let models = HTTPLLMProviderFactory::parse_list_models(&$Factory, native_resp)
                 .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
             Ok(Json(models))
@@ -96,17 +150,96 @@ macro_rules! impl_extism_http_plugin {
                 .cfg
                 .chat_request(&input.messages, input.tools.as_deref())
                 .map_err(PdkError::new)?;
-            let pdk_req = to_pdk_request(&req);
-            let resp: extism_pdk::http::HttpResponse =
-                extism_pdk::http::request(&pdk_req, Some(req.body()))?;
+            let native_resp = qmt_http_request_wrapper(&req)?;
 
-            let native_resp = http_response_to_native(resp);
             let chat_response = input
                 .cfg
                 .parse_chat(native_resp)
                 .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
             let dto: ExtismChatResponse = chat_response.into();
             Ok(Json(dto))
+        }
+
+        // chat_stream wrapper (wireframe implementation)
+        #[plugin_fn]
+        pub fn chat_stream(Json(input): Json<ExtismChatRequest<$Config>>) -> FnResult<()> {
+            use querymt::chat::StreamChunk;
+            use querymt::plugin::extism_impl::ExtismChatChunk;
+            use $crate::{
+                qmt_http_stream_close_wrapper, qmt_http_stream_next_wrapper,
+                qmt_http_stream_open_wrapper, qmt_yield_chunk_wrapper,
+            };
+
+            let req = input
+                .cfg
+                .chat_request(&input.messages, input.tools.as_deref())
+                .map_err(PdkError::new)?;
+
+            let stream_id = qmt_http_stream_open_wrapper(&req)?.0;
+
+            let mut buffer = Vec::new();
+            let mut done_received = false;
+
+            while let Some(raw_chunk) = qmt_http_stream_next_wrapper(stream_id)? {
+                buffer.extend_from_slice(&raw_chunk);
+
+                // Process complete lines from the buffer
+                if let Some(last_newline_pos) = buffer.iter().rposition(|&b| b == b'\n') {
+                    let to_process = &buffer[..=last_newline_pos];
+                    let chunks = input.cfg.parse_chat_stream_chunk(to_process).map_err(|e| {
+                        PdkError::msg(format!("parse_chat_stream_chunk failed: {}", e))
+                    })?;
+
+                    for chunk in chunks.iter() {
+                        // Extract usage if this is a Usage chunk
+                        let usage_to_send = match &chunk {
+                            StreamChunk::Usage(usage) => Some(usage.clone()),
+                            _ => None,
+                        };
+
+                        qmt_yield_chunk_wrapper(&ExtismChatChunk {
+                            chunk: chunk.clone(),
+                            usage: usage_to_send,
+                        })?;
+
+                        // Check for Done AFTER yielding it
+                        if matches!(chunk, StreamChunk::Done { .. }) {
+                            done_received = true;
+                            break; // Stop yielding more chunks after Done
+                        }
+                    }
+                    buffer.drain(..=last_newline_pos);
+                }
+
+                if done_received {
+                    break;
+                }
+            }
+
+            // Process any remaining data in the buffer after the stream ends
+            if !buffer.is_empty() && !done_received {
+                let chunks = input.cfg.parse_chat_stream_chunk(&buffer).map_err(|e| {
+                    PdkError::msg(format!(
+                        "parse_chat_stream_chunk failed on remaining buffer: {}",
+                        e
+                    ))
+                })?;
+
+                for chunk in chunks {
+                    // Extract usage if this is a Usage chunk
+                    let usage_to_send = match &chunk {
+                        StreamChunk::Usage(usage) => Some(usage.clone()),
+                        _ => None,
+                    };
+                    qmt_yield_chunk_wrapper(&ExtismChatChunk {
+                        chunk,
+                        usage: usage_to_send,
+                    })?;
+                }
+            }
+
+            qmt_http_stream_close_wrapper(stream_id)?;
+            Ok(())
         }
 
         // embed wrapper
@@ -118,11 +251,8 @@ macro_rules! impl_extism_http_plugin {
                 .cfg
                 .embed_request(&input.inputs)
                 .map_err(PdkError::new)?;
-            let pdk_req = to_pdk_request(&req);
-            let resp: extism_pdk::http::HttpResponse =
-                extism_pdk::http::request(&pdk_req, Some(req.body()))?;
+            let native_resp = qmt_http_request_wrapper(&req)?;
 
-            let native_resp = http_response_to_native(resp);
             let embed_response = input
                 .cfg
                 .parse_embed(native_resp)
@@ -138,11 +268,8 @@ macro_rules! impl_extism_http_plugin {
                 .cfg
                 .complete_request(&input.req)
                 .map_err(PdkError::new)?;
-            let pdk_req = to_pdk_request(&req);
-            let resp: extism_pdk::http::HttpResponse =
-                extism_pdk::http::request(&pdk_req, Some(req.body()))?;
+            let native_resp = qmt_http_request_wrapper(&req)?;
 
-            let native_resp = http_response_to_native(resp);
             let complete_response = input
                 .cfg
                 .parse_complete(native_resp)
