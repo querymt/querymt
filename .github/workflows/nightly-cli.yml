@@ -135,9 +135,17 @@ jobs:
           pattern: ${{ env.APP_NAME }}-*
           merge-multiple: true
 
-      # This step creates or updates a single "Nightly" pre-release.
-      # It will overwrite existing assets with new builds.
-      - name: Create or Update Nightly Release
+      # Delete the existing nightly tag and release to ensure fresh artifacts
+      # and updated source archives on each run.
+      - name: Delete existing nightly release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --yes --cleanup-tag || true
+
+      # This step creates a fresh "Nightly" pre-release.
+      - name: Create Nightly Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly
