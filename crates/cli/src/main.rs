@@ -11,6 +11,7 @@ use std::fs;
 use std::io::{self, IsTerminal};
 use tokio;
 
+mod auth;
 mod chat;
 mod cli_args;
 mod embed;
@@ -20,7 +21,7 @@ mod tracing;
 mod utils;
 
 use chat::{chat_pipe, interactive_loop};
-use cli_args::{CliArgs, Commands, ToolConfig, ToolPolicyState};
+use cli_args::{AuthCommands, CliArgs, Commands, SecretsCommands, ToolConfig, ToolPolicyState};
 use embed::embed_pipe;
 use provider::{get_api_key, get_provider_info, get_provider_registry, split_provider};
 use secret_store::SecretStore;
@@ -107,26 +108,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(cmd) = &args.command {
         match cmd {
-            Commands::Set { key, value } => {
-                let mut store = SecretStore::new()?;
-                store.set(key, value)?;
-                println!("{} Secret '{}' has been set.", "✓".bright_green(), key);
-                return Ok(());
-            }
-            Commands::Get { key } => {
-                let store = SecretStore::new()?;
-                match store.get(key) {
-                    Some(val) => println!("{}: {}", key, val),
-                    None => println!("{} Secret '{}' not found", "!".bright_yellow(), key),
+            Commands::Secrets { command } => match command {
+                SecretsCommands::Set { key, value } => {
+                    let mut store = SecretStore::new()?;
+                    store.set(key, value)?;
+                    println!("{} Secret '{}' has been set.", "✓".bright_green(), key);
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            Commands::Delete { key } => {
-                let mut store = SecretStore::new()?;
-                store.delete(key)?;
-                println!("{} Secret '{}' has been deleted.", "✓".bright_green(), key);
-                return Ok(());
-            }
+                SecretsCommands::Get { key } => {
+                    let store = SecretStore::new()?;
+                    match store.get(key) {
+                        Some(val) => println!("{}: {}", key, val),
+                        None => println!("{} Secret '{}' not found", "!".bright_yellow(), key),
+                    }
+                    return Ok(());
+                }
+                SecretsCommands::Delete { key } => {
+                    let mut store = SecretStore::new()?;
+                    store.delete(key)?;
+                    println!("{} Secret '{}' has been deleted.", "✓".bright_green(), key);
+                    return Ok(());
+                }
+            },
             Commands::Providers => {
                 for factory in registry.list() {
                     println!("- {}", factory.name());
@@ -198,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(m) = opt_model {
                     builder = builder.model(m);
                 }
-                if let Some(key) = get_api_key(&prov_name, &args, &registry) {
+                if let Some(key) = get_api_key(&prov_name, &args, &registry).await {
                     builder = builder.api_key(key);
                 }
                 if let Some(url) = &args.base_url {
@@ -257,6 +260,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", "Update check complete.".bright_blue());
                 return Ok(());
             }
+            Commands::Auth { command } => match command {
+                AuthCommands::Login { provider, mode } => {
+                    let oauth_provider = match auth::get_oauth_provider(provider, Some(mode)) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("{} {}", "Error:".bright_red(), e);
+                            return Ok(());
+                        }
+                    };
+
+                    let mut store = SecretStore::new()?;
+                    auth::authenticate(oauth_provider.as_ref(), &mut store).await?;
+                    return Ok(());
+                }
+                AuthCommands::Logout { provider } => {
+                    // Verify the provider supports OAuth
+                    if auth::get_oauth_provider(provider, None).is_err() {
+                        eprintln!(
+                            "{} Provider '{}' does not support OAuth",
+                            "Error:".bright_red(),
+                            provider
+                        );
+                        return Ok(());
+                    }
+
+                    let mut store = SecretStore::new()?;
+                    store.delete_oauth_tokens(provider)?;
+                    println!(
+                        "{} Logged out from {}",
+                        "✓".bright_green(),
+                        provider.bright_cyan()
+                    );
+                    return Ok(());
+                }
+                AuthCommands::Status { provider } => {
+                    let store = SecretStore::new()?;
+                    auth::show_auth_status(&store, provider.as_deref())?;
+                    return Ok(());
+                }
+            },
             // This command is handled before the match statement
             Commands::Completion { .. } => unreachable!(),
         }
@@ -271,7 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(sys) = &args.system {
         builder = builder.system(sys.clone());
     }
-    if let Some(key) = get_api_key(&prov_name, &args, &registry) {
+    if let Some(key) = get_api_key(&prov_name, &args, &registry).await {
         builder = builder.api_key(key);
     }
     if let Some(url) = &args.base_url {

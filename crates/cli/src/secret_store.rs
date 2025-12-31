@@ -1,74 +1,26 @@
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use anthropic_auth::TokenSet;
+use keyring::Entry;
+use std::io;
+use std::time::SystemTime;
 
 /// Key used to store the default provider in the secret store
 const DEFAULT_PROVIDER_KEY: &str = "default";
+const SERVICE_NAME: &str = "querymt-cli";
 
-/// A secure storage for API keys and other sensitive information
+/// A secure storage for API keys and other sensitive information using system keyring
 #[derive(Debug)]
 pub struct SecretStore {
-    /// Map of secret keys to their values
-    secrets: HashMap<String, String>,
-    /// Path to the secrets file
-    file_path: PathBuf,
+    // We no longer need to store secrets in memory or files
 }
 
 impl SecretStore {
     /// Creates a new SecretStore instance
     ///
-    /// Initializes the store with the default path (~/.llm/secrets.json)
-    /// and loads any existing secrets from the file.
-    ///
     /// # Returns
     ///
     /// * `io::Result<Self>` - A new SecretStore instance or an IO error
     pub fn new() -> io::Result<Self> {
-        let home_dir = dirs::home_dir().expect("Could not find home directory");
-        let file_path = home_dir.join(".qmt").join("secrets.json");
-
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let mut store = SecretStore {
-            secrets: HashMap::new(),
-            file_path,
-        };
-
-        store.load()?;
-        Ok(store)
-    }
-
-    /// Loads secrets from the file system
-    ///
-    /// # Returns
-    ///
-    /// * `io::Result<()>` - Success or an IO error
-    fn load(&mut self) -> io::Result<()> {
-        match File::open(&self.file_path) {
-            Ok(mut file) => {
-                let mut contents = String::new();
-                file.read_to_string(&mut contents)?;
-                self.secrets = serde_json::from_str(&contents).unwrap_or_default();
-                Ok(())
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Saves the current secrets to the file system
-    ///
-    /// # Returns
-    ///
-    /// * `io::Result<()>` - Success or an IO error
-    fn save(&self) -> io::Result<()> {
-        let contents = serde_json::to_string_pretty(&self.secrets)?;
-        let mut file = File::create(&self.file_path)?;
-        file.write_all(contents.as_bytes())?;
-        Ok(())
+        Ok(SecretStore {})
     }
 
     /// Sets a secret value for the given key
@@ -82,8 +34,15 @@ impl SecretStore {
     ///
     /// * `io::Result<()>` - Success or an IO error
     pub fn set(&mut self, key: impl Into<String>, value: impl Into<String>) -> io::Result<()> {
-        self.secrets.insert(key.into(), value.into());
-        self.save()
+        let key = key.into();
+        let value = value.into();
+
+        let entry = Entry::new(SERVICE_NAME, &key)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        entry
+            .set_password(&value)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 
     /// Retrieves a secret value for the given key
@@ -94,9 +53,10 @@ impl SecretStore {
     ///
     /// # Returns
     ///
-    /// * `Option<&String>` - The secret value if found, or None
-    pub fn get(&self, key: &str) -> Option<&String> {
-        self.secrets.get(key)
+    /// * `Option<String>` - The secret value if found, or None
+    pub fn get(&self, key: &str) -> Option<String> {
+        let entry = Entry::new(SERVICE_NAME, key).ok()?;
+        entry.get_password().ok()
     }
 
     /// Deletes a secret with the given key
@@ -109,8 +69,12 @@ impl SecretStore {
     ///
     /// * `io::Result<()>` - Success or an IO error
     pub fn delete(&mut self, key: &str) -> io::Result<()> {
-        self.secrets.remove(key);
-        self.save()
+        let entry = Entry::new(SERVICE_NAME, key)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        entry
+            .delete_credential()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 
     /// Sets the default provider for LLM interactions
@@ -123,18 +87,16 @@ impl SecretStore {
     ///
     /// * `io::Result<()>` - Success or an IO error
     pub fn set_default_provider(&mut self, provider: &str) -> io::Result<()> {
-        self.secrets
-            .insert(DEFAULT_PROVIDER_KEY.to_string(), provider.to_string());
-        self.save()
+        self.set(DEFAULT_PROVIDER_KEY, provider)
     }
 
     /// Retrieves the default provider for LLM interactions
     ///
     /// # Returns
     ///
-    /// * `Option<&String>` - The default provider if set, or None
-    pub fn get_default_provider(&self) -> Option<&String> {
-        self.secrets.get(DEFAULT_PROVIDER_KEY)
+    /// * `Option<String>` - The default provider if set, or None
+    pub fn get_default_provider(&self) -> Option<String> {
+        self.get(DEFAULT_PROVIDER_KEY)
     }
 
     /// Deletes the default provider setting
@@ -143,7 +105,114 @@ impl SecretStore {
     ///
     /// * `io::Result<()>` - Success or an IO error
     pub fn delete_default_provider(&mut self) -> io::Result<()> {
-        self.secrets.remove(DEFAULT_PROVIDER_KEY);
-        self.save()
+        self.delete(DEFAULT_PROVIDER_KEY)
+    }
+
+    /// Sets OAuth tokens for a provider
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The provider name
+    /// * `tokens` - The OAuth token set
+    ///
+    /// # Returns
+    ///
+    /// * `io::Result<()>` - Success or an IO error
+    pub fn set_oauth_tokens(&mut self, provider: &str, tokens: &TokenSet) -> io::Result<()> {
+        let tokens_json = serde_json::to_string(tokens)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        self.set(format!("oauth_{}", provider), tokens_json)
+    }
+
+    /// Retrieves OAuth tokens for a provider
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The provider name
+    ///
+    /// # Returns
+    ///
+    /// * `Option<TokenSet>` - The OAuth token set if found, or None
+    pub fn get_oauth_tokens(&self, provider: &str) -> Option<TokenSet> {
+        let tokens_json = self.get(&format!("oauth_{}", provider))?;
+        serde_json::from_str(&tokens_json).ok()
+    }
+
+    /// Deletes OAuth tokens for a provider
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The provider name
+    ///
+    /// # Returns
+    ///
+    /// * `io::Result<()>` - Success or an IO error
+    pub fn delete_oauth_tokens(&mut self, provider: &str) -> io::Result<()> {
+        self.delete(&format!("oauth_{}", provider))
+    }
+
+    /// Checks if OAuth tokens are expired
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The provider name
+    ///
+    /// # Returns
+    ///
+    /// * `bool` - True if tokens are expired or not found, false otherwise
+    pub fn are_tokens_expired(&self, provider: &str) -> bool {
+        if let Some(tokens) = self.get_oauth_tokens(provider) {
+            tokens.is_expired()
+        } else {
+            true
+        }
+    }
+
+    /// Gets the access token for a provider, returning None if expired
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The provider name
+    ///
+    /// # Returns
+    ///
+    /// * `Option<String>` - The access token if valid, or None if expired/missing
+    pub fn get_valid_access_token(&self, provider: &str) -> Option<String> {
+        let tokens = self.get_oauth_tokens(provider)?;
+        if tokens.is_expired() {
+            None
+        } else {
+            Some(tokens.access_token)
+        }
+    }
+
+    /// Gets the refresh token for a provider
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The provider name
+    ///
+    /// # Returns
+    ///
+    /// * `Option<String>` - The refresh token if found, or None
+    pub fn get_refresh_token(&self, provider: &str) -> Option<String> {
+        let tokens = self.get_oauth_tokens(provider)?;
+        Some(tokens.refresh_token.clone())
+    }
+}
+
+/// Helper to format timestamp for display
+pub fn format_timestamp(timestamp: u64) -> String {
+    let duration = std::time::Duration::from_secs(timestamp);
+    let datetime = SystemTime::UNIX_EPOCH + duration;
+
+    match datetime.duration_since(SystemTime::now()) {
+        Ok(remaining) => {
+            let hours = remaining.as_secs() / 3600;
+            let minutes = (remaining.as_secs() % 3600) / 60;
+            format!("in {}h {}m", hours, minutes)
+        }
+        Err(_) => "expired".to_string(),
     }
 }

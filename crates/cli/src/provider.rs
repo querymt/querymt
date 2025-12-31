@@ -23,22 +23,49 @@ pub fn get_provider_info(args: &CliArgs) -> Option<(String, Option<String>)> {
     }
     if let Ok(store) = SecretStore::new() {
         if let Some(default) = store.get_default_provider() {
-            return Some(split_provider(default));
+            return Some(split_provider(&default));
         }
     }
     None
 }
 
-/// Try to resolve an API key from CLI args, secret store, or environment
-pub fn get_api_key(provider: &str, args: &CliArgs, registry: &PluginRegistry) -> Option<String> {
-    args.api_key.clone().or_else(|| {
-        registry.get(provider).and_then(|factory| {
-            factory.as_http()?.api_key_name().and_then(|name| {
-                SecretStore::new()
-                    .ok()
-                    .and_then(|store| store.get(&name).cloned())
-                    .or_else(|| std::env::var(name).ok())
-            })
+/// Try to resolve an API key from CLI args, OAuth tokens, secret store, or environment
+///
+/// Priority order:
+/// 1. CLI args (--api-key)
+/// 2. OAuth tokens (if provider supports OAuth and tokens are valid)
+/// 3. Secret store (API key)
+/// 4. Environment variable
+pub async fn get_api_key(
+    provider: &str,
+    args: &CliArgs,
+    registry: &PluginRegistry,
+) -> Option<String> {
+    // 1. Check CLI args first (highest priority)
+    if let Some(key) = &args.api_key {
+        return Some(key.clone());
+    }
+
+    // 2. Check for OAuth tokens (prefer OAuth over API keys)
+    if let Ok(oauth_provider) = crate::auth::get_oauth_provider(provider, None) {
+        if let Ok(mut store) = SecretStore::new() {
+            // Try to get a valid OAuth token (will refresh if needed)
+            if let Ok(token) =
+                crate::auth::get_valid_token(oauth_provider.as_ref(), &mut store).await
+            {
+                log::debug!("Using OAuth token for {}", provider);
+                return Some(token);
+            }
+        }
+    }
+
+    // 3. Fall back to API key from secret store or environment
+    registry.get(provider).and_then(|factory| {
+        factory.as_http()?.api_key_name().and_then(|name| {
+            SecretStore::new()
+                .ok()
+                .and_then(|store| store.get(&name))
+                .or_else(|| std::env::var(name).ok())
         })
     })
 }

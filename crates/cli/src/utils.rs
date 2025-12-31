@@ -43,7 +43,6 @@ pub fn get_provider_api_key<P: HTTPLLMProviderFactory + ?Sized>(provider: &P) ->
     let api_key_name = provider.api_key_name()?;
     store
         .get(&api_key_name)
-        .cloned()
         .or_else(|| std::env::var(api_key_name).ok())
 }
 
