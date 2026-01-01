@@ -93,6 +93,76 @@ impl OAuthProvider for AnthropicProvider {
     }
 }
 
+/// OpenAI OAuth provider implementation
+pub struct OpenAIProvider;
+
+impl OpenAIProvider {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait::async_trait]
+impl OAuthProvider for OpenAIProvider {
+    fn name(&self) -> &str {
+        "openai"
+    }
+
+    fn display_name(&self) -> &str {
+        "OpenAI"
+    }
+
+    async fn start_flow(&self) -> Result<OAuthFlowData> {
+        use openai_auth::{OAuthClient as OpenAIOAuthClient, OAuthConfig as OpenAIOAuthConfig};
+
+        let client = OpenAIOAuthClient::new(OpenAIOAuthConfig::default())?;
+        let flow = client.start_flow()?;
+
+        Ok(OAuthFlowData {
+            authorization_url: flow.authorization_url,
+            state: flow.state,
+            verifier: flow.pkce_verifier, // Note: OpenAI uses 'pkce_verifier'
+        })
+    }
+
+    async fn exchange_code(&self, code: &str, _state: &str, verifier: &str) -> Result<TokenSet> {
+        use openai_auth::{OAuthClient as OpenAIOAuthClient, OAuthConfig as OpenAIOAuthConfig};
+
+        let client = OpenAIOAuthClient::new(OpenAIOAuthConfig::default())?;
+        let tokens = client.exchange_code(code, verifier).await?;
+
+        // Convert openai_auth::TokenSet to anthropic_auth::TokenSet
+        // They have identical structure, so we can serialize/deserialize
+        let json = serde_json::to_string(&tokens)
+            .map_err(|e| anyhow!("Failed to serialize OpenAI tokens: {}", e))?;
+        Ok(serde_json::from_str(&json)
+            .map_err(|e| anyhow!("Failed to deserialize OpenAI tokens: {}", e))?)
+    }
+
+    async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
+        use openai_auth::{OAuthClient as OpenAIOAuthClient, OAuthConfig as OpenAIOAuthConfig};
+
+        let client = OpenAIOAuthClient::new(OpenAIOAuthConfig::default())?;
+        let tokens = client.refresh_token(refresh_token).await?;
+
+        // Convert openai_auth::TokenSet to anthropic_auth::TokenSet
+        let json = serde_json::to_string(&tokens)
+            .map_err(|e| anyhow!("Failed to serialize OpenAI tokens: {}", e))?;
+        Ok(serde_json::from_str(&json)
+            .map_err(|e| anyhow!("Failed to deserialize OpenAI tokens: {}", e))?)
+    }
+
+    async fn create_api_key(&self, _access_token: &str) -> Result<Option<String>> {
+        // OpenAI OAuth doesn't support API key creation
+        // The OAuth tokens themselves are used for authentication
+        Ok(None)
+    }
+
+    fn api_key_name(&self) -> Option<&str> {
+        Some("OPENAI_API_KEY")
+    }
+}
+
 /// Generic OAuth authentication flow
 ///
 /// # Arguments
@@ -256,7 +326,7 @@ pub async fn show_auth_status(
         vec![p.to_string()]
     } else {
         // List all known OAuth providers
-        vec!["anthropic".to_string()]
+        vec!["anthropic".to_string(), "openai".to_string()]
     };
 
     println!("{}", "OAuth Authentication Status".bright_blue());
@@ -363,8 +433,10 @@ pub fn get_oauth_provider(
             };
             Ok(Box::new(AnthropicProvider::new(oauth_mode)))
         }
-        // Future providers can be added here:
-        // "openai" => Ok(Box::new(OpenAIProvider::new())),
+        "openai" => {
+            // OpenAI doesn't use modes, so we ignore the mode parameter
+            Ok(Box::new(OpenAIProvider::new()))
+        }
         _ => Err(anyhow!(
             "OAuth is not supported for provider '{}'",
             provider_name
