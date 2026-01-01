@@ -148,6 +148,9 @@ pub enum AuthCommands {
     Status {
         /// Provider to check (defaults to all supported providers)
         provider: Option<String>,
+        /// Skip automatic token refresh (show raw stored status)
+        #[arg(long, default_value = "false")]
+        no_refresh: bool,
     },
 }
 

@@ -242,11 +242,16 @@ pub async fn get_valid_token(
 ///
 /// * `store` - The secret store to check
 /// * `provider_name` - Optional provider name to check (defaults to all supported providers)
+/// * `try_refresh` - Whether to attempt automatic token refresh for expired tokens
 ///
 /// # Returns
 ///
 /// * `Result<()>` - Success or an error
-pub fn show_auth_status(store: &SecretStore, provider_name: Option<&str>) -> Result<()> {
+pub async fn show_auth_status(
+    store: &mut SecretStore,
+    provider_name: Option<&str>,
+    try_refresh: bool,
+) -> Result<()> {
     let providers_to_check = if let Some(p) = provider_name {
         vec![p.to_string()]
     } else {
@@ -262,11 +267,53 @@ pub fn show_auth_status(store: &SecretStore, provider_name: Option<&str>) -> Res
 
         if let Some(tokens) = store.get_oauth_tokens(&p) {
             if tokens.is_expired() {
-                println!("{}", "Expired ⚠️".bright_yellow());
-                println!(
-                    "  {}",
-                    format!("Run 'qmt auth {}' to re-authenticate", p).dimmed()
-                );
+                // Try to refresh if enabled
+                if try_refresh {
+                    // Attempt to get OAuth provider and refresh
+                    match get_oauth_provider(&p, None) {
+                        Ok(oauth_provider) => {
+                            match refresh_tokens(oauth_provider.as_ref(), store).await {
+                                Ok(new_tokens) => {
+                                    // Refresh successful
+                                    println!("{}", "Valid ✓".bright_green());
+                                    let expires_str = crate::secret_store::format_timestamp(
+                                        new_tokens.expires_at,
+                                    );
+                                    println!("  Access token expires: {}", expires_str.dimmed());
+                                    println!("  {}", "Refresh token available".dimmed());
+                                }
+                                Err(e) => {
+                                    // Refresh failed
+                                    println!("{}", "Expired ⚠️".bright_yellow());
+                                    println!(
+                                        "  {}",
+                                        format!("Token refresh failed: {}", e).dimmed()
+                                    );
+                                    println!(
+                                        "  {}",
+                                        format!("Run 'qmt auth login {}' to re-authenticate", p)
+                                            .bright_cyan()
+                                    );
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Provider doesn't support OAuth (shouldn't happen but handle it)
+                            println!("{}", "Expired ⚠️".bright_yellow());
+                            println!(
+                                "  {}",
+                                format!("Run 'qmt auth login {}' to re-authenticate", p).dimmed()
+                            );
+                        }
+                    }
+                } else {
+                    // No refresh, just show expired status
+                    println!("{}", "Expired ⚠️".bright_yellow());
+                    println!(
+                        "  {}",
+                        format!("Run 'qmt auth login {}' to re-authenticate", p).dimmed()
+                    );
+                }
             } else {
                 println!("{}", "Valid ✓".bright_green());
 
@@ -278,7 +325,7 @@ pub fn show_auth_status(store: &SecretStore, provider_name: Option<&str>) -> Res
             println!("{}", "Not authenticated".dimmed());
             println!(
                 "  {}",
-                format!("Run 'qmt auth {}' to authenticate", p).dimmed()
+                format!("Run 'qmt auth login {}' to authenticate", p).dimmed()
             );
         }
 

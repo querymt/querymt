@@ -22,6 +22,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
+/// Authentication type for Anthropic API
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthType {
+    /// Standard API key authentication (x-api-key header)
+    #[serde(rename = "api_key")]
+    ApiKey,
+    /// OAuth token authentication (Authorization: Bearer header)
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
 /// Client for interacting with Anthropic's API.
 ///
 /// Provides methods for chat and completion requests using Anthropic's models.
@@ -29,6 +41,12 @@ use url::Url;
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Anthropic {
     pub api_key: String,
+    /// Optional: Explicitly specify authentication type.
+    /// If not provided, will auto-detect based on api_key format:
+    /// - OAuth tokens: `sk-ant-oat<digits>-...` (e.g., sk-ant-oat01-...)
+    /// - API keys: `sk-ant-api<digits>-...` (e.g., sk-ant-api03-...)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<AuthType>,
     pub model: String,
     pub max_tokens: u32,
     pub temperature: f32,
@@ -282,6 +300,71 @@ impl Anthropic {
     fn default_base_url() -> Url {
         Url::parse("https://api.anthropic.com/v1/").unwrap()
     }
+
+    /// Determines the authentication type to use.
+    /// If auth_type is explicitly set, uses that. Otherwise, auto-detects based on token prefix:
+    /// - OAuth tokens: `sk-ant-oat<digits>-...` (e.g., sk-ant-oat01-...)
+    /// - API keys: `sk-ant-api<digits>-...` (e.g., sk-ant-api03-...)
+    ///
+    /// If the token format is unrecognized, logs a warning and defaults to API key authentication.
+    fn determine_auth_type(&self) -> AuthType {
+        self.auth_type.clone().unwrap_or_else(|| {
+            // Check for OAuth token pattern: sk-ant-oat<digits>-
+            if self.api_key.starts_with("sk-ant-oat") {
+                // Validate it has digits after 'oat'
+                if let Some(rest) = self.api_key.strip_prefix("sk-ant-oat") {
+                    if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                        return AuthType::OAuth;
+                    }
+                }
+            }
+
+            // Check for API key pattern: sk-ant-api<digits>-
+            if self.api_key.starts_with("sk-ant-api") {
+                // Validate it has digits after 'api'
+                if let Some(rest) = self.api_key.strip_prefix("sk-ant-api") {
+                    if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                        return AuthType::ApiKey;
+                    }
+                }
+            }
+
+            // Fallback: Check for generic sk-ant- prefix (backward compatibility)
+            if self.api_key.starts_with("sk-ant-") {
+                eprintln!(
+                    "Warning: Anthropic token format not recognized (expected 'sk-ant-oat<N>-' or 'sk-ant-api<N>-'). \
+                    Defaulting to API key authentication. Consider setting 'auth_type' explicitly."
+                );
+                return AuthType::ApiKey;
+            }
+
+            // Token doesn't match Anthropic format at all
+            eprintln!(
+                "Warning: Token does not match expected Anthropic format (should start with 'sk-ant-'). \
+                Defaulting to API key authentication. This may cause authentication failures."
+            );
+            AuthType::ApiKey
+        })
+    }
+
+    /// Returns true if using OAuth authentication
+    fn is_oauth(&self) -> bool {
+        self.determine_auth_type() == AuthType::OAuth
+    }
+
+    /// Adds authentication headers to the request builder based on auth type
+    fn add_auth_headers(&self, builder: http::request::Builder) -> http::request::Builder {
+        let auth_type = self.determine_auth_type();
+        let builder = match auth_type {
+            AuthType::OAuth => builder
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("anthropic-beta", "oauth-2025-04-20"),
+            AuthType::ApiKey => builder.header("x-api-key", &self.api_key),
+        };
+
+        // Common version header (always needed)
+        builder.header("anthropic-version", "2023-06-01")
+    }
 }
 
 impl HTTPChatProvider for Anthropic {
@@ -474,13 +557,15 @@ impl HTTPChatProvider for Anthropic {
 
         let json_req = serde_json::to_vec(&req_body)?;
         let url = Anthropic::default_base_url().join("messages")?;
-        Ok(Request::builder()
+
+        let builder = Request::builder()
             .method(Method::POST)
             .uri(url.as_str())
-            .header(CONTENT_TYPE, "application/json")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .body(json_req)?)
+            .header(CONTENT_TYPE, "application/json");
+
+        let builder = self.add_auth_headers(builder);
+
+        Ok(builder.body(json_req)?)
     }
 
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
@@ -607,3 +692,140 @@ fn get_pricing(model: &str) -> Option<ModelPricing> {
 }
 
 mod factory;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_oauth_token_detection() {
+        let anthropic = Anthropic {
+            api_key: "sk-ant-oat01-abc123".to_string(),
+            auth_type: None,
+            model: "claude-3-7-sonnet-20250219".to_string(),
+            max_tokens: 100,
+            temperature: 1.0,
+            timeout_seconds: None,
+            system: None,
+            stream: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            thinking_budget_tokens: None,
+        };
+
+        assert_eq!(anthropic.determine_auth_type(), AuthType::OAuth);
+    }
+
+    #[test]
+    fn test_api_key_detection() {
+        let anthropic = Anthropic {
+            api_key: "sk-ant-api03-xyz789".to_string(),
+            auth_type: None,
+            model: "claude-3-7-sonnet-20250219".to_string(),
+            max_tokens: 100,
+            temperature: 1.0,
+            timeout_seconds: None,
+            system: None,
+            stream: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            thinking_budget_tokens: None,
+        };
+
+        assert_eq!(anthropic.determine_auth_type(), AuthType::ApiKey);
+    }
+
+    #[test]
+    fn test_explicit_auth_type_override() {
+        // Even with an oat token, explicit auth_type should take precedence
+        let anthropic = Anthropic {
+            api_key: "sk-ant-oat01-abc123".to_string(),
+            auth_type: Some(AuthType::ApiKey), // Explicitly set to API key
+            model: "claude-3-7-sonnet-20250219".to_string(),
+            max_tokens: 100,
+            temperature: 1.0,
+            timeout_seconds: None,
+            system: None,
+            stream: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            thinking_budget_tokens: None,
+        };
+
+        assert_eq!(anthropic.determine_auth_type(), AuthType::ApiKey);
+    }
+
+    #[test]
+    fn test_fallback_to_api_key_for_unknown_format() {
+        let anthropic = Anthropic {
+            api_key: "sk-ant-unknown-format".to_string(),
+            auth_type: None,
+            model: "claude-3-7-sonnet-20250219".to_string(),
+            max_tokens: 100,
+            temperature: 1.0,
+            timeout_seconds: None,
+            system: None,
+            stream: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            thinking_budget_tokens: None,
+        };
+
+        // Should default to API key and print warning
+        assert_eq!(anthropic.determine_auth_type(), AuthType::ApiKey);
+    }
+
+    #[test]
+    fn test_version_number_flexibility() {
+        // Test with different version numbers
+        let anthropic_oat99 = Anthropic {
+            api_key: "sk-ant-oat99-future".to_string(),
+            auth_type: None,
+            model: "claude-3-7-sonnet-20250219".to_string(),
+            max_tokens: 100,
+            temperature: 1.0,
+            timeout_seconds: None,
+            system: None,
+            stream: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            thinking_budget_tokens: None,
+        };
+
+        assert_eq!(anthropic_oat99.determine_auth_type(), AuthType::OAuth);
+
+        let anthropic_api15 = Anthropic {
+            api_key: "sk-ant-api15-future".to_string(),
+            auth_type: None,
+            model: "claude-3-7-sonnet-20250219".to_string(),
+            max_tokens: 100,
+            temperature: 1.0,
+            timeout_seconds: None,
+            system: None,
+            stream: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            thinking_budget_tokens: None,
+        };
+
+        assert_eq!(anthropic_api15.determine_auth_type(), AuthType::ApiKey);
+    }
+}

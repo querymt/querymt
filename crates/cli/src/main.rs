@@ -294,9 +294,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     return Ok(());
                 }
-                AuthCommands::Status { provider } => {
-                    let store = SecretStore::new()?;
-                    auth::show_auth_status(&store, provider.as_deref())?;
+                AuthCommands::Status {
+                    provider,
+                    no_refresh,
+                } => {
+                    let mut store = SecretStore::new()?;
+                    auth::show_auth_status(&mut store, provider.as_deref(), !no_refresh).await?;
                     return Ok(());
                 }
             },
