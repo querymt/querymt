@@ -1,24 +1,27 @@
 use either::*;
 use http::{
-    header::{AUTHORIZATION, CONTENT_TYPE},
     Method, Request, Response,
+    header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use querymt::{
+    FunctionCall, ToolCall, Usage,
     chat::{
         ChatMessage, ChatResponse, ChatRole, MessageType, StreamChunk, StructuredOutputFormat,
         Tool, ToolChoice,
     },
     error::LLMError,
-    handle_http_error, FunctionCall, ToolCall, Usage,
+    handle_http_error,
 };
 use schemars::{
-    gen::SchemaGenerator,
+    r#gen::SchemaGenerator,
     schema::{InstanceType, Schema, SchemaObject, SingleOrVec},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use url::Url;
+
+use crate::AuthType;
 
 pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
     Schema::Object(SchemaObject {
@@ -269,6 +272,9 @@ impl std::fmt::Display for OpenAIChatResponse {
 
 pub trait OpenAIProviderConfig {
     fn api_key(&self) -> &str;
+    fn auth_type(&self) -> Option<&AuthType> {
+        None
+    }
     fn base_url(&self) -> &Url;
     fn model(&self) -> &str;
     fn max_tokens(&self) -> Option<&u32>;
@@ -291,14 +297,90 @@ pub trait OpenAIProviderConfig {
     }
 }
 
+fn is_openai_host(base_url: &Url) -> bool {
+    matches!(base_url.host_str(), Some("api.openai.com"))
+}
+
+fn token_hint(token: &str) -> String {
+    let len = token.chars().count();
+    if len <= 10 {
+        return "<redacted>".to_string();
+    }
+    let prefix: String = token.chars().take(6).collect();
+    let suffix: String = token
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{prefix}...{suffix}")
+}
+
+fn determine_auth_type(token: &str, explicit: Option<&AuthType>, base_url: &Url) -> AuthType {
+    if !is_openai_host(base_url) {
+        return AuthType::ApiKey;
+    }
+
+    if let Some(auth_type) = explicit {
+        return auth_type.clone();
+    }
+
+    if token.starts_with("sk-") {
+        return AuthType::ApiKey;
+    }
+
+    let dot_segments = token.split('.').count();
+    if dot_segments == 3 || token.starts_with("eyJ") {
+        return AuthType::OAuth;
+    }
+
+    eprintln!(
+        "Warning: OpenAI token format not recognized (expected 'sk-' or JWT). \
+        Defaulting to API key authentication. Consider setting 'auth_type' explicitly."
+    );
+    AuthType::ApiKey
+}
+
+fn resolve_auth_token<C: OpenAIProviderConfig>(cfg: &C) -> Result<&str, LLMError> {
+    let token = cfg.api_key();
+    if token.is_empty() {
+        return Err(LLMError::AuthError("Missing OpenAI auth token".to_string()));
+    }
+
+    if !is_openai_host(cfg.base_url()) {
+        if matches!(cfg.auth_type(), Some(AuthType::OAuth)) {
+            println!(
+                "Warning: OpenAI OAuth auth_type is only supported for api.openai.com; \
+                using API key authentication."
+            );
+        }
+        println!(
+            "OpenAI auth debug: host={}, auth_type={:?}, token_hint={}",
+            cfg.base_url().host_str().unwrap_or("<none>"),
+            cfg.auth_type(),
+            token_hint(token)
+        );
+        return Ok(token);
+    }
+
+    let resolved_auth_type = determine_auth_type(token, cfg.auth_type(), cfg.base_url());
+    println!(
+        "OpenAI auth debug: host={}, auth_type={:?}, resolved_auth_type={:?}, token_hint={}",
+        cfg.base_url().host_str().unwrap_or("<none>"),
+        cfg.auth_type(),
+        resolved_auth_type,
+        token_hint(token)
+    );
+    Ok(token)
+}
+
 pub fn openai_embed_request<C: OpenAIProviderConfig>(
     cfg: &C,
     inputs: &[String],
 ) -> Result<Request<Vec<u8>>, LLMError> {
-    let api_key = match cfg.api_key().into() {
-        Some(key) => key,
-        None => return Err(LLMError::AuthError("Missing API key".to_string())),
-    };
+    let api_key = resolve_auth_token(cfg)?;
 
     let emb_format = cfg
         .embedding_encoding_format()
@@ -338,10 +420,7 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
     messages: &[ChatMessage],
     tools: Option<&[Tool]>,
 ) -> Result<Request<Vec<u8>>, LLMError> {
-    let api_key = match cfg.api_key().into() {
-        Some(key) => key,
-        None => return Err(LLMError::AuthError("Missing API key".into())),
-    };
+    let api_key = resolve_auth_token(cfg)?;
 
     // Clone the messages to have an owned mutable vector.
     let messages = messages.to_vec();
@@ -521,6 +600,24 @@ pub fn openai_list_models_request(
         .ok_or(LLMError::InvalidRequest(
             "Could not find api_key".to_string(),
         ))?;
+
+    let auth_type = cfg
+        .get("auth_type")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    if !is_openai_host(base_url) && matches!(auth_type.as_ref(), Some(AuthType::OAuth)) {
+        println!(
+            "Warning: OpenAI OAuth auth_type is only supported for api.openai.com; \
+            using API key authentication."
+        );
+    } else if is_openai_host(base_url) {
+        let _ = determine_auth_type(&api_key, auth_type.as_ref(), base_url);
+    }
+    println!(
+        "OpenAI auth debug (list models): host={}, auth_type={:?}, token_hint={}",
+        base_url.host_str().unwrap_or("<none>"),
+        auth_type,
+        token_hint(&api_key)
+    );
 
     let model_list_url = base_url.join("models")?;
     Ok(Request::builder()

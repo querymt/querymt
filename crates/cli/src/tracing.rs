@@ -1,13 +1,13 @@
-use opentelemetry::{trace::TracerProvider, KeyValue};
+use opentelemetry::{KeyValue, trace::TracerProvider};
 use opentelemetry_sdk::{
-    trace::{RandomIdGenerator, SdkTracerProvider},
     Resource,
+    trace::{RandomIdGenerator, SdkTracerProvider},
 };
-use opentelemetry_semantic_conventions::{resource::SERVICE_VERSION, SCHEMA_URL};
+use opentelemetry_semantic_conventions::{SCHEMA_URL, resource::SERVICE_VERSION};
 use tracing_log::LogTracer;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::{fmt, EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, fmt};
 
 /// Build a resource with service name & version
 fn resource() -> Resource {

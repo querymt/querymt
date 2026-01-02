@@ -1,25 +1,25 @@
 use either::*;
 use http::{
-    header::{AUTHORIZATION, CONTENT_TYPE},
     Method, Request, Response,
+    header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use qmt_openai::api::{
-    openai_chat_request, openai_embed_request, openai_list_models_request, openai_parse_chat,
-    openai_parse_embed, openai_parse_list_models, url_schema, OpenAIProviderConfig,
+    OpenAIProviderConfig, openai_chat_request, openai_embed_request, openai_list_models_request,
+    openai_parse_chat, openai_parse_embed, openai_parse_list_models, url_schema,
 };
 use querymt::{
+    HTTPLLMProvider, ToolCall,
     chat::{
-        http::HTTPChatProvider, ChatMessage, ChatResponse, StructuredOutputFormat, Tool, ToolChoice,
+        ChatMessage, ChatResponse, StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
     },
-    completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
+    completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     get_env_var, handle_http_error,
     plugin::HTTPLLMProviderFactory,
     providers::{ModelPricing, ProvidersRegistry},
-    HTTPLLMProvider, ToolCall,
 };
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;

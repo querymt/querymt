@@ -1,21 +1,21 @@
-use http::{header::CONTENT_TYPE, Method, Request, Response};
+use http::{Method, Request, Response, header::CONTENT_TYPE};
 use qmt_openai::api::{
-    openai_chat_request, openai_embed_request, openai_parse_chat, openai_parse_embed, url_schema,
-    OpenAIProviderConfig,
+    OpenAIProviderConfig, openai_chat_request, openai_embed_request, openai_parse_chat,
+    openai_parse_embed, url_schema,
 };
 use querymt::{
+    HTTPLLMProvider,
     chat::{
-        http::HTTPChatProvider, ChatMessage, ChatResponse, StructuredOutputFormat, Tool, ToolChoice,
+        ChatMessage, ChatResponse, StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
     },
-    completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
+    completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     get_env_var,
     plugin::HTTPLLMProviderFactory,
     providers::{ModelPricing, ProvidersRegistry},
-    HTTPLLMProvider,
 };
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use url::Url;

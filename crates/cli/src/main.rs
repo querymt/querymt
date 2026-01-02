@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::{CommandFactory, Parser};
 use colored::*;
 use querymt::{
@@ -26,7 +26,7 @@ use embed::embed_pipe;
 use provider::{get_api_key, get_provider_info, get_provider_registry, split_provider};
 use secret_store::SecretStore;
 use tracing::setup_logging;
-use utils::{find_config_in_home, get_provider_api_key, parse_tool_names, ToolLoadingStats};
+use utils::{ToolLoadingStats, find_config_in_home, get_provider_api_key, parse_tool_names};
 
 fn load_tool_config() -> Result<ToolConfig, Box<dyn std::error::Error>> {
     match find_config_in_home(&["tools-policy.toml"]) {
@@ -89,6 +89,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cmd = CliArgs::command();
         clap_complete::generate(*shell, &mut cmd, "qmt", &mut io::stdout());
         return Ok(());
+    }
+
+    if let Some(Commands::Auth { command }) = &args.command {
+        match command {
+            AuthCommands::Login { provider, mode } => {
+                let oauth_provider = match auth::get_oauth_provider(provider, Some(mode)) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("{} {}", "Error:".bright_red(), e);
+                        return Ok(());
+                    }
+                };
+
+                let mut store = SecretStore::new()?;
+                auth::authenticate(oauth_provider.as_ref(), &mut store).await?;
+                return Ok(());
+            }
+            AuthCommands::Logout { provider } => {
+                // Verify the provider supports OAuth
+                if auth::get_oauth_provider(provider, None).is_err() {
+                    eprintln!(
+                        "{} Provider '{}' does not support OAuth",
+                        "Error:".bright_red(),
+                        provider
+                    );
+                    return Ok(());
+                }
+
+                let store_key = if provider == "codex" {
+                    "openai"
+                } else {
+                    provider.as_str()
+                };
+                let mut store = SecretStore::new()?;
+                store.delete_oauth_tokens(store_key)?;
+                println!(
+                    "{} Logged out from {}",
+                    "✓".bright_green(),
+                    provider.bright_cyan()
+                );
+                return Ok(());
+            }
+            AuthCommands::Status {
+                provider,
+                no_refresh,
+            } => {
+                let mut store = SecretStore::new()?;
+                auth::show_auth_status(&mut store, provider.as_deref(), !no_refresh).await?;
+                return Ok(());
+            }
+        }
     }
 
     match querymt::providers::update_providers_if_stale().await {
@@ -261,47 +312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Commands::Auth { command } => match command {
-                AuthCommands::Login { provider, mode } => {
-                    let oauth_provider = match auth::get_oauth_provider(provider, Some(mode)) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("{} {}", "Error:".bright_red(), e);
-                            return Ok(());
-                        }
-                    };
-
-                    let mut store = SecretStore::new()?;
-                    auth::authenticate(oauth_provider.as_ref(), &mut store).await?;
-                    return Ok(());
-                }
-                AuthCommands::Logout { provider } => {
-                    // Verify the provider supports OAuth
-                    if auth::get_oauth_provider(provider, None).is_err() {
-                        eprintln!(
-                            "{} Provider '{}' does not support OAuth",
-                            "Error:".bright_red(),
-                            provider
-                        );
-                        return Ok(());
-                    }
-
-                    let mut store = SecretStore::new()?;
-                    store.delete_oauth_tokens(provider)?;
-                    println!(
-                        "{} Logged out from {}",
-                        "✓".bright_green(),
-                        provider.bright_cyan()
-                    );
-                    return Ok(());
-                }
-                AuthCommands::Status {
-                    provider,
-                    no_refresh,
-                } => {
-                    let mut store = SecretStore::new()?;
-                    auth::show_auth_status(&mut store, provider.as_deref(), !no_refresh).await?;
-                    return Ok(());
-                }
+                _ => unreachable!("Auth commands are handled before plugin loading"),
             },
             // This command is handled before the match statement
             Commands::Completion { .. } => unreachable!(),

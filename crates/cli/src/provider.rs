@@ -1,5 +1,5 @@
 use querymt::plugin::{
-    extism_impl::host::ExtismLoader, host::native::NativeLoader, host::PluginRegistry,
+    extism_impl::host::ExtismLoader, host::PluginRegistry, host::native::NativeLoader,
 };
 use std::path::PathBuf;
 

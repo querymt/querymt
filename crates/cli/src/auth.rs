@@ -1,7 +1,9 @@
 use anthropic_auth::{AsyncOAuthClient as AnthropicOAuthClient, OAuthConfig, OAuthMode, TokenSet};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use colored::*;
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::secret_store::SecretStore;
 
@@ -28,6 +30,16 @@ pub trait OAuthProvider: Send + Sync {
 
     /// Get the API key environment variable name (e.g., "ANTHROPIC_API_KEY")
     fn api_key_name(&self) -> Option<&str>;
+
+    /// Whether this provider supports automatic callback server
+    fn supports_callback_server(&self) -> bool {
+        false
+    }
+
+    /// Get the callback server port (if supported)
+    fn callback_port(&self) -> Option<u16> {
+        None
+    }
 }
 
 /// OAuth flow data returned when starting a flow
@@ -94,11 +106,15 @@ impl OAuthProvider for AnthropicProvider {
 }
 
 /// OpenAI OAuth provider implementation
-pub struct OpenAIProvider;
+pub struct OpenAIProvider {
+    api_key: Arc<Mutex<Option<String>>>,
+}
 
 impl OpenAIProvider {
     pub fn new() -> Self {
-        Self
+        Self {
+            api_key: Arc::new(Mutex::new(None)),
+        }
     }
 }
 
@@ -131,12 +147,27 @@ impl OAuthProvider for OpenAIProvider {
         let client = OpenAIOAuthClient::new(OpenAIOAuthConfig::default())?;
         let tokens = client.exchange_code(code, verifier).await?;
 
-        // Convert openai_auth::TokenSet to anthropic_auth::TokenSet
-        // They have identical structure, so we can serialize/deserialize
-        let json = serde_json::to_string(&tokens)
-            .map_err(|e| anyhow!("Failed to serialize OpenAI tokens: {}", e))?;
-        Ok(serde_json::from_str(&json)
-            .map_err(|e| anyhow!("Failed to deserialize OpenAI tokens: {}", e))?)
+        if let Some(id_token) = tokens.id_token.as_deref() {
+            match client.obtain_api_key(id_token).await {
+                Ok(api_key) => {
+                    if let Ok(mut slot) = self.api_key.lock() {
+                        *slot = Some(api_key);
+                    }
+                }
+                Err(err) => {
+                    println!(
+                        "OpenAI OAuth: API key exchange failed ({}). Try the `codex` provider if you only have OAuth access.",
+                        err
+                    );
+                }
+            }
+        }
+
+        Ok(TokenSet {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            expires_at: tokens.expires_at,
+        })
     }
 
     async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
@@ -145,21 +176,47 @@ impl OAuthProvider for OpenAIProvider {
         let client = OpenAIOAuthClient::new(OpenAIOAuthConfig::default())?;
         let tokens = client.refresh_token(refresh_token).await?;
 
-        // Convert openai_auth::TokenSet to anthropic_auth::TokenSet
-        let json = serde_json::to_string(&tokens)
-            .map_err(|e| anyhow!("Failed to serialize OpenAI tokens: {}", e))?;
-        Ok(serde_json::from_str(&json)
-            .map_err(|e| anyhow!("Failed to deserialize OpenAI tokens: {}", e))?)
+        if let Some(id_token) = tokens.id_token.as_deref() {
+            match client.obtain_api_key(id_token).await {
+                Ok(api_key) => {
+                    if let Ok(mut slot) = self.api_key.lock() {
+                        *slot = Some(api_key);
+                    }
+                }
+                Err(err) => {
+                    println!(
+                        "OpenAI OAuth: API key exchange failed ({}). Try the `codex` provider if you only have OAuth access.",
+                        err
+                    );
+                }
+            }
+        }
+
+        Ok(TokenSet {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            expires_at: tokens.expires_at,
+        })
     }
 
     async fn create_api_key(&self, _access_token: &str) -> Result<Option<String>> {
-        // OpenAI OAuth doesn't support API key creation
-        // The OAuth tokens themselves are used for authentication
-        Ok(None)
+        let mut api_key = None;
+        if let Ok(mut slot) = self.api_key.lock() {
+            api_key = slot.take();
+        }
+        Ok(api_key)
     }
 
     fn api_key_name(&self) -> Option<&str> {
         Some("OPENAI_API_KEY")
+    }
+
+    fn supports_callback_server(&self) -> bool {
+        true
+    }
+
+    fn callback_port(&self) -> Option<u16> {
+        Some(1455)
     }
 }
 
@@ -202,16 +259,23 @@ pub async fn authenticate(provider: &dyn OAuthProvider, store: &mut SecretStore)
         }
     }
 
-    print!("Paste the authorization response (code#state format): ");
-    io::stdout().flush()?;
-
-    let mut response = String::new();
-    io::stdin().read_line(&mut response)?;
-    let response = response.trim();
+    // Try automatic callback server or fall back to manual entry
+    let code = if provider.supports_callback_server() {
+        match try_callback_server(provider, &flow).await {
+            Ok(code) => code,
+            Err(e) => {
+                println!("{} Callback server failed: {}", "⚠️".bright_yellow(), e);
+                println!("Falling back to manual code entry...\n");
+                manual_code_entry()?
+            }
+        }
+    } else {
+        manual_code_entry()?
+    };
 
     println!("\n{} Exchanging code for tokens...", "🔄".bright_blue());
     let tokens = provider
-        .exchange_code(response, &flow.state, &flow.verifier)
+        .exchange_code(&code, &flow.state, &flow.verifier)
         .await?;
 
     // Store tokens
@@ -251,6 +315,87 @@ pub async fn authenticate(provider: &dyn OAuthProvider, store: &mut SecretStore)
     Ok(())
 }
 
+/// Try to use callback server for automatic code capture
+async fn try_callback_server(provider: &dyn OAuthProvider, flow: &OAuthFlowData) -> Result<String> {
+    if provider.name() == "openai" {
+        use openai_auth::run_callback_server;
+
+        let port = provider.callback_port().unwrap_or(1455);
+
+        println!(
+            "{} Starting callback server on port {}...",
+            "🌐".bright_blue(),
+            port
+        );
+        println!("{} Waiting for OAuth callback...", "⏳".bright_cyan());
+        println!("   (The browser should redirect automatically after you authorize)\n");
+
+        // Start callback server with 2 minute timeout
+        let code_future = run_callback_server(port, &flow.state);
+        let timeout_duration = Duration::from_secs(120); // 2 minutes
+
+        match tokio::time::timeout(timeout_duration, code_future).await {
+            Ok(Ok(code)) => {
+                println!("{} Authorization code received!", "✓".bright_green());
+                Ok(code)
+            }
+            Ok(Err(e)) => Err(anyhow!("Callback server error: {}", e)),
+            Err(_) => Err(anyhow!("Timeout waiting for OAuth callback (2 minutes)")),
+        }
+    } else {
+        Err(anyhow!("Callback server not supported for this provider"))
+    }
+}
+
+/// Prompt user to manually enter the authorization code
+fn manual_code_entry() -> Result<String> {
+    print!("Paste the authorization response (code#state format): ");
+    io::stdout().flush()?;
+
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+    let response = response.trim();
+
+    // For OpenAI, try to extract code from query string if present
+    // This handles cases where user pastes the full callback URL
+    if response.contains('?') || response.contains('&') {
+        if let Some(code) = extract_code_from_query(response) {
+            return Ok(code);
+        }
+    }
+
+    Ok(response.to_string())
+}
+
+/// Extract authorization code from query string or URL
+fn extract_code_from_query(input: &str) -> Option<String> {
+    use url::Url;
+
+    // Handle full URLs like http://localhost:1455/auth/callback?code=xxx&state=yyy
+    if input.starts_with("http") {
+        if let Ok(url) = Url::parse(input) {
+            for (key, value) in url.query_pairs() {
+                if key == "code" {
+                    return Some(value.into_owned());
+                }
+            }
+        }
+        return None;
+    }
+
+    // Handle query string like ?code=xxx&state=yyy or code=xxx&state=yyy
+    let query = input.trim_start_matches('?');
+    for part in query.split('&') {
+        if let Some((key, value)) = part.split_once('=') {
+            if key == "code" {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 /// Refresh OAuth tokens for a provider
 ///
 /// # Arguments
@@ -274,6 +419,12 @@ pub async fn refresh_tokens(
     // Store the new tokens
     store.set_oauth_tokens(provider.name(), &new_tokens)?;
 
+    if let Ok(Some(api_key)) = provider.create_api_key(&new_tokens.access_token).await {
+        if let Some(key_name) = provider.api_key_name() {
+            store.set(key_name, &api_key)?;
+        }
+    }
+
     Ok(new_tokens)
 }
 
@@ -291,6 +442,20 @@ pub async fn get_valid_token(
     provider: &dyn OAuthProvider,
     store: &mut SecretStore,
 ) -> Result<String> {
+    if provider.name() == "openai" {
+        if let Some(token) = store.get_valid_access_token(provider.name()) {
+            return Ok(token);
+        }
+        if let Some(key_name) = provider.api_key_name() {
+            if let Some(api_key) = store.get(key_name) {
+                return Ok(api_key);
+            }
+        }
+        return Err(anyhow!(
+            "OpenAI API key not found; run 'qmt auth login openai' to re-authenticate"
+        ));
+    }
+
     // Try to get valid token
     if let Some(token) = store.get_valid_access_token(provider.name()) {
         return Ok(token);
@@ -323,7 +488,8 @@ pub async fn show_auth_status(
     try_refresh: bool,
 ) -> Result<()> {
     let providers_to_check = if let Some(p) = provider_name {
-        vec![p.to_string()]
+        let name = if p == "codex" { "openai" } else { p };
+        vec![name.to_string()]
     } else {
         // List all known OAuth providers
         vec!["anthropic".to_string(), "openai".to_string()]
@@ -428,12 +594,12 @@ pub fn get_oauth_provider(
                     return Err(anyhow!(
                         "Invalid mode '{}' for Anthropic. Use 'max' or 'console'",
                         m
-                    ))
+                    ));
                 }
             };
             Ok(Box::new(AnthropicProvider::new(oauth_mode)))
         }
-        "openai" => {
+        "openai" | "codex" => {
             // OpenAI doesn't use modes, so we ignore the mode parameter
             Ok(Box::new(OpenAIProvider::new()))
         }
