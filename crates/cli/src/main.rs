@@ -22,7 +22,9 @@ mod utils;
 use chat::{chat_pipe, interactive_loop};
 use cli_args::{AuthCommands, CliArgs, Commands, SecretsCommands, ToolConfig, ToolPolicyState};
 use embed::embed_pipe;
-use provider::{get_api_key, get_provider_info, get_provider_registry, split_provider};
+use provider::{
+    apply_provider_config, get_api_key, get_provider_info, get_provider_registry, split_provider,
+};
 use secret_store::SecretStore;
 use tracing::setup_logging;
 use utils::{ToolLoadingStats, find_config_in_home, get_provider_api_key, parse_tool_names};
@@ -249,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (prov_name, opt_model) =
                     resolve_provider_and_model(&args, sc_provider.as_ref(), sc_model.as_ref())?;
                 let mut builder = LLMBuilder::new().provider(prov_name.clone());
+                builder = apply_provider_config(builder, &registry, &prov_name)?;
                 if let Some(m) = opt_model {
                     builder = builder.model(m);
                 }
@@ -322,6 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build provider + LLMBuilder
     let (prov_name, opt_model) = resolve_provider_and_model(&args, None, None)?;
     let mut builder = LLMBuilder::new().provider(prov_name.clone());
+    builder = apply_provider_config(builder, &registry, &prov_name)?;
     if let Some(m) = opt_model.or(args.model.clone()) {
         builder = builder.model(m);
     }
