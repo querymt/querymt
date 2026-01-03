@@ -3,6 +3,9 @@ name = "qmt-llama-cpp"
 version = "0.1.0"
 edition = "2021"
 
+[package.metadata.qmt]
+provider_type = "native"
+
 [features]
 default = ["native"]
 native = ["querymt", "querymt/tracing"]
