@@ -6,6 +6,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, ChatRole, MessageType, Tool};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
@@ -58,6 +59,16 @@ pub struct LlamaCppConfig {
     pub use_chat_template: Option<bool>,
     /// Control whether to add BOS when tokenizing prompts.
     pub add_bos: Option<bool>,
+    /// Logging destination for llama.cpp output.
+    pub log: Option<LlamaCppLogMode>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LlamaCppLogMode {
+    Stderr,
+    Tracing,
+    Off,
 }
 
 struct LlamaCppProvider {
@@ -99,12 +110,16 @@ struct GeneratedText {
 fn llama_backend() -> Result<std::sync::MutexGuard<'static, LlamaBackend>, LLMError> {
     static BACKEND: OnceLock<Result<Mutex<LlamaBackend>, String>> = OnceLock::new();
     let backend = BACKEND
-        .get_or_init(|| LlamaBackend::init().map(Mutex::new).map_err(|e| e.to_string()))
+        .get_or_init(|| {
+            LlamaBackend::init()
+                .map(Mutex::new)
+                .map_err(|e| e.to_string())
+        })
         .as_ref()
         .map_err(|e| LLMError::ProviderError(e.clone()))?;
-    backend.lock().map_err(|_| {
-        LLMError::ProviderError("Llama backend lock poisoned".to_string())
-    })
+    backend
+        .lock()
+        .map_err(|_| LLMError::ProviderError("Llama backend lock poisoned".to_string()))
 }
 
 impl LlamaCppProvider {
@@ -141,7 +156,13 @@ impl LlamaCppProvider {
     }
 
     fn new(cfg: LlamaCppConfig) -> Result<Self, LLMError> {
-        let backend = llama_backend()?;
+        let mut backend = llama_backend()?;
+        let log_mode = cfg.log.unwrap_or(LlamaCppLogMode::Off);
+        match log_mode {
+            LlamaCppLogMode::Stderr => {}
+            LlamaCppLogMode::Tracing => send_logs_to_tracing(LogOptions::default()),
+            LlamaCppLogMode::Off => backend.void_logs(),
+        }
         let model_path = Self::resolve_model_path(&cfg.model_path)?;
         let model_path = Path::new(&model_path);
         if !model_path.exists() {
@@ -202,11 +223,11 @@ impl LlamaCppProvider {
             );
         }
 
-        if let Ok(template) = self
-            .model
-            .chat_template(self.cfg.chat_template.as_deref())
-        {
-            if let Ok(prompt) = self.model.apply_chat_template(&template, &chat_messages, true) {
+        if let Ok(template) = self.model.chat_template(self.cfg.chat_template.as_deref()) {
+            if let Ok(prompt) = self
+                .model
+                .apply_chat_template(&template, &chat_messages, true)
+            {
                 return Ok((prompt, true));
             }
         }
@@ -259,9 +280,8 @@ impl LlamaCppProvider {
             samplers.push(LlamaSampler::top_k(top_k as i32));
         }
 
-        let use_sampling = temp.map_or(false, |t| t > 0.0)
-            || self.cfg.top_p.is_some()
-            || self.cfg.top_k.is_some();
+        let use_sampling =
+            temp.map_or(false, |t| t > 0.0) || self.cfg.top_p.is_some() || self.cfg.top_k.is_some();
         let seed = self.cfg.seed.unwrap_or(1234);
         if use_sampling {
             samplers.push(LlamaSampler::dist(seed));
@@ -273,12 +293,24 @@ impl LlamaCppProvider {
         LlamaSampler::chain_simple(samplers)
     }
 
-    fn generate(&self, prompt: &str, max_tokens: u32, temperature: Option<f32>) -> Result<GeneratedText, LLMError> {
+    fn generate(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+        temperature: Option<f32>,
+    ) -> Result<GeneratedText, LLMError> {
         let backend = llama_backend()?;
         let add_bos = self.cfg.add_bos.unwrap_or(true);
         let tokens = self
             .model
-            .str_to_token(prompt, if add_bos { AddBos::Always } else { AddBos::Never })
+            .str_to_token(
+                prompt,
+                if add_bos {
+                    AddBos::Always
+                } else {
+                    AddBos::Never
+                },
+            )
             .map_err(|e| LLMError::ProviderError(e.to_string()))?;
         if tokens.is_empty() {
             return Err(LLMError::InvalidRequest(
@@ -462,8 +494,7 @@ impl LLMProviderFactory for LlamaCppFactory {
 
     fn config_schema(&self) -> Value {
         let schema = schema_for!(LlamaCppConfig);
-        serde_json::to_value(&schema.schema)
-            .expect("LlamaCppConfig schema should always serialize")
+        serde_json::to_value(&schema.schema).expect("LlamaCppConfig schema should always serialize")
     }
 
     fn from_config(&self, cfg: &Value) -> Result<Box<dyn LLMProvider>, LLMError> {
