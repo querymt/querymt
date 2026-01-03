@@ -23,5 +23,9 @@ name = "openai"
 path = "oci://ghcr.io/querymt/openai:latest"
 
 [[providers]]
+name = "codex"
+path = "oci://ghcr.io/querymt/codex:latest"
+
+[[providers]]
 name = "openrouter"
 path = "oci://ghcr.io/querymt/openrouter:latest"

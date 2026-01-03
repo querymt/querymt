@@ -4,24 +4,36 @@
 
 use http::{Request, Response};
 use querymt::{
+    HTTPLLMProvider,
     chat::{
-        http::HTTPChatProvider, ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat,
-        Tool, ToolChoice,
+        ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+        http::HTTPChatProvider,
     },
-    completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
+    completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     get_env_var,
     plugin::HTTPLLMProviderFactory,
     providers::{ModelPricing, ProvidersRegistry},
-    HTTPLLMProvider,
 };
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
+
+/// Authentication type for OpenAI API.
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthType {
+    /// Standard API key authentication (Bearer token).
+    #[serde(rename = "api_key")]
+    ApiKey,
+    /// OAuth token authentication (Bearer token).
+    #[serde(rename = "oauth")]
+    OAuth,
+}
 
 /// Client for interacting with OpenAI's API.
 ///
@@ -30,6 +42,10 @@ use url::Url;
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct OpenAI {
     pub api_key: String,
+    /// Optional: Explicitly specify authentication type.
+    /// This is only honored when the host is api.openai.com; other hosts always use API keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<AuthType>,
     #[schemars(schema_with = "api::url_schema")]
     #[serde(default = "OpenAI::default_base_url")]
     pub base_url: Url,
@@ -71,6 +87,10 @@ pub mod api;
 impl api::OpenAIProviderConfig for OpenAI {
     fn api_key(&self) -> &str {
         &self.api_key
+    }
+
+    fn auth_type(&self) -> Option<&AuthType> {
+        self.auth_type.as_ref()
     }
 
     fn base_url(&self) -> &Url {

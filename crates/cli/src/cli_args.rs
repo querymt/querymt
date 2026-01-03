@@ -81,12 +81,16 @@ pub struct CliArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Set a secret key/value pair
-    Set { key: String, value: String },
-    /// Get a secret value by key
-    Get { key: String },
-    /// Delete a secret key
-    Delete { key: String },
+    /// Manage OAuth authentication
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+    /// Manage secrets and credentials
+    Secrets {
+        #[command(subcommand)]
+        command: SecretsCommands,
+    },
     /// List available providers
     Providers,
     /// List available models for providers
@@ -123,4 +127,39 @@ pub enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuthCommands {
+    /// Login to a provider using OAuth
+    Login {
+        /// Provider to authenticate with (e.g., "anthropic", "openai")
+        provider: String,
+        /// OAuth mode (provider-specific, e.g., "max" or "console" for Anthropic)
+        #[arg(long, default_value = "max")]
+        mode: String,
+    },
+    /// Logout from an OAuth provider (remove stored tokens)
+    Logout {
+        /// Provider to logout from
+        provider: String,
+    },
+    /// Check OAuth authentication status
+    Status {
+        /// Provider to check (defaults to all supported providers)
+        provider: Option<String>,
+        /// Skip automatic token refresh (show raw stored status)
+        #[arg(long, default_value = "false")]
+        no_refresh: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SecretsCommands {
+    /// Set a secret key/value pair
+    Set { key: String, value: String },
+    /// Get a secret value by key
+    Get { key: String },
+    /// Delete a secret key
+    Delete { key: String },
 }

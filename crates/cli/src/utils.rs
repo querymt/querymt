@@ -1,11 +1,11 @@
 use colored::*;
-use log::{log_enabled, Level};
+use log::{Level, log_enabled};
+use querymt::ToolCall;
 use querymt::chat::{ChatMessage, ImageMime};
 use querymt::plugin::HTTPLLMProviderFactory;
-use querymt::ToolCall;
-use rustyline::{error::ReadlineError, Config, Editor};
+use rustyline::{Config, Editor, error::ReadlineError};
 use serde_json::Value;
-use std::io::{stdout, Write};
+use std::io::{Write, stdout};
 use std::path::PathBuf;
 
 use crate::secret_store::SecretStore;
@@ -43,7 +43,6 @@ pub fn get_provider_api_key<P: HTTPLLMProviderFactory + ?Sized>(provider: &P) ->
     let api_key_name = provider.api_key_name()?;
     store
         .get(&api_key_name)
-        .cloned()
         .or_else(|| std::env::var(api_key_name).ok())
 }
 

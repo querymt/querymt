@@ -1,21 +1,21 @@
 use crate::cli_args::{ToolConfig, ToolPolicyState};
 use crate::utils::{parse_tool_names, print_separator, process_input, prompt_tool_execution};
 use colored::*;
-use futures::future::join_all;
 use futures::Stream;
 use futures::StreamExt;
+use futures::future::join_all;
 use querymt::{
+    FunctionCall, LLMProvider, ToolCall,
     chat::{ChatMessage, ChatResponse, StreamChunk},
     error::LLMError,
-    FunctionCall, LLMProvider, ToolCall,
 };
 use rustyline::{
+    Cmd, Config, Editor, EventHandler, KeyCode, KeyEvent, Modifiers,
     completion::FilenameCompleter,
     error::ReadlineError,
     highlight::{CmdKind, Highlighter, MatchingBracketHighlighter},
     hint::HistoryHinter,
     validate::MatchingBracketValidator,
-    Cmd, Config, Editor, EventHandler, KeyCode, KeyEvent, Modifiers,
 };
 use rustyline_derive::{Completer, Helper, Hinter, Validator};
 use spinners::{Spinner, Spinners};

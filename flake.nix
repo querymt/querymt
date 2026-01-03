@@ -30,6 +30,7 @@
           rustToolchain
           openssl
           cmake
+          dbus
           libclang
           rust-bindgen
           pkg-config

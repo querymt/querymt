@@ -2,24 +2,25 @@
 //!
 //! This module provides integration with Ollama's local LLM server through its API.
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use http::{header::CONTENT_TYPE, Method, Request, Response};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use http::{Method, Request, Response, header::CONTENT_TYPE};
 use querymt::{
+    FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     chat::{
-        http::HTTPChatProvider, ChatMessage, ChatResponse, ChatRole, MessageType,
-        StructuredOutputFormat, Tool,
+        ChatMessage, ChatResponse, ChatRole, MessageType, StructuredOutputFormat, Tool,
+        http::HTTPChatProvider,
     },
-    completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
+    completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     get_env_var, handle_http_error,
     plugin::HTTPLLMProviderFactory,
-    FunctionCall, HTTPLLMProvider, ToolCall, Usage,
 };
 use schemars::{
-    gen::SchemaGenerator,
+    JsonSchema,
+    r#gen::SchemaGenerator,
     schema::{InstanceType, Schema, SchemaObject, SingleOrVec},
-    schema_for, JsonSchema,
+    schema_for,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
