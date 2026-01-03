@@ -1,0 +1,25 @@
+[package]
+name = "qmt-llama-cpp"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["native"]
+native = ["querymt", "querymt/tracing"]
+cuda = ["llama-cpp-2/cuda"]
+metal = ["llama-cpp-2/metal"]
+openmp = ["llama-cpp-2/openmp"]
+vulkan = ["llama-cpp-2/vulkan"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+async-trait.workspace = true
+encoding_rs = "0.8"
+hf-hub = "0.4"
+llama-cpp-2 = { version = "0.1.130", default-features = false }
+querymt = { path = "../../querymt", default-features = false, optional = true }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true

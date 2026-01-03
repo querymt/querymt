@@ -29,3 +29,11 @@ path = "oci://ghcr.io/querymt/codex:latest"
 [[providers]]
 name = "openrouter"
 path = "oci://ghcr.io/querymt/openrouter:latest"
+
+# Local GGUF via native llama.cpp plugin
+[[providers]]
+name = "llama_cpp"
+path = "/path/to/libqmt_llama_cpp.dylib"
+[providers.config]
+model_path = "/path/to/model.gguf"
+max_tokens = 256
