@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use futures::channel::mpsc;
+use futures::Stream;
 use hf_hub::api::sync::ApiBuilder;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -20,6 +22,7 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 
 const DEFAULT_MAX_TOKENS: u32 = 256;
 const DEFAULT_BATCH: u32 = 512;
@@ -241,6 +244,25 @@ impl LlamaCppProvider {
         self.build_prompt_with(messages, use_chat_template)
     }
 
+    fn build_prompt_candidates(&self, messages: &[ChatMessage]) -> Result<Vec<String>, LLMError> {
+        let (prompt, used_chat_template) = self.build_prompt(messages)?;
+        let mut prompts = vec![prompt];
+
+        if used_chat_template && self.cfg.use_chat_template.is_none() {
+            let (fallback_prompt, _) = self.build_prompt_with(messages, false)?;
+            if !prompts.contains(&fallback_prompt) {
+                prompts.push(fallback_prompt);
+            }
+        }
+
+        let raw_prompt = self.build_raw_prompt(messages)?;
+        if !prompts.contains(&raw_prompt) {
+            prompts.push(raw_prompt);
+        }
+
+        Ok(prompts)
+    }
+
     fn build_raw_prompt(&self, messages: &[ChatMessage]) -> Result<String, LLMError> {
         for msg in messages {
             if !matches!(msg.message_type, MessageType::Text) {
@@ -419,10 +441,141 @@ impl LlamaCppProvider {
             },
         })
     }
+
+    fn generate_streaming(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+        temperature: Option<f32>,
+        tx: &mpsc::UnboundedSender<Result<querymt::chat::StreamChunk, LLMError>>,
+    ) -> Result<Usage, LLMError> {
+        let backend = llama_backend()?;
+        let add_bos = self.cfg.add_bos.unwrap_or(true);
+        let tokens = self
+            .model
+            .str_to_token(
+                prompt,
+                if add_bos {
+                    AddBos::Always
+                } else {
+                    AddBos::Never
+                },
+            )
+            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+        if tokens.is_empty() {
+            return Err(LLMError::InvalidRequest(
+                "Prompt tokenization resulted in an empty sequence".into(),
+            ));
+        }
+        if max_tokens == 0 {
+            return Ok(Usage {
+                input_tokens: tokens.len() as u32,
+                output_tokens: 0,
+            });
+        }
+
+        let mut ctx_params = LlamaContextParams::default();
+        if let Some(n_ctx) = self.cfg.n_ctx {
+            let n_ctx = NonZeroU32::new(n_ctx).ok_or_else(|| {
+                LLMError::InvalidRequest("n_ctx must be greater than zero".into())
+            })?;
+            ctx_params = ctx_params.with_n_ctx(Some(n_ctx));
+        }
+        if let Some(n_threads) = self.cfg.n_threads {
+            ctx_params = ctx_params.with_n_threads(n_threads);
+        }
+        if let Some(n_threads_batch) = self.cfg.n_threads_batch {
+            ctx_params = ctx_params.with_n_threads_batch(n_threads_batch);
+        }
+
+        let mut ctx = self
+            .model
+            .new_context(&*backend, ctx_params)
+            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+
+        let n_ctx_total = ctx.n_ctx() as i32;
+        let n_len_total = tokens.len() as i32 + max_tokens as i32;
+        if n_len_total > n_ctx_total {
+            return Err(LLMError::InvalidRequest(format!(
+                "Prompt + max_tokens ({n_len_total}) exceeds context window ({n_ctx_total})"
+            )));
+        }
+
+        let batch_tokens = self.cfg.n_batch.unwrap_or(DEFAULT_BATCH);
+        let mut batch = LlamaBatch::new(batch_tokens as usize, 1);
+
+        let last_index = tokens.len().saturating_sub(1) as i32;
+        for (i, token) in (0_i32..).zip(tokens.iter().copied()) {
+            let is_last = i == last_index;
+            batch
+                .add(token, i, &[0], is_last)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+        }
+
+        ctx.decode(&mut batch)
+            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+
+        let mut sampler = self.build_sampler(temperature);
+        let allow_fallback = temperature.is_none()
+            && self.cfg.temperature.is_none()
+            && self.cfg.top_p.is_none()
+            && self.cfg.top_k.is_none();
+        let mut fallback_used = false;
+
+        let mut n_cur = batch.n_tokens();
+        let mut output_tokens = 0u32;
+        while n_cur < n_len_total {
+            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            if self.model.is_eog_token(token) {
+                if output_tokens == 0 && allow_fallback && !fallback_used {
+                    sampler = self.build_fallback_sampler();
+                    fallback_used = true;
+                    continue;
+                }
+                break;
+            }
+            sampler.accept(token);
+
+            let bytes = self
+                .model
+                .token_to_bytes(token, Special::Tokenize)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+            let chunk = match self.model.token_to_str(token, Special::Tokenize) {
+                Ok(piece) => piece,
+                Err(_) => String::from_utf8_lossy(&bytes).to_string(),
+            };
+            if !chunk.is_empty() {
+                if tx.unbounded_send(Ok(querymt::chat::StreamChunk::Text(chunk)))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            batch.clear();
+            batch
+                .add(token, n_cur, &[0], true)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+            n_cur += 1;
+            output_tokens += 1;
+
+            ctx.decode(&mut batch)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+        }
+
+        Ok(Usage {
+            input_tokens: tokens.len() as u32,
+            output_tokens,
+        })
+    }
 }
 
 #[async_trait]
 impl ChatProvider for LlamaCppProvider {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -451,6 +604,55 @@ impl ChatProvider for LlamaCppProvider {
             text: generated.text,
             usage: generated.usage,
         }))
+    }
+
+    async fn chat_stream_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<querymt::chat::StreamChunk, LLMError>> + Send>>, LLMError>
+    {
+        if tools.is_some() {
+            return Err(LLMError::NotImplemented(
+                "Tool calling is not supported by llama.cpp provider".into(),
+            ));
+        }
+
+        let max_tokens = self.cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        let prompts = self.build_prompt_candidates(messages)?;
+        let (tx, rx) = mpsc::unbounded();
+        let cfg = self.cfg.clone();
+        let model = Arc::clone(&self.model);
+
+        thread::spawn(move || {
+            let provider = LlamaCppProvider { model, cfg };
+            let mut final_usage = None;
+            for (idx, prompt) in prompts.iter().enumerate() {
+                match provider.generate_streaming(prompt, max_tokens, None, &tx) {
+                    Ok(usage) => {
+                        let should_fallback = usage.output_tokens == 0 && idx + 1 < prompts.len();
+                        if should_fallback {
+                            continue;
+                        }
+                        final_usage = Some(usage);
+                        break;
+                    }
+                    Err(err) => {
+                        let _ = tx.unbounded_send(Err(err));
+                        return;
+                    }
+                }
+            }
+
+            if let Some(usage) = final_usage {
+                let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
+                let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Done {
+                    stop_reason: "end_turn".to_string(),
+                }));
+            }
+        });
+
+        Ok(Box::pin(rx))
     }
 }
 
