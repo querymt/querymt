@@ -1,3 +1,4 @@
+use querymt::builder::LLMBuilder;
 use querymt::plugin::{
     extism_impl::host::ExtismLoader, host::PluginRegistry, host::native::NativeLoader,
 };
@@ -7,6 +8,7 @@ use crate::cli_args::CliArgs;
 use crate::secret_store::SecretStore;
 use crate::utils::find_config_in_home;
 use querymt::error::LLMError;
+use serde_json::Value;
 
 /// Splits "provider:model" or just "provider" into (provider, Option<model>)
 pub fn split_provider(s: &str) -> (String, Option<String>) {
@@ -92,4 +94,30 @@ pub async fn get_provider_registry(args: &CliArgs) -> Result<PluginRegistry, LLM
     registry.load_all_plugins().await;
 
     Ok(registry)
+}
+
+/// Applies provider-specific config from providers.toml to the builder.
+pub fn apply_provider_config(
+    mut builder: LLMBuilder,
+    registry: &PluginRegistry,
+    provider: &str,
+) -> Result<LLMBuilder, LLMError> {
+    let provider_cfg = registry
+        .config
+        .providers
+        .iter()
+        .find(|cfg| cfg.name == provider);
+    let Some(provider_cfg) = provider_cfg else {
+        return Ok(builder);
+    };
+    let Some(config) = &provider_cfg.config else {
+        return Ok(builder);
+    };
+
+    for (key, value) in config {
+        let json: Value = serde_json::to_value(value)?;
+        builder = builder.parameter(key.clone(), json);
+    }
+
+    Ok(builder)
 }

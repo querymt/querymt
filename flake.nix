@@ -31,14 +31,20 @@
           openssl
           cmake
           dbus
-          libclang
+          clang
+          llvmPackages.libclang
           rust-bindgen
           pkg-config
         ];
 
-        shellHook = ''
-          export PS1="(env:querymt) $PS1"
-        '';
+        shellHook =
+          /*
+          bash
+          */
+          ''
+            export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+            export PS1="(env:querymt) $PS1"
+          '';
       };
     });
 }

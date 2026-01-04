@@ -1,0 +1,246 @@
+name: Build & Publish Native Provider Plugins
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
+
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Determine which native plugins need rebuilding
+        id: compute
+        shell: bash
+        run: |
+          BASE=${{ github.event.before }}
+          HEAD=${{ github.sha }}
+
+          # all subfolders under crates/providers
+          mapfile -t ALL < <(find crates/providers -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            PROVIDERS=( "${ALL[@]}" )
+          # if this is the very first commit (BASE is all zeros), rebuild everything
+          elif [[ "$BASE" == "0000000000000000000000000000000000000000" ]]; then
+            PROVIDERS=( "${ALL[@]}" )
+          else
+            # list changed files between BASE and HEAD
+            CHANGED=$(git diff --name-only $BASE $HEAD)
+
+            PROVIDERS=()
+            for f in $CHANGED; do
+              # if the querymt library changed, rebuild/test all plugins
+              if [[ $f =~ ^crates/querymt/ ]]; then
+                PROVIDERS=( "${ALL[@]}" )
+                break
+              fi
+
+              # if a provider crate changed, pick it up
+              if [[ $f =~ ^crates/providers/([^/]+)/ ]]; then
+                name=${BASH_REMATCH[1]}
+                # de-dup
+                if [[ ! " ${PROVIDERS[*]} " =~ " $name " ]]; then
+                  PROVIDERS+=( "$name" )
+                fi
+              fi
+            done
+          fi
+
+          get_provider_type() {
+            local crate="$1"
+            local toml="crates/providers/$crate/Cargo.toml"
+            local detected_type=""
+            if [[ -f "$toml" ]]; then
+              detected_type=$(
+                awk -F'=' '
+                  $0 ~ /^\[package\.metadata\.qmt\]/ {in=1; next}
+                  in && $0 ~ /^\[/ {in=0}
+                  in && $1 ~ /provider_type/ {
+                    gsub(/"/, "", $2); gsub(/ /, "", $2); print $2; exit
+                  }
+                ' "$toml"
+              )
+            fi
+            echo "$detected_type"
+          }
+
+          NATIVE=()
+          for p in "${PROVIDERS[@]}"; do
+            if [[ "$(get_provider_type "$p")" == "native" ]]; then
+              NATIVE+=( "$p" )
+            fi
+          done
+
+          if [ ${#NATIVE[@]} -eq 0 ]; then
+            NATIVE=( "noop" )
+          fi
+
+          echo "Final native plugin list: ${NATIVE[*]}"
+
+          entries=()
+          if [[ "${NATIVE[0]}" == "noop" ]]; then
+            entries+=( "{\"crate\":\"noop\"}" )
+          else
+            for p in "${NATIVE[@]}"; do
+              for os in linux darwin windows; do
+                case "$os" in
+                  linux)
+                    runner="ubuntu-latest"
+                    targets=( "x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu" )
+                    arches=( "amd64" "arm64" )
+                    features=( "cuda" "openmp" "vulkan" )
+                    ;;
+                  darwin)
+                    runner="macos-14"
+                    targets=( "x86_64-apple-darwin" "aarch64-apple-darwin" )
+                    arches=( "amd64" "arm64" )
+                    features=( "metal" "openmp" )
+                    ;;
+                  windows)
+                    runner="windows-latest"
+                    targets=( "x86_64-pc-windows-msvc" "aarch64-pc-windows-msvc" )
+                    arches=( "amd64" "arm64" )
+                    features=( "cuda" "openmp" "vulkan" )
+                    ;;
+                esac
+
+                for i in "${!targets[@]}"; do
+                  target="${targets[$i]}"
+                  arch="${arches[$i]}"
+                  for feature in "${features[@]}"; do
+                    if [[ "$os" == "windows" && "$arch" == "arm64" && "$feature" == "cuda" ]]; then
+                      continue
+                    fi
+                    entries+=( "{\"crate\":\"$p\",\"os\":\"$os\",\"arch\":\"$arch\",\"target\":\"$target\",\"feature\":\"$feature\",\"runner\":\"$runner\"}" )
+                  done
+                done
+              done
+            done
+          fi
+
+          joined=$(IFS=, ; echo "${entries[*]}")
+          matrix="{\"include\":[${joined}]}"
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+  publish-native-plugins:
+    needs: detect-changes
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+
+    steps:
+      - name: No crates changed
+        if: matrix.crate == 'noop'
+        run: echo "✅ No native plugin crates to build—skipping."
+
+      - name: Check out code
+        if: matrix.crate != 'noop'
+        uses: actions/checkout@v5
+
+      - name: Read crate version
+        if: matrix.crate != 'noop'
+        id: get-version
+        shell: bash
+        run: |
+          v=$(grep '^version' crates/providers/${{ matrix.crate }}/Cargo.toml \
+                | head -n1 | cut -d'"' -f2)
+          echo "VERSION=$v" >> $GITHUB_ENV
+
+      - name: Install Rust toolchain & target
+        if: matrix.crate != 'noop'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation toolchain
+        if: matrix.crate != 'noop' && runner.os == 'Linux'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Cache Cargo dependencies
+        if: matrix.crate != 'noop'
+        uses: swatinem/rust-cache@v2
+        with:
+          key: native-${{ matrix.target }}-${{ matrix.feature }}
+
+      - name: Set up CUDA toolkit
+        if: matrix.crate != 'noop' && matrix.feature == 'cuda'
+        uses: mjun0812/setup-cuda@v2
+        with:
+          cuda-version: "12.4"
+
+      - name: Build native library
+        if: matrix.crate != 'noop'
+        shell: bash
+        run: |
+          cargo build -p qmt-${{ matrix.crate }} \
+            --release \
+            --target ${{ matrix.target }} \
+            --features ${{ matrix.feature }}
+
+      - name: Package native library
+        if: matrix.crate != 'noop'
+        shell: bash
+        run: |
+          LIB_BASE="qmt_${{ matrix.crate }}"
+          case "${{ matrix.os }}" in
+            linux) LIB_FILE="lib${LIB_BASE}.so" ;;
+            darwin) LIB_FILE="lib${LIB_BASE}.dylib" ;;
+            windows) LIB_FILE="${LIB_BASE}.dll" ;;
+          esac
+
+          mkdir -p dist
+          tar -czf dist/plugin.tar.gz -C "target/${{ matrix.target }}/release" "$LIB_FILE"
+          echo "PLUGIN_TAR=dist/plugin.tar.gz" >> $GITHUB_ENV
+
+      - name: Log in to GHCR
+        if: matrix.crate != 'noop'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Oras CLI
+        if: matrix.crate != 'noop'
+        uses: oras-project/setup-oras@v1
+
+      - name: Create OCI config file
+        if: matrix.crate != 'noop'
+        shell: bash
+        run: echo '{}' > oci-config.json
+
+      - name: Push native artifact to GHCR with Oras
+        if: matrix.crate != 'noop'
+        shell: bash
+        run: |
+          IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}"
+          VERSIONED="${{ env.VERSION }}-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.feature }}"
+          ALIAS="${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.feature }}"
+
+          echo "Pushing native artifact to ${IMAGE_BASE} with tags ${VERSIONED} and ${ALIAS}"
+
+          oras push "${IMAGE_BASE}:${VERSIONED},${ALIAS}" \
+            --config oci-config.json:application/vnd.oci.image.config.v1+json \
+            --annotation "mt.query.plugin.type=native" \
+            --annotation "mt.query.plugin.feature=${{ matrix.feature }}" \
+            --annotation "org.opencontainers.image.version=${{ env.VERSION }}" \
+            --annotation "org.opencontainers.image.os=${{ matrix.os }}" \
+            --annotation "org.opencontainers.image.architecture=${{ matrix.arch }}" \
+            ${PLUGIN_TAR}:application/vnd.oci.image.layer.v1.tar+gzip
