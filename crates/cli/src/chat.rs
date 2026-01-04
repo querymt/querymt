@@ -141,45 +141,58 @@ pub async fn handle_any_response(
                     }
                 }
 
-                while let Some(chunk_res) = stream.next().await {
-                    match chunk_res? {
-                        StreamChunk::Text(t) => {
-                            log::trace!("Received stream text chunk: {} bytes", t.len());
-                            print!("{}", t);
-                            io::stdout().flush().ok();
-                            full_text.push_str(&t);
-                        }
-                        StreamChunk::ToolUseStart { index, id, name } => {
-                            log::debug!("Received tool use start: {} (idx {})", name, index);
-                            tool_calls_map.insert(index, (id, name, String::new()));
-                        }
-                        StreamChunk::ToolUseInputDelta {
-                            index,
-                            partial_json,
-                        } => {
-                            log::trace!(
-                                "Received tool use input delta: {} bytes (idx {})",
-                                partial_json.len(),
-                                index
-                            );
-                            if let Some(entry) = tool_calls_map.get_mut(&index) {
-                                entry.2.push_str(&partial_json);
+                loop {
+                    tokio::select! {
+                        chunk = stream.next() => {
+                            let Some(chunk_res) = chunk else {
+                                break;
+                            };
+                            match chunk_res? {
+                                StreamChunk::Text(t) => {
+                                    log::trace!("Received stream text chunk: {} bytes", t.len());
+                                    print!("{}", t);
+                                    io::stdout().flush().ok();
+                                    full_text.push_str(&t);
+                                }
+                                StreamChunk::ToolUseStart { index, id, name } => {
+                                    log::debug!("Received tool use start: {} (idx {})", name, index);
+                                    tool_calls_map.insert(index, (id, name, String::new()));
+                                }
+                                StreamChunk::ToolUseInputDelta {
+                                    index,
+                                    partial_json,
+                                } => {
+                                    log::trace!(
+                                        "Received tool use input delta: {} bytes (idx {})",
+                                        partial_json.len(),
+                                        index
+                                    );
+                                    if let Some(entry) = tool_calls_map.get_mut(&index) {
+                                        entry.2.push_str(&partial_json);
+                                    }
+                                }
+                                StreamChunk::ToolUseComplete { .. } => {
+                                    log::debug!("Received tool use complete");
+                                }
+                                StreamChunk::Usage(usage) => {
+                                    log::debug!(
+                                        "Usage: input={}, output={}",
+                                        usage.input_tokens,
+                                        usage.output_tokens
+                                    );
+                                }
+                                StreamChunk::Done { stop_reason } => {
+                                    log::debug!("Stream done: stop_reason={}", stop_reason);
+                                    println!();
+                                    break;
+                                }
                             }
                         }
-                        StreamChunk::ToolUseComplete { .. } => {
-                            log::debug!("Received tool use complete");
-                        }
-                        StreamChunk::Usage(usage) => {
-                            log::debug!(
-                                "Usage: input={}, output={}",
-                                usage.input_tokens,
-                                usage.output_tokens
-                            );
-                        }
-                        StreamChunk::Done { stop_reason } => {
-                            log::debug!("Stream done: stop_reason={}", stop_reason);
+                        _ = tokio::signal::ctrl_c() => {
                             println!();
-                            break;
+                            println!("{}", "Interrupted.".bright_yellow());
+                            print_separator();
+                            return Ok(());
                         }
                     }
                 }
@@ -477,20 +490,31 @@ pub async fn interactive_loop(
                 messages.push(ChatMessage::user().content(trimmed.to_string()).build());
                 let mut sp =
                     Spinner::new(Spinners::Dots12, "Thinking...".bright_magenta().to_string());
-                match unified_chat(&messages, provider).await {
-                    Ok(initial) => {
-                        handle_any_response(
-                            &mut messages,
-                            initial,
-                            provider,
-                            tool_config,
-                            Some(sp),
-                        )
-                        .await?;
+                let chat_fut = unified_chat(&messages, provider);
+                tokio::select! {
+                    res = chat_fut => {
+                        match res {
+                            Ok(initial) => {
+                                handle_any_response(
+                                    &mut messages,
+                                    initial,
+                                    provider,
+                                    tool_config,
+                                    Some(sp),
+                                )
+                                .await?;
+                            }
+                            Err(e) => {
+                                sp.stop();
+                                eprintln!("{} {}", "Error:".bright_red(), e);
+                                print_separator();
+                            }
+                        }
                     }
-                    Err(e) => {
+                    _ = tokio::signal::ctrl_c() => {
                         sp.stop();
-                        eprintln!("{} {}", "Error:".bright_red(), e);
+                        println!();
+                        println!("{}", "Interrupted.".bright_yellow());
                         print_separator();
                     }
                 }
