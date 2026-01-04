@@ -1,0 +1,103 @@
+use async_trait::async_trait;
+use querymt::chat::{FunctionTool, Tool};
+use querymt::error::LLMError;
+use serde_json::{Value, json};
+use std::time::Duration;
+
+use crate::tools::registry::BuiltInTool;
+
+pub struct WebFetchTool {
+    client: reqwest::Client,
+}
+
+impl WebFetchTool {
+    pub fn new() -> Self {
+        let client = reqwest::Client::builder()
+            .user_agent("qmt-agent-web-fetch/0.1")
+            .build()
+            .unwrap();
+        Self { client }
+    }
+}
+
+#[async_trait(?Send)]
+impl BuiltInTool for WebFetchTool {
+    fn name(&self) -> &str {
+        "web_fetch"
+    }
+
+    fn definition(&self) -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionTool {
+                name: self.name().to_string(),
+                description: "Fetch a URL and return the response body as text (UTF-8 lossy)."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The URL to fetch."
+                        },
+                        "max_bytes": {
+                            "type": "integer",
+                            "description": "Maximum response bytes to return.",
+                            "default": 65536
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Request timeout in milliseconds.",
+                            "default": 10000
+                        }
+                    },
+                    "required": ["url"]
+                }),
+            },
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<String, LLMError> {
+        let url = args
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| LLMError::InvalidRequest("url is required".to_string()))?;
+        let max_bytes = args
+            .get("max_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(65_536) as usize;
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(10_000);
+
+        let response = self
+            .client
+            .get(url)
+            .timeout(Duration::from_millis(timeout_ms))
+            .send()
+            .await
+            .map_err(|e| LLMError::ProviderError(format!("request failed: {}", e)))?;
+
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| LLMError::ProviderError(format!("read failed: {}", e)))?;
+
+        let mut body = String::from_utf8_lossy(&bytes).to_string();
+        let mut truncated = false;
+        if body.len() > max_bytes {
+            body.truncate(max_bytes);
+            truncated = true;
+        }
+
+        let result = json!({
+            "status": status.as_u16(),
+            "truncated": truncated,
+            "body": body
+        });
+        serde_json::to_string(&result)
+            .map_err(|e| LLMError::ProviderError(format!("serialize failed: {}", e)))
+    }
+}

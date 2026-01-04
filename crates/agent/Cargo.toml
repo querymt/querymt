@@ -1,0 +1,35 @@
+[package]
+name = "qmt-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Agent and Session management for querymt"
+
+[dependencies]
+querymt = { path = "../querymt", default-features = false, features = ["reqwest-client", "extism_host", "mcp", "native", "tracing", "http-client"] }
+agent-client-protocol = "0.9"
+async-trait.workspace = true
+anyhow = "1.0"
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled", "uuid", "time"] }
+rusqlite_migration = "2.3"
+time = { version = "0.3", features = ["serde"] }
+uuid = { version = "1.18", features = ["v4"] }
+blake3 = "1.8.2"
+ignore = "0.4.25"
+grep = "0.4.1"
+grep-searcher = "0.1.16"
+grep-regex = "0.1.14"
+similar = "2.7.0"
+pathdiff = "0.2.3"
+
+[lib]
+name = "querymt_agent"
+path = "src/lib.rs"
+
+[dev-dependencies]
+tokio-util = { version = "0.7", features = ["compat"] }

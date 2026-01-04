@@ -1,6 +1,7 @@
 use crate::{error::LLMError, LLMProvider};
 use futures::future::BoxFuture;
 use serde_json::Value;
+use std::path::PathBuf;
 
 #[cfg(feature = "http-client")]
 pub mod adapters;
@@ -16,6 +17,25 @@ pub mod host;
 pub mod extism_impl;
 
 pub type Fut<'a, T> = BoxFuture<'a, T>;
+
+#[cfg(feature = "extism_host")]
+pub fn default_providers_path() -> PathBuf {
+    if let Some(home_dir) = dirs::home_dir() {
+        return home_dir.join(".qmt").join("providers.toml");
+    }
+    if let Some(config_dir) = dirs::config_dir() {
+        return config_dir.join("qmt").join("providers.toml");
+    }
+    PathBuf::from(".qmt").join("providers.toml")
+}
+
+#[cfg(not(feature = "extism_host"))]
+pub fn default_providers_path() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        return PathBuf::from(home).join(".qmt").join("providers.toml");
+    }
+    PathBuf::from(".qmt").join("providers.toml")
+}
 
 pub trait LLMProviderFactory: Send + Sync {
     fn name(&self) -> &str;

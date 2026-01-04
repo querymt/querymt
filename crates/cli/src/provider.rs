@@ -1,5 +1,6 @@
 use querymt::plugin::{
-    extism_impl::host::ExtismLoader, host::PluginRegistry, host::native::NativeLoader,
+    default_providers_path, extism_impl::host::ExtismLoader, host::PluginRegistry,
+    host::native::NativeLoader,
 };
 use std::path::PathBuf;
 
@@ -76,13 +77,19 @@ pub async fn get_provider_registry(args: &CliArgs) -> Result<PluginRegistry, LLM
     let cfg_file = if let Some(cfg) = &args.provider_config {
         PathBuf::from(cfg)
     } else {
-        find_config_in_home(&["providers.json", "providers.toml", "providers.yaml"]).map_err(
-            |_| {
-                LLMError::InvalidRequest(
-                    "Config file for providers is missing. Please provide one!".to_string(),
-                )
-            },
-        )?
+        let default_cfg = default_providers_path();
+        if default_cfg.is_file() {
+            default_cfg
+        } else {
+            find_config_in_home(&["providers.json", "providers.toml", "providers.yaml"]).map_err(
+                |_| {
+                    LLMError::InvalidRequest(format!(
+                        "Config file for providers is missing. Expected {:?}.",
+                        default_providers_path()
+                    ))
+                },
+            )?
+        }
     };
 
     let mut registry = PluginRegistry::from_path(cfg_file)?;

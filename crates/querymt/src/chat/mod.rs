@@ -389,6 +389,29 @@ pub trait ChatResponse: std::fmt::Debug + std::fmt::Display + Send {
     fn usage(&self) -> Option<Usage>;
 }
 
+impl From<&dyn ChatResponse> for ChatMessage {
+    fn from(response: &dyn ChatResponse) -> Self {
+        let content = response.text().unwrap_or_default();
+        let tool_calls = response.tool_calls();
+        let message_type = if let Some(calls) = tool_calls.clone() {
+            MessageType::ToolUse(calls)
+        } else {
+            MessageType::Text
+        };
+        ChatMessage {
+            role: ChatRole::Assistant,
+            message_type,
+            content,
+        }
+    }
+}
+
+impl From<Box<dyn ChatResponse>> for ChatMessage {
+    fn from(response: Box<dyn ChatResponse>) -> Self {
+        ChatMessage::from(response.as_ref())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamChunk {
