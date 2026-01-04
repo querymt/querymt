@@ -1,0 +1,85 @@
+name: Test Agent
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'crates/agent/**'
+      - 'crates/querymt/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/test-agent.yml'
+  pull_request:
+    paths:
+      - 'crates/agent/**'
+      - 'crates/querymt/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/test-agent.yml'
+
+jobs:
+  # Job 1: Check formatting (fast, fails first)
+  format:
+    name: Check formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # Job 2: Run Clippy (parallel with format)
+  clippy:
+    name: Clippy lints
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+      
+      - name: Run Clippy
+        run: cargo clippy --package qmt-agent --all-targets -- -D warnings
+
+  # Job 3: Run tests with coverage
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: [format, clippy]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+      
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+      
+      - name: Run tests with coverage
+        run: cargo tarpaulin --package qmt-agent --all-targets --out xml --output-dir ./coverage
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/cobertura.xml
+          flags: agent
+          fail_ci_if_error: false
+     

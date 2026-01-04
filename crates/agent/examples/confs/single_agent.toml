@@ -1,0 +1,39 @@
+# Single Agent Configuration Example
+#
+# This demonstrates configuring a single AI agent with tools and MCP support.
+
+[agent]
+cwd = "."
+db = "./agent.db"
+
+# Provider configuration - supports env var interpolation
+provider = "openai"
+model = "${MODEL:-gpt-4}"
+# api_key = "${OPENAI_API_KEY}"  # Uncomment to use API key from env
+
+# Tools available to the agent
+# Can be builtin tools or MCP tools using patterns:
+# - "edit" - builtin tool
+# - "github.*" - all tools from github MCP server
+# - "github.search_repos" - specific tool from github MCP server
+tools = [
+    "read_file",
+    "edit", 
+    "shell",
+    "glob",
+    "search_text"
+]
+
+# System prompt (inline)
+system = "You are a helpful coding assistant."
+
+# Or load from file (mutually exclusive with system)
+# system_file = "prompts/assistant.md"
+
+# Optional: MCP servers for external tools
+# [[mcp]]
+# name = "github"
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@anthropic/mcp-server-github"]
+# env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }

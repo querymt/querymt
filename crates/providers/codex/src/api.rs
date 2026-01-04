@@ -5,7 +5,10 @@ use http::{
 };
 use querymt::{
     FunctionCall, ToolCall, Usage,
-    chat::{ChatMessage, ChatResponse, ChatRole, MessageType, StreamChunk, Tool, ToolChoice},
+    chat::{
+        ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, StreamChunk, Tool,
+        ToolChoice,
+    },
     error::LLMError,
     handle_http_error,
 };
@@ -159,6 +162,7 @@ struct CodexOutputContent {
     #[serde(rename = "type")]
     content_type: String,
     text: Option<String>,
+    tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -181,10 +185,10 @@ impl ChatResponse for CodexChatResponse {
             }
             if let Some(content) = &output.content {
                 for item in content {
-                    if item.content_type == "output_text" || item.content_type == "text" {
-                        if let Some(text) = &item.text {
-                            pieces.push(text.clone());
-                        }
+                    if (item.content_type == "output_text" || item.content_type == "text")
+                        && let Some(text) = &item.text
+                    {
+                        pieces.push(text.clone());
                     }
                 }
             }
@@ -196,12 +200,17 @@ impl ChatResponse for CodexChatResponse {
         }
     }
 
-    fn tool_calls(&self) -> Option<Vec<querymt::ToolCall>> {
+    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+        //self.output.iter().flat_map(|c| c.content).collect();
         None
     }
 
     fn usage(&self) -> Option<Usage> {
         self.usage.clone()
+    }
+
+    fn finish_reason(&self) -> Option<FinishReason> {
+        None
     }
 }
 
@@ -344,7 +353,7 @@ pub fn codex_parse_chat(response: Response<Vec<u8>>) -> Result<Box<dyn ChatRespo
     handle_http_error!(response);
 
     let json_resp: Result<CodexChatResponse, serde_json::Error> =
-        serde_json::from_slice(&response.body());
+        serde_json::from_slice(response.body());
     match json_resp {
         Ok(response) => Ok(Box::new(response)),
         Err(e) => Err(LLMError::ResponseFormatError {
@@ -426,10 +435,10 @@ pub fn codex_parse_stream_chunk_with_state(
             "response.completed" => {
                 if let Some(response) = event.response {
                     emit_tool_calls_from_response(&response, &mut results, tool_state_buffer);
-                    if let Some(usage_value) = response.get("usage") {
-                        if let Ok(usage) = serde_json::from_value::<Usage>(usage_value.clone()) {
-                            results.push(StreamChunk::Usage(usage));
-                        }
+                    if let Some(usage_value) = response.get("usage")
+                        && let Ok(usage) = serde_json::from_value::<Usage>(usage_value.clone())
+                    {
+                        results.push(StreamChunk::Usage(usage));
                     }
                 }
                 results.push(StreamChunk::Done {
@@ -484,11 +493,11 @@ fn handle_output_item_event(
     if let Some(name) = name {
         state.name = Some(name);
     }
-    if !state.started {
-        if let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
-            state.started = true;
-            results.push(StreamChunk::ToolUseStart { index, id, name });
-        }
+    if !state.started
+        && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone())
+    {
+        state.started = true;
+        results.push(StreamChunk::ToolUseStart { index, id, name });
     }
 
     if let Some(arguments) = arguments {
@@ -507,11 +516,11 @@ fn handle_function_call_arguments_delta(
     let index = resolve_tool_index_with_item(output_index, item_id, tool_state_buffer);
     let mut buffer = tool_state_buffer.lock().unwrap();
     let state = buffer.entry(index).or_default();
-    if !state.started {
-        if let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
-            state.started = true;
-            results.push(StreamChunk::ToolUseStart { index, id, name });
-        }
+    if !state.started
+        && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone())
+    {
+        state.started = true;
+        results.push(StreamChunk::ToolUseStart { index, id, name });
     }
     state.arguments.push_str(delta);
     results.push(StreamChunk::ToolUseInputDelta {
@@ -529,11 +538,11 @@ fn handle_function_call_arguments_done(
     let index = resolve_tool_index_with_item(output_index, item_id, tool_state_buffer);
     let mut buffer = tool_state_buffer.lock().unwrap();
     if let Some(state) = buffer.get_mut(&index) {
-        if !state.started {
-            if let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
-                state.started = true;
-                results.push(StreamChunk::ToolUseStart { index, id, name });
-            }
+        if !state.started
+            && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone())
+        {
+            state.started = true;
+            results.push(StreamChunk::ToolUseStart { index, id, name });
         }
         emit_tool_complete(index, state, results);
     }
@@ -571,11 +580,11 @@ fn emit_tool_calls_from_response(
         if let Some(name) = name {
             state.name = Some(name);
         }
-        if !state.started {
-            if let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
-                state.started = true;
-                results.push(StreamChunk::ToolUseStart { index, id, name });
-            }
+        if !state.started
+            && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone())
+        {
+            state.started = true;
+            results.push(StreamChunk::ToolUseStart { index, id, name });
         }
         if !arguments.is_empty() {
             emit_arguments_delta(index, arguments, state, results);
@@ -717,7 +726,7 @@ pub fn codex_list_models_request_from_value(cfg: &Value) -> Result<Request<Vec<u
 pub fn codex_parse_list_models(response: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
     handle_http_error!(response);
     let json_resp: Result<CodexModelsResponse, serde_json::Error> =
-        serde_json::from_slice(&response.body());
+        serde_json::from_slice(response.body());
     match json_resp {
         Ok(response) => Ok(response.models.into_iter().map(|m| m.slug).collect()),
         Err(e) => Err(LLMError::ResponseFormatError {

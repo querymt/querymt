@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/agent",
     "crates/querymt",
     "crates/cli",
     "crates/providers/*", "crates/querymt-extism-macros",

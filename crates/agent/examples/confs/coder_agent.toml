@@ -1,0 +1,28 @@
+# Coder Agent - Multi-agent system for code implementation
+#
+# This configuration defines a quorum with a planner agent that coordinates
+# a specialized coder agent for implementation tasks.
+
+[quorum]
+cwd = "."
+db = "./test.db"
+delegation = true
+verification = false
+
+[planner]
+provider = "moonshotai"
+model = "kimi-k2-thinking-turbo"
+tools = ["delegate", "create_task", "search_text", "glob", "ls", "read_file", "shell"]
+system_file = "../prompts/planner.md"
+
+[[delegates]]
+id = "coder"
+provider = "ollama"
+model = "devstral-small-2:latest"
+description = "Specialized in implementation and code writing"
+capabilities = ["rust", "python"]
+tools = ["edit", "glob", "ls", "shell", "read_file", "write_file"]
+system_file = "../prompts/coder.md"
+
+[delegates.parameters]
+num_ctx = 65536

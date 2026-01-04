@@ -58,33 +58,6 @@ struct CacheMetadata {
     retrieved_at_unix: u64,
 }
 
-// Docker manifest format v2
-#[derive(Debug, Serialize, Deserialize)]
-struct DockerManifest {
-    #[serde(rename = "schemaVersion")]
-    schema_version: u32,
-    #[serde(rename = "mediaType")]
-    media_type: String,
-    config: DockerManifestConfig,
-    layers: Vec<DockerManifestLayer>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct DockerManifestConfig {
-    #[serde(rename = "mediaType")]
-    media_type: String,
-    size: u64,
-    digest: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct DockerManifestLayer {
-    #[serde(rename = "mediaType")]
-    media_type: String,
-    size: u64,
-    digest: String,
-}
-
 fn build_auth(reference: &Reference) -> RegistryAuth {
     let server = reference
         .resolve_registry()
@@ -116,7 +89,7 @@ fn build_auth(reference: &Reference) -> RegistryAuth {
 
 async fn setup_trust_repository(
     config: &OciDownloaderConfig,
-) -> Result<Box<dyn TrustRoot>, anyhow::Error> {
+) -> Result<Box<dyn TrustRoot + Send + Sync>, anyhow::Error> {
     if config.use_sigstore_tuf_data {
         // Use Sigstore TUF data from the official repository
         log::info!("Using Sigstore TUF data for verification");
@@ -603,27 +576,35 @@ impl OciDownloader {
             Err(e) => {
                 match e {
                     OciDistributionError::RegistryError { envelope, url } => {
-                        // FIXME: errors is a Vec<> so need to check the others
-                        for e in envelope.errors {
-                            if e.code == OciErrorCode::Denied {
-                                return Err(format!(
-                                    "Access denied for '{:?}': {}",
-                                    url, e.message
-                                )
-                                .into());
-                            } else if e.code == OciErrorCode::Unauthorized {
-                                return Err(format!(
-                                    "Unauthorized access to '{:?}': {}",
-                                    url, e.message
-                                )
-                                .into());
-                            } else {
-                                return Err(format!(
-                                    "Error while accessing '{:?}': {}",
-                                    url, e.message
-                                )
-                                .into());
+                        // Prioritize auth-related errors as they are most actionable
+                        let auth_error = envelope.errors.iter().find(|e| {
+                            matches!(e.code, OciErrorCode::Denied | OciErrorCode::Unauthorized)
+                        });
+
+                        if let Some(e) = auth_error {
+                            match e.code {
+                                OciErrorCode::Denied => {
+                                    return Err(format!(
+                                        "Access denied for '{:?}': {}",
+                                        url, e.message
+                                    )
+                                    .into());
+                                }
+                                OciErrorCode::Unauthorized => {
+                                    return Err(format!(
+                                        "Unauthorized access to '{:?}': {}",
+                                        url, e.message
+                                    )
+                                    .into());
+                                }
+                                _ => unreachable!(),
                             }
+                        } else if let Some(e) = envelope.errors.first() {
+                            return Err(format!(
+                                "Error while accessing '{:?}': {}",
+                                url, e.message
+                            )
+                            .into());
                         }
                     }
                     OciDistributionError::UnauthorizedError { url } => {

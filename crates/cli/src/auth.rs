@@ -107,12 +107,19 @@ impl OAuthProvider for AnthropicProvider {
 
 /// OpenAI OAuth provider implementation
 pub struct OpenAIProvider {
+    client: openai_auth::OAuthClient,
     api_key: Arc<Mutex<Option<String>>>,
 }
 
 impl OpenAIProvider {
     pub fn new() -> Self {
+        let config = openai_auth::OAuthConfig::builder()
+            .redirect_port(1455)
+            .build();
+        let client =
+            openai_auth::OAuthClient::new(config).expect("Failed to create OpenAI OAuth client");
         Self {
+            client,
             api_key: Arc::new(Mutex::new(None)),
         }
     }
@@ -129,38 +136,27 @@ impl OAuthProvider for OpenAIProvider {
     }
 
     async fn start_flow(&self) -> Result<OAuthFlowData> {
-        use openai_auth::{OAuthClient as OpenAIOAuthClient, OAuthConfig as OpenAIOAuthConfig};
-
-        let client = OpenAIOAuthClient::new(OpenAIOAuthConfig::default())?;
-        let flow = client.start_flow()?;
+        let flow = self.client.start_flow()?;
 
         Ok(OAuthFlowData {
             authorization_url: flow.authorization_url,
             state: flow.state,
-            verifier: flow.pkce_verifier, // Note: OpenAI uses 'pkce_verifier'
+            verifier: flow.pkce_verifier,
         })
     }
 
     async fn exchange_code(&self, code: &str, _state: &str, verifier: &str) -> Result<TokenSet> {
-        use openai_auth::{OAuthClient as OpenAIOAuthClient, OAuthConfig as OpenAIOAuthConfig};
+        // Use exchange_code_for_api_key to get tokens with API key in one call
+        let tokens = self
+            .client
+            .exchange_code_for_api_key(code, verifier)
+            .await?;
 
-        let client = OpenAIOAuthClient::new(OpenAIOAuthConfig::default())?;
-        let tokens = client.exchange_code(code, verifier).await?;
-
-        if let Some(id_token) = tokens.id_token.as_deref() {
-            match client.obtain_api_key(id_token).await {
-                Ok(api_key) => {
-                    if let Ok(mut slot) = self.api_key.lock() {
-                        *slot = Some(api_key);
-                    }
-                }
-                Err(err) => {
-                    println!(
-                        "OpenAI OAuth: API key exchange failed ({}). Try the `codex` provider if you only have OAuth access.",
-                        err
-                    );
-                }
-            }
+        // Store the API key if present
+        if let Some(ref api_key) = tokens.api_key
+            && let Ok(mut slot) = self.api_key.lock()
+        {
+            *slot = Some(api_key.clone());
         }
 
         Ok(TokenSet {
@@ -171,13 +167,11 @@ impl OAuthProvider for OpenAIProvider {
     }
 
     async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
-        use openai_auth::{OAuthClient as OpenAIOAuthClient, OAuthConfig as OpenAIOAuthConfig};
+        let tokens = self.client.refresh_token(refresh_token).await?;
 
-        let client = OpenAIOAuthClient::new(OpenAIOAuthConfig::default())?;
-        let tokens = client.refresh_token(refresh_token).await?;
-
-        if let Some(id_token) = tokens.id_token.as_deref() {
-            match client.obtain_api_key(id_token).await {
+        // Try to obtain API key if we have an id_token
+        if let Some(ref id_token) = tokens.id_token {
+            match self.client.obtain_api_key(id_token).await {
                 Ok(api_key) => {
                     if let Ok(mut slot) = self.api_key.lock() {
                         *slot = Some(api_key);
@@ -260,30 +254,52 @@ pub async fn authenticate(provider: &dyn OAuthProvider, store: &mut SecretStore)
     }
 
     // Try automatic callback server or fall back to manual entry
-    let code = if provider.supports_callback_server() {
-        match try_callback_server(provider, &flow).await {
-            Ok(code) => code,
-            Err(e) => {
-                println!("{} Callback server failed: {}", "⚠️".bright_yellow(), e);
-                println!("Falling back to manual code entry...\n");
-                manual_code_entry()?
+    // For OpenAI with callback server, we get tokens directly
+    let (tokens, callback_api_key) =
+        if provider.supports_callback_server() && provider.name() == "openai" {
+            match try_callback_server_openai(provider, &flow).await {
+                Ok((tokens, api_key)) => {
+                    // Callback server already exchanged tokens
+                    (tokens, api_key)
+                }
+                Err(e) => {
+                    println!("{} Callback server failed: {}", "⚠️".bright_yellow(), e);
+                    println!("Falling back to manual code entry...\n");
+                    let code = manual_code_entry()?;
+                    println!("\n{} Exchanging code for tokens...", "🔄".bright_blue());
+                    let tokens = provider
+                        .exchange_code(&code, &flow.state, &flow.verifier)
+                        .await?;
+                    (tokens, None)
+                }
             }
-        }
-    } else {
-        manual_code_entry()?
-    };
-
-    println!("\n{} Exchanging code for tokens...", "🔄".bright_blue());
-    let tokens = provider
-        .exchange_code(&code, &flow.state, &flow.verifier)
-        .await?;
+        } else {
+            // Manual flow for other providers or when callback not supported
+            let code = manual_code_entry()?;
+            println!("\n{} Exchanging code for tokens...", "🔄".bright_blue());
+            let tokens = provider
+                .exchange_code(&code, &flow.state, &flow.verifier)
+                .await?;
+            (tokens, None)
+        };
 
     // Store tokens
     store.set_oauth_tokens(provider.name(), &tokens)?;
     println!("{} Successfully authenticated!", "✓".bright_green());
 
     // Try to create API key if provider supports it
-    if let Ok(Some(api_key)) = provider.create_api_key(&tokens.access_token).await {
+    // First check if we already got one from callback server
+    let api_key = if let Some(key) = callback_api_key {
+        Some(key)
+    } else {
+        provider
+            .create_api_key(&tokens.access_token)
+            .await
+            .ok()
+            .flatten()
+    };
+
+    if let Some(api_key) = api_key {
         println!("\n{} Creating API key...", "🔑".bright_blue());
 
         // Store API key separately
@@ -315,35 +331,55 @@ pub async fn authenticate(provider: &dyn OAuthProvider, store: &mut SecretStore)
     Ok(())
 }
 
-/// Try to use callback server for automatic code capture
-async fn try_callback_server(provider: &dyn OAuthProvider, flow: &OAuthFlowData) -> Result<String> {
-    if provider.name() == "openai" {
-        use openai_auth::run_callback_server;
+/// Try to use callback server for automatic code capture and token exchange (OpenAI only)
+async fn try_callback_server_openai(
+    provider: &dyn OAuthProvider,
+    flow: &OAuthFlowData,
+) -> Result<(TokenSet, Option<String>)> {
+    use openai_auth::run_callback_server;
 
-        let port = provider.callback_port().unwrap_or(1455);
+    let port = provider.callback_port().unwrap_or(1455);
 
-        println!(
-            "{} Starting callback server on port {}...",
-            "🌐".bright_blue(),
-            port
-        );
-        println!("{} Waiting for OAuth callback...", "⏳".bright_cyan());
-        println!("   (The browser should redirect automatically after you authorize)\n");
+    println!(
+        "{} Starting callback server on port {}...",
+        "🌐".bright_blue(),
+        port
+    );
+    println!("{} Waiting for OAuth callback...", "⏳".bright_cyan());
+    println!("   (The browser should redirect automatically after you authorize)\n");
 
-        // Start callback server with 2 minute timeout
-        let code_future = run_callback_server(port, &flow.state);
-        let timeout_duration = Duration::from_secs(120); // 2 minutes
+    // Create a temporary client for the callback server
+    let config = openai_auth::OAuthConfig::builder()
+        .redirect_port(port)
+        .build();
+    let client = openai_auth::OAuthClient::new(config)?;
 
-        match tokio::time::timeout(timeout_duration, code_future).await {
-            Ok(Ok(code)) => {
-                println!("{} Authorization code received!", "✓".bright_green());
-                Ok(code)
-            }
-            Ok(Err(e)) => Err(anyhow!("Callback server error: {}", e)),
-            Err(_) => Err(anyhow!("Timeout waiting for OAuth callback (2 minutes)")),
+    // Start callback server with 2 minute timeout
+    // New API: pass client and verifier, returns TokenSet directly
+    let tokens_future = run_callback_server(port, &flow.state, &client, &flow.verifier);
+    let timeout_duration = Duration::from_secs(120); // 2 minutes
+
+    match tokio::time::timeout(timeout_duration, tokens_future).await {
+        Ok(Ok(tokens)) => {
+            println!(
+                "{} Authorization and token exchange complete!",
+                "✓".bright_green()
+            );
+
+            // Extract API key if present
+            let api_key = tokens.api_key.clone();
+
+            // Convert openai_auth::TokenSet to anthropic_auth::TokenSet
+            let token_set = TokenSet {
+                access_token: tokens.access_token,
+                refresh_token: tokens.refresh_token,
+                expires_at: tokens.expires_at,
+            };
+
+            Ok((token_set, api_key))
         }
-    } else {
-        Err(anyhow!("Callback server not supported for this provider"))
+        Ok(Err(e)) => Err(anyhow!("Callback server error: {}", e)),
+        Err(_) => Err(anyhow!("Timeout waiting for OAuth callback (2 minutes)")),
     }
 }
 
@@ -358,10 +394,10 @@ fn manual_code_entry() -> Result<String> {
 
     // For OpenAI, try to extract code from query string if present
     // This handles cases where user pastes the full callback URL
-    if response.contains('?') || response.contains('&') {
-        if let Some(code) = extract_code_from_query(response) {
-            return Ok(code);
-        }
+    if (response.contains('?') || response.contains('&'))
+        && let Some(code) = extract_code_from_query(response)
+    {
+        return Ok(code);
     }
 
     Ok(response.to_string())
@@ -386,10 +422,10 @@ fn extract_code_from_query(input: &str) -> Option<String> {
     // Handle query string like ?code=xxx&state=yyy or code=xxx&state=yyy
     let query = input.trim_start_matches('?');
     for part in query.split('&') {
-        if let Some((key, value)) = part.split_once('=') {
-            if key == "code" {
-                return Some(value.to_string());
-            }
+        if let Some((key, value)) = part.split_once('=')
+            && key == "code"
+        {
+            return Some(value.to_string());
         }
     }
 
@@ -419,10 +455,10 @@ pub async fn refresh_tokens(
     // Store the new tokens
     store.set_oauth_tokens(provider.name(), &new_tokens)?;
 
-    if let Ok(Some(api_key)) = provider.create_api_key(&new_tokens.access_token).await {
-        if let Some(key_name) = provider.api_key_name() {
-            store.set(key_name, &api_key)?;
-        }
+    if let Ok(Some(api_key)) = provider.create_api_key(&new_tokens.access_token).await
+        && let Some(key_name) = provider.api_key_name()
+    {
+        store.set(key_name, &api_key)?;
     }
 
     Ok(new_tokens)
@@ -446,10 +482,10 @@ pub async fn get_valid_token(
         if let Some(token) = store.get_valid_access_token(provider.name()) {
             return Ok(token);
         }
-        if let Some(key_name) = provider.api_key_name() {
-            if let Some(api_key) = store.get(key_name) {
-                return Ok(api_key);
-            }
+        if let Some(key_name) = provider.api_key_name()
+            && let Some(api_key) = store.get(key_name)
+        {
+            return Ok(api_key);
         }
         return Err(anyhow!(
             "OpenAI API key not found; run 'qmt auth login openai' to re-authenticate"

@@ -314,19 +314,21 @@ impl JsonSchema for ToolChoice {
 
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
         // string variant schema
-        let mut str_schema = SchemaObject::default();
-        str_schema.instance_type = Some(SingleOrVec::Single(Box::new(InstanceType::String)));
-        str_schema.metadata = Some(Box::new(Metadata {
-            description: Some(
-                "One of the string options: \"required\", \"auto\", \"none\"".to_string(),
-            ),
+        let str_schema = SchemaObject {
+            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
+            metadata: Some(Box::new(Metadata {
+                description: Some(
+                    "One of the string options: \"required\", \"auto\", \"none\"".to_string(),
+                ),
+                ..Default::default()
+            })),
+            enum_values: Some(vec![
+                serde_json::Value::String("required".to_string()),
+                serde_json::Value::String("auto".to_string()),
+                serde_json::Value::String("none".to_string()),
+            ]),
             ..Default::default()
-        }));
-        str_schema.enum_values = Some(vec![
-            serde_json::Value::String("required".to_string()),
-            serde_json::Value::String("auto".to_string()),
-            serde_json::Value::String("none".to_string()),
-        ]);
+        };
 
         // function object schema
         let mut func_obj = ObjectValidation::default();
@@ -383,10 +385,45 @@ impl JsonSchema for ToolChoice {
 pub trait ChatResponse: std::fmt::Debug + std::fmt::Display + Send {
     fn text(&self) -> Option<String>;
     fn tool_calls(&self) -> Option<Vec<ToolCall>>;
+    fn finish_reason(&self) -> Option<FinishReason>;
     fn thinking(&self) -> Option<String> {
         None
     }
     fn usage(&self) -> Option<Usage>;
+}
+
+impl From<&dyn ChatResponse> for ChatMessage {
+    fn from(response: &dyn ChatResponse) -> Self {
+        let content = response.text().unwrap_or_default();
+        let tool_calls = response.tool_calls();
+        let message_type = if let Some(calls) = tool_calls.clone() {
+            MessageType::ToolUse(calls)
+        } else {
+            MessageType::Text
+        };
+        ChatMessage {
+            role: ChatRole::Assistant,
+            message_type,
+            content,
+        }
+    }
+}
+
+impl From<Box<dyn ChatResponse>> for ChatMessage {
+    fn from(response: Box<dyn ChatResponse>) -> Self {
+        ChatMessage::from(response.as_ref())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    Stop,
+    Length,
+    ContentFilter,
+    ToolCalls,
+    Error,
+    Other,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

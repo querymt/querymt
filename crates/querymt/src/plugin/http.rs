@@ -19,9 +19,12 @@ pub trait HTTPLLMProviderFactory: Send + Sync {
     fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError>;
 
     /// Given a chosen model name, build a sync `HttpLLMProvider`
+    // FIXME: refactor to follow rust standards
+    #[allow(clippy::wrong_self_convention)]
     fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError>;
 }
 
+#[allow(improper_ctypes_definitions)]
 pub type HTTPFactoryCtor = unsafe extern "C" fn() -> *mut dyn HTTPLLMProviderFactory;
 
 #[macro_export]

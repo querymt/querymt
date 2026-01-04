@@ -1,5 +1,5 @@
 use crate::{
-    chat::{ChatMessage, ChatResponse, Tool},
+    chat::{ChatMessage, ChatResponse, FinishReason, Tool},
     completion::CompletionRequest,
     ToolCall, Usage,
 };
@@ -16,6 +16,7 @@ pub trait BinaryCodec {
         Self: Sized;
 }
 
+#[allow(dead_code)]
 pub trait FromBytesOwned: Sized {
     type Error;
 
@@ -47,6 +48,7 @@ pub struct ExtismChatResponse {
     pub tool_calls: Option<Vec<ToolCall>>,
     pub thinking: Option<String>,
     pub usage: Option<Usage>,
+    pub finish_reason: Option<FinishReason>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -80,6 +82,9 @@ impl ChatResponse for ExtismChatResponse {
     fn usage(&self) -> Option<Usage> {
         self.usage.clone()
     }
+    fn finish_reason(&self) -> Option<FinishReason> {
+        self.finish_reason
+    }
 }
 
 impl From<Box<dyn ChatResponse>> for ExtismChatResponse {
@@ -89,6 +94,7 @@ impl From<Box<dyn ChatResponse>> for ExtismChatResponse {
             tool_calls: r.tool_calls(),
             thinking: r.thinking(),
             usage: r.usage(),
+            finish_reason: r.finish_reason(),
         }
     }
 }

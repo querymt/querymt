@@ -121,7 +121,7 @@ impl HTTPChatProvider for OpenRouter {
     }
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        Ok(openai_parse_chat(self, response)?)
+        openai_parse_chat(self, response)
     }
 }
 
@@ -136,11 +136,11 @@ impl HTTPEmbeddingProvider for OpenRouter {
 }
 
 impl HTTPCompletionProvider for OpenRouter {
-    fn complete_request(&self, req: &CompletionRequest) -> Result<Request<Vec<u8>>, LLMError> {
+    fn complete_request(&self, _req: &CompletionRequest) -> Result<Request<Vec<u8>>, LLMError> {
         !unimplemented!("feature is missing!")
     }
 
-    fn parse_complete(&self, resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
+    fn parse_complete(&self, _resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
         !unimplemented!("feature is missing!")
     }
 }
@@ -182,7 +182,7 @@ impl HTTPLLMProviderFactory for OpenRouterFactory {
     }
 
     fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
-        let resp_json: Value = serde_json::from_slice(&resp.body())?;
+        let resp_json: Value = serde_json::from_slice(resp.body())?;
         let arr = resp_json
             .get("data")
             .and_then(Value::as_array)
@@ -216,10 +216,10 @@ impl HTTPLLMProviderFactory for OpenRouterFactory {
 
 #[warn(dead_code)]
 fn get_pricing(model: &str) -> Option<ModelPricing> {
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
-        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
-            return registry.get_pricing("openrouter", model).cloned();
-        }
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
+        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
+    {
+        return registry.get_pricing("openrouter", model).cloned();
     }
     None
 }

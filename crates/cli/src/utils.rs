@@ -182,8 +182,8 @@ pub fn prompt_tool_execution(tool: &ToolCall) -> Result<(bool, Option<String>), 
         .edit_mode(rustyline::EditMode::Emacs)
         .build();
 
-    let mut rl: Editor<(), rustyline::history::DefaultHistory> = Editor::with_config(config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut rl: Editor<(), rustyline::history::DefaultHistory> =
+        Editor::with_config(config).map_err(std::io::Error::other)?;
 
     let readline = rl.readline("");
     clear_prev_lines(3);
@@ -207,7 +207,7 @@ pub fn prompt_tool_execution(tool: &ToolCall) -> Result<(bool, Option<String>), 
                         Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
                             Ok((false, Some("User cancelled".to_string())))
                         }
-                        Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+                        Err(err) => Err(std::io::Error::other(err)),
                     }
                 }
                 None => Ok((false, None)),
@@ -216,7 +216,7 @@ pub fn prompt_tool_execution(tool: &ToolCall) -> Result<(bool, Option<String>), 
         Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
             Ok((false, Some("User cancelled".to_string())))
         }
-        Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+        Err(err) => Err(std::io::Error::other(err)),
     }
 }
 

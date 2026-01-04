@@ -1,0 +1,59 @@
+[package]
+name = "qmt-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Agent and Session management for querymt"
+
+[features]
+default = []
+dashboard = []
+
+[dependencies]
+querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
+agent-client-protocol = { version = "0.9", features = ["unstable"] }
+agent-client-protocol-schema = { version = "0.10", features = ["unstable"]}
+async-trait.workspace = true
+anyhow = "1.0"
+thiserror = "2.0"
+log.workspace = true
+tracing = { version = "0.1", features = ["attributes"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled", "uuid", "time"] }
+time = { version = "0.3", features = ["serde"] }
+uuid = { version = "1.18", features = ["v4", "v7"] }
+rapidhash = "4.2"
+ignore = "0.4.25"
+glob = "0.3"
+grep = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+similar = "2.7"
+strsim = "0.11"
+once_cell = "1.21"
+pathdiff = "0.2"
+patchkit = "0.2"
+gitpatch = "0.7"
+rmcp = { version = "0.9", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-sse-client-reqwest", "reqwest"] }
+axum = { version = "0.7", features = ["macros", "ws"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+rust-embed = { version = "8.6", features = ["axum"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+mime_guess = "2.0"
+futures-util = "0.3"
+toml = "0.9"
+regex = "1"
+srgn = "0.14.1"
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[lib]
+name = "querymt_agent"
+path = "src/lib.rs"
+
+[dev-dependencies]
+mockall = "0.14"
+env_logger = "0.10"
+tempfile = "3.0"

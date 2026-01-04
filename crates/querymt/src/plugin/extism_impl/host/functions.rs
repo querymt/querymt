@@ -9,6 +9,7 @@ use futures::StreamExt;
 pub(crate) struct HostState {
     pub allowed_hosts: Vec<String>,
     #[cfg(feature = "http-client")]
+    #[allow(clippy::type_complexity)]
     pub http_streams: std::collections::HashMap<
         u64,
         Pin<Box<dyn Stream<Item = Result<Vec<u8>, reqwest::Error>> + Send>>,
@@ -142,7 +143,7 @@ pub(crate) fn reqwest_http(
     let http_resp = rx
         .recv()
         .map_err(|e| extism::Error::msg(format!("{}", e)))?
-        .map_err(|e| extism::Error::msg(e))?;
+        .map_err(extism::Error::msg)?;
     let ser_resp = SerializableHttpResponse { resp: http_resp };
     let resp_json =
         serde_json::to_vec(&ser_resp).map_err(|e| extism::Error::msg(format!("{}", e)))?;
@@ -271,9 +272,20 @@ pub(crate) fn qmt_http_stream_next(
         }
 
         let next_chunk = handle_tokio.block_on(async {
-            let mut state_guard = state.lock().unwrap();
-            let stream = state_guard.http_streams.get_mut(&stream_id).unwrap();
-            stream.next().await
+            let mut stream = {
+                let mut state_guard = state.lock().unwrap();
+                state_guard.http_streams.remove(&stream_id).unwrap()
+            };
+
+            let result = stream.next().await;
+
+            // Put it back
+            {
+                let mut state_guard = state.lock().unwrap();
+                state_guard.http_streams.insert(stream_id, stream);
+            }
+
+            result
         });
         match next_chunk {
             Some(Ok(bytes)) => {

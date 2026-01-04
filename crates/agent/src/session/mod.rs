@@ -1,0 +1,44 @@
+pub mod error;
+pub use error::{SessionError, SessionResult};
+
+pub mod domain;
+pub mod provider;
+pub use provider::{SessionContext, SessionProvider};
+pub mod repository;
+pub mod schema;
+pub mod sqlite_storage;
+pub use sqlite_storage::SqliteStorage;
+pub mod store;
+
+// Storage backend abstraction
+pub mod backend;
+pub use backend::StorageBackend;
+
+// Repository implementations
+pub mod repo_artifact;
+pub mod repo_decision;
+pub mod repo_delegation;
+pub mod repo_intent;
+pub mod repo_progress;
+pub mod repo_session;
+pub mod repo_task;
+
+pub use repo_artifact::SqliteArtifactRepository;
+pub use repo_decision::SqliteDecisionRepository;
+pub use repo_delegation::SqliteDelegationRepository;
+pub use repo_intent::SqliteIntentRepository;
+pub use repo_progress::SqliteProgressRepository;
+pub use repo_session::SqliteSessionRepository;
+pub use repo_task::SqliteTaskRepository;
+
+// Projection stores
+pub mod projection;
+
+pub use projection::{
+    AuditView, DefaultRedactor, EventStore, FieldSensitivity, RedactedView, RedactionPolicy,
+    Redactor, SummaryView, ViewStore,
+};
+
+// Phase 3: Runtime integration
+pub mod runtime;
+pub use runtime::{RuntimeContext, SessionForkHelper};

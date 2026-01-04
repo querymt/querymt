@@ -1,0 +1,75 @@
+# Multi-Agent Quorum Configuration Example
+#
+# This demonstrates configuring a multi-agent system with a planner
+# coordinating specialist agents.
+
+[quorum]
+cwd = "."
+db = "./quorum.db"
+delegation = true
+verification = true
+
+# Global MCP servers (available to all agents)
+[[mcp]]
+name = "github"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@anthropic/mcp-server-github"]
+env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }
+
+# Planner agent configuration
+[planner]
+provider = "openai"
+model = "${PLANNER_MODEL:-gpt-4}"
+# api_key = "${OPENAI_API_KEY}"
+
+tools = [
+    "delegate",
+    "create_task",
+    "read_file",
+    "search_text",
+    "github.*"  # All tools from github MCP
+]
+
+system_file = "prompts/planner.md"
+
+# Delegate agents
+[[delegates]]
+id = "coder"
+provider = "ollama"
+model = "devstral:latest"
+description = "Expert coder for implementation tasks"
+capabilities = ["rust", "python", "typescript"]
+
+tools = [
+    "edit",
+    "shell",
+    "read_file",
+    "write_file",
+    "glob",
+    "search_text"
+]
+
+system_file = "prompts/coder.md"
+
+# Inline MCP for this delegate only
+# [[delegates.mcp]]
+# name = "local_fs"
+# transport = "stdio"
+# command = "./my-fs-server"
+
+[[delegates]]
+id = "researcher"
+provider = "anthropic"
+model = "claude-3-sonnet"
+description = "Research specialist for information gathering"
+capabilities = ["research", "web_search"]
+
+tools = [
+    "web_fetch",
+    "read_file",
+    "github.search_repos",  # Specific tool from github MCP
+    "github.list_issues"
+]
+
+system = "You are a research specialist. Find accurate, up-to-date information from reliable sources."

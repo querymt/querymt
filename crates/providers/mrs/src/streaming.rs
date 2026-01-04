@@ -91,10 +91,10 @@ pub(crate) fn parse_mistral_stream_chunk(
     let mut chunks = Vec::new();
 
     for choice in chunk.choices {
-        if let Some(content) = &choice.delta.content {
-            if !content.is_empty() {
-                chunks.push(StreamChunk::Text(content.clone()));
-            }
+        if let Some(content) = &choice.delta.content
+            && !content.is_empty()
+        {
+            chunks.push(StreamChunk::Text(content.clone()));
         }
 
         if let Some(tool_calls) = &choice.delta.tool_calls {
@@ -112,11 +112,11 @@ pub(crate) fn parse_mistral_stream_chunk(
         }
     }
 
-    if let Some(usage) = &chunk.usage {
-        if !*usage_emitted {
-            chunks.push(StreamChunk::Usage(usage_from_mistral(usage)));
-            *usage_emitted = true;
-        }
+    if let Some(usage) = &chunk.usage
+        && !*usage_emitted
+    {
+        chunks.push(StreamChunk::Usage(usage_from_mistral(usage)));
+        *usage_emitted = true;
     }
 
     chunks
@@ -130,7 +130,7 @@ pub(crate) fn parse_mistral_done_response(
 ) -> Vec<StreamChunk> {
     let mut chunks = Vec::new();
 
-    if let Some(choice) = response.choices.get(0) {
+    if let Some(choice) = response.choices.first() {
         if let Some(tool_calls) = &choice.message.tool_calls {
             for call in tool_calls {
                 emit_tool_call_chunks(call, tool_states, &mut chunks);

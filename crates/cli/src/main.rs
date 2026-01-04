@@ -9,7 +9,6 @@ use serde_json::Value;
 use spinners::{Spinner, Spinners};
 use std::fs;
 use std::io::{self, IsTerminal};
-use tokio;
 
 mod auth;
 mod chat;
@@ -197,9 +196,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     print!("{}: ", factory.name());
                     let models = match factory.as_http() {
                         Some(http_factory) => {
-                            match get_provider_api_key(http_factory) {
-                                Some(api_key) => cfg = serde_json::json!({"api_key": api_key}),
-                                _ => (),
+                            if let Some(api_key) = get_provider_api_key(http_factory) {
+                                cfg = serde_json::json!({"api_key": api_key})
                             }
                             factory.list_models(&cfg).await
                         }
@@ -315,9 +313,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", "Update check complete.".bright_blue());
                 return Ok(());
             }
-            Commands::Auth { command } => match command {
-                _ => unreachable!("Auth commands are handled before plugin loading"),
-            },
+            Commands::Auth { command: _ } => {
+                unreachable!("Auth commands are handled before plugin loading")
+            }
             // This command is handled before the match statement
             Commands::Completion { .. } => unreachable!(),
         }
@@ -382,7 +380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_ref()
                     .and_then(|tools| tools.get(effective_server))
                     .and_then(|server_tools| server_tools.get(effective_tool))
-                    .or_else(|| tool_config.default.as_ref())
+                    .or(tool_config.default.as_ref())
                     .unwrap_or(&ToolPolicyState::Ask);
 
                 if *state == ToolPolicyState::Deny {

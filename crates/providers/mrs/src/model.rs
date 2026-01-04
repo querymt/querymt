@@ -205,9 +205,7 @@ fn load_model_config_from_hf(
 
 fn resolve_token_source(cfg: &MistralRSConfig) -> Result<TokenSource, LLMError> {
     match cfg.token_source.as_ref() {
-        Some(token_source) => {
-            TokenSource::from_str(token_source).map_err(|e| LLMError::InvalidRequest(e))
-        }
+        Some(token_source) => TokenSource::from_str(token_source).map_err(LLMError::InvalidRequest),
         None => Ok(TokenSource::CacheToken),
     }
 }

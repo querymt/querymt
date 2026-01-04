@@ -67,6 +67,10 @@ impl PluginRegistry {
         })
     }
 
+    pub fn from_default_path() -> Result<Self, LLMError> {
+        Self::from_path(crate::plugin::default_providers_path())
+    }
+
     pub fn register_loader(&mut self, loader: Box<dyn PluginLoader>) {
         self.loaders.insert(loader.supported_type(), loader);
     }

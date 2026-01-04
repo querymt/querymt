@@ -37,12 +37,11 @@ impl SecretStore {
         let key = key.into();
         let value = value.into();
 
-        let entry = Entry::new(SERVICE_NAME, &key)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let entry = Entry::new(SERVICE_NAME, &key).map_err(|e| io::Error::other(e.to_string()))?;
 
         entry
             .set_password(&value)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     /// Retrieves a secret value for the given key
@@ -69,12 +68,11 @@ impl SecretStore {
     ///
     /// * `io::Result<()>` - Success or an IO error
     pub fn delete(&mut self, key: &str) -> io::Result<()> {
-        let entry = Entry::new(SERVICE_NAME, key)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let entry = Entry::new(SERVICE_NAME, key).map_err(|e| io::Error::other(e.to_string()))?;
 
         entry
             .delete_credential()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     /// Sets the default provider for LLM interactions

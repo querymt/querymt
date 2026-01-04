@@ -26,33 +26,6 @@ use std::{
     io::{self, Read, Write},
 };
 
-#[derive(Debug)]
-struct SyntheticResponse {
-    text: Option<String>,
-    tool_calls: Option<Vec<ToolCall>>,
-}
-
-impl std::fmt::Display for SyntheticResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(ref text) = self.text {
-            write!(f, "{}", text)?;
-        }
-        Ok(())
-    }
-}
-
-impl ChatResponse for SyntheticResponse {
-    fn text(&self) -> Option<String> {
-        self.text.clone()
-    }
-    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-        self.tool_calls.clone()
-    }
-    fn usage(&self) -> Option<querymt::Usage> {
-        None
-    }
-}
-
 #[derive(Helper, Completer, Hinter, Validator)]
 struct QmtHelper {
     #[rustyline(Completer)]
@@ -280,7 +253,7 @@ pub async fn handle_any_response(
                     .as_ref()
                     .and_then(|tools| tools.get(effective_server))
                     .and_then(|server_tools| server_tools.get(effective_tool))
-                    .or_else(|| tool_config.default.as_ref())
+                    .or(tool_config.default.as_ref())
                     .unwrap_or(&ToolPolicyState::Ask);
 
                 match state {

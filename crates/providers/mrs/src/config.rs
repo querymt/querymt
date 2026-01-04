@@ -40,7 +40,9 @@ pub struct MistralRSConfig {
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum MistralRSModelKind {
+    #[default]
     Text,
     Vision,
     Embedding,
@@ -59,10 +61,4 @@ pub enum MistralRSPagedCacheType {
     Auto,
     #[serde(rename = "f8e4m3")]
     F8E4M3,
-}
-
-impl Default for MistralRSModelKind {
-    fn default() -> Self {
-        Self::Text
-    }
 }

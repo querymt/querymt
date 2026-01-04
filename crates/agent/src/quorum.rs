@@ -1,0 +1,247 @@
+use crate::agent::QueryMTAgent;
+use crate::delegation::{AgentInfo, AgentRegistry, DefaultAgentRegistry, DelegationOrchestrator};
+use crate::event_bus::EventBus;
+use crate::server::AgentServer;
+use crate::session::backend::StorageBackend;
+use crate::session::error::SessionError;
+use crate::session::projection::ViewStore;
+use crate::session::sqlite_storage::SqliteStorage;
+use crate::session::store::SessionStore;
+use crate::tools::CapabilityRequirement;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+type DelegateFactory =
+    Box<dyn FnOnce(Arc<dyn SessionStore>, Arc<EventBus>) -> Arc<QueryMTAgent> + Send>;
+
+type PlannerFactory = Box<
+    dyn FnOnce(
+            Arc<dyn SessionStore>,
+            Arc<EventBus>,
+            Arc<dyn AgentRegistry + Send + Sync>,
+        ) -> Arc<QueryMTAgent>
+        + Send,
+>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentQuorumError {
+    #[error("agent quorum requires a planner agent")]
+    MissingPlanner,
+    #[error("failed to create session store: {0}")]
+    Store(#[from] SessionError),
+    #[error("missing required capability: {0:?}")]
+    MissingCapability(CapabilityRequirement),
+}
+
+pub struct DelegateAgent {
+    pub info: AgentInfo,
+    pub agent: Arc<QueryMTAgent>,
+}
+
+pub struct AgentQuorum {
+    store: Arc<dyn SessionStore>,
+    view_store: Arc<dyn ViewStore>,
+    event_bus: Arc<EventBus>,
+    registry: Arc<dyn AgentRegistry + Send + Sync>,
+    planner: Arc<QueryMTAgent>,
+    delegates: Vec<DelegateAgent>,
+    orchestrator: Option<Arc<DelegationOrchestrator>>,
+    cwd: Option<PathBuf>,
+}
+
+impl AgentQuorum {
+    pub async fn builder(db_path: Option<PathBuf>) -> Result<AgentQuorumBuilder, AgentQuorumError> {
+        let path = db_path.unwrap_or_else(|| PathBuf::from(":memory:"));
+        let backend = SqliteStorage::connect(path).await?;
+        Ok(AgentQuorumBuilder::from_backend(backend))
+    }
+
+    pub fn planner(&self) -> Arc<QueryMTAgent> {
+        self.planner.clone()
+    }
+
+    pub fn delegates(&self) -> &[DelegateAgent] {
+        &self.delegates
+    }
+
+    pub fn delegate(&self, id: &str) -> Option<Arc<QueryMTAgent>> {
+        self.delegates
+            .iter()
+            .find(|entry| entry.info.id == id)
+            .map(|entry| entry.agent.clone())
+    }
+
+    pub fn store(&self) -> Arc<dyn SessionStore> {
+        self.store.clone()
+    }
+
+    pub fn event_bus(&self) -> Arc<EventBus> {
+        self.event_bus.clone()
+    }
+
+    pub fn registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
+        self.registry.clone()
+    }
+
+    pub fn orchestrator(&self) -> Option<Arc<DelegationOrchestrator>> {
+        self.orchestrator.clone()
+    }
+
+    pub fn cwd(&self) -> Option<&PathBuf> {
+        self.cwd.as_ref()
+    }
+
+    pub fn view_store(&self) -> Arc<dyn ViewStore> {
+        self.view_store.clone()
+    }
+
+    pub async fn run_gui(&self, addr: &str) -> anyhow::Result<()> {
+        let server = AgentServer::new(self.planner.clone(), self.view_store.clone());
+        server.run(addr).await
+    }
+}
+
+pub struct AgentQuorumBuilder {
+    store: Arc<dyn SessionStore>,
+    view_store: Arc<dyn ViewStore>,
+    event_bus: Arc<EventBus>,
+    cwd: Option<PathBuf>,
+    delegate_factories: Vec<(AgentInfo, DelegateFactory)>,
+    planner_factory: Option<PlannerFactory>,
+    delegation_enabled: bool,
+    verification_enabled: bool,
+}
+
+impl AgentQuorumBuilder {
+    pub fn new(store: Arc<dyn SessionStore>, view_store: Arc<dyn ViewStore>) -> Self {
+        Self {
+            store,
+            view_store,
+            event_bus: Arc::new(EventBus::new()),
+            cwd: None,
+            delegate_factories: Vec::new(),
+            planner_factory: None,
+            delegation_enabled: true,
+            verification_enabled: false,
+        }
+    }
+
+    /// Create builder from a storage backend (registers event observer automatically).
+    pub fn from_backend(backend: SqliteStorage) -> Self {
+        let event_bus = Arc::new(EventBus::new());
+        event_bus.add_observer(backend.event_observer());
+        Self {
+            store: backend.session_store(),
+            view_store: backend
+                .view_store()
+                .expect("SqliteStorage always provides ViewStore"),
+            event_bus,
+            cwd: None,
+            delegate_factories: Vec::new(),
+            planner_factory: None,
+            delegation_enabled: true,
+            verification_enabled: false,
+        }
+    }
+
+    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
+        self.event_bus = event_bus;
+        self
+    }
+
+    pub fn add_delegate_agent<F>(mut self, info: AgentInfo, factory: F) -> Self
+    where
+        F: FnOnce(Arc<dyn SessionStore>, Arc<EventBus>) -> Arc<QueryMTAgent> + Send + 'static,
+    {
+        self.delegate_factories.push((info, Box::new(factory)));
+        self
+    }
+
+    pub fn with_planner<F>(mut self, factory: F) -> Self
+    where
+        F: FnOnce(
+                Arc<dyn SessionStore>,
+                Arc<EventBus>,
+                Arc<dyn AgentRegistry + Send + Sync>,
+            ) -> Arc<QueryMTAgent>
+            + Send
+            + 'static,
+    {
+        self.planner_factory = Some(Box::new(factory));
+        self
+    }
+
+    pub fn with_delegation(mut self, enabled: bool) -> Self {
+        self.delegation_enabled = enabled;
+        self
+    }
+
+    pub fn with_verification(mut self, enabled: bool) -> Self {
+        self.verification_enabled = enabled;
+        self
+    }
+
+    pub fn build(self) -> Result<AgentQuorum, AgentQuorumError> {
+        // Capability validation
+        let mut all_required_caps = std::collections::HashSet::new();
+        for (info, _) in &self.delegate_factories {
+            for cap in &info.required_capabilities {
+                all_required_caps.insert(*cap);
+            }
+        }
+
+        if all_required_caps.contains(&CapabilityRequirement::Filesystem) && self.cwd.is_none() {
+            return Err(AgentQuorumError::MissingCapability(
+                CapabilityRequirement::Filesystem,
+            ));
+        }
+
+        let mut registry = DefaultAgentRegistry::new();
+        let mut delegates = Vec::with_capacity(self.delegate_factories.len());
+
+        for (info, factory) in self.delegate_factories {
+            let agent = factory(self.store.clone(), self.event_bus.clone());
+            registry.register(info.clone(), agent.clone());
+            delegates.push(DelegateAgent { info, agent });
+        }
+
+        let registry = Arc::new(registry);
+
+        let planner_factory = self
+            .planner_factory
+            .ok_or(AgentQuorumError::MissingPlanner)?;
+        let planner = planner_factory(self.store.clone(), self.event_bus.clone(), registry.clone());
+
+        let orchestrator = if self.delegation_enabled {
+            let orchestrator = Arc::new(
+                DelegationOrchestrator::new(
+                    planner.clone(),
+                    self.store.clone(),
+                    registry.clone(),
+                    self.cwd.clone(),
+                )
+                .with_verification(self.verification_enabled),
+            );
+            planner.add_observer(orchestrator.clone());
+            Some(orchestrator)
+        } else {
+            None
+        };
+
+        Ok(AgentQuorum {
+            store: self.store,
+            view_store: self.view_store,
+            event_bus: self.event_bus,
+            registry,
+            planner,
+            delegates,
+            orchestrator,
+            cwd: self.cwd,
+        })
+    }
+}

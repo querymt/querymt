@@ -1,0 +1,1101 @@
+use crate::events::{AgentEvent, AgentEventKind, EventObserver};
+use crate::model::{AgentMessage, MessagePart};
+use crate::session::domain::{
+    Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
+    DelegationStatus, ForkInfo, ForkOrigin, ForkPointType, IntentSnapshot, ProgressEntry,
+    ProgressKind, Task, TaskStatus,
+};
+use crate::session::error::{SessionError, SessionResult};
+use crate::session::projection::{
+    AuditView, DefaultRedactor, EventStore, RedactedArtifact, RedactedProgress, RedactedTask,
+    RedactedView, RedactionPolicy, Redactor, SummaryView, ViewStore,
+};
+use crate::session::repo_artifact::SqliteArtifactRepository;
+use crate::session::repo_decision::SqliteDecisionRepository;
+use crate::session::repo_delegation::SqliteDelegationRepository;
+use crate::session::repo_intent::SqliteIntentRepository;
+use crate::session::repo_progress::SqliteProgressRepository;
+use crate::session::repo_session::SqliteSessionRepository;
+use crate::session::repo_task::SqliteTaskRepository;
+use crate::session::repository::{
+    ArtifactRepository, DecisionRepository, DelegationRepository, IntentRepository,
+    ProgressRepository, SessionRepository, TaskRepository,
+};
+use crate::session::schema;
+use crate::session::store::{LLMConfig, Session, SessionStore, extract_llm_config_values};
+use async_trait::async_trait;
+use querymt::LLMParams;
+use querymt::chat::ChatRole;
+use querymt::error::LLMError;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+/// A unified SQLite storage implementation.
+///
+/// This implementation provides all storage functionality in a single struct:
+/// - Session and message persistence (SessionStore)
+/// - Event persistence and querying (EventStore)
+/// - View generation for observability (ViewStore)
+/// - Event observation for the event bus (EventObserver)
+/// - Storage backend interface (StorageBackend)
+///
+/// ## Session Isolation Guarantees
+///
+/// This implementation ensures strict session isolation through:
+/// 1. **Unique Session IDs**: Each session has a UUID-based unique identifier
+/// 2. **Query Scoping**: All database queries are scoped by session_id
+/// 3. **Thread-Safe Access**: Uses `Arc<Mutex<Connection>>` for thread-safe database access
+/// 4. **Non-Blocking Operations**: All database operations use `spawn_blocking` to avoid
+///    blocking the async runtime, allowing parallel session operations
+///
+/// ## Concurrency Model
+///
+/// - The `Mutex<Connection>` serializes database access but only for the duration of each query
+/// - Each operation quickly acquires the lock, executes the query, and releases the lock
+/// - Different sessions can execute operations in parallel (interleaved database access)
+/// - Within a session, operations are executed in the order they arrive
+///
+/// This design balances simplicity (single connection) with reasonable concurrency
+/// for most use cases. For higher throughput, consider using a connection pool.
+#[derive(Clone)]
+pub struct SqliteStorage {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteStorage {
+    pub async fn connect(path: PathBuf) -> SessionResult<Self> {
+        let db_path = path.clone();
+        let conn = tokio::task::spawn_blocking(move || -> Result<Connection, rusqlite::Error> {
+            let mut conn = Connection::open(&db_path)?;
+            conn.execute("PRAGMA foreign_keys = ON;", [])?;
+            apply_migrations(&mut conn)?;
+            Ok(conn)
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(SessionError::from)?;
+
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    async fn run_blocking<F, R>(&self, f: F) -> SessionResult<R>
+    where
+        F: FnOnce(&mut Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        let conn_arc = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn_arc.lock().unwrap();
+            f(&mut conn)
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    /// Helper: Resolve session public_id → internal i64
+    async fn resolve_session_internal_id(&self, session_public_id: &str) -> SessionResult<i64> {
+        let session_public_id_owned = session_public_id.to_string();
+        let error_value = session_public_id_owned.clone();
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT id FROM sessions WHERE public_id = ?",
+                params![session_public_id_owned],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .map_err(|err| match err {
+            SessionError::DatabaseError(msg) if msg.contains("Query returned no rows") => {
+                SessionError::SessionNotFound(error_value.clone())
+            }
+            other => other,
+        })
+    }
+
+    /// Helper: Resolve message public_id → internal i64
+    async fn resolve_message_internal_id(&self, message_public_id: &str) -> SessionResult<i64> {
+        let message_public_id_owned = message_public_id.to_string();
+        let error_value = message_public_id_owned.clone();
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT id FROM messages WHERE public_id = ?",
+                params![message_public_id_owned],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .map_err(|err| match err {
+            SessionError::DatabaseError(msg) if msg.contains("Query returned no rows") => {
+                SessionError::InvalidOperation(format!("Message not found: {}", error_value))
+            }
+            other => other,
+        })
+    }
+}
+
+#[async_trait]
+impl SessionStore for SqliteStorage {
+    async fn create_session(&self, name: Option<String>) -> SessionResult<Session> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.create_session(name).await
+    }
+
+    async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.get_session(session_id).await
+    }
+
+    async fn list_sessions(&self) -> SessionResult<Vec<Session>> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.list_sessions().await
+    }
+
+    async fn delete_session(&self, session_id: &str) -> SessionResult<()> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.delete_session(session_id).await
+    }
+
+    async fn get_history(&self, session_id: &str) -> SessionResult<Vec<AgentMessage>> {
+        // Resolve session public_id → internal i64
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+        let session_id_str = session_id.to_string();
+
+        self.run_blocking(move |conn| {
+            // 1. Fetch Messages with public_id and internal parent_message_id
+            let mut stmt = conn.prepare(
+                "SELECT id, public_id, role, created_at, parent_message_id FROM messages WHERE session_id = ? ORDER BY created_at ASC"
+            )?;
+
+            // Build a map: internal_id → public_id for parent resolution
+            let mut id_map: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+            let messages_data: Vec<(i64, String, String, i64, Option<i64>)> = stmt
+                .query_map(params![session_internal_id], |row| {
+                    let internal_id: i64 = row.get(0)?;
+                    let public_id: String = row.get(1)?;
+                    let role_str: String = row.get(2)?;
+                    let created_at: i64 = row.get(3)?;
+                    let parent_internal_id: Option<i64> = row.get(4)?;
+                    Ok((internal_id, public_id, role_str, created_at, parent_internal_id))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // Build id_map
+            for (internal_id, public_id, _, _, _) in &messages_data {
+                id_map.insert(*internal_id, public_id.clone());
+            }
+
+            // Convert to AgentMessage, resolving parent_message_id
+            let mut messages: Vec<AgentMessage> = messages_data
+                .into_iter()
+                .map(|(_internal_id, public_id, role_str, created_at, parent_internal_id)| {
+                    let role = match role_str.as_str() {
+                        "User" => ChatRole::User,
+                        "Assistant" => ChatRole::Assistant,
+                        _ => ChatRole::User, // Default fallback
+                    };
+
+                    let parent_message_id = parent_internal_id.and_then(|pid| id_map.get(&pid).cloned());
+
+                    AgentMessage {
+                        id: public_id.clone(),
+                        session_id: session_id_str.clone(),
+                        role,
+                        parts: Vec::new(), // Will populate next
+                        created_at,
+                        parent_message_id,
+                    }
+                })
+                .collect();
+
+            // 2. Fetch Parts for all messages in this session (by internal message_id)
+            let mut part_stmt = conn.prepare(
+                "SELECT message_id, content_json FROM message_parts WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?) ORDER BY sort_order ASC"
+            )?;
+
+            let parts_iter = part_stmt.query_map(params![session_internal_id], |row| {
+                let message_internal_id: i64 = row.get(0)?;
+                let content: String = row.get(1)?;
+                let part: MessagePart = serde_json::from_str(&content).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+                Ok((message_internal_id, part))
+            })?;
+
+            // Group parts by message internal_id, then convert to public_id
+            let mut parts_map: std::collections::HashMap<String, Vec<MessagePart>> = std::collections::HashMap::new();
+            for res in parts_iter {
+                let (message_internal_id, part) = res?;
+                if let Some(public_id) = id_map.get(&message_internal_id) {
+                    parts_map.entry(public_id.clone()).or_default().push(part);
+                }
+            }
+
+            // Attach parts to messages
+            for msg in &mut messages {
+                if let Some(parts) = parts_map.remove(&msg.id) {
+                    msg.parts = parts;
+                }
+            }
+
+            Ok(messages)
+        })
+        .await
+    }
+
+    async fn add_message(&self, session_id: &str, message: AgentMessage) -> SessionResult<()> {
+        // Resolve session public_id → internal i64
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+
+        // Resolve parent message public_id → internal i64 if present
+        let parent_internal_id = if let Some(ref parent_public_id) = message.parent_message_id {
+            Some(self.resolve_message_internal_id(parent_public_id).await?)
+        } else {
+            None
+        };
+
+        let msg = message.clone();
+
+        self.run_blocking(move |conn| {
+            let tx = conn.transaction()?;
+
+            let role_str = match msg.role {
+                ChatRole::User => "User",
+                ChatRole::Assistant => "Assistant",
+            };
+
+            // Insert message with public_id and internal session_id/parent_message_id
+            tx.execute(
+                "INSERT INTO messages (public_id, session_id, role, created_at, parent_message_id) VALUES (?, ?, ?, ?, ?)",
+                params![msg.id, session_internal_id, role_str, msg.created_at, parent_internal_id],
+            )?;
+
+            // Get the internal message_id that was just inserted
+            let message_internal_id: i64 = tx.last_insert_rowid();
+
+            for (idx, part) in msg.parts.iter().enumerate() {
+                let content_json = serde_json::to_string(part).map_err(|e| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+                })?;
+
+                // Use internal message_id for FK
+                tx.execute(
+                    "INSERT INTO message_parts (message_id, part_type, content_json, sort_order) VALUES (?, ?, ?, ?)",
+                    params![message_internal_id, part.type_name(), content_json, idx as i32],
+                )?;
+            }
+
+            // Update session with internal ID
+            tx.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                params![OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default(), session_internal_id],
+            )?;
+
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn fork_session(
+        &self,
+        source_session_id: &str,
+        target_message_id: &str,
+        fork_origin: ForkOrigin,
+    ) -> SessionResult<String> {
+        // Resolve source session public_id → internal i64
+        let source_session_internal_id =
+            self.resolve_session_internal_id(source_session_id).await?;
+
+        // Resolve target message public_id → internal i64
+        let target_message_internal_id =
+            self.resolve_message_internal_id(target_message_id).await?;
+
+        self.run_blocking(move |conn| {
+            let tx = conn.transaction()?;
+
+            // 1. Create New Session with UUID v7 public_id
+            let new_session_public_id = Uuid::now_v7().to_string();
+            let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
+
+            // Get parent session llm_config_id (internal i64)
+            let parent_llm_config_id: Option<i64> = tx
+                .query_row(
+                    "SELECT llm_config_id FROM sessions WHERE id = ?",
+                    params![source_session_internal_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+
+            tx.execute(
+                "INSERT INTO sessions (public_id, name, created_at, updated_at, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    new_session_public_id.clone(),
+                    format!("Fork of session"), // Temporary name
+                    now.clone(),
+                    now,
+                    parent_llm_config_id,
+                    source_session_internal_id,
+                    fork_origin.to_string(),
+                    ForkPointType::MessageIndex.to_string(),
+                    target_message_internal_id,
+                ],
+            )?;
+
+            // Get new session internal ID
+            let new_session_internal_id: i64 = tx.last_insert_rowid();
+
+            // 2. Identify messages to copy (up to target_message_id internal ID)
+            let messages_to_copy = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, public_id, role, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC"
+                )?;
+
+                let messages: Vec<(i64, String, String, i64)> = stmt.query_map(params![source_session_internal_id], |row| {
+                    Ok((
+                        row.get(0)?, // internal id
+                        row.get(1)?, // public_id
+                        row.get(2)?, // role
+                        row.get(3)?  // created_at
+                    ))
+                })?.collect::<Result<Vec<_>, _>>()?;
+
+                let mut to_copy = Vec::new();
+                for m in messages {
+                    let msg_internal_id = m.0;
+                    to_copy.push(m);
+                    if msg_internal_id == target_message_internal_id {
+                        break;
+                    }
+                }
+                to_copy
+            };
+
+            // 3. Copy messages and their parts with new UUID v7 public_ids
+            for (old_internal_id, _old_public_id, role, created_at) in messages_to_copy {
+                let new_msg_public_id = Uuid::now_v7().to_string();
+
+                // Insert Message with new public_id and internal session_id
+                tx.execute(
+                    "INSERT INTO messages (public_id, session_id, role, created_at, parent_message_id) VALUES (?, ?, ?, ?, ?)",
+                    params![new_msg_public_id, new_session_internal_id, role, created_at, Option::<i64>::None],
+                )?;
+
+                // Get new message internal ID
+                let new_msg_internal_id: i64 = tx.last_insert_rowid();
+
+                // Copy Parts using internal message_id
+                {
+                    let mut part_stmt = tx.prepare(
+                        "SELECT part_type, content_json, sort_order FROM message_parts WHERE message_id = ?"
+                    )?;
+
+                    let parts: Vec<(String, String, i32)> = part_stmt.query_map(params![old_internal_id], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?.collect::<Result<Vec<_>, _>>()?;
+
+                    for (ptype, content, order) in parts {
+                        tx.execute(
+                            "INSERT INTO message_parts (message_id, part_type, content_json, sort_order) VALUES (?, ?, ?, ?)",
+                            params![new_msg_internal_id, ptype, content, order],
+                        )?;
+                    }
+                }
+            }
+
+            tx.commit()?;
+            Ok(new_session_public_id)
+        })
+        .await
+    }
+
+    async fn create_or_get_llm_config(&self, input: &LLMParams) -> SessionResult<LLMConfig> {
+        let (provider, model, params) = extract_llm_config_values(input)?;
+        let name = input.name.clone();
+
+        let params_str = if let Some(ref p) = params {
+            serde_json::to_string(p)?
+        } else {
+            serde_json::to_string(&serde_json::Value::Object(serde_json::Map::new()))?
+        };
+
+        self.run_blocking(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, provider, model, params, created_at, updated_at FROM llm_configs WHERE provider = ? AND model = ? AND params = ?",
+            )?;
+            if let Some(config) = stmt
+                .query_row(params![provider, model, params_str], parse_llm_config_row)
+                .optional()?
+            {
+                return Ok(config);
+            }
+
+            let now = OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
+
+            // Insert without explicit id to let INTEGER PRIMARY KEY autoincrement
+            conn.execute(
+                "INSERT INTO llm_configs (name, provider, model, params, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    name,
+                    provider,
+                    model,
+                    params_str,
+                    now.clone(),
+                    now.clone(),
+                ],
+            )?;
+
+            // Get the autoincremented id
+            let id: i64 = conn.last_insert_rowid();
+
+            Ok(LLMConfig {
+                id,
+                name,
+                provider,
+                model,
+                params: parse_llm_params(&params_str)?,
+                created_at: OffsetDateTime::parse(
+                    &now,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .ok(),
+                updated_at: OffsetDateTime::parse(
+                    &now,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .ok(),
+            })
+        })
+        .await
+    }
+
+    async fn get_llm_config(&self, id: i64) -> SessionResult<Option<LLMConfig>> {
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT id, name, provider, model, params, created_at, updated_at FROM llm_configs WHERE id = ?",
+                params![id],
+                parse_llm_config_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    async fn get_session_llm_config(&self, session_id: &str) -> SessionResult<Option<LLMConfig>> {
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT c.id, c.name, c.provider, c.model, c.params, c.created_at, c.updated_at FROM llm_configs c INNER JOIN sessions s ON s.llm_config_id = c.id WHERE s.id = ?",
+                params![session_internal_id],
+                parse_llm_config_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()> {
+        // Resolve session public_id → internal i64
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+
+        self.run_blocking(move |conn| {
+            let affected = conn.execute(
+                "UPDATE sessions SET llm_config_id = ?, updated_at = ? WHERE id = ?",
+                params![
+                    config_id,
+                    OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default(),
+                    session_internal_id
+                ],
+            )?;
+            if affected == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| match e {
+            SessionError::DatabaseError(_) => SessionError::SessionNotFound(session_id.to_string()),
+            _ => e,
+        })
+    }
+
+    // Phase 3: Delegate to repository implementations
+    async fn set_current_intent_snapshot(
+        &self,
+        session_id: &str,
+        snapshot_id: Option<&str>,
+    ) -> SessionResult<()> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.set_current_intent_snapshot(session_id, snapshot_id)
+            .await
+    }
+
+    async fn set_active_task(&self, session_id: &str, task_id: Option<&str>) -> SessionResult<()> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.set_active_task(session_id, task_id).await
+    }
+
+    async fn get_session_fork_info(&self, session_id: &str) -> SessionResult<Option<ForkInfo>> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.get_session_fork_info(session_id).await
+    }
+
+    async fn list_child_sessions(&self, parent_id: &str) -> SessionResult<Vec<String>> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.list_child_sessions(parent_id).await
+    }
+
+    // Task repository methods
+    async fn create_task(&self, task: Task) -> SessionResult<Task> {
+        let repo = SqliteTaskRepository::new(self.conn.clone());
+        repo.create_task(task).await
+    }
+
+    async fn get_task(&self, task_id: &str) -> SessionResult<Option<Task>> {
+        let repo = SqliteTaskRepository::new(self.conn.clone());
+        repo.get_task(task_id).await
+    }
+
+    async fn list_tasks(&self, session_id: &str) -> SessionResult<Vec<Task>> {
+        let repo = SqliteTaskRepository::new(self.conn.clone());
+        repo.list_tasks(session_id).await
+    }
+
+    async fn update_task_status(&self, task_id: &str, status: TaskStatus) -> SessionResult<()> {
+        let repo = SqliteTaskRepository::new(self.conn.clone());
+        repo.update_task_status(task_id, status).await
+    }
+
+    async fn update_task(&self, task: Task) -> SessionResult<()> {
+        let repo = SqliteTaskRepository::new(self.conn.clone());
+        repo.update_task(task).await
+    }
+
+    async fn delete_task(&self, task_id: &str) -> SessionResult<()> {
+        let repo = SqliteTaskRepository::new(self.conn.clone());
+        repo.delete_task(task_id).await
+    }
+
+    // Intent repository methods
+    async fn create_intent_snapshot(&self, snapshot: IntentSnapshot) -> SessionResult<()> {
+        let repo = SqliteIntentRepository::new(self.conn.clone());
+        repo.create_intent_snapshot(snapshot).await
+    }
+
+    async fn get_intent_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> SessionResult<Option<IntentSnapshot>> {
+        let repo = SqliteIntentRepository::new(self.conn.clone());
+        repo.get_intent_snapshot(snapshot_id).await
+    }
+
+    async fn list_intent_snapshots(&self, session_id: &str) -> SessionResult<Vec<IntentSnapshot>> {
+        let repo = SqliteIntentRepository::new(self.conn.clone());
+        repo.list_intent_snapshots(session_id).await
+    }
+
+    async fn get_current_intent_snapshot(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<IntentSnapshot>> {
+        let repo = SqliteIntentRepository::new(self.conn.clone());
+        repo.get_current_intent_snapshot(session_id).await
+    }
+
+    // Decision repository methods
+    async fn record_decision(&self, decision: Decision) -> SessionResult<()> {
+        let repo = SqliteDecisionRepository::new(self.conn.clone());
+        repo.record_decision(decision).await
+    }
+
+    async fn record_alternative(&self, alternative: Alternative) -> SessionResult<()> {
+        let repo = SqliteDecisionRepository::new(self.conn.clone());
+        repo.record_alternative(alternative).await
+    }
+
+    async fn get_decision(&self, decision_id: &str) -> SessionResult<Option<Decision>> {
+        let repo = SqliteDecisionRepository::new(self.conn.clone());
+        repo.get_decision(decision_id).await
+    }
+
+    async fn list_decisions(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> SessionResult<Vec<Decision>> {
+        let repo = SqliteDecisionRepository::new(self.conn.clone());
+        repo.list_decisions(session_id, task_id).await
+    }
+
+    async fn list_alternatives(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> SessionResult<Vec<Alternative>> {
+        let repo = SqliteDecisionRepository::new(self.conn.clone());
+        repo.list_alternatives(session_id, task_id).await
+    }
+
+    async fn update_decision_status(
+        &self,
+        decision_id: &str,
+        status: DecisionStatus,
+    ) -> SessionResult<()> {
+        let repo = SqliteDecisionRepository::new(self.conn.clone());
+        repo.update_decision_status(decision_id, status).await
+    }
+
+    async fn update_alternative_status(
+        &self,
+        alternative_id: &str,
+        status: AlternativeStatus,
+    ) -> SessionResult<()> {
+        let repo = SqliteDecisionRepository::new(self.conn.clone());
+        repo.update_alternative_status(alternative_id, status).await
+    }
+
+    // Progress repository methods
+    async fn append_progress_entry(&self, entry: ProgressEntry) -> SessionResult<()> {
+        let repo = SqliteProgressRepository::new(self.conn.clone());
+        repo.append_progress_entry(entry).await
+    }
+
+    async fn get_progress_entry(&self, entry_id: &str) -> SessionResult<Option<ProgressEntry>> {
+        let repo = SqliteProgressRepository::new(self.conn.clone());
+        repo.get_progress_entry(entry_id).await
+    }
+
+    async fn list_progress_entries(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> SessionResult<Vec<ProgressEntry>> {
+        let repo = SqliteProgressRepository::new(self.conn.clone());
+        repo.list_progress_entries(session_id, task_id).await
+    }
+
+    async fn list_progress_by_kind(
+        &self,
+        session_id: &str,
+        kind: ProgressKind,
+    ) -> SessionResult<Vec<ProgressEntry>> {
+        let repo = SqliteProgressRepository::new(self.conn.clone());
+        repo.list_progress_by_kind(session_id, kind).await
+    }
+
+    // Artifact repository methods
+    async fn record_artifact(&self, artifact: Artifact) -> SessionResult<()> {
+        let repo = SqliteArtifactRepository::new(self.conn.clone());
+        repo.record_artifact(artifact).await
+    }
+
+    async fn get_artifact(&self, artifact_id: &str) -> SessionResult<Option<Artifact>> {
+        let repo = SqliteArtifactRepository::new(self.conn.clone());
+        repo.get_artifact(artifact_id).await
+    }
+
+    async fn list_artifacts(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> SessionResult<Vec<Artifact>> {
+        let repo = SqliteArtifactRepository::new(self.conn.clone());
+        repo.list_artifacts(session_id, task_id).await
+    }
+
+    async fn list_artifacts_by_kind(
+        &self,
+        session_id: &str,
+        kind: &str,
+    ) -> SessionResult<Vec<Artifact>> {
+        let repo = SqliteArtifactRepository::new(self.conn.clone());
+        repo.list_artifacts_by_kind(session_id, kind).await
+    }
+
+    // Delegation repository methods
+    async fn create_delegation(&self, delegation: Delegation) -> SessionResult<Delegation> {
+        let repo = SqliteDelegationRepository::new(self.conn.clone());
+        repo.create_delegation(delegation).await
+    }
+
+    async fn get_delegation(&self, delegation_id: &str) -> SessionResult<Option<Delegation>> {
+        let repo = SqliteDelegationRepository::new(self.conn.clone());
+        repo.get_delegation(delegation_id).await
+    }
+
+    async fn list_delegations(&self, session_id: &str) -> SessionResult<Vec<Delegation>> {
+        let repo = SqliteDelegationRepository::new(self.conn.clone());
+        repo.list_delegations(session_id).await
+    }
+
+    async fn update_delegation_status(
+        &self,
+        delegation_id: &str,
+        status: DelegationStatus,
+    ) -> SessionResult<()> {
+        let repo = SqliteDelegationRepository::new(self.conn.clone());
+        repo.update_delegation_status(delegation_id, status).await
+    }
+
+    async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()> {
+        let repo = SqliteDelegationRepository::new(self.conn.clone());
+        repo.update_delegation(delegation).await
+    }
+}
+
+// ============================================================================
+// EventStore implementation
+// ============================================================================
+
+#[async_trait]
+impl EventStore for SqliteStorage {
+    async fn append_event(&self, event: &AgentEvent) -> SessionResult<()> {
+        let conn_arc = self.conn.clone();
+        let event_clone = event.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            let kind_json = serde_json::to_string(&event_clone.kind)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            conn.execute(
+                "INSERT INTO events (seq, timestamp, session_id, kind) VALUES (?, ?, ?, ?)",
+                rusqlite::params![
+                    event_clone.seq,
+                    event_clone.timestamp,
+                    &event_clone.session_id,
+                    kind_json
+                ],
+            )?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    async fn get_session_events(&self, session_id: &str) -> SessionResult<Vec<AgentEvent>> {
+        let session_id_str = session_id.to_string();
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<AgentEvent>, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT seq, timestamp, session_id, kind FROM events WHERE session_id = ? ORDER BY seq ASC")?;
+
+            let events = stmt
+                .query_map([session_id_str], |row| {
+                    let kind_json: String = row.get(3)?;
+                    let kind: AgentEventKind = serde_json::from_str(&kind_json)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+                    Ok(AgentEvent {
+                        seq: row.get(0)?,
+                        timestamp: row.get(1)?,
+                        session_id: row.get(2)?,
+                        kind,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(events)
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    async fn get_events_since(
+        &self,
+        session_id: &str,
+        after_seq: u64,
+    ) -> SessionResult<Vec<AgentEvent>> {
+        let session_id_str = session_id.to_string();
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<AgentEvent>, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT seq, timestamp, session_id, kind FROM events WHERE session_id = ? AND seq > ? ORDER BY seq ASC")?;
+
+            let events = stmt
+                .query_map(rusqlite::params![session_id_str, after_seq], |row| {
+                    let kind_json: String = row.get(3)?;
+                    let kind: AgentEventKind = serde_json::from_str(&kind_json)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+                    Ok(AgentEvent {
+                        seq: row.get(0)?,
+                        timestamp: row.get(1)?,
+                        session_id: row.get(2)?,
+                        kind,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(events)
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+}
+
+// ============================================================================
+// ViewStore implementation
+// ============================================================================
+
+#[async_trait]
+impl ViewStore for SqliteStorage {
+    async fn get_audit_view(&self, session_id: &str) -> SessionResult<AuditView> {
+        let events = self.get_session_events(session_id).await?;
+
+        let task_repo = SqliteTaskRepository::new(self.conn.clone());
+        let intent_repo = SqliteIntentRepository::new(self.conn.clone());
+        let decision_repo = SqliteDecisionRepository::new(self.conn.clone());
+        let progress_repo = SqliteProgressRepository::new(self.conn.clone());
+        let artifact_repo = SqliteArtifactRepository::new(self.conn.clone());
+        let delegation_repo = SqliteDelegationRepository::new(self.conn.clone());
+
+        let tasks = task_repo.list_tasks(session_id).await?;
+        let intent_snapshots = intent_repo.list_intent_snapshots(session_id).await?;
+        let decisions = decision_repo.list_decisions(session_id, None).await?;
+        let progress_entries = progress_repo
+            .list_progress_entries(session_id, None)
+            .await?;
+        let artifacts = artifact_repo.list_artifacts(session_id, None).await?;
+        let delegations = delegation_repo.list_delegations(session_id).await?;
+
+        Ok(AuditView {
+            session_id: session_id.to_string(),
+            events,
+            tasks,
+            intent_snapshots,
+            decisions,
+            progress_entries,
+            artifacts,
+            delegations,
+            generated_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    async fn get_redacted_view(
+        &self,
+        session_id: &str,
+        policy: RedactionPolicy,
+    ) -> SessionResult<RedactedView> {
+        let redactor = DefaultRedactor;
+
+        let intent_repo = SqliteIntentRepository::new(self.conn.clone());
+        let task_repo = SqliteTaskRepository::new(self.conn.clone());
+        let progress_repo = SqliteProgressRepository::new(self.conn.clone());
+        let artifact_repo = SqliteArtifactRepository::new(self.conn.clone());
+
+        // Get current intent
+        let intent_snapshots = intent_repo.list_intent_snapshots(session_id).await?;
+        let current_intent = intent_snapshots
+            .last()
+            .map(|s| redactor.redact(&s.summary, policy));
+
+        // Get active task
+        let tasks = task_repo.list_tasks(session_id).await?;
+        let active_task = tasks
+            .iter()
+            .find(|t| matches!(t.status, TaskStatus::Active))
+            .map(|t| RedactedTask {
+                id: t.public_id.clone(),
+                status: format!("{:?}", t.status),
+                expected_deliverable: t
+                    .expected_deliverable
+                    .as_ref()
+                    .map(|d| redactor.redact(d, policy)),
+            });
+
+        // Get recent progress (last 10 entries)
+        let all_progress = progress_repo
+            .list_progress_entries(session_id, None)
+            .await?;
+        let recent_progress: Vec<RedactedProgress> = all_progress
+            .iter()
+            .rev()
+            .take(10)
+            .map(|p| RedactedProgress {
+                kind: format!("{:?}", p.kind),
+                summary: redactor.redact(&p.content, policy),
+                created_at: p.created_at,
+            })
+            .collect();
+
+        // Get artifacts
+        let all_artifacts = artifact_repo.list_artifacts(session_id, None).await?;
+        let artifacts: Vec<RedactedArtifact> = all_artifacts
+            .iter()
+            .map(|a| RedactedArtifact {
+                kind: a.kind.clone(),
+                summary: a.summary.as_ref().map(|s| redactor.redact(s, policy)),
+                created_at: a.created_at,
+            })
+            .collect();
+
+        Ok(RedactedView {
+            session_id: session_id.to_string(),
+            current_intent,
+            active_task,
+            recent_progress,
+            artifacts,
+            generated_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    async fn get_summary_view(&self, session_id: &str) -> SessionResult<SummaryView> {
+        let intent_repo = SqliteIntentRepository::new(self.conn.clone());
+        let task_repo = SqliteTaskRepository::new(self.conn.clone());
+        let decision_repo = SqliteDecisionRepository::new(self.conn.clone());
+        let progress_repo = SqliteProgressRepository::new(self.conn.clone());
+        let artifact_repo = SqliteArtifactRepository::new(self.conn.clone());
+
+        // Get current intent
+        let intent_snapshots = intent_repo.list_intent_snapshots(session_id).await?;
+        let current_intent = intent_snapshots.last().map(|s| s.summary.clone());
+
+        // Get active task status
+        let tasks = task_repo.list_tasks(session_id).await?;
+        let active_task_status = tasks
+            .iter()
+            .find(|t| matches!(t.status, TaskStatus::Active))
+            .map(|t| format!("{:?}", t.status));
+
+        // Count entities
+        let decisions = decision_repo.list_decisions(session_id, None).await?;
+        let progress_entries = progress_repo
+            .list_progress_entries(session_id, None)
+            .await?;
+        let artifacts = artifact_repo.list_artifacts(session_id, None).await?;
+
+        // Get last activity
+        let last_activity = progress_entries.last().map(|p| {
+            format!(
+                "{:?}: {}",
+                p.kind,
+                p.content.chars().take(50).collect::<String>()
+            )
+        });
+
+        Ok(SummaryView {
+            session_id: session_id.to_string(),
+            current_intent,
+            active_task_status,
+            progress_count: progress_entries.len(),
+            artifact_count: artifacts.len(),
+            decision_count: decisions.len(),
+            last_activity,
+            generated_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    async fn get_atif(
+        &self,
+        session_id: &str,
+        options: &crate::export::AtifExportOptions,
+    ) -> SessionResult<crate::export::ATIF> {
+        use crate::export::ATIFBuilder;
+
+        // Get the full audit view which contains all events and domain data
+        let audit_view = self.get_audit_view(session_id).await?;
+
+        // Build the ATIF trajectory from the audit view
+        // Tool definitions will be extracted from ToolsAvailable events
+        let builder = ATIFBuilder::from_audit_view(&audit_view, options);
+        let trajectory = builder.build();
+
+        Ok(trajectory)
+    }
+}
+
+// ============================================================================
+// EventObserver implementation
+// ============================================================================
+
+#[async_trait]
+impl EventObserver for SqliteStorage {
+    async fn on_event(&self, event: &AgentEvent) -> Result<(), LLMError> {
+        self.append_event(event)
+            .await
+            .map_err(|e| LLMError::ProviderError(format!("Event storage failed: {}", e)))?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+fn parse_llm_params(params: &str) -> Result<Option<serde_json::Value>, rusqlite::Error> {
+    if params.trim().is_empty() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_str(params).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    if value.as_object().is_none_or(|obj| obj.is_empty()) {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn parse_llm_config_row(row: &rusqlite::Row<'_>) -> Result<LLMConfig, rusqlite::Error> {
+    let params_str: String = row.get(4)?;
+    Ok(LLMConfig {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        provider: row.get(2)?,
+        model: row.get(3)?,
+        params: parse_llm_params(&params_str)?,
+        created_at: row.get::<_, Option<String>>(5)?.and_then(|s| {
+            OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).ok()
+        }),
+        updated_at: row.get::<_, Option<String>>(6)?.and_then(|s| {
+            OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).ok()
+        }),
+    })
+}
+
+fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    // Drop every table that might have been created by older schema versions so we can start fresh.
+    conn.execute_batch(
+        r#"
+            DROP TABLE IF EXISTS message_tool_calls;
+            DROP TABLE IF EXISTS message_binaries;
+            DROP TABLE IF EXISTS message_usage;
+            DROP TABLE IF EXISTS messages_fts;
+            DROP TABLE IF EXISTS message_parts;
+            DROP TABLE IF EXISTS messages;
+            DROP TABLE IF EXISTS events;
+            DROP TABLE IF EXISTS delegations;
+            DROP TABLE IF EXISTS artifacts;
+            DROP TABLE IF EXISTS progress_entries;
+            DROP TABLE IF EXISTS alternatives;
+            DROP TABLE IF EXISTS decisions;
+            DROP TABLE IF EXISTS intent_snapshots;
+            DROP TABLE IF EXISTS tasks;
+            DROP TABLE IF EXISTS sessions;
+            DROP TABLE IF EXISTS llm_configs;
+        "#,
+    )?;
+
+    schema::init_schema(conn)?;
+    Ok(())
+}

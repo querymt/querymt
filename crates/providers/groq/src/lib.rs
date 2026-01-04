@@ -1,4 +1,3 @@
-use either::*;
 use http::{
     Method, Request, Response,
     header::{AUTHORIZATION, CONTENT_TYPE},
@@ -157,7 +156,7 @@ impl HTTPChatProvider for Groq {
     }
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        Ok(openai_parse_chat(self, response)?)
+        openai_parse_chat(self, response)
     }
 }
 
@@ -204,7 +203,7 @@ impl HTTPCompletionProvider for Groq {
         handle_http_error!(resp);
 
         let json_resp: Result<GroqCompletionResponse, serde_json::Error> =
-            serde_json::from_slice(&resp.body());
+            serde_json::from_slice(resp.body());
         match json_resp {
             Ok(completion_response) => Ok(CompletionResponse {
                 text: completion_response.choices[0].message.content.clone(), // FIXME
@@ -266,10 +265,10 @@ impl HTTPLLMProviderFactory for GroqFactory {
 
 #[warn(dead_code)]
 fn get_pricing(model: &str) -> Option<ModelPricing> {
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
-        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
-            return registry.get_pricing("groq", model).cloned();
-        }
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
+        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
+    {
+        return registry.get_pricing("groq", model).cloned();
     }
     None
 }

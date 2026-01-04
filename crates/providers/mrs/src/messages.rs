@@ -51,10 +51,7 @@ pub(crate) fn apply_message_to_request(
 }
 
 pub(crate) fn ensure_chat_model(model: &Model) -> Result<(), LLMError> {
-    let category = model
-        .config()
-        .map_err(|e| LLMError::ProviderError(e))?
-        .category;
+    let category = model.config().map_err(LLMError::ProviderError)?.category;
     if matches!(category, ModelCategory::Embedding) {
         return Err(LLMError::InvalidRequest(
             "embedding models do not support chat requests".into(),
@@ -64,10 +61,7 @@ pub(crate) fn ensure_chat_model(model: &Model) -> Result<(), LLMError> {
 }
 
 pub(crate) fn ensure_embedding_model(model: &Model) -> Result<(), LLMError> {
-    let category = model
-        .config()
-        .map_err(|e| LLMError::ProviderError(e))?
-        .category;
+    let category = model.config().map_err(LLMError::ProviderError)?.category;
     if matches!(category, ModelCategory::Embedding) {
         Ok(())
     } else {

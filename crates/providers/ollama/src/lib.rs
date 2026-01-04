@@ -7,8 +7,8 @@ use http::{Method, Request, Response, header::CONTENT_TYPE};
 use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, MessageType, StructuredOutputFormat, Tool,
-        http::HTTPChatProvider,
+        ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, StructuredOutputFormat,
+        Tool, http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -122,6 +122,9 @@ pub struct Ollama {
 
     /// Whether to use NUMA (Non-Uniform Memory Access)
     pub numa: Option<bool>,
+
+    /// Sets the size of the context window used to generate the next token
+    pub num_ctx: Option<u32>,
 }
 
 /// Request payload for Ollama's chat API endpoint.
@@ -243,6 +246,8 @@ struct OllamaResponse {
     content: Option<String>,
     response: Option<String>,
     message: Option<OllamaChatResponseMessage>,
+    done: bool,
+    done_reason: Option<String>,
     prompt_eval_count: Option<u32>,
     eval_count: Option<u32>,
 }
@@ -257,16 +262,16 @@ impl std::fmt::Display for OllamaResponse {
             .or(self.message.as_ref().map(|m| &m.content))
             .unwrap_or(&empty);
 
-        if let Some(msg) = &self.message {
-            if let Some(tool_calls) = &msg.tool_calls {
-                for tc in tool_calls {
-                    writeln!(
-                        f,
-                        "{{\"name\": \"{}\", \"arguments\": {}}}",
-                        tc.function.name,
-                        serde_json::to_string_pretty(&tc.function.arguments).unwrap_or_default()
-                    )?;
-                }
+        if let Some(msg) = &self.message
+            && let Some(tool_calls) = &msg.tool_calls
+        {
+            for tc in tool_calls {
+                writeln!(
+                    f,
+                    "{{\"name\": \"{}\", \"arguments\": {}}}",
+                    tc.function.name,
+                    serde_json::to_string_pretty(&tc.function.arguments).unwrap_or_default()
+                )?;
             }
         }
         write!(f, "{}", text)
@@ -303,14 +308,33 @@ impl ChatResponse for OllamaResponse {
     }
 
     fn usage(&self) -> Option<Usage> {
-        if let Some(input_tokens) = self.prompt_eval_count {
-            Some(Usage {
-                input_tokens,
-                output_tokens: self.eval_count.unwrap_or(0),
-            })
-        } else {
-            None
+        self.prompt_eval_count.map(|input_tokens| Usage {
+            input_tokens,
+            output_tokens: self.eval_count.unwrap_or(0),
+        })
+    }
+
+    fn finish_reason(&self) -> Option<FinishReason> {
+        if self.done {
+            // Check if there are tool calls - takes precedence over done_reason
+            // because Ollama returns "stop" even when tool calls are present
+            if self
+                .message
+                .as_ref()
+                .and_then(|m| m.tool_calls.as_ref())
+                .is_some_and(|tc| !tc.is_empty())
+            {
+                return Some(FinishReason::ToolCalls);
+            }
+
+            return Some(match self.done_reason.as_deref() {
+                Some("stop") => FinishReason::Stop,
+                Some("length") => FinishReason::Length,
+                Some("unload" | "load") => FinishReason::Other,
+                Some(_) | None => FinishReason::Unknown,
+            });
         }
+        None
     }
 }
 
@@ -382,7 +406,7 @@ impl Ollama {
     /// Builds OllamaOptions from Ollama configuration, handling all parameters
     fn build_options(&self) -> OllamaOptions {
         OllamaOptions {
-            num_ctx: Some(24 * 4096), // Keep existing default
+            num_ctx: self.num_ctx,
             temperature: self.temperature,
             top_p: self.top_p,
             top_k: self.top_k,
@@ -575,7 +599,7 @@ impl HTTPLLMProviderFactory for OllamaFactory {
             .get("base_url")
             .and_then(Value::as_str)
             .map(String::from)
-            .unwrap_or_else(|| return Ollama::default_base_url().as_str().to_string());
+            .unwrap_or_else(|| Ollama::default_base_url().as_str().to_string());
 
         let url: String = format!("{}/api/tags", base);
         Ok(Request::builder()
@@ -586,7 +610,7 @@ impl HTTPLLMProviderFactory for OllamaFactory {
     }
 
     fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
-        let resp_json: Value = serde_json::from_slice(&resp.body())?;
+        let resp_json: Value = serde_json::from_slice(resp.body())?;
 
         let arr = resp_json
             .get("models")

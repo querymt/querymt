@@ -19,6 +19,7 @@ use crate::tools::{build_mistral_tools, map_tool_choice};
 struct MistralChatResponse {
     text: Option<String>,
     tool_calls: Option<Vec<ToolCall>>,
+    finish_reason: Option<String>,
     usage: Option<Usage>,
 }
 
@@ -30,7 +31,7 @@ impl std::fmt::Display for MistralChatResponse {
 
 impl From<ChatCompletionResponse> for MistralChatResponse {
     fn from(value: ChatCompletionResponse) -> Self {
-        let choice = value.choices.get(0);
+        let choice = value.choices.first();
         let tool_calls = choice
             .and_then(|choice| choice.message.tool_calls.as_ref())
             .map(|calls| {
@@ -50,11 +51,13 @@ impl From<ChatCompletionResponse> for MistralChatResponse {
             input_tokens: u32::try_from(value.usage.prompt_tokens).unwrap_or(u32::MAX),
             output_tokens: u32::try_from(value.usage.completion_tokens).unwrap_or(u32::MAX),
         });
+        let finish_reason = choice.map(|choice| choice.finish_reason.clone());
 
         MistralChatResponse {
             text: choice.and_then(|choice| choice.message.content.clone()),
             tool_calls,
             usage,
+            finish_reason,
         }
     }
 }
@@ -71,6 +74,16 @@ impl ChatResponse for MistralChatResponse {
     }
     fn thinking(&self) -> Option<String> {
         None
+    }
+    fn finish_reason(&self) -> Option<querymt::chat::FinishReason> {
+        self.finish_reason
+            .clone()
+            .map(|reason| match reason.as_str() {
+                "stop" => querymt::chat::FinishReason::Stop,
+                "tool_calls" => querymt::chat::FinishReason::ToolCalls,
+                "length" => querymt::chat::FinishReason::Length,
+                _other => querymt::chat::FinishReason::Other,
+            })
     }
 }
 

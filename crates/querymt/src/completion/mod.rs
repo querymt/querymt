@@ -1,6 +1,10 @@
 use async_trait::async_trait;
 
-use crate::{chat::ChatResponse, error::LLMError, ToolCall, Usage};
+use crate::{
+    chat::{ChatResponse, FinishReason},
+    error::LLMError,
+    ToolCall, Usage,
+};
 use serde::{Deserialize, Serialize};
 
 pub mod http;
@@ -33,6 +37,9 @@ impl ChatResponse for CompletionResponse {
         None
     }
     fn usage(&self) -> Option<Usage> {
+        None
+    }
+    fn finish_reason(&self) -> Option<FinishReason> {
         None
     }
 }

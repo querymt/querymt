@@ -6,8 +6,8 @@ use http::{
 use querymt::{
     FunctionCall, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, MessageType, StreamChunk, StructuredOutputFormat,
-        Tool, ToolChoice,
+        ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, StreamChunk,
+        StructuredOutputFormat, Tool, ToolChoice,
     },
     error::LLMError,
     handle_http_error,
@@ -154,6 +154,7 @@ struct OpenAIChatResponse {
 /// Individual choice within an OpenAI chat API response.
 #[derive(Deserialize, Debug)]
 struct OpenAIChatChoice {
+    finish_reason: String,
     message: OpenAIChatMsg,
 }
 
@@ -243,6 +244,18 @@ impl ChatResponse for OpenAIChatResponse {
 
     fn usage(&self) -> Option<Usage> {
         self.usage.clone()
+    }
+
+    fn finish_reason(&self) -> Option<FinishReason> {
+        self.choices
+            .first()
+            .map(|c| match c.finish_reason.as_str() {
+                "stop" => FinishReason::Stop,
+                "length" => FinishReason::Length,
+                "content_filter" => FinishReason::ContentFilter,
+                "tool_calls" | "function_call" => FinishReason::ToolCalls,
+                _ => FinishReason::Unknown,
+            })
     }
 }
 
@@ -382,9 +395,7 @@ pub fn openai_embed_request<C: OpenAIProviderConfig>(
 ) -> Result<Request<Vec<u8>>, LLMError> {
     let api_key = resolve_auth_token(cfg)?;
 
-    let emb_format = cfg
-        .embedding_encoding_format()
-        .unwrap_or_else(|| "float".into());
+    let emb_format = cfg.embedding_encoding_format().unwrap_or("float");
 
     let body = OpenAIEmbeddingRequest {
         model: cfg.model().into(),
@@ -477,7 +488,7 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
     };
 
     let body = OpenAIChatRequest {
-        model: &cfg.model(),
+        model: cfg.model(),
         messages: openai_msgs,
         max_tokens: cfg.max_tokens().copied(),
         temperature: cfg.temperature().copied(),
@@ -514,7 +525,7 @@ pub fn openai_parse_chat<C: OpenAIProviderConfig>(
 
     // Parse the successful response
     let json_resp: Result<OpenAIChatResponse, serde_json::Error> =
-        serde_json::from_slice(&response.body());
+        serde_json::from_slice(response.body());
 
     let resp_text: String = "".to_string();
     match json_resp {
@@ -774,10 +785,10 @@ pub fn parse_openai_sse_chunk(
         // Process each choice
         for choice in &stream_chunk.choices {
             // Handle text content
-            if let Some(content) = &choice.delta.content {
-                if !content.is_empty() {
-                    results.push(StreamChunk::Text(content.clone()));
-                }
+            if let Some(content) = &choice.delta.content
+                && !content.is_empty()
+            {
+                results.push(StreamChunk::Text(content.clone()));
             }
 
             // Handle tool calls

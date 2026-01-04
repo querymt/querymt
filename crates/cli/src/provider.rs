@@ -1,5 +1,6 @@
 use querymt::plugin::{
-    extism_impl::host::ExtismLoader, host::PluginRegistry, host::native::NativeLoader,
+    default_providers_path, extism_impl::host::ExtismLoader, host::PluginRegistry,
+    host::native::NativeLoader,
 };
 use std::path::PathBuf;
 
@@ -21,10 +22,10 @@ pub fn get_provider_info(args: &CliArgs) -> Option<(String, Option<String>)> {
     if let Some(ref s) = args.backend {
         return Some(split_provider(s));
     }
-    if let Ok(store) = SecretStore::new() {
-        if let Some(default) = store.get_default_provider() {
-            return Some(split_provider(&default));
-        }
+    if let Ok(store) = SecretStore::new()
+        && let Some(default) = store.get_default_provider()
+    {
+        return Some(split_provider(&default));
     }
     None
 }
@@ -47,28 +48,25 @@ pub async fn get_api_key(
     }
 
     // 2. Check for OAuth tokens (prefer OAuth over API keys)
-    if let Ok(oauth_provider) = crate::auth::get_oauth_provider(provider, None) {
-        if let Ok(mut store) = SecretStore::new() {
-            // Try to get a valid OAuth token (will refresh if needed)
-            if let Ok(token) =
-                crate::auth::get_valid_token(oauth_provider.as_ref(), &mut store).await
-            {
-                log::debug!("Using OAuth token for {}", provider);
-                return Some(token);
-            }
+    if let Ok(oauth_provider) = crate::auth::get_oauth_provider(provider, None)
+        && let Ok(mut store) = SecretStore::new()
+    {
+        // Try to get a valid OAuth token (will refresh if needed)
+        if let Ok(token) = crate::auth::get_valid_token(oauth_provider.as_ref(), &mut store).await {
+            log::debug!("Using OAuth token for {}", provider);
+            return Some(token);
         }
     }
 
     // 3. Fall back to API key from secret store or environment
-    if let Some(factory) = registry.get(provider).await {
-        if let Some(http_factory) = factory.as_http() {
-            if let Some(name) = http_factory.api_key_name() {
-                return SecretStore::new()
-                    .ok()
-                    .and_then(|store| store.get(&name))
-                    .or_else(|| std::env::var(name).ok());
-            }
-        }
+    if let Some(factory) = registry.get(provider).await
+        && let Some(http_factory) = factory.as_http()
+        && let Some(name) = http_factory.api_key_name()
+    {
+        return SecretStore::new()
+            .ok()
+            .and_then(|store| store.get(&name))
+            .or_else(|| std::env::var(name).ok());
     }
     None
 }
@@ -79,13 +77,19 @@ pub async fn get_provider_registry(args: &CliArgs) -> Result<PluginRegistry, LLM
     let cfg_file = if let Some(cfg) = &args.provider_config {
         PathBuf::from(cfg)
     } else {
-        find_config_in_home(&["providers.json", "providers.toml", "providers.yaml"]).map_err(
-            |_| {
-                LLMError::InvalidRequest(
-                    "Config file for providers is missing. Please provide one!".to_string(),
-                )
-            },
-        )?
+        let default_cfg = default_providers_path();
+        if default_cfg.is_file() {
+            default_cfg
+        } else {
+            find_config_in_home(&["providers.json", "providers.toml", "providers.yaml"]).map_err(
+                |_| {
+                    LLMError::InvalidRequest(format!(
+                        "Config file for providers is missing. Expected {:?}.",
+                        default_providers_path()
+                    ))
+                },
+            )?
+        }
     };
 
     let mut registry = PluginRegistry::from_path(cfg_file)?;

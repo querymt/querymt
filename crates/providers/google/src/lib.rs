@@ -44,8 +44,8 @@ use http::{Method, Request, Response, header::CONTENT_TYPE};
 use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, MessageType, StructuredOutputFormat, Tool, ToolChoice,
-        http::HTTPChatProvider,
+        ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, StructuredOutputFormat,
+        Tool, ToolChoice, http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -333,6 +333,35 @@ impl ChatResponse for GoogleChatResponse {
     fn usage(&self) -> Option<Usage> {
         self.usage.clone()
     }
+
+    fn finish_reason(&self) -> Option<FinishReason> {
+        if self.tool_calls().is_some() {
+            return Some(FinishReason::ToolCalls);
+        }
+
+        match self
+            .candidates
+            .first()
+            .map(|c| c.finish_reason.clone())
+            .unwrap()
+            .as_deref()
+        {
+            Some("STOP") => Some(FinishReason::Stop),
+            Some("MAX_TOKENS") => Some(FinishReason::Length),
+            Some(
+                "SAFETY"
+                | "IMAGE_SAFETY"
+                | "IMAGE_PROHIBITED_CONTENT"
+                | "BLOCKLIST"
+                | "SPII"
+                | "PROHIBITED_CONTENT",
+            ) => Some(FinishReason::ContentFilter),
+            Some("OTHER" | "IMAGE_OTHER") => Some(FinishReason::Other),
+            Some("MALFORMED_FUNCTION_CALL") => Some(FinishReason::Error),
+            Some("FINISH_REASON_UNSPECIFIED") => Some(FinishReason::Unknown),
+            _ => None,
+        }
+    }
 }
 
 /// Individual part of response content
@@ -553,9 +582,9 @@ impl HTTPChatProvider for Google {
         let mut chat_contents = Vec::with_capacity(messages.len());
 
         if self.cached_content.is_some() && self.tools().is_some() {
-            return Err(LLMError::InvalidRequest(format!(
-                "Cached content is set and tools as well!"
-            )));
+            return Err(LLMError::InvalidRequest(
+                "Cached content is set and tools as well!".to_string(),
+            ));
         }
 
         // Add conversation messages in pairs to maintain context
@@ -617,13 +646,9 @@ impl HTTPChatProvider for Google {
         }
 
         // Add system message if present
-        let system_instruction = if let Some(system) = &self.system {
-            Some(GoogleSystemInstruction {
-                parts: vec![GoogleContentPart::Text(system)],
-            })
-        } else {
-            None
-        };
+        let system_instruction = self.system.as_ref().map(|system| GoogleSystemInstruction {
+            parts: vec![GoogleContentPart::Text(system)],
+        });
 
         // Convert tools to Google's format if provided
         let google_tools = tools.map(|t| {
@@ -654,14 +679,12 @@ impl HTTPChatProvider for Google {
                 (None, None)
             };
 
-            let thinking_config = if let Some(thinking_budget) = self.thinking_budget {
-                Some(GoogleThinkingConfig {
-                    include_thoughts: None, // TODO
-                    thinking_budget: Some(thinking_budget),
-                })
-            } else {
-                None
-            };
+            let thinking_config =
+                self.thinking_budget
+                    .map(|thinking_budget| GoogleThinkingConfig {
+                        include_thoughts: None, // TODO
+                        thinking_budget: Some(thinking_budget),
+                    });
 
             Some(GoogleGenerationConfig {
                 max_output_tokens: self.max_tokens,
@@ -714,7 +737,7 @@ impl HTTPChatProvider for Google {
         handle_http_error!(resp);
 
         let json_resp: Result<GoogleChatResponse, serde_json::Error> =
-            serde_json::from_slice(&resp.body());
+            serde_json::from_slice(resp.body());
 
         match json_resp {
             Ok(response) => Ok(Box::new(response)),
@@ -798,7 +821,7 @@ impl HTTPEmbeddingProvider for Google {
             let req_body = GoogleEmbeddingRequest {
                 model: "models/text-embedding-004",
                 content: GoogleEmbeddingContent {
-                    parts: vec![GoogleContentPart::Text(&text)],
+                    parts: vec![GoogleContentPart::Text(text)],
                 },
             };
             json_body = serde_json::to_vec(&req_body)?;
@@ -824,7 +847,7 @@ impl HTTPEmbeddingProvider for Google {
 
     fn parse_embed(&self, resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
         let embedding_resp: GoogleEmbeddingResponse = serde_json::from_slice(resp.body())?;
-        let x = embedding_resp.embedding.values;
+        let _x = embedding_resp.embedding.values;
         //Ok(embedding_resp.embedding.values)
         todo!("finish google embedding");
         Err(LLMError::ProviderError("asd".to_string()))
@@ -842,26 +865,23 @@ impl HTTPLLMProvider for Google {
 fn extract_complete_json_objects(
     buffer: &str,
 ) -> Result<(Vec<querymt::chat::StreamChunk>, usize), LLMError> {
-    use serde_json::Deserializer;
-
-    let mut result_chunks: Vec<querymt::chat::StreamChunk> = Vec::new();
+    let _result_chunks: Vec<querymt::chat::StreamChunk> = Vec::new();
     let mut bytes_consumed = 0;
 
     // Strip leading whitespace and array opening bracket
     let trimmed = buffer.trim_start();
-    let working_text = if trimmed.starts_with('[') {
+    let working_text = if let Some(stripped) = trimmed.strip_prefix('[') {
         bytes_consumed += buffer.len() - trimmed.len() + 1; // whitespace + '['
-        &trimmed[1..]
+        stripped
     } else {
         trimmed
     };
 
     // Strip leading comma and whitespace (between array elements)
     let working_text = working_text.trim_start();
-    if working_text.starts_with(',') {
+    if let Some(stripped) = working_text.strip_prefix(',') {
         bytes_consumed += 1;
-        let working_text = &working_text[1..];
-        let working_text = working_text.trim_start();
+        let working_text = stripped.trim_start();
         bytes_consumed +=
             working_text.as_ptr() as usize - (buffer.as_ptr() as usize + bytes_consumed);
 
@@ -1001,15 +1021,14 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
     }
 
     // Extract usage metadata - only emit with finish_reason (final chunk)
-    if let Some(usage) = response.usage {
-        if response
+    if let Some(usage) = response.usage
+        && response
             .candidates
             .first()
             .and_then(|c| c.finish_reason.as_ref())
             .is_some()
-        {
-            chunks.push(querymt::chat::StreamChunk::Usage(usage));
-        }
+    {
+        chunks.push(querymt::chat::StreamChunk::Usage(usage));
     }
 
     chunks
@@ -1046,7 +1065,7 @@ impl HTTPLLMProviderFactory for GoogleFactory {
     }
 
     fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
-        let resp_json: Value = serde_json::from_slice(&resp.body())?;
+        let resp_json: Value = serde_json::from_slice(resp.body())?;
         let arr = resp_json
             .get("models")
             .and_then(Value::as_array)
@@ -1075,10 +1094,10 @@ impl HTTPLLMProviderFactory for GoogleFactory {
 
 #[warn(dead_code)]
 fn get_pricing(model: &str) -> Option<ModelPricing> {
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
-        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
-            return registry.get_pricing("google", model).cloned();
-        }
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
+        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
+    {
+        return registry.get_pricing("google", model).cloned();
     }
     None
 }

@@ -13,10 +13,6 @@ use querymt::{
     error::LLMError,
     plugin::HTTPLLMProviderFactory,
 };
-use querymt::{
-    get_env_var,
-    providers::{ModelPricing, ProvidersRegistry},
-};
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -179,7 +175,7 @@ struct MoonshotAIFactory;
 
 impl HTTPLLMProviderFactory for MoonshotAIFactory {
     fn name(&self) -> &str {
-        "moonshot"
+        "moonshotai"
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -225,7 +221,7 @@ mod extism_exports {
     impl_extism_http_plugin! {
         config = MoonshotAI,
         factory = MoonshotAIFactory,
-        name   = "moonshot",
+        name   = "moonshotai",
     }
 }
 
@@ -234,10 +230,10 @@ fn get_pricing(model: &str) -> Option<querymt::providers::ModelPricing> {
     use querymt::get_env_var;
     use querymt::providers::ProvidersRegistry;
 
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
-        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
-            return registry.get_pricing("moonshot", model).cloned();
-        }
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
+        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
+    {
+        return registry.get_pricing("moonshotai", model).cloned();
     }
     None
 }

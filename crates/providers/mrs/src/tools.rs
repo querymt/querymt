@@ -27,10 +27,11 @@ pub(crate) fn build_mistral_tools(tools: &[Tool]) -> Result<Vec<MistralTool>, LL
                     tool.tool_type
                 )));
             }
-            let params = match tool.function.parameters.as_object() {
-                Some(map) => Some(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-                None => None,
-            };
+            let params = tool
+                .function
+                .parameters
+                .as_object()
+                .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
             Ok(MistralTool {
                 tp: MistralToolType::Function,
                 function: MistralFunction {

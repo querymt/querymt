@@ -9,7 +9,8 @@ use http::{Method, Request, Response, header::CONTENT_TYPE};
 use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, MessageType, Tool, ToolChoice, http::HTTPChatProvider,
+        ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, Tool, ToolChoice,
+        http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -151,6 +152,7 @@ struct ImageSource<'a> {
 #[derive(Deserialize, Debug)]
 struct AnthropicCompleteResponse {
     content: Vec<AnthropicContent>,
+    stop_reason: String,
     usage: Option<Usage>,
 }
 
@@ -215,11 +217,7 @@ impl std::fmt::Display for AnthropicCompleteResponse {
                     f,
                     "{{\n \"name\": {}, \"input\": {}\n}}",
                     content.name.clone().unwrap_or_default(),
-                    content
-                        .input
-                        .clone()
-                        .unwrap_or(serde_json::Value::Null)
-                        .to_string()
+                    content.input.clone().unwrap_or(serde_json::Value::Null)
                 )?,
                 Some(ref t) if t == "thinking" => {
                     write!(f, "{}", content.thinking.clone().unwrap_or_default())?
@@ -294,6 +292,17 @@ impl ChatResponse for AnthropicCompleteResponse {
     fn usage(&self) -> Option<Usage> {
         self.usage.clone()
     }
+
+    fn finish_reason(&self) -> Option<FinishReason> {
+        Some(match self.stop_reason.as_ref() {
+            "end_turn" => FinishReason::Stop,
+            "max_tokens" => FinishReason::Length,
+            "stop_sequence" => FinishReason::Stop,
+            "tool_use" => FinishReason::ToolCalls,
+            "refusal" | "pause_turn" => FinishReason::Other,
+            _ => FinishReason::Unknown,
+        })
+    }
 }
 
 impl Anthropic {
@@ -312,21 +321,19 @@ impl Anthropic {
             // Check for OAuth token pattern: sk-ant-oat<digits>-
             if self.api_key.starts_with("sk-ant-oat") {
                 // Validate it has digits after 'oat'
-                if let Some(rest) = self.api_key.strip_prefix("sk-ant-oat") {
-                    if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                if let Some(rest) = self.api_key.strip_prefix("sk-ant-oat")
+                    && rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                         return AuthType::OAuth;
                     }
-                }
             }
 
             // Check for API key pattern: sk-ant-api<digits>-
             if self.api_key.starts_with("sk-ant-api") {
                 // Validate it has digits after 'api'
-                if let Some(rest) = self.api_key.strip_prefix("sk-ant-api") {
-                    if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                if let Some(rest) = self.api_key.strip_prefix("sk-ant-api")
+                    && rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                         return AuthType::ApiKey;
                     }
-                }
             }
 
             // Fallback: Check for generic sk-ant- prefix (backward compatibility)
@@ -379,8 +386,7 @@ impl HTTPChatProvider for Anthropic {
 
         let anthropic_messages: Vec<AnthropicMessage> = messages
             .iter()
-            .enumerate()
-            .map(|(i, m)| AnthropicMessage {
+            .map(|m| AnthropicMessage {
                 role: match m.role {
                     ChatRole::User => "user",
                     ChatRole::Assistant => "assistant",
@@ -612,14 +618,13 @@ impl HTTPChatProvider for Anthropic {
                     "content_block_start" => {
                         if let (Some(index), Some(block)) =
                             (stream_resp.index, stream_resp.content_block)
+                            && block.block_type == "tool_use"
                         {
-                            if block.block_type == "tool_use" {
-                                chunks.push(querymt::chat::StreamChunk::ToolUseStart {
-                                    index,
-                                    id: block.id.unwrap_or_default(),
-                                    name: block.name.unwrap_or_default(),
-                                });
-                            }
+                            chunks.push(querymt::chat::StreamChunk::ToolUseStart {
+                                index,
+                                id: block.id.unwrap_or_default(),
+                                name: block.name.unwrap_or_default(),
+                            });
                         }
                     }
                     "content_block_delta" => {
@@ -637,10 +642,10 @@ impl HTTPChatProvider for Anthropic {
                         }
                     }
                     "message_delta" => {
-                        if let Some(delta) = stream_resp.delta {
-                            if let Some(stop_reason) = delta.stop_reason {
-                                chunks.push(querymt::chat::StreamChunk::Done { stop_reason });
-                            }
+                        if let Some(delta) = stream_resp.delta
+                            && let Some(stop_reason) = delta.stop_reason
+                        {
+                            chunks.push(querymt::chat::StreamChunk::Done { stop_reason });
                         }
                     }
                     _ => {}
@@ -683,10 +688,10 @@ impl HTTPLLMProvider for Anthropic {
 
 #[warn(dead_code)]
 fn get_pricing(model: &str) -> Option<ModelPricing> {
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
-        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
-            return registry.get_pricing("anthropic", model).cloned();
-        }
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
+        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
+    {
+        return registry.get_pricing("anthropic", model).cloned();
     }
     None
 }

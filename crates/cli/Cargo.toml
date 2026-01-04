@@ -31,7 +31,7 @@ dirs = "6.0"
 toml = "0.9"
 futures = "0.3"
 anthropic-auth = { version = "0.1", default-features = false, features = ["browser", "async", "rustls-tls"] }
-openai-auth = { version = "0.2", features = ["browser", "async", "callback-server"] }
+openai-auth = { version = "1.0", features = ["browser", "async", "callback-server"] }
 async-trait = "0.1"
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native", "crypto-rust"] }
 url = "2"

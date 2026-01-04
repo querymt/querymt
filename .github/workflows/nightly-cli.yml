@@ -11,8 +11,43 @@ env:
   APP_NAME: qmt
 
 jobs:
+  check-changes:
+    name: Check for changes since last nightly
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+      last_commit: ${{ steps.check.outputs.last_commit }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # Need full history to compare
+      
+      - name: Check for changes
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get the commit SHA from the last nightly release
+          LAST_NIGHTLY_SHA=$(gh release view nightly --json targetCommitish --jq '.targetCommitish' 2>/dev/null || echo "")
+          
+          CURRENT_SHA=$(git rev-parse HEAD)
+          
+          # If no previous nightly exists, or SHAs differ, we have changes
+          if [ -z "$LAST_NIGHTLY_SHA" ] || [ "$LAST_NIGHTLY_SHA" != "$CURRENT_SHA" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Changes detected or first nightly build"
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No changes since last nightly build ($LAST_NIGHTLY_SHA)"
+          fi
+          
+          echo "last_commit=$LAST_NIGHTLY_SHA" >> $GITHUB_OUTPUT
+
   build:
     name: Build for ${{ matrix.target }}
+    needs: check-changes
+    if: needs.check-changes.outputs.has_changes == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -120,7 +155,8 @@ jobs:
 
   release:
     name: Create Nightly GitHub Release
-    needs: build
+    needs: [check-changes, build]
+    if: needs.check-changes.outputs.has_changes == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write # Required to create/update releases

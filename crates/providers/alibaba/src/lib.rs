@@ -245,10 +245,10 @@ impl HTTPLLMProviderFactory for AlibabaFactory {
 
 #[warn(dead_code)]
 fn get_pricing(model: &str) -> Option<ModelPricing> {
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA") {
-        if let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models) {
-            return registry.get_pricing("alibaba", model).cloned();
-        }
+    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
+        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
+    {
+        return registry.get_pricing("alibaba", model).cloned();
     }
     None
 }

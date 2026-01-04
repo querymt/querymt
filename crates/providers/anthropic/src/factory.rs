@@ -34,22 +34,18 @@ impl HTTPLLMProviderFactory for AnthropicFactory {
                     .unwrap_or_else(|| {
                         // Auto-detect based on api_key format
                         // Check for OAuth token pattern: sk-ant-oat<digits>-
-                        if api_key.starts_with("sk-ant-oat") {
-                            if let Some(rest) = api_key.strip_prefix("sk-ant-oat") {
-                                if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                        if api_key.starts_with("sk-ant-oat")
+                            && let Some(rest) = api_key.strip_prefix("sk-ant-oat")
+                                && rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                                     return crate::AuthType::OAuth;
                                 }
-                            }
-                        }
 
                         // Check for API key pattern: sk-ant-api<digits>-
-                        if api_key.starts_with("sk-ant-api") {
-                            if let Some(rest) = api_key.strip_prefix("sk-ant-api") {
-                                if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                        if api_key.starts_with("sk-ant-api")
+                            && let Some(rest) = api_key.strip_prefix("sk-ant-api")
+                                && rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                                     return crate::AuthType::ApiKey;
                                 }
-                            }
-                        }
 
                         // Fallback: Check for generic sk-ant- prefix (backward compatibility)
                         if api_key.starts_with("sk-ant-") {
@@ -89,7 +85,7 @@ impl HTTPLLMProviderFactory for AnthropicFactory {
     }
 
     fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
-        let resp_json: Value = serde_json::from_slice(&resp.body())?;
+        let resp_json: Value = serde_json::from_slice(resp.body())?;
         let arr = resp_json
             .get("data")
             .and_then(Value::as_array)

@@ -51,6 +51,9 @@ pub mod plugin;
 
 pub mod tool_decorator;
 
+/// LLM configuration parameters
+pub mod params;
+
 /// Validation wrapper for LLM providers with retry capabilities
 #[cfg(any(feature = "http-client", feature = "extism_host"))]
 pub mod validated_llm;
@@ -59,6 +62,9 @@ pub mod validated_llm;
 pub mod evaluator;
 
 pub mod providers;
+
+// Re-export LLMParams for convenience
+pub use params::LLMParams;
 
 /// Core trait that all LLM providers must implement, combining chat, completion
 /// and embedding capabilities into a unified interface
