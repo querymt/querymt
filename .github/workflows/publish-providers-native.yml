@@ -322,6 +322,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           key: native-${{ matrix.target }}-${{ matrix.feature_tag }}
+          cache-targets: "false"
 
       - name: Set up CUDA toolkit
         if: matrix.crate != 'noop' && matrix.needs_cuda == 'true'
@@ -346,6 +347,12 @@ jobs:
           Copy-Item -Path "$($folder.FullName)\bin\*" -Destination "$env:CUDA_PATH\bin" -Recurse -Force
           Copy-Item -Path "$($folder.FullName)\include\*" -Destination "$env:CUDA_PATH\include" -Recurse -Force
           Copy-Item -Path "$($folder.FullName)\lib\x64\*" -Destination "$env:CUDA_PATH\lib\x64" -Recurse -Force
+
+      - name: Set up MSVC (Windows CUDA)
+        if: matrix.os == 'windows' && matrix.needs_cuda == 'true'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Build native library
         if: matrix.crate != 'noop'
