@@ -233,7 +233,7 @@ jobs:
         if: matrix.crate != 'noop' && matrix.needs_cuda == 'true'
         uses: mjun0812/setup-cuda@v1
         with:
-          version: "12.4"
+          version: "12.8"
 
       - name: Build native library
         if: matrix.crate != 'noop'
