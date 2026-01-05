@@ -66,9 +66,9 @@ jobs:
             if [[ -f "$toml" ]]; then
               detected_type=$(
                 awk -F'=' '
-                  $0 ~ /^\[package\.metadata\.qmt\]/ {in=1; next}
-                  in && $0 ~ /^\[/ {in=0}
-                  in && $1 ~ /provider_type/ {
+                  $0 ~ /^\[package\.metadata\.qmt\]/ {in_qmt=1; next}
+                  in_qmt && $0 ~ /^\[/ {in_qmt=0}
+                  in_qmt && $1 ~ /provider_type/ {
                     gsub(/"/, "", $2); gsub(/ /, "", $2); print $2; exit
                   }
                 ' "$toml"
@@ -120,7 +120,7 @@ jobs:
 
           providers = [p for p in os.environ.get("PROVIDERS", "").split() if p]
           if not providers or providers == ["noop"]:
-            print(json.dumps({"include": [{"crate": "noop"}]}))
+            print(json.dumps({"include": [{"crate": "noop", "runner": "ubuntu-latest"}]}))
             raise SystemExit(0)
 
           config = load_yaml(os.environ.get("NATIVE_MATRIX", ".github/workflows/native-matrix.yml"))

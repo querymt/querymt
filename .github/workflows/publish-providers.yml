@@ -74,9 +74,9 @@ jobs:
             if [[ -f "$toml" ]]; then
               detected_type=$(
                 awk -F'=' '
-                  $0 ~ /^\[package\.metadata\.qmt\]/ {in=1; next}
-                  in && $0 ~ /^\[/ {in=0}
-                  in && $1 ~ /^type$/ {
+                  $0 ~ /^\[package\.metadata\.qmt\]/ {in_qmt=1; next}
+                  in_qmt && $0 ~ /^\[/ {in_qmt=0}
+                  in_qmt && $1 ~ /^type$/ {
                     gsub(/"/, "", $2); gsub(/ /, "", $2); print $2; exit
                   }
                 ' "$toml"
