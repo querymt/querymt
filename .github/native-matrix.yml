@@ -32,6 +32,18 @@ providers:
       windows:
         "cuda flash-attn cudnn":
           CUDA_COMPUTE_CAP: "86;89;120"
+    # Per-architecture feature sets for windows (CUDA only on amd64)
+    targets:
+      windows:
+        - target: x86_64-pc-windows-msvc
+          arch: amd64
+          features:
+            - ""
+            - "cuda flash-attn cudnn"
+        - target: aarch64-pc-windows-msvc
+          arch: arm64
+          features:
+            - ""
     feature_sets:
       linux:
         - ""
@@ -39,6 +51,3 @@ providers:
       darwin:
         - "accelerate"
         - "metal"
-      windows:
-        - ""
-        - "cuda flash-attn cudnn"

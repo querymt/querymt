@@ -94,7 +94,7 @@ jobs:
 
           echo "Final native plugin list: ${NATIVE[*]}"
 
-          matrix=$(PROVIDERS="${NATIVE[*]}" NATIVE_MATRIX=".github/workflows/native-matrix.yml" python - <<'PY'
+          matrix=$(PROVIDERS="${NATIVE[*]}" NATIVE_MATRIX=".github/native-matrix.yml" python - <<'PY'
           import json
           import os
           import re
@@ -127,7 +127,7 @@ jobs:
             print(json.dumps({"include": [{"crate": "noop", "runner": "ubuntu-latest", "env": {}}]}))
             raise SystemExit(0)
 
-          config = load_yaml(os.environ.get("NATIVE_MATRIX", ".github/workflows/native-matrix.yml"))
+          config = load_yaml(os.environ.get("NATIVE_MATRIX", ".github/native-matrix.yml"))
           defaults = config.get("defaults", {}) or {}
           default_targets = defaults.get("targets", {}) or {}
           default_feature_sets = defaults.get("feature_sets", {}) or {}
@@ -142,7 +142,7 @@ jobs:
             for osname in ("linux", "darwin", "windows"):
               targets = provider_targets.get(osname) or default_targets.get(osname) or []
               feature_sets = provider_feature_sets.get(osname) or default_feature_sets.get(osname) or []
-              if not targets or not feature_sets:
+              if not targets:
                 continue
               env_by_feature = provider_env.get(osname) or {}
               for target_info in targets:
@@ -150,7 +150,19 @@ jobs:
                 arch = target_info.get("arch")
                 if not target or not arch:
                   continue
-                for feature_set in feature_sets:
+                # Check if this target has per-arch features, otherwise use OS-level features
+                target_features = target_info.get("features")
+                if target_features is not None:
+                  # Use per-architecture feature sets
+                  features_to_build = target_features
+                else:
+                  # Use OS-level feature sets
+                  features_to_build = feature_sets
+
+                if not features_to_build:
+                  continue
+
+                for feature_set in features_to_build:
                   features = feature_set or ""
                   feature_tag = sanitize_feature_tag(features)
                   needs_cuda = "cuda" in features.split()
