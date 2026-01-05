@@ -2,17 +2,16 @@ use std::collections::HashMap;
 
 use futures::TryFutureExt;
 use mistralrs::{ChatCompletionResponse, RequestBuilder, ResponseOk};
-use querymt::{FunctionCall, ToolCall, Usage};
 use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool};
 use querymt::error::LLMError;
+use querymt::{FunctionCall, ToolCall, Usage};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::messages::{apply_message_to_request, ensure_chat_model};
 use crate::model::MistralRS;
 use crate::streaming::{
-    MistralToolUseState, flush_tool_states, parse_mistral_done_response,
-    parse_mistral_stream_chunk,
+    MistralToolUseState, flush_tool_states, parse_mistral_done_response, parse_mistral_stream_chunk,
 };
 use crate::tools::{build_mistral_tools, map_tool_choice};
 

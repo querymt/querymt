@@ -1,16 +1,20 @@
-use std::{env, fs, path::{Path, PathBuf}, str::FromStr};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
-use hf_hub::{api::sync::ApiBuilder, Cache, Repo, RepoType};
+use hf_hub::{Cache, Repo, RepoType, api::sync::ApiBuilder};
 use mistralrs::{
     DeviceMapSetting, EmbeddingLoaderType, EmbeddingModelBuilder, EmbeddingRequestBuilder,
     GgufModelBuilder, IsqType, MemoryGpuConfig, Model, ModelDType, NormalLoaderType,
     PagedAttentionConfig, PagedCacheType, TextModelBuilder, TokenSource, Topology,
     VisionLoaderType, VisionModelBuilder, parse_isq_value,
 };
-use querymt::{LLMProvider, error::LLMError};
 use querymt::chat::Tool;
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
+use querymt::{LLMProvider, error::LLMError};
 use serde::Deserialize;
 
 use crate::config::{
@@ -42,7 +46,7 @@ impl MistralRS {
                 _ => {
                     return Err(LLMError::InvalidRequest(
                         "gguf loading is only supported for text models".into(),
-                    ))
+                    ));
                 }
             },
             None => match model_kind {
@@ -224,10 +228,7 @@ fn token_from_source(source: &TokenSource) -> Result<Option<String>, LLMError> {
     Ok(token.map(|s| s.trim().to_string()))
 }
 
-fn device_map_setting(
-    cfg: &MistralRSConfig,
-    kind: MistralRSModelKind,
-) -> Option<DeviceMapSetting> {
+fn device_map_setting(cfg: &MistralRSConfig, kind: MistralRSModelKind) -> Option<DeviceMapSetting> {
     match cfg.device_map {
         Some(MistralRSDeviceMap::Single) => Some(DeviceMapSetting::dummy()),
         Some(MistralRSDeviceMap::Auto) => None,

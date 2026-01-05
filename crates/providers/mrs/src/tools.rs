@@ -2,8 +2,8 @@ use mistralrs::{
     CalledFunction, Function as MistralFunction, Tool as MistralTool, ToolCallResponse,
     ToolCallType, ToolChoice as MistralToolChoice, ToolType as MistralToolType,
 };
-use querymt::{ToolCall, error::LLMError};
 use querymt::chat::{Tool, ToolChoice};
+use querymt::{ToolCall, error::LLMError};
 
 pub(crate) fn convert_tool_call(index: usize, call: &ToolCall) -> ToolCallResponse {
     ToolCallResponse {

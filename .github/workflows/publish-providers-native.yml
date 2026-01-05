@@ -221,7 +221,7 @@ jobs:
         if: matrix.crate != 'noop' && matrix.needs_cuda == 'true'
         uses: mjun0812/setup-cuda@v1
         with:
-          cuda-version: "12.4"
+          version: "12.4"
 
       - name: Build native library
         if: matrix.crate != 'noop'
@@ -288,3 +288,192 @@ jobs:
             --annotation "org.opencontainers.image.os=${{ matrix.os }}" \
             --annotation "org.opencontainers.image.architecture=${{ matrix.arch }}" \
             ${PLUGIN_TAR}:application/vnd.oci.image.layer.v1.tar+gzip
+
+      - name: Save manifest data for aggregation
+        if: matrix.crate != 'noop'
+        shell: bash
+        run: |
+          IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}"
+          VERSIONED="${{ env.VERSION }}-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.feature_tag }}"
+
+          mkdir -p manifest-data
+          cat > manifest-data/data.txt <<EOF
+          PROVIDER=${{ matrix.crate }}
+          VERSION=${{ env.VERSION }}
+          OS=${{ matrix.os }}
+          ARCH=${{ matrix.arch }}
+          FEATURE_TAG=${{ matrix.feature_tag }}
+          IMAGE_REF=${IMAGE_BASE}:${VERSIONED}
+          EOF
+
+      - name: Upload manifest data artifact
+        if: matrix.crate != 'noop'
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ matrix.crate }}-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.feature_tag }}
+          path: manifest-data/data.txt
+          retention-days: 1
+
+  create-multi-platform-manifests:
+    needs: publish-native-plugins
+    runs-on: ubuntu-latest
+    if: needs.publish-native-plugins.result == 'success'
+
+    steps:
+      - name: Download all manifest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: manifest-*
+          path: manifests/
+
+      - name: Install ORAS CLI
+        uses: oras-project/setup-oras@v1
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Create multi-platform manifests
+        shell: bash
+        run: |
+          python3 <<'PYTHON'
+          import os
+          import subprocess
+          from pathlib import Path
+          from collections import defaultdict
+
+          # Read all manifest data files
+          builds = []
+          manifest_dir = Path("manifests")
+
+          if not manifest_dir.exists():
+              print("No manifest data found, skipping multi-platform manifest creation")
+              exit(0)
+
+          for manifest_file in manifest_dir.rglob("data.txt"):
+              data = {}
+              with open(manifest_file) as f:
+                  for line in f:
+                      line = line.strip()
+                      if "=" in line:
+                          key, value = line.split("=", 1)
+                          data[key] = value
+              if data and data.get("PROVIDER") != "noop":
+                  builds.append(data)
+
+          if not builds:
+              print("No builds to aggregate, skipping")
+              exit(0)
+
+          print(f"Found {len(builds)} builds to aggregate")
+          for build in builds:
+              print(f"  - {build['PROVIDER']} {build['VERSION']} {build['OS']}/{build['ARCH']} {build['FEATURE_TAG']}")
+
+          # Group by (provider, feature_tag)
+          groups = defaultdict(list)
+          for build in builds:
+              provider = build["PROVIDER"]
+              feature_tag = build["FEATURE_TAG"]
+              key = (provider, feature_tag)
+              groups[key].append(build)
+
+          print(f"\nGrouped into {len(groups)} unique (provider, feature_tag) combinations")
+
+          # Track which providers we've seen for creating plain "latest" tag
+          providers_versions = {}
+
+          # Create manifest indexes for each group
+          for (provider, feature_tag), images in groups.items():
+              base = f"ghcr.io/${{ github.repository_owner }}/{provider}"
+
+              # Extract version from first image (all should have same version)
+              version = images[0]["VERSION"]
+
+              # Track provider version
+              if provider not in providers_versions:
+                  providers_versions[provider] = version
+
+              # Collect all image refs
+              refs = [img["IMAGE_REF"] for img in images]
+
+              print(f"\n=== Processing {provider}:{feature_tag} ===")
+              print(f"  Version: {version}")
+              print(f"  Platforms: {len(images)}")
+              for img in images:
+                  print(f"    - {img['OS']}/{img['ARCH']} -> {img['IMAGE_REF']}")
+
+              # 1. Create version-pinned multi-platform manifest (e.g., 0.1.0-metal)
+              versioned_tag = f"{base}:{version}-{feature_tag}"
+              cmd = ["oras", "manifest", "index", "create", versioned_tag]
+              for ref in refs:
+                  cmd.extend(["--amend", ref])
+
+              print(f"  Creating: {versioned_tag}")
+              result = subprocess.run(cmd, capture_output=True, text=True)
+              if result.returncode != 0:
+                  print(f"    ERROR: {result.stderr}")
+                  exit(1)
+              else:
+                  print(f"    ✓ Success")
+
+              # 2. Create/update latest-{feature} tag (e.g., latest-metal)
+              latest_feature_tag = f"{base}:latest-{feature_tag}"
+              cmd = ["oras", "manifest", "index", "create", latest_feature_tag]
+              for ref in refs:
+                  cmd.extend(["--amend", ref])
+
+              print(f"  Creating: {latest_feature_tag}")
+              result = subprocess.run(cmd, capture_output=True, text=True)
+              if result.returncode != 0:
+                  print(f"    ERROR: {result.stderr}")
+                  exit(1)
+              else:
+                  print(f"    ✓ Success")
+
+              # 3. For "default" feature, also create plain version tag (e.g., 0.1.0)
+              if feature_tag == "default":
+                  plain_version_tag = f"{base}:{version}"
+                  cmd = ["oras", "manifest", "index", "create", plain_version_tag]
+                  for ref in refs:
+                      cmd.extend(["--amend", ref])
+
+                  print(f"  Creating: {plain_version_tag}")
+                  result = subprocess.run(cmd, capture_output=True, text=True)
+                  if result.returncode != 0:
+                      print(f"    ERROR: {result.stderr}")
+                      exit(1)
+                  else:
+                      print(f"    ✓ Success")
+
+          # 4. Create plain "latest" tag for each provider (points to default features)
+          print(f"\n=== Creating 'latest' tags ===")
+          for provider, version in providers_versions.items():
+              # Check if this provider has a "default" feature set
+              default_key = (provider, "default")
+              if default_key in groups:
+                  base = f"ghcr.io/${{ github.repository_owner }}/{provider}"
+                  refs = [img["IMAGE_REF"] for img in groups[default_key]]
+
+                  latest_tag = f"{base}:latest"
+                  cmd = ["oras", "manifest", "index", "create", latest_tag]
+                  for ref in refs:
+                      cmd.extend(["--amend", ref])
+
+                  print(f"  Creating: {latest_tag}")
+                  result = subprocess.run(cmd, capture_output=True, text=True)
+                  if result.returncode != 0:
+                      print(f"    ERROR: {result.stderr}")
+                      exit(1)
+                  else:
+                      print(f"    ✓ Success")
+              else:
+                  print(f"  Skipping {provider}:latest (no 'default' feature set found)")
+
+          print(f"\n=== Summary ===")
+          total_manifests = len(groups) * 2  # version-pinned + latest-feature
+          total_manifests += sum(1 for (_, ft) in groups.keys() if ft == "default")  # plain version tags
+          total_manifests += len([p for p in providers_versions if (p, "default") in groups])  # latest tags
+          print(f"Created {total_manifests} manifest indexes across {len(providers_versions)} provider(s)")
+          PYTHON

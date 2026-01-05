@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use mistralrs::{ChatCompletionChunkResponse, ChatCompletionResponse, ToolCallResponse};
-use querymt::{FunctionCall, ToolCall, Usage};
 use querymt::chat::StreamChunk;
+use querymt::{FunctionCall, ToolCall, Usage};
 
 #[derive(Default, Debug)]
 pub(crate) struct MistralToolUseState {

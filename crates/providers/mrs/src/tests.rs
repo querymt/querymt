@@ -49,9 +49,11 @@ fn get_provider() -> Box<dyn LLMProvider> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn mrs_chat_integration_test() {
     let provider = get_provider();
-    let messages = vec![ChatMessageBuilder::new(ChatRole::User)
-        .content("Hello?")
-        .build()];
+    let messages = vec![
+        ChatMessageBuilder::new(ChatRole::User)
+            .content("Hello?")
+            .build(),
+    ];
 
     let _resp = provider.chat(&messages).await.unwrap();
 }
