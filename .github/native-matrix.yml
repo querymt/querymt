@@ -28,10 +28,10 @@ providers:
     env:
       linux:
         "cuda flash-attn cudnn":
-          CUDA_COMPUTE_CAP: "86;89;120"
+          CUDA_COMPUTE_CAP: "86"
       windows:
         "cuda flash-attn cudnn":
-          CUDA_COMPUTE_CAP: "86;89;120"
+          CUDA_COMPUTE_CAP: "86"
     # Per-architecture feature sets for windows (CUDA only on amd64)
     targets:
       windows:
