@@ -3,18 +3,25 @@ defaults:
     linux:
       - target: x86_64-unknown-linux-gnu
         arch: amd64
+        runner: ubuntu-latest
       - target: aarch64-unknown-linux-gnu
         arch: arm64
+        runner: ubuntu-latest
+        runner_cuda: ubuntu-24.04-arm
     darwin:
       - target: x86_64-apple-darwin
         arch: amd64
+        runner: macos-13
       - target: aarch64-apple-darwin
         arch: arm64
+        runner: macos-14
     windows:
       - target: x86_64-pc-windows-msvc
         arch: amd64
+        runner: windows-latest
       - target: aarch64-pc-windows-msvc
         arch: arm64
+        runner: windows-latest
   feature_sets:
     linux:
       - ""
@@ -25,29 +32,37 @@ defaults:
 
 providers:
   mrs:
-    env:
-      linux:
-        "cuda flash-attn cudnn":
-          CUDA_COMPUTE_CAP: "86"
-      windows:
-        "cuda flash-attn cudnn":
-          CUDA_COMPUTE_CAP: "86"
-    # Per-architecture feature sets for windows (CUDA only on amd64)
+    cuda:
+      toolkit_version: "12.8"
+      strategy: "split"
+      variants:
+        x86_64:
+          - sm: 75
+            features: ["cuda", "cudnn"]
+          - sm: 80
+            features: ["cuda", "cudnn", "flash-attn"]
+          - sm: 86
+            features: ["cuda", "cudnn", "flash-attn"]
+          - sm: 89
+            features: ["cuda", "cudnn", "flash-attn"]
+          - sm: 120
+            features: ["cuda", "cudnn", "flash-attn"]
+        aarch64:
+          - sm: 87
+            features: ["cuda", "cudnn"]
     targets:
       windows:
         - target: x86_64-pc-windows-msvc
           arch: amd64
-          features:
-            - ""
-            - "cuda flash-attn cudnn"
+          runner: windows-latest
         - target: aarch64-pc-windows-msvc
           arch: arm64
+          runner: windows-latest
           features:
             - ""
     feature_sets:
       linux:
         - ""
-        - "cuda flash-attn cudnn"
       darwin:
         - "accelerate"
         - "metal"

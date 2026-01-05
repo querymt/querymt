@@ -117,10 +117,59 @@ jobs:
               "windows": "windows-latest",
             }[osname]
 
+          def get_runner_for_build(target_info, osname, is_cuda):
+            """Get appropriate runner based on target and whether it's a CUDA build"""
+            if is_cuda and 'runner_cuda' in target_info:
+              return target_info['runner_cuda']
+            if 'runner' in target_info:
+              return target_info['runner']
+            return runner_for(osname)
+
           def sanitize_feature_tag(feature_set):
             if not feature_set:
               return "default"
             return re.sub(r"[^A-Za-z0-9._-]+", "-", feature_set).strip("-")
+
+          def generate_cuda_features(cuda_config, arch_key):
+            """Generate CUDA feature sets for a specific architecture"""
+            if not cuda_config or 'variants' not in cuda_config:
+              return []
+            variants = cuda_config.get('variants', {}).get(arch_key, [])
+            if not variants:
+              return []
+            cuda_version = cuda_config.get('toolkit_version', '12.8')
+            strategy = cuda_config.get('strategy', 'split')
+            
+            if strategy == 'combined':
+              sm_list = [str(v['sm']) for v in variants]
+              # For combined, we need to merge all features from all variants
+              all_features = set()
+              for v in variants:
+                all_features.update(v.get('features', ['cuda']))
+              
+              feature_string = " ".join(sorted(list(all_features)))
+              feature_name = f"cuda{cuda_version}"
+              return [{
+                'feature_string': feature_string,
+                'feature_tag': sanitize_feature_tag(feature_name),
+                'compute_cap': ";".join(sm_list),
+                'cuda_version': cuda_version
+              }]
+            else:
+              features = []
+              for variant in variants:
+                sm = variant['sm']
+                # Use features from variant or default to ["cuda"]
+                variant_features = variant.get('features', ['cuda'])
+                feature_string = " ".join(variant_features)
+                feature_name = f"cuda{cuda_version}-sm{sm}"
+                features.append({
+                  'feature_string': feature_string,
+                  'feature_tag': sanitize_feature_tag(feature_name),
+                  'compute_cap': str(sm),
+                  'cuda_version': cuda_version
+                })
+              return features
 
           providers = [p for p in os.environ.get("PROVIDERS", "").split() if p]
           if not providers or providers == ["noop"]:
@@ -139,9 +188,9 @@ jobs:
             provider_targets = conf.get("targets", {}) or {}
             provider_feature_sets = conf.get("feature_sets", {}) or {}
             provider_env = conf.get("env", {}) or {}
+            cuda_config = conf.get("cuda", {})
             for osname in ("linux", "darwin", "windows"):
               targets = provider_targets.get(osname) or default_targets.get(osname) or []
-              feature_sets = provider_feature_sets.get(osname) or default_feature_sets.get(osname) or []
               if not targets:
                 continue
               env_by_feature = provider_env.get(osname) or {}
@@ -150,37 +199,82 @@ jobs:
                 arch = target_info.get("arch")
                 if not target or not arch:
                   continue
+                
+                arch_key = 'x86_64' if arch == 'amd64' else 'aarch64'
+                
                 # Check if this target has per-arch features, otherwise use OS-level features
                 target_features = target_info.get("features")
                 if target_features is not None:
-                  # Use per-architecture feature sets
                   features_to_build = target_features
                 else:
-                  # Use OS-level feature sets
-                  features_to_build = feature_sets
-
-                if not features_to_build:
-                  continue
-
+                  features_to_build = provider_feature_sets.get(osname) or default_feature_sets.get(osname) or []
+                
+                # Process non-CUDA features
                 for feature_set in features_to_build:
-                  features = feature_set or ""
-                  feature_tag = sanitize_feature_tag(features)
-                  needs_cuda = "cuda" in features.split()
-                  env_vars = env_by_feature.get(features) or {}
+                  if feature_set:
+                    features = feature_set
+                    feature_tag = sanitize_feature_tag(features)
+                    runner = get_runner_for_build(target_info, osname, is_cuda=False)
+                    entries.append({
+                      "crate": provider,
+                      "os": osname,
+                      "arch": arch,
+                      "target": target,
+                      "features": features,
+                      "feature_tag": feature_tag,
+                      "needs_cuda": "false",
+                      "runner": runner,
+                      "env": env_by_feature.get(features) or {},
+                    })
+                
+                # Process default (empty string) feature
+                if "" in features_to_build or not features_to_build:
+                  runner = get_runner_for_build(target_info, osname, is_cuda=False)
                   entries.append({
                     "crate": provider,
                     "os": osname,
                     "arch": arch,
                     "target": target,
-                    "features": features,
-                    "feature_tag": feature_tag,
-                    "needs_cuda": str(needs_cuda).lower(),
-                    "runner": runner_for(osname),
-                    "env": env_vars,
+                    "features": "",
+                    "feature_tag": "default",
+                    "needs_cuda": "false",
+                    "runner": runner,
+                    "env": env_by_feature.get("") or {},
                   })
+                
+                # Add CUDA variants
+                include_cuda = False
+                if osname in ['linux', 'windows']:
+                  # If target features are not explicitly restricted, or if they include "cuda"
+                  if target_features is None:
+                    include_cuda = True
+                  elif any("cuda" in f for f in target_features):
+                    include_cuda = True
+
+                if include_cuda:
+                  cuda_features = generate_cuda_features(cuda_config, arch_key)
+                  for cuda_feat in cuda_features:
+                    runner = get_runner_for_build(target_info, osname, is_cuda=True)
+                    env_vars = env_by_feature.get(cuda_feat['feature_string']) or {}
+                    env_vars.update({
+                      "CUDA_COMPUTE_CAP": cuda_feat['compute_cap'],
+                      "CUDA_VERSION": cuda_feat['cuda_version']
+                    })
+                    entries.append({
+                      "crate": provider,
+                      "os": osname,
+                      "arch": arch,
+                      "target": target,
+                      "features": cuda_feat['feature_string'],
+                      "feature_tag": cuda_feat['feature_tag'],
+                      "needs_cuda": "true",
+                      "runner": runner,
+                      "env": env_vars,
+                    })
 
           print(json.dumps({"include": entries}))
           PY
+
           )
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
 
@@ -233,11 +327,30 @@ jobs:
         if: matrix.crate != 'noop' && matrix.needs_cuda == 'true'
         uses: mjun0812/setup-cuda@v1
         with:
-          version: "12.8"
+          version: "${{ matrix.env.CUDA_VERSION || '12.8' }}"
+
+      - name: Install cuDNN (Linux)
+        if: matrix.os == 'linux' && matrix.needs_cuda == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcudnn9-dev-cuda-12
+
+      - name: Install cuDNN (Windows)
+        if: matrix.os == 'windows' && matrix.needs_cuda == 'true'
+        shell: powershell
+        run: |
+          $url = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.0.0.312_cuda12-archive.zip"
+          Invoke-WebRequest -Uri $url -OutFile cudnn.zip
+          Expand-Archive cudnn.zip -DestinationPath .
+          $folder = Get-ChildItem -Directory -Filter "cudnn-windows-x86_64-9*" | Select-Object -First 1
+          Copy-Item -Path "$($folder.FullName)\bin\*" -Destination "$env:CUDA_PATH\bin" -Recurse -Force
+          Copy-Item -Path "$($folder.FullName)\include\*" -Destination "$env:CUDA_PATH\include" -Recurse -Force
+          Copy-Item -Path "$($folder.FullName)\lib\x64\*" -Destination "$env:CUDA_PATH\lib\x64" -Recurse -Force
 
       - name: Build native library
         if: matrix.crate != 'noop'
         shell: bash
+        env: ${{ matrix.env }}
         run: |
           FEATURES="${{ matrix.features }}"
           FEATURE_ARGS=()
