@@ -210,7 +210,7 @@ jobs:
 
       - name: Set up CUDA toolkit
         if: matrix.crate != 'noop' && matrix.needs_cuda == 'true'
-        uses: mjun0812/setup-cuda@v2
+        uses: mjun0812/setup-cuda@v1
         with:
           cuda-version: "12.4"
 
