@@ -76,8 +76,12 @@ jobs:
                 awk -F'=' '
                   $0 ~ /^\[package\.metadata\.qmt\]/ {in_qmt=1; next}
                   in_qmt && $0 ~ /^\[/ {in_qmt=0}
-                  in_qmt && $1 ~ /^type$/ {
-                    gsub(/"/, "", $2); gsub(/ /, "", $2); print $2; exit
+                  in_qmt {
+                    key=$1
+                    gsub(/^[ \t]+|[ \t]+$/, "", key)
+                    if (key == "type") {
+                      gsub(/"/, "", $2); gsub(/ /, "", $2); print $2; exit
+                    }
                   }
                 ' "$toml"
               )
