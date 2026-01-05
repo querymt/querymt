@@ -359,6 +359,12 @@ jobs:
         shell: bash
         env: ${{ matrix.env }}
         run: |
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            # Remove Git's link.exe to prevent it from shadowing MSVC's linker.
+            # This is a known issue when using bash on Windows GHA runners.
+            rm -f /usr/bin/link.exe
+          fi
+
           FEATURES="${{ matrix.features }}"
           FEATURE_ARGS=()
           if [ -n "$FEATURES" ]; then

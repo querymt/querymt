@@ -37,8 +37,6 @@ providers:
       strategy: "split"
       variants:
         x86_64:
-          - sm: 75
-            features: ["cuda", "cudnn"]
           - sm: 80
             features: ["cuda", "cudnn", "flash-attn"]
           - sm: 86
