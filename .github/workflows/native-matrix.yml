@@ -25,6 +25,13 @@ defaults:
 
 providers:
   mrs:
+    env:
+      linux:
+        "cuda flash-attn cudnn":
+          CUDA_COMPUTE_CAP: "86;89;120"
+      windows:
+        "cuda flash-attn cudnn":
+          CUDA_COMPUTE_CAP: "86;89;120"
     feature_sets:
       linux:
         - ""

@@ -124,7 +124,7 @@ jobs:
 
           providers = [p for p in os.environ.get("PROVIDERS", "").split() if p]
           if not providers or providers == ["noop"]:
-            print(json.dumps({"include": [{"crate": "noop", "runner": "ubuntu-latest"}]}))
+            print(json.dumps({"include": [{"crate": "noop", "runner": "ubuntu-latest", "env": {}}]}))
             raise SystemExit(0)
 
           config = load_yaml(os.environ.get("NATIVE_MATRIX", ".github/workflows/native-matrix.yml"))
@@ -138,11 +138,13 @@ jobs:
             conf = providers_conf.get(provider, {}) or {}
             provider_targets = conf.get("targets", {}) or {}
             provider_feature_sets = conf.get("feature_sets", {}) or {}
+            provider_env = conf.get("env", {}) or {}
             for osname in ("linux", "darwin", "windows"):
               targets = provider_targets.get(osname) or default_targets.get(osname) or []
               feature_sets = provider_feature_sets.get(osname) or default_feature_sets.get(osname) or []
               if not targets or not feature_sets:
                 continue
+              env_by_feature = provider_env.get(osname) or {}
               for target_info in targets:
                 target = target_info.get("target")
                 arch = target_info.get("arch")
@@ -152,6 +154,7 @@ jobs:
                   features = feature_set or ""
                   feature_tag = sanitize_feature_tag(features)
                   needs_cuda = "cuda" in features.split()
+                  env_vars = env_by_feature.get(features) or {}
                   entries.append({
                     "crate": provider,
                     "os": osname,
@@ -161,6 +164,7 @@ jobs:
                     "feature_tag": feature_tag,
                     "needs_cuda": str(needs_cuda).lower(),
                     "runner": runner_for(osname),
+                    "env": env_vars,
                   })
 
           print(json.dumps({"include": entries}))
@@ -171,6 +175,7 @@ jobs:
   publish-native-plugins:
     needs: detect-changes
     runs-on: ${{ matrix.runner }}
+    env: ${{ matrix.env }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
