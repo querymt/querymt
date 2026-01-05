@@ -11,10 +11,10 @@ defaults:
     darwin:
       - target: x86_64-apple-darwin
         arch: amd64
-        runner: macos-13
+        runner: macos-latest
       - target: aarch64-apple-darwin
         arch: arm64
-        runner: macos-14
+        runner: macos-latest
     windows:
       - target: x86_64-pc-windows-msvc
         arch: amd64

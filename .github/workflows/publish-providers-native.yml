@@ -113,7 +113,7 @@ jobs:
           def runner_for(osname):
             return {
               "linux": "ubuntu-latest",
-              "darwin": "macos-14",
+              "darwin": "macos-latest",
               "windows": "windows-latest",
             }[osname]
 
