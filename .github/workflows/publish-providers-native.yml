@@ -427,10 +427,18 @@ jobs:
             --username "${{ github.actor }}" \
             --password-stdin
 
-      - name: Create OCI config file
+      - name: Create OCI config file with platform info
         if: matrix.crate != 'noop'
         shell: bash
-        run: echo '{}' > oci-config.json
+        run: |
+          # Create config with platform information
+          cat > oci-config.json <<EOF
+          {
+            "architecture": "${{ matrix.arch }}",
+            "os": "${{ matrix.os }}"
+          }
+          EOF
+          cat oci-config.json
 
       - name: Push native artifact to GHCR with Oras
         if: matrix.crate != 'noop'
@@ -441,7 +449,7 @@ jobs:
           ALIAS="${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.feature_tag }}"
 
           echo "Pushing native artifact to ${IMAGE_BASE} with tags ${VERSIONED} and ${ALIAS}"
-
+          
           oras push "${IMAGE_BASE}:${VERSIONED},${ALIAS}" \
             --config oci-config.json:application/vnd.oci.image.config.v1+json \
             --annotation "mt.query.plugin.type=native" \
@@ -450,6 +458,9 @@ jobs:
             --annotation "org.opencontainers.image.os=${{ matrix.os }}" \
             --annotation "org.opencontainers.image.architecture=${{ matrix.arch }}" \
             ${PLUGIN_TAR}:application/vnd.oci.image.layer.v1.tar+gzip
+          
+          echo "Verifying manifest has platform fields..."
+          oras manifest fetch "${IMAGE_BASE}:${VERSIONED}" | jq '.'
 
       - name: Save manifest data for aggregation
         if: matrix.crate != 'noop'
@@ -592,17 +603,44 @@ jobs:
                 return 1
               fi
               
-              # Extract platform info from annotations
-              local os arch media_type
-              os=$(echo "$manifest" | jq -r '.annotations["org.opencontainers.image.os"] // empty')
-              arch=$(echo "$manifest" | jq -r '.annotations["org.opencontainers.image.architecture"] // empty')
+              # Extract platform info from config or annotations
+              local os arch media_type config_digest
               media_type=$(echo "$manifest" | jq -r '.mediaType // "application/vnd.oci.image.manifest.v1+json"')
+              config_digest=$(echo "$manifest" | jq -r '.config.digest // empty')
+              
+              # Try to get platform info from the config blob first
+              if [[ -n "$config_digest" ]]; then
+                echo "    Fetching config blob..."
+                local config_blob
+                # Extract repository path from the reference
+                local repo_path="${ref%:*}"
+                config_blob=$(oras blob fetch --output - "${repo_path}@${config_digest}" 2>&1 || echo "{}")
+                os=$(echo "$config_blob" | jq -r '.os // empty')
+                arch=$(echo "$config_blob" | jq -r '.architecture // empty')
+                
+                if [[ -n "$os" ]] && [[ -n "$arch" ]]; then
+                  echo "    Found platform in config: $os/$arch"
+                fi
+              fi
+              
+              # Fall back to annotations if config didn't have platform info
+              if [[ -z "$os" ]] || [[ -z "$arch" ]]; then
+                os=$(echo "$manifest" | jq -r '.annotations["org.opencontainers.image.os"] // empty')
+                arch=$(echo "$manifest" | jq -r '.annotations["org.opencontainers.image.architecture"] // empty')
+                
+                if [[ -n "$os" ]] && [[ -n "$arch" ]]; then
+                  echo "    Found platform in annotations: $os/$arch"
+                fi
+              fi
               
               # Validate we got platform info
               if [[ -z "$os" ]] || [[ -z "$arch" ]]; then
-                echo "    ERROR: Missing platform annotations in $ref"
+                echo "    ERROR: Missing platform information in $ref"
+                echo "           Could not find os/arch in config blob or annotations"
                 echo "           org.opencontainers.image.os: '$os'"
                 echo "           org.opencontainers.image.architecture: '$arch'"
+                echo "    Manifest content:"
+                echo "$manifest" | jq '.'
                 return 1
               fi
               
@@ -749,14 +787,10 @@ jobs:
             done
             echo ""
             
-            # Validate minimum platform count
-            if [[ ${#refs[@]} -lt 2 ]]; then
-              echo "  ⚠️  WARNING: Only ${#refs[@]} platform(s) found for ${provider}:${feature_tag}"
-              echo "  Multi-platform manifests require at least 2 platforms"
-              echo "  This indicates that some builds may have failed or artifacts are missing"
-              echo "  Skipping manifest creation for ${provider}:${feature_tag}"
-              echo ""
-              continue
+            # Note: We create indexes even for single-platform builds for consistency
+            # An OCI image index with 1 manifest is valid per spec
+            if [[ ${#refs[@]} -eq 1 ]]; then
+              echo "  ℹ️  Note: Creating single-platform index for ${provider}:${feature_tag}"
             fi
             
             # 1. Create version-pinned multi-platform manifest (e.g., 0.1.0-metal)
