@@ -548,7 +548,9 @@ jobs:
             source "$data_file"
             
             # Skip noop entries
-            [[ "$PROVIDER" == "noop" ]] && continue
+            if [[ "$PROVIDER" == "noop" ]]; then
+              continue
+            fi
             
             # Store build info
             key="${PROVIDER}|${VERSION}|${OS}|${ARCH}|${FEATURE_TAG}"
@@ -665,7 +667,9 @@ jobs:
               echo "      Platform: $os/$arch (digest: ${digest:0:19}..., size: $size)"
               
               # Build manifest descriptor JSON
-              [[ "$first" == "false" ]] && manifests_json+=","
+              if [[ "$first" == "false" ]]; then
+                manifests_json+=","
+              fi
               first=false
               
               manifests_json+=$(jq -n \
@@ -819,11 +823,15 @@ jobs:
           total_manifests=$((${#groups[@]} * 2))
           for group_key in "${!groups[@]}"; do
             IFS='|' read -r _ feature_tag <<< "$group_key"
-            [[ "$feature_tag" == "default" ]] && ((total_manifests++))
+            if [[ "$feature_tag" == "default" ]]; then
+              ((total_manifests++))
+            fi
           done
           # Count providers with default feature for latest tags
           for provider in "${!provider_versions[@]}"; do
-            [[ -n "${groups[${provider}|default]:-}" ]] && ((total_manifests++))
+            if [[ -n "${groups[${provider}|default]:-}" ]]; then
+              ((total_manifests++))
+            fi
           done
           echo "Created $total_manifests manifest indexes across ${#provider_versions[@]} provider(s)"
 
@@ -846,7 +854,9 @@ jobs:
             unset PROVIDER FEATURE_TAG
             source "$data_file"
             
-            [[ "$PROVIDER" == "noop" ]] && continue
+            if [[ "$PROVIDER" == "noop" ]]; then
+              continue
+            fi
             
             key="${PROVIDER}|${FEATURE_TAG}"
             provider_features[$key]=1
