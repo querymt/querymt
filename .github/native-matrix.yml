@@ -33,6 +33,7 @@ defaults:
 providers:
   mrs:
     cuda:
+      disabled: false
       toolkit_version: "12.8"
       strategy: "split"
       variants:
