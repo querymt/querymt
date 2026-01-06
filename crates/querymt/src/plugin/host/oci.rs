@@ -29,6 +29,23 @@ use super::{PluginType, ProviderPlugin};
 
 const PLUGIN_TYPE_ANNOTATION: &str = "mt.query.plugin.type";
 
+/// Normalize OS name to OCI standard naming conventions
+fn normalize_os(os: &str) -> &str {
+    match os {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+/// Normalize architecture to OCI standard naming conventions
+fn normalize_arch(arch: &str) -> &str {
+    match arch {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct CacheMetadata {
     /// The immutable digest the tag pointed to, e.g., "sha256:..."
@@ -477,17 +494,19 @@ impl OciDownloader {
                         log::debug!("Found a multi-platform image index.");
 
                         let native_platform = Platform {
-                            os: OS.into(),
-                            architecture: ARCH.into(),
+                            os: normalize_os(OS).into(),
+                            architecture: normalize_arch(ARCH).into(),
                             os_version: None,
                             os_features: None,
                             variant: None,
                             features: None,
                         };
                         log::debug!(
-                            "Searching for platform: {}/{}",
+                            "Searching for platform: {}/{} (normalized from {}/{})",
                             native_platform.os,
-                            native_platform.architecture
+                            native_platform.architecture,
+                            OS,
+                            ARCH
                         );
 
                         let maybe_descriptor = index
