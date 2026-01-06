@@ -3922,6 +3922,7 @@ checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
 dependencies = [
  "byteorder",
  "dbus-secret-service",
+ "linux-keyutils",
  "log",
  "secret-service",
  "security-framework 2.11.1",
@@ -4073,6 +4074,16 @@ dependencies = [
  "bitflags 2.10.0",
  "libc",
  "redox_syscall 0.7.0",
+]
+
+[[package]]
+name = "linux-keyutils"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "761e49ec5fd8a5a463f9b84e877c373d888935b71c6be78f3767fe2ae6bed18e"
+dependencies = [
+ "bitflags 2.10.0",
+ "libc",
 ]
 
 [[package]]
@@ -4436,7 +4447,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#eb90e90208be0a44f51f7b2c227030660e62adf1"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#bee2abf9f9551e98937169400d3a095290432505"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -4460,7 +4471,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#eb90e90208be0a44f51f7b2c227030660e62adf1"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#bee2abf9f9551e98937169400d3a095290432505"
 dependencies = [
  "anyhow",
  "apodize",
@@ -4471,7 +4482,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#eb90e90208be0a44f51f7b2c227030660e62adf1"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#bee2abf9f9551e98937169400d3a095290432505"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -4569,7 +4580,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#eb90e90208be0a44f51f7b2c227030660e62adf1"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#bee2abf9f9551e98937169400d3a095290432505"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4589,7 +4600,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#eb90e90208be0a44f51f7b2c227030660e62adf1"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#bee2abf9f9551e98937169400d3a095290432505"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.5",
@@ -4605,7 +4616,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#eb90e90208be0a44f51f7b2c227030660e62adf1"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#bee2abf9f9551e98937169400d3a095290432505"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
@@ -4634,7 +4645,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#eb90e90208be0a44f51f7b2c227030660e62adf1"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#bee2abf9f9551e98937169400d3a095290432505"
 dependencies = [
  "candle-core",
  "image",
@@ -6636,9 +6647,9 @@ dependencies = [
 
 [[package]]
 name = "regalloc2"
-version = "0.13.3"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e249c660440317032a71ddac302f25f1d5dff387667bcc3978d1f77aa31ac34"
+checksum = "919cc500365f55230d2e2230cb813dd7c6fa5f907ad332d83ad3b862112cb69e"
 dependencies = [
  "allocator-api2",
  "bumpalo",
@@ -6858,9 +6869,9 @@ dependencies = [
 
 [[package]]
 name = "rsa"
-version = "0.9.9"
+version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40a0376c50d0358279d9d643e4bf7b7be212f1f4ff1da9070a7b54d22ef75c88"
+checksum = "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
 dependencies = [
  "const-oid",
  "digest",
@@ -7430,9 +7441,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.148"
+version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3084b546a1dd6289475996f182a22aba973866ea8e8b02c51d9f46b1336a22da"
+checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
  "indexmap 2.12.1",
  "itoa",
@@ -9059,9 +9070,9 @@ checksum = "eeba86d422ce181a719445e51872fa30f1f7413b62becb52e95ec91aa262d85c"
 
 [[package]]
 name = "unicase"
-version = "2.8.1"
+version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75b844d17643ee918803943289730bec8aac480150456169e647ed0b576ba539"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-general-category"
