@@ -488,6 +488,30 @@ jobs:
           pattern: manifest-*
           path: manifests/
 
+      - name: Debug - List downloaded artifacts
+        shell: bash
+        run: |
+          echo "=== Downloaded Artifact Structure ==="
+          ls -la manifests/ || echo "No manifests directory found"
+          echo ""
+          echo "=== Found data.txt files ==="
+          find manifests/ -type f -name "data.txt" -exec echo "  - {}" \;
+          echo ""
+          echo "=== Artifact contents ==="
+          for data_file in manifests/*/data.txt; do
+            [[ -f "$data_file" ]] || continue
+            echo "File: $data_file"
+            cat "$data_file"
+            echo "---"
+          done
+
+      - name: Wait for GHCR to index manifests
+        shell: bash
+        run: |
+          echo "Waiting 15 seconds for GHCR to fully index uploaded manifests..."
+          sleep 15
+          echo "✓ Wait complete"
+
       - name: Install ORAS CLI
         uses: oras-project/setup-oras@v1
 
@@ -540,6 +564,15 @@ jobs:
 
           echo "Found $build_count builds to aggregate"
           echo ""
+          
+          # Debug: Show all parsed builds
+          echo "=== Parsed Build Information ==="
+          for key in "${!builds_data[@]}"; do
+            IFS='|' read -r provider version os arch feature_tag <<< "$key"
+            echo "  • $provider v$version - $os/$arch [$feature_tag]"
+            echo "    → ${builds_data[$key]}"
+          done
+          echo ""
 
           # Function to create a multi-platform index with proper platform fields
           create_index() {
@@ -554,15 +587,35 @@ jobs:
             local first=true
             
             for ref in "${refs[@]}"; do
-              # Fetch the manifest to get annotations and size
+              # Fetch the manifest to get annotations and size (with retry logic)
               echo "    Fetching manifest: $ref"
               local manifest
-              manifest=$(oras manifest fetch "$ref" 2>&1)
-              if [[ $? -ne 0 ]]; then
-                echo "    ERROR: Failed to fetch manifest for $ref"
-                echo "$manifest"
+              local max_attempts=5
+              local attempt=1
+              local success=false
+              
+              while [[ $attempt -le $max_attempts ]]; do
+                manifest=$(oras manifest fetch "$ref" 2>&1)
+                if [[ $? -eq 0 ]]; then
+                  success=true
+                  break
+                fi
+                
+                if [[ $attempt -lt $max_attempts ]]; then
+                  echo "    ⚠️  Attempt $attempt/$max_attempts failed, retrying in 10s..."
+                  sleep 10
+                fi
+                ((attempt++))
+              done
+              
+              if [[ "$success" != "true" ]]; then
+                echo "    ❌ ERROR: Failed to fetch manifest after $max_attempts attempts"
+                echo "    Reference: $ref"
+                echo "    Last error: $manifest"
                 return 1
               fi
+              
+              echo "    ✓ Manifest fetched successfully (attempt $attempt/$max_attempts)"
               
               # Extract platform info from annotations
               local os arch media_type
@@ -578,12 +631,29 @@ jobs:
                 return 1
               fi
               
-              # Get the digest
+              # Get the digest (with retry logic)
               local digest
-              digest=$(oras resolve "$ref" 2>&1)
-              if [[ $? -ne 0 ]]; then
-                echo "    ERROR: Failed to resolve digest for $ref"
-                echo "$digest"
+              local resolve_attempts=3
+              local resolve_attempt=1
+              local resolve_success=false
+              
+              while [[ $resolve_attempt -le $resolve_attempts ]]; do
+                digest=$(oras resolve "$ref" 2>&1)
+                if [[ $? -eq 0 ]]; then
+                  resolve_success=true
+                  break
+                fi
+                
+                if [[ $resolve_attempt -lt $resolve_attempts ]]; then
+                  echo "    ⚠️  Resolve attempt $resolve_attempt/$resolve_attempts failed, retrying in 5s..."
+                  sleep 5
+                fi
+                ((resolve_attempt++))
+              done
+              
+              if [[ "$resolve_success" != "true" ]]; then
+                echo "    ❌ ERROR: Failed to resolve digest after $resolve_attempts attempts"
+                echo "    Last error: $digest"
                 return 1
               fi
               
@@ -631,15 +701,35 @@ jobs:
             index_file=$(mktemp)
             echo "$index_json" > "$index_file"
             
-            # Push the index manifest
-            if ! oras manifest push "$tag" "$index_file" 2>&1; then
-              echo "    ERROR: Failed to push index"
+            # Push the index manifest (with retry logic)
+            local push_attempts=3
+            local push_attempt=1
+            local push_success=false
+            local push_output
+            
+            while [[ $push_attempt -le $push_attempts ]]; do
+              push_output=$(oras manifest push "$tag" "$index_file" 2>&1)
+              if [[ $? -eq 0 ]]; then
+                push_success=true
+                break
+              fi
+              
+              if [[ $push_attempt -lt $push_attempts ]]; then
+                echo "    ⚠️  Push attempt $push_attempt/$push_attempts failed, retrying in 5s..."
+                sleep 5
+              fi
+              ((push_attempt++))
+            done
+            
+            if [[ "$push_success" != "true" ]]; then
+              echo "    ❌ ERROR: Failed to push index after $push_attempts attempts"
+              echo "    Last error: $push_output"
               rm -f "$index_file"
               return 1
             fi
             
             rm -f "$index_file"
-            echo "    ✓ Success"
+            echo "    ✓ Index pushed successfully"
             return 0
           }
 
@@ -675,6 +765,22 @@ jobs:
             echo "=== Processing ${provider}:${feature_tag} ==="
             echo "  Version: $version"
             echo "  Platforms: ${#refs[@]}"
+            
+            # List all platforms for this group
+            for ref in "${refs[@]}"; do
+              echo "    - $ref"
+            done
+            echo ""
+            
+            # Validate minimum platform count
+            if [[ ${#refs[@]} -lt 2 ]]; then
+              echo "  ⚠️  WARNING: Only ${#refs[@]} platform(s) found for ${provider}:${feature_tag}"
+              echo "  Multi-platform manifests require at least 2 platforms"
+              echo "  This indicates that some builds may have failed or artifacts are missing"
+              echo "  Skipping manifest creation for ${provider}:${feature_tag}"
+              echo ""
+              continue
+            fi
             
             # 1. Create version-pinned multi-platform manifest (e.g., 0.1.0-metal)
             versioned_tag="${base}:${version}-${feature_tag}"
