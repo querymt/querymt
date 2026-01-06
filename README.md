@@ -23,14 +23,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize registry and register the Wasm loader
     let mut registry = PluginRegistry::from_path("providers.toml")?;
     registry.register_loader(Box::new(ExtismLoader));
-    registry.load_all_plugins().await;
 
     // 2. Build the LLM provider
     let llm = LLMBuilder::new()
         .provider("openai")
         .model("gpt-5-mini")
         .api_key("your-api-key")
-        .build(&registry)?;
+        .build(&registry)
+        .await?;
 
     // 3. Send a message
     let response = llm.chat(&[
