@@ -33,7 +33,7 @@ defaults:
 providers:
   mrs:
     cuda:
-      disabled: true  # Temporarily disabled for faster dev cycles - set to false to re-enable
+      disabled: false
       toolkit_version: "12.8"
       strategy: "split"
       variants:
@@ -50,19 +50,18 @@ providers:
           - sm: 87
             features: ["cuda", "cudnn"]
     targets:
-      linux: []  # Temporarily disabled for faster dev cycles - restore to defaults or add entries to re-enable
-      windows: []  # Temporarily disabled for faster dev cycles - restore to defaults or add entries to re-enable
-      # windows (original config - commented out for dev):
-      #   - target: x86_64-pc-windows-msvc
-      #     arch: amd64
-      #     runner: windows-latest
-      #   - target: aarch64-pc-windows-msvc
-      #     arch: arm64
-      #     runner: windows-latest
-      #     features:
-      #       - ""
+      windows:
+        - target: x86_64-pc-windows-msvc
+          arch: amd64
+          runner: windows-latest
+        - target: aarch64-pc-windows-msvc
+          arch: arm64
+          runner: windows-latest
+          features:
+            - ""
     feature_sets:
-      linux: []  # Temporarily disabled for faster dev cycles - restore to defaults to re-enable
+      linux:
+        - ""
       darwin:
         - "accelerate"
-        # - "metal"  # Temporarily disabled for faster dev cycles - uncomment to re-enable
+        - "metal"

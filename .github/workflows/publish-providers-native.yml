@@ -489,23 +489,6 @@ jobs:
           path: manifests/
           merge-multiple: false
 
-      - name: Debug - List downloaded artifacts
-        shell: bash
-        run: |
-          echo "=== Downloaded Artifact Structure ==="
-          ls -la manifests/ || echo "No manifests directory found"
-          echo ""
-          echo "=== Found data.txt files ==="
-          find manifests/ -type f -name "data.txt" -exec echo "  - {}" \;
-          echo ""
-          echo "=== Artifact contents ==="
-          for data_file in manifests/*/data.txt; do
-            [[ -f "$data_file" ]] || continue
-            echo "File: $data_file"
-            cat "$data_file"
-            echo "---"
-          done
-
       - name: Wait for GHCR to index manifests
         shell: bash
         run: |
@@ -540,21 +523,15 @@ jobs:
           declare -A builds_data
           build_count=0
 
-          echo "DEBUG: Starting to process data files..."
           for data_file in manifests/*/data.txt; do
-            echo "DEBUG: Checking file: $data_file"
-            [[ -f "$data_file" ]] || { echo "DEBUG: File not found, skipping"; continue; }
+            [[ -f "$data_file" ]] || continue
             
-            echo "DEBUG: File exists, reading..."
             # Read the data file
             unset PROVIDER VERSION OS ARCH FEATURE_TAG IMAGE_REF
             source "$data_file"
             
-            echo "DEBUG: Read PROVIDER=$PROVIDER, OS=$OS, ARCH=$ARCH"
-            
             # Skip noop entries
             if [[ "$PROVIDER" == "noop" ]]; then
-              echo "DEBUG: Skipping noop provider"
               continue
             fi
             
@@ -563,12 +540,8 @@ jobs:
             builds_data["$key"]="$IMAGE_REF"
             
             echo "  - $PROVIDER $VERSION $OS/$ARCH $FEATURE_TAG"
-            echo "DEBUG: Incrementing build_count from $build_count"
             build_count=$((build_count + 1))
-            echo "DEBUG: build_count is now $build_count"
           done
-          
-          echo "DEBUG: Loop completed. Total build_count=$build_count"
 
           if [[ $build_count -eq 0 ]]; then
             echo "No builds to aggregate, skipping"
@@ -576,15 +549,6 @@ jobs:
           fi
 
           echo "Found $build_count builds to aggregate"
-          echo ""
-          
-          # Debug: Show all parsed builds
-          echo "=== Parsed Build Information ==="
-          for key in "${!builds_data[@]}"; do
-            IFS='|' read -r provider version os arch feature_tag <<< "$key"
-            echo "  • $provider v$version - $os/$arch [$feature_tag]"
-            echo "    → ${builds_data[$key]}"
-          done
           echo ""
 
           # Function to create a multi-platform index with proper platform fields
@@ -627,8 +591,6 @@ jobs:
                 echo "    Last error: $manifest"
                 return 1
               fi
-              
-              echo "    ✓ Manifest fetched successfully (attempt $attempt/$max_attempts)"
               
               # Extract platform info from annotations
               local os arch media_type
@@ -744,7 +706,7 @@ jobs:
             fi
             
             rm -f "$index_file"
-            echo "    ✓ Index pushed successfully"
+            echo "    ✓ Success"
             return 0
           }
 
