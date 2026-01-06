@@ -143,8 +143,34 @@ impl PluginRegistry {
         }
     }
 
-    pub fn get(&self, provider: &str) -> Option<Arc<dyn LLMProviderFactory>> {
-        self.factories.read().unwrap().get(provider).cloned()
+    /// Get a provider factory, loading it lazily if not already loaded.
+    ///
+    /// This method will first check if the provider is already loaded in the registry.
+    /// If not, it will attempt to load it from the configuration and cache it.
+    pub async fn get(&self, provider: &str) -> Option<Arc<dyn LLMProviderFactory>> {
+        // First check if already loaded
+        if let Some(factory) = self.factories.read().unwrap().get(provider).cloned() {
+            return Some(factory);
+        }
+
+        // Not loaded yet, find the provider config
+        let provider_cfg = self.config.providers.iter().find(|p| p.name == provider)?;
+
+        // Try to load it
+        match self.load_and_process_plugin(provider_cfg).await {
+            Ok(factory) => {
+                log::info!("Lazy loaded provider '{}'", provider);
+                self.factories
+                    .write()
+                    .unwrap()
+                    .insert(provider.to_string(), factory.clone());
+                Some(factory)
+            }
+            Err(e) => {
+                log::error!("Failed to lazy load provider '{}': {}", provider, e);
+                None
+            }
+        }
     }
 
     pub fn list(&self) -> Vec<Arc<dyn LLMProviderFactory>> {

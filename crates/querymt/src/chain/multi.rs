@@ -216,8 +216,8 @@ impl<'a> MultiPromptChain<'a> {
             // 1) Replace {{xyz}} in template with existing memory
             let prompt_text = self.replace_template(&step.template);
 
-            // 2) Get the right backend
-            let llm = self.registry.get(&step.provider_id).ok_or_else(|| {
+            // 2) Get the right backend (with lazy loading)
+            let llm = self.registry.get(&step.provider_id).await.ok_or_else(|| {
                 LLMError::InvalidRequest(format!(
                     "No provider with id '{}' found in registry",
                     step.provider_id

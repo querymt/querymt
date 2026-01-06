@@ -60,17 +60,20 @@ pub async fn get_api_key(
     }
 
     // 3. Fall back to API key from secret store or environment
-    registry.get(provider).and_then(|factory| {
-        factory.as_http()?.api_key_name().and_then(|name| {
-            SecretStore::new()
-                .ok()
-                .and_then(|store| store.get(&name))
-                .or_else(|| std::env::var(name).ok())
-        })
-    })
+    if let Some(factory) = registry.get(provider).await {
+        if let Some(http_factory) = factory.as_http() {
+            if let Some(name) = http_factory.api_key_name() {
+                return SecretStore::new()
+                    .ok()
+                    .and_then(|store| store.get(&name))
+                    .or_else(|| std::env::var(name).ok());
+            }
+        }
+    }
+    None
 }
 
-/// Initializes provider registry (from config path or default ~/.qmt)
+/// Initializes provider registry WITHOUT loading plugins (lazy loading)
 pub async fn get_provider_registry(args: &CliArgs) -> Result<PluginRegistry, LLMError> {
     // Determine config file path
     let cfg_file = if let Some(cfg) = &args.provider_config {
@@ -89,7 +92,7 @@ pub async fn get_provider_registry(args: &CliArgs) -> Result<PluginRegistry, LLM
 
     registry.register_loader(Box::new(ExtismLoader));
     registry.register_loader(Box::new(NativeLoader));
-    registry.load_all_plugins().await;
+    // Don't load all plugins - they will be loaded on-demand
 
     Ok(registry)
 }

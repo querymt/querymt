@@ -325,7 +325,7 @@ impl LLMBuilder {
     /// - Required backend feature is not enabled
     /// - Required configuration like API keys are missing
     #[instrument(name = "llm_builder.build", skip(self, registry), fields(provider = self.provider.as_deref().unwrap_or("unknown")))]
-    pub fn build(self, registry: &PluginRegistry) -> Result<Box<dyn LLMProvider>, LLMError> {
+    pub async fn build(self, registry: &PluginRegistry) -> Result<Box<dyn LLMProvider>, LLMError> {
         //        let (tools, tool_choice) = self.validate_tool_config()?;
 
         let provider_name = self
@@ -333,7 +333,7 @@ impl LLMBuilder {
             .clone()
             .ok_or_else(|| LLMError::InvalidRequest("No provider specified".to_string()))?;
         let factory: Arc<dyn LLMProviderFactory> =
-            registry.get(&provider_name).ok_or_else(|| {
+            registry.get(&provider_name).await.ok_or_else(|| {
                 LLMError::InvalidRequest(format!("Unknown provider: {}", provider_name))
             })?;
 

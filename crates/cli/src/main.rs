@@ -182,12 +182,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             Commands::Providers => {
+                // Load all plugins since we need to list all providers
+                registry.load_all_plugins().await;
                 for factory in registry.list() {
                     println!("- {}", factory.name());
                 }
                 return Ok(());
             }
             Commands::Models => {
+                // Load all plugins since we need to list models from all providers
+                registry.load_all_plugins().await;
                 let mut cfg: Value = Default::default();
                 for factory in registry.list() {
                     print!("{}: ", factory.name());
@@ -265,7 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     builder = builder.embedding_dimensions(*dim);
                 }
 
-                let provider = builder.build(&registry)?;
+                let provider = builder.build(&registry).await?;
                 let embeddings = embed_pipe(&provider, text.as_ref(), separator.as_ref()).await?;
 
                 // pretty-print as JSON
@@ -400,7 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     tool_stats.log_summary();
-    let provider = builder.build(&registry)?;
+    let provider = builder.build(&registry).await?;
     let is_pipe = !io::stdin().is_terminal();
 
     if is_pipe || args.prompt.is_some() {
