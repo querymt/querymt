@@ -190,7 +190,11 @@ jobs:
             provider_env = conf.get("env", {}) or {}
             cuda_config = conf.get("cuda", {})
             for osname in ("linux", "darwin", "windows"):
-              targets = provider_targets.get(osname) or default_targets.get(osname) or []
+              # Check for explicit override (even if empty list) before falling back to defaults
+              if osname in provider_targets:
+                targets = provider_targets.get(osname) or []
+              else:
+                targets = default_targets.get(osname) or []
               if not targets:
                 continue
               env_by_feature = provider_env.get(osname) or {}
@@ -252,6 +256,10 @@ jobs:
                     include_cuda = True
                   elif any("cuda" in f for f in target_features):
                     include_cuda = True
+
+                # Check if CUDA is explicitly disabled in config
+                if include_cuda and cuda_config.get('disabled', False):
+                  include_cuda = False
 
                 if include_cuda:
                   cuda_features = generate_cuda_features(cuda_config, arch_key)
