@@ -244,7 +244,9 @@ jobs:
                 
                 # Add CUDA variants
                 include_cuda = False
-                if osname in ['linux', 'windows']:
+                # Disable Windows CUDA builds until upstream support lands.
+                # TODO: retest after https://github.com/EricLBuehler/mistral.rs/pull/1801 merged
+                if osname in ['linux']:
                   # If target features are not explicitly restricted, or if they include "cuda"
                   if target_features is None:
                     include_cuda = True
@@ -390,6 +392,20 @@ jobs:
           mkdir -p dist
           tar -czf dist/plugin.tar.gz -C "target/${{ matrix.target }}/release" "$LIB_FILE"
           echo "PLUGIN_TAR=dist/plugin.tar.gz" >> $GITHUB_ENV
+
+      - name: Cleanup build artifacts (non-Windows)
+        if: matrix.crate != 'noop' && matrix.os != 'windows'
+        shell: bash
+        run: |
+          # Free runner disk before cache post-job runs.
+          rm -rf target
+
+      - name: Cleanup build artifacts (Windows)
+        if: matrix.crate != 'noop' && matrix.os == 'windows'
+        shell: powershell
+        run: |
+          # Free runner disk before cache post-job runs.
+          Remove-Item -Recurse -Force target
 
       - name: Install Oras CLI
         if: matrix.crate != 'noop'
