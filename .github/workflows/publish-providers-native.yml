@@ -560,9 +560,7 @@ jobs:
 
               # 1. Create version-pinned multi-platform manifest (e.g., 0.1.0-metal)
               versioned_tag = f"{base}:{version}-{feature_tag}"
-              cmd = ["oras", "manifest", "index", "create", versioned_tag]
-              for ref in refs:
-                  cmd.extend(["--amend", ref])
+              cmd = ["oras", "manifest", "index", "create", versioned_tag] + refs
 
               print(f"  Creating: {versioned_tag}")
               result = subprocess.run(cmd, capture_output=True, text=True)
@@ -574,9 +572,7 @@ jobs:
 
               # 2. Create/update latest-{feature} tag (e.g., latest-metal)
               latest_feature_tag = f"{base}:latest-{feature_tag}"
-              cmd = ["oras", "manifest", "index", "create", latest_feature_tag]
-              for ref in refs:
-                  cmd.extend(["--amend", ref])
+              cmd = ["oras", "manifest", "index", "create", latest_feature_tag] + refs
 
               print(f"  Creating: {latest_feature_tag}")
               result = subprocess.run(cmd, capture_output=True, text=True)
@@ -589,9 +585,7 @@ jobs:
               # 3. For "default" feature, also create plain version tag (e.g., 0.1.0)
               if feature_tag == "default":
                   plain_version_tag = f"{base}:{version}"
-                  cmd = ["oras", "manifest", "index", "create", plain_version_tag]
-                  for ref in refs:
-                      cmd.extend(["--amend", ref])
+                  cmd = ["oras", "manifest", "index", "create", plain_version_tag] + refs
 
                   print(f"  Creating: {plain_version_tag}")
                   result = subprocess.run(cmd, capture_output=True, text=True)
@@ -611,9 +605,7 @@ jobs:
                   refs = [img["IMAGE_REF"] for img in groups[default_key]]
 
                   latest_tag = f"{base}:latest"
-                  cmd = ["oras", "manifest", "index", "create", latest_tag]
-                  for ref in refs:
-                      cmd.extend(["--amend", ref])
+                  cmd = ["oras", "manifest", "index", "create", latest_tag] + refs
 
                   print(f"  Creating: {latest_tag}")
                   result = subprocess.run(cmd, capture_output=True, text=True)
