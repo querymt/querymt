@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use crate::cli_args::CliArgs;
 use crate::secret_store::SecretStore;
-use crate::utils::find_config_in_home;
+use crate::utils::{find_config_in_home, read_codex_auth_token};
 use querymt::error::LLMError;
 
 /// Splits "provider:model" or just "provider" into (provider, Option<model>)
@@ -56,6 +56,14 @@ pub async fn get_api_key(
                 log::debug!("Using OAuth token for {}", provider);
                 return Some(token);
             }
+        }
+    }
+
+    // 2b. Codex CLI auth token fallback
+    if provider == "codex" {
+        if let Some(token) = read_codex_auth_token() {
+            log::debug!("Using ~/.codex/auth.json token for codex");
+            return Some(token);
         }
     }
 

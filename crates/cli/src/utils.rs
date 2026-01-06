@@ -39,8 +39,13 @@ fn display_colored_prompt() -> String {
 }
 
 pub fn get_provider_api_key<P: HTTPLLMProviderFactory + ?Sized>(provider: &P) -> Option<String> {
-    let store = SecretStore::new().ok()?;
     let api_key_name = provider.api_key_name()?;
+    if provider.name() == "codex" {
+        if let Some(token) = read_codex_auth_token() {
+            return Some(token);
+        }
+    }
+    let store = SecretStore::new().ok()?;
     store
         .get(&api_key_name)
         .or_else(|| std::env::var(api_key_name).ok())
@@ -326,4 +331,32 @@ pub fn find_config_in_home(filenames: &[&str]) -> Result<PathBuf, Box<dyn std::e
     }
 
     Err(format!("No config file found in {:?}", config_dir).into())
+}
+
+fn extract_auth_token(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(token) if !token.trim().is_empty() => Some(token.to_string()),
+        serde_json::Value::Object(map) => map
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .map(|token| token.to_string()),
+        _ => None,
+    }
+}
+
+/// Best-effort read of Codex CLI auth token from ~/.codex/auth.json.
+pub fn read_codex_auth_token() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let auth_path = home.join(".codex").join("auth.json");
+    let raw = std::fs::read_to_string(auth_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+
+    value
+        .get("access_token")
+        .and_then(extract_auth_token)
+        .or_else(|| value.get("token").and_then(extract_auth_token))
+        .or_else(|| value.get("api_key").and_then(extract_auth_token))
+        .or_else(|| value.pointer("/tokens/access_token").and_then(extract_auth_token))
+        .or_else(|| value.pointer("/tokens/token").and_then(extract_auth_token))
+        .or_else(|| value.pointer("/auth/access_token").and_then(extract_auth_token))
 }
