@@ -492,134 +492,311 @@ jobs:
       - name: Create multi-platform manifests
         shell: bash
         run: |
-          python3 <<'PYTHON'
-          import os
-          import subprocess
-          from pathlib import Path
-          from collections import defaultdict
+          #!/bin/bash
+          set -euo pipefail
 
-          # Read all manifest data files
-          builds = []
-          manifest_dir = Path("manifests")
+          echo "=== Creating multi-platform manifests with proper platform fields ==="
+          
+          # Check if we have any manifest data
+          if [[ ! -d "manifests" ]]; then
+            echo "No manifest data found, skipping multi-platform manifest creation"
+            exit 0
+          fi
 
-          if not manifest_dir.exists():
-              print("No manifest data found, skipping multi-platform manifest creation")
-              exit(0)
+          # Read all manifest data files into an associative array
+          declare -A builds_data
+          build_count=0
 
-          for manifest_file in manifest_dir.rglob("data.txt"):
-              data = {}
-              with open(manifest_file) as f:
-                  for line in f:
-                      line = line.strip()
-                      if "=" in line:
-                          key, value = line.split("=", 1)
-                          data[key] = value
-              if data and data.get("PROVIDER") != "noop":
-                  builds.append(data)
+          for data_file in manifests/*/data.txt; do
+            [[ -f "$data_file" ]] || continue
+            
+            # Read the data file
+            unset PROVIDER VERSION OS ARCH FEATURE_TAG IMAGE_REF
+            source "$data_file"
+            
+            # Skip noop entries
+            [[ "$PROVIDER" == "noop" ]] && continue
+            
+            # Store build info
+            key="${PROVIDER}|${VERSION}|${OS}|${ARCH}|${FEATURE_TAG}"
+            builds_data["$key"]="$IMAGE_REF"
+            
+            echo "  - $PROVIDER $VERSION $OS/$ARCH $FEATURE_TAG"
+            ((build_count++))
+          done
 
-          if not builds:
-              print("No builds to aggregate, skipping")
-              exit(0)
+          if [[ $build_count -eq 0 ]]; then
+            echo "No builds to aggregate, skipping"
+            exit 0
+          fi
 
-          print(f"Found {len(builds)} builds to aggregate")
-          for build in builds:
-              print(f"  - {build['PROVIDER']} {build['VERSION']} {build['OS']}/{build['ARCH']} {build['FEATURE_TAG']}")
+          echo "Found $build_count builds to aggregate"
+          echo ""
 
-          # Group by (provider, feature_tag)
-          groups = defaultdict(list)
-          for build in builds:
-              provider = build["PROVIDER"]
-              feature_tag = build["FEATURE_TAG"]
-              key = (provider, feature_tag)
-              groups[key].append(build)
+          # Function to create a multi-platform index with proper platform fields
+          create_index() {
+            local tag="$1"
+            shift
+            local refs=("$@")
+            
+            echo "  Creating index: $tag"
+            
+            # Build the manifests array for the index
+            local manifests_json="["
+            local first=true
+            
+            for ref in "${refs[@]}"; do
+              # Fetch the manifest to get annotations and size
+              echo "    Fetching manifest: $ref"
+              local manifest
+              manifest=$(oras manifest fetch "$ref" 2>&1)
+              if [[ $? -ne 0 ]]; then
+                echo "    ERROR: Failed to fetch manifest for $ref"
+                echo "$manifest"
+                return 1
+              fi
+              
+              # Extract platform info from annotations
+              local os arch media_type
+              os=$(echo "$manifest" | jq -r '.annotations["org.opencontainers.image.os"] // empty')
+              arch=$(echo "$manifest" | jq -r '.annotations["org.opencontainers.image.architecture"] // empty')
+              media_type=$(echo "$manifest" | jq -r '.mediaType // "application/vnd.oci.image.manifest.v1+json"')
+              
+              # Validate we got platform info
+              if [[ -z "$os" ]] || [[ -z "$arch" ]]; then
+                echo "    ERROR: Missing platform annotations in $ref"
+                echo "           org.opencontainers.image.os: '$os'"
+                echo "           org.opencontainers.image.architecture: '$arch'"
+                return 1
+              fi
+              
+              # Get the digest
+              local digest
+              digest=$(oras resolve "$ref" 2>&1)
+              if [[ $? -ne 0 ]]; then
+                echo "    ERROR: Failed to resolve digest for $ref"
+                echo "$digest"
+                return 1
+              fi
+              
+              # Get the manifest size
+              local size
+              size=$(echo "$manifest" | wc -c | tr -d ' ')
+              
+              echo "      Platform: $os/$arch (digest: ${digest:0:19}..., size: $size)"
+              
+              # Build manifest descriptor JSON
+              [[ "$first" == "false" ]] && manifests_json+=","
+              first=false
+              
+              manifests_json+=$(jq -n \
+                --arg mediaType "$media_type" \
+                --arg digest "$digest" \
+                --argjson size "$size" \
+                --arg os "$os" \
+                --arg arch "$arch" \
+                '{
+                  mediaType: $mediaType,
+                  digest: $digest,
+                  size: $size,
+                  platform: {
+                    os: $os,
+                    architecture: $arch
+                  }
+                }')
+            done
+            
+            manifests_json+="]"
+            
+            # Create the index JSON
+            local index_json
+            index_json=$(jq -n \
+              --argjson manifests "$manifests_json" \
+              '{
+                schemaVersion: 2,
+                mediaType: "application/vnd.oci.image.index.v1+json",
+                manifests: $manifests
+              }')
+            
+            # Save to temp file
+            local index_file
+            index_file=$(mktemp)
+            echo "$index_json" > "$index_file"
+            
+            # Push the index manifest
+            if ! oras manifest push "$tag" "$index_file" 2>&1; then
+              echo "    ERROR: Failed to push index"
+              rm -f "$index_file"
+              return 1
+            fi
+            
+            rm -f "$index_file"
+            echo "    ✓ Success"
+            return 0
+          }
 
-          print(f"\nGrouped into {len(groups)} unique (provider, feature_tag) combinations")
+          # Group builds by (provider, feature_tag)
+          declare -A groups
+          declare -A provider_versions
+          
+          for key in "${!builds_data[@]}"; do
+            IFS='|' read -r provider version os arch feature_tag <<< "$key"
+            
+            group_key="${provider}|${feature_tag}"
+            if [[ -z "${groups[$group_key]:-}" ]]; then
+              groups[$group_key]="${builds_data[$key]}"
+            else
+              groups[$group_key]+=" ${builds_data[$key]}"
+            fi
+            
+            # Track provider versions
+            provider_versions[$provider]="$version"
+          done
 
-          # Track which providers we've seen for creating plain "latest" tag
-          providers_versions = {}
+          echo "Grouped into ${#groups[@]} unique (provider, feature_tag) combinations"
+          echo ""
 
-          # Create manifest indexes for each group
-          for (provider, feature_tag), images in groups.items():
-              base = f"ghcr.io/${{ github.repository_owner }}/{provider}"
-
-              # Extract version from first image (all should have same version)
-              version = images[0]["VERSION"]
-
-              # Track provider version
-              if provider not in providers_versions:
-                  providers_versions[provider] = version
-
-              # Collect all image refs
-              refs = [img["IMAGE_REF"] for img in images]
-
-              print(f"\n=== Processing {provider}:{feature_tag} ===")
-              print(f"  Version: {version}")
-              print(f"  Platforms: {len(images)}")
-              for img in images:
-                  print(f"    - {img['OS']}/{img['ARCH']} -> {img['IMAGE_REF']}")
-
-              # 1. Create version-pinned multi-platform manifest (e.g., 0.1.0-metal)
-              versioned_tag = f"{base}:{version}-{feature_tag}"
-              cmd = ["oras", "manifest", "index", "create", versioned_tag] + refs
-
-              print(f"  Creating: {versioned_tag}")
-              result = subprocess.run(cmd, capture_output=True, text=True)
-              if result.returncode != 0:
-                  print(f"    ERROR: {result.stderr}")
-                  exit(1)
-              else:
-                  print(f"    ✓ Success")
-
-              # 2. Create/update latest-{feature} tag (e.g., latest-metal)
-              latest_feature_tag = f"{base}:latest-{feature_tag}"
-              cmd = ["oras", "manifest", "index", "create", latest_feature_tag] + refs
-
-              print(f"  Creating: {latest_feature_tag}")
-              result = subprocess.run(cmd, capture_output=True, text=True)
-              if result.returncode != 0:
-                  print(f"    ERROR: {result.stderr}")
-                  exit(1)
-              else:
-                  print(f"    ✓ Success")
-
-              # 3. For "default" feature, also create plain version tag (e.g., 0.1.0)
-              if feature_tag == "default":
-                  plain_version_tag = f"{base}:{version}"
-                  cmd = ["oras", "manifest", "index", "create", plain_version_tag] + refs
-
-                  print(f"  Creating: {plain_version_tag}")
-                  result = subprocess.run(cmd, capture_output=True, text=True)
-                  if result.returncode != 0:
-                      print(f"    ERROR: {result.stderr}")
-                      exit(1)
-                  else:
-                      print(f"    ✓ Success")
+          # Process each group
+          for group_key in "${!groups[@]}"; do
+            IFS='|' read -r provider feature_tag <<< "$group_key"
+            IFS=' ' read -ra refs <<< "${groups[$group_key]}"
+            
+            base="ghcr.io/${{ github.repository_owner }}/${provider}"
+            version="${provider_versions[$provider]}"
+            
+            echo "=== Processing ${provider}:${feature_tag} ==="
+            echo "  Version: $version"
+            echo "  Platforms: ${#refs[@]}"
+            
+            # 1. Create version-pinned multi-platform manifest (e.g., 0.1.0-metal)
+            versioned_tag="${base}:${version}-${feature_tag}"
+            create_index "$versioned_tag" "${refs[@]}" || exit 1
+            
+            # 2. Create/update latest-{feature} tag (e.g., latest-metal)
+            latest_feature_tag="${base}:latest-${feature_tag}"
+            create_index "$latest_feature_tag" "${refs[@]}" || exit 1
+            
+            # 3. For "default" feature, also create plain version tag (e.g., 0.1.0)
+            if [[ "$feature_tag" == "default" ]]; then
+              plain_version_tag="${base}:${version}"
+              create_index "$plain_version_tag" "${refs[@]}" || exit 1
+            fi
+            
+            echo ""
+          done
 
           # 4. Create plain "latest" tag for each provider (points to default features)
-          print(f"\n=== Creating 'latest' tags ===")
-          for provider, version in providers_versions.items():
-              # Check if this provider has a "default" feature set
-              default_key = (provider, "default")
-              if default_key in groups:
-                  base = f"ghcr.io/${{ github.repository_owner }}/{provider}"
-                  refs = [img["IMAGE_REF"] for img in groups[default_key]]
+          echo "=== Creating 'latest' tags ==="
+          for provider in "${!provider_versions[@]}"; do
+            group_key="${provider}|default"
+            if [[ -n "${groups[$group_key]:-}" ]]; then
+              IFS=' ' read -ra refs <<< "${groups[$group_key]}"
+              base="ghcr.io/${{ github.repository_owner }}/${provider}"
+              latest_tag="${base}:latest"
+              create_index "$latest_tag" "${refs[@]}" || exit 1
+            else
+              echo "  Skipping ${provider}:latest (no 'default' feature set found)"
+            fi
+          done
 
-                  latest_tag = f"{base}:latest"
-                  cmd = ["oras", "manifest", "index", "create", latest_tag] + refs
+          echo ""
+          echo "=== Summary ==="
+          total_manifests=$((${#groups[@]} * 2))
+          for group_key in "${!groups[@]}"; do
+            IFS='|' read -r _ feature_tag <<< "$group_key"
+            [[ "$feature_tag" == "default" ]] && ((total_manifests++))
+          done
+          # Count providers with default feature for latest tags
+          for provider in "${!provider_versions[@]}"; do
+            [[ -n "${groups[${provider}|default]:-}" ]] && ((total_manifests++))
+          done
+          echo "Created $total_manifests manifest indexes across ${#provider_versions[@]} provider(s)"
 
-                  print(f"  Creating: {latest_tag}")
-                  result = subprocess.run(cmd, capture_output=True, text=True)
-                  if result.returncode != 0:
-                      print(f"    ERROR: {result.stderr}")
-                      exit(1)
-                  else:
-                      print(f"    ✓ Success")
-              else:
-                  print(f"  Skipping {provider}:latest (no 'default' feature set found)")
-
-          print(f"\n=== Summary ===")
-          total_manifests = len(groups) * 2  # version-pinned + latest-feature
-          total_manifests += sum(1 for (_, ft) in groups.keys() if ft == "default")  # plain version tags
-          total_manifests += len([p for p in providers_versions if (p, "default") in groups])  # latest tags
-          print(f"Created {total_manifests} manifest indexes across {len(providers_versions)} provider(s)")
-          PYTHON
+      - name: Validate multi-platform manifests
+        shell: bash
+        run: |
+          #!/bin/bash
+          set -euo pipefail
+          
+          echo "=== Validating multi-platform manifests ==="
+          echo "Verifying that platform fields are properly set..."
+          echo ""
+          
+          # Read all manifest data files to get list of tags to validate
+          declare -A provider_features
+          
+          for data_file in manifests/*/data.txt; do
+            [[ -f "$data_file" ]] || continue
+            
+            unset PROVIDER FEATURE_TAG
+            source "$data_file"
+            
+            [[ "$PROVIDER" == "noop" ]] && continue
+            
+            key="${PROVIDER}|${FEATURE_TAG}"
+            provider_features[$key]=1
+          done
+          
+          if [[ ${#provider_features[@]} -eq 0 ]]; then
+            echo "No manifests to validate, skipping"
+            exit 0
+          fi
+          
+          validation_failed=false
+          
+          # Validate each unique (provider, feature_tag) combination
+          for key in "${!provider_features[@]}"; do
+            IFS='|' read -r provider feature_tag <<< "$key"
+            base="ghcr.io/${{ github.repository_owner }}/${provider}"
+            tag="${base}:latest-${feature_tag}"
+            
+            echo "Validating: $tag"
+            
+            # Fetch the index
+            index=$(oras manifest fetch "$tag" 2>&1)
+            if [[ $? -ne 0 ]]; then
+              echo "  ❌ ERROR: Failed to fetch manifest"
+              validation_failed=true
+              continue
+            fi
+            
+            # Check if it's an index
+            media_type=$(echo "$index" | jq -r '.mediaType // empty')
+            if [[ "$media_type" != "application/vnd.oci.image.index.v1+json" ]]; then
+              echo "  ⚠️  WARNING: Not an image index (mediaType: $media_type)"
+              continue
+            fi
+            
+            # Check each manifest descriptor for platform fields
+            manifest_count=$(echo "$index" | jq '.manifests | length')
+            echo "  Found $manifest_count platform(s)"
+            
+            platform_errors=0
+            for i in $(seq 0 $((manifest_count - 1))); do
+              os=$(echo "$index" | jq -r ".manifests[$i].platform.os // empty")
+              arch=$(echo "$index" | jq -r ".manifests[$i].platform.architecture // empty")
+              digest=$(echo "$index" | jq -r ".manifests[$i].digest")
+              
+              if [[ -z "$os" ]] || [[ -z "$arch" ]]; then
+                echo "  ❌ ERROR: Manifest descriptor missing platform info"
+                echo "     Digest: $digest"
+                echo "     OS: '$os', Architecture: '$arch'"
+                ((platform_errors++))
+                validation_failed=true
+              else
+                echo "  ✓ Platform $os/$arch (${digest:0:19}...)"
+              fi
+            done
+            
+            if [[ $platform_errors -eq 0 ]]; then
+              echo "  ✓ All platform fields validated successfully"
+            fi
+            echo ""
+          done
+          
+          if [[ "$validation_failed" == "true" ]]; then
+            echo "❌ Validation failed: Some manifests are missing platform information"
+            exit 1
+          fi
+          
+          echo "✅ All multi-platform manifests validated successfully"
