@@ -540,15 +540,21 @@ jobs:
           declare -A builds_data
           build_count=0
 
+          echo "DEBUG: Starting to process data files..."
           for data_file in manifests/*/data.txt; do
-            [[ -f "$data_file" ]] || continue
+            echo "DEBUG: Checking file: $data_file"
+            [[ -f "$data_file" ]] || { echo "DEBUG: File not found, skipping"; continue; }
             
+            echo "DEBUG: File exists, reading..."
             # Read the data file
             unset PROVIDER VERSION OS ARCH FEATURE_TAG IMAGE_REF
             source "$data_file"
             
+            echo "DEBUG: Read PROVIDER=$PROVIDER, OS=$OS, ARCH=$ARCH"
+            
             # Skip noop entries
             if [[ "$PROVIDER" == "noop" ]]; then
+              echo "DEBUG: Skipping noop provider"
               continue
             fi
             
@@ -557,8 +563,12 @@ jobs:
             builds_data["$key"]="$IMAGE_REF"
             
             echo "  - $PROVIDER $VERSION $OS/$ARCH $FEATURE_TAG"
-            ((build_count++))
+            echo "DEBUG: Incrementing build_count from $build_count"
+            build_count=$((build_count + 1))
+            echo "DEBUG: build_count is now $build_count"
           done
+          
+          echo "DEBUG: Loop completed. Total build_count=$build_count"
 
           if [[ $build_count -eq 0 ]]; then
             echo "No builds to aggregate, skipping"
