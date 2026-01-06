@@ -487,6 +487,7 @@ jobs:
         with:
           pattern: manifest-*
           path: manifests/
+          merge-multiple: false
 
       - name: Debug - List downloaded artifacts
         shell: bash
