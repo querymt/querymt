@@ -1305,6 +1305,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#oauth-authentication" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        OAuth Authentication
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#storing-api-keys" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1619,101 +1630,139 @@
 <a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>$<span class="w"> </span>qmt<span class="w"> </span>default
 <a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>Default<span class="w"> </span>provider:<span class="w"> </span>openai:gpt-4-turbo
 </code></pre></div>
-<h4 id="storing-api-keys">Storing API Keys</h4>
-<p>Securely store API keys. The <code>key</code> should match the <code>api_key_name</code> defined by the provider plugin (e.g., <code>OPENAI_API_KEY</code>, <code>ANTHROPIC_API_KEY</code>).</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1"># Store your OpenAI API key</span>
-<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>$<span class="w"> </span>qmt<span class="w"> </span><span class="nb">set</span><span class="w"> </span>OPENAI_API_KEY<span class="w"> </span><span class="s2">&quot;sk-...&quot;</span>
-<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>✓<span class="w"> </span>Secret<span class="w"> </span><span class="s1">&#39;OPENAI_API_KEY&#39;</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>set.
+<h4 id="oauth-authentication">OAuth Authentication</h4>
+<p>Some providers support OAuth authentication for enhanced security and automatic token management. The <code>qmt</code> CLI can handle the OAuth flow for you, including opening your browser and storing credentials securely.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1"># Login to Anthropic via OAuth (using Max mode by default)</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>auth<span class="w"> </span>login<span class="w"> </span><span class="nv">anthropic</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="o">===</span><span class="w"> </span>Anthropic<span class="w"> </span>OAuth<span class="w"> </span><span class="nv">Authentication</span><span class="w"> </span><span class="o">===</span>
 <a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>
-<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="c1"># Retrieve a stored key (for verification)</span>
-<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>$<span class="w"> </span>qmt<span class="w"> </span>get<span class="w"> </span>OPENAI_API_KEY
-<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>OPENAI_API_KEY:<span class="w"> </span>sk-...
-<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>
-<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="c1"># Delete a key</span>
-<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>$<span class="w"> </span>qmt<span class="w"> </span>delete<span class="w"> </span>OPENAI_API_KEY
-<a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>✓<span class="w"> </span>Secret<span class="w"> </span><span class="s1">&#39;OPENAI_API_KEY&#39;</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>deleted.
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>Starting<span class="w"> </span>OAuth<span class="w"> </span>flow<span class="w"> </span><span class="k">for</span><span class="w"> </span>Anthropic...
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>🔐<span class="w"> </span>Please<span class="w"> </span>visit<span class="w"> </span>this<span class="w"> </span>URL<span class="w"> </span>to<span class="w"> </span>authorize:
+<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>https://console.anthropic.com/oauth/authorize?...
+<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>
+<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>✓<span class="w"> </span>Browser<span class="w"> </span>opened<span class="w"> </span>automatically
+<a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>
+<a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a><span class="c1"># Login to Anthropic via OAuth (using Console mode for API key generation)</span>
+<a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a>$<span class="w"> </span>qmt<span class="w"> </span>auth<span class="w"> </span>login<span class="w"> </span>anthropic<span class="w"> </span>--mode<span class="w"> </span>console
+<a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a>
+<a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a><span class="c1"># Login to OpenAI via OAuth</span>
+<a id="__codelineno-6-16" name="__codelineno-6-16" href="#__codelineno-6-16"></a>$<span class="w"> </span>qmt<span class="w"> </span>auth<span class="w"> </span>login<span class="w"> </span>openai
+<a id="__codelineno-6-17" name="__codelineno-6-17" href="#__codelineno-6-17"></a>
+<a id="__codelineno-6-18" name="__codelineno-6-18" href="#__codelineno-6-18"></a><span class="c1"># Check authentication status for all providers</span>
+<a id="__codelineno-6-19" name="__codelineno-6-19" href="#__codelineno-6-19"></a>$<span class="w"> </span>qmt<span class="w"> </span>auth<span class="w"> </span>status
+<a id="__codelineno-6-20" name="__codelineno-6-20" href="#__codelineno-6-20"></a>OAuth<span class="w"> </span>Authentication<span class="w"> </span><span class="nv">Status</span>
+<a id="__codelineno-6-21" name="__codelineno-6-21" href="#__codelineno-6-21"></a><span class="o">===========================</span>
+<a id="__codelineno-6-22" name="__codelineno-6-22" href="#__codelineno-6-22"></a>
+<a id="__codelineno-6-23" name="__codelineno-6-23" href="#__codelineno-6-23"></a>anthropic:<span class="w"> </span>Valid<span class="w"> </span>✓
+<a id="__codelineno-6-24" name="__codelineno-6-24" href="#__codelineno-6-24"></a><span class="w">  </span>Access<span class="w"> </span>token<span class="w"> </span>expires:<span class="w"> </span><span class="m">2026</span>-02-15<span class="w"> </span><span class="m">14</span>:30:00<span class="w"> </span>UTC
+<a id="__codelineno-6-25" name="__codelineno-6-25" href="#__codelineno-6-25"></a><span class="w">  </span>Refresh<span class="w"> </span>token<span class="w"> </span>available
+<a id="__codelineno-6-26" name="__codelineno-6-26" href="#__codelineno-6-26"></a>
+<a id="__codelineno-6-27" name="__codelineno-6-27" href="#__codelineno-6-27"></a>openai:<span class="w"> </span>Not<span class="w"> </span>authenticated
+<a id="__codelineno-6-28" name="__codelineno-6-28" href="#__codelineno-6-28"></a><span class="w">  </span>Run<span class="w"> </span><span class="s1">&#39;qmt auth login openai&#39;</span><span class="w"> </span>to<span class="w"> </span>authenticate
+<a id="__codelineno-6-29" name="__codelineno-6-29" href="#__codelineno-6-29"></a>
+<a id="__codelineno-6-30" name="__codelineno-6-30" href="#__codelineno-6-30"></a><span class="c1"># Check status for a specific provider (with automatic refresh disabled)</span>
+<a id="__codelineno-6-31" name="__codelineno-6-31" href="#__codelineno-6-31"></a>$<span class="w"> </span>qmt<span class="w"> </span>auth<span class="w"> </span>status<span class="w"> </span>anthropic<span class="w"> </span>--no-refresh
+<a id="__codelineno-6-32" name="__codelineno-6-32" href="#__codelineno-6-32"></a>
+<a id="__codelineno-6-33" name="__codelineno-6-33" href="#__codelineno-6-33"></a><span class="c1"># Logout from a provider</span>
+<a id="__codelineno-6-34" name="__codelineno-6-34" href="#__codelineno-6-34"></a>$<span class="w"> </span>qmt<span class="w"> </span>auth<span class="w"> </span><span class="nb">logout</span><span class="w"> </span>anthropic
+<a id="__codelineno-6-35" name="__codelineno-6-35" href="#__codelineno-6-35"></a>✓<span class="w"> </span>Logged<span class="w"> </span>out<span class="w"> </span>from<span class="w"> </span>anthropic
+</code></pre></div>
+<h4 id="storing-api-keys">Storing API Keys</h4>
+<p>Securely store API keys and other secrets. The <code>key</code> should match the <code>api_key_name</code> defined by the provider plugin (e.g., <code>OPENAI_API_KEY</code>, <code>ANTHROPIC_API_KEY</code>).</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="c1"># Store your OpenAI API key</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>secrets<span class="w"> </span><span class="nb">set</span><span class="w"> </span>OPENAI_API_KEY<span class="w"> </span><span class="s2">&quot;sk-...&quot;</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>✓<span class="w"> </span>Secret<span class="w"> </span><span class="s1">&#39;OPENAI_API_KEY&#39;</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>set.
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="c1"># Retrieve a stored key (for verification)</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a>$<span class="w"> </span>qmt<span class="w"> </span>secrets<span class="w"> </span>get<span class="w"> </span>OPENAI_API_KEY
+<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a>OPENAI_API_KEY:<span class="w"> </span>sk-...
+<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>
+<a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="c1"># Delete a key</span>
+<a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a>$<span class="w"> </span>qmt<span class="w"> </span>secrets<span class="w"> </span>delete<span class="w"> </span>OPENAI_API_KEY
+<a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a>✓<span class="w"> </span>Secret<span class="w"> </span><span class="s1">&#39;OPENAI_API_KEY&#39;</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>deleted.
 </code></pre></div>
 <h3 id="discovering-providers-models">Discovering Providers &amp; Models</h3>
 <p>List the providers and models that <code>qmt</code> has loaded from your configuration.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="c1"># List all configured provider plugins</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>providers
-<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>-<span class="w"> </span>openai
-<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>-<span class="w"> </span>anthropic
-<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>-<span class="w"> </span>ollama-plugin
-<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a>
-<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="c1"># List all available models for each provider</span>
-<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>$<span class="w"> </span>qmt<span class="w"> </span>models
-<a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a>openai:
-<a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a><span class="w">  </span>-<span class="w"> </span>openai:gpt-4-turbo
-<a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a><span class="w">  </span>-<span class="w"> </span>openai:gpt-3.5-turbo
-<a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a>anthropic:
-<a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a><span class="w">  </span>-<span class="w"> </span>anthropic:claude-3-opus-20240229
-<a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a><span class="w">  </span>-<span class="w"> </span>anthropic:claude-3-sonnet-20240229
-<a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a>ollama-plugin:
-<a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a><span class="w">  </span>-<span class="w"> </span>ollama-plugin:llama3
-<a id="__codelineno-7-17" name="__codelineno-7-17" href="#__codelineno-7-17"></a><span class="w">  </span>-<span class="w"> </span>ollama-plugin:mistral
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="c1"># List all configured provider plugins</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>providers
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>-<span class="w"> </span>openai
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>-<span class="w"> </span>anthropic
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>-<span class="w"> </span>ollama-plugin
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>
+<a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a><span class="c1"># List all available models for each provider</span>
+<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>$<span class="w"> </span>qmt<span class="w"> </span>models
+<a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a>openai:
+<a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a><span class="w">  </span>-<span class="w"> </span>openai:gpt-4-turbo
+<a id="__codelineno-8-11" name="__codelineno-8-11" href="#__codelineno-8-11"></a><span class="w">  </span>-<span class="w"> </span>openai:gpt-3.5-turbo
+<a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a>anthropic:
+<a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a><span class="w">  </span>-<span class="w"> </span>anthropic:claude-3-opus-20240229
+<a id="__codelineno-8-14" name="__codelineno-8-14" href="#__codelineno-8-14"></a><span class="w">  </span>-<span class="w"> </span>anthropic:claude-3-sonnet-20240229
+<a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a>ollama-plugin:
+<a id="__codelineno-8-16" name="__codelineno-8-16" href="#__codelineno-8-16"></a><span class="w">  </span>-<span class="w"> </span>ollama-plugin:llama3
+<a id="__codelineno-8-17" name="__codelineno-8-17" href="#__codelineno-8-17"></a><span class="w">  </span>-<span class="w"> </span>ollama-plugin:mistral
 </code></pre></div>
 <h2 id="examples-advanced-usage">Examples &amp; Advanced Usage</h2>
 <p>Combine flags to customize LLM interactions.</p>
 <h4 id="specifying-a-provider-and-model">Specifying a Provider and Model</h4>
 <p>Use the <code>--provider</code> (<code>-p</code>) and <code>--model</code> flags, or combine them in the format <code>provider:model</code>.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="c1"># Use the anthropic provider with the claude-3-sonnet model</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>anthropic<span class="w"> </span>--model<span class="w"> </span>claude-3-sonnet-20240229<span class="w"> </span><span class="s2">&quot;Explain the concept of emergence.&quot;</span>
-<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>
-<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="c1"># A more concise way to do the same</span>
-<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>anthropic:claude-3-sonnet-20240229<span class="w"> </span><span class="s2">&quot;Explain the concept of emergence.&quot;</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="c1"># Use the anthropic provider with the claude-3-sonnet model</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>anthropic<span class="w"> </span>--model<span class="w"> </span>claude-3-sonnet-20240229<span class="w"> </span><span class="s2">&quot;Explain the concept of emergence.&quot;</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="c1"># A more concise way to do the same</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>anthropic:claude-3-sonnet-20240229<span class="w"> </span><span class="s2">&quot;Explain the concept of emergence.&quot;</span>
 </code></pre></div>
 <h4 id="using-a-local-model-via-a-proxylocal-server">Using a Local Model via a Proxy/Local Server</h4>
 <p>Override the <code>--base-url</code> to point to a local service like Ollama.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="c1"># Assuming you have an &#39;ollama&#39; provider configured that works with OpenAI&#39;s API format</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>ollama:llama3<span class="w"> </span>--base-url<span class="w"> </span>http://localhost:11434<span class="w"> </span><span class="s2">&quot;Who are you?&quot;</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="c1"># Assuming you have an &#39;ollama&#39; provider configured that works with OpenAI&#39;s API format</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>ollama:llama3<span class="w"> </span>--base-url<span class="w"> </span>http://localhost:11434<span class="w"> </span><span class="s2">&quot;Who are you?&quot;</span>
 </code></pre></div>
 <h4 id="setting-a-system-prompt">Setting a System Prompt</h4>
 <p>Guide the model's behavior with a system prompt using <code>--system</code> (<code>-s</code>).</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;You are a helpful assistant that only speaks in rhyme.&quot;</span><span class="w"> </span><span class="s2">&quot;What is a computer?&quot;</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;You are a helpful assistant that only speaks in rhyme.&quot;</span><span class="w"> </span><span class="s2">&quot;What is a computer?&quot;</span>
 </code></pre></div>
 <h4 id="controlling-generation-parameters">Controlling Generation Parameters</h4>
 <p>Adjust temperature, max tokens, and other parameters for more creative or controlled output.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>--temperature<span class="w"> </span><span class="m">1</span>.2<span class="w"> </span>--max-tokens<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="s2">&quot;Write a short, creative opening line for a fantasy novel.&quot;</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>--temperature<span class="w"> </span><span class="m">1</span>.2<span class="w"> </span>--max-tokens<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="s2">&quot;Write a short, creative opening line for a fantasy novel.&quot;</span>
 </code></pre></div>
 <h4 id="passing-custom-provider-specific-options">Passing Custom Provider-Specific Options</h4>
 <p>Use the <code>--options</code> (<code>-o</code>) flag to pass arbitrary key-value pairs that a specific plugin might support. Values are parsed as JSON if possible, otherwise as strings.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>some-custom-provider<span class="w"> </span>-o<span class="w"> </span><span class="nv">vision_mode</span><span class="o">=</span><span class="nb">true</span><span class="w"> </span>-o<span class="w"> </span><span class="nv">response_format</span><span class="o">=</span><span class="s1">&#39;{&quot;type&quot;: &quot;json_object&quot;}&#39;</span><span class="w"> </span><span class="s2">&quot;Analyze this image&quot;</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>some-custom-provider<span class="w"> </span>-o<span class="w"> </span><span class="nv">vision_mode</span><span class="o">=</span><span class="nb">true</span><span class="w"> </span>-o<span class="w"> </span><span class="nv">response_format</span><span class="o">=</span><span class="s1">&#39;{&quot;type&quot;: &quot;json_object&quot;}&#39;</span><span class="w"> </span><span class="s2">&quot;Analyze this image&quot;</span>
 </code></pre></div>
 <h4 id="embedding-with-specific-dimensions">Embedding with Specific Dimensions</h4>
 <p>Some embedding models support custom dimensions.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>embed<span class="w"> </span><span class="s2">&quot;This is a test&quot;</span><span class="w"> </span>-p<span class="w"> </span>openai:text-embedding-3-small<span class="w"> </span>--dimensions<span class="w"> </span><span class="m">512</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>embed<span class="w"> </span><span class="s2">&quot;This is a test&quot;</span><span class="w"> </span>-p<span class="w"> </span>openai:text-embedding-3-small<span class="w"> </span>--dimensions<span class="w"> </span><span class="m">512</span>
 </code></pre></div>
 <h4 id="using-tools-via-mcp">Using Tools via MCP</h4>
 <p>Create a file named <code>mcp-config.toml</code>. This file tells QueryMT how to launch and communicate with the tool server.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="c1"># mcp-config.toml</span>
-<a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="k">[[mcp]]</span>
-<a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mem_server&quot;</span>
-<a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="n">protocol</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;stdio&quot;</span>
-<a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a><span class="n">command</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;npx&quot;</span>
-<a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a><span class="n">args</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;-y&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;@modelcontextprotocol/server-memory&quot;</span><span class="p">]</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="c1"># mcp-config.toml</span>
+<a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="k">[[mcp]]</span>
+<a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mem_server&quot;</span>
+<a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a><span class="n">protocol</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;stdio&quot;</span>
+<a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a><span class="n">command</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;npx&quot;</span>
+<a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a><span class="n">args</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;-y&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;@modelcontextprotocol/server-memory&quot;</span><span class="p">]</span>
 </code></pre></div>
 <p>When you ask a question that requires a tool, the LLM will request to use it, and <code>qmt</code> will handle the communication.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="c1"># Ask the LLM to use the &#39;set&#39; tool from our stdio server</span>
-<a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>--provider<span class="w"> </span>openai:gpt-4o-mini<span class="w"> </span>--mcp-config<span class="w"> </span>./mcp-config.toml
-<a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a>qmt<span class="w"> </span>-<span class="w"> </span>Interactive<span class="w"> </span>Chat
-<a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a>Provider:<span class="w"> </span>openai
-<a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a>Type<span class="w"> </span><span class="s1">&#39;exit&#39;</span><span class="w"> </span>to<span class="w"> </span>quit
-<a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a>──────────────────────────────────────────────────
-<a id="__codelineno-15-7" name="__codelineno-15-7" href="#__codelineno-15-7"></a>::<span class="w"> </span>create<span class="w"> </span>two<span class="w"> </span>entities:<span class="w"> </span>qmt<span class="w"> </span>and<span class="w"> </span>awesome<span class="w"> </span>and<span class="w"> </span>connect<span class="w"> </span>qmt<span class="w"> </span>with<span class="w"> </span>an<span class="w"> </span>isa<span class="w"> </span>relation<span class="w"> </span>to<span class="w"> </span>awesome
-<a id="__codelineno-15-8" name="__codelineno-15-8" href="#__codelineno-15-8"></a>┌─<span class="w"> </span>create_entities
-<a id="__codelineno-15-9" name="__codelineno-15-9" href="#__codelineno-15-9"></a>└─<span class="w"> </span>calling...
-<a id="__codelineno-15-10" name="__codelineno-15-10" href="#__codelineno-15-10"></a>┌─<span class="w"> </span>create_entities
-<a id="__codelineno-15-11" name="__codelineno-15-11" href="#__codelineno-15-11"></a>└─<span class="w"> </span>generated
-<a id="__codelineno-15-12" name="__codelineno-15-12" href="#__codelineno-15-12"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>The<span class="w"> </span>entities<span class="w"> </span><span class="s2">&quot;qmt&quot;</span><span class="w"> </span>and<span class="w"> </span><span class="s2">&quot;awesome&quot;</span><span class="w"> </span>have<span class="w"> </span>been<span class="w"> </span>successfully<span class="w"> </span>created,<span class="w"> </span>and<span class="w"> </span>the<span class="w"> </span>relation<span class="w"> </span><span class="s2">&quot;isa&quot;</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>established<span class="w"> </span>from<span class="w"> </span><span class="s2">&quot;qmt&quot;</span><span class="w"> </span>to<span class="w"> </span><span class="s2">&quot;awesome.&quot;</span><span class="w"> </span>If<span class="w"> </span>you<span class="w"> </span>need<span class="w"> </span>any<span class="w"> </span>further<span class="w"> </span>modifications<span class="w"> </span>or<span class="w"> </span>additional<span class="w"> </span>actions,<span class="w"> </span>just<span class="w"> </span><span class="nb">let</span><span class="w"> </span>me<span class="w"> </span>know!
-<a id="__codelineno-15-13" name="__codelineno-15-13" href="#__codelineno-15-13"></a>──────────────────────────────────────────────────
-<a id="__codelineno-15-14" name="__codelineno-15-14" href="#__codelineno-15-14"></a>::<span class="w"> </span>what<span class="w"> </span>is<span class="w"> </span>qmt?
-<a id="__codelineno-15-15" name="__codelineno-15-15" href="#__codelineno-15-15"></a>┌─<span class="w"> </span>open_nodes
-<a id="__codelineno-15-16" name="__codelineno-15-16" href="#__codelineno-15-16"></a>└─<span class="w"> </span>generated
-<a id="__codelineno-15-17" name="__codelineno-15-17" href="#__codelineno-15-17"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>The<span class="w"> </span>entity<span class="w"> </span><span class="s2">&quot;qmt&quot;</span><span class="w"> </span>is<span class="w"> </span>of<span class="w"> </span><span class="nb">type</span><span class="w"> </span><span class="s2">&quot;type1&quot;</span><span class="w"> </span>and<span class="w"> </span>currently<span class="w"> </span>has<span class="w"> </span>no<span class="w"> </span>associated<span class="w"> </span>observations<span class="w"> </span>or<span class="w"> </span>relations<span class="w"> </span>other<span class="w"> </span>than<span class="w"> </span>the<span class="w"> </span>relation<span class="w"> </span>to<span class="w"> </span><span class="s2">&quot;awesome&quot;</span><span class="w"> </span>established<span class="w"> </span>earlier.<span class="w"> </span>If<span class="w"> </span>you<span class="w"> </span>need<span class="w"> </span>more<span class="w"> </span>information<span class="w"> </span>or<span class="w"> </span>to<span class="w"> </span>add<span class="w"> </span>observations,<span class="w"> </span>feel<span class="w"> </span>free<span class="w"> </span>to<span class="w"> </span>ask!
-<a id="__codelineno-15-18" name="__codelineno-15-18" href="#__codelineno-15-18"></a>──────────────────────────────────────────────────
-<a id="__codelineno-15-19" name="__codelineno-15-19" href="#__codelineno-15-19"></a>::
-<a id="__codelineno-15-20" name="__codelineno-15-20" href="#__codelineno-15-20"></a>👋<span class="w"> </span>Goodbye!
+<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="c1"># Ask the LLM to use the &#39;set&#39; tool from our stdio server</span>
+<a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>--provider<span class="w"> </span>openai:gpt-4o-mini<span class="w"> </span>--mcp-config<span class="w"> </span>./mcp-config.toml
+<a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a>qmt<span class="w"> </span>-<span class="w"> </span>Interactive<span class="w"> </span>Chat
+<a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a>Provider:<span class="w"> </span>openai
+<a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a>Type<span class="w"> </span><span class="s1">&#39;exit&#39;</span><span class="w"> </span>to<span class="w"> </span>quit
+<a id="__codelineno-16-6" name="__codelineno-16-6" href="#__codelineno-16-6"></a>──────────────────────────────────────────────────
+<a id="__codelineno-16-7" name="__codelineno-16-7" href="#__codelineno-16-7"></a>::<span class="w"> </span>create<span class="w"> </span>two<span class="w"> </span>entities:<span class="w"> </span>qmt<span class="w"> </span>and<span class="w"> </span>awesome<span class="w"> </span>and<span class="w"> </span>connect<span class="w"> </span>qmt<span class="w"> </span>with<span class="w"> </span>an<span class="w"> </span>isa<span class="w"> </span>relation<span class="w"> </span>to<span class="w"> </span>awesome
+<a id="__codelineno-16-8" name="__codelineno-16-8" href="#__codelineno-16-8"></a>┌─<span class="w"> </span>create_entities
+<a id="__codelineno-16-9" name="__codelineno-16-9" href="#__codelineno-16-9"></a>└─<span class="w"> </span>calling...
+<a id="__codelineno-16-10" name="__codelineno-16-10" href="#__codelineno-16-10"></a>┌─<span class="w"> </span>create_entities
+<a id="__codelineno-16-11" name="__codelineno-16-11" href="#__codelineno-16-11"></a>└─<span class="w"> </span>generated
+<a id="__codelineno-16-12" name="__codelineno-16-12" href="#__codelineno-16-12"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>The<span class="w"> </span>entities<span class="w"> </span><span class="s2">&quot;qmt&quot;</span><span class="w"> </span>and<span class="w"> </span><span class="s2">&quot;awesome&quot;</span><span class="w"> </span>have<span class="w"> </span>been<span class="w"> </span>successfully<span class="w"> </span>created,<span class="w"> </span>and<span class="w"> </span>the<span class="w"> </span>relation<span class="w"> </span><span class="s2">&quot;isa&quot;</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>established<span class="w"> </span>from<span class="w"> </span><span class="s2">&quot;qmt&quot;</span><span class="w"> </span>to<span class="w"> </span><span class="s2">&quot;awesome.&quot;</span><span class="w"> </span>If<span class="w"> </span>you<span class="w"> </span>need<span class="w"> </span>any<span class="w"> </span>further<span class="w"> </span>modifications<span class="w"> </span>or<span class="w"> </span>additional<span class="w"> </span>actions,<span class="w"> </span>just<span class="w"> </span><span class="nb">let</span><span class="w"> </span>me<span class="w"> </span>know!
+<a id="__codelineno-16-13" name="__codelineno-16-13" href="#__codelineno-16-13"></a>──────────────────────────────────────────────────
+<a id="__codelineno-16-14" name="__codelineno-16-14" href="#__codelineno-16-14"></a>::<span class="w"> </span>what<span class="w"> </span>is<span class="w"> </span>qmt?
+<a id="__codelineno-16-15" name="__codelineno-16-15" href="#__codelineno-16-15"></a>┌─<span class="w"> </span>open_nodes
+<a id="__codelineno-16-16" name="__codelineno-16-16" href="#__codelineno-16-16"></a>└─<span class="w"> </span>generated
+<a id="__codelineno-16-17" name="__codelineno-16-17" href="#__codelineno-16-17"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>The<span class="w"> </span>entity<span class="w"> </span><span class="s2">&quot;qmt&quot;</span><span class="w"> </span>is<span class="w"> </span>of<span class="w"> </span><span class="nb">type</span><span class="w"> </span><span class="s2">&quot;type1&quot;</span><span class="w"> </span>and<span class="w"> </span>currently<span class="w"> </span>has<span class="w"> </span>no<span class="w"> </span>associated<span class="w"> </span>observations<span class="w"> </span>or<span class="w"> </span>relations<span class="w"> </span>other<span class="w"> </span>than<span class="w"> </span>the<span class="w"> </span>relation<span class="w"> </span>to<span class="w"> </span><span class="s2">&quot;awesome&quot;</span><span class="w"> </span>established<span class="w"> </span>earlier.<span class="w"> </span>If<span class="w"> </span>you<span class="w"> </span>need<span class="w"> </span>more<span class="w"> </span>information<span class="w"> </span>or<span class="w"> </span>to<span class="w"> </span>add<span class="w"> </span>observations,<span class="w"> </span>feel<span class="w"> </span>free<span class="w"> </span>to<span class="w"> </span>ask!
+<a id="__codelineno-16-18" name="__codelineno-16-18" href="#__codelineno-16-18"></a>──────────────────────────────────────────────────
+<a id="__codelineno-16-19" name="__codelineno-16-19" href="#__codelineno-16-19"></a>::
+<a id="__codelineno-16-20" name="__codelineno-16-20" href="#__codelineno-16-20"></a>👋<span class="w"> </span>Goodbye!
 </code></pre></div>
 <h2 id="command-line-reference">Command-Line Reference</h2>
 <h3 id="global-options">Global Options</h3>
@@ -1799,15 +1848,35 @@
 </thead>
 <tbody>
 <tr>
-<td><code>qmt set &lt;KEY&gt; &lt;VALUE&gt;</code></td>
+<td><code>qmt auth login &lt;PROVIDER&gt;</code></td>
+<td>Login to a provider using OAuth authentication.</td>
+</tr>
+<tr>
+<td>&nbsp;&nbsp;<code>--mode &lt;MODE&gt;</code></td>
+<td>OAuth mode (provider-specific, e.g., "max" or "console" for Anthropic). Defaults to "max".</td>
+</tr>
+<tr>
+<td><code>qmt auth logout &lt;PROVIDER&gt;</code></td>
+<td>Logout from an OAuth provider (removes stored tokens).</td>
+</tr>
+<tr>
+<td><code>qmt auth status [PROVIDER]</code></td>
+<td>Check OAuth authentication status for all or a specific provider.</td>
+</tr>
+<tr>
+<td>&nbsp;&nbsp;<code>--no-refresh</code></td>
+<td>Skip automatic token refresh (show raw stored status).</td>
+</tr>
+<tr>
+<td><code>qmt secrets set &lt;KEY&gt; &lt;VALUE&gt;</code></td>
 <td>Set a secret key-value pair in the secure store.</td>
 </tr>
 <tr>
-<td><code>qmt get &lt;KEY&gt;</code></td>
+<td><code>qmt secrets get &lt;KEY&gt;</code></td>
 <td>Get a secret value by its key.</td>
 </tr>
 <tr>
-<td><code>qmt delete &lt;KEY&gt;</code></td>
+<td><code>qmt secrets delete &lt;KEY&gt;</code></td>
 <td>Delete a secret by its key.</td>
 </tr>
 <tr>
@@ -1845,6 +1914,14 @@
 <tr>
 <td>&nbsp;&nbsp;<code>--model &lt;NAME&gt;</code></td>
 <td>Override the model for this embedding task.</td>
+</tr>
+<tr>
+<td><code>qmt update</code></td>
+<td>Update provider plugins.</td>
+</tr>
+<tr>
+<td><code>qmt completion &lt;SHELL&gt;</code></td>
+<td>Generate shell completions for the specified shell.</td>
 </tr>
 </tbody>
 </table>
