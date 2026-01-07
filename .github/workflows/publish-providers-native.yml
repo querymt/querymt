@@ -248,9 +248,7 @@ jobs:
                 
                 # Add CUDA variants
                 include_cuda = False
-                # Disable Windows CUDA builds until upstream support lands.
-                # TODO: retest after https://github.com/EricLBuehler/mistral.rs/pull/1801 merged
-                if osname in ['linux']:
+                if osname in ['linux', 'windows']:
                   # If target features are not explicitly restricted, or if they include "cuda"
                   if target_features is None:
                     include_cuda = True
