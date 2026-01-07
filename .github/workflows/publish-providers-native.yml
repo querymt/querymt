@@ -488,9 +488,11 @@ jobs:
           retention-days: 1
 
   create-multi-platform-manifests:
-    needs: publish-native-plugins
+    needs: [detect-changes, publish-native-plugins]
     runs-on: ubuntu-latest
-    if: needs.publish-native-plugins.result == 'success'
+    if: |
+      needs.publish-native-plugins.result == 'success' &&
+      !contains(needs.detect-changes.outputs.matrix, '"crate": "noop"')
 
     steps:
       - name: Download all manifest artifacts
