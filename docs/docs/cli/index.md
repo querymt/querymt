@@ -119,21 +119,63 @@ $ qmt default
 Default provider: openai:gpt-4-turbo
 ```
 
+#### OAuth Authentication
+
+Some providers support OAuth authentication for enhanced security and automatic token management. The `qmt` CLI can handle the OAuth flow for you, including opening your browser and storing credentials securely.
+
+```sh
+# Login to Anthropic via OAuth (using Max mode by default)
+$ qmt auth login anthropic
+=== Anthropic OAuth Authentication ===
+
+Starting OAuth flow for Anthropic...
+
+🔐 Please visit this URL to authorize:
+https://console.anthropic.com/oauth/authorize?...
+
+✓ Browser opened automatically
+
+# Login to Anthropic via OAuth (using Console mode for API key generation)
+$ qmt auth login anthropic --mode console
+
+# Login to OpenAI via OAuth
+$ qmt auth login openai
+
+# Check authentication status for all providers
+$ qmt auth status
+OAuth Authentication Status
+===========================
+
+anthropic: Valid ✓
+  Access token expires: 2026-02-15 14:30:00 UTC
+  Refresh token available
+
+openai: Not authenticated
+  Run 'qmt auth login openai' to authenticate
+
+# Check status for a specific provider (with automatic refresh disabled)
+$ qmt auth status anthropic --no-refresh
+
+# Logout from a provider
+$ qmt auth logout anthropic
+✓ Logged out from anthropic
+```
+
 #### Storing API Keys
 
-Securely store API keys. The `key` should match the `api_key_name` defined by the provider plugin (e.g., `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`).
+Securely store API keys and other secrets. The `key` should match the `api_key_name` defined by the provider plugin (e.g., `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`).
 
 ```sh
 # Store your OpenAI API key
-$ qmt set OPENAI_API_KEY "sk-..."
+$ qmt secrets set OPENAI_API_KEY "sk-..."
 ✓ Secret 'OPENAI_API_KEY' has been set.
 
 # Retrieve a stored key (for verification)
-$ qmt get OPENAI_API_KEY
+$ qmt secrets get OPENAI_API_KEY
 OPENAI_API_KEY: sk-...
 
 # Delete a key
-$ qmt delete OPENAI_API_KEY
+$ qmt secrets delete OPENAI_API_KEY
 ✓ Secret 'OPENAI_API_KEY' has been deleted.
 ```
 
@@ -280,9 +322,14 @@ These options can be used with the main chat command.
 
 | Command                                | Description                                                          |
 | -------------------------------------- | -------------------------------------------------------------------- |
-| `qmt set <KEY> <VALUE>`                | Set a secret key-value pair in the secure store.                     |
-| `qmt get <KEY>`                        | Get a secret value by its key.                                       |
-| `qmt delete <KEY>`                     | Delete a secret by its key.                                          |
+| `qmt auth login <PROVIDER>`            | Login to a provider using OAuth authentication.                      |
+| &nbsp;&nbsp;`--mode <MODE>`            | OAuth mode (provider-specific, e.g., "max" or "console" for Anthropic). Defaults to "max". |
+| `qmt auth logout <PROVIDER>`           | Logout from an OAuth provider (removes stored tokens).               |
+| `qmt auth status [PROVIDER]`           | Check OAuth authentication status for all or a specific provider.    |
+| &nbsp;&nbsp;`--no-refresh`             | Skip automatic token refresh (show raw stored status).               |
+| `qmt secrets set <KEY> <VALUE>`        | Set a secret key-value pair in the secure store.                     |
+| `qmt secrets get <KEY>`                | Get a secret value by its key.                                       |
+| `qmt secrets delete <KEY>`             | Delete a secret by its key.                                          |
 | `qmt providers`                        | List all available provider plugins loaded from the configuration.   |
 | `qmt models`                           | List all available models for each provider.                         |
 | `qmt default [PROVIDER]`               | Get or set the default provider (e.g., `qmt default openai:gpt-4`).    |
@@ -292,3 +339,5 @@ These options can be used with the main chat command.
 | &nbsp;&nbsp;`--encoding-format <FMT>`  | Specify the embedding encoding format (e.g., `float`, `base64`).     |
 | &nbsp;&nbsp;`--provider <NAME>`        | Override the provider for this embedding task.                       |
 | &nbsp;&nbsp;`--model <NAME>`           | Override the model for this embedding task.                          |
+| `qmt update`                           | Update provider plugins.                                             |
+| `qmt completion <SHELL>`               | Generate shell completions for the specified shell.                  |
