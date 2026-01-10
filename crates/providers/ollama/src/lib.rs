@@ -43,23 +43,85 @@ pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Ollama {
+    // ===== Core Configuration =====
     #[schemars(schema_with = "url_schema")]
     #[serde(default = "Ollama::default_base_url")]
     pub base_url: Url,
     pub api_key: Option<String>,
     pub model: String,
-    pub max_tokens: Option<u32>,
-    pub temperature: Option<f32>,
-    pub system: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub stream: Option<bool>,
-    pub top_p: Option<f32>,
-    pub top_k: Option<u32>,
     pub reasoning: Option<bool>,
+    pub system: Option<String>,
     /// JSON schema for structured output
     pub json_schema: Option<StructuredOutputFormat>,
     /// Available tools for function calling
     pub tools: Option<Vec<Tool>>,
+
+    // ===== Sampling & Generation Parameters =====
+    /// Maximum tokens to generate (maps to num_predict in API)
+    pub max_tokens: Option<u32>,
+
+    /// Temperature controls randomness; higher values increase creativity
+    pub temperature: Option<f32>,
+
+    /// Top-K sampling; higher values increase diversity
+    pub top_k: Option<u32>,
+
+    /// Nucleus (Top-P) sampling probability
+    pub top_p: Option<f32>,
+
+    /// Minimum probability threshold for token selection
+    pub min_p: Option<f32>,
+
+    /// Typical probability; aims for quality and variety balance
+    pub typical_p: Option<f32>,
+
+    // ===== Repetition Control =====
+    /// How far back to look for repetition prevention
+    /// -1 = use num_ctx, 0 = disabled
+    pub repeat_last_n: Option<i32>,
+
+    /// Strength of repetition penalty; higher penalizes more
+    pub repeat_penalty: Option<f32>,
+
+    /// Penalty for token presence in output
+    pub presence_penalty: Option<f32>,
+
+    /// Penalty for token frequency in output
+    pub frequency_penalty: Option<f32>,
+
+    /// Whether to penalize newline tokens
+    pub penalize_newline: Option<bool>,
+
+    // ===== Generation Control =====
+    /// Random seed for reproducible generation
+    pub seed: Option<u32>,
+
+    /// Sequences that will cause generation to stop
+    pub stop: Option<Vec<String>>,
+
+    /// Number of tokens to keep in context
+    pub num_keep: Option<u32>,
+
+    // ===== Performance Tuning =====
+    /// Batch size for processing
+    pub num_batch: Option<u32>,
+
+    /// Number of CPU threads to use
+    pub num_thread: Option<u32>,
+
+    /// Number of GPU layers to offload to GPU
+    pub num_gpu: Option<u32>,
+
+    /// Primary GPU device ID
+    pub main_gpu: Option<u32>,
+
+    /// Whether to use memory mapping
+    pub use_mmap: Option<bool>,
+
+    /// Whether to use NUMA (Non-Uniform Memory Access)
+    pub numa: Option<bool>,
 }
 
 /// Request payload for Ollama's chat API endpoint.
@@ -75,10 +137,93 @@ struct OllamaChatRequest<'a> {
     tools: Option<Vec<Tool>>,
 }
 
-#[derive(Serialize)]
+/// Ollama model parameters that can be set per-request
+/// See: https://github.com/ollama/ollama/blob/main/docs/modelfile.mdx#valid-parameters-and-values
+#[derive(Serialize, Clone)]
 struct OllamaOptions {
-    top_p: Option<f32>,
+    /// Sets the size of the context window used to generate the next token. (Default: 2048)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<u32>,
+
+    /// Temperature controls randomness; higher values increase creativity. (Default: 0.8)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+
+    /// Top-K sampling; higher values increase diversity. (Default: 40)
+    #[serde(skip_serializing_if = "Option::is_none")]
     top_k: Option<u32>,
+
+    /// Nucleus (Top-P) sampling probability. (Default: 0.9)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+
+    /// Minimum probability threshold for token selection. (Default: 0.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_p: Option<f32>,
+
+    /// Typical probability; aims for quality and variety balance. (Default: 0.7)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    typical_p: Option<f32>,
+
+    /// How far back to look for repetition prevention. (-1 = num_ctx, 0 = disabled, Default: 64)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_last_n: Option<i32>,
+
+    /// Strength of repetition penalty; higher penalizes more. (Default: 1.1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f32>,
+
+    /// Penalty for token presence in output. (Default: 0.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
+
+    /// Penalty for token frequency in output. (Default: 0.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+
+    /// Whether to penalize newline tokens. (Default: false)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    penalize_newline: Option<bool>,
+
+    /// Maximum number of tokens to predict. (-1 = infinite, Default: -1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<i32>,
+
+    /// Sequences that will cause generation to stop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
+
+    /// Random seed for reproducible generation. (Default: 0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u32>,
+
+    /// Number of tokens to keep in context. (Default: 4)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_keep: Option<u32>,
+
+    /// Batch size for processing. (Default: 512)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_batch: Option<u32>,
+
+    /// Number of CPU threads to use. (Default: number of cores)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_thread: Option<u32>,
+
+    /// Number of GPU layers to offload to GPU. (Default: varies)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_gpu: Option<u32>,
+
+    /// Primary GPU device ID. (Default: 0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    main_gpu: Option<u32>,
+
+    /// Whether to use memory mapping. (Default: true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    use_mmap: Option<bool>,
+
+    /// Whether to use NUMA (Non-Uniform Memory Access). (Default: false)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    numa: Option<bool>,
 }
 
 /// Individual message in an Ollama chat conversation.
@@ -185,6 +330,8 @@ struct OllamaGenerateRequest<'a> {
     suffix: Option<&'a str>,
     raw: bool,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<OllamaOptions>,
 }
 
 #[derive(Serialize)]
@@ -230,6 +377,33 @@ impl Ollama {
     fn default_base_url() -> Url {
         let base_url = get_env_var!("OLLAMA_HOST").unwrap_or("http://localhost:11434".to_string());
         Url::parse(&base_url).unwrap()
+    }
+
+    /// Builds OllamaOptions from Ollama configuration, handling all parameters
+    fn build_options(&self) -> OllamaOptions {
+        OllamaOptions {
+            num_ctx: Some(24 * 4096), // Keep existing default
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            min_p: self.min_p,
+            typical_p: self.typical_p,
+            repeat_last_n: self.repeat_last_n,
+            repeat_penalty: self.repeat_penalty,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            penalize_newline: self.penalize_newline,
+            num_predict: self.max_tokens.map(|t| t as i32),
+            stop: self.stop.clone(),
+            seed: self.seed,
+            num_keep: self.num_keep,
+            num_batch: self.num_batch,
+            num_thread: self.num_thread,
+            num_gpu: self.num_gpu,
+            main_gpu: self.main_gpu,
+            use_mmap: self.use_mmap,
+            numa: self.numa,
+        }
     }
 }
 
@@ -303,10 +477,7 @@ impl HTTPChatProvider for Ollama {
             messages: chat_messages,
             stream: self.stream.unwrap_or(false),
             think: self.reasoning.unwrap_or(false),
-            options: Some(OllamaOptions {
-                top_p: self.top_p,
-                top_k: self.top_k,
-            }),
+            options: Some(self.build_options()),
             format,
             tools: tools.map(|t| t.to_vec()),
         };
@@ -339,14 +510,14 @@ impl HTTPCompletionProvider for Ollama {
             suffix: req.suffix.as_deref(),
             raw: true,
             stream: false,
+            options: Some(self.build_options()),
         };
 
         Ok(Request::builder()
             .method(Method::POST)
             .uri(url.as_str())
             .header(CONTENT_TYPE, "application/json")
-            .body(serde_json::to_vec(&req_body)?) // TODO: complete_request should return Result<Request...>
-            ?)
+            .body(serde_json::to_vec(&req_body)?)?)
     }
 
     fn parse_complete(&self, resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
