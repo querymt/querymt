@@ -1,7 +1,7 @@
 use crate::agent::QueryMTAgent;
 use crate::delegation::{AgentInfo, AgentRegistry, DefaultAgentRegistry, DelegationOrchestrator};
 use crate::event_bus::EventBus;
-use crate::server::AgentServer;
+
 use crate::session::backend::StorageBackend;
 use crate::session::error::SessionError;
 use crate::session::projection::ViewStore;
@@ -93,11 +93,6 @@ impl AgentQuorum {
 
     pub fn view_store(&self) -> Arc<dyn ViewStore> {
         self.view_store.clone()
-    }
-
-    pub async fn run_gui(&self, addr: &str) -> anyhow::Result<()> {
-        let server = AgentServer::new(self.planner.clone(), self.view_store.clone());
-        server.run(addr).await
     }
 }
 

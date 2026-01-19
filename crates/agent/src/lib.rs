@@ -17,10 +17,12 @@ pub mod model;
 pub mod model_info;
 pub mod quorum;
 pub mod send_agent;
+#[cfg(feature = "dashboard")]
 pub mod server;
 pub mod session;
 pub mod tasks;
 pub mod tools;
+#[cfg(feature = "dashboard")]
 pub mod ui;
 pub mod verification;
 

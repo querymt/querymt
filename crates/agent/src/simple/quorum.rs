@@ -14,6 +14,7 @@ use crate::events::AgentEvent;
 use crate::quorum::AgentQuorum;
 use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
+#[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
 use crate::session::projection::ViewStore;
 use crate::tools::CapabilityRequirement;
@@ -188,6 +189,7 @@ impl QuorumBuilder {
 
 pub struct Quorum {
     inner: AgentQuorum,
+    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
     view_store: Arc<dyn ViewStore>,
     planner_session_id: Arc<Mutex<Option<String>>>,
     cwd: Option<PathBuf>,
@@ -227,6 +229,7 @@ impl Quorum {
         self.inner.delegate(id)
     }
 
+    #[cfg(feature = "dashboard")]
     pub fn dashboard(&self) -> AgentServer {
         AgentServer::new(self.planner(), self.view_store.clone())
     }
@@ -442,6 +445,7 @@ impl ChatRunner for Quorum {
             .ensure_listener(self.inner.planner().subscribe_events());
     }
 
+    #[cfg(feature = "dashboard")]
     fn dashboard(&self) -> AgentServer {
         Quorum::dashboard(self)
     }

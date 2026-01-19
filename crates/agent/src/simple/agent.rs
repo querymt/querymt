@@ -13,6 +13,7 @@ use crate::config::SingleAgentConfig;
 use crate::events::AgentEvent;
 use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
+#[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
 use crate::session::backend::StorageBackend;
 use crate::session::projection::ViewStore;
@@ -142,6 +143,7 @@ impl AgentBuilder {
 
 pub struct Agent {
     pub(super) inner: Arc<QueryMTAgent>,
+    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
     pub(super) view_store: Arc<dyn ViewStore>,
     default_session_id: Arc<Mutex<Option<String>>>,
     pub(super) cwd: Option<PathBuf>,
@@ -239,6 +241,7 @@ impl Agent {
         self
     }
 
+    #[cfg(feature = "dashboard")]
     pub fn dashboard(&self) -> AgentServer {
         AgentServer::new(self.inner.clone(), self.view_store.clone())
     }
@@ -406,6 +409,7 @@ impl ChatRunner for Agent {
             .ensure_listener(self.inner.subscribe_events());
     }
 
+    #[cfg(feature = "dashboard")]
     fn dashboard(&self) -> AgentServer {
         Agent::dashboard(self)
     }

@@ -51,7 +51,7 @@ jobs:
         uses: swatinem/rust-cache@v2
       
       - name: Run Clippy
-        run: cargo clippy --package qmt-agent --all-targets -- -D warnings
+        run: cargo clippy --package qmt-agent --all-targets --all-features -- -D warnings
 
   # Job 3: Run tests with coverage
   test:
@@ -73,7 +73,7 @@ jobs:
         run: cargo install cargo-tarpaulin
       
       - name: Run tests with coverage
-        run: cargo tarpaulin --package qmt-agent --all-targets --out xml --output-dir ./coverage
+        run: cargo tarpaulin --package qmt-agent --all-targets --all-features --out xml --output-dir ./coverage
       
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4

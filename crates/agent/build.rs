@@ -1,3 +1,8 @@
+#[cfg(feature = "dashboard")]
+use std::path::Path;
+#[cfg(feature = "dashboard")]
+use std::process::Command;
+
 fn main() {
     // Only build UI when dashboard feature is enabled
     #[cfg(feature = "dashboard")]

@@ -39,7 +39,7 @@ use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
 use crate::acp::shutdown;
 use crate::agent::QueryMTAgent;
 use crate::event_bus::EventBus;
-use crate::send_agent::{ApcAgentAdapter, SendAgent};
+use crate::send_agent::ApcAgentAdapter;
 use agent_client_protocol::{AgentSideConnection, Client, SessionId, SessionNotification};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -166,105 +166,6 @@ fn spawn_event_bridge_forwarder(
     })
 }
 
-/// Run an ACP server over stdio with bidirectional client bridge.
-///
-/// This function sets up the complete bidirectional communication flow:
-/// 1. Creates an mpsc channel for agent→client messages
-/// 2. Creates the agent with a `ClientBridgeSender`
-/// 3. Wraps the agent in `ApcAgentAdapter` (implements SDK's `Agent` trait)
-/// 4. Creates `AgentSideConnection` for stdio protocol handling
-/// 5. Spawns a bridge task that forwards channel messages to the connection
-/// 6. Runs the IO task that handles stdin/stdout
-///
-/// # Type Parameters
-///
-/// * `T` - The agent type implementing `SendAgent`
-/// * `F` - Factory function that creates the agent given a bridge sender
-///
-/// # Arguments
-///
-/// * `agent_factory` - Function that receives `ClientBridgeSender` and returns the agent
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use querymt_agent::acp::{run_sdk_stdio, StubAgent};
-///
-/// #[tokio::main]
-/// async fn main() -> anyhow::Result<()> {
-///     run_sdk_stdio(|bridge| StubAgent::new(bridge)).await
-/// }
-/// ```
-///
-/// # Communication Flow
-///
-/// **Client → Agent** (already handled by SDK):
-/// ```text
-/// stdin → AgentSideConnection → ApcAgentAdapter → SendAgent::method()
-/// ```
-///
-/// **Agent → Client** (handled by bridge):
-/// ```text
-/// SendAgent::method() → bridge.notify() → mpsc → bridge_task → AgentSideConnection → stdout
-/// ```
-///
-/// # LocalSet Constraint
-///
-/// Everything runs within a `LocalSet` because:
-/// - `AgentSideConnection` is `!Send` (uses `?Send` futures internally)
-/// - The bridge task and IO task are spawned with `spawn_local`
-/// - The `SendAgent` implementation can still use `tokio::spawn` internally for parallel work
-pub async fn run_sdk_stdio<T, F>(agent_factory: F) -> anyhow::Result<()>
-where
-    T: SendAgent + 'static,
-    F: FnOnce(ClientBridgeSender) -> T,
-{
-    let local = tokio::task::LocalSet::new();
-
-    local
-        .run_until(async move {
-            log::info!("Starting SDK stdio server with bidirectional bridge");
-
-            // 1. Create the channel for agent→client communication (Send types only)
-            let (tx, rx) = mpsc::channel::<ClientBridgeMessage>(100);
-            let bridge_sender = ClientBridgeSender::new(tx);
-            log::debug!("Created bridge channel");
-
-            // 2. Create the agent with the bridge sender
-            let agent = Arc::new(agent_factory(bridge_sender));
-            let adapter = ApcAgentAdapter::new(agent);
-            log::debug!("Created agent and adapter");
-
-            // 3. Set up stdio streams (convert to futures-io traits)
-            let stdin = tokio::io::stdin().compat();
-            let stdout = tokio::io::stdout().compat_write();
-
-            // 4. Create the SDK connection (!Send, must stay in LocalSet)
-            let (connection, io_task) = AgentSideConnection::new(adapter, stdout, stdin, |fut| {
-                tokio::task::spawn_local(fut);
-            });
-            log::debug!("Created AgentSideConnection");
-
-            // 5. Wrap in Rc for sharing within LocalSet (connection is !Send)
-            let connection = Rc::new(connection);
-
-            // 6. Spawn the bridge task that forwards channel messages to connection
-            tokio::task::spawn_local(run_bridge_task(rx, connection.clone()));
-            log::info!("Bridge task spawned");
-
-            // 7. Run the IO task until stdin closes or error
-            log::info!("Server ready, listening on stdin...");
-            tokio::task::spawn_local(io_task)
-                .await
-                .map_err(|e| anyhow::anyhow!("IO task panicked: {}", e))?
-                .map_err(|e| anyhow::anyhow!("IO error: {}", e))?;
-
-            log::info!("SDK stdio server shutdown complete");
-            Ok(())
-        })
-        .await
-}
-
 /// Run an ACP stdio server with a QueryMTAgent.
 ///
 /// This is a convenience function for running QueryMTAgent over stdio with the ACP protocol.
@@ -273,8 +174,8 @@ where
 /// # Example
 ///
 /// ```rust,no_run
-/// use querymt_agent::Agent;
-/// use querymt_agent::acp::stdio::serve_stdio;
+/// use querymt_agent::simple::Agent;
+/// use querymt_agent::acp::serve_stdio;
 ///
 /// #[tokio::main]
 /// async fn main() -> anyhow::Result<()> {

@@ -7,6 +7,9 @@ description = "Agent and Session management for querymt"
 
 [features]
 default = []
+# Enables the web dashboard UI with React frontend
+# Requires Node.js/npm or bun to be installed for building the UI assets
+# The build script will automatically run npm install and npm run build
 dashboard = []
 
 [dependencies]

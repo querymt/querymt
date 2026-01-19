@@ -1,3 +1,21 @@
+#![cfg(feature = "dashboard")]
+
+//! Coder Agent Example
+//!
+//! Multi-mode agent that can run as ACP stdio server or web dashboard.
+//! Requires the `dashboard` feature to be enabled.
+//!
+//! ## Usage
+//!
+//! ```bash
+//! # ACP stdio mode
+//! cargo run --example coder_agent --features dashboard -- --stdio
+//!
+//! # Web dashboard mode
+//! cargo run --example coder_agent --features dashboard -- --dashboard
+//! cargo run --example coder_agent --features dashboard -- --dashboard=0.0.0.0:8080
+//! ```
+
 use querymt_agent::prelude::*;
 
 #[tokio::main]

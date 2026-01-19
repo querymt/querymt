@@ -4,6 +4,7 @@
 
 use crate::config::{Config, load_config};
 use crate::events::AgentEvent;
+#[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
 use crate::simple::{Agent, Quorum};
 use anyhow::Result;
@@ -42,6 +43,7 @@ pub trait ChatRunner: Send + Sync {
     fn on_error_boxed(&self, callback: Box<dyn Fn(String) + Send + Sync>);
 
     /// Get the web dashboard server
+    #[cfg(feature = "dashboard")]
     fn dashboard(&self) -> AgentServer;
 }
 
@@ -181,6 +183,7 @@ impl AgentRunner {
     }
 
     /// Get the web dashboard server
+    #[cfg(feature = "dashboard")]
     pub fn dashboard(&self) -> AgentServer {
         match self {
             AgentRunner::Single(agent) => agent.dashboard(),

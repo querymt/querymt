@@ -12,8 +12,6 @@ pub(crate) mod stdio;
 pub use transport::AcpTransport;
 pub use websocket::serve_websocket;
 
-// Re-export for backward compatibility with existing examples
-pub use stdio::run_sdk_stdio;
 pub use stdio::serve_stdio;
 
 // Existing manual JSON-RPC implementation (for dashboard compatibility)

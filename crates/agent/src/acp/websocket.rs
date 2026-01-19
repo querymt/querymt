@@ -6,7 +6,7 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use querymt_agent::Agent;
+//! use querymt_agent::simple::Agent;
 //! use querymt_agent::acp::websocket::serve_websocket;
 //!
 //! # async fn example() -> anyhow::Result<()> {
@@ -66,7 +66,7 @@ struct WsServerState {
 /// # Example
 ///
 /// ```rust,no_run
-/// use querymt_agent::Agent;
+/// use querymt_agent::simple::Agent;
 /// use querymt_agent::acp::websocket::serve_websocket;
 ///
 /// # async fn example() -> anyhow::Result<()> {
