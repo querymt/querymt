@@ -96,12 +96,48 @@ impl SessionProvider {
             }
         }
 
-        // Get API key from environment using the provider's specified env var name
+        // Get API key - try OAuth first (if feature enabled), then fall back to env var
         if let Some(http_factory) = factory.as_http()
             && let Some(env_var_name) = http_factory.api_key_name()
-            && let Ok(api_key) = std::env::var(&env_var_name)
         {
-            builder_config["api_key"] = api_key.into();
+            let api_key = {
+                #[cfg(feature = "oauth")]
+                {
+                    use crate::auth::get_or_refresh_token;
+
+                    log::debug!("Resolving API key for provider: {}", config.provider);
+
+                    // Try OAuth tokens first
+                    match get_or_refresh_token(&config.provider).await {
+                        Ok(token) => {
+                            log::debug!("Using OAuth token for provider: {}", config.provider);
+                            Some(token)
+                        }
+                        Err(e) => {
+                            // OAuth failed - fall back to environment variable
+                            log::debug!("OAuth unavailable for {}: {}", config.provider, e);
+                            log::debug!("Falling back to env var: {}", env_var_name);
+                            std::env::var(&env_var_name).ok()
+                        }
+                    }
+                }
+                #[cfg(not(feature = "oauth"))]
+                {
+                    std::env::var(&env_var_name).ok()
+                }
+            };
+
+            if let Some(key) = api_key {
+                builder_config["api_key"] = key.into();
+            } else {
+                // Both OAuth and env var failed
+                log::warn!(
+                    "No API key found for provider '{}'. Set {} or run 'qmt auth login {}'",
+                    config.provider,
+                    env_var_name,
+                    config.provider
+                );
+            }
         }
 
         let provider = factory.from_config(&builder_config)?;

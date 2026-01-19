@@ -4,6 +4,9 @@ pub mod simple;
 pub mod config;
 pub mod runner;
 
+#[cfg(feature = "oauth")]
+pub mod auth;
+
 pub mod acp;
 pub mod agent;
 pub mod delegation;

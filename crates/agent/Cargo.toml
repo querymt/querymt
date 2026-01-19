@@ -11,6 +11,8 @@ default = []
 # Requires Node.js/npm or bun to be installed for building the UI assets
 # The build script will automatically run npm install and npm run build
 dashboard = []
+# Enables OAuth token support for authentication (reads tokens from system keyring)
+oauth = ["anthropic-auth", "openai-auth", "keyring"]
 
 [dependencies]
 querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
@@ -51,6 +53,11 @@ toml = "0.9"
 regex = "1"
 srgn = "0.14.1"
 tokio-util = { version = "0.7", features = ["compat"] }
+
+# OAuth support (optional, feature-gated)
+anthropic-auth = { version = "0.1", default-features = false, features = ["async", "rustls-tls"], optional = true }
+openai-auth = { version = "1.0", features = ["async"], optional = true }
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native", "crypto-rust"], optional = true }
 
 [lib]
 name = "querymt_agent"
