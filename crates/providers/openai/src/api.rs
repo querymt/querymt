@@ -356,44 +356,66 @@ fn determine_auth_type(token: &str, explicit: Option<&AuthType>, base_url: &Url)
     AuthType::ApiKey
 }
 
-fn resolve_auth_token<C: OpenAIProviderConfig>(cfg: &C) -> Result<&str, LLMError> {
-    let token = cfg.api_key();
-    if token.is_empty() {
-        return Err(LLMError::AuthError("Missing OpenAI auth token".to_string()));
-    }
-
-    if !is_openai_host(cfg.base_url()) {
-        if matches!(cfg.auth_type(), Some(AuthType::OAuth)) {
-            println!(
-                "Warning: OpenAI OAuth auth_type is only supported for api.openai.com; \
-                using API key authentication."
-            );
+fn determine_effective_auth(
+    token: &str,
+    explicit: Option<&AuthType>,
+    base_url: &Url,
+) -> Result<AuthType, LLMError> {
+    // Allow explicitly disabling auth for non-OpenAI hosts.
+    if matches!(explicit, Some(AuthType::NoAuth)) {
+        if is_openai_host(base_url) {
+            return Err(LLMError::AuthError(
+                "OpenAI (api.openai.com) requires authentication".to_string(),
+            ));
         }
-        println!(
-            "OpenAI auth debug: host={}, auth_type={:?}, token_hint={}",
-            cfg.base_url().host_str().unwrap_or("<none>"),
-            cfg.auth_type(),
-            token_hint(token)
-        );
-        return Ok(token);
+        return Ok(AuthType::NoAuth);
     }
 
-    let resolved_auth_type = determine_auth_type(token, cfg.auth_type(), cfg.base_url());
-    println!(
-        "OpenAI auth debug: host={}, auth_type={:?}, resolved_auth_type={:?}, token_hint={}",
-        cfg.base_url().host_str().unwrap_or("<none>"),
-        cfg.auth_type(),
-        resolved_auth_type,
-        token_hint(token)
-    );
-    Ok(token)
+    // Official OpenAI host: always require a token.
+    if is_openai_host(base_url) {
+        if token.is_empty() {
+            return Err(LLMError::AuthError("Missing OpenAI auth token".to_string()));
+        }
+        return Ok(determine_auth_type(token, explicit, base_url));
+    }
+
+    // OpenAI-compatible/self-hosted endpoints.
+    if token.is_empty() {
+        return Ok(AuthType::NoAuth);
+    }
+
+    if matches!(explicit, Some(AuthType::OAuth)) {
+        println!(
+            "Warning: OpenAI OAuth auth_type is only supported for api.openai.com; \
+            using API key authentication."
+        );
+    }
+    Ok(AuthType::ApiKey)
+}
+
+fn maybe_add_auth_header(
+    mut builder: http::request::Builder,
+    auth: &AuthType,
+    token: &str,
+) -> Result<http::request::Builder, LLMError> {
+    match auth {
+        AuthType::NoAuth => Ok(builder),
+        _ => {
+            if token.is_empty() {
+                return Err(LLMError::AuthError("Missing OpenAI auth token".to_string()));
+            }
+            builder = builder.header(AUTHORIZATION, format!("Bearer {}", token));
+            Ok(builder)
+        }
+    }
 }
 
 pub fn openai_embed_request<C: OpenAIProviderConfig>(
     cfg: &C,
     inputs: &[String],
 ) -> Result<Request<Vec<u8>>, LLMError> {
-    let api_key = resolve_auth_token(cfg)?;
+    let token = cfg.api_key();
+    let auth = determine_effective_auth(token, cfg.auth_type(), cfg.base_url())?;
 
     let emb_format = cfg.embedding_encoding_format().unwrap_or("float");
 
@@ -409,12 +431,12 @@ pub fn openai_embed_request<C: OpenAIProviderConfig>(
         .join("embeddings")
         .map_err(|e| LLMError::HttpError(e.to_string()))?;
     let json_body = serde_json::to_vec(&body).unwrap();
-    Ok(Request::builder()
+    let builder = Request::builder()
         .method(Method::POST)
         .uri(url.to_string())
-        .header(AUTHORIZATION, format!("Bearer {}", api_key))
-        .header(CONTENT_TYPE, "application/json")
-        .body(json_body)?)
+        .header(CONTENT_TYPE, "application/json");
+    let builder = maybe_add_auth_header(builder, &auth, token)?;
+    Ok(builder.body(json_body)?)
 }
 
 pub fn openai_parse_embed<C: OpenAIProviderConfig>(
@@ -431,7 +453,8 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
     messages: &[ChatMessage],
     tools: Option<&[Tool]>,
 ) -> Result<Request<Vec<u8>>, LLMError> {
-    let api_key = resolve_auth_token(cfg)?;
+    let token = cfg.api_key();
+    let auth = determine_effective_auth(token, cfg.auth_type(), cfg.base_url())?;
 
     // Clone the messages to have an owned mutable vector.
     let messages = messages.to_vec();
@@ -508,12 +531,12 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
         .join("chat/completions")
         .map_err(|e| LLMError::HttpError(e.to_string()))?;
 
-    Ok(Request::builder()
+    let builder = Request::builder()
         .method(Method::POST)
         .uri(url.to_string())
-        .header(AUTHORIZATION, format!("Bearer {}", api_key))
-        .header(CONTENT_TYPE, "application/json")
-        .body(json_body)?)
+        .header(CONTENT_TYPE, "application/json");
+    let builder = maybe_add_auth_header(builder, &auth, token)?;
+    Ok(builder.body(json_body)?)
 }
 
 pub fn openai_parse_chat<C: OpenAIProviderConfig>(
@@ -607,36 +630,32 @@ pub fn openai_list_models_request(
     let api_key = cfg
         .get("api_key")
         .and_then(Value::as_str)
-        .map(String::from)
-        .ok_or(LLMError::InvalidRequest(
-            "Could not find api_key".to_string(),
-        ))?;
+        .unwrap_or("")
+        .to_string();
 
     let auth_type = cfg
         .get("auth_type")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
-    if !is_openai_host(base_url) && matches!(auth_type.as_ref(), Some(AuthType::OAuth)) {
+
+    let effective_auth = determine_effective_auth(&api_key, auth_type.as_ref(), base_url)?;
+    if !api_key.is_empty() {
         println!(
-            "Warning: OpenAI OAuth auth_type is only supported for api.openai.com; \
-            using API key authentication."
+            "OpenAI auth debug (list models): host={}, auth_type={:?}, effective_auth={:?}, token_hint={}",
+            base_url.host_str().unwrap_or("<none>"),
+            auth_type,
+            effective_auth,
+            token_hint(&api_key)
         );
-    } else if is_openai_host(base_url) {
-        let _ = determine_auth_type(&api_key, auth_type.as_ref(), base_url);
     }
-    println!(
-        "OpenAI auth debug (list models): host={}, auth_type={:?}, token_hint={}",
-        base_url.host_str().unwrap_or("<none>"),
-        auth_type,
-        token_hint(&api_key)
-    );
 
     let model_list_url = base_url.join("models")?;
-    Ok(Request::builder()
+    let builder = Request::builder()
         .method(Method::GET)
         .uri(model_list_url.to_string())
-        .header(AUTHORIZATION, format!("Bearer {}", api_key))
-        .header(CONTENT_TYPE, "application/json")
-        .body(Vec::new())?)
+        .header(CONTENT_TYPE, "application/json");
+
+    let builder = maybe_add_auth_header(builder, &effective_auth, &api_key)?;
+    Ok(builder.body(Vec::new())?)
 }
 
 pub fn openai_parse_list_models(response: &Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {

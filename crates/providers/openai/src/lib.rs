@@ -33,6 +33,11 @@ pub enum AuthType {
     /// OAuth token authentication (Bearer token).
     #[serde(rename = "oauth")]
     OAuth,
+    /// No authentication. No Authorization header is sent.
+    ///
+    /// Intended for OpenAI-compatible/self-hosted endpoints.
+    #[serde(rename = "none")]
+    NoAuth,
 }
 
 /// Client for interacting with OpenAI's API.
@@ -41,6 +46,7 @@ pub enum AuthType {
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct OpenAI {
+    #[serde(default)]
     pub api_key: String,
     /// Optional: Explicitly specify authentication type.
     /// This is only honored when the host is api.openai.com; other hosts always use API keys.
