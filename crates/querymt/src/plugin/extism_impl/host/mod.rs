@@ -322,6 +322,8 @@ impl ChatProvider for ExtismProvider {
                 .get()
                 .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
             let mut state_guard = state.lock().unwrap();
+            state_guard.cancel_state = functions::CancelState::NotCancelled;
+            let _ = state_guard.cancel_watch_tx.send(false);
             state_guard.yield_tx = Some(tx);
         } else {
             return Err(LLMError::PluginError(
@@ -345,15 +347,84 @@ impl ChatProvider for ExtismProvider {
             log::debug!("Extism plugin chat_stream thread started");
             let mut plug = plugin.lock().unwrap();
             let res: Result<(), _> = plug.call("chat_stream", Json(arg));
+
             if let Err(e) = res {
-                log::error!("chat_stream plugin call failed: {:?}", e);
+                let cancel_state = user_data_clone
+                    .get()
+                    .ok()
+                    .map(|s| s.lock().unwrap().cancel_state)
+                    .unwrap_or(functions::CancelState::NotCancelled);
+
+                match cancel_state {
+                    functions::CancelState::NotCancelled => {
+                        log::error!("chat_stream plugin call failed: {:#}", e);
+                    }
+                    functions::CancelState::CancelledByConsumerDrop => {
+                        log::info!("chat_stream stopped due to cancellation: {:#}", e);
+                    }
+                    functions::CancelState::YieldReceiverDropped => {
+                        log::warn!(
+                            "chat_stream stopped after receiver dropped (not explicit cancel): {:#}",
+                            e
+                        );
+                    }
+                }
             }
+
             log::debug!("Extism plugin chat_stream thread finished, clearing yield_tx");
             if let Ok(state) = user_data_clone.get() {
                 let mut state_guard = state.lock().unwrap();
                 state_guard.yield_tx = None;
             }
         });
+
+        // If the consumer drops this stream, mark the host state as cancelled.
+        struct StreamCancelGuard {
+            user_data: extism::UserData<functions::HostState>,
+        }
+
+        impl Drop for StreamCancelGuard {
+            fn drop(&mut self) {
+                if let Ok(state) = self.user_data.get() {
+                    let mut state_guard = state.lock().unwrap();
+
+                    // Only treat this as a "cancellation" if the stream was still actively wired.
+                    let was_active = state_guard.yield_tx.is_some();
+                    if was_active {
+                        state_guard.cancel_state = functions::CancelState::CancelledByConsumerDrop;
+                        let _ = state_guard.cancel_watch_tx.send(true);
+                        state_guard.yield_tx = None;
+                        log::info!("Extism stream cancelled: consumer dropped stream");
+                    } else {
+                        log::debug!(
+                            "Extism stream dropped after completion/error (not a user cancel)"
+                        );
+                    }
+                }
+            }
+        }
+
+        struct GuardedStream {
+            inner: std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>,
+            >,
+            _guard: StreamCancelGuard,
+        }
+
+        impl futures::Stream for GuardedStream {
+            type Item = Result<StreamChunk, LLMError>;
+
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                self.inner.as_mut().poll_next(cx)
+            }
+        }
+
+        let guard = StreamCancelGuard {
+            user_data: self.user_data.clone().unwrap(),
+        };
 
         let stream = futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|bytes| {
@@ -366,7 +437,10 @@ impl ChatProvider for ExtismProvider {
             })
         });
 
-        Ok(Box::pin(stream))
+        Ok(Box::pin(GuardedStream {
+            inner: Box::pin(stream),
+            _guard: guard,
+        }))
     }
 }
 

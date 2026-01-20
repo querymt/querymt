@@ -6,8 +6,18 @@ use tracing::instrument;
 #[cfg(feature = "http-client")]
 use futures::StreamExt;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelState {
+    NotCancelled,
+    CancelledByConsumerDrop,
+    YieldReceiverDropped,
+}
+
 pub(crate) struct HostState {
     pub allowed_hosts: Vec<String>,
+    pub cancel_state: CancelState,
+    pub cancel_watch_tx: tokio::sync::watch::Sender<bool>,
+    pub cancel_watch_rx: tokio::sync::watch::Receiver<bool>,
     #[cfg(feature = "http-client")]
     #[allow(clippy::type_complexity)]
     pub http_streams: std::collections::HashMap<
@@ -21,8 +31,12 @@ pub(crate) struct HostState {
 
 impl HostState {
     pub fn new(allowed_hosts: Vec<String>, tokio_handle: tokio::runtime::Handle) -> Self {
+        let (cancel_watch_tx, cancel_watch_rx) = tokio::sync::watch::channel(false);
         Self {
             allowed_hosts,
+            cancel_state: CancelState::NotCancelled,
+            cancel_watch_tx,
+            cancel_watch_rx,
             #[cfg(feature = "http-client")]
             http_streams: std::collections::HashMap::new(),
             next_stream_id: 1,
@@ -257,11 +271,12 @@ pub(crate) fn qmt_http_stream_next(
         })?;
 
         let state = user_data.get()?;
-        let (handle_tokio, stream_exists) = {
+        let (handle_tokio, stream_exists, cancel_rx) = {
             let state_guard = state.lock().unwrap();
             (
                 state_guard.tokio_handle.clone(),
                 state_guard.http_streams.contains_key(&stream_id),
+                state_guard.cancel_watch_rx.clone(),
             )
         };
         if !stream_exists {
@@ -272,12 +287,35 @@ pub(crate) fn qmt_http_stream_next(
         }
 
         let next_chunk = handle_tokio.block_on(async {
+            // Fast path: already cancelled.
+            if *cancel_rx.borrow() {
+                let mut state_guard = state.lock().unwrap();
+                state_guard.http_streams.remove(&stream_id);
+                return None;
+            }
+
             let mut stream = {
                 let mut state_guard = state.lock().unwrap();
                 state_guard.http_streams.remove(&stream_id).unwrap()
             };
 
-            let result = stream.next().await;
+            let mut cancel_rx = cancel_rx;
+
+            let result = tokio::select! {
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        None
+                    } else {
+                        stream.next().await
+                    }
+                }
+                item = stream.next() => item,
+            };
+
+            // If cancelled, drop the stream (don't put it back).
+            if *cancel_rx.borrow() {
+                return None;
+            }
 
             // Put it back
             {
@@ -311,14 +349,14 @@ pub(crate) fn qmt_http_stream_next(
 }
 
 pub(crate) fn qmt_http_stream_close(
-    _plugin: &mut CurrentPlugin,
+    plugin: &mut CurrentPlugin,
     inputs: &[Val],
     _outputs: &mut [Val],
     user_data: UserData<HostState>,
 ) -> Result<(), extism::Error> {
     #[cfg(feature = "http-client")]
     {
-        let stream_id_json: Vec<u8> = _plugin.memory_get_val(&inputs[0])?;
+        let stream_id_json: Vec<u8> = plugin.memory_get_val(&inputs[0])?;
         let stream_id: u64 = serde_json::from_slice(&stream_id_json).map_err(|e| {
             extism::Error::msg(format!("Failed to deserialize stream_id in close: {}", e))
         })?;
@@ -342,15 +380,25 @@ pub(crate) fn qmt_yield_chunk(
     user_data: UserData<HostState>,
 ) -> Result<(), extism::Error> {
     let chunk_json: Vec<u8> = plugin.memory_get_val(&inputs[0])?;
-    log::debug!("Host received qmt_yield_chunk: {} bytes", chunk_json.len());
-
     let state = user_data.get()?;
-    let state_guard = state.lock().unwrap();
+    let mut state_guard = state.lock().unwrap();
+
     if let Some(tx) = &state_guard.yield_tx {
-        tx.send(chunk_json)
-            .map_err(|e| extism::Error::msg(format!("Failed to yield chunk: {}", e)))?;
+        log::debug!("Host received qmt_yield_chunk: {} bytes", chunk_json.len());
+        if let Err(_e) = tx.send(chunk_json) {
+            // Normal/expected: consumer stopped reading (stream dropped/aborted).
+            if state_guard.cancel_state == CancelState::NotCancelled {
+                state_guard.cancel_state = CancelState::YieldReceiverDropped;
+                let _ = state_guard.cancel_watch_tx.send(true);
+            }
+            state_guard.yield_tx = None;
+            log::warn!("Extism stream receiver dropped (yield channel closed); stopping output");
+            return Ok(());
+        }
     } else {
-        log::warn!("qmt_yield_chunk called but yield_tx is None");
+        // Expected after cancellation.
+        log::trace!("qmt_yield_chunk called but yield_tx is None (cancelled)");
     }
+
     Ok(())
 }
