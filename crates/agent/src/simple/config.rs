@@ -1,6 +1,7 @@
 //! Agent configuration types for the simple builder API
 
 use super::utils::infer_required_capabilities;
+use crate::config::MiddlewareEntry;
 use crate::tools::CapabilityRequirement;
 use querymt::LLMParams;
 use serde_json::Value;
@@ -14,6 +15,7 @@ pub(super) struct AgentConfig {
     pub tools: Vec<String>,
     pub description: Option<String>,
     pub required_capabilities: Vec<CapabilityRequirement>,
+    pub middleware: Vec<MiddlewareEntry>,
 }
 
 impl AgentConfig {
@@ -25,6 +27,7 @@ impl AgentConfig {
             tools: Vec::new(),
             description: None,
             required_capabilities: Vec::new(),
+            middleware: Vec::new(),
         }
     }
 }

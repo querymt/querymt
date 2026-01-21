@@ -76,6 +76,8 @@ pub struct SessionRuntime {
     pub permission_cache: StdMutex<HashMap<String, bool>>,
     /// Hash of currently available tools (for change detection)
     pub current_tools_hash: StdMutex<Option<crate::hash::RapidHash>>,
+    /// Function index for duplicate code detection (built asynchronously on session start)
+    pub function_index: Option<Arc<tokio::sync::RwLock<crate::index::FunctionIndex>>>,
 }
 
 /// Policy for tool usage and availability.
@@ -272,6 +274,16 @@ impl QueryMTAgent {
     /// Access the underlying event bus.
     pub fn event_bus(&self) -> Arc<EventBus> {
         self.event_bus.clone()
+    }
+
+    /// Access the session runtime map.
+    ///
+    /// This is primarily used by middleware that needs access to per-session state
+    /// like the function index for duplicate code detection.
+    pub fn session_runtime(
+        &self,
+    ) -> Arc<Mutex<HashMap<String, Arc<SessionRuntime>>>> {
+        self.session_runtime.clone()
     }
 
     /// Access the agent registry.

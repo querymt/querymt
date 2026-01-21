@@ -8,7 +8,8 @@ use super::utils::{
 };
 use crate::agent::builder::AgentBuilderExt;
 use crate::agent::core::{QueryMTAgent, ToolPolicy};
-use crate::config::{QuorumConfig, resolve_tools};
+use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
+use crate::middleware::MIDDLEWARE_REGISTRY;
 use crate::delegation::AgentInfo;
 use crate::events::AgentEvent;
 use crate::quorum::AgentQuorum;
@@ -143,6 +144,7 @@ impl QuorumBuilder {
             };
             let llm_config = build_llm_config(&delegate)?;
             let tools = delegate.tools.clone();
+            let middleware_entries = delegate.middleware.clone();
             let registry = registry.clone();
             builder = builder.add_delegate_agent(agent_info, move |store, event_bus| {
                 let mut agent = QueryMTAgent::new(registry.clone(), store, llm_config.clone())
@@ -151,12 +153,17 @@ impl QuorumBuilder {
                 if !tools.is_empty() {
                     agent = agent.with_allowed_tools(tools.clone());
                 }
+
+                // Apply middleware from config
+                apply_middleware_from_config(&mut agent, &middleware_entries);
+
                 Arc::new(agent)
             });
         }
 
         let planner_llm = build_llm_config(&planner_config)?;
         let planner_tools = planner_config.tools.clone();
+        let planner_middleware = planner_config.middleware.clone();
         let registry_for_planner = registry.clone();
         builder = builder.with_planner(move |store, event_bus, agent_registry| {
             let mut agent =
@@ -168,6 +175,10 @@ impl QuorumBuilder {
                     .with_tool_policy(ToolPolicy::BuiltInOnly)
                     .with_allowed_tools(planner_tools.clone());
             }
+
+            // Apply middleware from config
+            apply_middleware_from_config(&mut agent, &planner_middleware);
+
             Arc::new(agent)
         });
 
@@ -353,6 +364,9 @@ impl Quorum {
             );
         }
 
+        // Copy middleware config for planner
+        planner_config.middleware = config.planner.middleware;
+
         builder.planner_config = Some(planner_config);
 
         // Configure delegates with tool resolution
@@ -392,6 +406,10 @@ impl Quorum {
                 infer_required_capabilities(&delegate_config.tools)
                     .into_iter()
                     .collect();
+
+            // Copy middleware config for this delegate
+            delegate_config.middleware = delegate.middleware;
+
             builder.delegates.push(delegate_config);
         }
 
@@ -519,6 +537,32 @@ impl ChatSession for QuorumSession {
         self.callbacks.on_error(callback);
         self.callbacks
             .ensure_listener(self.planner.subscribe_events());
+    }
+}
+
+/// Helper to apply middleware from config entries to an agent
+fn apply_middleware_from_config(agent: &mut QueryMTAgent, entries: &[MiddlewareEntry]) {
+    for entry in entries {
+        match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, agent) {
+            Ok(middleware) => {
+                agent
+                    .middleware_drivers
+                    .lock()
+                    .unwrap()
+                    .push(middleware);
+            }
+            Err(e) => {
+                // Skip if middleware is disabled, otherwise log warning
+                let msg = e.to_string();
+                if !msg.contains("disabled") {
+                    log::warn!(
+                        "Failed to create middleware '{}': {}",
+                        entry.middleware_type,
+                        e
+                    );
+                }
+            }
+        }
     }
 }
 

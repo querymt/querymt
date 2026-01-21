@@ -376,19 +376,24 @@ mod tests {
         assert!(result.snapshot_part.is_none());
 
         let test_hash = crate::hash::RapidHash::new(b"test");
+        let changed_paths = crate::index::merkle::DiffPaths {
+            added: vec![],
+            modified: vec![std::path::PathBuf::from("test.txt")],
+            removed: vec![],
+        };
         let result_with_snapshot = result.with_snapshot(MessagePart::Snapshot {
             root_hash: test_hash,
-            diff_summary: Some("1 file changed".to_string()),
+            changed_paths,
         });
 
         assert!(result_with_snapshot.snapshot_part.is_some());
         if let Some(MessagePart::Snapshot {
             root_hash,
-            diff_summary,
+            changed_paths,
         }) = result_with_snapshot.snapshot_part
         {
             assert_eq!(root_hash, test_hash);
-            assert_eq!(diff_summary, Some("1 file changed".to_string()));
+            assert_eq!(changed_paths.summary(), "1 modified");
         }
     }
 }

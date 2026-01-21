@@ -183,16 +183,16 @@ impl QueryMTAgent {
         let snapshot_part = match snapshot {
             SnapshotState::Diff { pre_tree, root } => {
                 let post_tree = crate::index::merkle::MerkleTree::scan(root.as_path());
-                let diff = post_tree.diff_summary(&pre_tree);
+                let changed_paths = post_tree.diff_paths(&pre_tree);
                 self.emit_event(
                     session_id,
                     AgentEventKind::SnapshotEnd {
-                        summary: Some(diff.clone()),
+                        summary: Some(changed_paths.summary()),
                     },
                 );
                 Some(MessagePart::Snapshot {
                     root_hash: post_tree.root_hash,
-                    diff_summary: Some(diff),
+                    changed_paths,
                 })
             }
             SnapshotState::Metadata { root } => {

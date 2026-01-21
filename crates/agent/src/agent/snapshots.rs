@@ -1,7 +1,7 @@
 //! Snapshot management utilities
 
 use crate::agent::core::{QueryMTAgent, SnapshotPolicy};
-use crate::index::merkle::MerkleTree;
+use crate::index::merkle::{DiffPaths, MerkleTree};
 use crate::model::MessagePart;
 use std::path::Path;
 
@@ -69,9 +69,10 @@ pub fn snapshot_metadata(root: &Path) -> (MessagePart, Option<String>) {
     let root_hash = crate::hash::RapidHash::new(meta_string.as_bytes());
 
     let summary = format!("Files: {files}, Bytes: {bytes}, Latest mtime: {latest_mtime}");
+    // Metadata snapshot doesn't track actual file changes, just aggregate info
     let part = MessagePart::Snapshot {
         root_hash,
-        diff_summary: Some(summary.clone()),
+        changed_paths: DiffPaths::default(),
     };
     (part, Some(summary))
 }
@@ -93,17 +94,16 @@ mod tests {
         assert!(matches!(part, MessagePart::Snapshot { .. }));
         if let MessagePart::Snapshot {
             root_hash,
-            diff_summary,
+            changed_paths: _,
         } = part
         {
             // Hash is always non-zero for non-empty input
             assert_ne!(root_hash.as_u64(), 0);
-            assert!(diff_summary.is_some());
-            let summary = diff_summary.unwrap();
-            assert!(summary.contains("Files: 1"));
-            assert!(summary.contains("Bytes: 11"));
         }
         assert!(summary.is_some());
+        let summary = summary.unwrap();
+        assert!(summary.contains("Files: 1"));
+        assert!(summary.contains("Bytes: 11"));
     }
 
     #[test]

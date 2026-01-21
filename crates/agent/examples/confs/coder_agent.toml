@@ -15,6 +15,11 @@ model = "kimi-k2-thinking-turbo"
 tools = ["delegate", "create_task", "search_text", "glob", "ls", "read_file", "shell"]
 system_file = "../prompts/planner.md"
 
+# Middleware for planner (optional - detects duplicate code patterns)
+# [[planner.middleware]]
+# type = "dedup_check"
+# threshold = 0.8
+
 [[delegates]]
 id = "coder"
 provider = "ollama"
@@ -26,3 +31,9 @@ system_file = "../prompts/coder.md"
 
 [delegates.parameters]
 num_ctx = 65536
+
+# Middleware for coder delegate - detect when code is similar to existing code
+[[delegates.middleware]]
+type = "dedup_check"
+threshold = 0.85
+min_lines = 5

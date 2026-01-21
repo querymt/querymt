@@ -235,7 +235,7 @@ fn test_tool_result_with_snapshot() {
 
     let updated = result.with_snapshot(crate::model::MessagePart::Snapshot {
         root_hash: crate::hash::RapidHash::new(b"hash"),
-        diff_summary: Some("summary".to_string()),
+        changed_paths: crate::index::merkle::DiffPaths::default(),
     });
 
     assert!(updated.snapshot_part.is_some());

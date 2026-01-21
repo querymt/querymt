@@ -9,7 +9,8 @@ use crate::acp::stdio::serve_stdio;
 use crate::acp::websocket::serve_websocket;
 use crate::agent::builder::AgentBuilderExt;
 use crate::agent::core::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
-use crate::config::SingleAgentConfig;
+use crate::config::{MiddlewareEntry, SingleAgentConfig};
+use crate::middleware::{MiddlewareDriver, MIDDLEWARE_REGISTRY};
 use crate::events::AgentEvent;
 use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
@@ -26,12 +27,17 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// Type alias for middleware factory closures
+type MiddlewareFactory = Box<dyn FnOnce(&QueryMTAgent) -> Arc<dyn MiddlewareDriver> + Send>;
+
 pub struct AgentBuilder {
     pub(super) llm_config: Option<LLMParams>,
     pub(super) tools: Vec<String>,
     pub(super) cwd: Option<PathBuf>,
     pub(super) snapshot_policy: SnapshotPolicy,
     pub(super) db_path: Option<PathBuf>,
+    middleware_factories: Vec<MiddlewareFactory>,
+    middleware_entries: Vec<MiddlewareEntry>,
 }
 
 impl Default for AgentBuilder {
@@ -48,6 +54,8 @@ impl AgentBuilder {
             cwd: None,
             snapshot_policy: SnapshotPolicy::Diff,
             db_path: None,
+            middleware_factories: Vec::new(),
+            middleware_entries: Vec::new(),
         }
     }
 
@@ -101,6 +109,51 @@ impl AgentBuilder {
         self
     }
 
+    /// Add a middleware to the agent using a factory closure.
+    ///
+    /// The closure receives a reference to the constructed `QueryMTAgent`,
+    /// allowing access to internal state like `session_runtime()` and `event_bus()`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use querymt_agent::simple::Agent;
+    /// use querymt_agent::middleware::DedupCheckMiddleware;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let agent = Agent::single()
+    ///     .provider("openai", "gpt-4")
+    ///     .cwd(".")
+    ///     .middleware(|agent| {
+    ///         DedupCheckMiddleware::new(agent.session_runtime())
+    ///             .threshold(0.8)
+    ///             .min_lines(5)
+    ///             .with_event_bus(agent.event_bus())
+    ///     })
+    ///     .build()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn middleware<F, M>(mut self, factory: F) -> Self
+    where
+        F: FnOnce(&QueryMTAgent) -> M + Send + 'static,
+        M: MiddlewareDriver + 'static,
+    {
+        self.middleware_factories
+            .push(Box::new(move |agent| Arc::new(factory(agent))));
+        self
+    }
+
+    /// Add middleware from config entries (used by `from_single_config`).
+    ///
+    /// This is typically called internally when loading from TOML config files.
+    pub fn middleware_from_config(mut self, entries: Vec<MiddlewareEntry>) -> Self {
+        self.middleware_entries = entries;
+        self
+    }
+
     pub async fn build(self) -> Result<Agent> {
         let snapshot_policy = self.snapshot_policy;
         let cwd = if let Some(path) = self.cwd {
@@ -125,6 +178,40 @@ impl AgentBuilder {
             agent = agent
                 .with_tool_policy(ToolPolicy::BuiltInOnly)
                 .with_allowed_tools(self.tools.clone());
+        }
+
+        // Apply middleware factories - each factory receives the agent and returns a middleware
+        for factory in self.middleware_factories {
+            let middleware = factory(&agent);
+            agent
+                .middleware_drivers
+                .lock()
+                .unwrap()
+                .push(middleware);
+        }
+
+        // Apply config-based middleware entries
+        for entry in &self.middleware_entries {
+            match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &agent) {
+                Ok(middleware) => {
+                    agent
+                        .middleware_drivers
+                        .lock()
+                        .unwrap()
+                        .push(middleware);
+                }
+                Err(e) => {
+                    // Skip if middleware is disabled, otherwise fail
+                    let msg = e.to_string();
+                    if !msg.contains("disabled") {
+                        return Err(anyhow!(
+                            "Failed to create middleware '{}': {}",
+                            entry.middleware_type,
+                            e
+                        ));
+                    }
+                }
+            }
         }
 
         let view_store = backend
@@ -358,6 +445,11 @@ impl Agent {
         }
         if let Some(db) = config.agent.db {
             builder.db_path = Some(db);
+        }
+
+        // Apply middleware from config
+        if !config.middleware.is_empty() {
+            builder = builder.middleware_from_config(config.middleware);
         }
 
         builder.build().await

@@ -26,6 +26,31 @@ pub struct SingleAgentConfig {
     pub agent: AgentSettings,
     #[serde(default)]
     pub mcp: Vec<McpServerConfig>,
+    #[serde(default)]
+    pub middleware: Vec<MiddlewareEntry>,
+}
+
+/// Raw middleware entry from TOML config
+///
+/// The `type` field determines which middleware factory to use.
+/// All other fields are passed to the factory as a JSON value.
+///
+/// # Example
+///
+/// ```toml
+/// [[middleware]]
+/// type = "dedup_check"
+/// threshold = 0.8
+/// min_lines = 5
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct MiddlewareEntry {
+    /// The middleware type name (e.g., "dedup_check")
+    #[serde(rename = "type")]
+    pub middleware_type: String,
+    /// All other config fields, passed to the middleware factory
+    #[serde(flatten)]
+    pub config: serde_json::Value,
 }
 
 /// Agent settings for single agent mode
@@ -86,6 +111,8 @@ pub struct PlannerConfig {
     pub system_file: Option<PathBuf>,
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
+    #[serde(default)]
+    pub middleware: Vec<MiddlewareEntry>,
 }
 
 /// Delegate agent configuration
@@ -107,6 +134,8 @@ pub struct DelegateConfig {
     pub parameters: Option<HashMap<String, Value>>,
     #[serde(default)]
     pub mcp: Vec<McpServerConfig>,
+    #[serde(default)]
+    pub middleware: Vec<MiddlewareEntry>,
 }
 
 /// MCP server configuration

@@ -160,6 +160,11 @@ pub enum AgentEventKind {
         tools: Vec<querymt::chat::Tool>,
         tools_hash: RapidHash,
     },
+    /// Emitted when duplicate/similar code is detected in newly written code
+    DuplicateCodeDetected {
+        /// List of duplicate code warnings
+        warnings: Vec<crate::middleware::dedup_check::DuplicateWarning>,
+    },
 }
 
 #[async_trait]

@@ -1,6 +1,7 @@
+use crate::index::merkle::DiffPaths;
 use querymt::{
-    FunctionCall, ToolCall,
     chat::{ChatMessage, ChatRole, MessageType},
+    FunctionCall, ToolCall,
 };
 use serde::{Deserialize, Serialize};
 
@@ -38,7 +39,7 @@ pub enum MessagePart {
     },
     Snapshot {
         root_hash: crate::hash::RapidHash,
-        diff_summary: Option<String>,
+        changed_paths: DiffPaths,
     },
     Compaction {
         summary: String,
@@ -58,6 +59,22 @@ impl MessagePart {
             MessagePart::Patch { .. } => "patch",
             MessagePart::Snapshot { .. } => "snapshot",
             MessagePart::Compaction { .. } => "compaction",
+        }
+    }
+
+    /// Get the diff summary for a Snapshot part, or None for other part types
+    pub fn diff_summary(&self) -> Option<String> {
+        match self {
+            MessagePart::Snapshot { changed_paths, .. } => Some(changed_paths.summary()),
+            _ => None,
+        }
+    }
+
+    /// Get the changed paths for a Snapshot part, or None for other part types
+    pub fn changed_paths(&self) -> Option<&DiffPaths> {
+        match self {
+            MessagePart::Snapshot { changed_paths, .. } => Some(changed_paths),
+            _ => None,
         }
     }
 }
@@ -113,11 +130,11 @@ impl AgentMessage {
                     });
                     content.push_str(res);
                 }
-                MessagePart::Snapshot {
-                    diff_summary: Some(summary),
-                    ..
-                } => {
-                    content.push_str(&format!("\n[System: File changes: {}]\n", summary));
+                MessagePart::Snapshot { changed_paths, .. } => {
+                    let summary = changed_paths.summary();
+                    if !changed_paths.is_empty() {
+                        content.push_str(&format!("\n[System: File changes: {}]\n", summary));
+                    }
                 }
                 MessagePart::Compaction { summary, .. } => {
                     content.push_str(&format!("\n[Conversation summary]\n{}\n", summary));

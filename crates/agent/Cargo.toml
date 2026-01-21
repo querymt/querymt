@@ -59,6 +59,10 @@ anthropic-auth = { version = "0.1", default-features = false, features = ["async
 openai-auth = { version = "1.0", features = ["async"], optional = true }
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native", "crypto-rust"], optional = true }
 
+# Code similarity detection (local fork with tree-sitter 0.25)
+similarity-core = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
+similarity-rs = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
+
 [lib]
 name = "querymt_agent"
 path = "src/lib.rs"

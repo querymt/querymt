@@ -1,7 +1,56 @@
 use crate::hash::RapidHash;
 use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Represents the file paths that changed between two snapshots
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DiffPaths {
+    /// Files that were added (exist in new but not in old)
+    pub added: Vec<PathBuf>,
+    /// Files that were modified (exist in both but content changed)
+    pub modified: Vec<PathBuf>,
+    /// Files that were removed (exist in old but not in new)
+    pub removed: Vec<PathBuf>,
+}
+
+impl DiffPaths {
+    /// Create a new empty DiffPaths
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if there are no changes
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.modified.is_empty() && self.removed.is_empty()
+    }
+
+    /// Generate a human-readable summary of the changes
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.added.is_empty() {
+            parts.push(format!("+{} files", self.added.len()));
+        }
+        if !self.removed.is_empty() {
+            parts.push(format!("-{} files", self.removed.len()));
+        }
+        if !self.modified.is_empty() {
+            parts.push(format!("{} modified", self.modified.len()));
+        }
+
+        if parts.is_empty() {
+            "No changes".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    /// Get all files that were added or modified (useful for analysis)
+    pub fn changed_files(&self) -> impl Iterator<Item = &PathBuf> {
+        self.added.iter().chain(self.modified.iter())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct MerkleTree {
@@ -49,43 +98,45 @@ impl MerkleTree {
         }
     }
 
+    /// Compare this tree with an older tree and return a summary string
+    ///
+    /// Deprecated: Use `diff_paths()` instead for structured access to changed files
     pub fn diff_summary(&self, older: &MerkleTree) -> String {
-        let mut added = 0;
-        let mut removed = 0;
-        let mut modified = 0;
+        self.diff_paths(older).summary()
+    }
+
+    /// Compare this tree with an older tree and return the actual changed paths
+    pub fn diff_paths(&self, older: &MerkleTree) -> DiffPaths {
+        let mut added = Vec::new();
+        let mut modified = Vec::new();
+        let mut removed = Vec::new();
 
         for (path, hash) in &self.entries {
             match older.entries.get(path) {
                 Some(old_hash) => {
                     if hash != old_hash {
-                        modified += 1;
+                        modified.push(path.clone());
                     }
                 }
-                None => added += 1,
+                None => added.push(path.clone()),
             }
         }
 
         for path in older.entries.keys() {
             if !self.entries.contains_key(path) {
-                removed += 1;
+                removed.push(path.clone());
             }
         }
 
-        let mut parts = Vec::new();
-        if added > 0 {
-            parts.push(format!("+{} files", added));
-        }
-        if removed > 0 {
-            parts.push(format!("-{} files", removed));
-        }
-        if modified > 0 {
-            parts.push(format!("{} modified", modified));
-        }
+        // Sort for deterministic output
+        added.sort();
+        modified.sort();
+        removed.sort();
 
-        if parts.is_empty() {
-            "No changes".to_string()
-        } else {
-            parts.join(", ")
+        DiffPaths {
+            added,
+            modified,
+            removed,
         }
     }
 }

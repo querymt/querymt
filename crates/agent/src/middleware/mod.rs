@@ -1,10 +1,12 @@
 // New state machine architecture
 pub mod driver;
 pub mod error;
+pub mod factory;
 pub mod state;
 
 // Keep existing exports during transition
 mod context;
+pub mod dedup_check;
 mod delegation;
 pub mod delegation_guard;
 mod limits;
@@ -37,6 +39,10 @@ pub use presets::MiddlewarePresets;
 pub use specialized::{
     DuplicateToolCallMiddleware, PlanModeMiddleware, TaskAutoCompletionMiddleware,
 };
+pub use dedup_check::{
+    DedupCheckFactory, DedupCheckMiddleware, DuplicateWarning, FunctionLocation, SimilarMatch,
+};
+pub use factory::{MiddlewareFactory, MiddlewareRegistry, MIDDLEWARE_REGISTRY};
 
 #[cfg(test)]
 mod driver_tests;
