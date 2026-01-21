@@ -640,10 +640,7 @@ mod tests {
 
     #[test]
     fn test_parse_snapshot_policy() {
-        assert_eq!(
-            parse_snapshot_policy(None).unwrap(),
-            SnapshotPolicy::None
-        );
+        assert_eq!(parse_snapshot_policy(None).unwrap(), SnapshotPolicy::None);
         assert_eq!(
             parse_snapshot_policy(Some("none".to_string())).unwrap(),
             SnapshotPolicy::None
