@@ -162,10 +162,10 @@ impl QuorumBuilder {
                     .with_snapshot_policy(snapshot_policy_for_delegate);
 
                 // Set snapshot root if snapshot policy is enabled and cwd is available
-                if snapshot_policy_for_delegate != SnapshotPolicy::None {
-                    if let Some(ref root) = cwd_for_delegate {
-                        agent = agent.with_snapshot_root(root.clone());
-                    }
+                if snapshot_policy_for_delegate != SnapshotPolicy::None
+                    && let Some(ref root) = cwd_for_delegate
+                {
+                    agent = agent.with_snapshot_root(root.clone());
                 }
 
                 if !tools.is_empty() {
@@ -193,10 +193,10 @@ impl QuorumBuilder {
                     .with_snapshot_policy(snapshot_policy_for_planner);
 
             // Set snapshot root if snapshot policy is enabled and cwd is available
-            if snapshot_policy_for_planner != SnapshotPolicy::None {
-                if let Some(ref root) = cwd_for_planner {
-                    agent = agent.with_snapshot_root(root.clone());
-                }
+            if snapshot_policy_for_planner != SnapshotPolicy::None
+                && let Some(ref root) = cwd_for_planner
+            {
+                agent = agent.with_snapshot_root(root.clone());
             }
 
             if !planner_tools.is_empty() {
