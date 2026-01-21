@@ -169,7 +169,8 @@ impl DedupCheckMiddleware {
 
         for result in results {
             if let Some(ref snapshot) = result.snapshot_part
-                && let Some(paths) = snapshot.changed_paths() {
+                && let Some(paths) = snapshot.changed_paths()
+            {
                 combined.added.extend(paths.added.iter().cloned());
                 combined.modified.extend(paths.modified.iter().cloned());
                 combined.removed.extend(paths.removed.iter().cloned());
@@ -481,7 +482,10 @@ impl MiddlewareFactory for DedupCheckFactory {
         agent: &QueryMTAgent,
     ) -> AnyhowResult<Arc<dyn MiddlewareDriver>> {
         // Check if explicitly disabled
-        let enabled = config.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let enabled = config
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         if !enabled {
             return Err(anyhow::anyhow!("Middleware disabled"));

@@ -1,7 +1,7 @@
 use crate::index::merkle::DiffPaths;
 use querymt::{
-    chat::{ChatMessage, ChatRole, MessageType},
     FunctionCall, ToolCall,
+    chat::{ChatMessage, ChatRole, MessageType},
 };
 use serde::{Deserialize, Serialize};
 

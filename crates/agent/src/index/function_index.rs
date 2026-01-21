@@ -5,9 +5,8 @@
 
 use ignore::WalkBuilder;
 use similarity_core::{
-    AstFingerprint, TSEDOptions, calculate_tsed,
-    extract_functions, generic_tree_sitter_parser::GenericTreeSitterParser,
-    language_parser::LanguageParser,
+    AstFingerprint, TSEDOptions, calculate_tsed, extract_functions,
+    generic_tree_sitter_parser::GenericTreeSitterParser, language_parser::LanguageParser,
     parser::parse_and_convert_to_tree,
 };
 use similarity_rs::rust_parser::RustParser;
@@ -135,10 +134,7 @@ impl FunctionIndex {
                 Err(_) => continue,
             };
 
-            let ext = file_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
             match get_language_category(ext) {
                 Some("typescript") => ts_files.push((file_path, content)),
@@ -156,18 +152,20 @@ impl FunctionIndex {
         // Index TypeScript/JavaScript files
         for (path, source) in &ts_files {
             if let Ok(entries) = index_typescript_file(path, source, &config)
-                && !entries.is_empty() {
+                && !entries.is_empty()
+            {
                 functions.insert(path.clone(), entries);
             }
         }
 
         // Index Rust files
         if !rust_files.is_empty()
-            && let Ok(mut parser) = RustParser::new() {
+            && let Ok(mut parser) = RustParser::new()
+        {
             for (path, source) in &rust_files {
-                if let Ok(entries) =
-                    index_with_parser(&mut parser, path, source, "rust", &config)
-                    && !entries.is_empty() {
+                if let Ok(entries) = index_with_parser(&mut parser, path, source, "rust", &config)
+                    && !entries.is_empty()
+                {
                     functions.insert(path.clone(), entries);
                 }
             }
@@ -175,10 +173,12 @@ impl FunctionIndex {
 
         // Index Go files
         if !go_files.is_empty()
-            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("go") {
+            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("go")
+        {
             for (path, source) in &go_files {
                 if let Ok(entries) = index_with_parser(&mut parser, path, source, "go", &config)
-                    && !entries.is_empty() {
+                    && !entries.is_empty()
+                {
                     functions.insert(path.clone(), entries);
                 }
             }
@@ -186,11 +186,12 @@ impl FunctionIndex {
 
         // Index Java files
         if !java_files.is_empty()
-            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("java") {
+            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("java")
+        {
             for (path, source) in &java_files {
-                if let Ok(entries) =
-                    index_with_parser(&mut parser, path, source, "java", &config)
-                    && !entries.is_empty() {
+                if let Ok(entries) = index_with_parser(&mut parser, path, source, "java", &config)
+                    && !entries.is_empty()
+                {
                     functions.insert(path.clone(), entries);
                 }
             }
@@ -198,10 +199,12 @@ impl FunctionIndex {
 
         // Index C files
         if !c_files.is_empty()
-            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("c") {
+            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("c")
+        {
             for (path, source) in &c_files {
                 if let Ok(entries) = index_with_parser(&mut parser, path, source, "c", &config)
-                    && !entries.is_empty() {
+                    && !entries.is_empty()
+                {
                     functions.insert(path.clone(), entries);
                 }
             }
@@ -209,11 +212,12 @@ impl FunctionIndex {
 
         // Index C++ files
         if !cpp_files.is_empty()
-            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("cpp") {
+            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("cpp")
+        {
             for (path, source) in &cpp_files {
-                if let Ok(entries) =
-                    index_with_parser(&mut parser, path, source, "cpp", &config)
-                    && !entries.is_empty() {
+                if let Ok(entries) = index_with_parser(&mut parser, path, source, "cpp", &config)
+                    && !entries.is_empty()
+                {
                     functions.insert(path.clone(), entries);
                 }
             }
@@ -221,11 +225,12 @@ impl FunctionIndex {
 
         // Index C# files
         if !csharp_files.is_empty()
-            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("csharp") {
+            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("csharp")
+        {
             for (path, source) in &csharp_files {
-                if let Ok(entries) =
-                    index_with_parser(&mut parser, path, source, "csharp", &config)
-                    && !entries.is_empty() {
+                if let Ok(entries) = index_with_parser(&mut parser, path, source, "csharp", &config)
+                    && !entries.is_empty()
+                {
                     functions.insert(path.clone(), entries);
                 }
             }
@@ -233,11 +238,12 @@ impl FunctionIndex {
 
         // Index Ruby files
         if !ruby_files.is_empty()
-            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("ruby") {
+            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("ruby")
+        {
             for (path, source) in &ruby_files {
-                if let Ok(entries) =
-                    index_with_parser(&mut parser, path, source, "ruby", &config)
-                    && !entries.is_empty() {
+                if let Ok(entries) = index_with_parser(&mut parser, path, source, "ruby", &config)
+                    && !entries.is_empty()
+                {
                     functions.insert(path.clone(), entries);
                 }
             }
@@ -316,10 +322,7 @@ impl FunctionIndex {
         file_path: &Path,
         source: &str,
     ) -> Vec<(IndexedFunctionEntry, Vec<SimilarFunctionMatch>)> {
-        let ext = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         let language = match get_language_category(ext) {
             Some(lang) => lang,
@@ -328,7 +331,9 @@ impl FunctionIndex {
 
         // Extract functions from the new code
         let new_entries = match language {
-            "typescript" => index_typescript_file(file_path, source, &self.config).unwrap_or_default(),
+            "typescript" => {
+                index_typescript_file(file_path, source, &self.config).unwrap_or_default()
+            }
             "rust" => {
                 if let Ok(mut parser) = RustParser::new() {
                     index_with_parser(&mut parser, file_path, source, language, &self.config)
@@ -361,10 +366,7 @@ impl FunctionIndex {
 
     /// Update the index for a specific file
     pub fn update_file(&mut self, file_path: &Path, source: &str) {
-        let ext = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         let language = match get_language_category(ext) {
             Some(lang) => lang,
@@ -376,7 +378,9 @@ impl FunctionIndex {
         };
 
         let entries = match language {
-            "typescript" => index_typescript_file(file_path, source, &self.config).unwrap_or_default(),
+            "typescript" => {
+                index_typescript_file(file_path, source, &self.config).unwrap_or_default()
+            }
             "rust" => {
                 if let Ok(mut parser) = RustParser::new() {
                     index_with_parser(&mut parser, file_path, source, language, &self.config)
@@ -418,7 +422,11 @@ impl FunctionIndex {
     }
 
     /// Calculate similarity between two function entries
-    fn calculate_similarity(&self, func1: &IndexedFunctionEntry, func2: &IndexedFunctionEntry) -> f64 {
+    fn calculate_similarity(
+        &self,
+        func1: &IndexedFunctionEntry,
+        func2: &IndexedFunctionEntry,
+    ) -> f64 {
         // For TypeScript/JavaScript, use the oxc-based parser
         // For other languages, we'd need a different approach
         let filename1 = func1.file_path.to_string_lossy().to_string();
@@ -566,7 +574,7 @@ fn extract_body_text_lines(source: &str, start_line: u32, end_line: u32) -> Stri
 /// Collect all supported source files from a directory
 fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     let supported_extensions = [
-        "ts", "tsx", "js", "jsx", "mjs", "cjs", // TypeScript/JavaScript
+        "ts", "tsx", "js", "jsx", "mjs", "cjs",  // TypeScript/JavaScript
         "rs",   // Rust
         "go",   // Go
         "java", // Java
@@ -586,7 +594,8 @@ fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> {
         let path = entry.path();
         if path.is_file()
             && let Some(ext) = path.extension().and_then(|e| e.to_str())
-            && supported_extensions.contains(&ext) {
+            && supported_extensions.contains(&ext)
+        {
             files.push(path.to_path_buf());
         }
     }

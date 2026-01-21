@@ -30,8 +30,12 @@ pub use crate::model_info::{CapabilityError, ModelInfoSource};
 pub use context::{
     AutoCompactMiddleware, ContextConfig, ContextMiddleware, ContextWarningMiddleware,
 };
+pub use dedup_check::{
+    DedupCheckFactory, DedupCheckMiddleware, DuplicateWarning, FunctionLocation, SimilarMatch,
+};
 pub use delegation::{DelegationConfig, DelegationContextMiddleware, DelegationMiddleware};
 pub use delegation_guard::DelegationGuardMiddleware;
+pub use factory::{MIDDLEWARE_REGISTRY, MiddlewareFactory, MiddlewareRegistry};
 pub use limits::{
     LimitsConfig, LimitsMiddleware, MaxStepsMiddleware, PriceLimitMiddleware, TurnLimitMiddleware,
 };
@@ -39,10 +43,6 @@ pub use presets::MiddlewarePresets;
 pub use specialized::{
     DuplicateToolCallMiddleware, PlanModeMiddleware, TaskAutoCompletionMiddleware,
 };
-pub use dedup_check::{
-    DedupCheckFactory, DedupCheckMiddleware, DuplicateWarning, FunctionLocation, SimilarMatch,
-};
-pub use factory::{MiddlewareFactory, MiddlewareRegistry, MIDDLEWARE_REGISTRY};
 
 #[cfg(test)]
 mod driver_tests;

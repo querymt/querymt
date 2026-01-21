@@ -280,9 +280,7 @@ impl QueryMTAgent {
     ///
     /// This is primarily used by middleware that needs access to per-session state
     /// like the function index for duplicate code detection.
-    pub fn session_runtime(
-        &self,
-    ) -> Arc<Mutex<HashMap<String, Arc<SessionRuntime>>>> {
+    pub fn session_runtime(&self) -> Arc<Mutex<HashMap<String, Arc<SessionRuntime>>>> {
         self.session_runtime.clone()
     }
 

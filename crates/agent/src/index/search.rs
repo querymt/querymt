@@ -1,5 +1,5 @@
 use grep_regex::RegexMatcher;
-use grep_searcher::{sinks::Lossy, Searcher};
+use grep_searcher::{Searcher, sinks::Lossy};
 use ignore::WalkBuilder;
 use std::error::Error;
 use std::path::Path;

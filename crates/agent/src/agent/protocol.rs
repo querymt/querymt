@@ -157,13 +157,16 @@ impl SendAgent for QueryMTAgent {
         let function_index = if let Some(ref cwd_path) = cwd {
             let cwd_clone = cwd_path.clone();
             let index_config = crate::index::FunctionIndexConfig::default();
-            
+
             // Spawn index building in background
             let index_handle = tokio::spawn(async move {
                 match crate::index::FunctionIndex::build(&cwd_clone, index_config).await {
                     Ok(index) => {
-                        log::info!("Function index built: {} functions in {} files", 
-                            index.function_count(), index.file_count());
+                        log::info!(
+                            "Function index built: {} functions in {} files",
+                            index.function_count(),
+                            index.file_count()
+                        );
                         Some(index)
                     }
                     Err(e) => {

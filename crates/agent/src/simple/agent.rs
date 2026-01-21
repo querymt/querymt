@@ -10,8 +10,8 @@ use crate::acp::websocket::serve_websocket;
 use crate::agent::builder::AgentBuilderExt;
 use crate::agent::core::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
 use crate::config::{MiddlewareEntry, SingleAgentConfig};
-use crate::middleware::{MiddlewareDriver, MIDDLEWARE_REGISTRY};
 use crate::events::AgentEvent;
+use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
 use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
 #[cfg(feature = "dashboard")]
@@ -183,22 +183,14 @@ impl AgentBuilder {
         // Apply middleware factories - each factory receives the agent and returns a middleware
         for factory in self.middleware_factories {
             let middleware = factory(&agent);
-            agent
-                .middleware_drivers
-                .lock()
-                .unwrap()
-                .push(middleware);
+            agent.middleware_drivers.lock().unwrap().push(middleware);
         }
 
         // Apply config-based middleware entries
         for entry in &self.middleware_entries {
             match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &agent) {
                 Ok(middleware) => {
-                    agent
-                        .middleware_drivers
-                        .lock()
-                        .unwrap()
-                        .push(middleware);
+                    agent.middleware_drivers.lock().unwrap().push(middleware);
                 }
                 Err(e) => {
                     // Skip if middleware is disabled, otherwise fail

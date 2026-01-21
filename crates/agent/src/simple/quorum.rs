@@ -9,9 +9,9 @@ use super::utils::{
 use crate::agent::builder::AgentBuilderExt;
 use crate::agent::core::{QueryMTAgent, ToolPolicy};
 use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
-use crate::middleware::MIDDLEWARE_REGISTRY;
 use crate::delegation::AgentInfo;
 use crate::events::AgentEvent;
+use crate::middleware::MIDDLEWARE_REGISTRY;
 use crate::quorum::AgentQuorum;
 use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
@@ -545,11 +545,7 @@ fn apply_middleware_from_config(agent: &mut QueryMTAgent, entries: &[MiddlewareE
     for entry in entries {
         match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, agent) {
             Ok(middleware) => {
-                agent
-                    .middleware_drivers
-                    .lock()
-                    .unwrap()
-                    .push(middleware);
+                agent.middleware_drivers.lock().unwrap().push(middleware);
             }
             Err(e) => {
                 // Skip if middleware is disabled, otherwise log warning
