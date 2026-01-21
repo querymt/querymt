@@ -92,10 +92,16 @@ pub struct QuorumSettings {
     pub delegation: bool,
     #[serde(default)]
     pub verification: bool,
+    #[serde(default = "default_snapshot_policy")]
+    pub snapshot_policy: Option<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_snapshot_policy() -> Option<String> {
+    None
 }
 
 /// Planner agent configuration

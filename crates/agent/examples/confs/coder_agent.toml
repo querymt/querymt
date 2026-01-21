@@ -8,6 +8,7 @@ cwd = "."
 db = "./test.db"
 delegation = true
 verification = false
+snapshot_policy = "diff"
 
 [planner]
 provider = "moonshotai"

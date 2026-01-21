@@ -7,7 +7,7 @@ use super::utils::{
     to_absolute_path,
 };
 use crate::agent::builder::AgentBuilderExt;
-use crate::agent::core::{QueryMTAgent, ToolPolicy};
+use crate::agent::core::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
 use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
 use crate::delegation::AgentInfo;
 use crate::events::AgentEvent;
@@ -36,6 +36,7 @@ pub struct QuorumBuilder {
     pub(super) delegates: Vec<AgentConfig>,
     pub(super) delegation_enabled: bool,
     pub(super) verification_enabled: bool,
+    pub(super) snapshot_policy: SnapshotPolicy,
 }
 
 impl Default for QuorumBuilder {
@@ -53,6 +54,7 @@ impl QuorumBuilder {
             delegates: Vec::new(),
             delegation_enabled: true,
             verification_enabled: false,
+            snapshot_policy: SnapshotPolicy::None,
         }
     }
 
@@ -93,6 +95,11 @@ impl QuorumBuilder {
 
     pub fn with_verification(mut self, enabled: bool) -> Self {
         self.verification_enabled = enabled;
+        self
+    }
+
+    pub fn with_snapshot_policy(mut self, policy: SnapshotPolicy) -> Self {
+        self.snapshot_policy = policy;
         self
     }
 
@@ -146,10 +153,21 @@ impl QuorumBuilder {
             let tools = delegate.tools.clone();
             let middleware_entries = delegate.middleware.clone();
             let registry = registry.clone();
+            let snapshot_policy_for_delegate = self.snapshot_policy;
+            let cwd_for_delegate = cwd.clone();
             builder = builder.add_delegate_agent(agent_info, move |store, event_bus| {
                 let mut agent = QueryMTAgent::new(registry.clone(), store, llm_config.clone())
                     .with_event_bus(event_bus)
-                    .with_tool_policy(ToolPolicy::BuiltInOnly);
+                    .with_tool_policy(ToolPolicy::BuiltInOnly)
+                    .with_snapshot_policy(snapshot_policy_for_delegate);
+
+                // Set snapshot root if snapshot policy is enabled and cwd is available
+                if snapshot_policy_for_delegate != SnapshotPolicy::None {
+                    if let Some(ref root) = cwd_for_delegate {
+                        agent = agent.with_snapshot_root(root.clone());
+                    }
+                }
+
                 if !tools.is_empty() {
                     agent = agent.with_allowed_tools(tools.clone());
                 }
@@ -165,11 +183,22 @@ impl QuorumBuilder {
         let planner_tools = planner_config.tools.clone();
         let planner_middleware = planner_config.middleware.clone();
         let registry_for_planner = registry.clone();
+        let snapshot_policy_for_planner = self.snapshot_policy;
+        let cwd_for_planner = cwd.clone();
         builder = builder.with_planner(move |store, event_bus, agent_registry| {
             let mut agent =
                 QueryMTAgent::new(registry_for_planner.clone(), store, planner_llm.clone())
                     .with_event_bus(event_bus)
-                    .with_agent_registry(agent_registry);
+                    .with_agent_registry(agent_registry)
+                    .with_snapshot_policy(snapshot_policy_for_planner);
+
+            // Set snapshot root if snapshot policy is enabled and cwd is available
+            if snapshot_policy_for_planner != SnapshotPolicy::None {
+                if let Some(ref root) = cwd_for_planner {
+                    agent = agent.with_snapshot_root(root.clone());
+                }
+            }
+
             if !planner_tools.is_empty() {
                 agent = agent
                     .with_tool_policy(ToolPolicy::BuiltInOnly)
@@ -325,6 +354,9 @@ impl Quorum {
         builder.delegation_enabled = config.quorum.delegation;
         builder.verification_enabled = config.quorum.verification;
 
+        // Parse snapshot policy
+        let snapshot_policy = parse_snapshot_policy(config.quorum.snapshot_policy)?;
+
         // Build the set of builtin tool names for validation
         let builtin_names: HashSet<String> = all_builtin_tools()
             .iter()
@@ -412,6 +444,8 @@ impl Quorum {
 
             builder.delegates.push(delegate_config);
         }
+
+        builder.snapshot_policy = snapshot_policy;
 
         builder.build().await
     }
@@ -540,6 +574,20 @@ impl ChatSession for QuorumSession {
     }
 }
 
+/// Helper to parse snapshot policy string to enum
+fn parse_snapshot_policy(policy: Option<String>) -> Result<SnapshotPolicy> {
+    match policy.as_deref() {
+        None => Ok(SnapshotPolicy::None),
+        Some("none") => Ok(SnapshotPolicy::None),
+        Some("metadata") => Ok(SnapshotPolicy::Metadata),
+        Some("diff") => Ok(SnapshotPolicy::Diff),
+        Some(other) => Err(anyhow!(
+            "Invalid snapshot_policy '{}'. Valid options: 'none', 'metadata', 'diff'",
+            other
+        )),
+    }
+}
+
 /// Helper to apply middleware from config entries to an agent
 fn apply_middleware_from_config(agent: &mut QueryMTAgent, entries: &[MiddlewareEntry]) {
     for entry in entries {
@@ -588,5 +636,32 @@ mod tests {
             delegate.llm_config.as_ref().and_then(|c| c.system.clone()),
             Some("Coder system prompt".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_snapshot_policy() {
+        assert_eq!(
+            parse_snapshot_policy(None).unwrap(),
+            SnapshotPolicy::None
+        );
+        assert_eq!(
+            parse_snapshot_policy(Some("none".to_string())).unwrap(),
+            SnapshotPolicy::None
+        );
+        assert_eq!(
+            parse_snapshot_policy(Some("metadata".to_string())).unwrap(),
+            SnapshotPolicy::Metadata
+        );
+        assert_eq!(
+            parse_snapshot_policy(Some("diff".to_string())).unwrap(),
+            SnapshotPolicy::Diff
+        );
+        assert!(parse_snapshot_policy(Some("invalid".to_string())).is_err());
+    }
+
+    #[test]
+    fn test_quorum_builder_snapshot_policy() {
+        let builder = QuorumBuilder::new().with_snapshot_policy(SnapshotPolicy::Diff);
+        assert_eq!(builder.snapshot_policy, SnapshotPolicy::Diff);
     }
 }
