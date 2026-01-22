@@ -399,11 +399,6 @@ pub fn codex_parse_chat_with_state(
             } else {
                 raw.to_string()
             };
-            log::debug!(
-                "Codex SSE parse incomplete ({} bytes): {}",
-                raw.len(),
-                truncated
-            );
             return Err(LLMError::ResponseFormatError {
                 message: "Codex SSE response did not include completion event".to_string(),
                 raw_response: truncated,
@@ -434,7 +429,6 @@ pub fn codex_parse_chat_with_state(
     } else {
         raw.to_string()
     };
-    log::debug!("Codex response decode failed ({} bytes)", raw.len());
     Err(LLMError::ResponseFormatError {
         message: "Failed to decode Codex API response as JSON or SSE".to_string(),
         raw_response: truncated,
