@@ -28,7 +28,7 @@ mock! {
 
     #[async_trait]
     impl SessionStore for SessionStore {
-        async fn create_session(&self, name: Option<String>) -> SessionResult<Session>;
+        async fn create_session(&self, name: Option<String>, cwd: Option<std::path::PathBuf>) -> SessionResult<Session>;
         async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>>;
         async fn list_sessions(&self) -> SessionResult<Vec<Session>>;
         async fn delete_session(&self, session_id: &str) -> SessionResult<()>;

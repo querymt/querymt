@@ -141,9 +141,13 @@ impl SqliteStorage {
 
 #[async_trait]
 impl SessionStore for SqliteStorage {
-    async fn create_session(&self, name: Option<String>) -> SessionResult<Session> {
+    async fn create_session(
+        &self,
+        name: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> SessionResult<Session> {
         let repo = SqliteSessionRepository::new(self.conn.clone());
-        repo.create_session(name).await
+        repo.create_session(name, cwd).await
     }
 
     async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>> {

@@ -4,12 +4,14 @@ import { Activity, Send, CheckCircle, XCircle, Loader, Menu, Plus } from 'lucide
 import { PatchDiff } from '@pierre/diffs/react';
 import { useUiClient } from './hooks/useUiClient';
 import { useSessionTimer } from './hooks/useSessionTimer';
+import { useFileMention } from './hooks/useFileMention';
 import { EventItem, EventFilters, UiAgentInfo } from './types';
 import { Sidebar } from './components/Sidebar';
 import { MessageContent } from './components/MessageContent';
 import { ThinkingIndicator } from './components/ThinkingIndicator';
 import { EventFiltersBar } from './components/EventFilters';
 import { FloatingStatsPanel } from './components/FloatingStatsPanel';
+import { MentionInput } from './components/MentionInput';
 import { getAgentColor } from './utils/agentColors';
 import { getAgentShortName } from './utils/agentNames';
 
@@ -29,6 +31,10 @@ function App() {
     loadSession,
     thinkingAgentId,
     isConversationComplete,
+    setFileIndexCallback,
+    setFileIndexErrorCallback,
+    requestFileIndex,
+    workspaceIndexStatus,
   } = useUiClient();
   
   // Live timer hook
@@ -49,6 +55,24 @@ function App() {
     searchQuery: '',
   });
   const [expertMode, setExpertMode] = useState(false);
+  const activeIndexStatus = sessionId ? workspaceIndexStatus[sessionId]?.status : undefined;
+  
+  // File mention hook
+  const fileMention = useFileMention(requestFileIndex);
+  
+  // Register file index callback
+  useEffect(() => {
+    setFileIndexCallback(fileMention.handleFileIndex);
+    return () => {
+      setFileIndexCallback(null);
+    };
+  }, [setFileIndexCallback, fileMention.handleFileIndex]);
+
+  // Register file index error callback
+  useEffect(() => {
+    setFileIndexErrorCallback(fileMention.handleFileIndexError);
+    return () => setFileIndexErrorCallback(null);
+  }, [setFileIndexErrorCallback, fileMention.handleFileIndexError]);
 
   useEffect(() => {
     return () => {
@@ -57,6 +81,7 @@ function App() {
       }
     };
   }, []);
+
 
   // Keyboard shortcut: Cmd+N / Ctrl+N to create new session
   useEffect(() => {
@@ -77,6 +102,9 @@ function App() {
   const handleSendPrompt = async () => {
     if (!prompt.trim() || loading || !sessionId) return;
 
+    // Clear file mention state
+    fileMention.clear();
+
     setLoading(true);
     try {
       await sendPrompt(prompt);
@@ -87,6 +115,10 @@ function App() {
       setLoading(false);
     }
   };
+
+
+
+
 
   const handleNewSession = async () => {
     try {
@@ -326,19 +358,17 @@ function App() {
 
       {/* Input Area */}
       <div className="px-6 py-4 bg-cyber-surface border-t border-cyber-border shadow-[0_-4px_20px_rgba(0,255,249,0.05)]">
-        <div className="flex gap-3">
-          <input
-            type="text"
+        <div className="flex gap-3 relative">
+          <MentionInput
             value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSendPrompt()}
-            placeholder={!sessionId ? "Create a session to start chatting..." : "Enter your prompt..."}
-            className="
-              flex-1 px-4 py-3 bg-cyber-bg border-2 border-cyber-border rounded-lg 
-              focus:outline-none focus:border-cyber-cyan focus:shadow-neon-cyan
-              text-white placeholder-gray-500 transition-all duration-200
-            "
+            onChange={setPrompt}
+            onSubmit={handleSendPrompt}
+            placeholder={!sessionId ? "Create a session to start chatting..." : "Enter your prompt... (use @ to mention files)"}
             disabled={loading || !connected || !sessionId}
+            files={fileMention.allFiles}
+            onRequestFiles={fileMention.requestIndex}
+            isLoadingFiles={fileMention.isLoading}
+            showIndexBuilding={activeIndexStatus === 'building'}
           />
           <button
             onClick={handleSendPrompt}

@@ -4,6 +4,7 @@ use crate::acp::client_bridge::ClientBridgeSender;
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_bus::EventBus;
 use crate::events::AgentEvent;
+use crate::index::{WorkspaceIndexManager, WorkspaceIndexManagerConfig};
 use crate::middleware::{CompositeDriver, MiddlewareDriver};
 use crate::session::provider::SessionProvider;
 use crate::session::store::{LLMConfig, SessionStore};
@@ -16,7 +17,7 @@ use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, OnceCell, broadcast, watch};
 
 /// Main agent implementation that coordinates LLM interactions, tool execution,
 /// session management, and protocol compliance.
@@ -41,6 +42,7 @@ pub struct QueryMTAgent {
     pub(crate) bridge: Arc<StdMutex<Option<ClientBridgeSender>>>,
     pub(crate) agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     pub(crate) delegation_context_config: DelegationContextConfig,
+    pub(crate) workspace_index_manager: Arc<WorkspaceIndexManager>,
 }
 
 /// Configuration for when and how delegation context is injected into conversations.
@@ -77,7 +79,7 @@ pub struct SessionRuntime {
     /// Hash of currently available tools (for change detection)
     pub current_tools_hash: StdMutex<Option<crate::hash::RapidHash>>,
     /// Function index for duplicate code detection (built asynchronously on session start)
-    pub function_index: Option<Arc<tokio::sync::RwLock<crate::index::FunctionIndex>>>,
+    pub function_index: Arc<OnceCell<Arc<tokio::sync::RwLock<crate::index::FunctionIndex>>>>,
 }
 
 /// Policy for tool usage and availability.
@@ -178,7 +180,14 @@ impl QueryMTAgent {
                 timing: DelegationContextTiming::FirstTurnOnly,
                 auto_inject: true,
             },
+            workspace_index_manager: Arc::new(WorkspaceIndexManager::new(
+                WorkspaceIndexManagerConfig::default(),
+            )),
         }
+    }
+
+    pub fn workspace_index_manager(&self) -> Arc<WorkspaceIndexManager> {
+        self.workspace_index_manager.clone()
     }
 
     /// Creates a CompositeDriver from the configured middleware drivers

@@ -20,6 +20,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             id INTEGER PRIMARY KEY,
             public_id TEXT UNIQUE NOT NULL,
             name TEXT,
+            cwd TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             current_intent_snapshot_id INTEGER,

@@ -4,6 +4,7 @@
 //! duplicate/similar code detection.
 
 use ignore::WalkBuilder;
+use rayon::prelude::*;
 use similarity_core::{
     AstFingerprint, TSEDOptions, calculate_tsed, extract_functions,
     generic_tree_sitter_parser::GenericTreeSitterParser, language_parser::LanguageParser,
@@ -118,7 +119,18 @@ impl FunctionIndex {
             root
         );
 
-        // Group files by language
+        // Read files in parallel and group by language
+        let file_contents: Vec<(PathBuf, String, &'static str)> = files
+            .par_iter()
+            .filter_map(|file_path| {
+                let content = std::fs::read_to_string(file_path).ok()?;
+                let ext = file_path.extension()?.to_str()?;
+                let lang = get_language_category(ext)?;
+                Some((file_path.clone(), content, lang))
+            })
+            .collect();
+
+        // Group by language
         let mut ts_files: Vec<(PathBuf, String)> = Vec::new();
         let mut rust_files: Vec<(PathBuf, String)> = Vec::new();
         let mut go_files: Vec<(PathBuf, String)> = Vec::new();
@@ -128,124 +140,174 @@ impl FunctionIndex {
         let mut csharp_files: Vec<(PathBuf, String)> = Vec::new();
         let mut ruby_files: Vec<(PathBuf, String)> = Vec::new();
 
-        for file_path in files {
-            let content = match std::fs::read_to_string(&file_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-            match get_language_category(ext) {
-                Some("typescript") => ts_files.push((file_path, content)),
-                Some("rust") => rust_files.push((file_path, content)),
-                Some("go") => go_files.push((file_path, content)),
-                Some("java") => java_files.push((file_path, content)),
-                Some("c") => c_files.push((file_path, content)),
-                Some("cpp") => cpp_files.push((file_path, content)),
-                Some("csharp") => csharp_files.push((file_path, content)),
-                Some("ruby") => ruby_files.push((file_path, content)),
+        for (path, content, lang) in file_contents {
+            match lang {
+                "typescript" => ts_files.push((path, content)),
+                "rust" => rust_files.push((path, content)),
+                "go" => go_files.push((path, content)),
+                "java" => java_files.push((path, content)),
+                "c" => c_files.push((path, content)),
+                "cpp" => cpp_files.push((path, content)),
+                "csharp" => csharp_files.push((path, content)),
+                "ruby" => ruby_files.push((path, content)),
                 _ => {}
             }
         }
 
-        // Index TypeScript/JavaScript files
-        for (path, source) in &ts_files {
-            if let Ok(entries) = index_typescript_file(path, source, &config)
-                && !entries.is_empty()
-            {
-                functions.insert(path.clone(), entries);
+        // Index TypeScript/JavaScript files in parallel
+        let ts_results: Vec<_> = ts_files
+            .par_iter()
+            .filter_map(|(path, source)| {
+                let entries = index_typescript_file(path, source, &config).ok()?;
+                if entries.is_empty() {
+                    None
+                } else {
+                    Some((path.clone(), entries))
+                }
+            })
+            .collect();
+
+        for (path, entries) in ts_results {
+            functions.insert(path, entries);
+        }
+
+        // Index Rust files in parallel
+        if !rust_files.is_empty() {
+            let rust_results: Vec<_> = rust_files
+                .par_iter()
+                .filter_map(|(path, source)| {
+                    let mut parser = RustParser::new().ok()?;
+                    let entries = index_with_parser(&mut parser, path, source, "rust", &config).ok()?;
+                    if entries.is_empty() {
+                        None
+                    } else {
+                        Some((path.clone(), entries))
+                    }
+                })
+                .collect();
+
+            for (path, entries) in rust_results {
+                functions.insert(path, entries);
             }
         }
 
-        // Index Rust files
-        if !rust_files.is_empty()
-            && let Ok(mut parser) = RustParser::new()
-        {
-            for (path, source) in &rust_files {
-                if let Ok(entries) = index_with_parser(&mut parser, path, source, "rust", &config)
-                    && !entries.is_empty()
-                {
-                    functions.insert(path.clone(), entries);
-                }
+        // Index Go files in parallel
+        if !go_files.is_empty() {
+            let go_results: Vec<_> = go_files
+                .par_iter()
+                .filter_map(|(path, source)| {
+                    let mut parser = GenericTreeSitterParser::from_language_name("go").ok()?;
+                    let entries = index_with_parser(&mut parser, path, source, "go", &config).ok()?;
+                    if entries.is_empty() {
+                        None
+                    } else {
+                        Some((path.clone(), entries))
+                    }
+                })
+                .collect();
+
+            for (path, entries) in go_results {
+                functions.insert(path, entries);
             }
         }
 
-        // Index Go files
-        if !go_files.is_empty()
-            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("go")
-        {
-            for (path, source) in &go_files {
-                if let Ok(entries) = index_with_parser(&mut parser, path, source, "go", &config)
-                    && !entries.is_empty()
-                {
-                    functions.insert(path.clone(), entries);
-                }
+        // Index Java files in parallel
+        if !java_files.is_empty() {
+            let java_results: Vec<_> = java_files
+                .par_iter()
+                .filter_map(|(path, source)| {
+                    let mut parser = GenericTreeSitterParser::from_language_name("java").ok()?;
+                    let entries = index_with_parser(&mut parser, path, source, "java", &config).ok()?;
+                    if entries.is_empty() {
+                        None
+                    } else {
+                        Some((path.clone(), entries))
+                    }
+                })
+                .collect();
+
+            for (path, entries) in java_results {
+                functions.insert(path, entries);
             }
         }
 
-        // Index Java files
-        if !java_files.is_empty()
-            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("java")
-        {
-            for (path, source) in &java_files {
-                if let Ok(entries) = index_with_parser(&mut parser, path, source, "java", &config)
-                    && !entries.is_empty()
-                {
-                    functions.insert(path.clone(), entries);
-                }
+        // Index C files in parallel
+        if !c_files.is_empty() {
+            let c_results: Vec<_> = c_files
+                .par_iter()
+                .filter_map(|(path, source)| {
+                    let mut parser = GenericTreeSitterParser::from_language_name("c").ok()?;
+                    let entries = index_with_parser(&mut parser, path, source, "c", &config).ok()?;
+                    if entries.is_empty() {
+                        None
+                    } else {
+                        Some((path.clone(), entries))
+                    }
+                })
+                .collect();
+
+            for (path, entries) in c_results {
+                functions.insert(path, entries);
             }
         }
 
-        // Index C files
-        if !c_files.is_empty()
-            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("c")
-        {
-            for (path, source) in &c_files {
-                if let Ok(entries) = index_with_parser(&mut parser, path, source, "c", &config)
-                    && !entries.is_empty()
-                {
-                    functions.insert(path.clone(), entries);
-                }
+        // Index C++ files in parallel
+        if !cpp_files.is_empty() {
+            let cpp_results: Vec<_> = cpp_files
+                .par_iter()
+                .filter_map(|(path, source)| {
+                    let mut parser = GenericTreeSitterParser::from_language_name("cpp").ok()?;
+                    let entries = index_with_parser(&mut parser, path, source, "cpp", &config).ok()?;
+                    if entries.is_empty() {
+                        None
+                    } else {
+                        Some((path.clone(), entries))
+                    }
+                })
+                .collect();
+
+            for (path, entries) in cpp_results {
+                functions.insert(path, entries);
             }
         }
 
-        // Index C++ files
-        if !cpp_files.is_empty()
-            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("cpp")
-        {
-            for (path, source) in &cpp_files {
-                if let Ok(entries) = index_with_parser(&mut parser, path, source, "cpp", &config)
-                    && !entries.is_empty()
-                {
-                    functions.insert(path.clone(), entries);
-                }
+        // Index C# files in parallel
+        if !csharp_files.is_empty() {
+            let csharp_results: Vec<_> = csharp_files
+                .par_iter()
+                .filter_map(|(path, source)| {
+                    let mut parser = GenericTreeSitterParser::from_language_name("csharp").ok()?;
+                    let entries = index_with_parser(&mut parser, path, source, "csharp", &config).ok()?;
+                    if entries.is_empty() {
+                        None
+                    } else {
+                        Some((path.clone(), entries))
+                    }
+                })
+                .collect();
+
+            for (path, entries) in csharp_results {
+                functions.insert(path, entries);
             }
         }
 
-        // Index C# files
-        if !csharp_files.is_empty()
-            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("csharp")
-        {
-            for (path, source) in &csharp_files {
-                if let Ok(entries) = index_with_parser(&mut parser, path, source, "csharp", &config)
-                    && !entries.is_empty()
-                {
-                    functions.insert(path.clone(), entries);
-                }
-            }
-        }
+        // Index Ruby files in parallel
+        if !ruby_files.is_empty() {
+            let ruby_results: Vec<_> = ruby_files
+                .par_iter()
+                .filter_map(|(path, source)| {
+                    let mut parser = GenericTreeSitterParser::from_language_name("ruby").ok()?;
+                    let entries = index_with_parser(&mut parser, path, source, "ruby", &config).ok()?;
+                    if entries.is_empty() {
+                        None
+                    } else {
+                        Some((path.clone(), entries))
+                    }
+                })
+                .collect();
 
-        // Index Ruby files
-        if !ruby_files.is_empty()
-            && let Ok(mut parser) = GenericTreeSitterParser::from_language_name("ruby")
-        {
-            for (path, source) in &ruby_files {
-                if let Ok(entries) = index_with_parser(&mut parser, path, source, "ruby", &config)
-                    && !entries.is_empty()
-                {
-                    functions.insert(path.clone(), entries);
-                }
+            for (path, entries) in ruby_results {
+                functions.insert(path, entries);
             }
         }
 

@@ -14,7 +14,11 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait SessionRepository: Send + Sync {
     /// Create a new session
-    async fn create_session(&self, name: Option<String>) -> SessionResult<Session>;
+    async fn create_session(
+        &self,
+        name: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> SessionResult<Session>;
 
     /// Get session by ID
     async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>>;

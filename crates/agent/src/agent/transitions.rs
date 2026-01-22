@@ -61,7 +61,7 @@ impl QueryMTAgent {
 
         let provider_context = self
             .provider
-            .with_session(Some(session_id.to_string()))
+            .with_session(session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
         let provider = provider_context
@@ -143,7 +143,7 @@ impl QueryMTAgent {
 
         let provider_context = self
             .provider
-            .with_session(Some(session_id.to_string()))
+            .with_session(session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
 
@@ -331,7 +331,7 @@ impl QueryMTAgent {
 
         let provider_context = self
             .provider
-            .with_session(Some(session_id.to_string()))
+            .with_session(session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
 
@@ -501,7 +501,7 @@ impl QueryMTAgent {
 
         let provider_context = self
             .provider
-            .with_session(Some(session_id.to_string()))
+            .with_session(session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
 
@@ -690,7 +690,7 @@ impl QueryMTAgent {
     ) -> Result<Arc<ConversationContext>, anyhow::Error> {
         let provider_context = self
             .provider
-            .with_session(Some(session_id.to_string()))
+            .with_session(session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
 

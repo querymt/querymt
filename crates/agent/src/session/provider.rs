@@ -37,15 +37,21 @@ impl SessionProvider {
         self.history_store.get_session(session_id).await
     }
 
-    /// Create or get a session context for operations
-    pub async fn with_session(&self, session_id: Option<String>) -> SessionResult<SessionContext> {
-        if let Some(sid) = session_id
-            && let Some(session) = self.get_session(&sid).await?
-        {
-            return SessionContext::new(Arc::new(self.clone()), session).await;
-        }
+    /// Load an existing session by ID
+    pub async fn with_session(&self, session_id: &str) -> SessionResult<SessionContext> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))?;
+        SessionContext::new(Arc::new(self.clone()), session).await
+    }
 
-        let mut session = self.history_store.create_session(None).await?;
+    /// Create a new session with optional cwd
+    pub async fn create_session(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+    ) -> SessionResult<SessionContext> {
+        let mut session = self.history_store.create_session(None, cwd).await?;
         let llm_config = self
             .history_store
             .create_or_get_llm_config(&self.initial_config)

@@ -121,8 +121,11 @@ export function calculateStats(events: EventItem[]): CalculatedStats {
     switch (event.type) {
       case 'user':
       case 'agent':
-        stats.messageCount++;
-        totalMessages++;
+        // Only count actual user/assistant messages, not internal events
+        if (event.isMessage) {
+          stats.messageCount++;
+          totalMessages++;
+        }
         break;
       case 'tool_call':
         stats.toolCallCount++;

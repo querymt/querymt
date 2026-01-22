@@ -364,7 +364,7 @@ impl MiddlewareDriver for DedupCheckMiddleware {
                     let runtimes = self.session_runtime.lock().await;
                     runtimes
                         .get(&session_id)
-                        .and_then(|r| r.function_index.clone())
+                        .and_then(|r| r.function_index.get().cloned())
                 };
 
                 let Some(function_index) = function_index else {

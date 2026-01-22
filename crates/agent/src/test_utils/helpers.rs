@@ -48,6 +48,7 @@ pub fn mock_session(session_id: &str) -> Session {
         id: 1,
         public_id: session_id.to_string(),
         name: None,
+        cwd: None,
         created_at: Some(OffsetDateTime::now_utc()),
         updated_at: Some(OffsetDateTime::now_utc()),
         current_intent_snapshot_id: None,

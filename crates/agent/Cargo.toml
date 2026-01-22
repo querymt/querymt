@@ -32,7 +32,9 @@ time = { version = "0.3", features = ["serde"] }
 uuid = { version = "1.18", features = ["v4", "v7"] }
 rapidhash = "4.2"
 ignore = "0.4.25"
+notify = "8"
 glob = "0.3"
+arc-swap = "1.7"
 grep = "0.4"
 grep-searcher = "0.1"
 grep-regex = "0.1"
@@ -53,6 +55,9 @@ toml = "0.9"
 regex.workspace = true
 srgn = "0.14"
 tokio-util = { version = "0.7", features = ["compat"] }
+base64.workspace = true
+infer = "0.16"
+rayon = "1.11"
 
 # OAuth support (optional, feature-gated)
 anthropic-auth = { version = "0.1", default-features = false, features = ["async", "rustls-tls"], optional = true }

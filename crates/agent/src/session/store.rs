@@ -20,6 +20,7 @@ pub struct Session {
     pub id: i64,
     pub public_id: String,
     pub name: Option<String>,
+    pub cwd: Option<std::path::PathBuf>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub created_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -132,8 +133,12 @@ pub(crate) fn extract_llm_config_values(
 /// - Ensure foreign key constraints maintain referential integrity
 #[async_trait]
 pub trait SessionStore: Send + Sync {
-    /// Creates a new session, optionally with a name.
-    async fn create_session(&self, name: Option<String>) -> SessionResult<Session>;
+    /// Creates a new session, optionally with a name and workspace path.
+    async fn create_session(
+        &self,
+        name: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> SessionResult<Session>;
 
     /// Retrieves session metadata by its unique ID.
     async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>>;

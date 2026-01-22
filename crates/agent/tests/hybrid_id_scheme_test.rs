@@ -18,7 +18,7 @@ async fn test_hybrid_id_scheme() {
     let (_temp_dir, store) = create_test_store().await;
 
     let session = store
-        .create_session(Some("test".to_string()))
+        .create_session(Some("test".to_string()), None)
         .await
         .expect("session");
     assert!(session.id > 0, "Should have INTEGER primary key");
@@ -98,7 +98,7 @@ async fn test_foreign_key_constraints() {
     let (_temp_dir, store) = create_test_store().await;
 
     let session = store
-        .create_session(Some("parent".to_string()))
+        .create_session(Some("parent".to_string()), None)
         .await
         .expect("session");
     let task = Task {

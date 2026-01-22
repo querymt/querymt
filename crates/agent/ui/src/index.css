@@ -102,3 +102,28 @@
   background: rgba(0, 255, 249, 0.2);
   box-shadow: inset 0 0 10px rgba(0, 255, 249, 0.3);
 }
+
+/* File mention link styles (for messages) */
+.file-mention {
+  @apply text-cyber-cyan transition-all duration-200;
+  text-shadow: 0 0 5px rgba(0, 255, 249, 0.3);
+}
+
+.file-mention:hover {
+  @apply text-cyber-magenta;
+  text-shadow: 0 0 8px rgba(255, 0, 255, 0.5);
+}
+
+.file-mention:hover .file-mention-path {
+  @apply underline decoration-cyber-magenta;
+}
+
+.file-mention-path {
+  @apply decoration-cyber-cyan underline-offset-2;
+}
+
+/* Ensure react-mentions uses our font */
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

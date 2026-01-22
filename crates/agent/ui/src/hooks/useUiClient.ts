@@ -8,9 +8,12 @@ import {
   SessionSummary,
   AuditView,
   AgentEvent,
+  FileIndexEntry,
 } from '../types';
 
-const DEFAULT_CWD = '/Users/wiking/querymt';
+// Callback type for file index updates
+type FileIndexCallback = (files: FileIndexEntry[], generatedAt: number) => void;
+type FileIndexErrorCallback = (message: string) => void;
 
 export function useUiClient() {
   const [events, setEvents] = useState<EventItem[]>([]);
@@ -23,11 +26,18 @@ export function useUiClient() {
   const [sessionAudit, setSessionAudit] = useState<AuditView | null>(null);
   const [thinkingAgentId, setThinkingAgentId] = useState<string | null>(null);
   const [isConversationComplete, setIsConversationComplete] = useState(false);
+  const [workspaceIndexStatus, setWorkspaceIndexStatus] = useState<
+    Record<string, { status: 'building' | 'ready' | 'error'; message?: string | null }>
+  >({});
   const socketRef = useRef<WebSocket | null>(null);
+  const fileIndexCallbackRef = useRef<FileIndexCallback | null>(null);
+  const fileIndexErrorCallbackRef = useRef<FileIndexErrorCallback | null>(null);
 
   useEffect(() => {
     let mounted = true;
-    const socket = new WebSocket('ws://127.0.0.1:3030/ui/ws');
+    // Dynamically construct WebSocket URL from current page location
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(`${wsProtocol}//${window.location.host}/ui/ws`);
     socketRef.current = socket;
 
     socket.onopen = () => {
@@ -65,6 +75,7 @@ export function useUiClient() {
   }, []);
 
   const handleServerMessage = (msg: UiServerMessage) => {
+    console.log('[useUiClient] Received message:', msg.type, msg);
     switch (msg.type) {
       case 'state':
         setAgents(msg.agents);
@@ -118,6 +129,13 @@ export function useUiClient() {
         console.error('UI server error:', msg.message);
         // Reset thinking state on error - the agent has stopped processing
         setThinkingAgentId(null);
+        // Check if this is a file index related error and notify
+        if (fileIndexErrorCallbackRef.current && 
+            (msg.message.includes('workspace') || 
+             msg.message.includes('File index') || 
+             msg.message.includes('working directory'))) {
+          fileIndexErrorCallbackRef.current(msg.message);
+        }
         setEvents((prev) => [
           ...prev,
           {
@@ -140,6 +158,17 @@ export function useUiClient() {
         // Store full audit for stats (tasks, artifacts, decisions, etc.)
         setSessionAudit(msg.audit);
         break;
+      case 'workspace_index_status':
+        setWorkspaceIndexStatus(prev => ({
+          ...prev,
+          [msg.session_id]: { status: msg.status, message: msg.message ?? null },
+        }));
+        break;
+      case 'file_index':
+        if (fileIndexCallbackRef.current) {
+          fileIndexCallbackRef.current(msg.files, msg.generated_at);
+        }
+        break;
       default:
         break;
     }
@@ -154,7 +183,12 @@ export function useUiClient() {
   };
 
   const newSession = useCallback(async () => {
-    sendMessage({ type: 'new_session', cwd: DEFAULT_CWD });
+    const input = window.prompt('Workspace path (blank for none):', '');
+    if (input === null) {
+      return;
+    }
+    const cwd = input.trim();
+    sendMessage({ type: 'new_session', cwd: cwd.length > 0 ? cwd : null });
   }, []);
 
   const sendPrompt = useCallback(async (promptText: string) => {
@@ -175,6 +209,22 @@ export function useUiClient() {
     sendMessage({ type: 'load_session', session_id: sessionId });
   }, []);
 
+  // Register a callback for file index updates
+  const setFileIndexCallback = useCallback((callback: FileIndexCallback | null) => {
+    console.log('[useUiClient] Registering file index callback:', !!callback);
+    fileIndexCallbackRef.current = callback;
+  }, []);
+
+  // Register a callback for file index errors
+  const setFileIndexErrorCallback = useCallback((callback: FileIndexErrorCallback | null) => {
+    fileIndexErrorCallbackRef.current = callback;
+  }, []);
+
+  // Request file index from server
+  const requestFileIndex = useCallback(() => {
+    sendMessage({ type: 'get_file_index' });
+  }, []);
+
   return {
     events,
     sessionId,
@@ -191,6 +241,10 @@ export function useUiClient() {
     sessionAudit,
     thinkingAgentId,
     isConversationComplete,
+    setFileIndexCallback,
+    setFileIndexErrorCallback,
+    requestFileIndex,
+    workspaceIndexStatus,
   };
 }
 
@@ -239,6 +293,7 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       type: 'user',
       content: event.kind?.content ?? '',
       timestamp,
+      isMessage: true,
     };
   }
 
@@ -249,6 +304,7 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       type: 'agent',
       content: event.kind?.content ?? '',
       timestamp,
+      isMessage: true,
     };
   }
 
@@ -385,6 +441,7 @@ function translateLoadedEvent(agentId: string, event: AgentEvent): EventItem {
       type: 'user',
       content: promptReceived.content ?? '',
       timestamp,
+      isMessage: true,
     };
   }
 
@@ -396,6 +453,7 @@ function translateLoadedEvent(agentId: string, event: AgentEvent): EventItem {
       type: 'agent',
       content: assistantMessage.content ?? '',
       timestamp,
+      isMessage: true,
     };
   }
 

@@ -291,6 +291,9 @@ impl TestHarness {
                 timing: DelegationContextTiming::FirstTurnOnly,
                 auto_inject: true,
             },
+            workspace_index_manager: Arc::new(crate::index::WorkspaceIndexManager::new(
+                crate::index::WorkspaceIndexManagerConfig::default(),
+            )),
         });
 
         if let Ok(mut config) = agent.tool_config.lock() {

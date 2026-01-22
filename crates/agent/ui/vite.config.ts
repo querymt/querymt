@@ -6,4 +6,14 @@ export default defineConfig({
   build: {
     outDir: 'dist',
   },
+  server: {
+    port: 5173,
+    proxy: {
+      // Proxy WebSocket connections to backend
+      '/ui/ws': {
+        target: 'ws://127.0.0.1:3030',
+        ws: true,
+      },
+    },
+  },
 })

@@ -130,7 +130,7 @@ impl SendAgent for QueryMTAgent {
         let (mcp_services, mcp_tools, mcp_tool_defs) = build_mcp_state(&req.mcp_servers).await?;
         let session_context = self
             .provider
-            .with_session(None)
+            .create_session(cwd.clone())
             .await
             .map_err(|e| Error::new(-32000, e.to_string()))?;
         let session_id = session_context.session().public_id.clone();
@@ -153,42 +153,7 @@ impl SendAgent for QueryMTAgent {
             .map_err(|e| Error::new(-32000, e.to_string()))?;
         }
 
-        // Build function index asynchronously if cwd is provided
-        let function_index = if let Some(ref cwd_path) = cwd {
-            let cwd_clone = cwd_path.clone();
-            let index_config = crate::index::FunctionIndexConfig::default();
-
-            // Spawn index building in background
-            let index_handle = tokio::spawn(async move {
-                match crate::index::FunctionIndex::build(&cwd_clone, index_config).await {
-                    Ok(index) => {
-                        log::info!(
-                            "Function index built: {} functions in {} files",
-                            index.function_count(),
-                            index.file_count()
-                        );
-                        Some(index)
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to build function index: {}", e);
-                        None
-                    }
-                }
-            });
-
-            // Wait briefly for the index to build, but don't block session creation
-            // The index will be available asynchronously
-            match tokio::time::timeout(std::time::Duration::from_millis(100), index_handle).await {
-                Ok(Ok(Some(index))) => Some(Arc::new(tokio::sync::RwLock::new(index))),
-                _ => {
-                    // Index still building or failed - will be None initially
-                    // TODO: Store the JoinHandle so we can await it later
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let function_index = Arc::new(tokio::sync::OnceCell::new());
 
         let runtime = Arc::new(crate::agent::core::SessionRuntime {
             cwd: cwd.clone(),
@@ -206,6 +171,30 @@ impl SendAgent for QueryMTAgent {
         }
 
         self.emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
+
+        if let Some(cwd_path) = cwd.clone() {
+            let session_runtime = self.session_runtime.clone();
+            let manager = self.workspace_index_manager.clone();
+            let session_id_clone = session_id.clone();
+            tokio::spawn(async move {
+                let root = crate::index::resolve_workspace_root(&cwd_path);
+                match manager.get_or_create(root).await {
+                    Ok(workspace) => {
+                        let index_handle = workspace.function_index_handle();
+                        let runtime = {
+                            let runtimes = session_runtime.lock().await;
+                            runtimes.get(&session_id_clone).cloned()
+                        };
+                        if let Some(runtime) = runtime {
+                            let _ = runtime.function_index.set(index_handle);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to initialize workspace index: {}", e);
+                    }
+                }
+            });
+        }
 
         // Emit SessionConfigured event with environment configuration
         let mcp_configs: Vec<crate::config::McpServerConfig> = req
@@ -279,7 +268,7 @@ impl SendAgent for QueryMTAgent {
             mcp_tool_defs,
             permission_cache: std::sync::Mutex::new(HashMap::new()),
             current_tools_hash: std::sync::Mutex::new(None),
-            function_index: None,
+            function_index: Arc::new(tokio::sync::OnceCell::new()),
         });
 
         {
@@ -443,7 +432,7 @@ impl SendAgent for QueryMTAgent {
             mcp_tool_defs,
             permission_cache: std::sync::Mutex::new(HashMap::new()),
             current_tools_hash: std::sync::Mutex::new(None),
-            function_index: None,
+            function_index: Arc::new(tokio::sync::OnceCell::new()),
         });
 
         {

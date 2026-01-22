@@ -81,20 +81,27 @@ impl SqliteSessionRepository {
 
 #[async_trait]
 impl SessionRepository for SqliteSessionRepository {
-    async fn create_session(&self, name: Option<String>) -> SessionResult<Session> {
+    async fn create_session(
+        &self,
+        name: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> SessionResult<Session> {
         let now = OffsetDateTime::now_utc();
         let now_str = format_rfc3339(&now);
         let public_id = Uuid::now_v7().to_string();
         let public_id_for_insert = public_id.clone();
         let name_for_insert = name.clone();
+        let cwd_for_insert = cwd.as_ref().map(|p| p.to_string_lossy().to_string());
+        let cwd_clone = cwd.clone();
 
         let inserted_id = self
             .run_blocking(move |conn| {
                 conn.execute(
-                    "INSERT INTO sessions (public_id, name, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, fork_instructions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, fork_instructions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         public_id_for_insert,
                         name_for_insert,
+                        cwd_for_insert,
                         now_str,
                         now_str,
                         Option::<i64>::None,
@@ -115,6 +122,7 @@ impl SessionRepository for SqliteSessionRepository {
             id: inserted_id,
             public_id,
             name,
+            cwd: cwd_clone,
             created_at: Some(now),
             updated_at: Some(now),
             current_intent_snapshot_id: None,
@@ -132,7 +140,7 @@ impl SessionRepository for SqliteSessionRepository {
         let session_id = session_id.to_string();
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT id, public_id, name, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, fork_instructions FROM sessions WHERE public_id = ?",
+                "SELECT id, public_id, name, cwd, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, fork_instructions FROM sessions WHERE public_id = ?",
                 params![session_id],
                 map_row_to_session,
             )
@@ -144,7 +152,7 @@ impl SessionRepository for SqliteSessionRepository {
     async fn list_sessions(&self) -> SessionResult<Vec<Session>> {
         self.run_blocking(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, public_id, name, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, fork_instructions FROM sessions ORDER BY updated_at DESC",
+                "SELECT id, public_id, name, cwd, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, fork_instructions FROM sessions ORDER BY updated_at DESC",
             )?;
             let sessions_iter = stmt.query_map([], map_row_to_session)?;
             sessions_iter.collect::<Result<Vec<_>, _>>()
@@ -229,6 +237,10 @@ impl SessionRepository for SqliteSessionRepository {
             .ok_or_else(|| SessionError::SessionNotFound(parent_public_id.clone()))?;
         let parent_internal_id = parent_session.id;
         let parent_llm_config_id = parent_session.llm_config_id;
+        let parent_cwd = parent_session
+            .cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
         let now = OffsetDateTime::now_utc();
         let now_str = format_rfc3339(&now);
         let fork_name = format!("Fork of {}", parent_public_id);
@@ -242,10 +254,11 @@ impl SessionRepository for SqliteSessionRepository {
         self.run_blocking(move |conn| {
             let tx = conn.transaction()?;
             tx.execute(
-                "INSERT INTO sessions (public_id, name, created_at, updated_at, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, fork_instructions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, fork_instructions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     new_public_id_for_insert,
                     fork_name,
+                    parent_cwd,
                     now_str,
                     now_str,
                     parent_llm_config_id,
@@ -302,27 +315,30 @@ fn parse_rfc3339(value: &str) -> Result<OffsetDateTime, rusqlite::Error> {
 }
 
 fn map_row_to_session(row: &rusqlite::Row) -> Result<Session, rusqlite::Error> {
-    let created_at = parse_rfc3339(&row.get::<_, String>(3)?)?;
-    let updated_at = parse_rfc3339(&row.get::<_, String>(4)?)?;
+    let created_at = parse_rfc3339(&row.get::<_, String>(4)?)?;
+    let updated_at = parse_rfc3339(&row.get::<_, String>(5)?)?;
 
     Ok(Session {
         id: row.get(0)?,
         public_id: row.get(1)?,
         name: row.get(2)?,
+        cwd: row
+            .get::<_, Option<String>>(3)?
+            .map(std::path::PathBuf::from),
         created_at: Some(created_at),
         updated_at: Some(updated_at),
-        current_intent_snapshot_id: row.get(5)?,
-        active_task_id: row.get(6)?,
-        llm_config_id: row.get(7)?,
-        parent_session_id: row.get(8)?,
+        current_intent_snapshot_id: row.get(6)?,
+        active_task_id: row.get(7)?,
+        llm_config_id: row.get(8)?,
+        parent_session_id: row.get(9)?,
         fork_origin: row
-            .get::<_, Option<String>>(9)?
+            .get::<_, Option<String>>(10)?
             .and_then(|s| s.parse::<ForkOrigin>().ok()),
         fork_point_type: row
-            .get::<_, Option<String>>(10)?
+            .get::<_, Option<String>>(11)?
             .and_then(|s| s.parse::<ForkPointType>().ok()),
-        fork_point_ref: row.get(11)?,
-        fork_instructions: row.get(12)?,
+        fork_point_ref: row.get(12)?,
+        fork_instructions: row.get(13)?,
     })
 }
 

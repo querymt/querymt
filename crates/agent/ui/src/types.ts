@@ -7,6 +7,12 @@ import type {
 // Re-export SDK types for use in other components
 export type { SessionNotification, SessionUpdate };
 
+// File index types for @ mentions
+export interface FileIndexEntry {
+  path: string;
+  is_dir: boolean;
+}
+
 // Custom UI-specific types
 export interface EventItem {
   id: string;
@@ -14,6 +20,7 @@ export interface EventItem {
   type: 'user' | 'agent' | 'tool_call' | 'tool_result';
   content: string;
   timestamp: number;
+  isMessage?: boolean;  // True for actual user/assistant messages (not internal events)
   toolCall?: {
     tool_call_id?: string;
     description?: string;
@@ -199,7 +206,14 @@ export type UiServerMessage =
       message: string;
     }
   | { type: 'session_list'; sessions: SessionSummary[] }
-  | { type: 'session_loaded'; session_id: string; audit: AuditView };
+  | { type: 'session_loaded'; session_id: string; audit: AuditView }
+  | {
+      type: 'workspace_index_status';
+      session_id: string;
+      status: 'building' | 'ready' | 'error';
+      message?: string | null;
+    }
+  | { type: 'file_index'; files: FileIndexEntry[]; generated_at: number };
 
 export type UiClientMessage =
   | { type: 'init' }
@@ -208,4 +222,5 @@ export type UiClientMessage =
   | { type: 'new_session'; cwd?: string | null }
   | { type: 'prompt'; text: string }
   | { type: 'list_sessions' }
-  | { type: 'load_session'; session_id: string };
+  | { type: 'load_session'; session_id: string }
+  | { type: 'get_file_index' };

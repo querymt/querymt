@@ -74,7 +74,7 @@ impl QueryMTAgent {
         // 2. Get Session Context
         let context = self
             .provider
-            .with_session(Some(session_id.clone()))
+            .with_session(&session_id)
             .await
             .map_err(|e| Error::new(-32000, e.to_string()))?;
 
