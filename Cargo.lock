@@ -6836,6 +6836,7 @@ dependencies = [
  "http",
  "querymt",
  "querymt-extism-macros",
+ "regex",
  "schemars 0.8.22",
  "serde",
  "serde_json",

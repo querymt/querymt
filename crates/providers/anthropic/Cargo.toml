@@ -25,3 +25,4 @@ url = { workspace = true }
 http = { workspace = true }
 schemars = { workspace = true }
 extism-pdk = { workspace = true, optional = true }
+regex = { workspace = true }

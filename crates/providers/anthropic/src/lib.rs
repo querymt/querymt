@@ -4,8 +4,16 @@
 
 use std::collections::HashMap;
 
+use regex::Regex;
+
+/// Tool name prefix used for OAuth requests to avoid conflicts with server-side tools
+const TOOL_PREFIX: &str = "mcp_";
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use http::{Method, Request, Response, header::CONTENT_TYPE};
+use http::{
+    Method, Request, Response,
+    header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
+};
 use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     chat::{
@@ -15,7 +23,7 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    get_env_var,
+    get_env_var, handle_http_error,
     providers::{ModelPricing, ProvidersRegistry},
 };
 use schemars::JsonSchema;
@@ -65,7 +73,7 @@ pub struct Anthropic {
 /// Anthropic-specific tool format that matches their API structure
 #[derive(Serialize, Debug)]
 struct AnthropicTool<'a> {
-    name: &'a str,
+    name: String,
     description: &'a str,
     #[serde(rename = "input_schema")]
     schema: &'a serde_json::Value,
@@ -89,7 +97,7 @@ struct AnthropicCompleteRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -359,17 +367,48 @@ impl Anthropic {
         self.determine_auth_type() == AuthType::OAuth
     }
 
+    /// Sanitizes the system prompt for OAuth requests.
+    fn sanitize_system_prompt(&self) -> Option<String> {
+        self.system.as_ref().map(|s| {
+            if self.is_oauth() {
+                // Replace "OpenCode" with "Claude Code" (exact case)
+                let result = s.replace("QueryMT", "Claude Code");
+                // Replace "opencode" case-insensitively with "Claude"
+                let re = Regex::new(r"(?i)querymt").unwrap();
+                re.replace_all(&result, "Claude").to_string()
+            } else {
+                s.clone()
+            }
+        })
+    }
+
+    /// Prefixes a tool name with TOOL_PREFIX if using OAuth
+    fn prefix_tool_name(&self, name: &str) -> String {
+        if self.is_oauth() {
+            format!("{}{}", TOOL_PREFIX, name)
+        } else {
+            name.to_string()
+        }
+    }
+
+    /// Strips the TOOL_PREFIX from a tool name if present (used for responses)
+    fn strip_tool_prefix(name: &str) -> String {
+        name.strip_prefix(TOOL_PREFIX).unwrap_or(name).to_string()
+    }
+
     /// Adds authentication headers to the request builder based on auth type
     fn add_auth_headers(&self, builder: http::request::Builder) -> http::request::Builder {
         let auth_type = self.determine_auth_type();
         let builder = match auth_type {
             AuthType::OAuth => builder
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .header("anthropic-beta", "oauth-2025-04-20"),
+                .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+                .header(
+                    "anthropic-beta",
+                    "oauth-2025-04-20,interleaved-thinking-2025-05-14",
+                )
+                .header(USER_AGENT, "claude-cli/2.1.2 (external, cli)"),
             AuthType::ApiKey => builder.header("x-api-key", &self.api_key),
         };
-
-        // Common version header (always needed)
         builder.header("anthropic-version", "2023-06-01")
     }
 }
@@ -474,7 +513,7 @@ impl HTTPChatProvider for Anthropic {
                                     serde_json::from_str(&c.function.arguments)
                                         .unwrap_or_else(|_| serde_json::json!({})),
                                 ),
-                                tool_name: Some(c.function.name.clone()),
+                                tool_name: Some(self.prefix_tool_name(&c.function.name)),
                                 tool_result_id: None,
                                 tool_output: None,
                             }
@@ -504,7 +543,7 @@ impl HTTPChatProvider for Anthropic {
             slice
                 .iter()
                 .map(|tool| AnthropicTool {
-                    name: &tool.function.name,
+                    name: self.prefix_tool_name(&tool.function.name),
                     description: &tool.function.description,
                     schema: &tool.function.parameters,
                 })
@@ -518,7 +557,7 @@ impl HTTPChatProvider for Anthropic {
             Some(ToolChoice::Any) => Some(HashMap::from([("type".to_string(), "any".to_string())])),
             Some(ToolChoice::Tool(ref tool_name)) => Some(HashMap::from([
                 ("type".to_string(), "tool".to_string()),
-                ("name".to_string(), tool_name.clone()),
+                ("name".to_string(), self.prefix_tool_name(tool_name)),
             ])),
             Some(ToolChoice::None) => {
                 Some(HashMap::from([("type".to_string(), "none".to_string())]))
@@ -541,6 +580,9 @@ impl HTTPChatProvider for Anthropic {
             None
         };
 
+        // Use sanitized system prompt for OAuth requests
+        let sanitized_system = self.sanitize_system_prompt();
+
         let req_body = AnthropicCompleteRequest {
             messages: anthropic_messages,
             model: &self.model,
@@ -552,7 +594,7 @@ impl HTTPChatProvider for Anthropic {
             } else {
                 self.temperature
             }),
-            system: self.system.as_deref(),
+            system: sanitized_system,
             stream: self.stream,
             top_p: self.top_p,
             top_k: self.top_k,
@@ -562,7 +604,12 @@ impl HTTPChatProvider for Anthropic {
         };
 
         let json_req = serde_json::to_vec(&req_body)?;
-        let url = Anthropic::default_base_url().join("messages")?;
+        let mut url = Anthropic::default_base_url().join("messages")?;
+
+        // Add beta query parameter for OAuth requests
+        if self.is_oauth() {
+            url.query_pairs_mut().append_pair("beta", "true");
+        }
 
         let builder = Request::builder()
             .method(Method::POST)
@@ -575,17 +622,19 @@ impl HTTPChatProvider for Anthropic {
     }
 
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_text: String = "".to_string();
-            return Err(LLMError::ResponseFormatError {
-                message: format!("API returned error status: {}", status),
-                raw_response: error_text,
-            });
-        }
+        handle_http_error!(resp);
 
-        let json_resp: AnthropicCompleteResponse = serde_json::from_slice(resp.body())
+        let mut json_resp: AnthropicCompleteResponse = serde_json::from_slice(resp.body())
             .map_err(|e| LLMError::HttpError(format!("Failed to parse JSON: {}", e)))?;
+
+        // Strip tool prefix from tool names in response (for OAuth)
+        if self.is_oauth() {
+            for content in &mut json_resp.content {
+                if let Some(ref mut name) = content.name {
+                    *name = Self::strip_tool_prefix(name);
+                }
+            }
+        }
 
         Ok(Box::new(json_resp))
     }
@@ -620,10 +669,17 @@ impl HTTPChatProvider for Anthropic {
                             (stream_resp.index, stream_resp.content_block)
                             && block.block_type == "tool_use"
                         {
+                            // Strip tool prefix from name for OAuth responses
+                            let name = block.name.unwrap_or_default();
+                            let name = if self.is_oauth() {
+                                Self::strip_tool_prefix(&name)
+                            } else {
+                                name
+                            };
                             chunks.push(querymt::chat::StreamChunk::ToolUseStart {
                                 index,
                                 id: block.id.unwrap_or_default(),
-                                name: block.name.unwrap_or_default(),
+                                name,
                             });
                         }
                     }
