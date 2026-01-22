@@ -131,8 +131,7 @@ impl HTTPChatProvider for Codex {
     }
 
     fn supports_streaming(&self) -> bool {
-        //true
-        false
+        true
     }
 
     fn parse_chat_stream_chunk(&self, _chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {

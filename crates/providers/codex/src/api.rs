@@ -356,118 +356,27 @@ pub fn codex_parse_chat_with_state(
 ) -> Result<Box<dyn ChatResponse>, LLMError> {
     handle_http_error!(response);
 
-    // Codex backend is a streaming-only endpoint, but the agent currently uses the non-streaming
-    // `chat_with_tools` path. We accept either a normal JSON response or a full SSE transcript.
     let body = response.body();
-    if let Ok(response) = serde_json::from_slice::<CodexChatResponse>(body) {
-        return Ok(Box::new(response));
-    }
-
     let raw = String::from_utf8_lossy(body);
+
+    // Codex `responses` endpoint is streaming-only; non-streaming calls must go through
+    // the `chat_stream` pipeline.
     if raw.contains("data: ") {
-        // Reset any prior tool state before parsing this stream.
         if let Ok(mut buf) = tool_state_buffer.lock() {
             buf.clear();
         }
-
-        let chunks = codex_parse_stream_chunk_with_state(body, tool_state_buffer)?;
-
-        let mut text = String::new();
-        let mut tool_calls = Vec::new();
-        let mut tool_call_ids = std::collections::HashSet::new();
-        let mut usage = None;
-        let mut saw_done = false;
-
-        for chunk in chunks {
-            match chunk {
-                StreamChunk::Text(delta) => text.push_str(&delta),
-                StreamChunk::ToolUseComplete { tool_call, .. } => {
-                    if tool_call_ids.insert(tool_call.id.clone()) {
-                        tool_calls.push(tool_call);
-                    }
-                }
-                StreamChunk::Usage(u) => usage = Some(u),
-                StreamChunk::Done { .. } => saw_done = true,
-                _ => {}
-            }
-        }
-
-        if !saw_done {
-            let max_len = 16 * 1024;
-            let truncated = if raw.len() > max_len {
-                raw[..max_len].to_string()
-            } else {
-                raw.to_string()
-            };
-            return Err(LLMError::ResponseFormatError {
-                message: "Codex SSE response did not include completion event".to_string(),
-                raw_response: truncated,
-            });
-        }
-
-        let finish_reason = if tool_calls.is_empty() {
-            Some(FinishReason::Stop)
-        } else {
-            Some(FinishReason::ToolCalls)
-        };
-
-        return Ok(Box::new(CodexAggregatedResponse {
-            text: if text.is_empty() { None } else { Some(text) },
-            tool_calls: if tool_calls.is_empty() {
-                None
-            } else {
-                Some(tool_calls)
-            },
-            usage,
-            finish_reason,
-        }));
+        return Err(LLMError::NotImplemented(
+            "Codex backend is streaming-only; call chat_stream(_with_tools)".to_string(),
+        ));
     }
 
-    let max_len = 16 * 1024;
-    let truncated = if raw.len() > max_len {
-        raw[..max_len].to_string()
-    } else {
-        raw.to_string()
-    };
-    Err(LLMError::ResponseFormatError {
-        message: "Failed to decode Codex API response as JSON or SSE".to_string(),
-        raw_response: truncated,
-    })
-}
-
-#[derive(Debug)]
-struct CodexAggregatedResponse {
-    text: Option<String>,
-    tool_calls: Option<Vec<ToolCall>>,
-    usage: Option<Usage>,
-    finish_reason: Option<FinishReason>,
-}
-
-impl std::fmt::Display for CodexAggregatedResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(ref txt) = self.text {
-            write!(f, "{}", txt)
-        } else {
-            write!(f, "")
-        }
-    }
-}
-
-impl ChatResponse for CodexAggregatedResponse {
-    fn text(&self) -> Option<String> {
-        self.text.clone()
-    }
-
-    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-        self.tool_calls.clone()
-    }
-
-    fn finish_reason(&self) -> Option<FinishReason> {
-        self.finish_reason
-    }
-
-    fn usage(&self) -> Option<Usage> {
-        self.usage.clone()
+    let json_resp: Result<CodexChatResponse, serde_json::Error> = serde_json::from_slice(body);
+    match json_resp {
+        Ok(response) => Ok(Box::new(response)),
+        Err(e) => Err(LLMError::ResponseFormatError {
+            message: format!("Failed to decode Codex API response: {}", e),
+            raw_response: raw.into_owned(),
+        }),
     }
 }
 

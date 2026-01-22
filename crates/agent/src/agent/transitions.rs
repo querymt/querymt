@@ -16,8 +16,11 @@ use crate::session::domain::TaskStatus;
 use crate::session::runtime::RuntimeContext;
 use agent_client_protocol::{ContentBlock, ContentChunk, SessionUpdate, StopReason, TextContent};
 use anyhow::Context;
+use futures_util::StreamExt;
 use log::{debug, info};
-use querymt::chat::{ChatRole, FinishReason};
+use querymt::chat::{ChatRole, FinishReason, StreamChunk};
+use querymt::plugin::extism_impl::ExtismChatResponse;
+use querymt::{ToolCall, Usage};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 use tracing::instrument;
@@ -157,10 +160,66 @@ impl QueryMTAgent {
                 .provider()
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to build provider: {}", e))?;
-            provider
-                .chat_with_tools(&context.messages, Some(tools))
-                .await
-                .map_err(|e| anyhow::anyhow!("LLM request with tools failed: {}", e))?
+
+            // NOTE(codex): Codex backend is streaming-only.
+            // Backend sends `{"detail":"Stream must be set to true"}`
+            // Keep this special-case for now narrow to avoid changing behavior for other providers.
+            if context.provider.as_ref() == "codex" {
+                let mut stream = provider
+                    .chat_stream_with_tools(&context.messages, Some(tools))
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("LLM streaming request with tools failed: {}", e)
+                    })?;
+
+                let mut text = String::new();
+                let mut tool_calls: Vec<ToolCall> = Vec::new();
+                let mut tool_call_ids = std::collections::HashSet::new();
+                let mut usage: Option<Usage> = None;
+
+                while let Some(item) = stream.next().await {
+                    if *cancel_rx.borrow() {
+                        return Ok(ExecutionState::Cancelled);
+                    }
+
+                    match item.map_err(|e| {
+                        anyhow::anyhow!("LLM streaming request with tools failed: {}", e)
+                    })? {
+                        StreamChunk::Text(delta) => text.push_str(&delta),
+                        StreamChunk::ToolUseComplete { tool_call, .. } => {
+                            if tool_call_ids.insert(tool_call.id.clone()) {
+                                tool_calls.push(tool_call);
+                            }
+                        }
+                        StreamChunk::Usage(u) => usage = Some(u),
+                        StreamChunk::Done { .. } => break,
+                        _ => {}
+                    }
+                }
+
+                let finish_reason = if tool_calls.is_empty() {
+                    Some(FinishReason::Stop)
+                } else {
+                    Some(FinishReason::ToolCalls)
+                };
+
+                Box::new(ExtismChatResponse {
+                    text: if text.is_empty() { None } else { Some(text) },
+                    tool_calls: if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(tool_calls)
+                    },
+                    thinking: None,
+                    usage,
+                    finish_reason,
+                })
+            } else {
+                provider
+                    .chat_with_tools(&context.messages, Some(tools))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("LLM request with tools failed: {}", e))?
+            }
         };
 
         let usage = response
