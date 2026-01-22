@@ -21,7 +21,6 @@ export function useUiClient() {
   const [connected, setConnected] = useState(false);
   const [sessionHistory, setSessionHistory] = useState<SessionSummary[]>([]);
   const [sessionAudit, setSessionAudit] = useState<AuditView | null>(null);
-  const [isAgentThinking, setIsAgentThinking] = useState(false);
   const [thinkingAgentId, setThinkingAgentId] = useState<string | null>(null);
   const [isConversationComplete, setIsConversationComplete] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
@@ -84,24 +83,20 @@ export function useUiClient() {
         const eventKind = msg.event?.kind?.type ?? msg.event?.kind?.type_name;
         // Track LLM thinking state and conversation completion
         if (eventKind === 'llm_request_start') {
-          setIsAgentThinking(true);
           setThinkingAgentId(msg.agent_id);
           setIsConversationComplete(false);
         } else if (eventKind === 'llm_request_end') {
           // Check finish_reason to determine if turn is complete
           const finishReason = msg.event?.kind?.finish_reason;
           if (finishReason === 'stop' || finishReason === 'Stop') {
-            setIsAgentThinking(false);
             setThinkingAgentId(null);
             setIsConversationComplete(true);
             // Auto-reset completion indicator after 2 seconds
             setTimeout(() => setIsConversationComplete(false), 2000);
           } else if (finishReason === 'tool_calls' || finishReason === 'ToolCalls') {
-            // Tool calls requested, still thinking
-            setIsAgentThinking(true);
+            // Tool calls requested, still thinking - keep thinkingAgentId set
           } else {
             // Other finish reasons (length, error, etc.) - stop thinking
-            setIsAgentThinking(false);
             setThinkingAgentId(null);
           }
         } else if (eventKind === 'prompt_received') {
@@ -109,16 +104,20 @@ export function useUiClient() {
           setIsConversationComplete(false);
         } else if (eventKind === 'assistant_message_stored') {
           // Fallback: if we somehow missed llm_request_end, stop thinking
-          if (isAgentThinking) {
-            setIsAgentThinking(false);
+          if (thinkingAgentId !== null) {
             setThinkingAgentId(null);
           }
+        } else if (eventKind === 'error') {
+          // Reset thinking state on error - the agent has stopped processing
+          setThinkingAgentId(null);
         }
         setEvents((prev) => [...prev, translateAgentEvent(msg.agent_id, msg.event)]);
         break;
       }
       case 'error':
         console.error('UI server error:', msg.message);
+        // Reset thinking state on error - the agent has stopped processing
+        setThinkingAgentId(null);
         setEvents((prev) => [
           ...prev,
           {
@@ -190,7 +189,6 @@ export function useUiClient() {
     sessionHistory,
     loadSession,
     sessionAudit,
-    isAgentThinking,
     thinkingAgentId,
     isConversationComplete,
   };
@@ -301,6 +299,8 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
     };
   }
 
+  // Note: 'error' event kinds are handled in the switch statement above
+  // by resetting thinking state. This translation just converts to EventItem.
   if (kind === 'error') {
     return {
       id,

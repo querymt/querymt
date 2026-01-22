@@ -43,7 +43,7 @@ interface SessionTimerResult {
  */
 export function useSessionTimer(
   events: EventItem[],
-  isAgentThinking: boolean,
+  thinkingAgentId: string | null,
   isConversationComplete: boolean
 ): SessionTimerResult {
   const [currentTime, setCurrentTime] = useState(Date.now());
@@ -157,7 +157,7 @@ export function useSessionTimer(
   // Calculate live elapsed times
   // GLOBAL TIMER: Add live delta only if session is active
   const anyAgentWorking = Array.from(agentStates.values()).some(s => s.isWorking);
-  const isSessionActive = anyAgentWorking || (isAgentThinking && !isConversationComplete);
+  const isSessionActive = anyAgentWorking || (thinkingAgentId !== null && !isConversationComplete);
   
   let globalElapsedMs = globalState.accumulatedMs;
   if (globalState.lastActiveAt !== undefined && isSessionActive) {

@@ -27,7 +27,6 @@ function App() {
     setRoutingMode,
     sessionHistory,
     loadSession,
-    isAgentThinking,
     thinkingAgentId,
     isConversationComplete,
   } = useUiClient();
@@ -35,7 +34,7 @@ function App() {
   // Live timer hook
   const { globalElapsedMs, agentElapsedMs, isSessionActive } = useSessionTimer(
     events,
-    isAgentThinking,
+    thinkingAgentId,
     isConversationComplete
   );
   const [prompt, setPrompt] = useState('');
@@ -320,8 +319,8 @@ function App() {
       </div>
 
       {/* Thinking/Completion Indicator - shows above input when agent is processing or just completed */}
-      {isAgentThinking && <ThinkingIndicator agentId={thinkingAgentId} agents={agents} />}
-      {!isAgentThinking && isConversationComplete && (
+      {thinkingAgentId !== null && <ThinkingIndicator agentId={thinkingAgentId} agents={agents} />}
+      {thinkingAgentId === null && isConversationComplete && (
         <ThinkingIndicator agentId={thinkingAgentId} agents={agents} isComplete={true} />
       )}
 
@@ -422,9 +421,9 @@ function EventCard({ event, agents }: { event: EventRow; agents: UiAgentInfo[] }
         <div className="flex items-start gap-2">
           <div className="flex-1 min-w-0">
             <div className="flex flex-wrap items-center gap-2 text-[11px] tracking-wide">
-              {event.agentId && (
+              {(event.agentId || event.type === 'user') && (
                 <span className={`font-semibold ${labelColor} normal-case`}>
-                  {getAgentShortName(event.agentId, agents)}
+                  {event.type === 'user' ? 'User' : getAgentShortName(event.agentId!, agents)}
                 </span>
               )}
               <span className="text-gray-500 normal-case">
