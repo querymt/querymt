@@ -30,13 +30,17 @@ impl TokenRefresher for AnthropicRefresher {
     }
 }
 
-/// OpenAI OAuth token refresher
-pub struct OpenAIRefresher;
+/// OpenAI/Codex OAuth token refresher.
+///
+/// `provider_name` is used as the keyring lookup key (e.g. `oauth_openai` vs `oauth_codex`).
+pub struct OpenAIRefresher {
+    provider_name: &'static str,
+}
 
 #[async_trait::async_trait]
 impl TokenRefresher for OpenAIRefresher {
     fn provider_name(&self) -> &str {
-        "openai"
+        self.provider_name
     }
 
     async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
@@ -69,7 +73,12 @@ impl TokenRefresher for OpenAIRefresher {
 pub fn get_token_refresher(provider: &str) -> Result<Box<dyn TokenRefresher>> {
     match provider {
         "anthropic" => Ok(Box::new(AnthropicRefresher)),
-        "openai" | "codex" => Ok(Box::new(OpenAIRefresher)),
+        "openai" => Ok(Box::new(OpenAIRefresher {
+            provider_name: "openai",
+        })),
+        "codex" => Ok(Box::new(OpenAIRefresher {
+            provider_name: "codex",
+        })),
         _ => Err(anyhow!(
             "OAuth token refresh not supported for provider: {}",
             provider
