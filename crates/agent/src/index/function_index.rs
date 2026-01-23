@@ -177,7 +177,8 @@ impl FunctionIndex {
                 .par_iter()
                 .filter_map(|(path, source)| {
                     let mut parser = RustParser::new().ok()?;
-                    let entries = index_with_parser(&mut parser, path, source, "rust", &config).ok()?;
+                    let entries =
+                        index_with_parser(&mut parser, path, source, "rust", &config).ok()?;
                     if entries.is_empty() {
                         None
                     } else {
@@ -197,7 +198,8 @@ impl FunctionIndex {
                 .par_iter()
                 .filter_map(|(path, source)| {
                     let mut parser = GenericTreeSitterParser::from_language_name("go").ok()?;
-                    let entries = index_with_parser(&mut parser, path, source, "go", &config).ok()?;
+                    let entries =
+                        index_with_parser(&mut parser, path, source, "go", &config).ok()?;
                     if entries.is_empty() {
                         None
                     } else {
@@ -217,7 +219,8 @@ impl FunctionIndex {
                 .par_iter()
                 .filter_map(|(path, source)| {
                     let mut parser = GenericTreeSitterParser::from_language_name("java").ok()?;
-                    let entries = index_with_parser(&mut parser, path, source, "java", &config).ok()?;
+                    let entries =
+                        index_with_parser(&mut parser, path, source, "java", &config).ok()?;
                     if entries.is_empty() {
                         None
                     } else {
@@ -237,7 +240,8 @@ impl FunctionIndex {
                 .par_iter()
                 .filter_map(|(path, source)| {
                     let mut parser = GenericTreeSitterParser::from_language_name("c").ok()?;
-                    let entries = index_with_parser(&mut parser, path, source, "c", &config).ok()?;
+                    let entries =
+                        index_with_parser(&mut parser, path, source, "c", &config).ok()?;
                     if entries.is_empty() {
                         None
                     } else {
@@ -257,7 +261,8 @@ impl FunctionIndex {
                 .par_iter()
                 .filter_map(|(path, source)| {
                     let mut parser = GenericTreeSitterParser::from_language_name("cpp").ok()?;
-                    let entries = index_with_parser(&mut parser, path, source, "cpp", &config).ok()?;
+                    let entries =
+                        index_with_parser(&mut parser, path, source, "cpp", &config).ok()?;
                     if entries.is_empty() {
                         None
                     } else {
@@ -277,7 +282,8 @@ impl FunctionIndex {
                 .par_iter()
                 .filter_map(|(path, source)| {
                     let mut parser = GenericTreeSitterParser::from_language_name("csharp").ok()?;
-                    let entries = index_with_parser(&mut parser, path, source, "csharp", &config).ok()?;
+                    let entries =
+                        index_with_parser(&mut parser, path, source, "csharp", &config).ok()?;
                     if entries.is_empty() {
                         None
                     } else {
@@ -297,7 +303,8 @@ impl FunctionIndex {
                 .par_iter()
                 .filter_map(|(path, source)| {
                     let mut parser = GenericTreeSitterParser::from_language_name("ruby").ok()?;
-                    let entries = index_with_parser(&mut parser, path, source, "ruby", &config).ok()?;
+                    let entries =
+                        index_with_parser(&mut parser, path, source, "ruby", &config).ok()?;
                     if entries.is_empty() {
                         None
                     } else {
