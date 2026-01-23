@@ -16,7 +16,22 @@ model = "kimi-k2-thinking-turbo"
 tools = ["delegate", "create_task", "search_text", "glob", "ls", "read_file", "shell"]
 system_file = "../prompts/planner.md"
 
-# Middleware for planner (optional - detects duplicate code patterns)
+# Middleware for planner
+# Limits middleware prevents runaway execution
+[[planner.middleware]]
+type = "limits"
+max_steps = 100  # Total LLM calls (including tool use loops)
+max_turns = 20   # User/Assistant conversation pairs
+# max_price_usd = 1.0  # Optional: stop if cost exceeds this
+
+# Context middleware warns when approaching token limits
+[[planner.middleware]]
+type = "context"
+warn_at_percent = 80      # Warn when 80% full
+auto_compact = true       # Auto-compact when full
+fallback_max_tokens = 32000
+
+# Optional: Detect duplicate code patterns
 # [[planner.middleware]]
 # type = "dedup_check"
 # threshold = 0.8
@@ -33,7 +48,20 @@ system_file = "../prompts/coder.md"
 [delegates.parameters]
 num_ctx = 65536
 
-# Middleware for coder delegate - detect when code is similar to existing code
+# Middleware for coder delegate
+# Apply same limits as planner
+[[delegates.middleware]]
+type = "limits"
+max_steps = 100
+max_turns = 20
+
+[[delegates.middleware]]
+type = "context"
+warn_at_percent = 80
+auto_compact = true
+fallback_max_tokens = 65536  # Match num_ctx parameter
+
+# Detect when code is similar to existing code
 [[delegates.middleware]]
 type = "dedup_check"
 threshold = 0.85

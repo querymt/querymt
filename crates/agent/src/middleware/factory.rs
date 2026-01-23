@@ -60,6 +60,8 @@ impl MiddlewareRegistry {
         };
         // Register built-in factories
         registry.register(Arc::new(super::dedup_check::DedupCheckFactory));
+        registry.register(Arc::new(super::limits::LimitsFactory));
+        registry.register(Arc::new(super::context::ContextFactory));
         registry
     }
 

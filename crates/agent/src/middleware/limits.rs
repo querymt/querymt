@@ -1,3 +1,4 @@
+use crate::middleware::factory::MiddlewareFactory;
 use crate::middleware::{
     AgentStats, ConversationContext, ExecutionState, MiddlewareDriver, Result,
 };
@@ -6,11 +7,35 @@ use agent_client_protocol::StopReason;
 use async_trait::async_trait;
 use log::{debug, trace};
 use querymt::providers::ModelPricing;
+use serde::Deserialize;
+use std::sync::Arc;
 
+/// Configuration for execution limits
+///
+/// # Terminology
+///
+/// - **Steps**: Individual LLM calls (including tool use). Each time the agent calls
+///   the LLM API, `steps` is incremented. This includes intermediate calls for tool
+///   execution.
+///
+/// - **Turns**: User/Assistant message pairs. Each user message starts a new turn.
+///   A single turn may involve multiple steps if the agent needs to call tools.
+///
+/// # Example
+///
+/// ```text
+/// User: "What's the weather in SF?"
+/// Agent: [calls weather tool] → [gets result] → [responds to user]
+///
+/// This is: 1 turn, 2+ steps (initial call + tool calls + final response)
+/// ```
 #[derive(Debug, Clone)]
 pub struct LimitsConfig {
+    /// Maximum number of LLM calls (including tool use loops)
     pub max_steps: Option<usize>,
+    /// Maximum number of user/assistant conversation turns (based on user message count)
     pub max_turns: Option<usize>,
+    /// Maximum total cost in USD
     pub max_price_usd: Option<f64>,
     /// Source for model info (pricing, capabilities, etc.) - default is FromSession
     pub model_info_source: ModelInfoSource,
@@ -63,6 +88,10 @@ impl LimitsConfig {
 }
 
 /// Middleware that enforces step, turn, and price limits
+///
+/// - **Steps**: Counts every LLM API call (via `context.stats.steps`)
+/// - **Turns**: Counts user/assistant message pairs (via `context.user_message_count()`)
+/// - **Price**: Calculates cumulative cost based on token usage
 pub struct LimitsMiddleware {
     config: LimitsConfig,
     last_model: std::sync::Mutex<Option<(String, String)>>,
@@ -150,11 +179,12 @@ impl MiddlewareDriver for LimitsMiddleware {
                 }
 
                 if let Some(max_turns) = self.config.max_turns
-                    && context.stats.steps >= max_turns
+                    && context.user_message_count() >= max_turns
                 {
                     debug!(
                         "LimitsMiddleware: stopping execution, {} turns >= {}",
-                        context.stats.steps, max_turns
+                        context.user_message_count(),
+                        max_turns
                     );
                     return Ok(ExecutionState::Stopped {
                         reason: StopReason::MaxTurnRequests,
@@ -283,16 +313,16 @@ impl MiddlewareDriver for TurnLimitMiddleware {
 
         match state {
             ExecutionState::BeforeTurn { ref context } => {
-                let current_steps = context.stats.steps;
+                let current_turns = context.user_message_count();
                 trace!(
-                    "TurnLimitMiddleware: current steps = {}, max = {}",
-                    current_steps, self.max_turns
+                    "TurnLimitMiddleware: current turns = {}, max = {}",
+                    current_turns, self.max_turns
                 );
 
-                if current_steps >= self.max_turns {
+                if current_turns >= self.max_turns {
                     debug!(
-                        "TurnLimitMiddleware: stopping execution, {} steps >= {}",
-                        current_steps, self.max_turns
+                        "TurnLimitMiddleware: stopping execution, {} turns >= {}",
+                        current_turns, self.max_turns
                     );
                     Ok(ExecutionState::Stopped {
                         reason: StopReason::MaxTurnRequests,
@@ -457,5 +487,76 @@ mod tests {
         let result = middleware.next_state(state).await.unwrap();
 
         assert!(matches!(result, ExecutionState::BeforeTurn { .. }));
+    }
+}
+
+/// Factory for creating LimitsMiddleware from config
+pub struct LimitsFactory;
+
+/// Configuration structure for LimitsMiddleware
+///
+/// # TOML Example
+///
+/// ```toml
+/// [[middleware]]
+/// type = "limits"
+/// max_steps = 100    # Total LLM API calls (including tool use)
+/// max_turns = 20     # User/Assistant message pairs
+/// max_price_usd = 1.0
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct LimitsFactoryConfig {
+    enabled: bool,
+    /// Maximum number of LLM calls (including tool invocations)
+    max_steps: Option<usize>,
+    /// Maximum number of user/assistant conversation turns
+    max_turns: Option<usize>,
+    /// Maximum total cost in USD
+    max_price_usd: Option<f64>,
+}
+
+impl Default for LimitsFactoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_steps: None,
+            max_turns: None,
+            max_price_usd: None,
+        }
+    }
+}
+
+impl MiddlewareFactory for LimitsFactory {
+    fn type_name(&self) -> &'static str {
+        "limits"
+    }
+
+    fn create(
+        &self,
+        config: &serde_json::Value,
+        _agent: &crate::agent::core::QueryMTAgent,
+    ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
+        let cfg: LimitsFactoryConfig = serde_json::from_value(config.clone())?;
+
+        if !cfg.enabled {
+            return Err(anyhow::anyhow!("Middleware disabled"));
+        }
+
+        let mut limits_config = LimitsConfig::default();
+
+        if let Some(max_steps) = cfg.max_steps {
+            limits_config = limits_config.max_steps(max_steps);
+        }
+
+        if let Some(max_turns) = cfg.max_turns {
+            limits_config = limits_config.max_turns(max_turns);
+        }
+
+        if let Some(max_price_usd) = cfg.max_price_usd {
+            limits_config = limits_config.max_price_usd(max_price_usd);
+        }
+
+        Ok(Arc::new(LimitsMiddleware::new(limits_config)))
     }
 }

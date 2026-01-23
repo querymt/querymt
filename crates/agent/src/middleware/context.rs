@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use super::{ExecutionState, MiddlewareDriver, Result};
 use crate::middleware::ConversationContext;
+use crate::middleware::factory::MiddlewareFactory;
 use crate::model_info::{ModelInfoSource, get_model_info};
+use serde::Deserialize;
 
 #[derive(Debug, Clone)]
 pub struct ContextConfig {
@@ -380,5 +382,56 @@ impl MiddlewareDriver for ContextWarningMiddleware {
 
     fn name(&self) -> &'static str {
         "ContextWarningMiddleware"
+    }
+}
+
+/// Factory for creating ContextMiddleware from config
+pub struct ContextFactory;
+
+/// Configuration structure for ContextMiddleware
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct ContextFactoryConfig {
+    enabled: bool,
+    warn_at_percent: u32,
+    auto_compact: bool,
+    fallback_max_tokens: usize,
+}
+
+impl Default for ContextFactoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            warn_at_percent: 80,
+            auto_compact: true,
+            fallback_max_tokens: 32_000,
+        }
+    }
+}
+
+impl MiddlewareFactory for ContextFactory {
+    fn type_name(&self) -> &'static str {
+        "context"
+    }
+
+    fn create(
+        &self,
+        config: &serde_json::Value,
+        _agent: &crate::agent::core::QueryMTAgent,
+    ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
+        let cfg: ContextFactoryConfig = serde_json::from_value(config.clone())?;
+
+        if !cfg.enabled {
+            return Err(anyhow::anyhow!("Middleware disabled"));
+        }
+
+        let context_config = ContextConfig {
+            warn_at_percent: cfg.warn_at_percent,
+            auto_compact: cfg.auto_compact,
+            context_source: ModelInfoSource::FromSession,
+            fallback_max_tokens: cfg.fallback_max_tokens,
+        };
+
+        Ok(Arc::new(ContextMiddleware::new(context_config)))
     }
 }
