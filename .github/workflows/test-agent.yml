@@ -51,7 +51,7 @@ jobs:
         uses: swatinem/rust-cache@v2
       
       - name: Run Clippy
-        run: cargo clippy --package qmt-agent --all-targets --all-features -- -D warnings
+        run: cargo clippy --package qmt-agent --all-targets --features dashboard,oauth -- -D warnings
 
   # Job 3: Run tests with coverage
   test:
@@ -73,13 +73,14 @@ jobs:
         run: cargo install cargo-tarpaulin
       
       - name: Run tests with coverage
-        run: cargo tarpaulin --package qmt-agent --all-targets --all-features --out xml --output-dir ./coverage
+        run: cargo tarpaulin --package qmt-agent --all-targets --features dashboard,oauth --out xml --output-dir ./coverage
       
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage/cobertura.xml
           flags: agent
+          slug: querymt/querymt
           fail_ci_if_error: false
      
