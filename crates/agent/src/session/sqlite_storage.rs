@@ -7,8 +7,9 @@ use crate::session::domain::{
 };
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::projection::{
-    AuditView, DefaultRedactor, EventStore, RedactedArtifact, RedactedProgress, RedactedTask,
-    RedactedView, RedactionPolicy, Redactor, SummaryView, ViewStore,
+    AuditView, DefaultRedactor, EventStore, FilterExpr, PredicateOp, RedactedArtifact,
+    RedactedProgress, RedactedTask, RedactedView, RedactionPolicy, Redactor, SessionGroup,
+    SessionListFilter, SessionListItem, SessionListView, SummaryView, ViewStore,
 };
 use crate::session::repo_artifact::SqliteArtifactRepository;
 use crate::session::repo_decision::SqliteDecisionRepository;
@@ -1009,6 +1010,100 @@ impl ViewStore for SqliteStorage {
         })
     }
 
+    async fn get_session_list_view(
+        &self,
+        filter: Option<SessionListFilter>,
+    ) -> SessionResult<SessionListView> {
+        use std::collections::HashMap;
+
+        let session_repo = SqliteSessionRepository::new(self.conn.clone());
+        let intent_repo = SqliteIntentRepository::new(self.conn.clone());
+
+        // Get all sessions (list_sessions already returns sorted by updated_at DESC)
+        let mut sessions = session_repo.list_sessions().await?;
+
+        // Apply filters if provided
+        if let Some(filter_spec) = filter {
+            if let Some(filter_expr) = filter_spec.filter {
+                sessions.retain(|s| evaluate_session_filter(s, &filter_expr));
+            }
+
+            // Apply limit if specified
+            if let Some(limit) = filter_spec.limit {
+                sessions.truncate(limit);
+            }
+        }
+
+        let total_count = sessions.len();
+
+        // Build session list items with titles
+        let mut items = Vec::with_capacity(sessions.len());
+
+        for session in sessions {
+            // Get latest intent snapshot for title
+            let title = match intent_repo
+                .get_current_intent_snapshot(&session.public_id)
+                .await
+            {
+                Ok(Some(intent)) => Some(intent.summary),
+                _ => {
+                    // Fallback: try to get first user message as excerpt
+                    self.get_first_user_message_excerpt(&session.public_id)
+                        .await
+                        .ok()
+                        .flatten()
+                }
+            };
+
+            items.push(SessionListItem {
+                session_id: session.public_id,
+                name: session.name,
+                cwd: session.cwd.map(|p| p.display().to_string()),
+                title,
+                created_at: session.created_at,
+                updated_at: session.updated_at,
+            });
+        }
+
+        // Group by CWD
+        let mut groups_map: HashMap<Option<String>, Vec<SessionListItem>> = HashMap::new();
+        for item in items {
+            groups_map.entry(item.cwd.clone()).or_default().push(item);
+        }
+
+        // Convert to SessionGroup vec and sort
+        let mut groups: Vec<SessionGroup> = groups_map
+            .into_iter()
+            .map(|(cwd, sessions)| {
+                let latest_activity = sessions.iter().filter_map(|s| s.updated_at).max();
+                SessionGroup {
+                    cwd,
+                    sessions,
+                    latest_activity,
+                }
+            })
+            .collect();
+
+        // Sort groups: No-CWD first, then by latest_activity desc
+        groups.sort_by(|a, b| {
+            match (&a.cwd, &b.cwd) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(_), Some(_)) => {
+                    // Both have CWD, sort by latest activity (most recent first)
+                    b.latest_activity.cmp(&a.latest_activity)
+                }
+            }
+        });
+
+        Ok(SessionListView {
+            groups,
+            total_count,
+            generated_at: OffsetDateTime::now_utc(),
+        })
+    }
+
     async fn get_atif(
         &self,
         session_id: &str,
@@ -1025,6 +1120,130 @@ impl ViewStore for SqliteStorage {
         let trajectory = builder.build();
 
         Ok(trajectory)
+    }
+}
+
+// ============================================================================
+// Helper methods for SqliteStorage
+// ============================================================================
+
+impl SqliteStorage {
+    /// Get first user message excerpt for session title fallback
+    async fn get_first_user_message_excerpt(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<String>> {
+        let conn = self.conn.clone();
+        let session_id = session_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> SessionResult<Option<String>> {
+            let conn = conn.lock().map_err(|e| {
+                SessionError::DatabaseError(format!("Failed to lock connection: {}", e))
+            })?;
+
+            let result: Option<String> = conn.query_row(
+                "SELECT content FROM events WHERE session_id = ? AND kind = 'prompt_received' ORDER BY seq ASC LIMIT 1",
+                params![&session_id],
+                |row| row.get::<_, String>(0),
+            ).optional().map_err(|e| {
+                SessionError::DatabaseError(format!("Failed to query first user message: {}", e))
+            })?;
+
+            Ok(result.map(|content: String| {
+                // Truncate to ~60 characters for display
+                if content.len() > 60 {
+                    format!("{}...", &content[..60])
+                } else {
+                    content
+                }
+            }))
+        })
+        .await
+        .map_err(|e| SessionError::DatabaseError(format!("Task join error: {}", e)))?
+    }
+}
+
+/// Evaluate a filter expression against a session
+fn evaluate_session_filter(session: &Session, expr: &FilterExpr) -> bool {
+    match expr {
+        FilterExpr::Predicate(pred) => evaluate_predicate(session, pred),
+        FilterExpr::And(exprs) => exprs.iter().all(|e| evaluate_session_filter(session, e)),
+        FilterExpr::Or(exprs) => exprs.iter().any(|e| evaluate_session_filter(session, e)),
+        FilterExpr::Not(expr) => !evaluate_session_filter(session, expr),
+    }
+}
+
+/// Evaluate a single predicate against a session
+fn evaluate_predicate(
+    session: &Session,
+    pred: &crate::session::projection::FieldPredicate,
+) -> bool {
+    use serde_json::json;
+
+    let field_value = match pred.field.as_str() {
+        "session_id" | "public_id" => Some(json!(session.public_id)),
+        "name" => session.name.as_ref().map(|n| json!(n)),
+        "cwd" => session.cwd.as_ref().map(|p| json!(p.display().to_string())),
+        "created_at" => session.created_at.map(|t| {
+            json!(
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            )
+        }),
+        "updated_at" => session.updated_at.map(|t| {
+            json!(
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            )
+        }),
+        _ => None,
+    };
+
+    match &pred.op {
+        PredicateOp::IsNull => field_value.is_none(),
+        PredicateOp::IsNotNull => field_value.is_some(),
+        PredicateOp::Eq(val) => field_value.as_ref() == Some(val),
+        PredicateOp::Ne(val) => field_value.as_ref() != Some(val),
+        PredicateOp::Gt(val) => {
+            // For string timestamps, compare lexicographically
+            match (field_value.as_ref().and_then(|v| v.as_str()), val.as_str()) {
+                (Some(fv), Some(v)) => fv > v,
+                _ => false,
+            }
+        }
+        PredicateOp::Gte(val) => {
+            match (field_value.as_ref().and_then(|v| v.as_str()), val.as_str()) {
+                (Some(fv), Some(v)) => fv >= v,
+                _ => false,
+            }
+        }
+        PredicateOp::Lt(val) => {
+            match (field_value.as_ref().and_then(|v| v.as_str()), val.as_str()) {
+                (Some(fv), Some(v)) => fv < v,
+                _ => false,
+            }
+        }
+        PredicateOp::Lte(val) => {
+            match (field_value.as_ref().and_then(|v| v.as_str()), val.as_str()) {
+                (Some(fv), Some(v)) => fv <= v,
+                _ => false,
+            }
+        }
+        PredicateOp::Contains(s) => {
+            if let Some(fv) = field_value.as_ref().and_then(|v| v.as_str()) {
+                fv.contains(s.as_str())
+            } else {
+                false
+            }
+        }
+        PredicateOp::StartsWith(s) => {
+            if let Some(fv) = field_value.as_ref().and_then(|v| v.as_str()) {
+                fv.starts_with(s.as_str())
+            } else {
+                false
+            }
+        }
+        PredicateOp::In(vals) => field_value.as_ref().is_some_and(|fv| vals.contains(fv)),
     }
 }
 

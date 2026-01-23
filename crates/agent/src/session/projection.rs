@@ -121,6 +121,14 @@ pub trait ViewStore: Send + Sync {
     /// Generate a summary view for a session
     async fn get_summary_view(&self, session_id: &str) -> SessionResult<SummaryView>;
 
+    /// Generate a session list view with optional filtering
+    /// If filter is None, returns all sessions (up to default limit)
+    /// Sessions are grouped by CWD and sorted by latest activity
+    async fn get_session_list_view(
+        &self,
+        filter: Option<SessionListFilter>,
+    ) -> SessionResult<SessionListView>;
+
     /// Export session as ATIF (Agent Trajectory Interchange Format)
     async fn get_atif(
         &self,
@@ -186,4 +194,81 @@ impl Redactor for DefaultRedactor {
             RedactionPolicy::Minimal => field_sensitivity == FieldSensitivity::Public,
         }
     }
+}
+
+// ============================================================================
+// Session List View - for UI splash screen / session picker
+// ============================================================================
+
+/// Generic field predicate for filtering
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldPredicate {
+    pub field: String,
+    pub op: PredicateOp,
+}
+
+/// Predicate operations for filtering
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", content = "value", rename_all = "snake_case")]
+pub enum PredicateOp {
+    Eq(serde_json::Value),
+    Ne(serde_json::Value),
+    Gt(serde_json::Value),
+    Gte(serde_json::Value),
+    Lt(serde_json::Value),
+    Lte(serde_json::Value),
+    Contains(String),
+    StartsWith(String),
+    IsNull,
+    IsNotNull,
+    In(Vec<serde_json::Value>),
+}
+
+/// Filter expression with boolean logic
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FilterExpr {
+    Predicate(FieldPredicate),
+    And(Vec<FilterExpr>),
+    Or(Vec<FilterExpr>),
+    Not(Box<FilterExpr>),
+}
+
+/// Filter for session list queries
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionListFilter {
+    pub filter: Option<FilterExpr>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+/// Individual session item for list display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionListItem {
+    pub session_id: String,
+    pub name: Option<String>,
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub created_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub updated_at: Option<OffsetDateTime>,
+}
+
+/// Group of sessions by CWD
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionGroup {
+    pub cwd: Option<String>,
+    pub sessions: Vec<SessionListItem>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub latest_activity: Option<OffsetDateTime>,
+}
+
+/// Session list view with grouping
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionListView {
+    pub groups: Vec<SessionGroup>,
+    pub total_count: usize,
+    #[serde(with = "time::serde::rfc3339")]
+    pub generated_at: OffsetDateTime,
 }

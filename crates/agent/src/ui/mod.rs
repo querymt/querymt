@@ -142,8 +142,17 @@ fn collect_event_sources(agent: &Arc<QueryMTAgent>) -> Vec<Arc<EventBus>> {
 struct SessionSummary {
     session_id: String,
     name: Option<String>,
+    cwd: Option<String>,
+    title: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SessionGroup {
+    cwd: Option<String>,
+    sessions: Vec<SessionSummary>,
+    latest_activity: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -191,7 +200,7 @@ enum UiServerMessage {
         message: String,
     },
     SessionList {
-        sessions: Vec<SessionSummary>,
+        groups: Vec<SessionGroup>,
     },
     SessionLoaded {
         session_id: String,
@@ -790,32 +799,38 @@ fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
 }
 
 async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>) {
-    let sessions = match state.agent.provider.history_store().list_sessions().await {
-        Ok(sessions) => sessions,
+    // Use ViewStore to get pre-grouped session list
+    let view = match state.view_store.get_session_list_view(None).await {
+        Ok(view) => view,
         Err(e) => {
             let _ = send_error(tx, format!("Failed to list sessions: {}", e)).await;
             return;
         }
     };
 
-    let summaries: Vec<SessionSummary> = sessions
+    // Convert to UI message format
+    let groups: Vec<SessionGroup> = view
+        .groups
         .into_iter()
-        .take(50) // Limit to 50 most recent
-        .map(|s| SessionSummary {
-            session_id: s.public_id,
-            name: s.name,
-            created_at: s.created_at.and_then(|t| t.format(&Rfc3339).ok()),
-            updated_at: s.updated_at.and_then(|t| t.format(&Rfc3339).ok()),
+        .map(|g| SessionGroup {
+            cwd: g.cwd,
+            latest_activity: g.latest_activity.and_then(|t| t.format(&Rfc3339).ok()),
+            sessions: g
+                .sessions
+                .into_iter()
+                .map(|s| SessionSummary {
+                    session_id: s.session_id,
+                    name: s.name,
+                    cwd: s.cwd,
+                    title: s.title,
+                    created_at: s.created_at.and_then(|t| t.format(&Rfc3339).ok()),
+                    updated_at: s.updated_at.and_then(|t| t.format(&Rfc3339).ok()),
+                })
+                .collect(),
         })
         .collect();
 
-    let _ = send_message(
-        tx,
-        UiServerMessage::SessionList {
-            sessions: summaries,
-        },
-    )
-    .await;
+    let _ = send_message(tx, UiServerMessage::SessionList { groups }).await;
 }
 
 async fn handle_get_file_index(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<String>) {

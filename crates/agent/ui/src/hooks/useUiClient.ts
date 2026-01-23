@@ -6,6 +6,7 @@ import {
   UiClientMessage,
   UiServerMessage,
   SessionSummary,
+  SessionGroup,
   AuditView,
   AgentEvent,
   FileIndexEntry,
@@ -23,6 +24,7 @@ export function useUiClient() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [sessionHistory, setSessionHistory] = useState<SessionSummary[]>([]);
+  const [sessionGroups, setSessionGroups] = useState<SessionGroup[]>([]);
   const [sessionAudit, setSessionAudit] = useState<AuditView | null>(null);
   const [thinkingAgentId, setThinkingAgentId] = useState<string | null>(null);
   const [isConversationComplete, setIsConversationComplete] = useState(false);
@@ -125,15 +127,17 @@ export function useUiClient() {
         setEvents((prev) => [...prev, translateAgentEvent(msg.agent_id, msg.event)]);
         break;
       }
-      case 'error':
+      case 'error': {
         console.error('UI server error:', msg.message);
         // Reset thinking state on error - the agent has stopped processing
         setThinkingAgentId(null);
         // Check if this is a file index related error and notify
-        if (fileIndexErrorCallbackRef.current && 
-            (msg.message.includes('workspace') || 
-             msg.message.includes('File index') || 
-             msg.message.includes('working directory'))) {
+        if (
+          fileIndexErrorCallbackRef.current &&
+          (msg.message.includes('workspace') ||
+            msg.message.includes('File index') ||
+            msg.message.includes('working directory'))
+        ) {
           fileIndexErrorCallbackRef.current(msg.message);
         }
         setEvents((prev) => [
@@ -141,14 +145,19 @@ export function useUiClient() {
           {
             id: `ui-error-${Date.now()}-${Math.random()}`,
             agentId: 'system',
-            type: 'agent',
-            content: `UI server error: ${msg.message}`,
+            type: 'system',
+            content: msg.message,
             timestamp: Date.now(),
+            isMessage: true,
           },
         ]);
         break;
+      }
       case 'session_list':
-        setSessionHistory(msg.sessions);
+        setSessionGroups(msg.groups);
+        // Flatten groups for backwards compatibility with Sidebar
+        const flatSessions = msg.groups.flatMap(g => g.sessions);
+        setSessionHistory(flatSessions);
         break;
       case 'session_loaded':
         setSessionId(msg.session_id);
@@ -237,6 +246,7 @@ export function useUiClient() {
     setActiveAgent: selectAgent,
     setRoutingMode: selectRoutingMode,
     sessionHistory,
+    sessionGroups,
     loadSession,
     sessionAudit,
     thinkingAgentId,
@@ -360,10 +370,11 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
   if (kind === 'error') {
     return {
       id,
-      agentId,
-      type: 'agent',
+      agentId: 'system',
+      type: 'system',
       content: event.kind?.message ?? 'Error',
       timestamp,
+      isMessage: true,
     };
   }
 
@@ -523,6 +534,18 @@ function translateLoadedEvent(agentId: string, event: AgentEvent): EventItem {
       content: `Event: provider_changed`,
       timestamp,
       contextLimit: providerChanged.context_limit,
+    };
+  }
+
+  if (kind.type === 'error') {
+    const errorEvent = kind as { type: 'error'; message?: string };
+    return {
+      id,
+      agentId: 'system',
+      type: 'system',
+      content: errorEvent.message ?? 'Error',
+      timestamp,
+      isMessage: true,
     };
   }
 

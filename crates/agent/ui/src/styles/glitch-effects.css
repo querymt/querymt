@@ -1,0 +1,279 @@
+/* Glitch Text Effects - Exact port from CodePen */
+/* https://codepen.io/jh3y/pen/jOOQjYP */
+
+/* Base setup for split characters (replaces splitting.css) */
+.splitting .char {
+  display: inline-block;
+  position: relative;
+}
+
+.glitch {
+  display: inline-block;
+}
+
+.glitch .char {
+  color: #fff;
+}
+
+/* ===== GLITCH-0 VARIANT - Jump and translate (CodePen) ===== */
+.glitch--0 {
+  animation: glitch--0 4s infinite steps(1);
+}
+
+/* Apply jump only to selected characters */
+.glitch--0 [data-char].glitch-0-active {
+  animation: jump-0 calc(var(--speed, 1) * 1s) infinite steps(1);
+}
+
+@keyframes glitch--0 {
+  0%, 50%, 58% {
+    transform: translate(0, 0) scale(1);
+  }
+  52% {
+    transform: translate(-25%, 10%) scale(0.85);
+  }
+  56% {
+    transform: translate(5%, -20%) scale(1.25);
+  }
+}
+
+@keyframes jump-0 {
+  0%, 50%, 60% {
+    transform: translate(0, 0) scale(1);
+  }
+  52% {
+    transform: translate(calc(var(--x-1) * 1%), calc(var(--y-1) * 1%)) scale(var(--scale-1));
+  }
+  54% {
+    transform: translate(calc(var(--x-2) * 1%), calc(var(--y-2) * 1%)) scale(var(--scale-2));
+  }
+}
+
+/* ===== GLITCH-3 VARIANT - The classic RGB split effect (continuous) ===== */
+.glitch--3 [data-char] {
+  --split: 50;
+  color: transparent;
+  position: relative;
+  animation: glitch--3 1.5s infinite ease-in-out alternate-reverse;
+}
+
+.glitch--3 [data-char]::after,
+.glitch--3 [data-char]::before {
+  content: attr(data-char);
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 100%;
+  color: #fff;
+  -webkit-clip-path: var(--clip);
+  clip-path: var(--clip);
+}
+
+.glitch--3 [data-char]::after {
+  transform: translate(calc(var(--shift) * 1%), 0);
+  --clip: inset(0 0 calc(var(--split) * 1%) 0);
+  text-shadow: calc(var(--shadow) * 1px) calc(var(--shadow) * 1px) #ff0000;
+}
+
+.glitch--3 [data-char]::before {
+  --clip: inset(calc((95 - var(--split)) * 1%) 0 0 0);
+  text-shadow: calc(var(--shadow) * -1px) 0 #00fff9;
+}
+
+@keyframes glitch--3 {
+  0% {
+    --split: 20;
+    --shift: 15;
+    --shadow: -2;
+  }
+  5% {
+    --split: 30;
+    --shift: 15;
+    --shadow: -2;
+  }
+  10% {
+    --split: 80;
+    --shift: 10;
+    --shadow: -2;
+  }
+  15% {
+    --split: 55;
+    --shift: 10;
+    --shadow: -2;
+  }
+  20%, 50% {
+    --split: 0;
+    --shift: 0;
+    --shadow: 0;
+  }
+  100% {
+    --split: 0;
+    --shift: 0;
+    --shadow: 0;
+  }
+}
+
+/* ===== GLITCH-12 VARIANT ===== */
+/* Exact copy of glitch--12 from CodePen - torn/frayed effect */
+.glitch--12 [data-char] {
+  --split: 70;
+  color: transparent;
+  position: relative;
+}
+
+.glitch--12 [data-char]::after,
+.glitch--12 [data-char]::before {
+  content: attr(data-char);
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 100%;
+  color: #fff;
+  -webkit-clip-path: var(--clip);
+  clip-path: var(--clip);
+}
+
+.glitch--12 [data-char]::after {
+  --clip: inset(0 0 calc(var(--split) * 1%) 0);
+  --shift-x: -125;
+  animation: shift 4s infinite steps(1);
+}
+
+.glitch--12 [data-char]::before {
+  animation: shift 8s infinite steps(1);
+  --shift-x: 50;
+  --shift-y: 50;
+  --clip: inset(calc((95 - var(--split)) * 1%) 0 0 0);
+}
+
+.glitch--12 [data-char='G'] {
+  animation: squash 3s infinite steps(2);
+}
+
+.glitch--12 [data-char='C'] {
+  animation: squash 4s infinite steps(2);
+}
+
+.glitch--12 [data-char='H'] {
+  --scale: 1.5;
+  animation: squash 4s infinite steps(2);
+}
+
+/* ===== GLITCH-5 VARIANT - RGB shadow with skew ===== */
+.glitch--5 [data-char] {
+  position: relative;
+  animation: glitch--5 2s infinite alternate, glitch-scale 4s -2s infinite steps(1);
+}
+
+.glitch--5 [data-char]::after,
+.glitch--5 [data-char]::before {
+  content: attr(data-char);
+  transform: skew(calc(var(--skew, 0) * 1deg));
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 100%;
+  color: #fff;
+  opacity: 0.75;
+}
+
+.glitch--5 [data-char]::after {
+  text-shadow: calc(var(--spread, 0) * -1px) calc(var(--spread, 0) * -1px) #ff0000;
+}
+
+.glitch--5 [data-char]::before {
+  text-shadow: calc(var(--spread, 0) * 1px) calc(var(--spread, 0) * 1px) #00fff9;
+}
+
+@keyframes glitch--5 {
+  0% {
+    --spread: 3;
+    --skew: 0;
+  }
+  5% {
+    --spread: -1;
+  }
+  10% {
+    --spread: -4;
+    --skew: 5;
+  }
+  12% {
+    --spread: 3;
+    --skew: 3;
+  }
+  15% {
+    --spread: 1;
+  }
+  18% {
+    --spread: 4;
+    --skew: -4;
+  }
+  25%, 100% {
+    --skew: 0;
+    --spread: 0;
+  }
+}
+
+@keyframes glitch-scale {
+  0%, 47%, 55%, 100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(var(--scale, 1.15));
+  }
+}
+
+@keyframes squash {
+  0%, 48%, 52%, 100% {
+    transform: scaleY(1);
+  }
+  50% {
+    transform: scaleY(var(--scale, 0));
+  }
+}
+
+/* ===== GLITCH-8 VARIANT - Split shift effect ===== */
+.glitch--8 [data-char] {
+  --split: 50;
+  color: transparent;
+  position: relative;
+}
+
+.glitch--8 [data-char]::after,
+.glitch--8 [data-char]::before {
+  content: attr(data-char);
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 100%;
+  color: #fff;
+  -webkit-clip-path: var(--clip);
+  clip-path: var(--clip);
+}
+
+.glitch--8 [data-char]::after {
+  --clip: inset(0 0 calc(var(--split) * 1%) 0);
+  --shift-y: -20;
+  --shift-x: 50;
+  animation: shift 3s infinite steps(1);
+}
+
+.glitch--8 [data-char]::before {
+  --shift-x: -50;
+  animation: shift 4s infinite steps(1);
+  --clip: inset(calc((95 - var(--split)) * 1%) 0 0 0);
+}
+
+/* Exact keyframe from CodePen */
+@keyframes shift {
+  0%, 68%, 72%, 100% {
+    transform: translate(0, 0);
+  }
+  70% {
+    transform: translate(calc(var(--shift-x, 25) * 1%), calc(var(--shift-y, 0) * 1%));
+  }
+}

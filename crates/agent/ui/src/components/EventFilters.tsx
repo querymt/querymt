@@ -14,7 +14,7 @@ interface EventFiltersProps {
   agents: UiAgentInfo[];
 }
 
-const EVENT_TYPES: EventItem['type'][] = ['user', 'agent', 'tool_call', 'tool_result'];
+const EVENT_TYPES: EventItem['type'][] = ['user', 'agent', 'tool_call', 'tool_result', 'system'];
 
 export function EventFiltersBar({
   events,

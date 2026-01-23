@@ -20,6 +20,8 @@
     "react-mentions": "^4.4.10",
     "react-virtuoso": "^4.6.2",
     "remark-gfm": "^4.0.1",
+    "shiki": "^1.29.2",
+    "splitting": "^1.1.0",
     "zod": "^4.3.5"
   },
   "devDependencies": {

@@ -1,3 +1,7 @@
+/* Circuit board and glitch effects - must come before @tailwind */
+@import './styles/circuit-background.css';
+@import './styles/glitch-effects.css';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -126,4 +130,606 @@
 * {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* ===== Tool Summary & Modal Styles ===== */
+
+/* Fade in animation */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.2s ease-out;
+}
+
+/* Fade in and slide up animation */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.25s ease-out;
+}
+
+/* ===== Delegation Connector Styles ===== */
+
+/* Container for delegation accordion with connector line */
+.delegation-container {
+  position: relative;
+  padding-left: 16px;
+}
+
+/* Vertical connector line from delegate tool to accordion */
+.delegation-connector {
+  position: absolute;
+  left: 0;
+  top: -8px;
+  bottom: 0;
+  width: 3px;
+  background: var(--connector-color, #b026ff);
+  border-radius: 2px;
+  opacity: 0.5;
+  transition: opacity 0.3s ease;
+}
+
+/* Active connector with pulsing animation */
+.delegation-connector.active {
+  opacity: 1;
+  animation: connector-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes connector-pulse {
+  0%, 100% {
+    opacity: 0.5;
+    box-shadow: 0 0 4px var(--connector-color, #b026ff);
+  }
+  50% {
+    opacity: 1;
+    box-shadow: 0 0 12px var(--connector-color, #b026ff);
+  }
+}
+
+/* Connector appears on hover over delegation container */
+.delegation-container:hover .delegation-connector {
+  opacity: 0.8;
+}
+
+/* SVG connector animation for active state */
+.delegation-connector-active {
+  animation: dash-flow 0.5s linear infinite;
+}
+
+@keyframes dash-flow {
+  from {
+    stroke-dashoffset: 8;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* ===== Modal Styles ===== */
+
+/* Modal backdrop */
+.modal-backdrop {
+  @apply fixed inset-0 z-50 flex items-center justify-center;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+}
+
+/* Modal content container */
+.modal-content {
+  @apply relative bg-cyber-surface border border-cyber-border rounded-lg;
+  box-shadow: 0 0 40px rgba(0, 255, 249, 0.2);
+  max-height: 85vh;
+  max-width: 90vw;
+}
+
+/* ===== Accordion Styles ===== */
+
+/* Accordion header */
+.accordion-header {
+  @apply flex items-center gap-3 px-4 py-2.5 text-left w-full;
+  @apply transition-colors duration-200;
+  @apply bg-cyber-surface/40 hover:bg-cyber-surface/60;
+}
+
+.accordion-header[data-expanded="true"] {
+  @apply bg-cyber-surface/80;
+}
+
+/* Accordion content with slide animation */
+.accordion-content {
+  @apply overflow-hidden;
+  max-height: 0;
+  transition: max-height 0.3s ease-out;
+}
+
+.accordion-content[data-expanded="true"] {
+  max-height: 500px;
+}
+
+/* ===== Tool Summary Card Styles ===== */
+
+/* Compact tool card hover effect */
+.tool-summary-card {
+  @apply flex items-center gap-2 px-3 py-1.5 rounded-md cursor-pointer;
+  @apply transition-all duration-200;
+  @apply bg-cyber-surface/60 border border-cyber-border/50;
+}
+
+.tool-summary-card:hover {
+  @apply bg-cyber-surface border-cyber-cyan/40;
+  box-shadow: 0 0 10px rgba(0, 255, 249, 0.15);
+}
+
+/* Delegate tool card with left accent */
+.tool-summary-card.delegate {
+  border-left-width: 2px;
+  border-left-color: #b026ff;
+}
+
+/* Failed tool card with orange accent */
+.tool-summary-card.failed {
+  border-left-width: 2px;
+  border-left-color: #ff6b35;
+}
+
+/* ===== Glow Pulse Animation ===== */
+
+@keyframes glow-pulse {
+  0%, 100% {
+    filter: drop-shadow(0 0 2px currentColor);
+  }
+  50% {
+    filter: drop-shadow(0 0 8px currentColor);
+  }
+}
+
+.animate-glow-pulse {
+  animation: glow-pulse 2s ease-in-out infinite;
+}
+
+/* ===== Scrollbar Styling ===== */
+
+/* Custom scrollbar for modal and accordion content */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 3px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(0, 255, 249, 0.3);
+  border-radius: 3px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 255, 249, 0.5);
+}
+
+/* ===== Turn Card Styles ===== */
+
+.turn-card {
+  @apply mb-6;
+}
+
+.user-message {
+  @apply mb-3;
+}
+
+.agent-response {
+  /* Additional styling handled inline in component */
+}
+
+.activity-section {
+  /* Styling handled in ActivitySection component */
+}
+
+/* Message content - remove prose bloat, use custom styles */
+.message-content {
+  @apply text-sm leading-relaxed;
+}
+
+.message-content p:first-child {
+  margin-top: 0;
+}
+
+.message-content p:last-child {
+  margin-bottom: 0;
+}
+
+/* Better spacing for lists */
+.message-content ul,
+.message-content ol {
+  @apply my-2;
+}
+
+.message-content li {
+  @apply leading-relaxed;
+}
+
+/* Code blocks */
+.message-content pre {
+  @apply my-3;
+}
+
+/* Inline code */
+.message-content code {
+  font-size: 0.9em;
+}
+
+/* Headings */
+.message-content h1,
+.message-content h2,
+.message-content h3 {
+  @apply font-semibold;
+}
+
+.message-content h1:first-child,
+.message-content h2:first-child,
+.message-content h3:first-child {
+  margin-top: 0;
+}
+
+/* ===== Session Timeline Styles ===== */
+
+/* Timeline container */
+.session-timeline {
+  @apply sticky top-0 z-40 bg-cyber-bg/95 backdrop-blur-sm;
+  @apply border-b border-cyber-border/50;
+  @apply px-4 py-3;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+}
+
+/* Horizontal track for timeline dots */
+.timeline-track {
+  @apply flex items-center gap-1 overflow-x-auto pb-2;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 255, 249, 0.3) transparent;
+}
+
+/* Spacing between turns */
+.timeline-turn-spacer {
+  width: 12px;
+  flex-shrink: 0;
+}
+
+/* Base timeline dot */
+.timeline-dot {
+  @apply relative rounded-full flex-shrink-0;
+  @apply transition-all duration-200;
+  @apply border-0 p-0 bg-current;
+  cursor: pointer;
+  outline: none;
+}
+
+/* Dot sizes */
+.timeline-dot-large {
+  width: 8px;
+  height: 8px;
+}
+
+.timeline-dot-medium {
+  width: 6px;
+  height: 6px;
+}
+
+.timeline-dot-small {
+  width: 5px;
+  height: 5px;
+}
+
+.timeline-dot-tiny {
+  width: 3px;
+  height: 3px;
+}
+
+/* Dot colors */
+.timeline-dot-cyber-cyan {
+  color: #00fff9;
+}
+
+.timeline-dot-cyber-magenta {
+  color: #ff00ff;
+}
+
+.timeline-dot-cyber-purple {
+  color: #b026ff;
+}
+
+.timeline-dot-cyber-orange {
+  color: #ff6b35;
+}
+
+.timeline-dot-cyber-lime {
+  color: #39ff14;
+}
+
+/* Hover effect - scale up and add glow */
+.timeline-dot:hover {
+  transform: scale(1.4);
+  filter: drop-shadow(0 0 4px currentColor);
+}
+
+/* Active turn highlight - larger with pulsing glow */
+.timeline-dot.active {
+  transform: scale(1.5);
+  animation: timeline-pulse 2s ease-in-out infinite;
+}
+
+@keyframes timeline-pulse {
+  0%, 100% {
+    filter: drop-shadow(0 0 3px currentColor);
+  }
+  50% {
+    filter: drop-shadow(0 0 8px currentColor);
+  }
+}
+
+/* Hovered turn - all dots in turn get subtle highlight */
+.timeline-dot.hovered {
+  transform: scale(1.2);
+  filter: drop-shadow(0 0 3px currentColor);
+}
+
+/* Focus visible for accessibility */
+.timeline-dot:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+/* ===== Syntax Highlighter Overrides ===== */
+
+/* Override shiki's gray background with cyber-bg */
+.highlighted-code-container pre {
+  background: #0a0e27 !important; /* cyber-bg color */
+  margin: 0;
+  padding: 1rem;
+}
+
+.highlighted-code-container code {
+  background: transparent !important;
+}
+
+/* ===== Pinned User Message - Left Side Card ===== */
+
+.pinned-user-card {
+  position: fixed;
+  top: 80px; /* Below header */
+  /* Position card with equal gaps on both sides */
+  /* Right edge: 20px gap to the centered content (which starts at 50% - 28rem) */
+  /* Left edge: 20px gap from screen edge */
+  left: 20px;
+  right: calc(50% + 28rem + 20px); /* 28rem = half of 56rem (max-w-4xl), plus 20px gap */
+  min-width: 160px; /* Fallback minimum */
+  max-width: 300px; /* Don't get too wide */
+  max-height: 300px;
+  z-index: 40;
+  
+  /* Ghost-like styling */
+  background: rgba(20, 27, 61, 0.7);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 0, 255, 0.2); /* cyber-magenta */
+  border-radius: 8px;
+  padding: 12px;
+  
+  /* Slide-in animation */
+  animation: slide-in-left 0.3s ease-out;
+}
+
+.pinned-user-card-text {
+  font-size: 12px;
+  font-weight: 600; /* Bold text */
+  color: #9ca3af; /* gray-400 */
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 8; /* Max 8 lines (increased since card is wider) */
+  -webkit-box-orient: vertical;
+  line-height: 1.4;
+}
+
+.pinned-user-card-header {
+  font-size: 10px;
+  font-weight: 600;
+  color: #ff00ff; /* cyber-magenta */
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pinned-user-card-jump {
+  font-size: 11px;
+  color: #ff00ff;
+  margin-top: 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  transition: color 0.2s;
+}
+
+.pinned-user-card-jump:hover {
+  color: #ff66ff;
+}
+
+/* ===== Pinned User Message - Top Bar (Narrow Screens) ===== */
+
+.pinned-user-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 60px; /* Below header */
+  height: 44px;
+  z-index: 40;
+  
+  /* Ghost-like styling */
+  background: rgba(20, 27, 61, 0.85);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid rgba(255, 0, 255, 0.2);
+  
+  /* Layout */
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  gap: 12px;
+  
+  /* Slide-in animation */
+  animation: slide-in-top 0.3s ease-out;
+}
+
+.pinned-user-bar-text {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 600; /* Bold text */
+  color: #9ca3af;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pinned-user-bar-jump {
+  font-size: 12px;
+  color: #ff00ff;
+  cursor: pointer;
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  transition: color 0.2s;
+}
+
+.pinned-user-bar-jump:hover {
+  color: #ff66ff;
+}
+
+/* ===== Animations ===== */
+
+@keyframes slide-in-left {
+  from {
+    transform: translateX(-100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes slide-in-top {
+  from {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* ===== Responsive ===== */
+
+@media (max-width: 1099px) {
+  .pinned-user-card {
+    display: none;
+  }
+}
+
+@media (min-width: 1100px) {
+  .pinned-user-bar {
+    display: none;
+  }
+}
+
+/* ===== Session Picker Styles ===== */
+
+/* Filter input glow */
+.session-filter-input {
+  position: relative;
+}
+
+.session-filter-input:focus {
+  box-shadow: 0 0 20px rgba(0, 255, 249, 0.3);
+}
+
+/* Group header pulse */
+.session-group-header {
+  position: relative;
+}
+
+.session-group-header:hover {
+  box-shadow: 0 0 15px rgba(0, 255, 249, 0.15);
+}
+
+/* Session card entrance animation */
+@keyframes session-card-entrance {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.session-card {
+  position: relative;
+  overflow: hidden;
+}
+
+/* Hover glow effect */
+.session-card:hover {
+  box-shadow: 0 0 20px rgba(0, 255, 249, 0.2);
+}
+
+/* Border trace animation on hover */
+.session-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, #00fff9, transparent);
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+
+.session-card:hover::before {
+  opacity: 1;
+  animation: border-trace 1.5s ease-in-out infinite;
+}
+
+@keyframes border-trace {
+  0% {
+    left: -100%;
+  }
+  100% {
+    left: 100%;
+  }
 }

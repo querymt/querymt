@@ -35,8 +35,9 @@ pub use repo_task::SqliteTaskRepository;
 pub mod projection;
 
 pub use projection::{
-    AuditView, DefaultRedactor, EventStore, FieldSensitivity, RedactedView, RedactionPolicy,
-    Redactor, SummaryView, ViewStore,
+    AuditView, DefaultRedactor, EventStore, FieldPredicate, FieldSensitivity, FilterExpr,
+    PredicateOp, RedactedView, RedactionPolicy, Redactor, SessionGroup, SessionListFilter,
+    SessionListItem, SessionListView, SummaryView, ViewStore,
 };
 
 // Phase 3: Runtime integration

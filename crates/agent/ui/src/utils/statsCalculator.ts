@@ -33,6 +33,9 @@ export function calculateStats(events: EventItem[]): CalculatedStats {
   let sessionEndTimestamp: number | undefined;
   
   for (const event of events) {
+    if (event.type === 'system') {
+      continue;
+    }
     const agentId = event.agentId || 'unknown';
     const timestamp = event.timestamp;
     

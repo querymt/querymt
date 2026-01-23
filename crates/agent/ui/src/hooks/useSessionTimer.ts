@@ -68,6 +68,9 @@ export function useSessionTimer(
     
     // Process events to reconstruct timing state
     for (const event of events) {
+      if (event.type === 'system') {
+        continue;
+      }
       const agentId = event.agentId || 'unknown';
       const timestamp = event.timestamp;
       lastEventTimestamp = Math.max(lastEventTimestamp, timestamp);

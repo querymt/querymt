@@ -1,19 +1,20 @@
-import { useState, useRef, useEffect, useMemo } from 'react';
+import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Virtuoso } from 'react-virtuoso';
-import { Activity, Send, CheckCircle, XCircle, Loader, Menu, Plus } from 'lucide-react';
-import { PatchDiff } from '@pierre/diffs/react';
+import { Activity, Send, CheckCircle, XCircle, Loader, Menu, Plus, Code } from 'lucide-react';
 import { useUiClient } from './hooks/useUiClient';
 import { useSessionTimer } from './hooks/useSessionTimer';
 import { useFileMention } from './hooks/useFileMention';
-import { EventItem, EventFilters, UiAgentInfo } from './types';
+import { EventItem, EventRow, DelegationGroupInfo, Turn } from './types';
 import { Sidebar } from './components/Sidebar';
-import { MessageContent } from './components/MessageContent';
 import { ThinkingIndicator } from './components/ThinkingIndicator';
-import { EventFiltersBar } from './components/EventFilters';
 import { FloatingStatsPanel } from './components/FloatingStatsPanel';
 import { MentionInput } from './components/MentionInput';
-import { getAgentColor } from './utils/agentColors';
-import { getAgentShortName } from './utils/agentNames';
+import { ToolDetailModal } from './components/ToolDetailModal';
+import { TurnCard } from './components/TurnCard';
+import { CircuitBackground } from './components/CircuitBackground';
+import { GlitchText } from './components/GlitchText';
+import { SessionPicker } from './components/SessionPicker';
+import { SystemLog } from './components/SystemLog';
 
 function App() {
   const {
@@ -28,6 +29,7 @@ function App() {
     setActiveAgent,
     setRoutingMode,
     sessionHistory,
+    sessionGroups,
     loadSession,
     thinkingAgentId,
     isConversationComplete,
@@ -48,14 +50,11 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sessionCopied, setSessionCopied] = useState(false);
   const copyTimeoutRef = useRef<number | null>(null);
-  const [filters, setFilters] = useState<EventFilters>({
-    types: new Set(['user', 'agent', 'tool_call', 'tool_result']),
-    agents: new Set(),
-    tools: new Set(),
-    searchQuery: '',
-  });
   const [expertMode, setExpertMode] = useState(false);
   const activeIndexStatus = sessionId ? workspaceIndexStatus[sessionId]?.status : undefined;
+  
+  // Modal state for tool details
+  const [selectedToolEvent, setSelectedToolEvent] = useState<EventRow | null>(null);
   
   // File mention hook
   const fileMention = useFileMention(requestFileIndex);
@@ -82,11 +81,9 @@ function App() {
     };
   }, []);
 
-
   // Keyboard shortcut: Cmd+N / Ctrl+N to create new session
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Cmd+N (Mac) or Ctrl+N (Windows/Linux) to create new session
       if ((e.metaKey || e.ctrlKey) && e.key === 'n') {
         e.preventDefault();
         if (connected && !loading) {
@@ -102,7 +99,6 @@ function App() {
   const handleSendPrompt = async () => {
     if (!prompt.trim() || loading || !sessionId) return;
 
-    // Clear file mention state
     fileMention.clear();
 
     setLoading(true);
@@ -115,10 +111,6 @@ function App() {
       setLoading(false);
     }
   };
-
-
-
-
 
   const handleNewSession = async () => {
     try {
@@ -160,56 +152,82 @@ function App() {
 
   // Calculate session info
   const sessionInfo = sessionId ? {
-    messageCount: events.length,
+    messageCount: events.filter((event) => event.type !== 'system').length,
     createdAt: events.length > 0 ? events[0].timestamp : Date.now(),
   } : undefined;
 
-  const derivedEvents = useMemo(() => buildEventRows(events), [events]);
+  // Build turns from events
+  const { turns } = useMemo(
+    () => buildTurns(events, thinkingAgentId),
+    [events, thinkingAgentId]
+  );
+  const systemEvents = useMemo(
+    () => events.filter((event) => event.type === 'system'),
+    [events]
+  );
+  const [systemClearIndex, setSystemClearIndex] = useState(0);
+  const visibleSystemEvents = useMemo(
+    () => systemEvents.slice(systemClearIndex),
+    [systemEvents, systemClearIndex]
+  );
 
-  const filteredEvents = useMemo(() => {
-    return derivedEvents.filter((event) => {
-      // Filter out verbose internal events unless in expert mode
-      if (!expertMode && event.type === 'agent') {
-        const content = event.content?.toLowerCase() || '';
-        const verbosePatterns = [
-          'event: llm_request_start',
-          'event: llm_request_end',
-          'event: progress_recorded',
-          'event: intent_captured',
-          'event: decision_recorded',
-          'event: task_created',
-          'event: task_updated',
-          'event: artifact_stored',
-        ];
-        if (verbosePatterns.some(pattern => content.includes(pattern))) {
-          return false;
-        }
-      }
+  useEffect(() => {
+    if (systemEvents.length === 0) {
+      setSystemClearIndex(0);
+      return;
+    }
+    if (systemClearIndex > systemEvents.length) {
+      setSystemClearIndex(0);
+    }
+  }, [systemEvents, systemClearIndex]);
 
-      if (!filters.types.has(event.type)) return false;
-      
-      if (filters.agents.size > 0 && event.agentId && !filters.agents.has(event.agentId)) {
-        return false;
+  const handleClearSystemEvents = useCallback(() => {
+    setSystemClearIndex(systemEvents.length);
+  }, [systemEvents.length]);
+
+  const filteredTurns = useMemo(() => {
+    // For now, show all turns. We can add turn-level filtering later if needed
+    return turns;
+  }, [turns]);
+  const hasTurns = filteredTurns.length > 0;
+
+  // Calculate last user message turn index for pinned message
+  const lastUserMessageTurnIndex = useMemo(() => {
+    for (let i = filteredTurns.length - 1; i >= 0; i--) {
+      if (filteredTurns[i].userMessage) {
+        return i;
       }
-      
-      if (filters.tools.size > 0) {
-        const toolName = event.toolCall?.kind;
-        if (!toolName || !filters.tools.has(toolName)) return false;
+    }
+    return -1;
+  }, [filteredTurns]);
+
+  // Handle tool click to open modal
+  const handleToolClick = useCallback((event: EventRow) => {
+    setSelectedToolEvent(event);
+  }, []);
+
+  // Handle delegation click - scroll to accordion
+  const handleDelegateClick = useCallback((delegationId: string) => {
+    setTimeout(() => {
+      const accordion = document.querySelector(`[data-delegation-id="${delegationId}"]`);
+      if (accordion) {
+        accordion.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
-      
-      if (filters.searchQuery) {
-        const query = filters.searchQuery.toLowerCase();
-        const content = event.content?.toLowerCase() || '';
-        const toolName = event.toolCall?.kind?.toLowerCase() || '';
-        if (!content.includes(query) && !toolName.includes(query)) return false;
-      }
-      
-      return true;
-    });
-  }, [derivedEvents, filters, expertMode]);
+    }, 100);
+  }, []);
+
+  // Render event item (used for delegations)
+  const renderEventItem = useCallback((_event: EventRow) => {
+    // For delegation child events, we don't need special rendering
+    // They're just shown in a simple list
+    return null;
+  }, []);
 
   return (
-    <div className="flex flex-col h-screen bg-cyber-bg text-gray-100 grid-background">
+    <div className="flex flex-col h-screen bg-cyber-bg text-gray-100 relative">
+      {/* Circuit Board Background */}
+      <CircuitBackground className="opacity-20" />
+      
       {/* Sidebar */}
       <Sidebar
         isOpen={sidebarOpen}
@@ -237,7 +255,9 @@ function App() {
             <Menu className="w-6 h-6 text-cyber-cyan" />
           </button>
           <Activity className="w-6 h-6 text-cyber-cyan animate-glow-pulse" />
-          <h1 className="text-xl font-semibold neon-text-cyan">QueryMT Agent</h1>
+          <h1 className="text-xl font-semibold neon-text-cyan">
+            <GlitchText text="QueryMT Agent" variant="3" />
+          </h1>
         </div>
         <div className="flex items-center gap-4 flex-wrap justify-end">
           {activeAgentId && (
@@ -269,32 +289,33 @@ function App() {
               {sessionCopied && <span className="ml-2 text-cyber-lime">Copied</span>}
             </button>
           )}
+          <button
+            onClick={() => setExpertMode(!expertMode)}
+            className={`flex items-center gap-1 px-3 py-1.5 rounded border text-sm transition-colors ${
+              expertMode
+                ? 'border-cyber-purple text-cyber-purple bg-cyber-purple/10'
+                : 'border-cyber-border text-gray-400 hover:border-cyber-purple/50'
+            }`}
+            title="Toggle expert mode (show all internal events)"
+          >
+            <Code className="w-4 h-4" />
+            <span>Expert</span>
+          </button>
         </div>
       </header>
 
       {/* Event Timeline */}
       <div className="flex-1 overflow-hidden flex flex-col relative">
-        {events.length > 0 && (
-          <EventFiltersBar
-            events={derivedEvents}
-            filters={filters}
-            onFiltersChange={setFilters}
-            filteredCount={filteredEvents.length}
-            totalCount={derivedEvents.length}
-            expertMode={expertMode}
-            onExpertModeChange={setExpertMode}
-            agents={agents}
-          />
-        )}
         <div className="flex-1 overflow-hidden">
-          {events.length === 0 ? (
-            <div className="flex items-center justify-center h-full text-gray-500">
-              <div className="text-center space-y-6 animate-fade-in">
-                <Activity className="w-16 h-16 mx-auto opacity-30 text-cyber-cyan" />
-                <div>
-                  <p className="text-lg text-gray-400">No events yet</p>
-                  {!sessionId && (
-                    <div className="mt-4 space-y-3">
+          {!hasTurns ? (
+            <div className="flex items-center justify-center h-full">
+              {!sessionId ? (
+                // No active session
+                sessionGroups.length === 0 ? (
+                  // No sessions exist - show welcome + new session button
+                  <div className="text-center space-y-6 animate-fade-in">
+                    <div>
+                      <p className="text-lg text-gray-400 mb-6">Welcome to QueryMT</p>
                       <button
                         onClick={handleNewSession}
                         disabled={!connected || loading}
@@ -316,24 +337,51 @@ function App() {
                         ) : (
                           <>
                             <Plus className="w-6 h-6" />
-                            <span>Start New Session</span>
+                            <GlitchText text="Start New Session" variant="0" hoverOnly />
                           </>
                         )}
                       </button>
-                      <p className="text-xs text-gray-500">
+                      <p className="text-xs text-gray-500 mt-3">
                         or press <kbd className="px-2 py-1 bg-cyber-bg border border-cyber-border rounded text-cyber-cyan font-mono text-[10px]">
                           {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+N
                         </kbd> to create a session
                       </p>
                     </div>
-                  )}
+                  </div>
+                ) : (
+                  // Sessions exist - show session picker
+                  <SessionPicker
+                    groups={sessionGroups}
+                    onSelectSession={loadSession}
+                    onNewSession={handleNewSession}
+                    disabled={!connected || loading}
+                  />
+                )
+              ) : (
+                // Active session but no events yet - ready to chat
+                <div className="text-center space-y-6 animate-fade-in text-gray-500">
+                  <Activity className="w-16 h-16 mx-auto opacity-30 text-cyber-cyan animate-glow-pulse" />
+                  <div>
+                    <p className="text-lg text-gray-400">Session Ready</p>
+                    <p className="text-sm text-gray-500 mt-2">Start chatting below to begin</p>
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
           ) : (
             <Virtuoso
-              data={filteredEvents}
-              itemContent={(_index, event) => <EventCard key={event.id} event={event} agents={agents} />}
+              data={filteredTurns}
+              itemContent={(index, turn) => (
+                <TurnCard
+                  key={turn.id}
+                  turn={turn}
+                  agents={agents}
+                  onToolClick={handleToolClick}
+                  onDelegateClick={handleDelegateClick}
+                  renderEvent={renderEventItem}
+                  isLastUserMessage={index === lastUserMessageTurnIndex}
+                />
+              )}
               followOutput="smooth"
               className="h-full"
             />
@@ -350,10 +398,17 @@ function App() {
         />
       </div>
 
-      {/* Thinking/Completion Indicator - shows above input when agent is processing or just completed */}
+      {/* Thinking/Completion Indicator */}
       {thinkingAgentId !== null && <ThinkingIndicator agentId={thinkingAgentId} agents={agents} />}
       {thinkingAgentId === null && isConversationComplete && (
         <ThinkingIndicator agentId={thinkingAgentId} agents={agents} isComplete={true} />
+      )}
+
+      {visibleSystemEvents.length > 0 && (
+        <SystemLog
+          events={visibleSystemEvents}
+          onClear={handleClearSystemEvents}
+        />
       )}
 
       {/* Input Area */}
@@ -378,7 +433,7 @@ function App() {
               bg-cyber-cyan/10 border-2 border-cyber-cyan text-cyber-cyan
               hover:bg-cyber-cyan/20 hover:shadow-neon-cyan
               disabled:opacity-30 disabled:cursor-not-allowed
-              flex items-center gap-2
+              flex items-center gap-2 overflow-visible
             "
           >
             {loading ? (
@@ -389,151 +444,122 @@ function App() {
             ) : (
               <>
                 <Send className="w-5 h-5" />
-                <span>Send</span>
+                <GlitchText text="Send" variant="0" hoverOnly />
               </>
             )}
           </button>
         </div>
       </div>
-    </div>
-  );
-}
 
-function EventCard({ event, agents }: { event: EventRow; agents: UiAgentInfo[] }) {
-  const depth = event.depth ?? 0;
-  const toolName = event.toolName ?? inferToolName(event);
-  const toolKind = inferToolKind(event) ?? event.toolCall?.kind;
-  const agentColor = event.agentId ? getAgentColor(event.agentId) : undefined;
+      {/* Tool Detail Modal */}
+      {selectedToolEvent && (
+        <ToolDetailModal
+          event={selectedToolEvent}
+          onClose={() => setSelectedToolEvent(null)}
+        />
+      )}
 
-  // For merged tool calls, determine status from result
-  const isToolCall = event.type === 'tool_call';
-  const hasMergedResult = isToolCall && event.mergedResult;
-  const toolStatus = hasMergedResult 
-    ? event.mergedResult?.toolCall?.status 
-    : event.toolCall?.status;
-  const isInProgress = isToolCall && !hasMergedResult;
-
-  const bgColor = {
-    user: 'bg-cyber-surface/80 border-cyber-magenta/30 shadow-[0_0_15px_rgba(255,0,255,0.1)]',
-    agent: 'bg-cyber-surface/50 border-cyber-border shadow-[0_0_10px_rgba(0,255,249,0.05)]',
-    tool_call: 'bg-cyber-surface/80 border-cyber-purple/30 shadow-[0_0_15px_rgba(176,38,255,0.1)]',
-    tool_result: 'bg-cyber-surface/80 border-cyber-lime/30 shadow-[0_0_15px_rgba(57,255,20,0.1)]',
-  }[event.type];
-
-  const labelColor = {
-    user: 'neon-text-magenta',
-    agent: 'neon-text-cyan',
-    tool_call: 'text-cyber-purple',
-    tool_result: 'neon-text-lime',
-  }[event.type];
-
-  const depthOffset = depth * 18;
-  const hasHierarchy = depth > 0;
-
-  return (
-    <div className="mx-4 my-1" style={{ marginLeft: depthOffset }}>
-      <div
-        className={`relative rounded-md border px-3 py-2 ${bgColor} animate-fade-in-up ${
-          hasHierarchy ? 'pl-4' : ''
-        }`}
-        style={{
-          borderLeftWidth: agentColor ? '3px' : undefined,
-          borderLeftColor: agentColor,
-          borderLeftStyle: agentColor ? 'solid' : undefined,
-        }}
-      >
-        {hasHierarchy && (
-          <>
-            <div className="absolute left-0 top-0 bottom-0 w-px bg-cyber-border/50" />
-            <div className="absolute -left-1.5 top-3 h-2 w-2 rounded-full bg-cyber-border/80" />
-          </>
-        )}
-        <div className="flex items-start gap-2">
-          <div className="flex-1 min-w-0">
-            <div className="flex flex-wrap items-center gap-2 text-[11px] tracking-wide">
-              {(event.agentId || event.type === 'user') && (
-                <span className={`font-semibold ${labelColor} normal-case`}>
-                  {event.type === 'user' ? 'User' : getAgentShortName(event.agentId!, agents)}
-                </span>
-              )}
-              <span className="text-gray-500 normal-case">
-                {new Date(event.timestamp).toLocaleTimeString()}
-              </span>
-              {toolName && (
-                <span className="text-[10px] font-mono bg-cyber-bg/80 px-2 py-0.5 rounded border border-cyber-border text-cyber-cyan">
-                  {toolName}
-                </span>
-              )}
-              {!toolName && toolKind && (
-                <span className="text-[10px] font-mono bg-cyber-bg/80 px-2 py-0.5 rounded border border-cyber-border text-cyber-cyan">
-                  {toolKind}
-                </span>
-              )}
-              {isInProgress && (
-                <span className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded border bg-cyber-purple/10 border-cyber-purple/30 text-cyber-purple normal-case">
-                  <Loader className="w-3 h-3 animate-spin" />
-                  running...
-                </span>
-              )}
-              {toolStatus && !isInProgress && (
-                <span
-                  className={`text-[10px] px-2 py-0.5 rounded border normal-case ${
-                    toolStatus === 'completed'
-                      ? 'bg-cyber-lime/10 border-cyber-lime/30 text-cyber-lime'
-                      : toolStatus === 'failed'
-                      ? 'bg-cyber-orange/10 border-cyber-orange/30 text-cyber-orange'
-                      : 'bg-cyber-purple/10 border-cyber-purple/30 text-cyber-purple'
-                  }`}
-                >
-                  {toolStatus}
-                </span>
-              )}
-            </div>
-            {event.type !== 'tool_result' && event.type !== 'tool_call' && event.content && (
-              <div className="mt-1 text-sm text-gray-200">
-                <MessageContent content={event.content} />
-              </div>
-            )}
-            {event.type === 'tool_call' && event.content && (
-              <div className="mt-1 text-sm text-gray-300">
-                <MessageContent content={event.content} />
-              </div>
-            )}
-            {event.type === 'tool_result' && (
-              <div className="mt-2 text-sm text-gray-200">
-                <ToolResultContent event={event} />
-              </div>
-            )}
-            {/* For merged tool calls, show input and result together */}
-            {event.type === 'tool_call' && (
-              <>
-                <ToolInputContent event={event} />
-                {hasMergedResult && event.mergedResult && (
-                  <div className="mt-2">
-                    <div className="text-[10px] text-gray-500 uppercase mb-1">Result</div>
-                    <ToolResultContent event={event.mergedResult as EventRow} />
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-        </div>
-      </div>
     </div>
   );
 }
 
 export default App;
 
-type EventRow = EventItem & {
-  depth: number;
-  parentId?: string;
-  toolName?: string;
-  mergedResult?: EventItem; // For merged tool_call + tool_result
-};
+// Build turns from event rows
+function buildTurns(events: EventItem[], thinkingAgentId: string | null): {
+  turns: Turn[];
+  allEventRows: EventRow[];
+} {
+  // First, build event rows with delegation grouping (from previous implementation)
+  const { rows, delegationGroups } = buildEventRowsWithDelegations(events);
+  
+  const turns: Turn[] = [];
+  let currentTurn: Turn | null = null;
+  let turnCounter = 0;
 
-function buildEventRows(events: EventItem[]): EventRow[] {
+  for (const row of rows) {
+    // Skip events that are part of a delegation (they'll be in the delegation group)
+    if (row.delegationGroupId && !row.isDelegateToolCall) {
+      continue;
+    }
+
+    // User message starts a new turn
+    if (row.type === 'user') {
+      // Close previous turn
+      if (currentTurn) {
+        currentTurn.endTime = currentTurn.endTime || row.timestamp;
+        currentTurn.isActive = false;
+        turns.push(currentTurn);
+      }
+      
+      // Start new turn
+      currentTurn = {
+        id: `turn-${turnCounter++}`,
+        userMessage: row,
+        agentMessages: [],
+        toolCalls: [],
+        delegations: [],
+        agentId: undefined,
+        startTime: row.timestamp,
+        endTime: undefined,
+        isActive: true,
+      };
+    } else if (currentTurn) {
+      // Add to current turn (only real messages, not internal events)
+      if (row.type === 'agent' && row.isMessage) {
+        currentTurn.agentMessages.push(row);
+        if (!currentTurn.agentId && row.agentId) {
+          currentTurn.agentId = row.agentId;
+        }
+        currentTurn.endTime = row.timestamp;
+      } else if (row.type === 'tool_call' || row.type === 'tool_result') {
+        // Only add tool_call events (results are merged)
+        if (row.type === 'tool_call') {
+          currentTurn.toolCalls.push(row);
+          
+          // Add delegation group if this is a delegate tool
+          if (row.isDelegateToolCall && row.delegationGroupId) {
+            const delGroup = delegationGroups.get(row.delegationGroupId);
+            if (delGroup) {
+              currentTurn.delegations.push(delGroup);
+            }
+          }
+        }
+        currentTurn.endTime = row.timestamp;
+      }
+    } else if (row.type === 'agent' && row.isMessage) {
+      // No current turn (agent-initiated message)
+      // Only create a turn if it's an actual message, not tool calls
+      currentTurn = {
+        id: `turn-${turnCounter++}`,
+        userMessage: undefined,
+        agentMessages: [row],
+        toolCalls: [],
+        delegations: [],
+        agentId: row.agentId,
+        startTime: row.timestamp,
+        endTime: row.timestamp,
+        isActive: true,
+      };
+    }
+  }
+
+  // Close final turn
+  if (currentTurn) {
+    currentTurn.isActive = thinkingAgentId !== null;
+    turns.push(currentTurn);
+  }
+
+  return { turns, allEventRows: rows };
+}
+
+// Build event rows with delegation grouping (from previous implementation)
+function buildEventRowsWithDelegations(events: EventItem[]): {
+  rows: EventRow[];
+  delegationGroups: Map<string, DelegationGroupInfo>;
+} {
   const rows: EventRow[] = [];
+  const delegationGroups = new Map<string, DelegationGroupInfo>();
   const depthMap = new Map<string, number>();
   const toolCallMap = new Map<
     string,
@@ -543,9 +569,14 @@ function buildEventRows(events: EventItem[]): EventRow[] {
   let currentAgentId: string | null = null;
 
   for (const event of events) {
+    if (event.type === 'system') {
+      continue;
+    }
     let depth = 0;
     let parentId: string | undefined;
     let toolName: string | undefined;
+    let isDelegateToolCall = false;
+    let delegationGroupId: string | undefined;
 
     if (event.type === 'tool_call') {
       const toolCallKey = event.toolCall?.tool_call_id ?? event.id;
@@ -566,24 +597,59 @@ function buildEventRows(events: EventItem[]): EventRow[] {
         name: toolName,
         rowIndex,
       });
-      if (event.toolCall?.kind === 'delegate') {
+
+      // Check if this is a delegate tool call
+      if (event.toolCall?.kind === 'delegate' || event.toolCall?.kind === 'mcp_task') {
+        isDelegateToolCall = true;
+        delegationGroupId = toolCallKey;
         openDelegations.push(toolCallKey);
+        
+        // Create delegation group
+        delegationGroups.set(toolCallKey, {
+          id: toolCallKey,
+          delegateToolCallId: toolCallKey,
+          delegateEvent: { ...event, depth, parentId, toolName, isDelegateToolCall: true, delegationGroupId: toolCallKey },
+          events: [],
+          status: 'in_progress',
+          startTime: event.timestamp,
+        });
+      }
+      
+      // If we're inside a delegation, mark this event
+      if (openDelegations.length > 0 && !isDelegateToolCall) {
+        delegationGroupId = openDelegations[openDelegations.length - 1];
+        const group = delegationGroups.get(delegationGroupId);
+        if (group) {
+          const childRow: EventRow = { ...event, depth, parentId, toolName, delegationGroupId };
+          group.events.push(childRow);
+          if (event.agentId && !group.agentId) {
+            group.agentId = event.agentId;
+          }
+        }
       }
       
       depthMap.set(event.id, depth);
-      rows.push({ ...event, depth, parentId, toolName });
+      rows.push({ ...event, depth, parentId, toolName, isDelegateToolCall, delegationGroupId });
     } else if (event.type === 'tool_result') {
       const toolCallKey = event.toolCall?.tool_call_id;
       const toolParent = toolCallKey ? toolCallMap.get(toolCallKey) : undefined;
       
       if (toolParent && toolParent.rowIndex !== undefined) {
-        // Merge result into the tool_call row instead of creating a new row
+        // Merge result into the tool_call row
         const toolCallRow = rows[toolParent.rowIndex];
         if (toolCallRow) {
           toolCallRow.mergedResult = event;
         }
+        
+        // Also update delegation group's delegate event
+        if (toolCallKey && delegationGroups.has(toolCallKey)) {
+          const group = delegationGroups.get(toolCallKey)!;
+          group.delegateEvent.mergedResult = event;
+          group.endTime = event.timestamp;
+          group.status = event.toolCall?.status === 'failed' ? 'failed' : 'completed';
+        }
       } else {
-        // No matching tool_call, render as separate event (shouldn't happen normally)
+        // No matching tool_call
         if (toolParent) {
           parentId = toolParent.eventId;
           depth = toolParent.depth + 1;
@@ -594,10 +660,21 @@ function buildEventRows(events: EventItem[]): EventRow[] {
         } else {
           depth = 1;
         }
+        
+        // Check if inside a delegation
+        if (openDelegations.length > 0) {
+          delegationGroupId = openDelegations[openDelegations.length - 1];
+          const group = delegationGroups.get(delegationGroupId);
+          if (group) {
+            group.events.push({ ...event, depth, parentId, toolName, delegationGroupId });
+          }
+        }
+        
         depthMap.set(event.id, depth);
-        rows.push({ ...event, depth, parentId, toolName });
+        rows.push({ ...event, depth, parentId, toolName, delegationGroupId });
       }
       
+      // Close delegation if this result completes it
       if (
         toolCallKey &&
         openDelegations[openDelegations.length - 1] === toolCallKey &&
@@ -608,259 +685,36 @@ function buildEventRows(events: EventItem[]): EventRow[] {
         openDelegations.pop();
       }
     } else {
+      // user or agent event
       if (openDelegations.length > 0) {
         const delegationId = openDelegations[openDelegations.length - 1];
         const delegationDepth = toolCallMap.get(delegationId)?.depth ?? 1;
         depth = delegationDepth + 1;
         parentId = toolCallMap.get(delegationId)?.eventId;
+        delegationGroupId = delegationId;
+        
+        // Add to delegation group
+        const group = delegationGroups.get(delegationId);
+        if (group) {
+          group.events.push({ ...event, depth, parentId, toolName, delegationGroupId });
+          if (event.agentId && !group.agentId) {
+            group.agentId = event.agentId;
+          }
+        }
       }
       if (event.type === 'agent') {
         currentAgentId = event.id;
       }
       
       depthMap.set(event.id, depth);
-      rows.push({ ...event, depth, parentId, toolName });
+      rows.push({ ...event, depth, parentId, toolName, delegationGroupId });
     }
   }
 
-  return rows;
-}
-
-function ToolInputContent({ event }: { event: EventItem }) {
-  const rawInput = parseJsonMaybe(event.toolCall?.raw_input) ?? event.toolCall?.raw_input;
-  if (!rawInput) return null;
-
-  const toolKind = event.toolCall?.kind;
-  const patchValue = extractPatchValue(rawInput);
-  const editInput = extractEditInput(rawInput);
-  const isApplyPatch = toolKind === 'apply_patch' || typeof patchValue === 'string';
-  const isEdit = toolKind === 'edit' || (editInput?.oldString && editInput?.newString);
-
-  if (isApplyPatch) {
-    const { cleaned, patch } = stripPatchFromInput(rawInput, patchValue ?? '');
-    const hasExtra = cleaned && Object.keys(cleaned).length > 0;
-    return (
-      <details className="mt-2">
-        <summary className="text-[11px] text-cyber-cyan cursor-pointer hover:text-cyber-magenta transition-colors">
-          Patch Input
-        </summary>
-        <div className="mt-2 event-diff-container">
-          <PatchDiff
-            patch={patch ?? ''}
-            options={{
-              theme: 'github-dark',
-              themeType: 'dark',
-              diffStyle: 'unified',
-              diffIndicators: 'bars',
-              overflow: 'wrap',
-              useCSSClasses: true,
-              disableBackground: true,
-            }}
-          />
-        </div>
-        {hasExtra && (
-          <pre className="mt-2 p-2 bg-cyber-bg/80 border border-cyber-border rounded-md text-xs overflow-x-auto">
-            {JSON.stringify(cleaned, null, 2)}
-          </pre>
-        )}
-      </details>
-    );
-  }
-
-  if (isEdit && editInput) {
-    const { cleaned, patch } = stripEditFromInput(rawInput, editInput);
-    const hasExtra = cleaned && Object.keys(cleaned).length > 0;
-    return (
-      <details open className="mt-2">
-        <summary className="text-[11px] text-cyber-cyan cursor-pointer hover:text-cyber-magenta transition-colors">
-          Edit Input
-        </summary>
-        <div className="mt-2 event-diff-container">
-          <PatchDiff
-            patch={patch}
-            options={{
-              theme: 'pierre-dark',
-              themeType: 'dark',
-              diffStyle: 'split',
-              diffIndicators: 'bars',
-              lineDiffType: 'word-alt',
-              overflow: 'wrap',
-              disableLineNumbers: false,
-              useCSSClasses: true,
-              disableBackground: true,
-            }}
-          />
-        </div>
-        {hasExtra && (
-          <pre className="mt-2 p-2 bg-cyber-bg/80 border border-cyber-border rounded-md text-xs overflow-x-auto">
-            {JSON.stringify(cleaned, null, 2)}
-          </pre>
-        )}
-      </details>
-    );
-  }
-
-  return (
-    <details className="mt-2">
-      <summary className="text-[11px] text-cyber-cyan cursor-pointer hover:text-cyber-magenta transition-colors">
-        View Input
-      </summary>
-      <pre className="mt-2 p-2 bg-cyber-bg/80 border border-cyber-border rounded-md text-xs overflow-x-auto">
-        {JSON.stringify(rawInput, null, 2)}
-      </pre>
-    </details>
-  );
-}
-
-function ToolResultContent({ event }: { event: EventRow }) {
-  const toolName = event.toolName ?? inferToolName(event);
-  const toolKind = inferToolKind(event);
-  if (toolName === 'shell' || toolKind === 'shell') {
-    return (
-      <ShellOutput
-        rawOutput={event.toolCall?.raw_output ?? event.content}
-        fallback={event.content}
-      />
-    );
-  }
-  if (toolName === 'read_file' || toolKind === 'read_file') {
-    return (
-      <ReadFileOutput
-        rawOutput={event.toolCall?.raw_output ?? event.content}
-        fallback={event.content}
-      />
-    );
-  }
-  if (!event.content) return null;
-  return (
-    <pre className="text-xs font-mono bg-cyber-bg/70 border border-cyber-border rounded-md p-2 overflow-x-auto">
-      {event.content}
-    </pre>
-  );
-}
-
-function ShellOutput({
-  rawOutput,
-  fallback,
-}: {
-  rawOutput?: unknown;
-  fallback?: string;
-}) {
-  const parsed = parseJsonMaybe(rawOutput) ?? parseJsonMaybe(fallback);
-  const stdout =
-    typeof parsed?.stdout === 'string'
-      ? parsed.stdout
-      : typeof rawOutput === 'string'
-      ? rawOutput
-      : fallback ?? '';
-  const stderr = typeof parsed?.stderr === 'string' ? parsed.stderr : '';
-  const exitCode = typeof parsed?.exit_code === 'number' ? parsed.exit_code : undefined;
-
-  return (
-    <div className="rounded-md border border-cyber-border/70 bg-black/60 font-mono text-xs text-gray-200">
-      <div className="flex items-center justify-between px-2 py-1 border-b border-cyber-border/60 text-[10px] uppercase tracking-wide text-gray-400">
-        <span>terminal</span>
-        {exitCode !== undefined && <span>exit {exitCode}</span>}
-      </div>
-      <div className="max-h-64 overflow-auto p-2 space-y-2">
-        {stdout && (
-          <div>
-            <div className="text-[10px] uppercase tracking-wide text-gray-400">stdout</div>
-            <pre className="whitespace-pre-wrap break-words">{stdout}</pre>
-          </div>
-        )}
-        {stderr && (
-          <div>
-            <div className="text-[10px] uppercase tracking-wide text-gray-400">stderr</div>
-            <pre className="whitespace-pre-wrap break-words text-cyber-orange/90">
-              {stderr}
-            </pre>
-          </div>
-        )}
-        {!stdout && !stderr && (
-          <div className="text-gray-500 text-[11px]">No output</div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ReadFileOutput({
-  rawOutput,
-  fallback,
-}: {
-  rawOutput?: unknown;
-  fallback?: string;
-}) {
-  const parsed = parseJsonMaybe(rawOutput) ?? parseJsonMaybe(fallback);
-  const filePath = typeof parsed?.path === 'string' ? parsed.path : undefined;
-  const content = typeof parsed?.content === 'string' ? parsed.content : fallback ?? '';
-  const startLine = typeof parsed?.start_line === 'number' ? parsed.start_line : undefined;
-  const endLine = typeof parsed?.end_line === 'number' ? parsed.end_line : undefined;
-
-  return (
-    <details className="rounded-md border border-cyber-border/70 bg-cyber-bg/70 p-2">
-      <summary className="cursor-pointer text-[11px] text-cyber-cyan hover:text-cyber-magenta transition-colors">
-        Read file{filePath ? `: ${filePath}` : ''}
-        {startLine !== undefined && endLine !== undefined ? ` (${startLine}-${endLine})` : ''}
-      </summary>
-      {typeof parsed?.content === 'string' ? (
-        <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words text-xs font-mono text-gray-200">
-          {content || 'No content'}
-        </pre>
-      ) : (
-        <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words text-xs font-mono text-gray-200">
-          {parsed ? JSON.stringify(parsed, null, 2) : content || 'No content'}
-        </pre>
-      )}
-    </details>
-  );
-}
-
-function parseJsonMaybe(value: unknown): any | undefined {
-  if (typeof value === 'string') {
-    try {
-      const parsed = JSON.parse(value);
-      if (typeof parsed === 'string') {
-        const trimmed = parsed.trim();
-        if (
-          (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
-          (trimmed.startsWith('[') && trimmed.endsWith(']'))
-        ) {
-          try {
-            return JSON.parse(trimmed);
-          } catch {
-            return parsed;
-          }
-        }
-      }
-      return parsed;
-    } catch {
-      return undefined;
-    }
-  }
-  if (typeof value === 'object' && value !== null) {
-    return value;
-  }
-  return undefined;
-}
-
-function inferToolKind(event: EventItem): string | undefined {
-  if (event.toolCall?.kind) return event.toolCall.kind;
-  const parsed = parseJsonMaybe(event.toolCall?.raw_output ?? event.content);
-  if (!parsed || typeof parsed !== 'object') return undefined;
-  if (typeof parsed.stdout === 'string' || typeof parsed.stderr === 'string') {
-    return 'shell';
-  }
-  if (typeof parsed.path === 'string' && typeof parsed.content === 'string') {
-    return 'read_file';
-  }
-  return undefined;
+  return { rows, delegationGroups };
 }
 
 function inferToolName(event: EventItem): string | undefined {
-  const named = (event as EventRow).toolName;
-  if (typeof named === 'string' && named.length > 0) return named;
   const toolCallId = event.toolCall?.tool_call_id;
   if (typeof toolCallId === 'string' && toolCallId.includes(':')) {
     const name = toolCallId.split(':')[0];
@@ -872,142 +726,4 @@ function inferToolName(event: EventItem): string | undefined {
     if (match?.[1]) return match[1];
   }
   return undefined;
-}
-
-function extractPatchValue(rawInput: unknown): string | undefined {
-  if (!rawInput) return undefined;
-  if (typeof rawInput === 'object' && rawInput !== null) {
-    const direct = (rawInput as { patch?: unknown }).patch;
-    if (typeof direct === 'string') return direct;
-    const args = (rawInput as { arguments?: unknown }).arguments;
-    if (typeof args === 'string') {
-      const parsed = parseJsonMaybe(args);
-      if (typeof parsed?.patch === 'string') return parsed.patch;
-    }
-    if (typeof args === 'object' && args !== null) {
-      const argPatch = (args as { patch?: unknown }).patch;
-      if (typeof argPatch === 'string') return argPatch;
-    }
-  }
-  if (typeof rawInput === 'string') {
-    const parsed = parseJsonMaybe(rawInput);
-    if (typeof parsed?.patch === 'string') return parsed.patch;
-  }
-  return undefined;
-}
-
-type EditInput = {
-  filePath?: string;
-  oldString?: string;
-  newString?: string;
-};
-
-function extractEditInput(rawInput: unknown): EditInput | undefined {
-  if (!rawInput) return undefined;
-  if (typeof rawInput === 'object' && rawInput !== null) {
-    const direct = rawInput as EditInput & { arguments?: unknown };
-    if (direct.oldString || direct.newString || direct.filePath) {
-      return {
-        filePath: direct.filePath,
-        oldString: direct.oldString,
-        newString: direct.newString,
-      };
-    }
-    const args = direct.arguments;
-    if (typeof args === 'string') {
-      const parsed = parseJsonMaybe(args);
-      if (parsed && typeof parsed === 'object') {
-        const parsedEdit = parsed as EditInput;
-        return {
-          filePath: parsedEdit.filePath,
-          oldString: parsedEdit.oldString,
-          newString: parsedEdit.newString,
-        };
-      }
-    }
-    if (typeof args === 'object' && args !== null) {
-      const parsedEdit = args as EditInput;
-      return {
-        filePath: parsedEdit.filePath,
-        oldString: parsedEdit.oldString,
-        newString: parsedEdit.newString,
-      };
-    }
-  }
-  if (typeof rawInput === 'string') {
-    const parsed = parseJsonMaybe(rawInput);
-    if (parsed && typeof parsed === 'object') {
-      const parsedEdit = parsed as EditInput;
-      return {
-        filePath: parsedEdit.filePath,
-        oldString: parsedEdit.oldString,
-        newString: parsedEdit.newString,
-      };
-    }
-  }
-  return undefined;
-}
-
-function buildEditPatch(editInput: EditInput): string {
-  const rawPath = editInput.filePath ?? 'file';
-  const normalizedPath = rawPath.replace(/^\/+/, '') || 'file';
-  const oldText = editInput.oldString ?? '';
-  const newText = editInput.newString ?? '';
-  const oldLines = oldText.split('\n').length;
-  const newLines = newText.split('\n').length;
-  const oldBlock = oldText
-    .split('\n')
-    .map((line) => `-${line}`)
-    .join('\n');
-  const newBlock = newText
-    .split('\n')
-    .map((line) => `+${line}`)
-    .join('\n');
-  return [
-    `diff --git a/${normalizedPath} b/${normalizedPath}`,
-    `--- a/${normalizedPath}`,
-    `+++ b/${normalizedPath}`,
-    `@@ -1,${oldLines} +1,${newLines} @@`,
-    oldBlock,
-    newBlock,
-  ].join('\n');
-}
-
-function stripEditFromInput(rawInput: unknown, editInput: EditInput) {
-  const patch = buildEditPatch(editInput);
-  if (typeof rawInput !== 'object' || rawInput === null) {
-    return { cleaned: undefined as Record<string, unknown> | undefined, patch };
-  }
-  const input = { ...(rawInput as Record<string, unknown>) };
-  if ('oldString' in input) delete input.oldString;
-  if ('newString' in input) delete input.newString;
-  if ('filePath' in input) delete input.filePath;
-  if (typeof input.arguments === 'object' && input.arguments !== null) {
-    const args = { ...(input.arguments as Record<string, unknown>) };
-    if ('oldString' in args) delete args.oldString;
-    if ('newString' in args) delete args.newString;
-    if ('filePath' in args) delete args.filePath;
-    input.arguments = args;
-  }
-  return { cleaned: input, patch };
-}
-
-function stripPatchFromInput(rawInput: unknown, patchValue: string) {
-  if (typeof rawInput !== 'object' || rawInput === null) {
-    return { cleaned: undefined as Record<string, unknown> | undefined, patch: patchValue };
-  }
-  const input = { ...(rawInput as Record<string, unknown>) };
-  if (input.patch === patchValue) {
-    delete input.patch;
-    return { cleaned: input, patch: patchValue };
-  }
-  if (typeof input.arguments === 'object' && input.arguments !== null) {
-    const args = { ...(input.arguments as Record<string, unknown>) };
-    if (args.patch === patchValue) {
-      delete args.patch;
-      input.arguments = args;
-      return { cleaned: input, patch: patchValue };
-    }
-  }
-  return { cleaned: input, patch: patchValue };
 }

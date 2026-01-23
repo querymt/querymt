@@ -17,7 +17,7 @@ export interface FileIndexEntry {
 export interface EventItem {
   id: string;
   agentId?: string;
-  type: 'user' | 'agent' | 'tool_call' | 'tool_result';
+  type: 'user' | 'agent' | 'tool_call' | 'tool_result' | 'system';
   content: string;
   timestamp: number;
   isMessage?: boolean;  // True for actual user/assistant messages (not internal events)
@@ -57,8 +57,16 @@ export interface UiAgentInfo {
 export interface SessionSummary {
   session_id: string;
   name?: string;
+  cwd?: string;
+  title?: string;
   created_at?: string;
   updated_at?: string;
+}
+
+export interface SessionGroup {
+  cwd?: string;
+  sessions: SessionSummary[];
+  latest_activity?: string;
 }
 
 // Event filters
@@ -183,6 +191,41 @@ export interface Delegation {
   created_at: string;
 }
 
+// Extended event row with display metadata (used in App.tsx)
+export interface EventRow extends EventItem {
+  depth: number;
+  parentId?: string;
+  toolName?: string;
+  mergedResult?: EventItem; // For merged tool_call + tool_result
+  isDelegateToolCall?: boolean; // True if this is a delegate tool call
+  delegationGroupId?: string; // ID of the delegation group this belongs to
+}
+
+// Delegation group for accordion display
+export interface DelegationGroupInfo {
+  id: string;
+  delegateToolCallId: string;
+  delegateEvent: EventRow;
+  agentId?: string;
+  events: EventRow[];
+  status: 'in_progress' | 'completed' | 'failed';
+  startTime: number;
+  endTime?: number;
+}
+
+// Turn-based grouping for conversation display
+export interface Turn {
+  id: string;
+  userMessage?: EventRow; // User prompt that started this turn (if any)
+  agentMessages: EventRow[]; // Agent responses/thinking
+  toolCalls: EventRow[]; // All tool calls in this turn
+  delegations: DelegationGroupInfo[]; // Sub-agent delegations
+  agentId?: string; // Primary agent for this turn
+  startTime: number;
+  endTime?: number;
+  isActive: boolean; // Currently in progress
+}
+
 export type UiServerMessage =
   | {
       type: 'state';
@@ -205,7 +248,7 @@ export type UiServerMessage =
       type: 'error';
       message: string;
     }
-  | { type: 'session_list'; sessions: SessionSummary[] }
+  | { type: 'session_list'; groups: SessionGroup[] }
   | { type: 'session_loaded'; session_id: string; audit: AuditView }
   | {
       type: 'workspace_index_status';

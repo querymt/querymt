@@ -23,10 +23,106 @@ export function MessageContent({ content, type = 'text' }: MessageContentProps) 
     const segments = parseFileMentions(content);
     const hasMentions = segments.some(seg => seg.type === 'mention');
 
+    // Custom markdown components with better styling (no prose bloat)
+    const markdownComponents = {
+      // Code blocks with syntax highlighting
+      code(props: ComponentPropsWithoutRef<'code'> & { inline?: boolean }) {
+        const { inline, className, children, ...rest } = props;
+        return !inline ? (
+          <pre className="my-3 bg-cyber-bg/70 border border-cyber-border rounded-md p-3 overflow-x-auto font-mono text-sm">
+            <code className={className} {...rest}>
+              {children}
+            </code>
+          </pre>
+        ) : (
+          <code className="bg-cyber-bg/50 px-1.5 py-0.5 rounded text-cyber-cyan font-mono text-sm" {...rest}>
+            {children}
+          </code>
+        );
+      },
+      // Links
+      a(props: ComponentPropsWithoutRef<'a'>) {
+        const { children, ...rest } = props;
+        return (
+          <a className="text-cyber-cyan hover:text-cyber-magenta transition-colors underline" {...rest}>
+            {children}
+          </a>
+        );
+      },
+      // Paragraphs - tighter spacing
+      p(props: ComponentPropsWithoutRef<'p'>) {
+        const { children, ...rest } = props;
+        return (
+          <p className="mb-2 text-sm leading-relaxed text-gray-200" {...rest}>
+            {children}
+          </p>
+        );
+      },
+      // Lists - tighter spacing
+      ul(props: ComponentPropsWithoutRef<'ul'>) {
+        const { children, ...rest } = props;
+        return (
+          <ul className="my-2 ml-4 space-y-1 list-disc text-sm text-gray-200" {...rest}>
+            {children}
+          </ul>
+        );
+      },
+      ol(props: ComponentPropsWithoutRef<'ol'>) {
+        const { children, ...rest } = props;
+        return (
+          <ol className="my-2 ml-4 space-y-1 list-decimal text-sm text-gray-200" {...rest}>
+            {children}
+          </ol>
+        );
+      },
+      li(props: ComponentPropsWithoutRef<'li'>) {
+        const { children, ...rest } = props;
+        return (
+          <li className="text-gray-200" {...rest}>
+            {children}
+          </li>
+        );
+      },
+      // Headings - smaller, tighter
+      h1(props: ComponentPropsWithoutRef<'h1'>) {
+        const { children, ...rest } = props;
+        return (
+          <h1 className="text-lg font-semibold mt-4 mb-2 text-cyber-cyan" {...rest}>
+            {children}
+          </h1>
+        );
+      },
+      h2(props: ComponentPropsWithoutRef<'h2'>) {
+        const { children, ...rest } = props;
+        return (
+          <h2 className="text-base font-semibold mt-3 mb-2 text-cyber-cyan" {...rest}>
+            {children}
+          </h2>
+        );
+      },
+      h3(props: ComponentPropsWithoutRef<'h3'>) {
+        const { children, ...rest } = props;
+        return (
+          <h3 className="text-sm font-semibold mt-2 mb-1 text-gray-300" {...rest}>
+            {children}
+          </h3>
+        );
+      },
+      // Blockquotes
+      blockquote(props: ComponentPropsWithoutRef<'blockquote'>) {
+        const { children, ...rest } = props;
+        return (
+          <blockquote className="my-2 pl-4 border-l-2 border-cyber-cyan/50 text-gray-400 italic text-sm" {...rest}>
+            {children}
+          </blockquote>
+        );
+      },
+    };
+
     // If there are file mentions, render them specially
     if (hasMentions) {
       return (
-        <div className="prose prose-invert prose-sm max-w-none">
+        <div className="message-content">
           {segments.map((segment, index) => {
             if (segment.type === 'mention' && segment.mention) {
               return <FileMention key={index} mention={segment.mention} />;
@@ -36,32 +132,7 @@ export function MessageContent({ content, type = 'text' }: MessageContentProps) 
               <ReactMarkdown 
                 key={index}
                 remarkPlugins={[remarkGfm]}
-                components={{
-                  // Custom styling for code blocks
-                  code(props: ComponentPropsWithoutRef<'code'> & { inline?: boolean }) {
-                    const { inline, className, children, ...rest } = props;
-                    return !inline ? (
-                      <pre className="bg-cyber-bg/50 border border-cyber-border rounded-lg p-4 overflow-x-auto">
-                        <code className={className} {...rest}>
-                          {children}
-                        </code>
-                      </pre>
-                    ) : (
-                      <code className="bg-cyber-bg/50 px-1.5 py-0.5 rounded text-cyber-cyan" {...rest}>
-                        {children}
-                      </code>
-                    );
-                  },
-                  // Style links with neon cyan
-                  a(props: ComponentPropsWithoutRef<'a'>) {
-                    const { children, ...rest } = props;
-                    return (
-                      <a className="text-cyber-cyan hover:text-cyber-magenta transition-colors" {...rest}>
-                        {children}
-                      </a>
-                    );
-                  },
-                }}
+                components={markdownComponents}
               >
                 {segment.content}
               </ReactMarkdown>
@@ -73,35 +144,10 @@ export function MessageContent({ content, type = 'text' }: MessageContentProps) 
 
     // No mentions, render normally
     return (
-      <div className="prose prose-invert prose-sm max-w-none">
+      <div className="message-content">
         <ReactMarkdown 
           remarkPlugins={[remarkGfm]}
-          components={{
-            // Custom styling for code blocks
-            code(props: ComponentPropsWithoutRef<'code'> & { inline?: boolean }) {
-              const { inline, className, children, ...rest } = props;
-              return !inline ? (
-                <pre className="bg-cyber-bg/50 border border-cyber-border rounded-lg p-4 overflow-x-auto">
-                  <code className={className} {...rest}>
-                    {children}
-                  </code>
-                </pre>
-              ) : (
-                <code className="bg-cyber-bg/50 px-1.5 py-0.5 rounded text-cyber-cyan" {...rest}>
-                  {children}
-                </code>
-              );
-            },
-            // Style links with neon cyan
-            a(props: ComponentPropsWithoutRef<'a'>) {
-              const { children, ...rest } = props;
-              return (
-                <a className="text-cyber-cyan hover:text-cyber-magenta transition-colors" {...rest}>
-                  {children}
-                </a>
-              );
-            },
-          }}
+          components={markdownComponents}
         >
           {content}
         </ReactMarkdown>
