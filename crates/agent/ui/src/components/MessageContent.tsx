@@ -28,7 +28,8 @@ export function MessageContent({ content, type = 'text' }: MessageContentProps) 
       // Code blocks with syntax highlighting
       code(props: ComponentPropsWithoutRef<'code'> & { inline?: boolean }) {
         const { inline, className, children, ...rest } = props;
-        return !inline ? (
+        const isInline = inline ?? !className;
+        return !isInline ? (
           <pre className="my-3 bg-cyber-bg/70 border border-cyber-border rounded-md p-3 overflow-x-auto font-mono text-sm">
             <code className={className} {...rest}>
               {children}
