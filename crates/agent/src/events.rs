@@ -44,6 +44,8 @@ pub enum AgentEventKind {
         cost_usd: Option<f64>,
         /// Cumulative cost for the session in USD
         cumulative_cost_usd: Option<f64>,
+        /// Current context size (input + output tokens)
+        context_tokens: u64,
     },
     ProviderChanged {
         provider: String,

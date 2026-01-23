@@ -8,8 +8,8 @@ use crate::agent::core::{QueryMTAgent, SessionRuntime};
 use crate::delegation::{format_delegation_completion_message, format_delegation_failure_message};
 use crate::events::{AgentEvent, AgentEventKind};
 use crate::middleware::{
-    ConversationContext, ExecutionState, LlmResponse, TokenUsage, ToolCall as MiddlewareToolCall,
-    ToolFunction, ToolResult, WaitCondition, WaitReason,
+    ConversationContext, ExecutionState, LlmResponse, ToolCall as MiddlewareToolCall, ToolFunction,
+    ToolResult, WaitCondition, WaitReason, calculate_context_tokens,
 };
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::TaskStatus;
@@ -222,9 +222,7 @@ impl QueryMTAgent {
             }
         };
 
-        let usage = response
-            .usage()
-            .map(|u| TokenUsage::new(u.input_tokens as u64, u.output_tokens as u64));
+        let usage = response.usage();
         let response_content = response.text().unwrap_or_default();
         let tool_calls = response.tool_calls().unwrap_or_default();
         let finish_reason = response.finish_reason();
@@ -272,6 +270,8 @@ impl QueryMTAgent {
             span.record("cost_usd", cost);
         }
 
+        let context_tokens = calculate_context_tokens(response.usage().as_ref());
+
         self.emit_event(
             session_id,
             AgentEventKind::LlmRequestEnd {
@@ -280,6 +280,7 @@ impl QueryMTAgent {
                 finish_reason,
                 cost_usd: request_cost,
                 cumulative_cost_usd: cumulative_cost,
+                context_tokens,
             },
         );
 
@@ -412,8 +413,9 @@ impl QueryMTAgent {
         // Update stats with usage and cost information
         let mut updated_stats = (*context.stats).clone();
         if let Some(token_usage) = &response.usage {
-            updated_stats.total_input_tokens += token_usage.input_tokens;
-            updated_stats.total_output_tokens += token_usage.output_tokens;
+            updated_stats.total_input_tokens += token_usage.input_tokens as u64;
+            updated_stats.total_output_tokens += token_usage.output_tokens as u64;
+            updated_stats.context_tokens = calculate_context_tokens(Some(token_usage)) as usize;
             updated_stats.steps += 1;
 
             // Update cost information if pricing is available

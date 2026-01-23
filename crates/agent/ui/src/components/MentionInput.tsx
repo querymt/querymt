@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { MentionsInput, Mention, SuggestionDataItem } from 'react-mentions';
+import { MentionsInput, Mention, SuggestionDataItem, type MentionsInputStyle } from 'react-mentions';
 import { Loader } from 'lucide-react';
 import { FileIndexEntry } from '../types';
 
@@ -16,11 +16,12 @@ interface MentionInputProps {
 }
 
 // Cyberpunk theme styles for MentionsInput
-const mentionsInputStyle = {
+const mentionsInputStyle: MentionsInputStyle = {
   control: {
     backgroundColor: 'rgb(20, 27, 61)',
     fontSize: 16,
     fontWeight: 'normal',
+    width: '100%',
   },
   '&singleLine': {
     display: 'flex',
@@ -39,6 +40,31 @@ const mentionsInputStyle = {
       minHeight: '48px',
       outline: 'none',
       transition: 'all 0.2s',
+    },
+  },
+  '&multiLine': {
+    display: 'block',
+    highlighter: {
+      padding: '12px 40px 12px 16px',
+      border: 'none',
+      minHeight: '48px',
+      whiteSpace: 'pre-wrap',
+      wordBreak: 'break-word',
+      boxSizing: 'border-box',
+      width: '100%',
+    },
+    input: {
+      padding: '12px 40px 12px 16px',
+      border: '2px solid rgb(59, 68, 129)',
+      borderRadius: '8px',
+      backgroundColor: 'rgb(20, 27, 61)',
+      color: 'white',
+      minHeight: '48px',
+      outline: 'none',
+      transition: 'all 0.2s',
+      resize: 'none',
+      boxSizing: 'border-box',
+      width: '100%',
     },
   },
   suggestions: {
@@ -93,6 +119,8 @@ export function MentionInput({
   const [isFocused, setIsFocused] = useState(false);
   const callbackRef = useRef<((data: SuggestionDataItem[]) => void) | null>(null);
   const searchRef = useRef<string>('');
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const maxInputHeight = 180;
   
   // When files change from empty to populated, re-trigger the callback
   useEffect(() => {
@@ -113,6 +141,15 @@ export function MentionInput({
       callbackRef.current(data);
     }
   }, [files]);
+
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    input.style.height = 'auto';
+    const nextHeight = Math.min(input.scrollHeight, maxInputHeight);
+    input.style.height = `${nextHeight}px`;
+    input.style.overflowY = input.scrollHeight > maxInputHeight ? 'auto' : 'hidden';
+  }, [value, maxInputHeight]);
 
   // Convert FileIndexEntry[] to react-mentions format or use function
   const mentionData = useCallback((search: string, callback: (data: SuggestionDataItem[]) => void) => {
@@ -217,13 +254,13 @@ export function MentionInput({
         onBlur={() => setIsFocused(false)}
         placeholder={placeholder}
         disabled={disabled}
-        singleLine={true}
+        inputRef={inputRef}
         style={{
           ...mentionsInputStyle,
-          '&singleLine': {
-            ...mentionsInputStyle['&singleLine'],
+          '&multiLine': {
+            ...mentionsInputStyle['&multiLine'],
             input: {
-              ...mentionsInputStyle['&singleLine'].input,
+              ...mentionsInputStyle['&multiLine']!.input,
               borderColor: isFocused ? '#00fff9' : 'rgb(59, 68, 129)',
               boxShadow: isFocused ? '0 0 20px rgba(0, 255, 249, 0.3)' : 'none',
             },

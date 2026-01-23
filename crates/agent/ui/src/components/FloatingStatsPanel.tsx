@@ -19,11 +19,6 @@ function formatCost(usd: number): string {
   return `$${usd.toFixed(2)}`;
 }
 
-// Format tokens with thousand separators
-function formatTokens(count: number): string {
-  return count.toLocaleString();
-}
-
 // Format tokens with abbreviated suffixes (k, M)
 function formatTokensAbbrev(count: number): string {
   if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
@@ -227,11 +222,43 @@ export function FloatingStatsPanel({
                       </span>
                     </div>
                   </div>
-                  <div className="flex justify-between">
-                    <span className="text-gray-500">Tokens</span>
-                    <span className="text-gray-300 font-mono">
-                      {formatTokens(session.totalInputTokens)} in / {formatTokens(session.totalOutputTokens)} out
-                    </span>
+                  <div className="flex justify-between items-center">
+                    <span className="text-gray-500">Context</span>
+                    <div className="flex items-center gap-1.5 font-mono text-gray-300">
+                      {perAgent.length === 1 ? (
+                        // Single agent: no dot, just show context
+                        <span>
+                          {formatTokensAbbrev(perAgent[0].currentContextTokens)}
+                          {perAgent[0].maxContextTokens && (
+                            <span className="text-gray-500">
+                              {' '}({((perAgent[0].currentContextTokens / perAgent[0].maxContextTokens) * 100).toFixed(0)}%)
+                            </span>
+                          )}
+                        </span>
+                      ) : (
+                        // Multiple agents: colored dots with context
+                        perAgent.map((agentStats) => (
+                          <span
+                            key={agentStats.agentId}
+                            className="flex items-center gap-0.5"
+                            title={getAgentDisplayName(agentStats.agentId, agents)}
+                          >
+                            <span
+                              className="w-2 h-2 rounded-full inline-block"
+                              style={{ backgroundColor: getAgentColor(agentStats.agentId) }}
+                            />
+                            <span>
+                              {formatTokensAbbrev(agentStats.currentContextTokens)}
+                              {agentStats.maxContextTokens && (
+                                <span className="text-gray-500">
+                                  ({((agentStats.currentContextTokens / agentStats.maxContextTokens) * 100).toFixed(0)}%)
+                                </span>
+                              )}
+                            </span>
+                          </span>
+                        ))
+                      )}
+                    </div>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-gray-500">Cost</span>
@@ -268,12 +295,6 @@ export function FloatingStatsPanel({
                           {formatDuration(globalElapsedMs)}
                         </span>
                       </div>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-gray-500">Tokens</span>
-                      <span className="text-gray-300 font-mono">
-                        {formatTokens(session.totalInputTokens)} in / {formatTokens(session.totalOutputTokens)} out
-                      </span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-gray-500">Cost</span>
@@ -319,19 +340,16 @@ export function FloatingStatsPanel({
                           </span>
                         </div>
                         <div className="flex justify-between">
-                          <span className="text-gray-500">Tokens</span>
+                          <span className="text-gray-500">Context</span>
                           <span className="text-gray-300 font-mono text-[11px]">
-                            {formatTokens(agentStats.inputTokens)} in / {formatTokens(agentStats.outputTokens)} out
+                            {formatTokensAbbrev(agentStats.currentContextTokens)}
+                            {agentStats.maxContextTokens && (
+                              <span className="text-gray-500">
+                                {' '}({((agentStats.currentContextTokens / agentStats.maxContextTokens) * 100).toFixed(1)}%)
+                              </span>
+                            )}
                           </span>
                         </div>
-                        {agentStats.maxContextTokens && (
-                          <div className="flex justify-between">
-                            <span className="text-gray-500">Context</span>
-                            <span className="text-gray-300 font-mono text-[11px]">
-                              {formatTokensAbbrev(agentStats.inputTokens)} / {formatTokensAbbrev(agentStats.maxContextTokens)} ({((agentStats.inputTokens / agentStats.maxContextTokens) * 100).toFixed(1)}%)
-                            </span>
-                          </div>
-                        )}
                         <div className="flex justify-between">
                           <span className="text-gray-500">Cost</span>
                           <span className="text-cyber-cyan font-mono font-semibold">

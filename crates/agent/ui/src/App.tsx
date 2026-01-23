@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { Virtuoso } from 'react-virtuoso';
-import { Activity, Send, CheckCircle, XCircle, Loader, Menu, Plus, Code } from 'lucide-react';
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
+import { Activity, Send, CheckCircle, XCircle, Loader, Menu, Plus, Code, ChevronDown } from 'lucide-react';
 import { useUiClient } from './hooks/useUiClient';
 import { useSessionTimer } from './hooks/useSessionTimer';
 import { useFileMention } from './hooks/useFileMention';
@@ -51,6 +51,8 @@ function App() {
   const [sessionCopied, setSessionCopied] = useState(false);
   const copyTimeoutRef = useRef<number | null>(null);
   const [expertMode, setExpertMode] = useState(false);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const activeIndexStatus = sessionId ? workspaceIndexStatus[sessionId]?.status : undefined;
   
   // Modal state for tool details
@@ -254,9 +256,8 @@ function App() {
           >
             <Menu className="w-6 h-6 text-cyber-cyan" />
           </button>
-          <Activity className="w-6 h-6 text-cyber-cyan animate-glow-pulse" />
           <h1 className="text-xl font-semibold neon-text-cyan">
-            <GlitchText text="QueryMT Agent" variant="3" />
+            <GlitchText text="QueryMT" variant="3" />
           </h1>
         </div>
         <div className="flex items-center gap-4 flex-wrap justify-end">
@@ -306,7 +307,7 @@ function App() {
 
       {/* Event Timeline */}
       <div className="flex-1 overflow-hidden flex flex-col relative">
-        <div className="flex-1 overflow-hidden">
+        <div className="flex-1 overflow-hidden relative">
           {!hasTurns ? (
             <div className="flex items-center justify-center h-full">
               {!sessionId ? (
@@ -370,6 +371,7 @@ function App() {
             </div>
           ) : (
             <Virtuoso
+              ref={virtuosoRef}
               data={filteredTurns}
               itemContent={(index, turn) => (
                 <TurnCard
@@ -383,10 +385,30 @@ function App() {
                 />
               )}
               followOutput="smooth"
+              atBottomStateChange={setIsAtBottom}
               className="h-full"
             />
           )}
         </div>
+        {hasTurns && !isAtBottom && (
+          <div className="absolute bottom-6 left-1/2 -translate-x-1/2">
+            <button
+              type="button"
+              onClick={() => {
+                if (filteredTurns.length === 0) return;
+                virtuosoRef.current?.scrollToIndex({
+                  index: filteredTurns.length - 1,
+                  align: 'end',
+                  behavior: 'smooth',
+                });
+              }}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs text-gray-200 bg-black/70 border border-cyber-border/70 shadow-[0_0_18px_rgba(0,255,249,0.12)] hover:border-cyber-cyan/60 hover:text-cyber-cyan transition-all animate-fade-in-up"
+            >
+              <span>Scroll to latest</span>
+              <ChevronDown className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
         {/* Floating Stats Panel */}
         <FloatingStatsPanel 
           events={events} 
@@ -413,7 +435,7 @@ function App() {
 
       {/* Input Area */}
       <div className="px-6 py-4 bg-cyber-surface border-t border-cyber-border shadow-[0_-4px_20px_rgba(0,255,249,0.05)]">
-        <div className="flex gap-3 relative">
+        <div className="flex gap-3 relative items-end">
           <MentionInput
             value={prompt}
             onChange={setPrompt}

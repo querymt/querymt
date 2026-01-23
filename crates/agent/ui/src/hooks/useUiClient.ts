@@ -328,6 +328,7 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       usage: event.kind?.usage,
       costUsd: event.kind?.cost_usd,
       cumulativeCostUsd: event.kind?.cumulative_cost_usd,
+      contextTokens: event.kind?.context_tokens,
       finishReason: event.kind?.finish_reason,
     };
   }
@@ -474,6 +475,7 @@ function translateLoadedEvent(agentId: string, event: AgentEvent): EventItem {
       usage?: { input_tokens: number; output_tokens: number };
       cost_usd?: number;
       cumulative_cost_usd?: number;
+      context_tokens?: number;
       finish_reason?: string;
     };
     return {
@@ -485,6 +487,7 @@ function translateLoadedEvent(agentId: string, event: AgentEvent): EventItem {
       usage: llmRequestEnd.usage,
       costUsd: llmRequestEnd.cost_usd,
       cumulativeCostUsd: llmRequestEnd.cumulative_cost_usd,
+      contextTokens: llmRequestEnd.context_tokens,
       finishReason: llmRequestEnd.finish_reason,
     };
   }

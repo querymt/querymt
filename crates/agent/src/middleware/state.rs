@@ -66,20 +66,13 @@ impl AgentStats {
     }
 }
 
-/// Token usage information
-#[derive(Debug, Clone)]
-pub struct TokenUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-}
-
-impl TokenUsage {
-    pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
-        Self {
-            input_tokens,
-            output_tokens,
-        }
-    }
+/// Calculate current context size from usage.
+/// Single source of truth for context token calculation.
+/// Returns the sum of input and output tokens, or 0 if no usage provided.
+pub fn calculate_context_tokens(usage: Option<&querymt::Usage>) -> u64 {
+    usage
+        .map(|u| (u.input_tokens + u.output_tokens) as u64)
+        .unwrap_or(0)
 }
 
 /// Represents a tool call
@@ -164,7 +157,7 @@ impl ConversationContext {
 pub struct LlmResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
-    pub usage: Option<TokenUsage>,
+    pub usage: Option<querymt::Usage>,
     pub finish_reason: Option<FinishReason>,
 }
 
@@ -172,7 +165,7 @@ impl LlmResponse {
     pub fn new(
         content: String,
         tool_calls: Vec<ToolCall>,
-        usage: Option<TokenUsage>,
+        usage: Option<querymt::Usage>,
         finish_reason: Option<FinishReason>,
     ) -> Self {
         Self {

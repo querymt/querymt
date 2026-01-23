@@ -37,6 +37,8 @@ export interface EventItem {
   };
   costUsd?: number;
   cumulativeCostUsd?: number;
+  // Current context size (input + output tokens) from backend
+  contextTokens?: number;
   // Time tracking fields
   finishReason?: string;  // 'stop', 'tool_calls', etc. from llm_request_end
   delegationId?: string;  // For delegation_requested/completed events
@@ -84,20 +86,17 @@ export interface AgentStats {
   toolCallCount: number;
   toolResultCount: number;
   toolBreakdown: Record<string, number>;
-  // Cost and token tracking
-  inputTokens: number;
-  outputTokens: number;
+  // Cost tracking
   costUsd: number;
   // Time tracking
   activeTimeMs: number;  // Accumulated active work time
-  // Context tracking
+  // Context tracking - current context size from last LLM request
+  currentContextTokens: number;  // Current context size (input + output) from backend
   maxContextTokens?: number;  // Model's context limit from provider_changed event
 }
 
 // Session-level statistics
 export interface SessionStats {
-  totalInputTokens: number;
-  totalOutputTokens: number;
   totalCostUsd: number;
   totalMessages: number;
   totalToolCalls: number;

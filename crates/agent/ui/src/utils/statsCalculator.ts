@@ -23,8 +23,6 @@ export function calculateStats(events: EventItem[]): CalculatedStats {
   };
   
   // Track session totals
-  let totalInputTokens = 0;
-  let totalOutputTokens = 0;
   let totalCostUsd = 0;
   let totalMessages = 0;
   let totalToolCalls = 0;
@@ -51,10 +49,9 @@ export function calculateStats(events: EventItem[]): CalculatedStats {
         toolCallCount: 0,
         toolResultCount: 0,
         toolBreakdown: {},
-        inputTokens: 0,
-        outputTokens: 0,
         costUsd: 0,
         activeTimeMs: 0,
+        currentContextTokens: 0,
         maxContextTokens: undefined,
       });
       timingMap.set(agentId, {
@@ -141,12 +138,9 @@ export function calculateStats(events: EventItem[]): CalculatedStats {
         break;
     }
     
-    // Track tokens and costs from llm_request_end events
-    if (event.usage) {
-      stats.inputTokens += event.usage.input_tokens || 0;
-      stats.outputTokens += event.usage.output_tokens || 0;
-      totalInputTokens += event.usage.input_tokens || 0;
-      totalOutputTokens += event.usage.output_tokens || 0;
+    // Track current context size from backend (not accumulated, just latest value)
+    if (event.contextTokens !== undefined) {
+      stats.currentContextTokens = event.contextTokens;
     }
     
     if (event.costUsd !== undefined) {
@@ -194,8 +188,6 @@ export function calculateStats(events: EventItem[]): CalculatedStats {
   );
   
   const session: SessionStats = {
-    totalInputTokens,
-    totalOutputTokens,
     totalCostUsd: sessionTotalCost,
     totalMessages,
     totalToolCalls,

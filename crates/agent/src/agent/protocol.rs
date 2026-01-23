@@ -172,6 +172,28 @@ impl SendAgent for QueryMTAgent {
 
         self.emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
 
+        // Emit initial provider configuration so UI can display context limits
+        if let Ok(Some(llm_config)) = self
+            .provider
+            .history_store()
+            .get_session_llm_config(&session_id)
+            .await
+        {
+            let context_limit =
+                crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
+                    .and_then(|m| m.context_limit());
+
+            self.emit_event(
+                &session_id,
+                crate::events::AgentEventKind::ProviderChanged {
+                    provider: llm_config.provider.clone(),
+                    model: llm_config.model.clone(),
+                    config_id: llm_config.id,
+                    context_limit,
+                },
+            );
+        }
+
         if let Some(cwd_path) = cwd.clone() {
             let session_runtime = self.session_runtime.clone();
             let manager = self.workspace_index_manager.clone();
@@ -280,6 +302,28 @@ impl SendAgent for QueryMTAgent {
         // TODO: Implement full-fidelity history streaming with SessionUpdate notifications
         // For now, we'll return success without streaming history
         self.emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
+
+        // Emit initial provider configuration so UI can display context limits
+        if let Ok(Some(llm_config)) = self
+            .provider
+            .history_store()
+            .get_session_llm_config(&session_id)
+            .await
+        {
+            let context_limit =
+                crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
+                    .and_then(|m| m.context_limit());
+
+            self.emit_event(
+                &session_id,
+                crate::events::AgentEventKind::ProviderChanged {
+                    provider: llm_config.provider.clone(),
+                    model: llm_config.model.clone(),
+                    config_id: llm_config.id,
+                    context_limit,
+                },
+            );
+        }
 
         Ok(LoadSessionResponse::new())
     }
