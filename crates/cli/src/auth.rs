@@ -125,6 +125,25 @@ impl OpenAIProvider {
     }
 }
 
+/// Codex OAuth provider implementation.
+///
+/// This is intentionally separate from OpenAI so tokens are stored and looked up
+/// under `oauth_codex` in the keychain (no aliasing).
+pub struct CodexProvider {
+    client: openai_auth::OAuthClient,
+}
+
+impl CodexProvider {
+    pub fn new() -> Self {
+        let config = openai_auth::OAuthConfig::builder()
+            .redirect_port(1455)
+            .build();
+        let client =
+            openai_auth::OAuthClient::new(config).expect("Failed to create OpenAI OAuth client");
+        Self { client }
+    }
+}
+
 #[async_trait::async_trait]
 impl OAuthProvider for OpenAIProvider {
     fn name(&self) -> &str {
@@ -214,6 +233,67 @@ impl OAuthProvider for OpenAIProvider {
     }
 }
 
+#[async_trait::async_trait]
+impl OAuthProvider for CodexProvider {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    fn display_name(&self) -> &str {
+        "Codex"
+    }
+
+    async fn start_flow(&self) -> Result<OAuthFlowData> {
+        let flow = self.client.start_flow()?;
+
+        Ok(OAuthFlowData {
+            authorization_url: flow.authorization_url,
+            state: flow.state,
+            verifier: flow.pkce_verifier,
+        })
+    }
+
+    async fn exchange_code(&self, code: &str, _state: &str, verifier: &str) -> Result<TokenSet> {
+        // Codex backend uses the OAuth access token directly; we intentionally ignore any API key.
+        let tokens = self
+            .client
+            .exchange_code_for_api_key(code, verifier)
+            .await?;
+
+        Ok(TokenSet {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            expires_at: tokens.expires_at,
+        })
+    }
+
+    async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
+        let tokens = self.client.refresh_token(refresh_token).await?;
+
+        Ok(TokenSet {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            expires_at: tokens.expires_at,
+        })
+    }
+
+    async fn create_api_key(&self, _access_token: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn api_key_name(&self) -> Option<&str> {
+        None
+    }
+
+    fn supports_callback_server(&self) -> bool {
+        true
+    }
+
+    fn callback_port(&self) -> Option<u16> {
+        Some(1455)
+    }
+}
+
 /// Generic OAuth authentication flow
 ///
 /// # Arguments
@@ -255,33 +335,39 @@ pub async fn authenticate(provider: &dyn OAuthProvider, store: &mut SecretStore)
 
     // Try automatic callback server or fall back to manual entry
     // For OpenAI with callback server, we get tokens directly
-    let (tokens, callback_api_key) =
-        if provider.supports_callback_server() && provider.name() == "openai" {
-            match try_callback_server_openai(provider, &flow).await {
-                Ok((tokens, api_key)) => {
-                    // Callback server already exchanged tokens
-                    (tokens, api_key)
-                }
-                Err(e) => {
-                    println!("{} Callback server failed: {}", "⚠️".bright_yellow(), e);
-                    println!("Falling back to manual code entry...\n");
-                    let code = manual_code_entry()?;
-                    println!("\n{} Exchanging code for tokens...", "🔄".bright_blue());
-                    let tokens = provider
-                        .exchange_code(&code, &flow.state, &flow.verifier)
-                        .await?;
-                    (tokens, None)
-                }
+    let (tokens, callback_api_key) = if provider.supports_callback_server()
+        && (provider.name() == "openai" || provider.name() == "codex")
+    {
+        match try_callback_server_openai(provider, &flow).await {
+            Ok((tokens, api_key)) => {
+                // Callback server already exchanged tokens
+                let api_key = if provider.api_key_name().is_some() {
+                    api_key
+                } else {
+                    None
+                };
+                (tokens, api_key)
             }
-        } else {
-            // Manual flow for other providers or when callback not supported
-            let code = manual_code_entry()?;
-            println!("\n{} Exchanging code for tokens...", "🔄".bright_blue());
-            let tokens = provider
-                .exchange_code(&code, &flow.state, &flow.verifier)
-                .await?;
-            (tokens, None)
-        };
+            Err(e) => {
+                println!("{} Callback server failed: {}", "⚠️".bright_yellow(), e);
+                println!("Falling back to manual code entry...\n");
+                let code = manual_code_entry()?;
+                println!("\n{} Exchanging code for tokens...", "🔄".bright_blue());
+                let tokens = provider
+                    .exchange_code(&code, &flow.state, &flow.verifier)
+                    .await?;
+                (tokens, None)
+            }
+        }
+    } else {
+        // Manual flow for other providers or when callback not supported
+        let code = manual_code_entry()?;
+        println!("\n{} Exchanging code for tokens...", "🔄".bright_blue());
+        let tokens = provider
+            .exchange_code(&code, &flow.state, &flow.verifier)
+            .await?;
+        (tokens, None)
+    };
 
     // Store tokens
     store.set_oauth_tokens(provider.name(), &tokens)?;
@@ -524,11 +610,14 @@ pub async fn show_auth_status(
     try_refresh: bool,
 ) -> Result<()> {
     let providers_to_check = if let Some(p) = provider_name {
-        let name = if p == "codex" { "openai" } else { p };
-        vec![name.to_string()]
+        vec![p.to_string()]
     } else {
         // List all known OAuth providers
-        vec!["anthropic".to_string(), "openai".to_string()]
+        vec![
+            "anthropic".to_string(),
+            "openai".to_string(),
+            "codex".to_string(),
+        ]
     };
 
     println!("{}", "OAuth Authentication Status".bright_blue());
@@ -635,10 +724,8 @@ pub fn get_oauth_provider(
             };
             Ok(Box::new(AnthropicProvider::new(oauth_mode)))
         }
-        "openai" | "codex" => {
-            // OpenAI doesn't use modes, so we ignore the mode parameter
-            Ok(Box::new(OpenAIProvider::new()))
-        }
+        "openai" => Ok(Box::new(OpenAIProvider::new())),
+        "codex" => Ok(Box::new(CodexProvider::new())),
         _ => Err(anyhow!(
             "OAuth is not supported for provider '{}'",
             provider_name

@@ -310,6 +310,7 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
         store: false,
         max_output_tokens: cfg.max_tokens().copied(),
         temperature: cfg.temperature().copied(),
+        // Codex backend requires streaming.
         stream: true,
         top_p: cfg.top_p().copied(),
         top_k: cfg.top_k().copied(),
@@ -349,16 +350,32 @@ fn to_codex_tools(tools: &[Tool]) -> Vec<CodexTool<'_>> {
         .collect()
 }
 
-pub fn codex_parse_chat(response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+pub fn codex_parse_chat_with_state(
+    response: Response<Vec<u8>>,
+    tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
+) -> Result<Box<dyn ChatResponse>, LLMError> {
     handle_http_error!(response);
 
-    let json_resp: Result<CodexChatResponse, serde_json::Error> =
-        serde_json::from_slice(response.body());
+    let body = response.body();
+    let raw = String::from_utf8_lossy(body);
+
+    // Codex `responses` endpoint is streaming-only; non-streaming calls must go through
+    // the `chat_stream` pipeline.
+    if raw.contains("data: ") {
+        if let Ok(mut buf) = tool_state_buffer.lock() {
+            buf.clear();
+        }
+        return Err(LLMError::NotImplemented(
+            "Codex backend is streaming-only; call chat_stream(_with_tools)".to_string(),
+        ));
+    }
+
+    let json_resp: Result<CodexChatResponse, serde_json::Error> = serde_json::from_slice(body);
     match json_resp {
         Ok(response) => Ok(Box::new(response)),
         Err(e) => Err(LLMError::ResponseFormatError {
-            message: format!("Failed to decode API response: {}", e),
-            raw_response: String::new(),
+            message: format!("Failed to decode Codex API response: {}", e),
+            raw_response: raw.into_owned(),
         }),
     }
 }

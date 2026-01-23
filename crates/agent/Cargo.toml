@@ -14,6 +14,10 @@ dashboard = []
 # Enables OAuth token support for authentication (reads tokens from system keyring)
 oauth = ["anthropic-auth", "openai-auth", "keyring"]
 
+# Enable DBus Secret Service backend for keyring on Linux.
+# This mirrors the CLI's `dbus-secret-service` feature, but is wired through the agent crate.
+dbus-secret-service = ["oauth", "keyring/sync-secret-service"]
+
 [dependencies]
 querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
 agent-client-protocol = { version = "0.9", features = ["unstable"] }

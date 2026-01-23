@@ -116,13 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
 
-                let store_key = if provider == "codex" {
-                    "openai"
-                } else {
-                    provider.as_str()
-                };
                 let mut store = SecretStore::new()?;
-                store.delete_oauth_tokens(store_key)?;
+                store.delete_oauth_tokens(provider.as_str())?;
                 println!(
                     "{} Logged out from {}",
                     "✓".bright_green(),

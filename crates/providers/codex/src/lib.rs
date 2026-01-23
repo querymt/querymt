@@ -127,12 +127,11 @@ impl HTTPChatProvider for Codex {
     }
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        api::codex_parse_chat(response)
+        api::codex_parse_chat_with_state(response, &self.tool_state_buffer)
     }
 
     fn supports_streaming(&self) -> bool {
-        //true
-        false
+        true
     }
 
     fn parse_chat_stream_chunk(&self, _chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
