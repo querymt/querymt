@@ -409,7 +409,7 @@ function FileReadView({ event }: { event: EventItem }) {
       </div>
       
       {/* Content with syntax highlighting */}
-      <div className="p-4 bg-black/40">
+      <div className="p-4 bg-black">
         {isMarkdown ? (
           <div className="prose prose-invert prose-sm max-w-none">
             <MessageContent content={content} />

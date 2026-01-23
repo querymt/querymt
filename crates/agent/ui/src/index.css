@@ -497,9 +497,13 @@
 
 /* ===== Syntax Highlighter Overrides ===== */
 
-/* Override shiki's gray background with cyber-bg */
+/* Override shiki background with true black */
+.highlighted-code-container {
+  background: #000 !important;
+}
+
 .highlighted-code-container pre {
-  background: #0a0e27 !important; /* cyber-bg color */
+  background: #000 !important;
   margin: 0;
   padding: 1rem;
 }
