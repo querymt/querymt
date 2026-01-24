@@ -10,6 +10,8 @@ import {
   AuditView,
   AgentEvent,
   FileIndexEntry,
+  ModelEntry,
+  LlmConfigDetails,
 } from '../types';
 
 // Callback type for file index updates
@@ -25,15 +27,22 @@ export function useUiClient() {
   const [connected, setConnected] = useState(false);
   const [sessionHistory, setSessionHistory] = useState<SessionSummary[]>([]);
   const [sessionGroups, setSessionGroups] = useState<SessionGroup[]>([]);
+  const [allModels, setAllModels] = useState<ModelEntry[]>([]);
+  const [sessionsByAgent, setSessionsByAgent] = useState<Record<string, string>>({});
+  const [agentModels, setAgentModels] = useState<
+    Record<string, { provider?: string; model?: string; contextLimit?: number }>
+  >({});
   const [sessionAudit, setSessionAudit] = useState<AuditView | null>(null);
   const [thinkingAgentId, setThinkingAgentId] = useState<string | null>(null);
   const [isConversationComplete, setIsConversationComplete] = useState(false);
   const [workspaceIndexStatus, setWorkspaceIndexStatus] = useState<
     Record<string, { status: 'building' | 'ready' | 'error'; message?: string | null }>
   >({});
+  const [llmConfigCache, setLlmConfigCache] = useState<Record<number, LlmConfigDetails>>({});
   const socketRef = useRef<WebSocket | null>(null);
   const fileIndexCallbackRef = useRef<FileIndexCallback | null>(null);
   const fileIndexErrorCallbackRef = useRef<FileIndexErrorCallback | null>(null);
+  const llmConfigCallbacksRef = useRef<Map<number, (config: LlmConfigDetails) => void>>(new Map());
 
   useEffect(() => {
     let mounted = true;
@@ -46,6 +55,7 @@ export function useUiClient() {
       if (!mounted) return;
       setConnected(true);
       sendMessage({ type: 'init' });
+      sendMessage({ type: 'list_all_models', refresh: false });
     };
 
     socket.onclose = () => {
@@ -84,6 +94,7 @@ export function useUiClient() {
         setRoutingMode(msg.routing_mode);
         setActiveAgentId(msg.active_agent_id);
         setSessionId(msg.active_session_id ?? null);
+        setSessionsByAgent(msg.sessions_by_agent ?? {});
         break;
       case 'session_created':
         if (msg.agent_id === activeAgentId) {
@@ -124,7 +135,18 @@ export function useUiClient() {
           // Reset thinking state on error - the agent has stopped processing
           setThinkingAgentId(null);
         }
-        setEvents((prev) => [...prev, translateAgentEvent(msg.agent_id, msg.event)]);
+        const translated = translateAgentEvent(msg.agent_id, msg.event);
+        if (eventKind === 'provider_changed') {
+          setAgentModels((prev) => ({
+            ...prev,
+            [msg.agent_id]: {
+              provider: msg.event?.kind?.provider,
+              model: msg.event?.kind?.model,
+              contextLimit: msg.event?.kind?.context_limit,
+            },
+          }));
+        }
+        setEvents((prev) => [...prev, translated]);
         break;
       }
       case 'error': {
@@ -164,6 +186,19 @@ export function useUiClient() {
         // Translate events from full audit view
         const loadedEvents = msg.audit.events.map(event => translateLoadedEvent(activeAgentId, event));
         setEvents(loadedEvents);
+        const lastProviderEvent = [...loadedEvents]
+          .reverse()
+          .find((event) => event.provider || event.model || event.contextLimit !== undefined);
+        if (lastProviderEvent) {
+          setAgentModels((prev) => ({
+            ...prev,
+            [activeAgentId]: {
+              provider: lastProviderEvent.provider,
+              model: lastProviderEvent.model,
+              contextLimit: lastProviderEvent.contextLimit,
+            },
+          }));
+        }
         // Store full audit for stats (tasks, artifacts, decisions, etc.)
         setSessionAudit(msg.audit);
         break;
@@ -178,6 +213,26 @@ export function useUiClient() {
           fileIndexCallbackRef.current(msg.files, msg.generated_at);
         }
         break;
+      case 'all_models_list':
+        setAllModels(msg.models);
+        break;
+      case 'llm_config': {
+        const config: LlmConfigDetails = {
+          configId: msg.config_id,
+          provider: msg.provider,
+          model: msg.model,
+          params: msg.params,
+        };
+        // Cache the config
+        setLlmConfigCache((prev) => ({ ...prev, [msg.config_id]: config }));
+        // Notify any pending callbacks
+        const callback = llmConfigCallbacksRef.current.get(msg.config_id);
+        if (callback) {
+          callback(config);
+          llmConfigCallbacksRef.current.delete(msg.config_id);
+        }
+        break;
+      }
       default:
         break;
     }
@@ -218,6 +273,14 @@ export function useUiClient() {
     sendMessage({ type: 'load_session', session_id: sessionId });
   }, []);
 
+  const refreshAllModels = useCallback(() => {
+    sendMessage({ type: 'list_all_models', refresh: true });
+  }, []);
+
+  const setSessionModel = useCallback((sessionId: string, modelId: string) => {
+    sendMessage({ type: 'set_session_model', session_id: sessionId, model_id: modelId });
+  }, []);
+
   // Register a callback for file index updates
   const setFileIndexCallback = useCallback((callback: FileIndexCallback | null) => {
     console.log('[useUiClient] Registering file index callback:', !!callback);
@@ -234,6 +297,19 @@ export function useUiClient() {
     sendMessage({ type: 'get_file_index' });
   }, []);
 
+  // Request LLM config by ID (returns cached if available, otherwise fetches)
+  const requestLlmConfig = useCallback((configId: number, callback: (config: LlmConfigDetails) => void) => {
+    // Check cache first
+    const cached = llmConfigCache[configId];
+    if (cached) {
+      callback(cached);
+      return;
+    }
+    // Register callback and request
+    llmConfigCallbacksRef.current.set(configId, callback);
+    sendMessage({ type: 'get_llm_config', config_id: configId });
+  }, [llmConfigCache]);
+
   return {
     events,
     sessionId,
@@ -247,7 +323,12 @@ export function useUiClient() {
     setRoutingMode: selectRoutingMode,
     sessionHistory,
     sessionGroups,
+    allModels,
+    sessionsByAgent,
+    agentModels,
     loadSession,
+    refreshAllModels,
+    setSessionModel,
     sessionAudit,
     thinkingAgentId,
     isConversationComplete,
@@ -255,6 +336,8 @@ export function useUiClient() {
     setFileIndexErrorCallback,
     requestFileIndex,
     workspaceIndexStatus,
+    llmConfigCache,
+    requestLlmConfig,
   };
 }
 
@@ -362,7 +445,10 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       type: 'agent',
       content: `Event: provider_changed`,
       timestamp,
+      provider: event.kind?.provider,
+      model: event.kind?.model,
       contextLimit: event.kind?.context_limit,
+      configId: event.kind?.config_id,
     };
   }
 
@@ -536,7 +622,10 @@ function translateLoadedEvent(agentId: string, event: AgentEvent): EventItem {
       type: 'agent',
       content: `Event: provider_changed`,
       timestamp,
+      provider: providerChanged.provider,
+      model: providerChanged.model,
       contextLimit: providerChanged.context_limit,
+      configId: providerChanged.config_id,
     };
   }
 

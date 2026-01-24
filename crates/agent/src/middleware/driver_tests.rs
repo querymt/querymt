@@ -5,7 +5,7 @@ use crate::middleware::{
 };
 use crate::test_utils::{
     CancelDriver, CompleteDriver, CountingDriver, ErrorDriver, PassThroughDriver, StopDriver,
-    test_context,
+    test_context, test_context_with_user_messages,
 };
 use agent_client_protocol::StopReason;
 use std::sync::Arc;
@@ -204,12 +204,14 @@ async fn test_max_steps_ignores_other_states() {
 async fn test_turn_limit_middleware() {
     let middleware = TurnLimitMiddleware::new(3);
 
-    let context = test_context("sess-1", 2);
+    // With 2 user messages, should continue (2 < 3)
+    let context = test_context_with_user_messages("sess-1", 2);
     let state = ExecutionState::BeforeTurn { context };
     let result = middleware.next_state(state).await.unwrap();
     assert!(matches!(result, ExecutionState::BeforeTurn { .. }));
 
-    let context = test_context("sess-1", 3);
+    // With 3 user messages, should stop (3 >= 3)
+    let context = test_context_with_user_messages("sess-1", 3);
     let state = ExecutionState::BeforeTurn { context };
     let result = middleware.next_state(state).await.unwrap();
     assert!(matches!(result, ExecutionState::Stopped { .. }));

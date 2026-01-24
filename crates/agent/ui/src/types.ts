@@ -44,6 +44,9 @@ export interface EventItem {
   delegationId?: string;  // For delegation_requested/completed events
   // Context limit from provider_changed events
   contextLimit?: number;
+  provider?: string;
+  model?: string;
+  configId?: number;  // LLM config ID from provider_changed events
 }
 
 export type RoutingMode = 'single' | 'broadcast';
@@ -223,6 +226,9 @@ export interface Turn {
   startTime: number;
   endTime?: number;
   isActive: boolean; // Currently in progress
+  // Model info for this turn (from most recent provider_changed before/during turn)
+  modelLabel?: string; // "provider / model" format
+  modelConfigId?: number; // LLM config ID for fetching params
 }
 
 export type UiServerMessage =
@@ -232,6 +238,7 @@ export type UiServerMessage =
       active_agent_id: string;
       active_session_id?: string | null;
       agents: UiAgentInfo[];
+      sessions_by_agent: Record<string, string>;
     }
   | {
       type: 'session_created';
@@ -255,7 +262,22 @@ export type UiServerMessage =
       status: 'building' | 'ready' | 'error';
       message?: string | null;
     }
-  | { type: 'file_index'; files: FileIndexEntry[]; generated_at: number };
+  | { type: 'all_models_list'; models: ModelEntry[] }
+  | { type: 'file_index'; files: FileIndexEntry[]; generated_at: number }
+  | { type: 'llm_config'; config_id: number; provider: string; model: string; params?: Record<string, unknown> | null };
+
+export interface ModelEntry {
+  provider: string;
+  model: string;
+}
+
+// Cached LLM config details for model config popover
+export interface LlmConfigDetails {
+  configId: number;
+  provider: string;
+  model: string;
+  params?: Record<string, unknown> | null;
+}
 
 export type UiClientMessage =
   | { type: 'init' }
@@ -265,4 +287,7 @@ export type UiClientMessage =
   | { type: 'prompt'; text: string }
   | { type: 'list_sessions' }
   | { type: 'load_session'; session_id: string }
-  | { type: 'get_file_index' };
+  | { type: 'list_all_models'; refresh?: boolean }
+  | { type: 'set_session_model'; session_id: string; model_id: string }
+  | { type: 'get_file_index' }
+  | { type: 'get_llm_config'; config_id: number };

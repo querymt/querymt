@@ -3,10 +3,11 @@
  */
 
 import { useRef, useEffect, useState } from 'react';
-import { Turn, UiAgentInfo, EventRow, DelegationGroupInfo } from '../types';
+import { Turn, UiAgentInfo, EventRow, DelegationGroupInfo, LlmConfigDetails } from '../types';
 import { MessageContent } from './MessageContent';
 import { ActivitySection } from './ActivitySection';
 import { PinnedUserMessage } from './PinnedUserMessage';
+import { ModelConfigPopover } from './ModelConfigPopover';
 import { getAgentShortName } from '../utils/agentNames';
 import { getAgentColor } from '../utils/agentColors';
 
@@ -17,6 +18,9 @@ export interface TurnCardProps {
   onDelegateClick: (delegationId: string) => void;
   renderEvent: (event: EventRow) => React.ReactNode;
   isLastUserMessage?: boolean;
+  showModelLabel?: boolean; // Show model label when session has multiple models
+  llmConfigCache?: Record<number, LlmConfigDetails>; // Cached LLM configs
+  requestLlmConfig?: (configId: number, callback: (config: LlmConfigDetails) => void) => void;
 }
 
 // Interleaved event item types
@@ -105,6 +109,9 @@ export function TurnCard({
   onDelegateClick,
   renderEvent,
   isLastUserMessage = false,
+  showModelLabel = false,
+  llmConfigCache = {},
+  requestLlmConfig,
 }: TurnCardProps) {
   const agentName = turn.agentId ? getAgentShortName(turn.agentId, agents) : 'Agent';
   const agentColor = turn.agentId ? getAgentColor(turn.agentId) : undefined;
@@ -115,6 +122,10 @@ export function TurnCard({
   // Track pinned state for last user message
   const userMessageRef = useRef<HTMLDivElement>(null);
   const [isPinned, setIsPinned] = useState(false);
+  
+  // Model config popover state
+  const [showConfigPopover, setShowConfigPopover] = useState(false);
+  const modelLabelRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!isLastUserMessage || !userMessageRef.current || !turn.userMessage) return;
@@ -164,22 +175,53 @@ export function TurnCard({
 
       {/* Agent response */}
       <div className="agent-response">
-        <div className="flex items-center gap-2 mb-1">
-          <span
-            className="text-xs font-semibold uppercase tracking-wide"
-            style={{ color: agentColor || '#00fff9' }}
-          >
-            {agentName}
-          </span>
-          <span className="text-[10px] text-gray-500">
-            {turn.agentMessages.length > 0
-              ? new Date(turn.agentMessages[0].timestamp).toLocaleTimeString()
-              : new Date(turn.startTime).toLocaleTimeString()}
-          </span>
-          {turn.isActive && (
-            <span className="text-[10px] text-cyber-purple px-1.5 py-0.5 rounded bg-cyber-purple/10 border border-cyber-purple/30">
-              thinking...
+        <div className="flex items-baseline justify-between gap-2 mb-1">
+          {/* Left: agent name, timestamp, thinking indicator */}
+          <div className="flex items-baseline gap-2">
+            <span
+              className="text-xs font-semibold uppercase tracking-wide leading-none"
+              style={{ color: agentColor || '#00fff9' }}
+            >
+              {agentName}
             </span>
+            <span className="text-[10px] text-gray-500 leading-none">
+              {turn.agentMessages.length > 0
+                ? new Date(turn.agentMessages[0].timestamp).toLocaleTimeString()
+                : new Date(turn.startTime).toLocaleTimeString()}
+            </span>
+            {turn.isActive && (
+              <span className="text-[10px] text-cyber-purple leading-none px-1.5 py-px rounded bg-cyber-purple/10 border border-cyber-purple/30">
+                thinking...
+              </span>
+            )}
+          </div>
+          {/* Right: model label */}
+          {showModelLabel && turn.modelLabel && (
+            <div className="relative flex-shrink-0">
+              <button
+                ref={modelLabelRef}
+                type="button"
+                onClick={() => turn.modelConfigId && requestLlmConfig && setShowConfigPopover(true)}
+                className={`text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-gray-400 truncate max-w-[200px] ${
+                  turn.modelConfigId && requestLlmConfig
+                    ? 'hover:border-cyber-cyan/40 hover:text-gray-300 cursor-pointer transition-colors'
+                    : 'cursor-default'
+                }`}
+                title={turn.modelLabel}
+                disabled={!turn.modelConfigId || !requestLlmConfig}
+              >
+                {turn.modelLabel}
+              </button>
+              {showConfigPopover && turn.modelConfigId && requestLlmConfig && (
+                <ModelConfigPopover
+                  configId={turn.modelConfigId}
+                  anchorRef={modelLabelRef}
+                  onClose={() => setShowConfigPopover(false)}
+                  requestConfig={requestLlmConfig}
+                  cachedConfig={llmConfigCache[turn.modelConfigId]}
+                />
+              )}
+            </div>
           )}
         </div>
 

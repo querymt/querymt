@@ -173,6 +173,11 @@ impl SessionProvider {
     pub fn get_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
         get_model_info(provider, model).map(|info| info.pricing)
     }
+
+    /// Get LLM config by ID
+    pub async fn get_llm_config(&self, config_id: i64) -> SessionResult<Option<LLMConfig>> {
+        self.history_store.get_llm_config(config_id).await
+    }
 }
 
 impl Clone for SessionProvider {

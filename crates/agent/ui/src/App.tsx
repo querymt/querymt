@@ -15,6 +15,7 @@ import { CircuitBackground } from './components/CircuitBackground';
 import { GlitchText } from './components/GlitchText';
 import { SessionPicker } from './components/SessionPicker';
 import { SystemLog } from './components/SystemLog';
+import { ModelPickerPopover } from './components/ModelPickerPopover';
 
 function App() {
   const {
@@ -37,6 +38,13 @@ function App() {
     setFileIndexErrorCallback,
     requestFileIndex,
     workspaceIndexStatus,
+    allModels,
+    sessionsByAgent,
+    agentModels,
+    refreshAllModels,
+    setSessionModel,
+    llmConfigCache,
+    requestLlmConfig,
   } = useUiClient();
   
   // Live timer hook
@@ -57,6 +65,10 @@ function App() {
   
   // Modal state for tool details
   const [selectedToolEvent, setSelectedToolEvent] = useState<EventRow | null>(null);
+  
+  // Model picker popover state
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const modelBadgeRef = useRef<HTMLButtonElement>(null);
   
   // File mention hook
   const fileMention = useFileMention(requestFileIndex);
@@ -159,7 +171,7 @@ function App() {
   } : undefined;
 
   // Build turns from events
-  const { turns } = useMemo(
+  const { turns, hasMultipleModels: sessionHasMultipleModels } = useMemo(
     () => buildTurns(events, thinkingAgentId),
     [events, thinkingAgentId]
   );
@@ -266,6 +278,39 @@ function App() {
               Active: {activeAgentId}
             </span>
           )}
+          {/* Model badge + popover */}
+          <div className="relative">
+            <button
+              ref={modelBadgeRef}
+              type="button"
+              onClick={() => setModelPickerOpen(!modelPickerOpen)}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-cyber-border bg-cyber-bg/60 text-xs text-gray-300 hover:border-cyber-cyan/60 hover:text-cyber-cyan transition-colors max-w-[280px]"
+              title={agentModels[activeAgentId] ? `${agentModels[activeAgentId].provider} / ${agentModels[activeAgentId].model}` : 'No model selected'}
+            >
+              <span className="truncate">
+                {agentModels[activeAgentId]?.provider && agentModels[activeAgentId]?.model
+                  ? `${agentModels[activeAgentId].provider} / ${agentModels[activeAgentId].model}`
+                  : 'Select model'}
+              </span>
+              <ChevronDown className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${modelPickerOpen ? 'rotate-180' : ''}`} />
+            </button>
+            <ModelPickerPopover
+              isOpen={modelPickerOpen}
+              onClose={() => setModelPickerOpen(false)}
+              anchorRef={modelBadgeRef}
+              connected={connected}
+              routingMode={routingMode}
+              activeAgentId={activeAgentId}
+              sessionId={sessionId}
+              sessionsByAgent={sessionsByAgent}
+              agents={agents}
+              allModels={allModels}
+              currentProvider={agentModels[activeAgentId]?.provider}
+              currentModel={agentModels[activeAgentId]?.model}
+              onRefresh={refreshAllModels}
+              onSetSessionModel={setSessionModel}
+            />
+          </div>
           <div className="flex items-center gap-2">
             {connected ? (
               <>
@@ -382,6 +427,9 @@ function App() {
                   onDelegateClick={handleDelegateClick}
                   renderEvent={renderEventItem}
                   isLastUserMessage={index === lastUserMessageTurnIndex}
+                  showModelLabel={sessionHasMultipleModels}
+                  llmConfigCache={llmConfigCache}
+                  requestLlmConfig={requestLlmConfig}
                 />
               )}
               followOutput="smooth"
@@ -487,13 +535,64 @@ function App() {
 
 export default App;
 
+// Model timeline entry
+interface ModelTimelineEntry {
+  timestamp: number;
+  provider: string;
+  model: string;
+  configId?: number;
+  label: string; // "provider / model"
+}
+
+// Build model timeline from events
+function buildModelTimeline(events: EventItem[]): ModelTimelineEntry[] {
+  const timeline: ModelTimelineEntry[] = [];
+  for (const event of events) {
+    if (event.provider && event.model) {
+      timeline.push({
+        timestamp: event.timestamp,
+        provider: event.provider,
+        model: event.model,
+        configId: event.configId,
+        label: `${event.provider} / ${event.model}`,
+      });
+    }
+  }
+  return timeline;
+}
+
+// Get active model at a given timestamp
+function getActiveModelAt(timeline: ModelTimelineEntry[], timestamp: number): ModelTimelineEntry | undefined {
+  // Find the most recent model change before or at this timestamp
+  let active: ModelTimelineEntry | undefined;
+  for (const entry of timeline) {
+    if (entry.timestamp <= timestamp) {
+      active = entry;
+    } else {
+      break; // Timeline is sorted by timestamp
+    }
+  }
+  return active;
+}
+
+// Check if session has multiple distinct models
+function hasMultipleModels(timeline: ModelTimelineEntry[]): boolean {
+  const uniqueLabels = new Set(timeline.map(e => e.label));
+  return uniqueLabels.size > 1;
+}
+
 // Build turns from event rows
 function buildTurns(events: EventItem[], thinkingAgentId: string | null): {
   turns: Turn[];
   allEventRows: EventRow[];
+  hasMultipleModels: boolean;
 } {
   // First, build event rows with delegation grouping (from previous implementation)
   const { rows, delegationGroups } = buildEventRowsWithDelegations(events);
+  
+  // Build model timeline
+  const modelTimeline = buildModelTimeline(events);
+  const multipleModels = hasMultipleModels(modelTimeline);
   
   const turns: Turn[] = [];
   let currentTurn: Turn | null = null;
@@ -514,6 +613,9 @@ function buildTurns(events: EventItem[], thinkingAgentId: string | null): {
         turns.push(currentTurn);
       }
       
+      // Get active model at turn start
+      const activeModel = getActiveModelAt(modelTimeline, row.timestamp);
+      
       // Start new turn
       currentTurn = {
         id: `turn-${turnCounter++}`,
@@ -525,6 +627,8 @@ function buildTurns(events: EventItem[], thinkingAgentId: string | null): {
         startTime: row.timestamp,
         endTime: undefined,
         isActive: true,
+        modelLabel: activeModel?.label,
+        modelConfigId: activeModel?.configId,
       };
     } else if (currentTurn) {
       // Add to current turn (only real messages, not internal events)
@@ -549,8 +653,17 @@ function buildTurns(events: EventItem[], thinkingAgentId: string | null): {
         }
         currentTurn.endTime = row.timestamp;
       }
+      
+      // Update model if changed during turn (from provider_changed event)
+      if (row.provider && row.model) {
+        currentTurn.modelLabel = `${row.provider} / ${row.model}`;
+        currentTurn.modelConfigId = row.configId;
+      }
     } else if (row.type === 'agent' && row.isMessage) {
       // No current turn (agent-initiated message)
+      // Get active model at turn start
+      const activeModel = getActiveModelAt(modelTimeline, row.timestamp);
+      
       // Only create a turn if it's an actual message, not tool calls
       currentTurn = {
         id: `turn-${turnCounter++}`,
@@ -562,6 +675,8 @@ function buildTurns(events: EventItem[], thinkingAgentId: string | null): {
         startTime: row.timestamp,
         endTime: row.timestamp,
         isActive: true,
+        modelLabel: activeModel?.label,
+        modelConfigId: activeModel?.configId,
       };
     }
   }
@@ -572,7 +687,7 @@ function buildTurns(events: EventItem[], thinkingAgentId: string | null): {
     turns.push(currentTurn);
   }
 
-  return { turns, allEventRows: rows };
+  return { turns, allEventRows: rows, hasMultipleModels: multipleModels };
 }
 
 // Build event rows with delegation grouping (from previous implementation)

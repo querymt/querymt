@@ -2,6 +2,7 @@
 
 use crate::middleware::{AgentStats, ConversationContext, ToolCall, ToolFunction};
 use crate::session::store::{LLMConfig, Session};
+use querymt::chat::{ChatMessage, ChatRole};
 use std::sync::Arc;
 use time::OffsetDateTime;
 
@@ -14,6 +15,29 @@ pub fn test_context(session_id: &str, steps: usize) -> Arc<ConversationContext> 
             steps,
             ..Default::default()
         }),
+        "mock".into(),
+        "mock-model".into(),
+    ))
+}
+
+/// Creates a test conversation context with the given number of user messages
+/// for testing turn-based middleware
+pub fn test_context_with_user_messages(
+    session_id: &str,
+    user_message_count: usize,
+) -> Arc<ConversationContext> {
+    let messages: Vec<ChatMessage> = (0..user_message_count)
+        .map(|i| ChatMessage {
+            role: ChatRole::User,
+            message_type: querymt::chat::MessageType::Text,
+            content: format!("User message {}", i),
+        })
+        .collect();
+
+    Arc::new(ConversationContext::new(
+        session_id.into(),
+        Arc::from(messages.into_boxed_slice()),
+        Arc::new(AgentStats::default()),
         "mock".into(),
         "mock-model".into(),
     ))

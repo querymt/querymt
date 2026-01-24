@@ -404,6 +404,15 @@ impl QueryMTAgent {
             .map_err(|e| Error::new(-32000, e.to_string()))
     }
 
+    /// Get LLM config by ID
+    pub async fn get_llm_config(&self, config_id: i64) -> Result<Option<LLMConfig>, Error> {
+        self.provider
+            .history_store()
+            .get_llm_config(config_id)
+            .await
+            .map_err(|e| Error::new(-32000, e.to_string()))
+    }
+
     /// Sends a session update notification to the client.
     ///
     /// Uses the client bridge if available (ACP stdio mode), otherwise no-op.

@@ -22,15 +22,40 @@ use axum::{
 use base64::Engine;
 use futures_util::{sink::SinkExt, stream::StreamExt as FuturesStreamExt};
 use once_cell::sync::Lazy;
+use querymt::plugin::HTTPLLMProviderFactory;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+/// TTL for model cache (30 minutes)
+const MODEL_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Cached model list entry
+#[derive(Debug, Clone, Serialize)]
+struct ModelEntry {
+    provider: String,
+    model: String,
+}
+
+/// Cache for model list to avoid repeated API calls
+struct ModelCache {
+    models: Vec<ModelEntry>,
+    fetched_at: Instant,
+}
+
+impl ModelCache {
+    fn is_valid(&self) -> bool {
+        self.fetched_at.elapsed() < MODEL_CACHE_TTL
+    }
+}
 
 const PRIMARY_AGENT_ID: &str = "primary";
 static FILE_MENTION_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"@\{(file|dir):([^}]+)\}").unwrap());
@@ -59,6 +84,7 @@ pub struct UiServer {
     session_agents: Arc<Mutex<HashMap<String, String>>>,
     session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     workspace_manager: Arc<WorkspaceIndexManager>,
+    model_cache: Arc<Mutex<Option<ModelCache>>>,
 }
 
 #[derive(Clone)]
@@ -71,6 +97,7 @@ struct ServerState {
     session_agents: Arc<Mutex<HashMap<String, String>>>,
     session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     workspace_manager: Arc<WorkspaceIndexManager>,
+    model_cache: Arc<Mutex<Option<ModelCache>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +119,7 @@ impl UiServer {
             session_agents: Arc::new(Mutex::new(HashMap::new())),
             session_cwds: Arc::new(Mutex::new(HashMap::new())),
             workspace_manager: agent.workspace_index_manager(),
+            model_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -105,6 +133,7 @@ impl UiServer {
             session_agents: self.session_agents,
             session_cwds: self.session_cwds,
             workspace_manager: self.workspace_manager,
+            model_cache: self.model_cache,
         };
 
         Router::new()
@@ -175,8 +204,20 @@ enum UiClientMessage {
     LoadSession {
         session_id: String,
     },
+    ListAllModels {
+        #[serde(default)]
+        refresh: bool,
+    },
+    SetSessionModel {
+        session_id: String,
+        model_id: String,
+    },
     /// Request file index for @ mentions
     GetFileIndex,
+    /// Request LLM config details by config_id
+    GetLlmConfig {
+        config_id: i64,
+    },
 }
 
 #[derive(Serialize)]
@@ -187,6 +228,7 @@ enum UiServerMessage {
         active_agent_id: String,
         active_session_id: Option<String>,
         agents: Vec<UiAgentInfo>,
+        sessions_by_agent: HashMap<String, String>,
     },
     SessionCreated {
         agent_id: String,
@@ -211,10 +253,20 @@ enum UiServerMessage {
         status: String,
         message: Option<String>,
     },
+    AllModelsList {
+        models: Vec<ModelEntry>,
+    },
     /// File index for autocomplete
     FileIndex {
         files: Vec<FileIndexEntry>,
         generated_at: u64,
+    },
+    /// LLM config details response
+    LlmConfig {
+        config_id: i64,
+        provider: String,
+        model: String,
+        params: Option<Value>,
     },
 }
 
@@ -369,10 +421,24 @@ async fn handle_ui_message(
         UiClientMessage::LoadSession { session_id } => {
             handle_load_session(state, conn_id, &session_id, tx).await;
         }
+        UiClientMessage::ListAllModels { refresh } => {
+            handle_list_all_models(state, refresh, tx).await;
+        }
+        UiClientMessage::SetSessionModel {
+            session_id,
+            model_id,
+        } => {
+            if let Err(err) = handle_set_session_model(state, &session_id, &model_id).await {
+                let _ = send_error(tx, err).await;
+            }
+        }
         UiClientMessage::GetFileIndex => {
             log::debug!("Received GetFileIndex message from conn_id={}", conn_id);
             handle_get_file_index(state, conn_id, tx).await;
             log::debug!("GetFileIndex handler completed for conn_id={}", conn_id);
+        }
+        UiClientMessage::GetLlmConfig { config_id } => {
+            handle_get_llm_config(state, config_id, tx).await;
         }
     }
 }
@@ -505,6 +571,26 @@ async fn ensure_session(
     )
     .await;
 
+    // Replay provider_changed event that was emitted during session creation
+    // (the event forwarder missed it because ownership wasn't registered yet)
+    if let Ok(audit) = state.view_store.get_audit_view(&session_id).await
+        && let Some(event) = audit.events.iter().rev().find(|e| {
+            matches!(
+                e.kind,
+                crate::events::AgentEventKind::ProviderChanged { .. }
+            )
+        })
+    {
+        let _ = send_message(
+            tx,
+            UiServerMessage::Event {
+                agent_id: agent_id.to_string(),
+                event: event.clone(),
+            },
+        )
+        .await;
+    }
+
     if let Some(cwd_path) = cwd.cloned() {
         let root = resolve_workspace_root(&cwd_path);
         let manager = state.workspace_manager.clone();
@@ -596,16 +682,22 @@ fn build_agent_list(state: &ServerState) -> Vec<UiAgentInfo> {
 }
 
 async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<String>) {
-    let (routing_mode, active_agent_id, active_session_id) = {
+    let (routing_mode, active_agent_id, active_session_id, sessions_by_agent) = {
         let connections = state.connections.lock().await;
         if let Some(conn) = connections.get(conn_id) {
             (
                 conn.routing_mode,
                 conn.active_agent_id.clone(),
                 conn.sessions.get(&conn.active_agent_id).cloned(),
+                conn.sessions.clone(),
             )
         } else {
-            (RoutingMode::Single, PRIMARY_AGENT_ID.to_string(), None)
+            (
+                RoutingMode::Single,
+                PRIMARY_AGENT_ID.to_string(),
+                None,
+                HashMap::new(),
+            )
         }
     };
 
@@ -617,9 +709,137 @@ async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<String
             active_agent_id,
             active_session_id,
             agents,
+            sessions_by_agent,
         },
     )
     .await;
+}
+
+async fn handle_list_all_models(state: &ServerState, refresh: bool, tx: &mpsc::Sender<String>) {
+    // Check cache first (unless refresh requested)
+    if !refresh {
+        let cache = state.model_cache.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.is_valid()
+        {
+            let _ = send_message(
+                tx,
+                UiServerMessage::AllModelsList {
+                    models: cached.models.clone(),
+                },
+            )
+            .await;
+            return;
+        }
+    }
+
+    // Fetch from all providers (same logic as CLI)
+    let registry = state.agent.provider.plugin_registry();
+    registry.load_all_plugins().await;
+
+    let mut models: Vec<ModelEntry> = Vec::new();
+
+    for factory in registry.list() {
+        let provider_name = factory.name().to_string();
+
+        // Build config with API key (same as CLI)
+        let cfg = if let Some(http_factory) = factory.as_http() {
+            if let Some(api_key) = resolve_provider_api_key(&provider_name, http_factory).await {
+                serde_json::json!({"api_key": api_key})
+            } else {
+                serde_json::json!({})
+            }
+        } else {
+            serde_json::json!({})
+        };
+
+        // Fetch models; on error, log to system log and continue
+        match factory.list_models(&cfg).await {
+            Ok(model_list) => {
+                for model in model_list {
+                    models.push(ModelEntry {
+                        provider: provider_name.clone(),
+                        model,
+                    });
+                }
+            }
+            Err(err) => {
+                // Send error to system log but continue with other providers
+                let _ = send_error(
+                    tx,
+                    format!("Failed to list models for {}: {}", provider_name, err),
+                )
+                .await;
+            }
+        }
+    }
+
+    // Update cache
+    {
+        let mut cache = state.model_cache.lock().await;
+        *cache = Some(ModelCache {
+            models: models.clone(),
+            fetched_at: Instant::now(),
+        });
+    }
+
+    let _ = send_message(tx, UiServerMessage::AllModelsList { models }).await;
+}
+
+async fn handle_set_session_model(
+    state: &ServerState,
+    session_id: &str,
+    model_id: &str,
+) -> Result<(), String> {
+    let (provider, model) = if let Some((provider, model)) = model_id.split_once('/') {
+        (provider.to_string(), model.to_string())
+    } else {
+        return Err("model_id must be in provider/model format".to_string());
+    };
+
+    state
+        .agent
+        .set_provider(session_id, &provider, &model)
+        .await
+        .map_err(|err: agent_client_protocol::Error| err.to_string())?;
+    Ok(())
+}
+
+async fn handle_get_llm_config(state: &ServerState, config_id: i64, tx: &mpsc::Sender<String>) {
+    match state.agent.get_llm_config(config_id).await {
+        Ok(Some(config)) => {
+            let _ = send_message(
+                tx,
+                UiServerMessage::LlmConfig {
+                    config_id: config.id,
+                    provider: config.provider,
+                    model: config.model,
+                    params: config.params,
+                },
+            )
+            .await;
+        }
+        Ok(None) => {
+            let _ = send_error(tx, format!("LLM config not found: {}", config_id)).await;
+        }
+        Err(err) => {
+            let _ = send_error(tx, format!("Failed to get LLM config: {}", err)).await;
+        }
+    }
+}
+
+async fn resolve_provider_api_key(
+    provider: &str,
+    factory: &dyn HTTPLLMProviderFactory,
+) -> Option<String> {
+    let api_key_name = factory.api_key_name()?;
+    #[cfg(feature = "oauth")]
+    {
+        if let Ok(token) = crate::auth::get_or_refresh_token(provider).await {
+            return Some(token);
+        }
+    }
+    std::env::var(api_key_name).ok()
 }
 
 fn resolve_cwd(cwd: Option<String>) -> Option<PathBuf> {
@@ -1003,7 +1223,9 @@ async fn send_message(tx: &mpsc::Sender<String>, message: UiServerMessage) -> Re
         UiServerMessage::SessionList { .. } => "session_list",
         UiServerMessage::SessionLoaded { .. } => "session_loaded",
         UiServerMessage::WorkspaceIndexStatus { .. } => "workspace_index_status",
+        UiServerMessage::AllModelsList { .. } => "all_models_list",
         UiServerMessage::FileIndex { .. } => "file_index",
+        UiServerMessage::LlmConfig { .. } => "llm_config",
     };
 
     match serde_json::to_string(&message) {
