@@ -1,7 +1,7 @@
 mod interface;
 pub use interface::{
     BinaryCodec, ExtismChatChunk, ExtismChatRequest, ExtismChatResponse, ExtismCompleteRequest,
-    ExtismEmbedRequest,
+    ExtismEmbedRequest, ExtismSttRequest, ExtismSttResponse,
 };
 
 #[cfg(feature = "extism_host")]

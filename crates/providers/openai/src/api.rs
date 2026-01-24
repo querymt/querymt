@@ -11,6 +11,7 @@ use querymt::{
     },
     error::LLMError,
     handle_http_error,
+    stt::{SttRequest, SttResponse},
 };
 use schemars::{
     r#gen::SchemaGenerator,
@@ -308,6 +309,153 @@ pub trait OpenAIProviderConfig {
     fn extra_body(&self) -> Option<Map<String, Value>> {
         None
     }
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAISttJsonResponse {
+    text: String,
+}
+
+// TODO: Move outside and make shared with others?
+struct MultipartForm {
+    boundary: &'static str,
+    body: Vec<u8>,
+}
+
+impl MultipartForm {
+    fn new(boundary: &'static str) -> Self {
+        Self {
+            boundary,
+            body: Vec::new(),
+        }
+    }
+
+    fn content_type(&self) -> String {
+        format!("multipart/form-data; boundary={}", self.boundary)
+    }
+
+    fn write_str(&mut self, s: &str) {
+        self.body.extend_from_slice(s.as_bytes());
+    }
+
+    fn validate_token(s: &str) -> Result<(), LLMError> {
+        if s.contains('\r') || s.contains('\n') {
+            return Err(LLMError::InvalidRequest(
+                "multipart field contains invalid characters".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_filename(s: &str) -> Result<(), LLMError> {
+        Self::validate_token(s)?;
+        if s.contains('"') {
+            return Err(LLMError::InvalidRequest(
+                "multipart filename contains invalid characters".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn begin_part(&mut self) {
+        self.write_str("--");
+        self.write_str(self.boundary);
+        self.write_str("\r\n");
+    }
+
+    fn text(&mut self, name: &str, value: &str) -> Result<(), LLMError> {
+        Self::validate_token(name)?;
+
+        self.begin_part();
+        self.write_str("Content-Disposition: form-data; name=\"");
+        self.write_str(name);
+        self.write_str("\"\r\n\r\n");
+        self.write_str(value);
+        self.write_str("\r\n");
+        Ok(())
+    }
+
+    fn file(
+        &mut self,
+        field_name: &str,
+        filename: &str,
+        mime_type: &str,
+        bytes: &[u8],
+    ) -> Result<(), LLMError> {
+        Self::validate_token(field_name)?;
+        Self::validate_filename(filename)?;
+        Self::validate_token(mime_type)?;
+
+        self.begin_part();
+        self.write_str(&format!(
+            "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+            field_name, filename
+        ));
+        self.write_str(&format!("Content-Type: {}\r\n\r\n", mime_type));
+        self.body.extend_from_slice(bytes);
+        self.write_str("\r\n");
+        Ok(())
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.write_str("--");
+        self.write_str(self.boundary);
+        self.write_str("--\r\n");
+        self.body
+    }
+}
+
+pub fn openai_stt_request<C: OpenAIProviderConfig>(
+    cfg: &C,
+    req: &SttRequest,
+) -> Result<Request<Vec<u8>>, LLMError> {
+    let token = cfg.api_key();
+    let auth = determine_effective_auth(token, cfg.auth_type(), cfg.base_url())?;
+
+    let url = cfg
+        .base_url()
+        .join("audio/transcriptions")
+        .map_err(|e| LLMError::HttpError(e.to_string()))?;
+
+    let model = req.model.as_deref().unwrap_or(cfg.model());
+    let filename = req.filename.as_deref().unwrap_or("audio.wav");
+    let mime_type = req.mime_type.as_deref().unwrap_or("audio/wav");
+
+    // NOTE: Deterministic boundary to avoid randomness requirements in WASM.
+    let boundary = "qmt-stt-boundary-7MA4YWxkTrZu0gW";
+
+    let mut form = MultipartForm::new(boundary);
+    form.text("model", model)?;
+    form.text("response_format", "json")?;
+    if let Some(language) = req.language.as_deref() {
+        form.text("language", language)?;
+    }
+    form.file("file", filename, mime_type, &req.audio)?;
+    let content_type = form.content_type();
+    let body = form.finish();
+
+    let builder = Request::builder()
+        .method(Method::POST)
+        .uri(url.to_string())
+        .header(CONTENT_TYPE, content_type);
+    let builder = maybe_add_auth_header(builder, &auth, token)?;
+    Ok(builder.body(body)?)
+}
+
+pub fn openai_parse_stt<C: OpenAIProviderConfig>(
+    _cfg: &C,
+    resp: Response<Vec<u8>>,
+) -> Result<SttResponse, LLMError> {
+    handle_http_error!(resp);
+
+    if let Ok(json_resp) = serde_json::from_slice::<OpenAISttJsonResponse>(resp.body()) {
+        return Ok(SttResponse {
+            text: json_resp.text,
+        });
+    }
+
+    let text = String::from_utf8(resp.body().to_vec())?;
+    Ok(SttResponse { text })
 }
 
 fn is_openai_host(base_url: &Url) -> bool {
@@ -886,4 +1034,32 @@ pub fn parse_openai_sse_chunk(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MultipartForm;
+
+    #[test]
+    fn multipart_form_encodes_text_and_file_parts() {
+        let boundary = "b";
+        let mut form = MultipartForm::new(boundary);
+        form.text("model", "whisper-1").unwrap();
+        form.text("response_format", "json").unwrap();
+        form.file("file", "audio.wav", "audio/wav", b"abc").unwrap();
+        let body = form.finish();
+
+        let s = String::from_utf8_lossy(&body);
+
+        assert!(s.contains("--b\r\n"));
+        assert!(s.contains("Content-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n"));
+        assert!(
+            s.contains("Content-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n")
+        );
+        assert!(
+            s.contains("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n")
+        );
+        assert!(s.contains("Content-Type: audio/wav\r\n\r\nabc\r\n"));
+        assert!(s.ends_with("--b--\r\n"));
+    }
 }

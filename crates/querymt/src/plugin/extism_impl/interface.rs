@@ -1,7 +1,7 @@
 use crate::{
     chat::{ChatMessage, ChatResponse, FinishReason, Tool},
     completion::CompletionRequest,
-    ToolCall, Usage,
+    stt, ToolCall, Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -40,6 +40,43 @@ pub struct ExtismEmbedRequest<C> {
 pub struct ExtismCompleteRequest<C> {
     pub cfg: C,
     pub req: CompletionRequest,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ExtismSttRequest<C> {
+    pub cfg: C,
+    pub audio_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+impl<C> ExtismSttRequest<C> {
+    pub fn into_stt_request(self) -> Result<stt::SttRequest, crate::error::LLMError> {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        let audio = BASE64
+            .decode(self.audio_base64)
+            .map_err(|e| crate::error::LLMError::InvalidRequest(e.to_string()))?;
+
+        Ok(stt::SttRequest {
+            audio,
+            filename: self.filename,
+            mime_type: self.mime_type,
+            model: self.model,
+            language: self.language,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExtismSttResponse {
+    pub text: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

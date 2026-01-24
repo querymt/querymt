@@ -38,6 +38,9 @@ pub mod completion;
 /// Vector embeddings generation for text
 pub mod embedding;
 
+/// Speech to text transcription representations
+pub mod stt;
+
 /// Error types and handling
 pub mod error;
 
@@ -87,6 +90,13 @@ pub trait LLMProvider:
     fn tool_server_name(&self, _name: &str) -> Option<&str> {
         None
     }
+
+    async fn transcribe(
+        &self,
+        _req: &stt::SttRequest,
+    ) -> Result<stt::SttResponse, error::LLMError> {
+        Err(error::LLMError::NotImplemented("STT not supported".into()))
+    }
 }
 
 pub trait HTTPLLMProvider:
@@ -98,6 +108,20 @@ pub trait HTTPLLMProvider:
 {
     fn tools(&self) -> Option<&[Tool]> {
         None
+    }
+
+    fn stt_request(
+        &self,
+        _req: &stt::SttRequest,
+    ) -> Result<http::Request<Vec<u8>>, error::LLMError> {
+        Err(error::LLMError::NotImplemented("STT not supported".into()))
+    }
+
+    fn parse_stt(
+        &self,
+        _resp: http::Response<Vec<u8>>,
+    ) -> Result<stt::SttResponse, error::LLMError> {
+        Err(error::LLMError::NotImplemented("STT not supported".into()))
     }
 }
 

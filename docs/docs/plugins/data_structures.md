@@ -21,6 +21,17 @@ These structures are used as the direct input/output for the main plugin functio
     -   `cfg: C`: Plugin-specific configuration.
     -   `req: CompletionRequest`: The core completion request.
 
+-   **`querymt::plugin::extism_impl::ExtismSttRequest<C>`**
+    -   `cfg: C`: Plugin-specific configuration.
+    -   `audio_base64: String`: Base64-encoded audio bytes.
+    -   `filename: Option<String>`: Optional filename hint.
+    -   `mime_type: Option<String>`: Optional MIME type hint.
+    -   `model: Option<String>`: Optional transcription model override.
+    -   `language: Option<String>`: Optional language hint.
+
+-   **`querymt::plugin::extism_impl::ExtismSttResponse`**
+    -   `text: String`: Transcribed text.
+
 -   **`querymt::plugin::extism_impl::ExtismChatResponse`** (implements `querymt::chat::ChatResponse`)
     -   `text: Option<String>`: The main textual response from the LLM.
     -   `tool_calls: Option<Vec<ToolCall>>`: If the LLM decides to call tools.

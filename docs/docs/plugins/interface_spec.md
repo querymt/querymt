@@ -81,4 +81,10 @@ These functions handle the core LLM tasks. Their inputs are wrapper structs that
 8.  **`embed(input: ExtismEmbedRequest<YourConfigType>) -> Result<Json<Vec<Vec<f32>>>, Error>`**: Generates embeddings.
 9.  **`complete(input: ExtismCompleteRequest<YourConfigType>) -> Result<Json<CompletionResponse>, Error>`**: Handles text completion.
 
+### Optional Speech Functions
+
+These exports are optional. If absent, the host will treat the capability as unsupported.
+
+10. **`transcribe(input: ExtismSttRequest<YourConfigType>) -> Result<Json<ExtismSttResponse>, Error>`**: Speech-to-text transcription.
+
 See [Data Structures](data_structures.md) for details on the `Extism*` request/response types.

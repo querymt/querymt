@@ -4,7 +4,7 @@ use crate::{
     embedding::EmbeddingProvider,
     error::LLMError,
     outbound::{call_outbound, call_outbound_stream},
-    HTTPLLMProvider, LLMProvider, Tool,
+    stt, HTTPLLMProvider, LLMProvider, Tool,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -159,8 +159,20 @@ impl CompletionProvider for LLMProviderFromHTTP {
     }
 }
 
+#[async_trait]
 impl LLMProvider for LLMProviderFromHTTP {
     fn tools(&self) -> Option<&[Tool]> {
         self.inner.tools()
+    }
+
+    #[instrument(name = "http_adapter.transcribe", skip_all)]
+    async fn transcribe(&self, req_obj: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
+        let req = self.inner.stt_request(req_obj)?;
+        let resp = call_outbound(req)
+            .await
+            .map_err(|e| LLMError::HttpError(format!("{:#}", e)))?;
+        self.inner
+            .parse_stt(resp)
+            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))
     }
 }
