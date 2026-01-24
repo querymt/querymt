@@ -8,7 +8,9 @@ use std::env;
 use std::path::PathBuf;
 
 fn usage() -> String {
-    let bin = env::args().next().unwrap_or_else(|| "stt_example".to_string());
+    let bin = env::args()
+        .next()
+        .unwrap_or_else(|| "stt_example".to_string());
     format!(
         "Usage: {bin} <providers.toml> <audio_file> [provider] [model]\n\nExample:\n  {bin} ./providers.toml ./audio.wav openai whisper-1\n\nEnv overrides:\n  OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL\n"
     )
