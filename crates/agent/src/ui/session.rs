@@ -3,8 +3,8 @@
 //! Handles session creation, agent lookup, routing modes (single/broadcast),
 //! and session-related state management.
 
-use super::messages::{RoutingMode, UiAgentInfo, UiServerMessage};
 use super::ServerState;
+use super::messages::{RoutingMode, UiAgentInfo, UiServerMessage};
 use crate::agent::QueryMTAgent;
 use crate::index::{normalize_cwd, resolve_workspace_root};
 use crate::send_agent::SendAgent;
@@ -54,8 +54,12 @@ pub async fn prompt_for_mode(
             let agent = agent_for_id(state, &agent_id)
                 .ok_or_else(|| format!("Unknown agent: {}", agent_id))?;
             let session_cwd = session_cwd_for(state, &session_id).await.or(cwd.cloned());
-            let prompt_blocks =
-                super::mentions::build_prompt_blocks(&state.workspace_manager, session_cwd.as_ref(), text).await;
+            let prompt_blocks = super::mentions::build_prompt_blocks(
+                &state.workspace_manager,
+                session_cwd.as_ref(),
+                text,
+            )
+            .await;
             send_prompt(agent, session_id, prompt_blocks).await?;
         }
         RoutingMode::Broadcast => {
@@ -65,8 +69,12 @@ pub async fn prompt_for_mode(
                 let agent = agent_for_id(state, &agent_id)
                     .ok_or_else(|| format!("Unknown agent: {}", agent_id))?;
                 let session_cwd = session_cwd_for(state, &session_id).await.or(cwd.cloned());
-                let prompt_blocks =
-                    super::mentions::build_prompt_blocks(&state.workspace_manager, session_cwd.as_ref(), text).await;
+                let prompt_blocks = super::mentions::build_prompt_blocks(
+                    &state.workspace_manager,
+                    session_cwd.as_ref(),
+                    text,
+                )
+                .await;
                 send_prompt(agent, session_id, prompt_blocks).await?;
             }
         }

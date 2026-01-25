@@ -4,7 +4,7 @@
 //! agent events to connected clients.
 
 use super::messages::{RoutingMode, UiClientMessage, UiServerMessage};
-use super::session::{build_agent_list, PRIMARY_AGENT_ID};
+use super::session::{PRIMARY_AGENT_ID, build_agent_list};
 use super::{ConnectionState, ServerState};
 use crate::events::{AgentEvent, AgentEventKind};
 use crate::session::domain::ForkOrigin;
@@ -122,7 +122,10 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
 }
 
 /// Send a message to the client.
-pub async fn send_message(tx: &mpsc::Sender<String>, message: UiServerMessage) -> Result<(), String> {
+pub async fn send_message(
+    tx: &mpsc::Sender<String>,
+    message: UiServerMessage,
+) -> Result<(), String> {
     let message_type = message.type_name();
 
     match serde_json::to_string(&message) {
