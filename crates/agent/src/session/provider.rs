@@ -103,10 +103,8 @@ impl SessionProvider {
         }
 
         // Apply provider-specific defaults for required fields
-        if config.provider == "anthropic" {
-            if builder_config.get("max_tokens").is_none() {
-                builder_config["max_tokens"] = serde_json::json!(32_000);
-            }
+        if config.provider == "anthropic" && builder_config.get("max_tokens").is_none() {
+            builder_config["max_tokens"] = serde_json::json!(32_000);
         }
 
         // Get API key - try OAuth first (if feature enabled), then fall back to env var
