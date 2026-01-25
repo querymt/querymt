@@ -1,11 +1,11 @@
 use colored::*;
-use log::{Level, log_enabled};
-use querymt::ToolCall;
+use log::{log_enabled, Level};
 use querymt::chat::{ChatMessage, ImageMime};
 use querymt::plugin::HTTPLLMProviderFactory;
-use rustyline::{Config, Editor, error::ReadlineError};
+use querymt::ToolCall;
+use rustyline::{error::ReadlineError, Config, Editor};
 use serde_json::Value;
-use std::io::{Write, stdout};
+use std::io::{stdout, Write};
 use std::path::PathBuf;
 
 use crate::secret_store::SecretStore;
@@ -38,9 +38,25 @@ fn display_colored_prompt() -> String {
     )
 }
 
-pub fn get_provider_api_key<P: HTTPLLMProviderFactory + ?Sized>(provider: &P) -> Option<String> {
+/// Get the API key for a provider.
+///
+/// Attempts to retrieve the API key in the following order:
+/// 1. OAuth access token from the keyring (if valid/not expired)
+/// 2. API key stored in the keyring under the env var name
+/// 3. Environment variable (e.g., ANTHROPIC_API_KEY)
+pub fn get_provider_api_key<P: HTTPLLMProviderFactory + ?Sized>(
+    provider_name: &str,
+    factory: &P,
+) -> Option<String> {
     let store = SecretStore::new().ok()?;
-    let api_key_name = provider.api_key_name()?;
+
+    // Try OAuth access token first
+    if let Some(token) = store.get_valid_access_token(provider_name) {
+        return Some(token);
+    }
+
+    // Fall back to API key from keyring or env var
+    let api_key_name = factory.api_key_name()?;
     store
         .get(&api_key_name)
         .or_else(|| std::env::var(api_key_name).ok())

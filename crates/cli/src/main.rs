@@ -5,7 +5,7 @@ use querymt::{
     builder::LLMBuilder,
     mcp::{adapter::McpToolAdapter, config::Config as MCPConfig},
 };
-use serde_json::Value;
+
 use spinners::{Spinner, Spinners};
 use std::fs;
 use std::io::{self, IsTerminal};
@@ -186,18 +186,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Commands::Models => {
                 // Load all plugins since we need to list models from all providers
                 registry.load_all_plugins().await;
-                let mut cfg: Value = Default::default();
                 for factory in registry.list() {
                     print!("{}: ", factory.name());
-                    let models = match factory.as_http() {
+                    let cfg = match factory.as_http() {
                         Some(http_factory) => {
-                            if let Some(api_key) = get_provider_api_key(http_factory) {
-                                cfg = serde_json::json!({"api_key": api_key})
+                            if let Some(api_key) =
+                                get_provider_api_key(factory.name(), http_factory)
+                            {
+                                serde_json::json!({"api_key": api_key})
+                            } else {
+                                serde_json::json!({})
                             }
-                            factory.list_models(&cfg).await
                         }
-                        None => factory.list_models(&cfg).await,
+                        None => serde_json::json!({}),
                     };
+                    let models = factory.list_models(&cfg).await;
 
                     match models {
                         Ok(models) if !models.is_empty() => {
