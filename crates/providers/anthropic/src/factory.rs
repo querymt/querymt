@@ -1,10 +1,12 @@
-use http::{Method, Request, Response, header::CONTENT_TYPE};
-use querymt::{HTTPLLMProvider, error::LLMError, plugin::HTTPLLMProviderFactory};
+use http::{header::CONTENT_TYPE, Method, Request, Response};
+use querymt::{
+    error::LLMError, handle_http_error, plugin::HTTPLLMProviderFactory, HTTPLLMProvider,
+};
 use schemars::schema_for;
 use serde_json::Value;
 use url::Url;
 
-use crate::Anthropic;
+use crate::{detect_auth_type, Anthropic};
 
 struct AnthropicFactory;
 
@@ -27,42 +29,11 @@ impl HTTPLLMProviderFactory for AnthropicFactory {
             Some(api_key) => {
                 let url = base_url.join("models")?;
 
-                // Determine auth type using the same logic as the main implementation
-                let auth_type = cfg
+                // Determine auth type using the shared detection function
+                let explicit_auth_type = cfg
                     .get("auth_type")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_else(|| {
-                        // Auto-detect based on api_key format
-                        // Check for OAuth token pattern: sk-ant-oat<digits>-
-                        if api_key.starts_with("sk-ant-oat")
-                            && let Some(rest) = api_key.strip_prefix("sk-ant-oat")
-                                && rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                                    return crate::AuthType::OAuth;
-                                }
-
-                        // Check for API key pattern: sk-ant-api<digits>-
-                        if api_key.starts_with("sk-ant-api")
-                            && let Some(rest) = api_key.strip_prefix("sk-ant-api")
-                                && rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                                    return crate::AuthType::ApiKey;
-                                }
-
-                        // Fallback: Check for generic sk-ant- prefix (backward compatibility)
-                        if api_key.starts_with("sk-ant-") {
-                            eprintln!(
-                                "Warning: Anthropic token format not recognized (expected 'sk-ant-oat<N>-' or 'sk-ant-api<N>-'). \
-                                Defaulting to API key authentication. Consider setting 'auth_type' explicitly."
-                            );
-                            return crate::AuthType::ApiKey;
-                        }
-
-                        // Token doesn't match Anthropic format at all
-                        eprintln!(
-                            "Warning: Token does not match expected Anthropic format (should start with 'sk-ant-'). \
-                            Defaulting to API key authentication. This may cause authentication failures."
-                        );
-                        crate::AuthType::ApiKey
-                    });
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                let auth_type = detect_auth_type(api_key, explicit_auth_type);
 
                 let builder = Request::builder()
                     .method(Method::GET)
@@ -85,6 +56,8 @@ impl HTTPLLMProviderFactory for AnthropicFactory {
     }
 
     fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
+        handle_http_error!(resp);
+
         let resp_json: Value = serde_json::from_slice(resp.body())?;
         let arr = resp_json
             .get("data")

@@ -43,6 +43,54 @@ pub enum AuthType {
     OAuth,
 }
 
+/// Determines the authentication type based on an explicit setting or by auto-detecting from the API key format.
+///
+/// If `explicit_auth_type` is `Some`, returns that value directly.
+/// Otherwise, auto-detects based on the token prefix:
+/// - OAuth tokens: `sk-ant-oat<digits>-...` (e.g., sk-ant-oat01-...)
+/// - API keys: `sk-ant-api<digits>-...` (e.g., sk-ant-api03-...)
+///
+/// If the token format is unrecognized, logs a warning and defaults to API key authentication.
+pub fn detect_auth_type(api_key: &str, explicit_auth_type: Option<AuthType>) -> AuthType {
+    if let Some(auth_type) = explicit_auth_type {
+        return auth_type;
+    }
+
+    // Check for OAuth token pattern: sk-ant-oat<digits>-
+    if api_key.starts_with("sk-ant-oat") {
+        if let Some(rest) = api_key.strip_prefix("sk-ant-oat")
+            && rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            return AuthType::OAuth;
+        }
+    }
+
+    // Check for API key pattern: sk-ant-api<digits>-
+    if api_key.starts_with("sk-ant-api") {
+        if let Some(rest) = api_key.strip_prefix("sk-ant-api")
+            && rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            return AuthType::ApiKey;
+        }
+    }
+
+    // Fallback: Check for generic sk-ant- prefix (backward compatibility)
+    if api_key.starts_with("sk-ant-") {
+        eprintln!(
+            "Warning: Anthropic token format not recognized (expected 'sk-ant-oat<N>-' or 'sk-ant-api<N>-'). \
+            Defaulting to API key authentication. Consider setting 'auth_type' explicitly."
+        );
+        return AuthType::ApiKey;
+    }
+
+    // Token doesn't match Anthropic format at all
+    eprintln!(
+        "Warning: Token does not match expected Anthropic format (should start with 'sk-ant-'). \
+        Defaulting to API key authentication. This may cause authentication failures."
+    );
+    AuthType::ApiKey
+}
+
 /// Client for interacting with Anthropic's API.
 ///
 /// Provides methods for chat and completion requests using Anthropic's models.
@@ -58,7 +106,7 @@ pub struct Anthropic {
     pub auth_type: Option<AuthType>,
     pub model: String,
     pub max_tokens: u32,
-    pub temperature: f32,
+    pub temperature: Option<f32>,
     pub timeout_seconds: Option<u64>,
     pub system: Option<String>,
     pub stream: Option<bool>,
@@ -319,47 +367,9 @@ impl Anthropic {
     }
 
     /// Determines the authentication type to use.
-    /// If auth_type is explicitly set, uses that. Otherwise, auto-detects based on token prefix:
-    /// - OAuth tokens: `sk-ant-oat<digits>-...` (e.g., sk-ant-oat01-...)
-    /// - API keys: `sk-ant-api<digits>-...` (e.g., sk-ant-api03-...)
-    ///
-    /// If the token format is unrecognized, logs a warning and defaults to API key authentication.
+    /// Delegates to `detect_auth_type` for the actual logic.
     fn determine_auth_type(&self) -> AuthType {
-        self.auth_type.clone().unwrap_or_else(|| {
-            // Check for OAuth token pattern: sk-ant-oat<digits>-
-            if self.api_key.starts_with("sk-ant-oat") {
-                // Validate it has digits after 'oat'
-                if let Some(rest) = self.api_key.strip_prefix("sk-ant-oat")
-                    && rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                        return AuthType::OAuth;
-                    }
-            }
-
-            // Check for API key pattern: sk-ant-api<digits>-
-            if self.api_key.starts_with("sk-ant-api") {
-                // Validate it has digits after 'api'
-                if let Some(rest) = self.api_key.strip_prefix("sk-ant-api")
-                    && rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                        return AuthType::ApiKey;
-                    }
-            }
-
-            // Fallback: Check for generic sk-ant- prefix (backward compatibility)
-            if self.api_key.starts_with("sk-ant-") {
-                eprintln!(
-                    "Warning: Anthropic token format not recognized (expected 'sk-ant-oat<N>-' or 'sk-ant-api<N>-'). \
-                    Defaulting to API key authentication. Consider setting 'auth_type' explicitly."
-                );
-                return AuthType::ApiKey;
-            }
-
-            // Token doesn't match Anthropic format at all
-            eprintln!(
-                "Warning: Token does not match expected Anthropic format (should start with 'sk-ant-'). \
-                Defaulting to API key authentication. This may cause authentication failures."
-            );
-            AuthType::ApiKey
-        })
+        detect_auth_type(&self.api_key, self.auth_type.clone())
     }
 
     /// Returns true if using OAuth authentication
@@ -587,13 +597,13 @@ impl HTTPChatProvider for Anthropic {
             messages: anthropic_messages,
             model: &self.model,
             max_tokens: Some(self.max_tokens),
-            temperature: Some(if self.reasoning.unwrap_or(false) {
+            temperature: if self.reasoning.unwrap_or(false) {
                 // NOTE: Ignoring temperature when reasoning is enabled. Temperature in this cases
                 // should always be set to `1.0`.
-                1.0
+                Some(1.0)
             } else {
                 self.temperature
-            }),
+            },
             system: sanitized_system,
             stream: self.stream,
             top_p: self.top_p,
@@ -765,7 +775,7 @@ mod tests {
             auth_type: None,
             model: "claude-3-7-sonnet-20250219".to_string(),
             max_tokens: 100,
-            temperature: 1.0,
+            temperature: Some(1.0),
             timeout_seconds: None,
             system: None,
             stream: None,
@@ -787,7 +797,7 @@ mod tests {
             auth_type: None,
             model: "claude-3-7-sonnet-20250219".to_string(),
             max_tokens: 100,
-            temperature: 1.0,
+            temperature: Some(1.0),
             timeout_seconds: None,
             system: None,
             stream: None,
@@ -810,7 +820,7 @@ mod tests {
             auth_type: Some(AuthType::ApiKey), // Explicitly set to API key
             model: "claude-3-7-sonnet-20250219".to_string(),
             max_tokens: 100,
-            temperature: 1.0,
+            temperature: Some(1.0),
             timeout_seconds: None,
             system: None,
             stream: None,
@@ -832,7 +842,7 @@ mod tests {
             auth_type: None,
             model: "claude-3-7-sonnet-20250219".to_string(),
             max_tokens: 100,
-            temperature: 1.0,
+            temperature: Some(1.0),
             timeout_seconds: None,
             system: None,
             stream: None,
@@ -856,7 +866,7 @@ mod tests {
             auth_type: None,
             model: "claude-3-7-sonnet-20250219".to_string(),
             max_tokens: 100,
-            temperature: 1.0,
+            temperature: Some(1.0),
             timeout_seconds: None,
             system: None,
             stream: None,
@@ -875,7 +885,7 @@ mod tests {
             auth_type: None,
             model: "claude-3-7-sonnet-20250219".to_string(),
             max_tokens: 100,
-            temperature: 1.0,
+            temperature: Some(1.0),
             timeout_seconds: None,
             system: None,
             stream: None,
