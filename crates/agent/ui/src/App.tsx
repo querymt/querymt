@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
-import { Activity, Send, CheckCircle, XCircle, Loader, Menu, Plus, Code, ChevronDown } from 'lucide-react';
+import { Activity, Send, CheckCircle, XCircle, Loader, Menu, Plus, Code, ChevronDown, Square } from 'lucide-react';
 import { useUiClient } from './hooks/useUiClient';
 import { useSessionTimer } from './hooks/useSessionTimer';
 import { useFileMention } from './hooks/useFileMention';
@@ -24,6 +24,7 @@ function App() {
     connected,
     newSession,
     sendPrompt,
+    cancelSession,
     agents,
     routingMode,
     activeAgentId,
@@ -109,6 +110,19 @@ function App() {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [connected, loading]);
+
+  // Keyboard shortcut: Escape to cancel active session
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && thinkingAgentId !== null) {
+        e.preventDefault();
+        cancelSession();
+      }
+    };
+    
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [thinkingAgentId, cancelSession]);
 
   const handleSendPrompt = async () => {
     if (!prompt.trim() || loading || !sessionId) return;
@@ -493,29 +507,45 @@ function App() {
             isLoadingFiles={fileMention.isLoading}
             showIndexBuilding={activeIndexStatus === 'building'}
           />
-          <button
-            onClick={handleSendPrompt}
-            disabled={loading || !connected || !sessionId || !prompt.trim()}
-            className="
-              px-6 py-3 rounded-lg font-medium transition-all duration-200
-              bg-cyber-cyan/10 border-2 border-cyber-cyan text-cyber-cyan
-              hover:bg-cyber-cyan/20 hover:shadow-neon-cyan
-              disabled:opacity-30 disabled:cursor-not-allowed
-              flex items-center gap-2 overflow-visible
-            "
-          >
-            {loading ? (
-              <>
-                <Loader className="w-5 h-5 animate-spin" />
-                <span>Sending...</span>
-              </>
-            ) : (
-              <>
-                <Send className="w-5 h-5" />
-                <GlitchText text="Send" variant="0" hoverOnly />
-              </>
-            )}
-          </button>
+          {thinkingAgentId !== null ? (
+            <button
+              onClick={cancelSession}
+              className="
+                px-6 py-3 rounded-lg font-medium transition-all duration-200
+                bg-cyber-orange/10 border-2 border-cyber-orange text-cyber-orange
+                hover:bg-cyber-orange/20 hover:shadow-[0_0_15px_rgba(255,165,0,0.3)]
+                flex items-center gap-2 overflow-visible
+              "
+              title="Stop generation (Esc)"
+            >
+              <Square className="w-5 h-5" />
+              <span>Stop</span>
+            </button>
+          ) : (
+            <button
+              onClick={handleSendPrompt}
+              disabled={loading || !connected || !sessionId || !prompt.trim()}
+              className="
+                px-6 py-3 rounded-lg font-medium transition-all duration-200
+                bg-cyber-cyan/10 border-2 border-cyber-cyan text-cyber-cyan
+                hover:bg-cyber-cyan/20 hover:shadow-neon-cyan
+                disabled:opacity-30 disabled:cursor-not-allowed
+                flex items-center gap-2 overflow-visible
+              "
+            >
+              {loading ? (
+                <>
+                  <Loader className="w-5 h-5 animate-spin" />
+                  <span>Sending...</span>
+                </>
+              ) : (
+                <>
+                  <Send className="w-5 h-5" />
+                  <GlitchText text="Send" variant="0" hoverOnly />
+                </>
+              )}
+            </button>
+          )}
         </div>
       </div>
 

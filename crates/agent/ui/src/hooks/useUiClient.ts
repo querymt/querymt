@@ -300,6 +300,11 @@ export function useUiClient() {
     sendMessage({ type: 'get_file_index' });
   }, []);
 
+  // Cancel the active session
+  const cancelSession = useCallback(() => {
+    sendMessage({ type: 'cancel_session' });
+  }, []);
+
   // Request LLM config by ID (returns cached if available, otherwise fetches)
   const requestLlmConfig = useCallback((configId: number, callback: (config: LlmConfigDetails) => void) => {
     // Check cache first
@@ -319,6 +324,7 @@ export function useUiClient() {
     connected,
     newSession,
     sendPrompt,
+    cancelSession,
     agents,
     routingMode,
     activeAgentId,

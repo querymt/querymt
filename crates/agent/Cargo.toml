@@ -45,6 +45,7 @@ grep-regex = "0.1"
 similar = "2.7"
 strsim = "0.11"
 once_cell = "1.21"
+moka = { version = "0.12", features = ["future"] }
 pathdiff = "0.2"
 patchkit = "0.2"
 gitpatch = "0.7"

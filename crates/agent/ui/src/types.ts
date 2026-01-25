@@ -290,4 +290,5 @@ export type UiClientMessage =
   | { type: 'list_all_models'; refresh?: boolean }
   | { type: 'set_session_model'; session_id: string; model_id: string }
   | { type: 'get_file_index' }
-  | { type: 'get_llm_config'; config_id: number };
+  | { type: 'get_llm_config'; config_id: number }
+  | { type: 'cancel_session' };
