@@ -93,7 +93,7 @@ export function ModelConfigPopover({
   return (
     <div
       ref={popoverRef}
-      className="fixed z-50 w-96 rounded-lg border border-cyber-border/40 bg-cyber-bg/95 shadow-[0_0_20px_rgba(0,255,249,0.15)] backdrop-blur-md animate-fade-in"
+      className="fixed z-50 w-96 rounded-lg border border-cyber-cyan/30 bg-cyber-bg shadow-lg shadow-cyber-cyan/25 animate-fade-in"
       style={{ top: position.top, left: position.left }}
     >
       {/* Header */}

@@ -48,14 +48,23 @@ export function useSessionTimer(
 ): SessionTimerResult {
   const [currentTime, setCurrentTime] = useState(Date.now());
   
-  // Update current time every second for live display
+  // Determine if session should be considered active
+  // This is computed early so we can use it to conditionally run the timer
+  const shouldTimerRun = thinkingAgentId !== null && !isConversationComplete;
+  
+  // Update current time every second ONLY when session is active
+  // This is the key optimization - no interval when idle
   useEffect(() => {
+    if (!shouldTimerRun) {
+      return; // Don't start interval if session is not active
+    }
+    
     const interval = setInterval(() => {
       setCurrentTime(Date.now());
     }, 1000);
     
     return () => clearInterval(interval);
-  }, []);
+  }, [shouldTimerRun]);
   
   // Calculate timing state from events
   const { agentStates, globalState } = useMemo(() => {
@@ -68,12 +77,27 @@ export function useSessionTimer(
     
     // Process events to reconstruct timing state
     for (const event of events) {
-      if (event.type === 'system') {
-        continue;
-      }
-      const agentId = event.agentId || 'unknown';
       const timestamp = event.timestamp;
       lastEventTimestamp = Math.max(lastEventTimestamp, timestamp);
+      
+      // Handle system error events - stop all agents
+      if (event.type === 'system') {
+        const content = event.content?.toLowerCase() || '';
+        if (content.includes('error') || content.includes('failed')) {
+          // System error - stop all working agents
+          for (const state of agentStates.values()) {
+            if (state.isWorking && state.workStartedAt !== undefined) {
+              const elapsed = timestamp - state.workStartedAt;
+              state.accumulatedMs += elapsed;
+              state.isWorking = false;
+              state.workStartedAt = undefined;
+            }
+          }
+        }
+        continue;
+      }
+      
+      const agentId = event.agentId || 'unknown';
       
       if (!agentStates.has(agentId)) {
         agentStates.set(agentId, {
@@ -91,6 +115,7 @@ export function useSessionTimer(
       const isLlmRequestEnd = eventContent.includes('llm_request_end');
       const isDelegationRequested = eventContent.includes('delegation_requested');
       const isDelegationCompleted = eventContent.includes('delegation_completed');
+      const isErrorEvent = eventContent.includes('error') || eventContent.includes('failed');
       const finishReason = event.finishReason?.toLowerCase();
       
       // GLOBAL TIMER: Start from first prompt_received
@@ -143,6 +168,16 @@ export function useSessionTimer(
         // If finishReason === 'tool_calls' or 'toolcalls', keep timer running
         // The agent will execute tools next
       }
+      
+      // PER-AGENT: Stop on error events - the agent has stopped processing
+      if (isErrorEvent && state.isWorking) {
+        if (state.workStartedAt !== undefined) {
+          const elapsed = timestamp - state.workStartedAt;
+          state.accumulatedMs += elapsed;
+        }
+        state.isWorking = false;
+        state.workStartedAt = undefined;
+      }
     }
     
     // GLOBAL TIMER: Pause when all agents stopped working
@@ -159,8 +194,9 @@ export function useSessionTimer(
   
   // Calculate live elapsed times
   // GLOBAL TIMER: Add live delta only if session is active
-  const anyAgentWorking = Array.from(agentStates.values()).some(s => s.isWorking);
-  const isSessionActive = anyAgentWorking || (thinkingAgentId !== null && !isConversationComplete);
+  // Use thinkingAgentId as the sole source of truth for active state
+  // This ensures loaded historical sessions are never shown as active
+  const isSessionActive = thinkingAgentId !== null && !isConversationComplete;
   
   let globalElapsedMs = globalState.accumulatedMs;
   if (globalState.lastActiveAt !== undefined && isSessionActive) {

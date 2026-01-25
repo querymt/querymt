@@ -1,5 +1,4 @@
-/* Circuit board and glitch effects - must come before @tailwind */
-@import './styles/circuit-background.css';
+/* Glitch effects - must come before @tailwind */
 @import './styles/glitch-effects.css';
 
 @tailwind base;
@@ -288,21 +287,6 @@
   border-left-color: #ff6b35;
 }
 
-/* ===== Glow Pulse Animation ===== */
-
-@keyframes glow-pulse {
-  0%, 100% {
-    filter: drop-shadow(0 0 2px currentColor);
-  }
-  50% {
-    filter: drop-shadow(0 0 8px currentColor);
-  }
-}
-
-.animate-glow-pulse {
-  animation: glow-pulse 2s ease-in-out infinite;
-}
-
 /* ===== Scrollbar Styling ===== */
 
 /* Custom scrollbar for modal and accordion content */
@@ -392,7 +376,7 @@
 
 /* Timeline container */
 .session-timeline {
-  @apply sticky top-0 z-40 bg-cyber-bg/95 backdrop-blur-sm;
+  @apply sticky top-0 z-40 bg-cyber-bg/95;
   @apply border-b border-cyber-border/50;
   @apply px-4 py-3;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);

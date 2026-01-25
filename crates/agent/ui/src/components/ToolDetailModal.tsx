@@ -71,14 +71,14 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm animate-fade-in"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 animate-fade-in"
       onClick={handleBackdropClick}
     >
       <div
         className="
           relative w-[90vw] max-w-5xl h-[85vh] max-h-[900px]
-          bg-cyber-surface border border-cyber-border rounded-lg
-          shadow-[0_0_40px_rgba(0,255,249,0.2)]
+          bg-cyber-surface border border-cyber-cyan/30 rounded-lg
+          shadow-lg shadow-cyber-cyan/25
           flex flex-col overflow-hidden
         "
         onClick={(e) => e.stopPropagation()}

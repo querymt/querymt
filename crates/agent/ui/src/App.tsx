@@ -11,7 +11,7 @@ import { FloatingStatsPanel } from './components/FloatingStatsPanel';
 import { MentionInput } from './components/MentionInput';
 import { ToolDetailModal } from './components/ToolDetailModal';
 import { TurnCard } from './components/TurnCard';
-import { CircuitBackground } from './components/CircuitBackground';
+
 import { GlitchText } from './components/GlitchText';
 import { SessionPicker } from './components/SessionPicker';
 import { SystemLog } from './components/SystemLog';
@@ -239,8 +239,6 @@ function App() {
 
   return (
     <div className="flex flex-col h-screen bg-cyber-bg text-gray-100 relative">
-      {/* Circuit Board Background */}
-      <CircuitBackground className="opacity-20" />
       
       {/* Sidebar */}
       <Sidebar
@@ -269,7 +267,7 @@ function App() {
             <Menu className="w-6 h-6 text-cyber-cyan" />
           </button>
           <h1 className="text-xl font-semibold neon-text-cyan">
-            <GlitchText text="QueryMT" variant="3" />
+            <GlitchText text="QueryMT" variant="3" hoverOnly />
           </h1>
         </div>
         <div className="flex items-center gap-4 flex-wrap justify-end">
@@ -406,7 +404,7 @@ function App() {
               ) : (
                 // Active session but no events yet - ready to chat
                 <div className="text-center space-y-6 animate-fade-in text-gray-500">
-                  <Activity className="w-16 h-16 mx-auto opacity-30 text-cyber-cyan animate-glow-pulse" />
+                  <Activity className="w-16 h-16 mx-auto text-cyber-cyan opacity-30" />
                   <div>
                     <p className="text-lg text-gray-400">Session Ready</p>
                     <p className="text-sm text-gray-500 mt-2">Start chatting below to begin</p>

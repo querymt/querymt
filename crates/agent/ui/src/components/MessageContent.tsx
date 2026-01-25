@@ -1,6 +1,6 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { ComponentPropsWithoutRef } from 'react';
+import { ComponentPropsWithoutRef, memo } from 'react';
 import { parseFileMentions } from '../utils/fileMentionParser';
 import { FileMention } from './FileMention';
 
@@ -14,7 +14,7 @@ interface MessageContentProps {
   };
 }
 
-export function MessageContent({ content, type = 'text' }: MessageContentProps) {
+export const MessageContent = memo(function MessageContent({ content, type = 'text' }: MessageContentProps) {
   // For now, we'll use markdown for text and pre-formatted code for others
   // In the future, we can integrate @pierre/diffs for better code/diff rendering
   
@@ -167,4 +167,4 @@ export function MessageContent({ content, type = 'text' }: MessageContentProps) 
   }
   
   return <pre className="text-sm whitespace-pre-wrap break-words">{content}</pre>;
-}
+});

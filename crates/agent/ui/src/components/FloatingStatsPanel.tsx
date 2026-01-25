@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect, useRef } from 'react';
+import { useMemo, useState, useEffect, useRef, memo } from 'react';
 import { ChevronDown, ChevronRight, BarChart3, GripVertical, Minimize2 } from 'lucide-react';
 import { EventItem, UiAgentInfo } from '../types';
 import { calculateStats } from '../utils/statsCalculator';
@@ -46,7 +46,7 @@ const STORAGE_KEY_POSITION = 'floatingStatsPosition';
 const STORAGE_KEY_COLLAPSED = 'floatingStatsCollapsed';
 const STORAGE_KEY_MINIMIZED = 'floatingStatsMinimized';
 
-export function FloatingStatsPanel({ 
+export const FloatingStatsPanel = memo(function FloatingStatsPanel({ 
   events, 
   agents, 
   expertMode = false,
@@ -148,7 +148,7 @@ export function FloatingStatsPanel({
       >
         <button
           onClick={() => setIsMinimized(false)}
-          className="drag-handle flex items-center gap-2 px-3 py-2 rounded-lg backdrop-blur-sm border border-cyber-border/30 shadow-[0_0_40px_rgba(0,255,249,0.2)] cursor-move"
+          className="drag-handle flex items-center gap-2 px-3 py-2 rounded-lg bg-cyber-surface/95 border border-cyber-cyan/30 shadow-lg shadow-cyber-cyan/25 cursor-move"
         >
           <BarChart3 className="w-4 h-4 text-cyber-cyan" />
           <span className="text-xs font-medium text-gray-300">Stats</span>
@@ -168,7 +168,7 @@ export function FloatingStatsPanel({
       }}
       onMouseDown={handleMouseDown}
     >
-      <div className="rounded-lg backdrop-blur-sm border border-cyber-border/30 shadow-[0_0_40px_rgba(0,255,249,0.2)]">
+      <div className="rounded-lg bg-cyber-surface/95 border border-cyber-cyan/30 shadow-lg shadow-cyber-cyan/25">
         {/* Header with drag handle */}
         <div className="drag-handle flex items-center justify-between px-3 py-2 border-b border-cyber-border/30 cursor-move">
           <div className="flex items-center gap-2">
@@ -382,4 +382,4 @@ export function FloatingStatsPanel({
       </div>
     </div>
   );
-}
+});

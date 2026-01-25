@@ -31,10 +31,9 @@ export function ThinkingIndicator({ agentId, agents, isComplete = false }: Think
   return (
     <div className="flex items-center gap-3 px-6 py-2 bg-cyber-surface/80 border-t border-cyber-border/50 animate-fade-in">
       <div
-        className="w-3 h-3 rounded-full animate-glow-pulse"
+        className="w-3 h-3 rounded-full animate-pulse"
         style={{
           backgroundColor: color,
-          boxShadow: `0 0 10px ${color}, 0 0 20px ${color}`,
         }}
       />
       <span className="text-sm text-gray-400">

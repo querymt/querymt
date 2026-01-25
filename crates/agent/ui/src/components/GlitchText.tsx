@@ -16,8 +16,10 @@ export function GlitchText({
   className = '',
 }: GlitchTextProps) {
   const textRef = useRef<HTMLSpanElement>(null);
-  const shouldHover = hoverOnly && variant === '12';
-  const shouldHoverJump = hoverOnly && variant === '0';
+  const shouldHover12 = hoverOnly && variant === '12';
+  const shouldHover0 = hoverOnly && variant === '0';
+  const shouldHover3 = hoverOnly && variant === '3';
+  const isHoverOnly = shouldHover0 || shouldHover3 || shouldHover12;
 
   useEffect(() => {
     if (textRef.current) {
@@ -53,21 +55,15 @@ export function GlitchText({
     <span
       ref={textRef}
       data-splitting=""
-      className={`glitch ${shouldHover || shouldHoverJump ? '' : `glitch--${variant}`} ${className}`}
+      className={`glitch ${isHoverOnly ? '' : `glitch--${variant}`} ${className}`}
       onMouseEnter={() => {
-        if (shouldHover) {
-          textRef.current?.classList.add('glitch--12');
-        }
-        if (shouldHoverJump) {
-          textRef.current?.classList.add('glitch--0');
+        if (isHoverOnly) {
+          textRef.current?.classList.add(`glitch--${variant}`);
         }
       }}
       onMouseLeave={() => {
-        if (shouldHover) {
-          textRef.current?.classList.remove('glitch--12');
-        }
-        if (shouldHoverJump) {
-          textRef.current?.classList.remove('glitch--0');
+        if (isHoverOnly) {
+          textRef.current?.classList.remove(`glitch--${variant}`);
         }
       }}
     >

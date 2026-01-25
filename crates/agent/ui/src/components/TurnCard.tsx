@@ -2,7 +2,7 @@
  * Turn card component - groups user prompt, agent responses, and tool activity
  */
 
-import { useRef, useEffect, useState } from 'react';
+import { useRef, useEffect, useState, memo } from 'react';
 import { Turn, UiAgentInfo, EventRow, DelegationGroupInfo, LlmConfigDetails } from '../types';
 import { MessageContent } from './MessageContent';
 import { ActivitySection } from './ActivitySection';
@@ -102,7 +102,7 @@ function interleaveEvents(
   return result;
 }
 
-export function TurnCard({
+export const TurnCard = memo(function TurnCard({
   turn,
   agents,
   onToolClick,
@@ -267,4 +267,4 @@ export function TurnCard({
       </div>
     </div>
   );
-}
+});

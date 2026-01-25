@@ -88,7 +88,7 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
   return (
     <div className="w-full px-6 pb-2">
       <div
-        className={`mx-auto w-full max-w-[960px] rounded-2xl border border-cyber-orange/40 bg-cyber-surface/70 shadow-[0_0_30px_rgba(255,107,53,0.25)] backdrop-blur-sm transition-all duration-300 ${
+        className={`mx-auto w-full max-w-[960px] rounded-2xl border border-cyber-orange/50 bg-cyber-surface/95 shadow-lg shadow-cyber-orange/25 transition-all duration-300 ${
           justOpened ? 'animate-fade-in-up' : ''
         }`}
       >

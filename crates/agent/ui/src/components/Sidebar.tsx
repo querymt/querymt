@@ -56,17 +56,17 @@ export function Sidebar({
       {isOpen && (
         <div 
           onClick={onClose}
-          className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40 md:hidden"
+          className="fixed inset-0 bg-black/60 z-40 md:hidden"
         />
       )}
       
       {/* Sidebar panel */}
       <aside
         className={`
-          fixed top-0 left-0 h-full w-80 bg-cyber-surface border-r border-cyber-border
+          fixed top-0 left-0 h-full w-80 bg-cyber-surface border-r border-cyber-cyan/30
           transform transition-transform duration-300 ease-out z-50
           ${isOpen ? 'translate-x-0' : '-translate-x-full'}
-          shadow-[0_0_20px_rgba(0,255,249,0.1)]
+          shadow-lg shadow-cyber-cyan/25
         `}
       >
         {/* Header */}
@@ -127,7 +127,7 @@ export function Sidebar({
             <div className="flex items-center gap-2">
               {connected ? (
                 <>
-                  <CheckCircle className="w-5 h-5 text-cyber-lime animate-glow-pulse" />
+                  <CheckCircle className="w-5 h-5 text-cyber-lime" />
                   <span className="text-cyber-lime">Connected</span>
                 </>
               ) : (

@@ -2,6 +2,7 @@
  * Compact tool card component - shows minimal summary, click to expand in modal
  */
 
+import { memo } from 'react';
 import { Loader, CheckCircle, XCircle, ChevronRight } from 'lucide-react';
 import { generateToolSummary } from '../utils/toolSummary';
 import { EventItem } from '../types';
@@ -13,7 +14,7 @@ export interface ToolSummaryProps {
   onDelegateClick?: () => void;
 }
 
-export function ToolSummary({ event, onClick, isDelegate, onDelegateClick }: ToolSummaryProps) {
+export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegate, onDelegateClick }: ToolSummaryProps) {
   const toolKind = event.toolCall?.kind;
   const toolName = inferToolName(event);
   const rawInput = parseJsonMaybe(event.toolCall?.raw_input) ?? event.toolCall?.raw_input;
@@ -108,7 +109,7 @@ export function ToolSummary({ event, onClick, isDelegate, onDelegateClick }: Too
       )}
     </div>
   );
-}
+});
 
 // Helper: parse tool name from event
 function inferToolName(event: EventItem): string | undefined {

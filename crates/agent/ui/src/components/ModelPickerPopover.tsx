@@ -214,7 +214,7 @@ export function ModelPickerPopover({
   return (
     <div
       ref={popoverRef}
-      className="absolute top-full right-0 mt-2 z-50 w-[480px] max-h-[420px] flex flex-col rounded-xl border border-cyber-border/30 bg-cyber-bg/95 shadow-[0_0_40px_rgba(0,255,249,0.2)] backdrop-blur-md animate-fade-in"
+      className="absolute top-full right-0 mt-2 z-50 w-[480px] max-h-[420px] flex flex-col rounded-xl border border-cyber-cyan/30 bg-cyber-bg shadow-lg shadow-cyber-cyan/25 animate-fade-in"
     >
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-cyber-border/60">

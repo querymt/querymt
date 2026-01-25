@@ -183,6 +183,9 @@ export function useUiClient() {
         break;
       case 'session_loaded':
         setSessionId(msg.session_id);
+        // Reset thinking state - loaded sessions are historical, not actively running
+        setThinkingAgentId(null);
+        setIsConversationComplete(false);
         // Translate events from full audit view
         const loadedEvents = msg.audit.events.map(event => translateLoadedEvent(activeAgentId, event));
         setEvents(loadedEvents);
