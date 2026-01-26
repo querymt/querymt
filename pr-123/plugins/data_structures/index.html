@@ -1321,6 +1321,24 @@
 </ul>
 </li>
 <li>
+<p><strong><code>querymt::plugin::extism_impl::ExtismTtsRequest&lt;C&gt;</code></strong></p>
+<ul>
+<li><code>cfg: C</code>: Plugin-specific configuration.</li>
+<li><code>text: String</code>: Text input to synthesize.</li>
+<li><code>model: Option&lt;String&gt;</code>: Optional model override.</li>
+<li><code>voice: Option&lt;String&gt;</code>: Optional voice selection.</li>
+<li><code>format: Option&lt;String&gt;</code>: Optional output format (e.g. mp3, wav).</li>
+<li><code>speed: Option&lt;f32&gt;</code>: Optional speech speed.</li>
+</ul>
+</li>
+<li>
+<p><strong><code>querymt::plugin::extism_impl::ExtismTtsResponse</code></strong></p>
+<ul>
+<li><code>audio_base64: String</code>: Base64-encoded audio bytes.</li>
+<li><code>mime_type: Option&lt;String&gt;</code>: Optional MIME type hint.</li>
+</ul>
+</li>
+<li>
 <p><strong><code>querymt::plugin::extism_impl::ExtismChatResponse</code></strong> (implements <code>querymt::chat::ChatResponse</code>)</p>
 <ul>
 <li><code>text: Option&lt;String&gt;</code>: The main textual response from the LLM.</li>

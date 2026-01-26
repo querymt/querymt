@@ -1427,7 +1427,12 @@
 <h3 id="optional-speech-functions">Optional Speech Functions</h3>
 <p>These exports are optional. If absent, the host will treat the capability as unsupported.</p>
 <ol>
-<li><strong><code>transcribe(input: ExtismSttRequest&lt;YourConfigType&gt;) -&gt; Result&lt;Json&lt;ExtismSttResponse&gt;, Error&gt;</code></strong>: Speech-to-text transcription.</li>
+<li>
+<p><strong><code>transcribe(input: ExtismSttRequest&lt;YourConfigType&gt;) -&gt; Result&lt;Json&lt;ExtismSttResponse&gt;, Error&gt;</code></strong>: Speech-to-text transcription.</p>
+</li>
+<li>
+<p><strong><code>speech(input: ExtismTtsRequest&lt;YourConfigType&gt;) -&gt; Result&lt;Json&lt;ExtismTtsResponse&gt;, Error&gt;</code></strong>: Text-to-speech synthesis.</p>
+</li>
 </ol>
 <p>See <a href="../data_structures/">Data Structures</a> for details on the <code>Extism*</code> request/response types.</p>
 
