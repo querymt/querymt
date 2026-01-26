@@ -1128,6 +1128,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#optional-speech-functions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Optional Speech Functions
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1412,6 +1423,16 @@
 <li><strong><code>chat(input: ExtismChatRequest&lt;YourConfigType&gt;) -&gt; Result&lt;Json&lt;ExtismChatResponse&gt;, Error&gt;</code></strong>: Handles chat completion requests.</li>
 <li><strong><code>embed(input: ExtismEmbedRequest&lt;YourConfigType&gt;) -&gt; Result&lt;Json&lt;Vec&lt;Vec&lt;f32&gt;&gt;&gt;, Error&gt;</code></strong>: Generates embeddings.</li>
 <li><strong><code>complete(input: ExtismCompleteRequest&lt;YourConfigType&gt;) -&gt; Result&lt;Json&lt;CompletionResponse&gt;, Error&gt;</code></strong>: Handles text completion.</li>
+</ol>
+<h3 id="optional-speech-functions">Optional Speech Functions</h3>
+<p>These exports are optional. If absent, the host will treat the capability as unsupported.</p>
+<ol>
+<li>
+<p><strong><code>transcribe(input: ExtismSttRequest&lt;YourConfigType&gt;) -&gt; Result&lt;Json&lt;ExtismSttResponse&gt;, Error&gt;</code></strong>: Speech-to-text transcription.</p>
+</li>
+<li>
+<p><strong><code>speech(input: ExtismTtsRequest&lt;YourConfigType&gt;) -&gt; Result&lt;Json&lt;ExtismTtsResponse&gt;, Error&gt;</code></strong>: Text-to-speech synthesis.</p>
+</li>
 </ol>
 <p>See <a href="../data_structures/">Data Structures</a> for details on the <code>Extism*</code> request/response types.</p>
 
