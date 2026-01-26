@@ -4,20 +4,19 @@
 
 use http::{Request, Response};
 use querymt::{
-    HTTPLLMProvider,
     chat::{
-        ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
-        http::HTTPChatProvider,
+        http::HTTPChatProvider, ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat,
+        Tool, ToolChoice,
     },
-    completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
+    completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     get_env_var,
     plugin::HTTPLLMProviderFactory,
     providers::{ModelPricing, ProvidersRegistry},
-    stt,
+    stt, tts, HTTPLLMProvider,
 };
-use schemars::{JsonSchema, schema_for};
+use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -234,6 +233,14 @@ impl HTTPLLMProvider for OpenAI {
 
     fn parse_stt(&self, resp: Response<Vec<u8>>) -> Result<stt::SttResponse, LLMError> {
         api::openai_parse_stt(self, resp)
+    }
+
+    fn tts_request(&self, req: &tts::TtsRequest) -> Result<Request<Vec<u8>>, LLMError> {
+        api::openai_tts_request(self, req)
+    }
+
+    fn parse_tts(&self, resp: Response<Vec<u8>>) -> Result<tts::TtsResponse, LLMError> {
+        api::openai_parse_tts(self, resp)
     }
 }
 

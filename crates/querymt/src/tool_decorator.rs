@@ -3,7 +3,7 @@ use crate::{
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
-    stt, LLMProvider, Tool,
+    stt, tts, LLMProvider, Tool,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -147,5 +147,9 @@ impl LLMProvider for ToolEnabledProvider {
 
     async fn transcribe(&self, req: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
         self.inner.transcribe(req).await
+    }
+
+    async fn speech(&self, req: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
+        self.inner.speech(req).await
     }
 }

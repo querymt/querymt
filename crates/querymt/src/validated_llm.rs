@@ -32,6 +32,7 @@ use crate::completion::{CompletionProvider, CompletionRequest, CompletionRespons
 use crate::embedding::EmbeddingProvider;
 use crate::error::LLMError;
 use crate::stt;
+use crate::tts;
 use crate::{builder::ValidatorFn, LLMProvider};
 
 /// A wrapper around an LLM provider that validates responses before returning them.
@@ -90,6 +91,10 @@ impl LLMProvider for ValidatedLLM {
 
     async fn transcribe(&self, req: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
         self.inner.transcribe(req).await
+    }
+
+    async fn speech(&self, req: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
+        self.inner.speech(req).await
     }
 }
 

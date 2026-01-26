@@ -6,12 +6,12 @@ use crate::{
     plugin::{
         extism_impl::{
             ExtismChatRequest, ExtismChatResponse, ExtismEmbedRequest, ExtismSttRequest,
-            ExtismSttResponse,
+            ExtismSttResponse, ExtismTtsRequest, ExtismTtsResponse,
         },
         Fut, HTTPLLMProviderFactory, LLMProviderFactory,
     },
     providers::read_providers_from_cache,
-    stt, LLMProvider,
+    stt, tts, LLMProvider,
 };
 
 use async_trait::async_trait;
@@ -507,5 +507,32 @@ impl LLMProvider for ExtismProvider {
             .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
 
         Ok(stt::SttResponse { text: out.0.text })
+    }
+
+    async fn speech(&self, req: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
+        let mut plug = self.plugin.lock().unwrap();
+
+        if !plug.function_exists("speech") {
+            return Err(LLMError::NotImplemented(
+                "TTS not supported by this plugin".into(),
+            ));
+        }
+
+        let arg = ExtismTtsRequest {
+            cfg: self.config.clone(),
+            text: req.text.clone(),
+            model: req.model.clone(),
+            voice: req.voice.clone(),
+            format: req.format.clone(),
+            speed: req.speed,
+        };
+
+        let out: Json<ExtismTtsResponse> = plug
+            .call("speech", Json(arg))
+            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
+
+        out.0
+            .into_tts_response()
+            .map_err(|e| LLMError::PluginError(e.to_string()))
     }
 }

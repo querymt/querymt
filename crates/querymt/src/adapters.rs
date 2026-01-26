@@ -4,7 +4,7 @@ use crate::{
     embedding::EmbeddingProvider,
     error::LLMError,
     outbound::{call_outbound, call_outbound_stream},
-    stt, HTTPLLMProvider, LLMProvider, Tool,
+    stt, tts, HTTPLLMProvider, LLMProvider, Tool,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -173,6 +173,17 @@ impl LLMProvider for LLMProviderFromHTTP {
             .map_err(|e| LLMError::HttpError(format!("{:#}", e)))?;
         self.inner
             .parse_stt(resp)
+            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))
+    }
+
+    #[instrument(name = "http_adapter.speech", skip_all)]
+    async fn speech(&self, req_obj: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
+        let req = self.inner.tts_request(req_obj)?;
+        let resp = call_outbound(req)
+            .await
+            .map_err(|e| LLMError::HttpError(format!("{:#}", e)))?;
+        self.inner
+            .parse_tts(resp)
             .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))
     }
 }

@@ -87,4 +87,6 @@ These exports are optional. If absent, the host will treat the capability as uns
 
 10. **`transcribe(input: ExtismSttRequest<YourConfigType>) -> Result<Json<ExtismSttResponse>, Error>`**: Speech-to-text transcription.
 
+11. **`speech(input: ExtismTtsRequest<YourConfigType>) -> Result<Json<ExtismTtsResponse>, Error>`**: Text-to-speech synthesis.
+
 See [Data Structures](data_structures.md) for details on the `Extism*` request/response types.

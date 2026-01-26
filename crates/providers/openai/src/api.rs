@@ -1,10 +1,9 @@
 use either::*;
 use http::{
-    Method, Request, Response,
     header::{AUTHORIZATION, CONTENT_TYPE},
+    Method, Request, Response,
 };
 use querymt::{
-    FunctionCall, ToolCall, Usage,
     chat::{
         ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, StreamChunk,
         StructuredOutputFormat, Tool, ToolChoice,
@@ -12,6 +11,8 @@ use querymt::{
     error::LLMError,
     handle_http_error,
     stt::{SttRequest, SttResponse},
+    tts::{TtsRequest, TtsResponse},
+    FunctionCall, ToolCall, Usage,
 };
 use schemars::{
     r#gen::SchemaGenerator,
@@ -316,6 +317,19 @@ struct OpenAISttJsonResponse {
     text: String,
 }
 
+#[derive(Serialize, Debug)]
+struct OpenAITtsRequestBody<'a> {
+    model: &'a str,
+    #[serde(rename = "input")]
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voice: Option<&'a str>,
+    #[serde(rename = "response_format", skip_serializing_if = "Option::is_none")]
+    format: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed: Option<f32>,
+}
+
 // TODO: Move outside and make shared with others?
 struct MultipartForm {
     boundary: &'static str,
@@ -456,6 +470,55 @@ pub fn openai_parse_stt<C: OpenAIProviderConfig>(
 
     let text = String::from_utf8(resp.body().to_vec())?;
     Ok(SttResponse { text })
+}
+
+pub fn openai_tts_request<C: OpenAIProviderConfig>(
+    cfg: &C,
+    req: &TtsRequest,
+) -> Result<Request<Vec<u8>>, LLMError> {
+    let token = cfg.api_key();
+    let auth = determine_effective_auth(token, cfg.auth_type(), cfg.base_url())?;
+
+    let url = cfg
+        .base_url()
+        .join("audio/speech")
+        .map_err(|e| LLMError::HttpError(e.to_string()))?;
+
+    let model = req.model.as_deref().unwrap_or(cfg.model());
+
+    let body = OpenAITtsRequestBody {
+        model,
+        text: &req.text,
+        voice: req.voice.as_deref(),
+        format: req.format.as_deref(),
+        speed: req.speed,
+    };
+    let json_body = serde_json::to_vec(&body)?;
+
+    let builder = Request::builder()
+        .method(Method::POST)
+        .uri(url.to_string())
+        .header(CONTENT_TYPE, "application/json");
+    let builder = maybe_add_auth_header(builder, &auth, token)?;
+    Ok(builder.body(json_body)?)
+}
+
+pub fn openai_parse_tts<C: OpenAIProviderConfig>(
+    _cfg: &C,
+    resp: Response<Vec<u8>>,
+) -> Result<TtsResponse, LLMError> {
+    handle_http_error!(resp);
+
+    let mime_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    Ok(TtsResponse {
+        audio: resp.body().clone(),
+        mime_type,
+    })
 }
 
 fn is_openai_host(base_url: &Url) -> bool {
