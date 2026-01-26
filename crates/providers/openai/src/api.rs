@@ -1,9 +1,10 @@
 use either::*;
 use http::{
-    header::{AUTHORIZATION, CONTENT_TYPE},
     Method, Request, Response,
+    header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use querymt::{
+    FunctionCall, ToolCall, Usage,
     chat::{
         ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, StreamChunk,
         StructuredOutputFormat, Tool, ToolChoice,
@@ -12,7 +13,6 @@ use querymt::{
     handle_http_error,
     stt::{SttRequest, SttResponse},
     tts::{TtsRequest, TtsResponse},
-    FunctionCall, ToolCall, Usage,
 };
 use schemars::{
     r#gen::SchemaGenerator,

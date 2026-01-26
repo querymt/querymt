@@ -101,10 +101,7 @@ pub trait LLMProvider:
         Err(error::LLMError::NotImplemented("STT not supported".into()))
     }
 
-    async fn speech(
-        &self,
-        _req: &tts::TtsRequest,
-    ) -> Result<tts::TtsResponse, error::LLMError> {
+    async fn speech(&self, _req: &tts::TtsRequest) -> Result<tts::TtsResponse, error::LLMError> {
         Err(error::LLMError::NotImplemented("TTS not supported".into()))
     }
 }

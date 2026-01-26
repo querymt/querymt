@@ -2,12 +2,12 @@ use extism_pdk::*;
 use serde::{Deserialize, Serialize};
 
 pub fn decode_base64_standard(s: &str) -> Result<Vec<u8>, Error> {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     BASE64.decode(s).map_err(|e| Error::msg(e.to_string()))
 }
 
 pub fn encode_base64_standard(bytes: &[u8]) -> String {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     BASE64.encode(bytes)
 }
 
@@ -89,20 +89,21 @@ macro_rules! impl_extism_http_plugin {
         factory = $Factory:path,
         name = $name:expr,
     ) => {
-        use extism_pdk::{plugin_fn, Error as PdkError, FnResult, FromBytes, Json, ToBytes};
+        use extism_pdk::{Error as PdkError, FnResult, FromBytes, Json, ToBytes, plugin_fn};
         use querymt::{
+            HTTPLLMProvider,
             chat::http::HTTPChatProvider,
-            completion::{http::HTTPCompletionProvider, CompletionResponse},
+            completion::{CompletionResponse, http::HTTPCompletionProvider},
             embedding::http::HTTPEmbeddingProvider,
             plugin::{
+                HTTPLLMProviderFactory,
                 extism_impl::{
                     BinaryCodec, ExtismChatRequest, ExtismChatResponse, ExtismCompleteRequest,
                     ExtismEmbedRequest, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
                     ExtismTtsResponse,
                 },
-                HTTPLLMProviderFactory,
             },
-            stt, tts, HTTPLLMProvider,
+            stt, tts,
         };
         use serde_json::Value;
         use $crate::qmt_http_request_wrapper;

@@ -7,7 +7,9 @@ use querymt::{
 use std::{env, path::PathBuf};
 
 fn usage() -> String {
-    let bin = env::args().next().unwrap_or_else(|| "tts_example".to_string());
+    let bin = env::args()
+        .next()
+        .unwrap_or_else(|| "tts_example".to_string());
     format!(
         "Usage: {bin} <providers.toml> <text> <out_file> [provider] [model] [voice] [format]\n\n\
 Example:\n  {bin} ./providers.toml \"hello world\" ./out.mp3 openai gpt-4o-mini alloy mp3\n\n\

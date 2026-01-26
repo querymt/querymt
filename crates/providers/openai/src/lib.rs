@@ -4,19 +4,20 @@
 
 use http::{Request, Response};
 use querymt::{
+    HTTPLLMProvider,
     chat::{
-        http::HTTPChatProvider, ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat,
-        Tool, ToolChoice,
+        ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+        http::HTTPChatProvider,
     },
-    completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
+    completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     get_env_var,
     plugin::HTTPLLMProviderFactory,
     providers::{ModelPricing, ProvidersRegistry},
-    stt, tts, HTTPLLMProvider,
+    stt, tts,
 };
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
