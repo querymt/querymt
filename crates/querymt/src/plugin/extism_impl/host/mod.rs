@@ -4,14 +4,18 @@ use crate::{
     embedding::EmbeddingProvider,
     error::LLMError,
     plugin::{
-        extism_impl::{ExtismChatRequest, ExtismChatResponse, ExtismEmbedRequest},
+        extism_impl::{
+            ExtismChatRequest, ExtismChatResponse, ExtismEmbedRequest, ExtismSttRequest,
+            ExtismSttResponse, ExtismTtsRequest, ExtismTtsResponse,
+        },
         Fut, HTTPLLMProviderFactory, LLMProviderFactory,
     },
     providers::read_providers_from_cache,
-    LLMProvider,
+    stt, tts, LLMProvider,
 };
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use extism::{convert::Json, Manifest, Plugin, PluginBuilder, Wasm};
 use futures::FutureExt;
 use serde_json::Value;
@@ -478,4 +482,57 @@ impl CompletionProvider for ExtismProvider {
     }
 }
 
-impl LLMProvider for ExtismProvider {}
+#[async_trait]
+impl LLMProvider for ExtismProvider {
+    async fn transcribe(&self, req: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
+        let mut plug = self.plugin.lock().unwrap();
+
+        if !plug.function_exists("transcribe") {
+            return Err(LLMError::NotImplemented(
+                "STT not supported by this plugin".into(),
+            ));
+        }
+
+        let arg = ExtismSttRequest {
+            cfg: self.config.clone(),
+            audio_base64: BASE64.encode(&req.audio),
+            filename: req.filename.clone(),
+            mime_type: req.mime_type.clone(),
+            model: req.model.clone(),
+            language: req.language.clone(),
+        };
+
+        let out: Json<ExtismSttResponse> = plug
+            .call("transcribe", Json(arg))
+            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
+
+        Ok(stt::SttResponse { text: out.0.text })
+    }
+
+    async fn speech(&self, req: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
+        let mut plug = self.plugin.lock().unwrap();
+
+        if !plug.function_exists("speech") {
+            return Err(LLMError::NotImplemented(
+                "TTS not supported by this plugin".into(),
+            ));
+        }
+
+        let arg = ExtismTtsRequest {
+            cfg: self.config.clone(),
+            text: req.text.clone(),
+            model: req.model.clone(),
+            voice: req.voice.clone(),
+            format: req.format.clone(),
+            speed: req.speed,
+        };
+
+        let out: Json<ExtismTtsResponse> = plug
+            .call("speech", Json(arg))
+            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
+
+        out.0
+            .into_tts_response()
+            .map_err(|e| LLMError::PluginError(e.to_string()))
+    }
+}

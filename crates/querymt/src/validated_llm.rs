@@ -31,6 +31,8 @@ use crate::chat::{
 use crate::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use crate::embedding::EmbeddingProvider;
 use crate::error::LLMError;
+use crate::stt;
+use crate::tts;
 use crate::{builder::ValidatorFn, LLMProvider};
 
 /// A wrapper around an LLM provider that validates responses before returning them.
@@ -85,6 +87,14 @@ impl LLMProvider for ValidatedLLM {
 
     fn tool_server_name(&self, name: &str) -> Option<&str> {
         self.inner.tool_server_name(name)
+    }
+
+    async fn transcribe(&self, req: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
+        self.inner.transcribe(req).await
+    }
+
+    async fn speech(&self, req: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
+        self.inner.speech(req).await
     }
 }
 

@@ -7231,6 +7231,7 @@ dependencies = [
 name = "querymt-extism-macros"
 version = "0.2.0"
 dependencies = [
+ "base64 0.22.1",
  "extism-pdk",
  "http",
  "http-serde-ext",

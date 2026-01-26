@@ -15,6 +15,7 @@ use querymt::{
     get_env_var,
     plugin::HTTPLLMProviderFactory,
     providers::{ModelPricing, ProvidersRegistry},
+    stt, tts,
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,22 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
+
+fn normalize_base_url(mut url: Url) -> Url {
+    if !url.path().ends_with('/') {
+        let p = url.path().to_string();
+        url.set_path(&(p + "/"));
+    }
+    url
+}
+
+fn deserialize_base_url<'de, D>(deserializer: D) -> Result<Url, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let url = Url::deserialize(deserializer)?;
+    Ok(normalize_base_url(url))
+}
 
 /// Authentication type for OpenAI API.
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
@@ -53,7 +70,10 @@ pub struct OpenAI {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_type: Option<AuthType>,
     #[schemars(schema_with = "api::url_schema")]
-    #[serde(default = "OpenAI::default_base_url")]
+    #[serde(
+        default = "OpenAI::default_base_url",
+        deserialize_with = "deserialize_base_url"
+    )]
     pub base_url: Url,
     pub model: String,
     pub max_tokens: Option<u32>,
@@ -207,6 +227,22 @@ impl HTTPLLMProvider for OpenAI {
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }
+
+    fn stt_request(&self, req: &stt::SttRequest) -> Result<Request<Vec<u8>>, LLMError> {
+        api::openai_stt_request(self, req)
+    }
+
+    fn parse_stt(&self, resp: Response<Vec<u8>>) -> Result<stt::SttResponse, LLMError> {
+        api::openai_parse_stt(self, resp)
+    }
+
+    fn tts_request(&self, req: &tts::TtsRequest) -> Result<Request<Vec<u8>>, LLMError> {
+        api::openai_tts_request(self, req)
+    }
+
+    fn parse_tts(&self, resp: Response<Vec<u8>>) -> Result<tts::TtsResponse, LLMError> {
+        api::openai_parse_tts(self, resp)
+    }
 }
 
 struct OpenAIFactory;
@@ -221,8 +257,8 @@ impl HTTPLLMProviderFactory for OpenAIFactory {
 
     fn list_models_request(&self, cfg: &Value) -> Result<Request<Vec<u8>>, LLMError> {
         let base_url = match cfg.get("base_url").and_then(Value::as_str) {
-            Some(base_url_str) => Url::parse(base_url_str)?,
-            None => OpenAI::default_base_url(),
+            Some(base_url_str) => normalize_base_url(Url::parse(base_url_str)?),
+            None => normalize_base_url(OpenAI::default_base_url()),
         };
         api::openai_list_models_request(&base_url, cfg)
     }
@@ -238,8 +274,30 @@ impl HTTPLLMProviderFactory for OpenAIFactory {
     }
 
     fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
-        let provider: OpenAI = serde_json::from_value(cfg.clone())?;
+        let mut provider: OpenAI = serde_json::from_value(cfg.clone())?;
+        provider.base_url = normalize_base_url(provider.base_url);
         Ok(Box::new(provider))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenAI;
+
+    #[test]
+    fn base_url_is_normalized_to_trailing_slash() {
+        let cfg = serde_json::json!({
+            "api_key": "",
+            "base_url": "http://localhost:8000/v1",
+            "model": "gpt-4o-mini"
+        });
+        let provider: OpenAI = serde_json::from_value(cfg).unwrap();
+        assert_eq!(provider.base_url.as_str(), "http://localhost:8000/v1/");
+        let joined = provider.base_url.join("audio/transcriptions").unwrap();
+        assert_eq!(
+            joined.as_str(),
+            "http://localhost:8000/v1/audio/transcriptions"
+        );
     }
 }
 

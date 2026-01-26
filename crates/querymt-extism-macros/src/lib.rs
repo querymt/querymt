@@ -1,6 +1,16 @@
 use extism_pdk::*;
 use serde::{Deserialize, Serialize};
 
+pub fn decode_base64_standard(s: &str) -> Result<Vec<u8>, Error> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    BASE64.decode(s).map_err(|e| Error::msg(e.to_string()))
+}
+
+pub fn encode_base64_standard(bytes: &[u8]) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    BASE64.encode(bytes)
+}
+
 // Import base serializable types from querymt
 use querymt::plugin::extism_impl::{
     SerializableHttpRequest as BaseHttpRequest, SerializableHttpResponse as BaseHttpResponse,
@@ -81,6 +91,7 @@ macro_rules! impl_extism_http_plugin {
     ) => {
         use extism_pdk::{Error as PdkError, FnResult, FromBytes, Json, ToBytes, plugin_fn};
         use querymt::{
+            HTTPLLMProvider,
             chat::http::HTTPChatProvider,
             completion::{CompletionResponse, http::HTTPCompletionProvider},
             embedding::http::HTTPEmbeddingProvider,
@@ -88,9 +99,11 @@ macro_rules! impl_extism_http_plugin {
                 HTTPLLMProviderFactory,
                 extism_impl::{
                     BinaryCodec, ExtismChatRequest, ExtismChatResponse, ExtismCompleteRequest,
-                    ExtismEmbedRequest,
+                    ExtismEmbedRequest, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
+                    ExtismTtsResponse,
                 },
             },
+            stt, tts,
         };
         use serde_json::Value;
         use $crate::qmt_http_request_wrapper;
@@ -275,6 +288,54 @@ macro_rules! impl_extism_http_plugin {
                 .parse_complete(native_resp)
                 .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
             Ok(Json(complete_response))
+        }
+
+        #[plugin_fn]
+        pub fn transcribe(
+            Json(input): Json<ExtismSttRequest<$Config>>,
+        ) -> FnResult<Json<ExtismSttResponse>> {
+            let audio = $crate::decode_base64_standard(&input.audio_base64)?;
+            let stt_req = stt::SttRequest {
+                audio,
+                filename: input.filename,
+                mime_type: input.mime_type,
+                model: input.model,
+                language: input.language,
+            };
+
+            let req = input.cfg.stt_request(&stt_req).map_err(PdkError::new)?;
+            let native_resp = qmt_http_request_wrapper(&req)?;
+            let resp = input
+                .cfg
+                .parse_stt(native_resp)
+                .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
+
+            Ok(Json(ExtismSttResponse { text: resp.text }))
+        }
+
+        #[plugin_fn]
+        pub fn speech(
+            Json(input): Json<ExtismTtsRequest<$Config>>,
+        ) -> FnResult<Json<ExtismTtsResponse>> {
+            let tts_req = tts::TtsRequest {
+                text: input.text,
+                model: input.model,
+                voice: input.voice,
+                format: input.format,
+                speed: input.speed,
+            };
+
+            let req = input.cfg.tts_request(&tts_req).map_err(PdkError::new)?;
+            let native_resp = qmt_http_request_wrapper(&req)?;
+            let resp = input
+                .cfg
+                .parse_tts(native_resp)
+                .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
+
+            Ok(Json(ExtismTtsResponse {
+                audio_base64: $crate::encode_base64_standard(&resp.audio),
+                mime_type: resp.mime_type,
+            }))
         }
 
         #[plugin_fn]
