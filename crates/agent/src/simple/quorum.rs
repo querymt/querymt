@@ -368,7 +368,7 @@ impl Quorum {
         let mut llm = querymt::LLMParams::new()
             .provider(config.planner.provider)
             .model(config.planner.model);
-        if let Some(system) = config.planner.system {
+        for system in config.planner.system {
             llm = llm.system(system);
         }
         if let Some(api_key) = config.planner.api_key {
@@ -407,7 +407,7 @@ impl Quorum {
             let mut llm = querymt::LLMParams::new()
                 .provider(delegate.provider)
                 .model(delegate.model);
-            if let Some(system) = delegate.system {
+            for system in delegate.system {
                 llm = llm.system(system);
             }
             if let Some(api_key) = delegate.api_key {
@@ -633,8 +633,8 @@ mod tests {
         assert_eq!(builder.delegates.len(), 1);
         let delegate = &builder.delegates[0];
         assert_eq!(
-            delegate.llm_config.as_ref().and_then(|c| c.system.clone()),
-            Some("Coder system prompt".to_string())
+            delegate.llm_config.as_ref().map(|c| c.system.clone()),
+            Some(vec!["Coder system prompt".to_string()])
         );
     }
 

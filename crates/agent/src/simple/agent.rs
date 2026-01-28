@@ -424,7 +424,7 @@ impl Agent {
         if let Some(api_key) = config.agent.api_key {
             builder = builder.api_key(api_key);
         }
-        if let Some(system) = config.agent.system {
+        for system in config.agent.system {
             builder = builder.system(system);
         }
         if let Some(params) = config.agent.parameters {

@@ -314,8 +314,8 @@ mod tests {
 
         // Verify other params are included
         assert_eq!(
-            obj.get("system").and_then(|v| v.as_str()),
-            Some("test system")
+            obj.get("system").and_then(|v| v.as_array()),
+            Some(&vec![Value::String("test system".to_string())])
         );
         // Check temperature with tolerance for f32 -> f64 conversion
         let temp = obj.get("temperature").and_then(|v| v.as_f64()).unwrap();

@@ -7,6 +7,7 @@ use agent_client_protocol::{
 };
 use anyhow::{Context, Result, anyhow};
 use regex::{Captures, Regex};
+use querymt::params::deserialize_system_vec;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -64,7 +65,8 @@ pub struct AgentSettings {
     pub api_key: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
-    pub system: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_system_vec")]
+    pub system: Vec<String>,
     pub system_file: Option<PathBuf>,
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
@@ -113,7 +115,8 @@ pub struct PlannerConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
-    pub system: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_system_vec")]
+    pub system: Vec<String>,
     pub system_file: Option<PathBuf>,
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
@@ -134,7 +137,8 @@ pub struct DelegateConfig {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub tools: Vec<String>,
-    pub system: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_system_vec")]
+    pub system: Vec<String>,
     pub system_file: Option<PathBuf>,
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
@@ -376,7 +380,7 @@ pub fn interpolate_env_vars(content: &str) -> Result<String> {
 
 /// Validate agent settings
 fn validate_agent_settings(settings: &AgentSettings) -> Result<()> {
-    if settings.system.is_some() && settings.system_file.is_some() {
+    if !settings.system.is_empty() && settings.system_file.is_some() {
         return Err(anyhow!(
             "Cannot specify both 'system' and 'system_file' in agent config"
         ));
@@ -386,7 +390,7 @@ fn validate_agent_settings(settings: &AgentSettings) -> Result<()> {
 
 /// Validate planner config
 fn validate_planner_config(config: &PlannerConfig) -> Result<()> {
-    if config.system.is_some() && config.system_file.is_some() {
+    if !config.system.is_empty() && config.system_file.is_some() {
         return Err(anyhow!(
             "Cannot specify both 'system' and 'system_file' in planner config"
         ));
@@ -396,7 +400,7 @@ fn validate_planner_config(config: &PlannerConfig) -> Result<()> {
 
 /// Validate delegate config
 fn validate_delegate_config(config: &DelegateConfig) -> Result<()> {
-    if config.system.is_some() && config.system_file.is_some() {
+    if !config.system.is_empty() && config.system_file.is_some() {
         return Err(anyhow!(
             "Cannot specify both 'system' and 'system_file' in delegate '{}' config",
             config.id
@@ -421,11 +425,10 @@ fn validate_mcp_servers(servers: &[McpServerConfig]) -> Result<()> {
 async fn resolve_agent_prompts(settings: &mut AgentSettings, base_path: &Path) -> Result<()> {
     if let Some(file) = &settings.system_file {
         let path = base_path.join(file);
-        settings.system = Some(
-            tokio::fs::read_to_string(&path)
-                .await
-                .with_context(|| format!("Failed to load agent prompt from {:?}", path))?,
-        );
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("Failed to load agent prompt from {:?}", path))?;
+        settings.system = vec![content];
         settings.system_file = None;
     }
     Ok(())
@@ -435,11 +438,10 @@ async fn resolve_agent_prompts(settings: &mut AgentSettings, base_path: &Path) -
 async fn resolve_planner_prompts(config: &mut PlannerConfig, base_path: &Path) -> Result<()> {
     if let Some(file) = &config.system_file {
         let path = base_path.join(file);
-        config.system = Some(
-            tokio::fs::read_to_string(&path)
-                .await
-                .with_context(|| format!("Failed to load planner prompt from {:?}", path))?,
-        );
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("Failed to load planner prompt from {:?}", path))?;
+        config.system = vec![content];
         config.system_file = None;
     }
     Ok(())
@@ -449,12 +451,13 @@ async fn resolve_planner_prompts(config: &mut PlannerConfig, base_path: &Path) -
 async fn resolve_delegate_prompts(config: &mut DelegateConfig, base_path: &Path) -> Result<()> {
     if let Some(file) = &config.system_file {
         let path = base_path.join(file);
-        config.system = Some(tokio::fs::read_to_string(&path).await.with_context(|| {
+        let content = tokio::fs::read_to_string(&path).await.with_context(|| {
             format!(
                 "Failed to load prompt for delegate '{}' from {:?}",
                 config.id, path
             )
-        })?);
+        })?;
+        config.system = vec![content];
         config.system_file = None;
     }
     Ok(())

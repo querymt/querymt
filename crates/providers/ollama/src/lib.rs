@@ -52,6 +52,10 @@ pub struct Ollama {
     pub timeout_seconds: Option<u64>,
     pub stream: Option<bool>,
     pub reasoning: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "querymt::params::deserialize_system_string"
+    )]
     pub system: Option<String>,
     /// JSON schema for structured output
     pub json_schema: Option<StructuredOutputFormat>,

@@ -325,7 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(m) = opt_model.or(args.model.clone()) {
         builder = builder.model(m);
     }
-    if let Some(sys) = &args.system {
+    for sys in &args.system {
         builder = builder.system(sys.clone());
     }
     if let Some(key) = get_api_key(&prov_name, &args, &registry).await {

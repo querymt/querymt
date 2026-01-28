@@ -294,7 +294,7 @@ pub trait OpenAIProviderConfig {
     fn model(&self) -> &str;
     fn max_tokens(&self) -> Option<&u32>;
     fn temperature(&self) -> Option<&f32>;
-    fn system(&self) -> Option<&str>;
+    fn system(&self) -> &[String];
     fn timeout_seconds(&self) -> Option<&u64>;
     fn stream(&self) -> Option<&bool>;
     fn top_p(&self) -> Option<&f32>;
@@ -690,22 +690,27 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
         }
     }
 
-    if let Some(system) = cfg.system() {
-        openai_msgs.insert(
-            0,
-            OpenAIChatMessage {
-                role: "system",
-                content: Some(Left(vec![MessageContent {
-                    message_type: Some("text"),
-                    text: Some(system),
-                    image_url: None,
+    let system_parts = cfg.system();
+    if !system_parts.is_empty() {
+        // Insert system messages in reverse order at position 0
+        // so they end up in the correct order.
+        for part in system_parts.iter().rev() {
+            openai_msgs.insert(
+                0,
+                OpenAIChatMessage {
+                    role: "system",
+                    content: Some(Left(vec![MessageContent {
+                        message_type: Some("text"),
+                        text: Some(part),
+                        image_url: None,
+                        tool_call_id: None,
+                        tool_output: None,
+                    }])),
+                    tool_calls: None,
                     tool_call_id: None,
-                    tool_output: None,
-                }])),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-        );
+                },
+            );
+        }
     }
 
     // Build the response format object

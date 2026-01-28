@@ -33,6 +33,10 @@ pub struct Codex {
     pub temperature: Option<f32>,
     /// Base instructions required by the Codex backend.
     pub instructions: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "querymt::params::deserialize_system_string"
+    )]
     pub system: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub stream: Option<bool>,

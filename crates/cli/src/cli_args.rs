@@ -42,9 +42,9 @@ pub struct CliArgs {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// System prompt to set context
-    #[arg(short, long)]
-    pub system: Option<String>,
+    /// System prompt to set context. Can be specified multiple times for multi-part prompts.
+    #[arg(short, long, action = clap::ArgAction::Append)]
+    pub system: Vec<String>,
 
     /// API key for the provider
     #[arg(long)]

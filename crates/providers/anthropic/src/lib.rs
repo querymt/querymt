@@ -27,7 +27,7 @@ use querymt::{
     providers::{ModelPricing, ProvidersRegistry},
 };
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use url::Url;
 
@@ -108,7 +108,7 @@ pub struct Anthropic {
     pub max_tokens: u32,
     pub temperature: Option<f32>,
     pub timeout_seconds: Option<u64>,
-    pub system: Option<String>,
+    pub system: Option<AnthropicSystemPrompt>,
     pub stream: Option<bool>,
     pub top_p: Option<f32>,
     pub top_k: Option<u32>,
@@ -145,7 +145,7 @@ struct AnthropicCompleteRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<AnthropicSystemPrompt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,6 +202,170 @@ struct ImageSource<'a> {
     source_type: &'a str,
     media_type: &'a str,
     data: String,
+}
+
+// --- System prompt types (Anthropic API union: string | TextBlockParam[]) ---
+
+/// Time-to-live for cache control breakpoints.
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
+pub enum CacheTTL {
+    /// 5 minutes
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    /// 1 hour
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+/// Cache control configuration for ephemeral caching.
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
+pub struct CacheControlEphemeral {
+    #[serde(rename = "type")]
+    pub control_type: String,
+    /// Time-to-live for the cache control breakpoint. Defaults to 5m.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<CacheTTL>,
+}
+
+/// Citation referencing a character location within a document.
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
+pub struct CitationCharLocationParam {
+    pub cited_text: String,
+    pub document_index: u64,
+    pub document_title: String,
+    pub end_char_index: u64,
+    pub start_char_index: u64,
+}
+
+/// Citation referencing a page location within a document.
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
+pub struct CitationPageLocationParam {
+    pub cited_text: String,
+    pub document_index: u64,
+    pub document_title: String,
+    pub end_page_number: u64,
+    pub start_page_number: u64,
+}
+
+/// Citation referencing a content block location within a document.
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
+pub struct CitationContentBlockLocationParam {
+    pub cited_text: String,
+    pub document_index: u64,
+    pub document_title: String,
+    pub end_block_index: u64,
+    pub start_block_index: u64,
+}
+
+/// Citation referencing a web search result location.
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
+pub struct CitationWebSearchResultLocationParam {
+    pub cited_text: String,
+    pub encrypted_index: String,
+    pub title: String,
+    pub url: String,
+}
+
+/// Citation referencing a search result location.
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
+pub struct CitationSearchResultLocationParam {
+    pub cited_text: String,
+    pub end_block_index: u64,
+    pub search_result_index: u64,
+    pub source: String,
+    pub start_block_index: u64,
+    pub title: String,
+}
+
+/// Union of all citation parameter types, discriminated by the `type` field.
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum TextCitationParam {
+    #[serde(rename = "char_location")]
+    CharLocation(CitationCharLocationParam),
+    #[serde(rename = "page_location")]
+    PageLocation(CitationPageLocationParam),
+    #[serde(rename = "content_block_location")]
+    ContentBlockLocation(CitationContentBlockLocationParam),
+    #[serde(rename = "web_search_result_location")]
+    WebSearchResultLocation(CitationWebSearchResultLocationParam),
+    #[serde(rename = "search_result_location")]
+    SearchResultLocation(CitationSearchResultLocationParam),
+}
+
+/// A text content block used in system prompts, with optional cache control and citations.
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
+pub struct TextBlockParam {
+    #[serde(rename = "type")]
+    pub block_type: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub citations: Option<Vec<TextCitationParam>>,
+}
+
+/// Anthropic system prompt: either a plain string or an array of TextBlockParam.
+///
+/// Deserializes from three JSON shapes:
+/// - `"string"` → `Text(String)`
+/// - `["s1", "s2"]` → `Blocks` with each string wrapped as a `TextBlockParam`
+/// - `[{"type":"text","text":"...","cache_control":{...}}]` → `Blocks(Vec<TextBlockParam>)`
+#[derive(Debug, Clone, JsonSchema, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum AnthropicSystemPrompt {
+    /// Plain text system prompt
+    Text(String),
+    /// Array of text content blocks with optional cache control and citations
+    Blocks(Vec<TextBlockParam>),
+}
+
+impl<'de> Deserialize<'de> for AnthropicSystemPrompt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(s) => Ok(AnthropicSystemPrompt::Text(s)),
+            Value::Array(arr) => {
+                // Try to deserialize as Vec<TextBlockParam> first (objects with "type"/"text")
+                // If that fails, try as Vec<String> (plain string array from LLMParams)
+                let blocks_result: Result<Vec<TextBlockParam>, _> =
+                    serde_json::from_value(Value::Array(arr.clone()));
+                if let Ok(blocks) = blocks_result {
+                    return Ok(AnthropicSystemPrompt::Blocks(blocks));
+                }
+
+                // Try as array of plain strings
+                let strings: Vec<String> = arr
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::String(s) => Ok(s),
+                        other => Err(serde::de::Error::custom(format!(
+                            "expected string or TextBlockParam object in system array, got {}",
+                            other
+                        ))),
+                    })
+                    .collect::<Result<_, _>>()?;
+                Ok(AnthropicSystemPrompt::Blocks(
+                    strings
+                        .into_iter()
+                        .map(|text| TextBlockParam {
+                            block_type: "text".to_string(),
+                            text,
+                            cache_control: None,
+                            citations: None,
+                        })
+                        .collect(),
+                ))
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "expected string or array for system prompt, got {}",
+                other
+            ))),
+        }
+    }
 }
 
 /// Response from Anthropic's messages API endpoint.
@@ -378,16 +542,32 @@ impl Anthropic {
     }
 
     /// Sanitizes the system prompt for OAuth requests.
-    fn sanitize_system_prompt(&self) -> Option<String> {
-        self.system.as_ref().map(|s| {
+    fn sanitize_system_prompt(&self) -> Option<AnthropicSystemPrompt> {
+        self.system.as_ref().map(|prompt| {
             if self.is_oauth() {
-                // Replace "OpenCode" with "Claude Code" (exact case)
-                let result = s.replace("QueryMT", "Claude Code");
-                // Replace "opencode" case-insensitively with "Claude"
                 let re = Regex::new(r"(?i)querymt").unwrap();
-                re.replace_all(&result, "Claude").to_string()
+                match prompt {
+                    AnthropicSystemPrompt::Text(s) => {
+                        let result = s.replace("QueryMT", "Claude Code");
+                        AnthropicSystemPrompt::Text(re.replace_all(&result, "Claude").to_string())
+                    }
+                    AnthropicSystemPrompt::Blocks(blocks) => AnthropicSystemPrompt::Blocks(
+                        blocks
+                            .iter()
+                            .map(|block| {
+                                let result = block.text.replace("QueryMT", "Claude Code");
+                                TextBlockParam {
+                                    block_type: block.block_type.clone(),
+                                    text: re.replace_all(&result, "Claude").to_string(),
+                                    cache_control: block.cache_control.clone(),
+                                    citations: block.citations.clone(),
+                                }
+                            })
+                            .collect(),
+                    ),
+                }
             } else {
-                s.clone()
+                prompt.clone()
             }
         })
     }
@@ -898,5 +1078,238 @@ mod tests {
         };
 
         assert_eq!(anthropic_api15.determine_auth_type(), AuthType::ApiKey);
+    }
+
+    #[test]
+    fn test_system_prompt_deserialize_string() {
+        let json = serde_json::json!({
+            "api_key": "sk-ant-api03-test",
+            "model": "claude-3-7-sonnet-20250219",
+            "max_tokens": 100,
+            "system": "You are a helpful assistant."
+        });
+        let anthropic: Anthropic = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            anthropic.system,
+            Some(AnthropicSystemPrompt::Text(
+                "You are a helpful assistant.".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_deserialize_blocks() {
+        let json = serde_json::json!({
+            "api_key": "sk-ant-api03-test",
+            "model": "claude-3-7-sonnet-20250219",
+            "max_tokens": 100,
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are a helpful assistant.",
+                    "cache_control": {
+                        "type": "ephemeral"
+                    }
+                }
+            ]
+        });
+        let anthropic: Anthropic = serde_json::from_value(json).unwrap();
+        match &anthropic.system {
+            Some(AnthropicSystemPrompt::Blocks(blocks)) => {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].text, "You are a helpful assistant.");
+                assert_eq!(blocks[0].block_type, "text");
+                assert!(blocks[0].cache_control.is_some());
+                let cc = blocks[0].cache_control.as_ref().unwrap();
+                assert_eq!(cc.control_type, "ephemeral");
+                assert_eq!(cc.ttl, None);
+            }
+            other => panic!("Expected Blocks variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_system_prompt_deserialize_blocks_with_ttl() {
+        let json = serde_json::json!({
+            "api_key": "sk-ant-api03-test",
+            "model": "claude-3-7-sonnet-20250219",
+            "max_tokens": 100,
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are a helpful assistant.",
+                    "cache_control": {
+                        "type": "ephemeral",
+                        "ttl": "1h"
+                    }
+                }
+            ]
+        });
+        let anthropic: Anthropic = serde_json::from_value(json).unwrap();
+        match &anthropic.system {
+            Some(AnthropicSystemPrompt::Blocks(blocks)) => {
+                let cc = blocks[0].cache_control.as_ref().unwrap();
+                assert_eq!(cc.ttl, Some(CacheTTL::OneHour));
+            }
+            other => panic!("Expected Blocks variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_system_prompt_serialize_string() {
+        let prompt = AnthropicSystemPrompt::Text("Hello".to_string());
+        let json = serde_json::to_value(&prompt).unwrap();
+        assert_eq!(json, serde_json::json!("Hello"));
+    }
+
+    #[test]
+    fn test_system_prompt_serialize_blocks() {
+        let prompt = AnthropicSystemPrompt::Blocks(vec![TextBlockParam {
+            block_type: "text".to_string(),
+            text: "Hello".to_string(),
+            cache_control: Some(CacheControlEphemeral {
+                control_type: "ephemeral".to_string(),
+                ttl: Some(CacheTTL::FiveMinutes),
+            }),
+            citations: None,
+        }]);
+        let json = serde_json::to_value(&prompt).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {
+                    "type": "text",
+                    "text": "Hello",
+                    "cache_control": {
+                        "type": "ephemeral",
+                        "ttl": "5m"
+                    }
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_deserialize_blocks_with_citations() {
+        let json = serde_json::json!({
+            "api_key": "sk-ant-api03-test",
+            "model": "claude-3-7-sonnet-20250219",
+            "max_tokens": 100,
+            "system": [
+                {
+                    "type": "text",
+                    "text": "Context from document.",
+                    "citations": [
+                        {
+                            "type": "char_location",
+                            "cited_text": "some text",
+                            "document_index": 0,
+                            "document_title": "doc.pdf",
+                            "start_char_index": 0,
+                            "end_char_index": 9
+                        },
+                        {
+                            "type": "page_location",
+                            "cited_text": "page text",
+                            "document_index": 1,
+                            "document_title": "doc2.pdf",
+                            "start_page_number": 1,
+                            "end_page_number": 3
+                        }
+                    ]
+                }
+            ]
+        });
+        let anthropic: Anthropic = serde_json::from_value(json).unwrap();
+        match &anthropic.system {
+            Some(AnthropicSystemPrompt::Blocks(blocks)) => {
+                assert_eq!(blocks.len(), 1);
+                let citations = blocks[0].citations.as_ref().unwrap();
+                assert_eq!(citations.len(), 2);
+                match &citations[0] {
+                    TextCitationParam::CharLocation(c) => {
+                        assert_eq!(c.cited_text, "some text");
+                        assert_eq!(c.start_char_index, 0);
+                        assert_eq!(c.end_char_index, 9);
+                    }
+                    other => panic!("Expected CharLocation, got {:?}", other),
+                }
+                match &citations[1] {
+                    TextCitationParam::PageLocation(p) => {
+                        assert_eq!(p.cited_text, "page text");
+                        assert_eq!(p.start_page_number, 1);
+                        assert_eq!(p.end_page_number, 3);
+                    }
+                    other => panic!("Expected PageLocation, got {:?}", other),
+                }
+            }
+            other => panic!("Expected Blocks variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sanitize_system_prompt_oauth_text() {
+        let anthropic = Anthropic {
+            api_key: "sk-ant-oat01-abc123".to_string(),
+            auth_type: None,
+            model: "claude-3-7-sonnet-20250219".to_string(),
+            max_tokens: 100,
+            temperature: None,
+            timeout_seconds: None,
+            system: Some(AnthropicSystemPrompt::Text(
+                "You are QueryMT assistant.".to_string(),
+            )),
+            stream: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            thinking_budget_tokens: None,
+        };
+        let sanitized = anthropic.sanitize_system_prompt();
+        assert_eq!(
+            sanitized,
+            Some(AnthropicSystemPrompt::Text(
+                "You are Claude assistant.".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_sanitize_system_prompt_oauth_blocks() {
+        let anthropic = Anthropic {
+            api_key: "sk-ant-oat01-abc123".to_string(),
+            auth_type: None,
+            model: "claude-3-7-sonnet-20250219".to_string(),
+            max_tokens: 100,
+            temperature: None,
+            timeout_seconds: None,
+            system: Some(AnthropicSystemPrompt::Blocks(vec![TextBlockParam {
+                block_type: "text".to_string(),
+                text: "You are QueryMT assistant.".to_string(),
+                cache_control: Some(CacheControlEphemeral {
+                    control_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+                citations: None,
+            }])),
+            stream: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            thinking_budget_tokens: None,
+        };
+        let sanitized = anthropic.sanitize_system_prompt();
+        match sanitized {
+            Some(AnthropicSystemPrompt::Blocks(blocks)) => {
+                assert_eq!(blocks[0].text, "You are Claude assistant.");
+                // cache_control should be preserved
+                assert!(blocks[0].cache_control.is_some());
+            }
+            other => panic!("Expected Blocks variant, got {:?}", other),
+        }
     }
 }

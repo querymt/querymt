@@ -75,6 +75,10 @@ pub struct Google {
     /// Sampling temperature between 0.0 and 1.0
     pub temperature: Option<f32>,
     /// Optional system prompt to set context
+    #[serde(
+        default,
+        deserialize_with = "querymt::params::deserialize_system_string"
+    )]
     pub system: Option<String>,
     /// Request timeout in seconds
     pub timeout_seconds: Option<u64>,

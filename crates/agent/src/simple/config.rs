@@ -237,8 +237,8 @@ mod tests {
 
         let result = build_llm_config(&config).unwrap();
         assert_eq!(
-            result.system.as_deref(),
-            Some("You are a helpful assistant.")
+            result.system,
+            vec!["You are a helpful assistant.".to_string()]
         );
     }
 }

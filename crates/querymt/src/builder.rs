@@ -70,8 +70,8 @@ pub struct LLMBuilder {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     /// System prompt/context to guide model behavior
-    #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    system: Vec<String>,
     /// Request timeout duration in seconds
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout_seconds: Option<u64>,
@@ -164,9 +164,9 @@ impl LLMBuilder {
         self
     }
 
-    /// Sets the system prompt/context.
+    /// Appends a system prompt part. Can be called multiple times for multi-part prompts.
     pub fn system(mut self, system: impl Into<String>) -> Self {
-        self.system = Some(system.into());
+        self.system.push(system.into());
         self
     }
 

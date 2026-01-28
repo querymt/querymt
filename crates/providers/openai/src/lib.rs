@@ -78,7 +78,8 @@ pub struct OpenAI {
     pub model: String,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
-    pub system: Option<String>,
+    #[serde(default, deserialize_with = "querymt::params::deserialize_system_vec")]
+    pub system: Vec<String>,
     pub timeout_seconds: Option<u64>,
     pub stream: Option<bool>,
     pub top_p: Option<f32>,
@@ -135,8 +136,8 @@ impl api::OpenAIProviderConfig for OpenAI {
         self.temperature.as_ref()
     }
 
-    fn system(&self) -> Option<&str> {
-        self.system.as_deref()
+    fn system(&self) -> &[String] {
+        &self.system
     }
 
     fn timeout_seconds(&self) -> Option<&u64> {

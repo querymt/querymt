@@ -3,9 +3,54 @@
 //! This module provides a serializable configuration struct that contains
 //! only LLM parameters without operational concerns like validators or tool registries.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+
+/// Parses a system prompt value (null, string, or array of strings) into `Vec<String>`.
+fn parse_system_parts<E: serde::de::Error>(value: Option<Value>) -> Result<Vec<String>, E> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => Ok(vec![s]),
+        Some(Value::Array(arr)) => arr
+            .into_iter()
+            .map(|v| match v {
+                Value::String(s) => Ok(s),
+                other => Err(E::custom(format!(
+                    "expected string in system array, got {other}"
+                ))),
+            })
+            .collect(),
+        Some(other) => Err(E::custom(format!(
+            "expected string or array for system, got {other}"
+        ))),
+    }
+}
+
+/// Deserializes a system prompt that can be either a single string, an array of strings,
+/// or absent/null. Used by string-only providers to accept the `Vec<String>` format
+/// from `LLMParams` and join them into a single string.
+pub fn deserialize_system_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let parts = parse_system_parts::<D::Error>(Option::deserialize(deserializer)?)?;
+    Ok(if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    })
+}
+
+/// Deserializes a system prompt that can be either a single string, an array of strings,
+/// or absent/null into a `Vec<String>`. Used by providers that support multiple system
+/// messages (e.g., OpenAI-compatible providers).
+pub fn deserialize_system_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    parse_system_parts::<D::Error>(Option::deserialize(deserializer)?)
+}
 
 /// Pure configuration parameters for LLM providers.
 ///
@@ -33,9 +78,10 @@ pub struct LLMParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 
-    /// System prompt/context to guide model behavior
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    /// System prompt/context to guide model behavior.
+    /// Supports multiple parts for providers that accept multi-part system prompts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system: Vec<String>,
 
     /// Maximum tokens to generate in responses
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,9 +156,9 @@ impl LLMParams {
         self
     }
 
-    /// Sets the system prompt
+    /// Appends a system prompt part. Can be called multiple times for multi-part prompts.
     pub fn system(mut self, system: impl Into<String>) -> Self {
-        self.system = Some(system.into());
+        self.system.push(system.into());
         self
     }
 
