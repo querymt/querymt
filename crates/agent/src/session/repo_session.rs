@@ -85,6 +85,8 @@ impl SessionRepository for SqliteSessionRepository {
         &self,
         name: Option<String>,
         cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<String>,
+        fork_origin: Option<ForkOrigin>,
     ) -> SessionResult<Session> {
         let now = OffsetDateTime::now_utc();
         let now_str = format_rfc3339(&now);
@@ -93,6 +95,20 @@ impl SessionRepository for SqliteSessionRepository {
         let name_for_insert = name.clone();
         let cwd_for_insert = cwd.as_ref().map(|p| p.to_string_lossy().to_string());
         let cwd_clone = cwd.clone();
+
+        // Resolve parent public ID to internal ID if provided
+        let parent_internal_id = if let Some(parent_id) = &parent_session_id {
+            let parent_session = self
+                .get_session(parent_id)
+                .await?
+                .ok_or_else(|| SessionError::SessionNotFound(parent_id.to_string()))?;
+            Some(parent_session.id)
+        } else {
+            None
+        };
+
+        let fork_origin_str = fork_origin.as_ref().map(|fo| fo.to_string());
+        let fork_origin_clone = fork_origin;
 
         let inserted_id = self
             .run_blocking(move |conn| {
@@ -107,8 +123,8 @@ impl SessionRepository for SqliteSessionRepository {
                         Option::<i64>::None,
                         Option::<i64>::None,
                         Option::<i64>::None,
-                        Option::<i64>::None,
-                        Option::<String>::None,
+                        parent_internal_id,
+                        fork_origin_str,
                         Option::<String>::None,
                         Option::<String>::None,
                         Option::<String>::None,
@@ -128,8 +144,8 @@ impl SessionRepository for SqliteSessionRepository {
             current_intent_snapshot_id: None,
             active_task_id: None,
             llm_config_id: None,
-            parent_session_id: None,
-            fork_origin: None,
+            parent_session_id: parent_internal_id,
+            fork_origin: fork_origin_clone,
             fork_point_type: None,
             fork_point_ref: None,
             fork_instructions: None,

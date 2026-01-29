@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use glob::Pattern;
 use grep_regex::RegexMatcher;
-use grep_searcher::{Searcher, sinks::Lossy};
+use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::Lossy};
 use ignore::WalkBuilder;
 use querymt::chat::{FunctionTool, Tool};
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
+
+/// Maximum bytes for a single matched line's text.
+/// Lines longer than this are truncated to prevent binary blobs or extremely
+/// long lines from bloating tool results.
+const MAX_MATCH_TEXT_BYTES: usize = 500;
 
 /// A single match result
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,7 +116,9 @@ impl SearchTextTool {
 
             files_searched += 1;
 
-            Searcher::new()
+            SearcherBuilder::new()
+                .binary_detection(BinaryDetection::quit(b'\0'))
+                .build()
                 .search_path(
                     &matcher,
                     path,
@@ -120,11 +127,20 @@ impl SearchTextTool {
                             return Ok(false); // Stop searching this file
                         }
 
+                        let trimmed = line.trim_end();
+                        let text = if trimmed.len() > MAX_MATCH_TEXT_BYTES {
+                            let mut truncated = trimmed[..MAX_MATCH_TEXT_BYTES].to_string();
+                            truncated.push_str("...[truncated]");
+                            truncated
+                        } else {
+                            trimmed.to_string()
+                        };
+
                         matches.push(Match {
                             file: path.display().to_string(),
                             line: lnum,
                             column: None,
-                            text: line.trim_end().to_string(),
+                            text,
                         });
                         Ok(true)
                     }),

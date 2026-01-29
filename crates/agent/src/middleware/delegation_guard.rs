@@ -1,7 +1,7 @@
+use crate::events::StopType;
 use crate::middleware::{ExecutionState, MiddlewareDriver, Result};
 use crate::session::domain::DelegationStatus;
 use crate::session::store::SessionStore;
-use agent_client_protocol::StopReason;
 use async_trait::async_trait;
 use log::{debug, trace};
 use querymt::chat::ChatRole;
@@ -191,8 +191,8 @@ impl MiddlewareDriver for DelegationGuardMiddleware {
                                         // Inject warning message and stop execution
                                         let _new_context = context.inject_message(warning);
                                         return Ok(ExecutionState::Stopped {
-                                            reason: StopReason::EndTurn,
                                             message: "Delegation blocked by guard".into(),
+                                            stop_type: StopType::DelegationBlocked,
                                         });
                                     }
                                 }

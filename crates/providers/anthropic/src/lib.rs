@@ -189,6 +189,9 @@ struct MessageContent<'a> {
     tool_result_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "content")]
     tool_output: Option<String>,
+    // cache control
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControlEphemeral>,
 }
 
 #[derive(Serialize, Debug)]
@@ -615,12 +618,9 @@ impl HTTPChatProvider for Anthropic {
 
         let anthropic_messages: Vec<AnthropicMessage> = messages
             .iter()
-            .map(|m| AnthropicMessage {
-                role: match m.role {
-                    ChatRole::User => "user",
-                    ChatRole::Assistant => "assistant",
-                },
-                content: match &m.message_type {
+            .map(|m| {
+                // Build content blocks first
+                let mut content = match &m.message_type {
                     MessageType::Text => vec![MessageContent {
                         message_type: Some("text"),
                         text: Some(&m.content),
@@ -631,6 +631,7 @@ impl HTTPChatProvider for Anthropic {
                         tool_name: None,
                         tool_result_id: None,
                         tool_output: None,
+                        cache_control: None,
                     }],
                     MessageType::Pdf(raw_bytes) => {
                         vec![MessageContent {
@@ -647,6 +648,7 @@ impl HTTPChatProvider for Anthropic {
                             tool_name: None,
                             tool_result_id: None,
                             tool_output: None,
+                            cache_control: None,
                         }]
                     }
                     MessageType::Image((image_mime, raw_bytes)) => {
@@ -664,6 +666,7 @@ impl HTTPChatProvider for Anthropic {
                             tool_name: None,
                             tool_result_id: None,
                             tool_output: None,
+                            cache_control: None,
                         }]
                     }
                     MessageType::ImageURL(url) => vec![MessageContent {
@@ -676,6 +679,7 @@ impl HTTPChatProvider for Anthropic {
                         tool_name: None,
                         tool_result_id: None,
                         tool_output: None,
+                        cache_control: None,
                     }],
                     MessageType::ToolUse(calls) => {
                         let mut content = Vec::new();
@@ -690,6 +694,7 @@ impl HTTPChatProvider for Anthropic {
                                 tool_name: None,
                                 tool_result_id: None,
                                 tool_output: None,
+                                cache_control: None,
                             });
                         }
                         content.extend(calls.iter().map(|c| {
@@ -706,6 +711,7 @@ impl HTTPChatProvider for Anthropic {
                                 tool_name: Some(self.prefix_tool_name(&c.function.name)),
                                 tool_result_id: None,
                                 tool_output: None,
+                                cache_control: None,
                             }
                         }));
                         content
@@ -722,9 +728,36 @@ impl HTTPChatProvider for Anthropic {
                             tool_name: None,
                             tool_result_id: Some(r.id.clone()),
                             tool_output: Some(r.function.arguments.clone()),
+                            cache_control: None,
                         })
                         .collect(),
-                },
+                };
+
+                // Apply cache_control to the last content block if present
+                if let Some(cache_hint) = &m.cache {
+                    if let Some(last) = content.last_mut() {
+                        last.cache_control = Some(match cache_hint {
+                            querymt::chat::CacheHint::Ephemeral { ttl_seconds } => {
+                                CacheControlEphemeral {
+                                    control_type: "ephemeral".to_string(),
+                                    ttl: match ttl_seconds {
+                                        Some(s) if *s > 300 => Some(CacheTTL::OneHour),
+                                        Some(_) => Some(CacheTTL::FiveMinutes),
+                                        None => None,
+                                    },
+                                }
+                            }
+                        });
+                    }
+                }
+
+                AnthropicMessage {
+                    role: match m.role {
+                        ChatRole::User => "user",
+                        ChatRole::Assistant => "assistant",
+                    },
+                    content,
+                }
             })
             .collect();
 

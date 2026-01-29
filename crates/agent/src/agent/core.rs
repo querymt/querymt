@@ -1,11 +1,13 @@
 //! Core agent structures and basic implementations
 
 use crate::acp::client_bridge::ClientBridgeSender;
+use crate::config::{CompactionConfig, PruningConfig, ToolOutputConfig};
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_bus::EventBus;
 use crate::events::AgentEvent;
 use crate::index::{WorkspaceIndexManager, WorkspaceIndexManagerConfig};
 use crate::middleware::{CompositeDriver, MiddlewareDriver};
+use crate::session::compaction::SessionCompaction;
 use crate::session::provider::SessionProvider;
 use crate::session::store::{LLMConfig, SessionStore};
 use crate::tools::ToolRegistry;
@@ -43,6 +45,16 @@ pub struct QueryMTAgent {
     pub(crate) agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     pub(crate) delegation_context_config: DelegationContextConfig,
     pub(crate) workspace_index_manager: Arc<WorkspaceIndexManager>,
+
+    // Compaction system (3-layer)
+    /// Tool output truncation configuration (Layer 1)
+    pub(crate) tool_output_config: ToolOutputConfig,
+    /// Pruning configuration (Layer 2) - runs after every turn
+    pub(crate) pruning_config: PruningConfig,
+    /// AI compaction configuration (Layer 3) - runs on context overflow
+    pub(crate) compaction_config: CompactionConfig,
+    /// Session compaction service for AI summaries
+    pub(crate) compaction: SessionCompaction,
 }
 
 /// Configuration for when and how delegation context is injected into conversations.
@@ -183,6 +195,11 @@ impl QueryMTAgent {
             workspace_index_manager: Arc::new(WorkspaceIndexManager::new(
                 WorkspaceIndexManagerConfig::default(),
             )),
+            // Compaction system (3-layer) - all defaults
+            tool_output_config: ToolOutputConfig::default(),
+            pruning_config: PruningConfig::default(),
+            compaction_config: CompactionConfig::default(),
+            compaction: SessionCompaction::new(),
         }
     }
 
@@ -211,6 +228,11 @@ impl QueryMTAgent {
         }
 
         CompositeDriver::new(drivers)
+    }
+
+    /// Returns the session limits from configured middleware
+    pub fn get_session_limits(&self) -> Option<crate::events::SessionLimits> {
+        self.create_driver().get_limits()
     }
 
     /// Builds delegation metadata for ACP AgentCapabilities._meta field

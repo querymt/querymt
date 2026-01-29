@@ -1,4 +1,5 @@
 use crate::model::{AgentMessage, MessagePart};
+use crate::model_heuristics::ModelDefaults;
 use crate::model_info::get_model_info;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::store::{LLMConfig, Session, SessionStore};
@@ -46,12 +47,26 @@ impl SessionProvider {
         SessionContext::new(Arc::new(self.clone()), session).await
     }
 
-    /// Create a new session with optional cwd
+    /// Create a new session with optional cwd and parent
     pub async fn create_session(
         &self,
         cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<&str>,
     ) -> SessionResult<SessionContext> {
-        let mut session = self.history_store.create_session(None, cwd).await?;
+        let fork_origin = if parent_session_id.is_some() {
+            Some(crate::session::domain::ForkOrigin::Delegation)
+        } else {
+            None
+        };
+        let mut session = self
+            .history_store
+            .create_session(
+                None,
+                cwd,
+                parent_session_id.map(|s| s.to_string()),
+                fork_origin,
+            )
+            .await?;
         let llm_config = self
             .history_store
             .create_or_get_llm_config(&self.initial_config)
@@ -75,17 +90,14 @@ impl SessionProvider {
         &self,
         session_id: &str,
     ) -> SessionResult<Arc<dyn LLMProvider>> {
-        let llm_config = self
+        let config = self
             .history_store
             .get_session_llm_config(session_id)
             .await?
             .ok_or_else(|| {
                 SessionError::InvalidOperation("Session has no LLM config".to_string())
             })?;
-        self.build_provider(&llm_config).await
-    }
 
-    async fn build_provider(&self, config: &LLMConfig) -> SessionResult<Arc<dyn LLMProvider>> {
         let factory = self
             .plugin_registry
             .get(&config.provider)
@@ -102,10 +114,9 @@ impl SessionProvider {
             }
         }
 
-        // Apply provider-specific defaults for required fields
-        if config.provider == "anthropic" && builder_config.get("max_tokens").is_none() {
-            builder_config["max_tokens"] = serde_json::json!(32_000);
-        }
+        // Apply model/provider heuristic defaults (only fills keys not already present)
+        let defaults = ModelDefaults::for_model(&config.provider, &config.model);
+        defaults.apply_to(&mut builder_config, session_id);
 
         // Get API key - try OAuth first (if feature enabled), then fall back to env var
         if let Some(http_factory) = factory.as_http()
@@ -331,6 +342,7 @@ impl SessionContext {
                         is_error: false,
                         tool_name: Some(call.function.name.clone()),
                         tool_arguments: Some(call.function.arguments.clone()),
+                        compacted_at: None,
                     });
                 }
             }

@@ -7,6 +7,30 @@ import type {
 // Re-export SDK types for use in other components
 export type { SessionNotification, SessionUpdate };
 
+// Stop type enum matching Rust StopType
+export type StopType =
+  | 'step_limit'
+  | 'turn_limit'
+  | 'price_limit'
+  | 'context_threshold'
+  | 'model_token_limit'
+  | 'content_filter'
+  | 'delegation_blocked'
+  | 'other';
+
+// Execution metrics matching Rust ExecutionMetrics
+export interface ExecutionMetrics {
+  steps: number;
+  turns: number;
+}
+
+// Session limits matching Rust SessionLimits
+export interface SessionLimits {
+  max_steps?: number;
+  max_turns?: number;
+  max_cost_usd?: number;
+}
+
 // File index types for @ mentions
 export interface FileIndexEntry {
   path: string;
@@ -41,12 +65,21 @@ export interface EventItem {
   contextTokens?: number;
   // Time tracking fields
   finishReason?: string;  // 'stop', 'tool_calls', etc. from llm_request_end
-  delegationId?: string;  // For delegation_requested/completed events
+  delegationId?: string;  // For delegation_requested/completed/failed events
+  delegationTargetAgentId?: string;
+  delegationObjective?: string;
+  delegationEventType?: 'requested' | 'completed' | 'failed';
   // Context limit from provider_changed events
   contextLimit?: number;
   provider?: string;
   model?: string;
   configId?: number;  // LLM config ID from provider_changed events
+  // Execution metrics from llm_request_end events
+  metrics?: ExecutionMetrics;
+  // Middleware stopped event data
+  stopType?: StopType;
+  stopReason?: string;
+  stopMetrics?: ExecutionMetrics;
 }
 
 export type RoutingMode = 'single' | 'broadcast';
@@ -66,6 +99,9 @@ export interface SessionSummary {
   title?: string;
   created_at?: string;
   updated_at?: string;
+  parent_session_id?: string;
+  fork_origin?: string;
+  has_children?: boolean;
 }
 
 export interface SessionGroup {
@@ -96,6 +132,9 @@ export interface AgentStats {
   // Context tracking - current context size from last LLM request
   currentContextTokens: number;  // Current context size (input + output) from backend
   maxContextTokens?: number;  // Model's context limit from provider_changed event
+  // Execution metrics from backend
+  steps: number;  // LLM calls
+  turns: number;  // User/assistant exchanges
 }
 
 // Session-level statistics
@@ -106,6 +145,11 @@ export interface SessionStats {
   // Time tracking
   totalElapsedMs: number;      // Total wall-clock time from first to last event
   startTimestamp?: number;     // First event timestamp (for live timer calculation)
+  // Execution metrics from backend
+  totalSteps: number;  // LLM calls
+  totalTurns: number;  // User/assistant exchanges
+  // Session limits (if configured)
+  limits?: SessionLimits;
 }
 
 // Combined statistics result
@@ -208,6 +252,9 @@ export interface DelegationGroupInfo {
   id: string;
   delegateToolCallId: string;
   delegateEvent: EventRow;
+  delegationId?: string;
+  targetAgentId?: string;
+  objective?: string;
   agentId?: string;
   events: EventRow[];
   status: 'in_progress' | 'completed' | 'failed';

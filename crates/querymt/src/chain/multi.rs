@@ -219,6 +219,7 @@ impl<'a> MultiPromptChain<'a> {
                         role: ChatRole::User,
                         message_type: MessageType::Text,
                         content: prompt_text,
+                        cache: None,
                     }];
 
                     let mut final_response_text = String::new();
@@ -235,6 +236,7 @@ impl<'a> MultiPromptChain<'a> {
                         step_messages.push(ChatMessage {
                             role: ChatRole::Assistant,
                             content: response_text.clone().unwrap_or_default(),
+                            cache: None,
                             message_type: if let Some(ref tcs) = tool_calls {
                                 if tcs.is_empty() {
                                     MessageType::Text
@@ -284,6 +286,7 @@ impl<'a> MultiPromptChain<'a> {
                                 role: ChatRole::User,
                                 content: String::new(),
                                 message_type: MessageType::ToolResult(tool_results),
+                                cache: None,
                             });
 
                             // Continue the loop to allow the LLM to process the tool results.

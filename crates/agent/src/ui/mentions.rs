@@ -17,6 +17,7 @@ pub static FILE_MENTION_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"@\{(file|dir):([^}]+)\}").unwrap());
 
 /// Build prompt content blocks from text with @ mentions expanded.
+/// Returns separate blocks: user text (first), attachments (second if any), images (remaining).
 pub async fn build_prompt_blocks(
     workspace_manager: &Arc<WorkspaceIndexManager>,
     cwd: Option<&PathBuf>,
@@ -26,21 +27,38 @@ pub async fn build_prompt_blocks(
         return vec![ContentBlock::Text(TextContent::new(text.to_string()))];
     };
 
-    let (expanded, mut attachments) = expand_prompt_mentions(workspace_manager, cwd, text).await;
-    let mut blocks = Vec::with_capacity(1 + attachments.len());
-    blocks.push(ContentBlock::Text(TextContent::new(expanded)));
-    blocks.append(&mut attachments);
+    let (user_text, attachment_text, image_blocks) =
+        expand_prompt_mentions(workspace_manager, cwd, text).await;
+    let mut blocks = Vec::new();
+
+    // Block 1: User's message with [file:...] references (clean, for intent snapshots)
+    blocks.push(ContentBlock::Text(TextContent::new(user_text)));
+
+    // Block 2: Attachment content (if any) - for LLM context only
+    if !attachment_text.is_empty() {
+        blocks.push(ContentBlock::Text(TextContent::new(format!(
+            "Attachments:\n{}",
+            attachment_text
+        ))));
+    }
+
+    // Blocks 3+: Images
+    blocks.extend(image_blocks);
+
     blocks
 }
 
-/// Expand @ mentions in text and return the expanded text plus any image blocks.
+/// Expand @ mentions in text and return separate components:
+/// - user_text: The user's message with [file:...] references (no attachment content)
+/// - attachment_text: Joined attachment content (file contents, dir listings, etc.)
+/// - image_blocks: Image content blocks
 async fn expand_prompt_mentions(
     workspace_manager: &Arc<WorkspaceIndexManager>,
     cwd: &Path,
     text: &str,
-) -> (String, Vec<ContentBlock>) {
+) -> (String, String, Vec<ContentBlock>) {
     if !text.contains("@{") {
-        return (text.to_string(), Vec::new());
+        return (text.to_string(), String::new(), Vec::new());
     }
 
     let root = resolve_workspace_root(cwd);
@@ -123,12 +141,14 @@ async fn expand_prompt_mentions(
 
     output.push_str(&text[last_index..]);
 
-    if !attachments.is_empty() {
-        output.push_str("\n\nAttachments:\n");
-        output.push_str(&attachments.join("\n\n"));
-    }
+    // Don't append attachments to user text - return them separately
+    let attachment_content = if !attachments.is_empty() {
+        attachments.join("\n\n")
+    } else {
+        String::new()
+    };
 
-    (output, blocks)
+    (output, attachment_content, blocks)
 }
 
 /// Build a lookup map from the file index for the current working directory.

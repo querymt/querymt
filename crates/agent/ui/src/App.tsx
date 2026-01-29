@@ -11,6 +11,8 @@ import { FloatingStatsPanel } from './components/FloatingStatsPanel';
 import { MentionInput } from './components/MentionInput';
 import { ToolDetailModal } from './components/ToolDetailModal';
 import { TurnCard } from './components/TurnCard';
+import { DelegationsView } from './components/DelegationsView';
+import { DelegationDrawer } from './components/DelegationDrawer';
 
 import { GlitchText } from './components/GlitchText';
 import { SessionPicker } from './components/SessionPicker';
@@ -46,6 +48,7 @@ function App() {
     setSessionModel,
     llmConfigCache,
     requestLlmConfig,
+    sessionLimits,
   } = useUiClient();
   
   // Live timer hook
@@ -63,6 +66,8 @@ function App() {
   const [isAtBottom, setIsAtBottom] = useState(true);
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const activeIndexStatus = sessionId ? workspaceIndexStatus[sessionId]?.status : undefined;
+  const [activeTimelineView, setActiveTimelineView] = useState<'chat' | 'delegations'>('chat');
+  const [activeDelegationId, setActiveDelegationId] = useState<string | null>(null);
   
   // Modal state for tool details
   const [selectedToolEvent, setSelectedToolEvent] = useState<EventRow | null>(null);
@@ -95,6 +100,11 @@ function App() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    setActiveDelegationId(null);
+    setActiveTimelineView('chat');
+  }, [sessionId]);
 
   // Keyboard shortcut: Cmd+N / Ctrl+N to create new session
   useEffect(() => {
@@ -185,10 +195,11 @@ function App() {
   } : undefined;
 
   // Build turns from events
-  const { turns, hasMultipleModels: sessionHasMultipleModels } = useMemo(
-    () => buildTurns(events, thinkingAgentId),
-    [events, thinkingAgentId]
-  );
+  const {
+    turns,
+    delegations,
+    hasMultipleModels: sessionHasMultipleModels,
+  } = useMemo(() => buildTurns(events, thinkingAgentId), [events, thinkingAgentId]);
   const systemEvents = useMemo(
     () => events.filter((event) => event.type === 'system'),
     [events]
@@ -218,6 +229,7 @@ function App() {
     return turns;
   }, [turns]);
   const hasTurns = filteredTurns.length > 0;
+  const hasDelegations = delegations.length > 0;
 
   // Calculate last user message turn index for pinned message
   const lastUserMessageTurnIndex = useMemo(() => {
@@ -234,22 +246,50 @@ function App() {
     setSelectedToolEvent(event);
   }, []);
 
-  // Handle delegation click - scroll to accordion
+  // Handle delegation click - open drawer
   const handleDelegateClick = useCallback((delegationId: string) => {
-    setTimeout(() => {
-      const accordion = document.querySelector(`[data-delegation-id="${delegationId}"]`);
-      if (accordion) {
-        accordion.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
-    }, 100);
-  }, []);
+    console.log('[handleDelegateClick] Setting delegation ID:', delegationId);
+    console.log('[handleDelegateClick] Current state:', {
+      activeTimelineView,
+      hasTurns,
+      sessionId,
+      delegationsCount: delegations.length,
+      eventsCount: events.length
+    });
+    setActiveDelegationId(delegationId);
+  }, [activeTimelineView, hasTurns, sessionId, delegations.length, events.length]);
 
-  // Render event item (used for delegations)
-  const renderEventItem = useCallback((_event: EventRow) => {
-    // For delegation child events, we don't need special rendering
-    // They're just shown in a simple list
-    return null;
-  }, []);
+  const activeDelegation = useMemo(
+    () => delegations.find((delegation) => delegation.id === activeDelegationId),
+    [delegations, activeDelegationId]
+  );
+  const activeDelegationTurn = useMemo(
+    () => (activeDelegation ? buildDelegationTurn(activeDelegation) : null),
+    [activeDelegation]
+  );
+
+  useEffect(() => {
+    if (activeDelegationId && !activeDelegation) {
+      setActiveDelegationId(null);
+    }
+  }, [activeDelegation, activeDelegationId]);
+
+  useEffect(() => {
+    if (activeTimelineView === 'delegations' && delegations.length === 0) {
+      setActiveTimelineView('chat');
+    }
+  }, [activeTimelineView, delegations.length]);
+
+  useEffect(() => {
+    if (activeTimelineView === 'delegations') {
+      // Auto-close drawer when switching to delegations tab
+      setActiveDelegationId(null);
+      // Auto-select first delegation in delegations view
+      if (delegations.length > 0) {
+        setActiveDelegationId(delegations[0].id);
+      }
+    }
+  }, [activeTimelineView, delegations]);
 
   return (
     <div className="flex flex-col h-screen bg-cyber-bg text-gray-100 relative">
@@ -364,8 +404,46 @@ function App() {
 
       {/* Event Timeline */}
       <div className="flex-1 overflow-hidden flex flex-col relative">
+        {sessionId && (hasTurns || hasDelegations) && (
+          <div className="px-6 py-2 border-b border-cyber-border/60 bg-cyber-surface/40 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setActiveTimelineView('chat')}
+              className={`text-xs uppercase tracking-wider px-3 py-1.5 rounded-full border transition-colors ${
+                activeTimelineView === 'chat'
+                  ? 'border-cyber-cyan text-cyber-cyan bg-cyber-cyan/10'
+                  : 'border-cyber-border text-gray-400 hover:border-cyber-cyan/60 hover:text-gray-200'
+              }`}
+            >
+              Chat
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTimelineView('delegations')}
+              className={`text-xs uppercase tracking-wider px-3 py-1.5 rounded-full border transition-colors ${
+                activeTimelineView === 'delegations'
+                  ? 'border-cyber-purple text-cyber-purple bg-cyber-purple/10'
+                  : 'border-cyber-border text-gray-400 hover:border-cyber-purple/60 hover:text-gray-200'
+              }`}
+            >
+              Delegations
+              {hasDelegations && (
+                <span className="ml-2 text-[10px] text-gray-500">{delegations.length}</span>
+              )}
+            </button>
+          </div>
+        )}
         <div className="flex-1 overflow-hidden relative">
-          {!hasTurns ? (
+          {activeTimelineView === 'delegations' ? (
+            <DelegationsView
+              delegations={delegations}
+              agents={agents}
+              activeDelegationId={activeDelegationId}
+              activeTurn={activeDelegationTurn}
+              onSelectDelegation={handleDelegateClick}
+              onToolClick={handleToolClick}
+            />
+          ) : !hasTurns ? (
             <div className="flex items-center justify-center h-full">
               {!sessionId ? (
                 // No active session
@@ -437,11 +515,11 @@ function App() {
                   agents={agents}
                   onToolClick={handleToolClick}
                   onDelegateClick={handleDelegateClick}
-                  renderEvent={renderEventItem}
                   isLastUserMessage={index === lastUserMessageTurnIndex}
                   showModelLabel={sessionHasMultipleModels}
                   llmConfigCache={llmConfigCache}
                   requestLlmConfig={requestLlmConfig}
+                  activeView={activeTimelineView}
                 />
               )}
               followOutput="smooth"
@@ -450,7 +528,7 @@ function App() {
             />
           )}
         </div>
-        {hasTurns && !isAtBottom && (
+        {activeTimelineView === 'chat' && hasTurns && !isAtBottom && (
           <div className="absolute bottom-6 left-1/2 -translate-x-1/2">
             <button
               type="button"
@@ -470,14 +548,18 @@ function App() {
           </div>
         )}
         {/* Floating Stats Panel */}
-        <FloatingStatsPanel 
-          events={events} 
-          agents={agents} 
-          expertMode={expertMode}
-          globalElapsedMs={globalElapsedMs}
-          agentElapsedMs={agentElapsedMs}
-          isSessionActive={isSessionActive}
-        />
+        {activeTimelineView === 'chat' && (
+          <FloatingStatsPanel 
+            events={events} 
+            agents={agents} 
+            expertMode={expertMode}
+            globalElapsedMs={globalElapsedMs}
+            agentElapsedMs={agentElapsedMs}
+            isSessionActive={isSessionActive}
+            agentModels={agentModels}
+            sessionLimits={sessionLimits}
+          />
+        )}
       </div>
 
       {/* Thinking/Completion Indicator */}
@@ -514,7 +596,7 @@ function App() {
                 px-6 py-3 rounded-lg font-medium transition-all duration-200
                 bg-cyber-orange/10 border-2 border-cyber-orange text-cyber-orange
                 hover:bg-cyber-orange/20 hover:shadow-[0_0_15px_rgba(255,165,0,0.3)]
-                flex items-center gap-2 overflow-visible
+                flex items-center gap-2 overflow-visible self-end min-h-[48px]
               "
               title="Stop generation (Esc)"
             >
@@ -530,7 +612,7 @@ function App() {
                 bg-cyber-cyan/10 border-2 border-cyber-cyan text-cyber-cyan
                 hover:bg-cyber-cyan/20 hover:shadow-neon-cyan
                 disabled:opacity-30 disabled:cursor-not-allowed
-                flex items-center gap-2 overflow-visible
+                flex items-center gap-2 overflow-visible self-end min-h-[48px]
               "
             >
               {loading ? (
@@ -554,6 +636,18 @@ function App() {
         <ToolDetailModal
           event={selectedToolEvent}
           onClose={() => setSelectedToolEvent(null)}
+        />
+      )}
+
+      {activeTimelineView === 'chat' && activeDelegation && (
+        <DelegationDrawer
+          delegation={activeDelegation}
+          agents={agents}
+          onClose={() => {
+          console.log('[DelegationDrawer] Closing drawer');
+          setActiveDelegationId(null);
+        }}
+          onToolClick={handleToolClick}
         />
       )}
 
@@ -614,6 +708,7 @@ function buildTurns(events: EventItem[], thinkingAgentId: string | null): {
   turns: Turn[];
   allEventRows: EventRow[];
   hasMultipleModels: boolean;
+  delegations: DelegationGroupInfo[];
 } {
   // First, build event rows with delegation grouping (from previous implementation)
   const { rows, delegationGroups } = buildEventRowsWithDelegations(events);
@@ -715,7 +810,35 @@ function buildTurns(events: EventItem[], thinkingAgentId: string | null): {
     turns.push(currentTurn);
   }
 
-  return { turns, allEventRows: rows, hasMultipleModels: multipleModels };
+  return {
+    turns,
+    allEventRows: rows,
+    hasMultipleModels: multipleModels,
+    delegations: Array.from(delegationGroups.values()).sort(
+      (a, b) => a.startTime - b.startTime
+    ),
+  };
+}
+
+function buildDelegationTurn(group: DelegationGroupInfo): Turn {
+  const messageEvents = group.events.filter(
+    (event) => event.type === 'agent' && event.isMessage
+  );
+  const toolCalls = group.events.filter((event) => event.type === 'tool_call');
+  const firstTimestamp = group.events[0]?.timestamp ?? group.startTime;
+  const lastTimestamp = group.events[group.events.length - 1]?.timestamp ?? group.endTime ?? group.startTime;
+
+  return {
+    id: `delegation-${group.id}`,
+    userMessage: undefined,
+    agentMessages: messageEvents,
+    toolCalls,
+    delegations: [],
+    agentId: group.targetAgentId ?? group.agentId,
+    startTime: firstTimestamp,
+    endTime: group.endTime ?? lastTimestamp,
+    isActive: group.status === 'in_progress',
+  };
 }
 
 // Build event rows with delegation grouping (from previous implementation)
@@ -730,8 +853,62 @@ function buildEventRowsWithDelegations(events: EventItem[]): {
     string,
     { eventId: string; depth: number; kind?: string; name?: string; rowIndex?: number }
   >();
-  const openDelegations: string[] = [];
   let currentAgentId: string | null = null;
+  const pendingDelegationsByAgent = new Map<string, string[]>();
+  const delegationIdToToolCall = new Map<string, string>();
+  const activeDelegationByAgent = new Map<string, string>();
+
+  const getDelegateTargetAgentId = (event: EventItem): string | undefined => {
+    if (event.toolCall?.raw_input && typeof event.toolCall.raw_input === 'object') {
+      const rawInput = event.toolCall.raw_input as {
+        target_agent_id?: string;
+        targetAgentId?: string;
+      };
+      return rawInput.target_agent_id ?? rawInput.targetAgentId;
+    }
+    return undefined;
+  };
+
+  const addPendingDelegation = (agentId: string, toolCallId: string) => {
+    const pending = pendingDelegationsByAgent.get(agentId) ?? [];
+    pending.push(toolCallId);
+    pendingDelegationsByAgent.set(agentId, pending);
+  };
+
+  const takePendingDelegation = (agentId: string) => {
+    const pending = pendingDelegationsByAgent.get(agentId);
+    if (!pending || pending.length === 0) return undefined;
+    const next = pending.shift();
+    if (pending.length === 0) {
+      pendingDelegationsByAgent.delete(agentId);
+    }
+    return next;
+  };
+
+  const ensureDelegationGroup = (toolCallId: string, fallbackEvent: EventItem) => {
+    if (delegationGroups.has(toolCallId)) {
+      return delegationGroups.get(toolCallId)!;
+    }
+    const delegateEvent: EventRow = {
+      ...fallbackEvent,
+      type: 'tool_call',
+      content: fallbackEvent.content || 'delegate',
+      depth: 1,
+      toolCall: fallbackEvent.toolCall ?? { kind: 'delegate', status: 'in_progress' },
+      isDelegateToolCall: true,
+      delegationGroupId: toolCallId,
+    };
+    const group: DelegationGroupInfo = {
+      id: toolCallId,
+      delegateToolCallId: toolCallId,
+      delegateEvent,
+      events: [],
+      status: 'in_progress',
+      startTime: fallbackEvent.timestamp,
+    };
+    delegationGroups.set(toolCallId, group);
+    return group;
+  };
 
   for (const event of events) {
     if (event.type === 'system') {
@@ -743,10 +920,58 @@ function buildEventRowsWithDelegations(events: EventItem[]): {
     let isDelegateToolCall = false;
     let delegationGroupId: string | undefined;
 
+     if (event.delegationEventType === 'requested' && event.delegationId) {
+       const targetAgentId = event.delegationTargetAgentId;
+       const toolCallId = targetAgentId ? takePendingDelegation(targetAgentId) : undefined;
+       const delegationKey = toolCallId ?? event.delegationId;
+       delegationIdToToolCall.set(event.delegationId, delegationKey);
+       const group = ensureDelegationGroup(delegationKey, event);
+       group.delegationId = event.delegationId;
+       group.targetAgentId = targetAgentId ?? group.targetAgentId;
+       group.objective = event.delegationObjective ?? group.objective;
+       group.startTime = event.timestamp;
+       if (targetAgentId) {
+         activeDelegationByAgent.set(targetAgentId, delegationKey);
+       }
+     }
+
+     if (event.delegationEventType === 'completed' && event.delegationId) {
+       const delegationKey = delegationIdToToolCall.get(event.delegationId) ?? event.delegationId;
+       const group = delegationGroups.get(delegationKey);
+       if (group) {
+         group.endTime = event.timestamp;
+         if (group.status === 'in_progress') {
+           group.status = 'completed';
+         }
+         if (group.targetAgentId) {
+           activeDelegationByAgent.delete(group.targetAgentId);
+         }
+       }
+     }
+
+     if (event.delegationEventType === 'failed' && event.delegationId) {
+       const delegationKey = delegationIdToToolCall.get(event.delegationId) ?? event.delegationId;
+       const group = delegationGroups.get(delegationKey);
+       if (group) {
+         group.endTime = event.timestamp;
+         group.status = 'failed';
+         if (group.targetAgentId) {
+           activeDelegationByAgent.delete(group.targetAgentId);
+         }
+       }
+     }
+
+     const activeDelegationKey = event.agentId
+       ? activeDelegationByAgent.get(event.agentId)
+       : undefined;
+     if (activeDelegationKey) {
+       delegationGroupId = activeDelegationKey;
+     }
+
     if (event.type === 'tool_call') {
       const toolCallKey = event.toolCall?.tool_call_id ?? event.id;
-      const delegationParent = openDelegations.length
-        ? toolCallMap.get(openDelegations[openDelegations.length - 1])?.eventId
+      const delegationParent = delegationGroupId
+        ? toolCallMap.get(delegationGroupId)?.eventId
         : null;
       const parentCandidate = delegationParent ?? currentAgentId;
       const parentDepth = parentCandidate ? depthMap.get(parentCandidate) ?? 0 : 0;
@@ -764,25 +989,32 @@ function buildEventRowsWithDelegations(events: EventItem[]): {
       });
 
       // Check if this is a delegate tool call
-      if (event.toolCall?.kind === 'delegate' || event.toolCall?.kind === 'mcp_task') {
+      if (event.toolCall?.kind === 'delegate') {
         isDelegateToolCall = true;
         delegationGroupId = toolCallKey;
-        openDelegations.push(toolCallKey);
-        
-        // Create delegation group
-        delegationGroups.set(toolCallKey, {
-          id: toolCallKey,
-          delegateToolCallId: toolCallKey,
-          delegateEvent: { ...event, depth, parentId, toolName, isDelegateToolCall: true, delegationGroupId: toolCallKey },
-          events: [],
-          status: 'in_progress',
-          startTime: event.timestamp,
-        });
+        const targetAgentId = getDelegateTargetAgentId(event);
+        if (targetAgentId) {
+          addPendingDelegation(targetAgentId, toolCallKey);
+        }
+
+        const group = ensureDelegationGroup(toolCallKey, event);
+        group.targetAgentId = targetAgentId ?? group.targetAgentId;
+        group.objective =
+          group.objective ??
+          ((event.toolCall?.raw_input as { objective?: string } | undefined)?.objective ??
+            event.delegationObjective);
+        group.delegateEvent = {
+          ...event,
+          depth,
+          parentId,
+          toolName,
+          isDelegateToolCall: true,
+          delegationGroupId: toolCallKey,
+        };
       }
       
       // If we're inside a delegation, mark this event
-      if (openDelegations.length > 0 && !isDelegateToolCall) {
-        delegationGroupId = openDelegations[openDelegations.length - 1];
+      if (delegationGroupId && !isDelegateToolCall) {
         const group = delegationGroups.get(delegationGroupId);
         if (group) {
           const childRow: EventRow = { ...event, depth, parentId, toolName, delegationGroupId };
@@ -810,8 +1042,22 @@ function buildEventRowsWithDelegations(events: EventItem[]): {
         if (toolCallKey && delegationGroups.has(toolCallKey)) {
           const group = delegationGroups.get(toolCallKey)!;
           group.delegateEvent.mergedResult = event;
-          group.endTime = event.timestamp;
-          group.status = event.toolCall?.status === 'failed' ? 'failed' : 'completed';
+          if (event.toolCall?.status === 'failed') {
+            group.status = 'failed';
+          }
+        }
+        
+        // Also update delegation group's events array copy (for tools within the delegation)
+        if (toolCallRow?.delegationGroupId) {
+          const group = delegationGroups.get(toolCallRow.delegationGroupId);
+          if (group) {
+            const groupEvent = group.events.find(
+              e => e.toolCall?.tool_call_id === toolCallKey
+            );
+            if (groupEvent) {
+              groupEvent.mergedResult = event;
+            }
+          }
         }
       } else {
         // No matching tool_call
@@ -827,8 +1073,7 @@ function buildEventRowsWithDelegations(events: EventItem[]): {
         }
         
         // Check if inside a delegation
-        if (openDelegations.length > 0) {
-          delegationGroupId = openDelegations[openDelegations.length - 1];
+        if (delegationGroupId) {
           const group = delegationGroups.get(delegationGroupId);
           if (group) {
             group.events.push({ ...event, depth, parentId, toolName, delegationGroupId });
@@ -838,28 +1083,15 @@ function buildEventRowsWithDelegations(events: EventItem[]): {
         depthMap.set(event.id, depth);
         rows.push({ ...event, depth, parentId, toolName, delegationGroupId });
       }
-      
-      // Close delegation if this result completes it
-      if (
-        toolCallKey &&
-        openDelegations[openDelegations.length - 1] === toolCallKey &&
-        (!event.toolCall?.status ||
-          event.toolCall?.status === 'completed' ||
-          event.toolCall?.status === 'failed')
-      ) {
-        openDelegations.pop();
-      }
     } else {
       // user or agent event
-      if (openDelegations.length > 0) {
-        const delegationId = openDelegations[openDelegations.length - 1];
-        const delegationDepth = toolCallMap.get(delegationId)?.depth ?? 1;
+      if (delegationGroupId) {
+        const delegationDepth = toolCallMap.get(delegationGroupId)?.depth ?? 1;
         depth = delegationDepth + 1;
-        parentId = toolCallMap.get(delegationId)?.eventId;
-        delegationGroupId = delegationId;
+        parentId = toolCallMap.get(delegationGroupId)?.eventId;
         
         // Add to delegation group
-        const group = delegationGroups.get(delegationId);
+        const group = delegationGroups.get(delegationGroupId);
         if (group) {
           group.events.push({ ...event, depth, parentId, toolName, delegationGroupId });
           if (event.agentId && !group.agentId) {
@@ -867,7 +1099,7 @@ function buildEventRowsWithDelegations(events: EventItem[]): {
           }
         }
       }
-      if (event.type === 'agent') {
+      if (event.type === 'agent' && event.isMessage) {
         currentAgentId = event.id;
       }
       

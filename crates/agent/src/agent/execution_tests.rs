@@ -172,6 +172,10 @@ impl TestHarness {
             workspace_index_manager: Arc::new(crate::index::WorkspaceIndexManager::new(
                 crate::index::WorkspaceIndexManagerConfig::default(),
             )),
+            tool_output_config: crate::config::ToolOutputConfig::default(),
+            pruning_config: crate::config::PruningConfig::default(),
+            compaction_config: crate::config::CompactionConfig::default(),
+            compaction: crate::session::compaction::SessionCompaction::new(),
         };
 
         if let Ok(mut config) = agent.tool_config.lock() {

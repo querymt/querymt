@@ -24,6 +24,22 @@ pub enum ChatRole {
     Assistant,
 }
 
+/// Cache hint for providers that support prompt caching.
+/// When set on a message, the provider may use it to mark cache breakpoints,
+/// allowing the conversation prefix up to this point to be cached and reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheHint {
+    /// Ephemeral cache breakpoint. Providers that support caching (e.g., Anthropic)
+    /// will cache the conversation prefix up to and including this message.
+    /// The optional TTL specifies cache lifetime in seconds.
+    /// If None, the provider uses its default TTL.
+    Ephemeral {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl_seconds: Option<u64>,
+    },
+}
+
 /// The supported MIME type of an image.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -86,6 +102,10 @@ pub struct ChatMessage {
     pub message_type: MessageType,
     /// The text content of the message
     pub content: String,
+    /// Optional cache hint. Providers that support caching (e.g., Anthropic)
+    /// will translate this into provider-specific cache breakpoint markers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheHint>,
 }
 
 /// Represents a parameter in a function tool
@@ -405,6 +425,7 @@ impl From<&dyn ChatResponse> for ChatMessage {
             role: ChatRole::Assistant,
             message_type,
             content,
+            cache: None,
         }
     }
 }
@@ -584,6 +605,7 @@ pub struct ChatMessageBuilder {
     role: ChatRole,
     message_type: MessageType,
     content: String,
+    cache: Option<CacheHint>,
 }
 
 impl ChatMessageBuilder {
@@ -593,6 +615,7 @@ impl ChatMessageBuilder {
             role,
             message_type: MessageType::default(),
             content: String::new(),
+            cache: None,
         }
     }
 
@@ -632,12 +655,19 @@ impl ChatMessageBuilder {
         self
     }
 
+    /// Set cache hint for this message
+    pub fn cache(mut self, cache: CacheHint) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
     /// Build the ChatMessage
     pub fn build(self) -> ChatMessage {
         ChatMessage {
             role: self.role,
             message_type: self.message_type,
             content: self.content,
+            cache: self.cache,
         }
     }
 }

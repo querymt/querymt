@@ -424,8 +424,10 @@ impl Agent {
         if let Some(api_key) = config.agent.api_key {
             builder = builder.api_key(api_key);
         }
-        for system in config.agent.system {
-            builder = builder.system(system);
+        for part in config.agent.system {
+            if let crate::config::SystemPart::Inline(s) = part {
+                builder = builder.system(s);
+            }
         }
         if let Some(params) = config.agent.parameters {
             for (key, value) in params {

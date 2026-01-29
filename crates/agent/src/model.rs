@@ -31,6 +31,10 @@ pub enum MessagePart {
         is_error: bool,
         tool_name: Option<String>,
         tool_arguments: Option<String>,
+        /// Timestamp when this tool result was marked as compacted (pruned)
+        /// When set, the content should be replaced with a placeholder in LLM context
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compacted_at: Option<i64>,
     },
     Patch {
         id: String,
@@ -118,17 +122,24 @@ impl AgentMessage {
                     content: res,
                     tool_name,
                     tool_arguments: _tool_arguments,
+                    compacted_at,
                     ..
                 } => {
+                    // If compacted, return placeholder text instead of original content
+                    let effective_content = if compacted_at.is_some() {
+                        "[Old tool result content cleared]".to_string()
+                    } else {
+                        res.clone()
+                    };
                     tool_results.push(ToolCall {
                         id: call_id.clone(),
                         call_type: "function".to_string(),
                         function: FunctionCall {
                             name: tool_name.clone().unwrap_or_else(|| "unknown".to_string()),
-                            arguments: res.clone(),
+                            arguments: effective_content.clone(),
                         },
                     });
-                    content.push_str(res);
+                    content.push_str(&effective_content);
                 }
                 MessagePart::Snapshot { changed_paths, .. } => {
                     let summary = changed_paths.summary();
@@ -155,6 +166,7 @@ impl AgentMessage {
             role: self.role.clone(),
             message_type,
             content,
+            cache: None,
         }
     }
 }

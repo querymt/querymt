@@ -6,7 +6,7 @@ import { useState } from 'react';
 import { ChevronDown, ChevronRight, Loader } from 'lucide-react';
 import { EventRow, DelegationGroupInfo, UiAgentInfo } from '../types';
 import { ToolSummary } from './ToolSummary';
-import { DelegationAccordion } from './DelegationAccordion';
+import { DelegationSummaryCard } from './DelegationSummaryCard';
 
 export interface ActivitySectionProps {
   toolCalls: EventRow[];
@@ -15,7 +15,6 @@ export interface ActivitySectionProps {
   agents: UiAgentInfo[];
   onToolClick: (event: EventRow) => void;
   onDelegateClick: (delegationId: string) => void;
-  renderEvent: (event: EventRow) => React.ReactNode;
 }
 
 export function ActivitySection({
@@ -25,10 +24,8 @@ export function ActivitySection({
   agents,
   onToolClick,
   onDelegateClick,
-  renderEvent,
 }: ActivitySectionProps) {
-  const [isExpanded, setIsExpanded] = useState(isActive); // Auto-expand for active turns
-  const [expandedDelegations, setExpandedDelegations] = useState<Set<string>>(new Set());
+  const [isExpanded, setIsExpanded] = useState(true); // Always expanded by default
 
   // Calculate summary
   const totalTools = toolCalls.length;
@@ -44,17 +41,10 @@ export function ActivitySection({
     return null; // No activity to show
   }
 
-  const handleDelegationToggle = (delegationId: string) => {
-    setExpandedDelegations(prev => {
-      const next = new Set(prev);
-      if (next.has(delegationId)) {
-        next.delete(delegationId);
-      } else {
-        next.add(delegationId);
-      }
-      return next;
-    });
-  };
+  const toolCallIds = new Set(toolCalls.map((call) => call.toolCall?.tool_call_id ?? call.id));
+  const unanchoredDelegations = delegations.filter(
+    (delegation) => !toolCallIds.has(delegation.delegateToolCallId)
+  );
 
   return (
     <div className="activity-section my-3">
@@ -112,23 +102,34 @@ export function ActivitySection({
                   onDelegateClick={delegationGroup ? () => onDelegateClick(delegationGroup.id) : undefined}
                 />
 
-                {/* Delegation accordion below delegate tool */}
+                {/* Delegation summary below delegate tool */}
                 {isDelegate && delegationGroup && (
-                  <div className="mt-1.5 ml-4">
-                    <DelegationAccordion
+                  <div className="mt-2 ml-4">
+                    <DelegationSummaryCard
                       group={delegationGroup}
                       agents={agents}
-                      isExpanded={expandedDelegations.has(delegationGroup.id)}
-                      onToggle={() => handleDelegationToggle(delegationGroup.id)}
-                      onToolClick={onToolClick}
-                      renderEvent={renderEvent}
-                      isActive={delegationGroup.status === 'in_progress'}
+                      onOpen={onDelegateClick}
                     />
                   </div>
                 )}
               </div>
             );
           })}
+          {unanchoredDelegations.length > 0 && (
+            <div className="pt-2">
+              <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Delegations</div>
+              <div className="space-y-2">
+                {unanchoredDelegations.map((delegation) => (
+                  <DelegationSummaryCard
+                    key={delegation.id}
+                    group={delegation}
+                    agents={agents}
+                    onOpen={onDelegateClick}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

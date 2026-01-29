@@ -62,6 +62,7 @@ impl MiddlewareRegistry {
         registry.register(Arc::new(super::dedup_check::DedupCheckFactory));
         registry.register(Arc::new(super::limits::LimitsFactory));
         registry.register(Arc::new(super::context::ContextFactory));
+        registry.register(Arc::new(super::modes::PlanModeFactory));
         registry
     }
 

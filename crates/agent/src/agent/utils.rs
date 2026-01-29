@@ -2,6 +2,19 @@
 
 use agent_client_protocol::{ContentBlock, EmbeddedResourceResource, ToolCallLocation, ToolKind};
 
+/// Format only user text from prompt blocks (first Text block only).
+/// This excludes attachment content which is in subsequent Text blocks.
+/// Used for intent snapshots and session titles where we want clean user text.
+pub fn format_prompt_user_text_only(blocks: &[ContentBlock]) -> String {
+    blocks
+        .first()
+        .and_then(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// Formats prompt content blocks into a single string
 pub fn format_prompt_blocks(blocks: &[ContentBlock], max_prompt_bytes: Option<usize>) -> String {
     let mut content = String::new();

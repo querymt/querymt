@@ -3,6 +3,7 @@ use log::{debug, trace, warn};
 use std::sync::Arc;
 
 use super::{ExecutionState, MiddlewareDriver, Result};
+use crate::events::StopType;
 use crate::middleware::ConversationContext;
 use crate::middleware::factory::MiddlewareFactory;
 use crate::model_info::{ModelInfoSource, get_model_info};
@@ -181,12 +182,12 @@ impl MiddlewareDriver for ContextMiddleware {
                         current_tokens, max_tokens
                     );
                     return Ok(ExecutionState::Stopped {
-                        reason: agent_client_protocol::StopReason::MaxTokens,
                         message: format!(
                             "Context token threshold ({} / {} tokens) reached, requesting compaction",
                             current_tokens, max_tokens
                         )
                         .into(),
+                        stop_type: StopType::ContextThreshold,
                     });
                 }
 
@@ -260,11 +261,11 @@ impl MiddlewareDriver for AutoCompactMiddleware {
                     );
                     // In the new system, we use a Stopped state to signal compaction
                     Ok(ExecutionState::Stopped {
-                        reason: agent_client_protocol::StopReason::MaxTokens,
                         message: format!(
                             "Context token threshold ({} / {} tokens) reached, requesting compaction",
                             current_tokens, self.threshold_tokens
                         ).into(),
+                        stop_type: StopType::ContextThreshold,
                     })
                 } else {
                     trace!(

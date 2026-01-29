@@ -1,7 +1,7 @@
 //! Common test driver implementations for middleware testing
 
+use crate::events::StopType;
 use crate::middleware::{ExecutionState, MiddlewareDriver, Result};
-use agent_client_protocol::StopReason;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -95,13 +95,13 @@ impl MiddlewareDriver for PassThroughDriver {
 // ============================================================================
 
 pub struct StopDriver {
-    pub reason: StopReason,
+    pub stop_type: StopType,
     pub message: &'static str,
 }
 
 impl StopDriver {
-    pub fn new(reason: StopReason, message: &'static str) -> Self {
-        Self { reason, message }
+    pub fn new(stop_type: StopType, message: &'static str) -> Self {
+        Self { stop_type, message }
     }
 }
 
@@ -109,8 +109,8 @@ impl StopDriver {
 impl MiddlewareDriver for StopDriver {
     async fn next_state(&self, _state: ExecutionState) -> Result<ExecutionState> {
         Ok(ExecutionState::Stopped {
-            reason: self.reason,
             message: self.message.into(),
+            stop_type: self.stop_type,
         })
     }
 
@@ -126,15 +126,15 @@ impl MiddlewareDriver for StopDriver {
 // ============================================================================
 
 pub struct AlwaysStopDriver {
-    pub reason: StopReason,
+    pub stop_type: StopType,
 }
 
 #[async_trait]
 impl MiddlewareDriver for AlwaysStopDriver {
     async fn next_state(&self, _state: ExecutionState) -> Result<ExecutionState> {
         Ok(ExecutionState::Stopped {
-            reason: self.reason,
             message: "stopped by middleware".into(),
+            stop_type: self.stop_type,
         })
     }
 
@@ -284,8 +284,8 @@ impl MiddlewareDriver for StopOnBeforeTurn {
     async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
         match state {
             ExecutionState::BeforeTurn { .. } => Ok(ExecutionState::Stopped {
-                reason: StopReason::EndTurn,
                 message: "stopped".into(),
+                stop_type: StopType::Other,
             }),
             other => Ok(other),
         }

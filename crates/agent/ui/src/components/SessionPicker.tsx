@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react';
-import { SessionGroup } from '../types';
+import { SessionGroup, SessionSummary } from '../types';
 import { GlitchText } from './GlitchText';
-import { ChevronDown, ChevronRight, Search, Plus, Clock } from 'lucide-react';
+import { ChevronDown, ChevronRight, Search, Plus, Clock, GitBranch } from 'lucide-react';
 
 interface SessionPickerProps {
   groups: SessionGroup[];
@@ -14,19 +14,57 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled 
   const [filterText, setFilterText] = useState('');
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set(groups.map((_, i) => `group-${i}`)));
   
-  // Filter groups and sessions by search text
+  // Build session hierarchy and filter by search text
   const filteredGroups = useMemo(() => {
-    if (!filterText.trim()) return groups;
+    // First, build the hierarchy
+    const groupsWithHierarchy = groups.map(group => {
+      
+      // Find top-level sessions (those without parent_session_id)
+      const topLevelSessions = group.sessions.filter(s => !s.parent_session_id);
+      
+      // Build hierarchy: attach children to parents
+      const buildHierarchy = (session: SessionSummary): SessionSummary & { children?: SessionSummary[] } => {
+        const children = group.sessions.filter(s => s.parent_session_id === session.session_id);
+        if (children.length > 0) {
+          return { ...session, children: children.map(buildHierarchy) };
+        }
+        return session;
+      };
+      
+      return {
+        ...group,
+        sessions: topLevelSessions.map(buildHierarchy),
+      };
+    });
+    
+    // Then apply filtering
+    if (!filterText.trim()) return groupsWithHierarchy;
     
     const query = filterText.toLowerCase();
-    return groups
+    const matchesQuery = (s: SessionSummary) =>
+      s.session_id.toLowerCase().includes(query) ||
+      s.title?.toLowerCase().includes(query) ||
+      s.name?.toLowerCase().includes(query);
+    
+    // Filter with hierarchy awareness
+    const filterWithHierarchy = (session: SessionSummary & { children?: SessionSummary[] }): (SessionSummary & { children?: SessionSummary[] }) | null => {
+      const sessionMatches = matchesQuery(session);
+      const childrenFiltered = session.children?.map(filterWithHierarchy).filter(c => c !== null) as (SessionSummary & { children?: SessionSummary[] })[] | undefined;
+      
+      // Include if session matches OR any children match
+      if (sessionMatches || (childrenFiltered && childrenFiltered.length > 0)) {
+        return {
+          ...session,
+          children: childrenFiltered && childrenFiltered.length > 0 ? childrenFiltered : undefined,
+        };
+      }
+      return null;
+    };
+    
+    return groupsWithHierarchy
       .map(group => ({
         ...group,
-        sessions: group.sessions.filter(s =>
-          s.session_id.toLowerCase().includes(query) ||
-          s.title?.toLowerCase().includes(query) ||
-          s.name?.toLowerCase().includes(query)
-        ),
+        sessions: group.sessions.map(filterWithHierarchy).filter(s => s !== null) as SessionSummary[],
       }))
       .filter(group => group.sessions.length > 0);
   }, [groups, filterText]);
@@ -60,6 +98,66 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled 
     if (diffDays < 7) return `${diffDays} days ago`;
     
     return date.toLocaleDateString();
+  };
+
+  // Helper to render a single session card with its children
+  const renderSessionCard = (session: SessionSummary & { children?: SessionSummary[] }, sessionIndex: number, depth: number = 0) => {
+    const isChild = !!session.parent_session_id;
+    const isDelegation = session.fork_origin === 'delegation';
+    const indentClass = depth > 0 ? `ml-${depth * 6}` : '';
+    
+    return (
+      <div key={session.session_id}>
+        <button
+          onClick={() => onSelectSession(session.session_id)}
+          disabled={disabled}
+          className={`w-full text-left px-4 py-3 bg-cyber-surface/40 hover:bg-cyber-surface border ${
+            isChild ? 'border-l-2 border-l-cyber-cyan/60' : ''
+          } border-cyber-border/50 hover:border-cyber-cyan/40 rounded-lg transition-all duration-200 group session-card disabled:opacity-50 disabled:cursor-not-allowed overflow-visible ${indentClass}`}
+          style={{
+            animation: `session-card-entrance 0.3s ease-out ${sessionIndex * 0.05}s both`,
+            marginLeft: depth > 0 ? `${depth * 1.5}rem` : '0',
+          }}
+        >
+          {/* Title with optional child indicator */}
+          <div className="font-medium text-gray-200 mb-1 group-hover:text-cyber-cyan transition-colors flex items-center gap-2">
+            {isChild && (
+              <GitBranch className="w-3.5 h-3.5 text-cyber-cyan/70 flex-shrink-0" />
+            )}
+            <span className={isChild ? 'text-sm' : ''}>
+              {session.title || session.name || 'Untitled session'}
+            </span>
+            {isDelegation && (
+              <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded border border-purple-500/30">
+                delegated
+              </span>
+            )}
+          </div>
+          
+          {/* Metadata */}
+          <div className="flex items-center gap-4 text-xs text-gray-500">
+            <span className="font-mono">
+              {session.session_id.slice(0, 12)}...
+            </span>
+            {session.updated_at && (
+              <span className="flex items-center gap-1">
+                <Clock className="w-3 h-3" />
+                {formatTimestamp(session.updated_at)}
+              </span>
+            )}
+          </div>
+        </button>
+        
+        {/* Render children recursively */}
+        {session.children && session.children.length > 0 && (
+          <div className="mt-2 space-y-2">
+            {session.children.map((child, childIndex) => 
+              renderSessionCard(child, childIndex, depth + 1)
+            )}
+          </div>
+        )}
+      </div>
+    );
   };
   
   return (
@@ -125,39 +223,9 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled 
                   {/* Sessions in group */}
                   {isExpanded && (
                     <div className="mt-2 space-y-2 pl-4">
-                      {group.sessions.map((session, sessionIndex) => (
-                        <button
-                          key={session.session_id}
-                          onClick={() => onSelectSession(session.session_id)}
-                          disabled={disabled}
-                          className="w-full text-left px-4 py-3 bg-cyber-surface/40 hover:bg-cyber-surface border border-cyber-border/50 hover:border-cyber-cyan/40 rounded-lg transition-all duration-200 group session-card disabled:opacity-50 disabled:cursor-not-allowed overflow-visible"
-                          style={{
-                            animation: `session-card-entrance 0.3s ease-out ${sessionIndex * 0.05}s both`,
-                          }}
-                        >
-                          {/* Title */}
-                          <div className="font-medium text-gray-200 mb-1 group-hover:text-cyber-cyan transition-colors">
-                            <GlitchText 
-                              text={session.title || session.name || 'Untitled session'} 
-                              variant="0" 
-                              hoverOnly
-                            />
-                          </div>
-                          
-                          {/* Metadata */}
-                          <div className="flex items-center gap-4 text-xs text-gray-500">
-                            <span className="font-mono">
-                              {session.session_id.slice(0, 12)}...
-                            </span>
-                            {session.updated_at && (
-                              <span className="flex items-center gap-1">
-                                <Clock className="w-3 h-3" />
-                                {formatTimestamp(session.updated_at)}
-                              </span>
-                            )}
-                          </div>
-                        </button>
-                      ))}
+                      {group.sessions.map((session, sessionIndex) => 
+                        renderSessionCard(session, sessionIndex, 0)
+                      )}
                     </div>
                   )}
                 </div>

@@ -8,7 +8,6 @@ use super::mentions::filter_index_for_cwd;
 use super::messages::{ModelEntry, SessionGroup, SessionSummary, UiClientMessage, UiServerMessage};
 use super::session::{PRIMARY_AGENT_ID, ensure_sessions_for_mode, prompt_for_mode, resolve_cwd};
 use crate::index::resolve_workspace_root;
-use crate::send_agent::SendAgent;
 use agent_client_protocol::CancelNotification;
 use querymt::plugin::HTTPLLMProviderFactory;
 use time::format_description::well_known::Rfc3339;
@@ -77,10 +76,20 @@ pub async fn handle_ui_message(
             if text.trim().is_empty() {
                 return;
             }
-            let cwd = resolve_cwd(None);
-            if let Err(err) = prompt_for_mode(state, conn_id, &text, cwd.as_ref(), tx).await {
-                let _ = send_error(tx, err).await;
-            }
+            // Spawn prompt execution on a separate task so the WebSocket receive
+            // loop continues processing messages (crucially, CancelSession).
+            // Without this, the receive loop blocks on prompt completion and
+            // cancel messages are never read until the prompt finishes.
+            let state = state.clone();
+            let conn_id = conn_id.to_string();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let cwd = resolve_cwd(None);
+                if let Err(err) = prompt_for_mode(&state, &conn_id, &text, cwd.as_ref(), &tx).await
+                {
+                    let _ = send_error(&tx, err).await;
+                }
+            });
         }
         UiClientMessage::ListSessions => {
             handle_list_sessions(state, tx).await;
@@ -139,6 +148,9 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                     title: s.title,
                     created_at: s.created_at.and_then(|t| t.format(&Rfc3339).ok()),
                     updated_at: s.updated_at.and_then(|t| t.format(&Rfc3339).ok()),
+                    parent_session_id: s.parent_session_id,
+                    fork_origin: s.fork_origin,
+                    has_children: s.has_children,
                 })
                 .collect(),
         })
@@ -398,9 +410,19 @@ pub async fn handle_cancel_session(state: &ServerState, conn_id: &str, tx: &mpsc
         return;
     };
 
-    // Call cancel on the agent
+    // Route cancel to the agent that owns this session, not always the primary.
+    // When the user is interacting with a delegate agent, state.agent (primary)
+    // won't have this session in its active_sessions map.
+    let agent_id = {
+        let agents = state.session_agents.lock().await;
+        agents.get(&session_id).cloned()
+    };
+    let agent = agent_id
+        .and_then(|id| super::session::agent_for_id(state, &id))
+        .unwrap_or_else(|| state.agent.clone());
+
     let notif = CancelNotification::new(session_id);
-    if let Err(e) = state.agent.cancel(notif).await {
+    if let Err(e) = agent.cancel(notif).await {
         let _ = send_error(tx, format!("Failed to cancel session: {}", e)).await;
     }
 }

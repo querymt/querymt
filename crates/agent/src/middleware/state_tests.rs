@@ -1,9 +1,9 @@
+use crate::events::StopType;
 use crate::middleware::{
     AgentStats, ConversationContext, ExecutionState, LlmResponse, ToolResult, WaitCondition,
     WaitReason,
 };
 use crate::test_utils::{mock_tool_call, test_context};
-use agent_client_protocol::StopReason;
 use querymt::chat::{ChatMessage, ChatRole, FinishReason, MessageType};
 use std::sync::Arc;
 
@@ -77,8 +77,8 @@ fn test_execution_state_name_all_variants() {
         (ExecutionState::Complete, "Complete"),
         (
             ExecutionState::Stopped {
-                reason: StopReason::EndTurn,
                 message: "done".into(),
+                stop_type: StopType::Other,
             },
             "Stopped",
         ),
@@ -146,8 +146,8 @@ fn test_execution_state_context_accessors() {
     let terminal_states = vec![
         ExecutionState::Complete,
         ExecutionState::Stopped {
-            reason: StopReason::EndTurn,
             message: "done".into(),
+            stop_type: StopType::Other,
         },
         ExecutionState::Cancelled,
     ];
@@ -164,16 +164,19 @@ fn test_conversation_context_counts_user_messages() {
             role: ChatRole::User,
             content: "one".to_string(),
             message_type: MessageType::Text,
+            cache: None,
         },
         ChatMessage {
             role: ChatRole::Assistant,
             content: "two".to_string(),
             message_type: MessageType::Text,
+            cache: None,
         },
         ChatMessage {
             role: ChatRole::User,
             content: "three".to_string(),
             message_type: MessageType::Text,
+            cache: None,
         },
     ];
     let context = ConversationContext::new(

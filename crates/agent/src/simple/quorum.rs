@@ -368,8 +368,10 @@ impl Quorum {
         let mut llm = querymt::LLMParams::new()
             .provider(config.planner.provider)
             .model(config.planner.model);
-        for system in config.planner.system {
-            llm = llm.system(system);
+        for part in config.planner.system {
+            if let crate::config::SystemPart::Inline(s) = part {
+                llm = llm.system(s);
+            }
         }
         if let Some(api_key) = config.planner.api_key {
             llm = llm.api_key(api_key);
@@ -407,8 +409,10 @@ impl Quorum {
             let mut llm = querymt::LLMParams::new()
                 .provider(delegate.provider)
                 .model(delegate.model);
-            for system in delegate.system {
-                llm = llm.system(system);
+            for part in delegate.system {
+                if let crate::config::SystemPart::Inline(s) = part {
+                    llm = llm.system(s);
+                }
             }
             if let Some(api_key) = delegate.api_key {
                 llm = llm.api_key(api_key);

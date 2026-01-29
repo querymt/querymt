@@ -6,12 +6,281 @@ use agent_client_protocol::{
     EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
 };
 use anyhow::{Context, Result, anyhow};
-use querymt::params::deserialize_system_vec;
 use regex::{Captures, Regex};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+// ============================================================================
+// Compaction Configuration (3-Layer System)
+// ============================================================================
+
+/// Default maximum lines before truncation
+pub const DEFAULT_MAX_LINES: usize = 2000;
+
+/// Default maximum bytes before truncation (50 KB)
+pub const DEFAULT_MAX_BYTES: usize = 51200;
+
+/// Default tokens to protect from pruning
+pub const DEFAULT_PRUNE_PROTECT_TOKENS: usize = 40_000;
+
+/// Default minimum tokens required before pruning
+pub const DEFAULT_PRUNE_MINIMUM_TOKENS: usize = 20_000;
+
+/// Default protected tools that should never be pruned
+pub const DEFAULT_PROTECTED_TOOLS: &[&str] = &["skill"];
+
+/// Default maximum retry attempts for compaction
+pub const DEFAULT_MAX_RETRIES: usize = 3;
+
+/// Default initial backoff in milliseconds
+pub const DEFAULT_INITIAL_BACKOFF_MS: u64 = 1000;
+
+/// Default backoff multiplier
+pub const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
+
+fn default_max_lines() -> usize {
+    DEFAULT_MAX_LINES
+}
+
+fn default_max_bytes() -> usize {
+    DEFAULT_MAX_BYTES
+}
+
+fn default_prune_protect_tokens() -> usize {
+    DEFAULT_PRUNE_PROTECT_TOKENS
+}
+
+fn default_prune_minimum_tokens() -> usize {
+    DEFAULT_PRUNE_MINIMUM_TOKENS
+}
+
+fn default_protected_tools() -> Vec<String> {
+    DEFAULT_PROTECTED_TOOLS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn default_max_retries() -> usize {
+    DEFAULT_MAX_RETRIES
+}
+
+fn default_initial_backoff_ms() -> u64 {
+    DEFAULT_INITIAL_BACKOFF_MS
+}
+
+fn default_backoff_multiplier() -> f64 {
+    DEFAULT_BACKOFF_MULTIPLIER
+}
+
+/// Where to store overflow output when tool output is truncated
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OverflowStorage {
+    /// Discard overflow (don't save)
+    Discard,
+    /// Save to temp directory (/tmp/qmt-tool-outputs/{session_id}/)
+    #[default]
+    TempDir,
+    /// Save to persistent data directory
+    DataDir,
+    // TODO: Database storage option for future implementation
+}
+
+/// Configuration for tool output truncation (Layer 1)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolOutputConfig {
+    /// Maximum lines before truncation
+    #[serde(default = "default_max_lines")]
+    pub max_lines: usize,
+
+    /// Maximum bytes before truncation
+    #[serde(default = "default_max_bytes")]
+    pub max_bytes: usize,
+
+    /// Where to save full output when truncated
+    #[serde(default)]
+    pub overflow_storage: OverflowStorage,
+}
+
+impl Default for ToolOutputConfig {
+    fn default() -> Self {
+        Self {
+            max_lines: DEFAULT_MAX_LINES,
+            max_bytes: DEFAULT_MAX_BYTES,
+            overflow_storage: OverflowStorage::default(),
+        }
+    }
+}
+
+/// Configuration for pruning (Layer 2) - runs after every turn
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PruningConfig {
+    /// Enable/disable pruning
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Tokens of recent tool outputs to protect from pruning
+    #[serde(default = "default_prune_protect_tokens")]
+    pub protect_tokens: usize,
+
+    /// Minimum tokens to clear before pruning (avoids small pruning operations)
+    #[serde(default = "default_prune_minimum_tokens")]
+    pub minimum_tokens: usize,
+
+    /// Tools that should never be pruned
+    #[serde(default = "default_protected_tools")]
+    pub protected_tools: Vec<String>,
+}
+
+impl Default for PruningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            protect_tokens: DEFAULT_PRUNE_PROTECT_TOKENS,
+            minimum_tokens: DEFAULT_PRUNE_MINIMUM_TOKENS,
+            protected_tools: default_protected_tools(),
+        }
+    }
+}
+
+/// Retry configuration for compaction LLM calls
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryConfig {
+    /// Maximum retry attempts
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
+
+    /// Initial backoff delay in milliseconds
+    #[serde(default = "default_initial_backoff_ms")]
+    pub initial_backoff_ms: u64,
+
+    /// Exponential backoff multiplier
+    #[serde(default = "default_backoff_multiplier")]
+    pub backoff_multiplier: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff_ms: DEFAULT_INITIAL_BACKOFF_MS,
+            backoff_multiplier: DEFAULT_BACKOFF_MULTIPLIER,
+        }
+    }
+}
+
+/// Configuration for AI compaction (Layer 3) - runs on context overflow
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionConfig {
+    /// Enable/disable AI compaction (setting true auto-enables ContextMiddleware)
+    #[serde(default = "default_true")]
+    pub auto: bool,
+
+    /// Optional: different provider for compaction (cheaper model)
+    pub provider: Option<String>,
+
+    /// Optional: different model for compaction (cheaper model)
+    pub model: Option<String>,
+
+    /// Retry configuration for compaction LLM calls
+    #[serde(default)]
+    pub retry: RetryConfig,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            provider: None,
+            model: None,
+            retry: RetryConfig::default(),
+        }
+    }
+}
+
+// ============================================================================
+// End Compaction Configuration
+// ============================================================================
+
+/// A single part of a system prompt, either an inline string or a file reference.
+///
+/// In TOML configs, the `system` field accepts a mixed array of strings and
+/// `{ file = "path" }` objects, preserving order:
+///
+/// ```toml
+/// system = [
+///   "You are a helpful assistant.",
+///   { file = "prompts/coder.md" },
+///   "Additional instructions.",
+/// ]
+/// ```
+///
+/// For convenience, a plain string is also accepted:
+///
+/// ```toml
+/// system = "You are a helpful assistant."
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SystemPart {
+    /// An inline system prompt string
+    Inline(String),
+    /// A file reference whose contents will be loaded as a system prompt part
+    File { file: PathBuf },
+}
+
+/// Deserializes the `system` field which can be:
+/// - absent → empty vec
+/// - a single string → `[Inline(s)]`
+/// - an array of mixed strings and `{ file = "..." }` objects → `Vec<SystemPart>`
+fn deserialize_system_parts<'de, D>(deserializer: D) -> Result<Vec<SystemPart>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SystemField {
+        Single(String),
+        Multiple(Vec<SystemPart>),
+    }
+    match Option::<SystemField>::deserialize(deserializer)? {
+        None => Ok(Vec::new()),
+        Some(SystemField::Single(s)) => Ok(vec![SystemPart::Inline(s)]),
+        Some(SystemField::Multiple(v)) => Ok(v),
+    }
+}
+
+/// Resolves a list of system parts into a flat list of strings by reading file contents.
+async fn resolve_system_parts(
+    parts: &[SystemPart],
+    base_path: &Path,
+    context: &str,
+) -> Result<Vec<String>> {
+    let mut resolved = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            SystemPart::Inline(s) => resolved.push(s.clone()),
+            SystemPart::File { file } => {
+                let path = base_path.join(file);
+                let content = tokio::fs::read_to_string(&path)
+                    .await
+                    .with_context(|| format!("Failed to load {context} prompt from {path:?}"))?;
+                let content = interpolate_env_vars(&content).with_context(|| {
+                    format!("Failed to interpolate env vars in {context} prompt from {path:?}")
+                })?;
+                resolved.push(content);
+            }
+        }
+    }
+    Ok(resolved)
+}
 
 /// Top-level config discriminator
 #[derive(Debug)]
@@ -65,11 +334,19 @@ pub struct AgentSettings {
     pub api_key: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_system_vec")]
-    pub system: Vec<String>,
-    pub system_file: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_system_parts")]
+    pub system: Vec<SystemPart>,
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
+    /// Tool output truncation settings (Layer 1)
+    #[serde(default)]
+    pub tool_output: ToolOutputConfig,
+    /// Pruning settings - runs after every turn (Layer 2)
+    #[serde(default)]
+    pub pruning: PruningConfig,
+    /// AI compaction settings - runs on context overflow (Layer 3)
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 /// Multi-agent quorum configuration
@@ -115,9 +392,8 @@ pub struct PlannerConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_system_vec")]
-    pub system: Vec<String>,
-    pub system_file: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_system_parts")]
+    pub system: Vec<SystemPart>,
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
     #[serde(default)]
@@ -137,9 +413,8 @@ pub struct DelegateConfig {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub tools: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_system_vec")]
-    pub system: Vec<String>,
-    pub system_file: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_system_parts")]
+    pub system: Vec<SystemPart>,
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
     #[serde(default)]
@@ -300,18 +575,19 @@ pub async fn load_config(path: impl AsRef<Path>) -> Result<Config> {
     let processed = interpolate_env_vars(&content)?;
 
     // Step 2: Detect config type and parse
+    let base_path = path.parent().unwrap_or(Path::new("."));
+
     let config = if processed.contains("[agent]") {
         // Single agent config
         let mut config: SingleAgentConfig =
             toml::from_str(&processed).with_context(|| "Failed to parse single agent config")?;
 
         // Step 3: Validate
-        validate_agent_settings(&config.agent)?;
         validate_mcp_servers(&config.mcp)?;
 
-        // Step 4: Resolve prompt files
-        let base_path = path.parent().unwrap_or(Path::new("."));
-        resolve_agent_prompts(&mut config.agent, base_path).await?;
+        // Step 4: Resolve system prompt file references
+        let resolved = resolve_system_parts(&config.agent.system, base_path, "agent").await?;
+        config.agent.system = resolved.into_iter().map(SystemPart::Inline).collect();
 
         Config::Single(config)
     } else if processed.contains("[quorum]") || processed.contains("[planner]") {
@@ -320,20 +596,18 @@ pub async fn load_config(path: impl AsRef<Path>) -> Result<Config> {
             toml::from_str(&processed).with_context(|| "Failed to parse quorum config")?;
 
         // Step 3: Validate
-        validate_planner_config(&config.planner)?;
-        for delegate in &config.delegates {
-            validate_delegate_config(delegate)?;
-        }
         validate_mcp_servers(&config.mcp)?;
         for delegate in &config.delegates {
             validate_mcp_servers(&delegate.mcp)?;
         }
 
-        // Step 4: Resolve prompt files
-        let base_path = path.parent().unwrap_or(Path::new("."));
-        resolve_planner_prompts(&mut config.planner, base_path).await?;
+        // Step 4: Resolve system prompt file references
+        let resolved = resolve_system_parts(&config.planner.system, base_path, "planner").await?;
+        config.planner.system = resolved.into_iter().map(SystemPart::Inline).collect();
         for delegate in &mut config.delegates {
-            resolve_delegate_prompts(delegate, base_path).await?;
+            let context = format!("delegate '{}'", delegate.id);
+            let resolved = resolve_system_parts(&delegate.system, base_path, &context).await?;
+            delegate.system = resolved.into_iter().map(SystemPart::Inline).collect();
         }
 
         Config::Multi(config)
@@ -378,37 +652,6 @@ pub fn interpolate_env_vars(content: &str) -> Result<String> {
     Ok(result.into_owned())
 }
 
-/// Validate agent settings
-fn validate_agent_settings(settings: &AgentSettings) -> Result<()> {
-    if !settings.system.is_empty() && settings.system_file.is_some() {
-        return Err(anyhow!(
-            "Cannot specify both 'system' and 'system_file' in agent config"
-        ));
-    }
-    Ok(())
-}
-
-/// Validate planner config
-fn validate_planner_config(config: &PlannerConfig) -> Result<()> {
-    if !config.system.is_empty() && config.system_file.is_some() {
-        return Err(anyhow!(
-            "Cannot specify both 'system' and 'system_file' in planner config"
-        ));
-    }
-    Ok(())
-}
-
-/// Validate delegate config
-fn validate_delegate_config(config: &DelegateConfig) -> Result<()> {
-    if !config.system.is_empty() && config.system_file.is_some() {
-        return Err(anyhow!(
-            "Cannot specify both 'system' and 'system_file' in delegate '{}' config",
-            config.id
-        ));
-    }
-    Ok(())
-}
-
 /// Validate MCP servers have unique names
 fn validate_mcp_servers(servers: &[McpServerConfig]) -> Result<()> {
     let mut seen = HashSet::new();
@@ -417,48 +660,6 @@ fn validate_mcp_servers(servers: &[McpServerConfig]) -> Result<()> {
         if !seen.insert(name) {
             return Err(anyhow!("Duplicate MCP server name: {}", name));
         }
-    }
-    Ok(())
-}
-
-/// Resolve and load agent prompt from file
-async fn resolve_agent_prompts(settings: &mut AgentSettings, base_path: &Path) -> Result<()> {
-    if let Some(file) = &settings.system_file {
-        let path = base_path.join(file);
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("Failed to load agent prompt from {:?}", path))?;
-        settings.system = vec![content];
-        settings.system_file = None;
-    }
-    Ok(())
-}
-
-/// Resolve and load planner prompt from file
-async fn resolve_planner_prompts(config: &mut PlannerConfig, base_path: &Path) -> Result<()> {
-    if let Some(file) = &config.system_file {
-        let path = base_path.join(file);
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("Failed to load planner prompt from {:?}", path))?;
-        config.system = vec![content];
-        config.system_file = None;
-    }
-    Ok(())
-}
-
-/// Resolve and load delegate prompt from file
-async fn resolve_delegate_prompts(config: &mut DelegateConfig, base_path: &Path) -> Result<()> {
-    if let Some(file) = &config.system_file {
-        let path = base_path.join(file);
-        let content = tokio::fs::read_to_string(&path).await.with_context(|| {
-            format!(
-                "Failed to load prompt for delegate '{}' from {:?}",
-                config.id, path
-            )
-        })?;
-        config.system = vec![content];
-        config.system_file = None;
     }
     Ok(())
 }
@@ -519,6 +720,7 @@ pub fn resolve_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_parse_tool_spec() {
@@ -550,5 +752,144 @@ mod tests {
 
         let missing = "model = \"${MISSING_REQUIRED}\"";
         assert!(interpolate_env_vars(missing).is_err());
+    }
+
+    /// Helper to deserialize an AgentSettings from a TOML fragment
+    fn parse_agent(toml: &str) -> AgentSettings {
+        let full = format!(
+            "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\n{}",
+            toml
+        );
+        #[derive(Deserialize)]
+        struct Wrapper {
+            agent: AgentSettings,
+        }
+        toml::from_str::<Wrapper>(&full)
+            .expect("Failed to parse TOML")
+            .agent
+    }
+
+    fn make_temp_prompt(contents: &str) -> (PathBuf, PathBuf) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System time before epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("querymt-prompt-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("Failed to create temp prompt dir");
+        let file = PathBuf::from("prompt.md");
+        std::fs::write(dir.join(&file), contents).expect("Failed to write temp prompt");
+        (dir, file)
+    }
+
+    #[test]
+    fn test_system_absent() {
+        let agent = parse_agent("");
+        assert!(agent.system.is_empty());
+    }
+
+    #[test]
+    fn test_system_single_string() {
+        let agent = parse_agent("system = \"hello\"");
+        assert_eq!(agent.system.len(), 1);
+        assert!(matches!(&agent.system[0], SystemPart::Inline(s) if s == "hello"));
+    }
+
+    #[test]
+    fn test_system_array_of_strings() {
+        let agent = parse_agent("system = [\"part1\", \"part2\"]");
+        assert_eq!(agent.system.len(), 2);
+        assert!(matches!(&agent.system[0], SystemPart::Inline(s) if s == "part1"));
+        assert!(matches!(&agent.system[1], SystemPart::Inline(s) if s == "part2"));
+    }
+
+    #[test]
+    fn test_system_file_reference() {
+        let agent = parse_agent("system = [{ file = \"prompts/coder.md\" }]");
+        assert_eq!(agent.system.len(), 1);
+        assert!(
+            matches!(&agent.system[0], SystemPart::File { file } if file == Path::new("prompts/coder.md"))
+        );
+    }
+
+    #[test]
+    fn test_system_mixed_inline_and_file() {
+        let agent = parse_agent(
+            r#"system = ["You are helpful.", { file = "prompts/rules.md" }, "Be concise."]"#,
+        );
+        assert_eq!(agent.system.len(), 3);
+        assert!(matches!(&agent.system[0], SystemPart::Inline(s) if s == "You are helpful."));
+        assert!(
+            matches!(&agent.system[1], SystemPart::File { file } if file == Path::new("prompts/rules.md"))
+        );
+        assert!(matches!(&agent.system[2], SystemPart::Inline(s) if s == "Be concise."));
+    }
+
+    #[test]
+    fn test_system_multiple_file_references() {
+        let agent = parse_agent(
+            r#"system = [{ file = "prompts/base.md" }, { file = "prompts/extra.md" }]"#,
+        );
+        assert_eq!(agent.system.len(), 2);
+        assert!(
+            matches!(&agent.system[0], SystemPart::File { file } if file == Path::new("prompts/base.md"))
+        );
+        assert!(
+            matches!(&agent.system[1], SystemPart::File { file } if file == Path::new("prompts/extra.md"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_system_parts_inline_only() {
+        let parts = vec![
+            SystemPart::Inline("hello".into()),
+            SystemPart::Inline("world".into()),
+        ];
+        let resolved = resolve_system_parts(&parts, Path::new("."), "test")
+            .await
+            .unwrap();
+        assert_eq!(resolved, vec!["hello", "world"]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_system_parts_file_not_found() {
+        let parts = vec![SystemPart::File {
+            file: PathBuf::from("nonexistent_prompt.md"),
+        }];
+        let result = resolve_system_parts(&parts, Path::new("."), "test").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to load test prompt")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_system_parts_file_env_vars() {
+        unsafe {
+            std::env::set_var("TEST_PROMPT_VAR", "resolved");
+        }
+
+        let (dir, file) = make_temp_prompt("Hello ${TEST_PROMPT_VAR}!");
+        let parts = vec![SystemPart::File { file }];
+        let resolved = resolve_system_parts(&parts, &dir, "test").await.unwrap();
+        assert_eq!(resolved, vec!["Hello resolved!"]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_system_parts_file_env_default() {
+        let (dir, file) = make_temp_prompt("Model ${MISSING_PROMPT_VAR:-gpt-4}");
+        let parts = vec![SystemPart::File { file }];
+        let resolved = resolve_system_parts(&parts, &dir, "test").await.unwrap();
+        assert_eq!(resolved, vec!["Model gpt-4"]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_system_parts_file_env_missing() {
+        let (dir, file) = make_temp_prompt("${MISSING_PROMPT_REQUIRED}");
+        let parts = vec![SystemPart::File { file }];
+        let result = resolve_system_parts(&parts, &dir, "test").await;
+        assert!(result.is_err());
     }
 }

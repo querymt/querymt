@@ -229,10 +229,13 @@ async fn handle_delegation(
 
     let delegate_session = match &config.cwd {
         Some(cwd) => {
-            match delegate_agent
-                .new_session(NewSessionRequest::new(cwd.clone()))
-                .await
-            {
+            let mut req = NewSessionRequest::new(cwd.clone());
+            // Pass parent_session_id via meta so it gets set in the session record
+            req.meta = Some(serde_json::Map::from_iter([(
+                "parent_session_id".to_string(),
+                serde_json::Value::String(parent_session_id.clone()),
+            )]));
+            match delegate_agent.new_session(req).await {
                 Ok(session) => session,
                 Err(e) => {
                     let error_message = format!("Failed to create session: {}", e);
@@ -250,10 +253,13 @@ async fn handle_delegation(
             }
         }
         None => {
-            match delegate_agent
-                .new_session(NewSessionRequest::new(PathBuf::new()))
-                .await
-            {
+            let mut req = NewSessionRequest::new(PathBuf::new());
+            // Pass parent_session_id via meta so it gets set in the session record
+            req.meta = Some(serde_json::Map::from_iter([(
+                "parent_session_id".to_string(),
+                serde_json::Value::String(parent_session_id.clone()),
+            )]));
+            match delegate_agent.new_session(req).await {
                 Ok(session) => session,
                 Err(e) => {
                     let error_message = format!("Failed to create session: {}", e);

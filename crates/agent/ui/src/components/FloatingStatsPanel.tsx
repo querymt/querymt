@@ -1,6 +1,6 @@
 import { useMemo, useState, useEffect, useRef, memo } from 'react';
 import { ChevronDown, ChevronRight, BarChart3, GripVertical, Minimize2 } from 'lucide-react';
-import { EventItem, UiAgentInfo } from '../types';
+import { EventItem, UiAgentInfo, SessionLimits } from '../types';
 import { calculateStats } from '../utils/statsCalculator';
 import { getAgentColor } from '../utils/agentColors';
 import { getAgentDisplayName } from '../utils/agentNames';
@@ -12,6 +12,13 @@ interface FloatingStatsPanelProps {
   globalElapsedMs: number;
   agentElapsedMs: Map<string, number>;
   isSessionActive: boolean;
+  agentModels: Record<string, { provider?: string; model?: string; contextLimit?: number }>;
+  sessionLimits?: SessionLimits | null;
+}
+
+// Format percentage for progress indicators
+function formatPercentage(current: number, max: number): string {
+  return `${Math.min(100, Math.round((current / max) * 100))}%`;
 }
 
 // Format cost as USD with 2 decimal places
@@ -52,7 +59,9 @@ export const FloatingStatsPanel = memo(function FloatingStatsPanel({
   expertMode = false,
   globalElapsedMs,
   agentElapsedMs,
-  isSessionActive
+  isSessionActive,
+  agentModels,
+  sessionLimits,
 }: FloatingStatsPanelProps) {
   const [isCollapsed, setIsCollapsed] = useState(() => {
     const stored = localStorage.getItem(STORAGE_KEY_COLLAPSED);
@@ -76,7 +85,15 @@ export const FloatingStatsPanel = memo(function FloatingStatsPanel({
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const panelRef = useRef<HTMLDivElement>(null);
   
-  const { session, perAgent } = useMemo(() => calculateStats(events), [events]);
+  const { session, perAgent } = useMemo(() => calculateStats(events, sessionLimits), [events, sessionLimits]);
+  
+  // Enhance perAgent stats with context limits from agentModels if missing
+  const enrichedPerAgent = useMemo(() => {
+    return perAgent.map(agentStats => ({
+      ...agentStats,
+      maxContextTokens: agentStats.maxContextTokens ?? agentModels[agentStats.agentId]?.contextLimit
+    }));
+  }, [perAgent, agentModels]);
   
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY_POSITION, JSON.stringify(position));
@@ -132,7 +149,8 @@ export const FloatingStatsPanel = memo(function FloatingStatsPanel({
     }
   }, [isDragging, dragStart]);
   
-  if (events.length === 0) return null;
+  // Don't show panel if there are no actual session events (only system events)
+  if (session.totalMessages === 0 && session.totalToolCalls === 0) return null;
   
   // Minimized state - just a floating button
   if (isMinimized) {
@@ -225,19 +243,19 @@ export const FloatingStatsPanel = memo(function FloatingStatsPanel({
                   <div className="flex justify-between items-center">
                     <span className="text-gray-500">Context</span>
                     <div className="flex items-center gap-1.5 font-mono text-gray-300">
-                      {perAgent.length === 1 ? (
+                      {enrichedPerAgent.length === 1 ? (
                         // Single agent: no dot, just show context
                         <span>
-                          {formatTokensAbbrev(perAgent[0].currentContextTokens)}
-                          {perAgent[0].maxContextTokens && (
+                          {formatTokensAbbrev(enrichedPerAgent[0].currentContextTokens)}
+                          {enrichedPerAgent[0].maxContextTokens && (
                             <span className="text-gray-500">
-                              {' '}({((perAgent[0].currentContextTokens / perAgent[0].maxContextTokens) * 100).toFixed(0)}%)
+                              {' '}({((enrichedPerAgent[0].currentContextTokens / enrichedPerAgent[0].maxContextTokens) * 100).toFixed(0)}%)
                             </span>
                           )}
                         </span>
                       ) : (
                         // Multiple agents: colored dots with context
-                        perAgent.map((agentStats) => (
+                        enrichedPerAgent.map((agentStats) => (
                           <span
                             key={agentStats.agentId}
                             className="flex items-center gap-0.5"
@@ -264,8 +282,32 @@ export const FloatingStatsPanel = memo(function FloatingStatsPanel({
                     <span className="text-gray-500">Cost</span>
                     <span className="text-cyber-cyan font-mono font-semibold">
                       {formatCost(session.totalCostUsd)}
+                      {session.limits?.max_cost_usd && (
+                        <span className="text-gray-500 ml-1">
+                          / {formatCost(session.limits.max_cost_usd)}
+                        </span>
+                      )}
                     </span>
                   </div>
+                  {/* Show cost progress bar if limit is set */}
+                  {session.limits?.max_cost_usd && (
+                    <div className="pt-1">
+                      <div className="w-full bg-cyber-bg/50 rounded-full h-1.5 overflow-hidden">
+                        <div
+                          className={`h-full rounded-full transition-all ${
+                            session.totalCostUsd / session.limits.max_cost_usd > 0.9
+                              ? 'bg-cyber-orange'
+                              : session.totalCostUsd / session.limits.max_cost_usd > 0.7
+                              ? 'bg-yellow-500'
+                              : 'bg-cyber-cyan'
+                          }`}
+                          style={{
+                            width: formatPercentage(session.totalCostUsd, session.limits.max_cost_usd),
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
                   <div className="flex justify-between">
                     <span className="text-gray-500">Messages</span>
                     <span className="text-gray-300">{session.totalMessages}</span>
@@ -274,6 +316,29 @@ export const FloatingStatsPanel = memo(function FloatingStatsPanel({
                     <span className="text-gray-500">Tool Calls</span>
                     <span className="text-gray-300">{session.totalToolCalls}</span>
                   </div>
+                  {/* Show steps/turns with limits if available */}
+                  {(session.totalSteps > 0 || session.limits?.max_steps) && (
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">Steps</span>
+                      <span className="text-gray-300">
+                        {session.totalSteps}
+                        {session.limits?.max_steps && (
+                          <span className="text-gray-500"> / {session.limits.max_steps}</span>
+                        )}
+                      </span>
+                    </div>
+                  )}
+                  {(session.totalTurns > 0 || session.limits?.max_turns) && (
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">Turns</span>
+                      <span className="text-gray-300">
+                        {session.totalTurns}
+                        {session.limits?.max_turns && (
+                          <span className="text-gray-500"> / {session.limits.max_turns}</span>
+                        )}
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -300,13 +365,104 @@ export const FloatingStatsPanel = memo(function FloatingStatsPanel({
                       <span className="text-gray-500">Cost</span>
                       <span className="text-cyber-cyan font-mono font-semibold">
                         {formatCost(session.totalCostUsd)}
+                        {session.limits?.max_cost_usd && (
+                          <span className="text-gray-500 ml-1">
+                            / {formatCost(session.limits.max_cost_usd)}
+                          </span>
+                        )}
                       </span>
                     </div>
+                    {/* Show cost progress bar if limit is set */}
+                    {session.limits?.max_cost_usd && (
+                      <div className="pt-1">
+                        <div className="w-full bg-cyber-bg/50 rounded-full h-1.5 overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all ${
+                              session.totalCostUsd / session.limits.max_cost_usd > 0.9
+                                ? 'bg-cyber-orange'
+                                : session.totalCostUsd / session.limits.max_cost_usd > 0.7
+                                ? 'bg-yellow-500'
+                                : 'bg-cyber-cyan'
+                            }`}
+                            style={{
+                              width: formatPercentage(session.totalCostUsd, session.limits.max_cost_usd),
+                            }}
+                          />
+                        </div>
+                        <div className="text-[10px] text-gray-500 mt-0.5">
+                          {formatPercentage(session.totalCostUsd, session.limits.max_cost_usd)} of budget used
+                        </div>
+                      </div>
+                    )}
+                    {/* Steps with limit */}
+                    {(session.totalSteps > 0 || session.limits?.max_steps) && (
+                      <>
+                        <div className="flex justify-between">
+                          <span className="text-gray-500">Steps (LLM calls)</span>
+                          <span className="text-gray-300 font-mono">
+                            {session.totalSteps}
+                            {session.limits?.max_steps && (
+                              <span className="text-gray-500"> / {session.limits.max_steps}</span>
+                            )}
+                          </span>
+                        </div>
+                        {session.limits?.max_steps && (
+                          <div className="pt-1">
+                            <div className="w-full bg-cyber-bg/50 rounded-full h-1.5 overflow-hidden">
+                              <div
+                                className={`h-full rounded-full transition-all ${
+                                  session.totalSteps / session.limits.max_steps > 0.9
+                                    ? 'bg-cyber-orange'
+                                    : session.totalSteps / session.limits.max_steps > 0.7
+                                    ? 'bg-yellow-500'
+                                    : 'bg-cyber-purple'
+                                }`}
+                                style={{
+                                  width: formatPercentage(session.totalSteps, session.limits.max_steps),
+                                }}
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+                    {/* Turns with limit */}
+                    {(session.totalTurns > 0 || session.limits?.max_turns) && (
+                      <>
+                        <div className="flex justify-between">
+                          <span className="text-gray-500">Turns (exchanges)</span>
+                          <span className="text-gray-300 font-mono">
+                            {session.totalTurns}
+                            {session.limits?.max_turns && (
+                              <span className="text-gray-500"> / {session.limits.max_turns}</span>
+                            )}
+                          </span>
+                        </div>
+                        {session.limits?.max_turns && (
+                          <div className="pt-1">
+                            <div className="w-full bg-cyber-bg/50 rounded-full h-1.5 overflow-hidden">
+                              <div
+                                className={`h-full rounded-full transition-all ${
+                                  session.totalTurns / session.limits.max_turns > 0.9
+                                    ? 'bg-cyber-orange'
+                                    : session.totalTurns / session.limits.max_turns > 0.7
+                                    ? 'bg-yellow-500'
+                                    : 'bg-cyber-lime'
+                                }`}
+                                style={{
+                                  width: formatPercentage(session.totalTurns, session.limits.max_turns),
+                                }}
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
                   </div>
                 </div>
                 
                 {/* Per-Agent Stats */}
-                {perAgent.map((agentStats) => {
+                {enrichedPerAgent.map((agentStats) => {
                   const displayName = getAgentDisplayName(agentStats.agentId, agents);
                   const liveAgentTime = agentElapsedMs.get(agentStats.agentId) ?? agentStats.activeTimeMs;
                   return (
@@ -356,6 +512,23 @@ export const FloatingStatsPanel = memo(function FloatingStatsPanel({
                             {formatCost(agentStats.costUsd)}
                           </span>
                         </div>
+                        {/* Agent-level steps/turns in expert mode */}
+                        {agentStats.steps > 0 && (
+                          <div className="flex justify-between">
+                            <span className="text-gray-500">Steps</span>
+                            <span className="text-gray-300 font-mono text-[11px]">
+                              {agentStats.steps}
+                            </span>
+                          </div>
+                        )}
+                        {agentStats.turns > 0 && (
+                          <div className="flex justify-between">
+                            <span className="text-gray-500">Turns</span>
+                            <span className="text-gray-300 font-mono text-[11px]">
+                              {agentStats.turns}
+                            </span>
+                          </div>
+                        )}
                       </div>
                       {Object.keys(agentStats.toolBreakdown).length > 0 && (
                         <div className="mt-2 pt-2 border-t border-cyber-border/50">

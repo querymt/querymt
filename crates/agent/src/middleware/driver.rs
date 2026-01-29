@@ -1,3 +1,4 @@
+use crate::events::SessionLimits;
 use crate::middleware::{ExecutionState, Result};
 use async_trait::async_trait;
 use log::{debug, trace};
@@ -15,6 +16,12 @@ pub trait MiddlewareDriver: Send + Sync {
 
     /// Returns a human-readable name for this driver
     fn name(&self) -> &'static str;
+
+    /// Returns session limits if this middleware enforces any.
+    /// Default implementation returns None.
+    fn get_limits(&self) -> Option<SessionLimits> {
+        None
+    }
 }
 
 /// Composite driver that runs multiple middleware drivers in sequence
@@ -118,11 +125,36 @@ impl MiddlewareDriver for CompositeDriver {
     fn name(&self) -> &'static str {
         "CompositeDriver"
     }
+
+    fn get_limits(&self) -> Option<SessionLimits> {
+        // Aggregate limits from all drivers
+        let mut limits = SessionLimits::default();
+        let mut has_any = false;
+
+        for driver in &self.drivers {
+            if let Some(driver_limits) = driver.get_limits() {
+                has_any = true;
+                // Take the first non-None value for each limit
+                if limits.max_steps.is_none() && driver_limits.max_steps.is_some() {
+                    limits.max_steps = driver_limits.max_steps;
+                }
+                if limits.max_turns.is_none() && driver_limits.max_turns.is_some() {
+                    limits.max_turns = driver_limits.max_turns;
+                }
+                if limits.max_cost_usd.is_none() && driver_limits.max_cost_usd.is_some() {
+                    limits.max_cost_usd = driver_limits.max_cost_usd;
+                }
+            }
+        }
+
+        if has_any { Some(limits) } else { None }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::StopType;
     use crate::middleware::{AgentStats, ConversationContext};
     use std::sync::Arc;
 
@@ -136,8 +168,8 @@ mod tests {
         async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
             if self.should_stop {
                 Ok(ExecutionState::Stopped {
-                    reason: agent_client_protocol::StopReason::EndTurn,
                     message: "test stop".into(),
+                    stop_type: StopType::Other,
                 })
             } else {
                 Ok(state)

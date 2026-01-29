@@ -1,3 +1,4 @@
+use agent_client_protocol::StopReason;
 use async_trait::async_trait;
 use querymt::Usage;
 use querymt::chat::FinishReason;
@@ -11,6 +12,62 @@ use crate::session::domain::{
     Alternative, Artifact, Decision, Delegation, ForkOrigin, ForkPointType, IntentSnapshot,
     ProgressEntry, Task,
 };
+
+/// Why execution was stopped
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StopType {
+    /// Step limit reached (max LLM calls)
+    StepLimit,
+    /// Turn limit reached (max user/assistant exchanges)
+    TurnLimit,
+    /// Price/cost limit exceeded
+    PriceLimit,
+    /// Context token threshold reached (compaction needed)
+    ContextThreshold,
+    /// Model hit its token limit
+    ModelTokenLimit,
+    /// Content filter blocked the response
+    ContentFilter,
+    /// Delegation was blocked
+    DelegationBlocked,
+    /// Generic/unknown stop reason
+    Other,
+}
+
+impl From<StopType> for StopReason {
+    fn from(stop_type: StopType) -> Self {
+        match stop_type {
+            StopType::StepLimit | StopType::TurnLimit | StopType::DelegationBlocked => {
+                StopReason::MaxTurnRequests
+            }
+            StopType::PriceLimit | StopType::ContextThreshold | StopType::ModelTokenLimit => {
+                StopReason::MaxTokens
+            }
+            StopType::ContentFilter | StopType::Other => StopReason::EndTurn,
+        }
+    }
+}
+
+/// Execution progress metrics
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecutionMetrics {
+    /// Number of LLM calls made
+    pub steps: usize,
+    /// Number of user/assistant turns
+    pub turns: usize,
+}
+
+/// Session limits configuration (exposed to UI)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionLimits {
+    /// Maximum number of LLM calls
+    pub max_steps: Option<usize>,
+    /// Maximum number of user/assistant turns
+    pub max_turns: Option<usize>,
+    /// Maximum cost in USD
+    pub max_cost_usd: Option<f64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
@@ -46,6 +103,8 @@ pub enum AgentEventKind {
         cumulative_cost_usd: Option<f64>,
         /// Current context size (input + output tokens)
         context_tokens: u64,
+        /// Execution progress metrics (steps/turns)
+        metrics: ExecutionMetrics,
     },
     ProviderChanged {
         provider: String,
@@ -81,7 +140,12 @@ pub enum AgentEventKind {
         message: String,
     },
     MiddlewareStopped {
+        /// Type of stop (for UI to handle differently)
+        stop_type: StopType,
+        /// Human-readable reason message
         reason: String,
+        /// Execution metrics at time of stop
+        metrics: ExecutionMetrics,
     },
     Cancelled,
     Error {
@@ -156,6 +220,8 @@ pub enum AgentEventKind {
     SessionConfigured {
         cwd: Option<PathBuf>,
         mcp_servers: Vec<McpServerConfig>,
+        /// Session limits configuration (if any)
+        limits: Option<SessionLimits>,
     },
     /// Emitted at session start and whenever available tools change
     ToolsAvailable {

@@ -1,3 +1,4 @@
+use crate::events::StopType;
 use crate::middleware::{
     AgentStats, CompositeDriver, ConversationContext, ExecutionState, LimitsConfig,
     LimitsMiddleware, MaxStepsMiddleware, MiddlewareDriver, PriceLimitMiddleware,
@@ -7,7 +8,6 @@ use crate::test_utils::{
     CancelDriver, CompleteDriver, CountingDriver, ErrorDriver, PassThroughDriver, StopDriver,
     test_context, test_context_with_user_messages,
 };
-use agent_client_protocol::StopReason;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -62,7 +62,7 @@ async fn test_composite_driver_stopped_halts() {
 
     let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![
         Arc::new(StopDriver {
-            reason: StopReason::EndTurn,
+            stop_type: StopType::Other,
             message: "stopped",
         }),
         counter.clone(),
@@ -166,7 +166,7 @@ async fn test_max_steps_at_limit_stops() {
     assert!(matches!(
         result,
         ExecutionState::Stopped {
-            reason: StopReason::MaxTurnRequests,
+            stop_type: StopType::StepLimit,
             ..
         }
     ));
@@ -241,7 +241,7 @@ async fn test_price_limit_over_budget() {
     assert!(matches!(
         result,
         ExecutionState::Stopped {
-            reason: StopReason::MaxTokens,
+            stop_type: StopType::PriceLimit,
             ..
         }
     ));

@@ -258,10 +258,12 @@ pub async fn handle_rpc_message<S: SendAgent>(
             }
         },
 
-        m if m == AGENT_METHOD_NAMES.session_cancel => {
-            log::warn!("session/cancel not yet implemented");
-            Err(Error::new(-32601, "session/cancel not implemented yet"))
-        }
+        m if m == AGENT_METHOD_NAMES.session_cancel => match serde_json::from_value(req.params) {
+            Ok(params) => agent.cancel(params).await.map(|_| serde_json::Value::Null),
+            Err(e) => {
+                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+            }
+        },
         m if m == AGENT_METHOD_NAMES.session_fork => {
             log::warn!("session/fork not yet implemented");
             Err(Error::new(-32601, "session/fork not implemented yet"))

@@ -128,23 +128,24 @@ impl SendAgent for QueryMTAgent {
         };
 
         let (mcp_services, mcp_tools, mcp_tool_defs) = build_mcp_state(&req.mcp_servers).await?;
+
+        // Extract parent_session_id from meta if provided
+        let parent_session_id = req
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("parent_session_id"))
+            .and_then(|v| v.as_str());
+
         let session_context = self
             .provider
-            .create_session(cwd.clone())
+            .create_session(cwd.clone(), parent_session_id)
             .await
             .map_err(|e| Error::new(-32000, e.to_string()))?;
         let session_id = session_context.session().public_id.clone();
 
-        // Phase 3: Initialize fork if parent_session_id is provided in meta
-        if let Some(_parent_id) = req
-            .meta
-            .as_ref()
-            .and_then(|m| m.get("parent_session_id"))
-            .and_then(|v| v.as_str())
-        {
-            // Forking is now handled via the repository/store
-            // but we need to reconstruct state if this is a fresh fork point.
-            // Note: In Phase 3, we expect fork point metadata to be in the session
+        // Phase 3: Initialize fork if parent_session_id was provided
+        if parent_session_id.is_some() {
+            // Reconstruct state if this is a fresh fork point
             crate::session::runtime::SessionForkHelper::initialize_fork(
                 self.provider.history_store(),
                 &session_id,
@@ -230,6 +231,7 @@ impl SendAgent for QueryMTAgent {
             crate::events::AgentEventKind::SessionConfigured {
                 cwd,
                 mcp_servers: mcp_configs,
+                limits: self.get_session_limits(),
             },
         );
 
@@ -246,6 +248,11 @@ impl SendAgent for QueryMTAgent {
         let active = self.active_sessions.lock().await;
         if let Some(tx) = active.get(&session_id) {
             let _ = tx.send(true);
+        } else {
+            log::warn!(
+                "Cancel requested for session {} but not found in active_sessions",
+                session_id
+            );
         }
         Ok(())
     }

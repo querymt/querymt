@@ -1,4 +1,4 @@
-import { EventItem, AgentStats, CalculatedStats, SessionStats } from '../types';
+import { EventItem, AgentStats, CalculatedStats, SessionStats, SessionLimits } from '../types';
 
 // Track agent working state during reconstruction
 interface AgentTimingState {
@@ -14,7 +14,7 @@ interface GlobalTimerState {
   lastActiveAt?: number;
 }
 
-export function calculateStats(events: EventItem[]): CalculatedStats {
+export function calculateStats(events: EventItem[], sessionLimits?: SessionLimits | null): CalculatedStats {
   const statsMap = new Map<string, AgentStats>();
   const timingMap = new Map<string, AgentTimingState>();
   const globalState: GlobalTimerState = {
@@ -53,6 +53,8 @@ export function calculateStats(events: EventItem[]): CalculatedStats {
         activeTimeMs: 0,
         currentContextTokens: 0,
         maxContextTokens: undefined,
+        steps: 0,
+        turns: 0,
       });
       timingMap.set(agentId, {
         isWorking: false,
@@ -143,6 +145,12 @@ export function calculateStats(events: EventItem[]): CalculatedStats {
       stats.currentContextTokens = event.contextTokens;
     }
     
+    // Track steps and turns from backend metrics
+    if (event.metrics) {
+      stats.steps = event.metrics.steps;
+      stats.turns = event.metrics.turns;
+    }
+    
     if (event.costUsd !== undefined) {
       stats.costUsd += event.costUsd;
       totalCostUsd += event.costUsd;
@@ -187,12 +195,20 @@ export function calculateStats(events: EventItem[]): CalculatedStats {
     a.agentId === 'primary' ? -1 : b.agentId === 'primary' ? 1 : a.agentId.localeCompare(b.agentId)
   );
   
+  // Calculate total steps and turns from the primary agent (or first agent with data)
+  const primaryStats = perAgent.find(s => s.agentId === 'primary') ?? perAgent[0];
+  const totalSteps = primaryStats?.steps ?? 0;
+  const totalTurns = primaryStats?.turns ?? 0;
+  
   const session: SessionStats = {
     totalCostUsd: sessionTotalCost,
     totalMessages,
     totalToolCalls,
     totalElapsedMs: globalState.accumulatedMs,
     startTimestamp: sessionStartTimestamp,
+    totalSteps,
+    totalTurns,
+    limits: sessionLimits ?? undefined,
   };
   
   return { session, perAgent };

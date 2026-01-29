@@ -1,7 +1,7 @@
-use agent_client_protocol::StopReason;
 use querymt::chat::{ChatMessage, ChatRole, FinishReason};
 use std::sync::Arc;
 
+use crate::events::StopType;
 use crate::model::MessagePart;
 
 /// Statistics about agent execution
@@ -133,6 +133,7 @@ impl ConversationContext {
             role: ChatRole::User,
             message_type: querymt::chat::MessageType::Text,
             content,
+            cache: None,
         };
 
         messages.push(injected_msg);
@@ -312,8 +313,8 @@ pub enum ExecutionState {
 
     /// Execution stopped by middleware
     Stopped {
-        reason: StopReason,
         message: Arc<str>,
+        stop_type: StopType,
     },
 
     /// Execution cancelled by user

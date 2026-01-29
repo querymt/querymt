@@ -138,6 +138,8 @@ pub trait SessionStore: Send + Sync {
         &self,
         name: Option<String>,
         cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<String>,
+        fork_origin: Option<ForkOrigin>,
     ) -> SessionResult<Session>;
 
     /// Retrieves session metadata by its unique ID.
@@ -274,6 +276,23 @@ pub trait SessionStore: Send + Sync {
         status: DelegationStatus,
     ) -> SessionResult<()>;
     async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()>;
+
+    // Compaction methods
+
+    /// Mark tool results as compacted (pruned) by their call IDs.
+    ///
+    /// This updates the `compacted_at` timestamp for matching ToolResult parts,
+    /// causing them to return placeholder text instead of full content when
+    /// converted to chat messages.
+    ///
+    /// # Arguments
+    /// * `session_id` - The session containing the messages
+    /// * `call_ids` - List of tool call IDs to mark as compacted
+    async fn mark_tool_results_compacted(
+        &self,
+        session_id: &str,
+        call_ids: &[String],
+    ) -> SessionResult<usize>;
 }
 
 #[cfg(test)]

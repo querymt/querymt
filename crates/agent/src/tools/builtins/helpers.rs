@@ -1,5 +1,6 @@
 //! Shared helper utilities for builtin tools
-use std::path::Path;
+use crate::config::OverflowStorage;
+use std::path::{Path, PathBuf};
 
 /// Maximum lines to return before truncation
 pub const MAX_LINES: usize = 2000;
@@ -128,6 +129,132 @@ pub fn interpolate_description(
         .replace("${cwd}", &cwd.display().to_string())
         .replace("${max_lines}", &max_lines.to_string())
         .replace("${max_bytes}", &max_bytes.to_string())
+}
+
+// ============================================================================
+// Overflow Storage Functions
+// ============================================================================
+
+/// Result of saving overflow output
+#[derive(Debug, Clone)]
+pub struct OverflowSaveResult {
+    /// Path where the overflow was saved (if any)
+    pub path: Option<PathBuf>,
+    /// Error message if save failed (but we don't fail the whole operation)
+    pub error: Option<String>,
+}
+
+/// Get the directory for overflow storage based on config
+pub fn get_overflow_directory(
+    storage: &OverflowStorage,
+    session_id: &str,
+    data_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    match storage {
+        OverflowStorage::Discard => None,
+        OverflowStorage::TempDir => {
+            let mut path = std::env::temp_dir();
+            path.push("qmt-tool-outputs");
+            path.push(session_id);
+            Some(path)
+        }
+        OverflowStorage::DataDir => data_dir.map(|d| {
+            let mut path = d.to_path_buf();
+            path.push("overflow");
+            path.push(session_id);
+            path
+        }),
+    }
+}
+
+/// Save overflow output to the configured location
+///
+/// # Arguments
+/// * `content` - The full content to save
+/// * `storage` - The storage configuration
+/// * `session_id` - The session ID (used for directory organization)
+/// * `tool_call_id` - The tool call ID (used for filename)
+/// * `data_dir` - Optional data directory for DataDir storage
+///
+/// # Returns
+/// An `OverflowSaveResult` with the path where the file was saved, or an error
+pub fn save_overflow_output(
+    content: &str,
+    storage: &OverflowStorage,
+    session_id: &str,
+    tool_call_id: &str,
+    data_dir: Option<&Path>,
+) -> OverflowSaveResult {
+    let dir = match get_overflow_directory(storage, session_id, data_dir) {
+        Some(d) => d,
+        None => {
+            return OverflowSaveResult {
+                path: None,
+                error: None,
+            };
+        }
+    };
+
+    // Create the directory if it doesn't exist
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return OverflowSaveResult {
+            path: None,
+            error: Some(format!("Failed to create overflow directory: {}", e)),
+        };
+    }
+
+    // Generate a unique filename
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+    let filename = format!("{}-{}.txt", tool_call_id, timestamp);
+    let file_path = dir.join(&filename);
+
+    // Write the content
+    match std::fs::write(&file_path, content) {
+        Ok(()) => OverflowSaveResult {
+            path: Some(file_path),
+            error: None,
+        },
+        Err(e) => OverflowSaveResult {
+            path: None,
+            error: Some(format!("Failed to write overflow file: {}", e)),
+        },
+    }
+}
+
+/// Format truncation message with optional overflow file path
+pub fn format_truncation_message_with_overflow(
+    result: &TruncationResult,
+    direction: TruncationDirection,
+    overflow_result: Option<&OverflowSaveResult>,
+) -> String {
+    if !result.was_truncated {
+        return String::new();
+    }
+
+    let dir_str = match direction {
+        TruncationDirection::Head => "first",
+        TruncationDirection::Tail => "last",
+    };
+
+    let overflow_info = match overflow_result {
+        Some(OverflowSaveResult { path: Some(p), .. }) => {
+            format!(" Full output saved to: {}", p.display())
+        }
+        Some(OverflowSaveResult { error: Some(e), .. }) => {
+            format!(" (Failed to save overflow: {})", e)
+        }
+        _ => String::new(),
+    };
+
+    format!(
+        "\n\n[Output truncated: showing {} {} lines / {} bytes of {} lines / {} bytes total.{}]",
+        dir_str,
+        result.content.lines().count(),
+        result.content.len(),
+        result.original_line_count,
+        result.original_byte_count,
+        overflow_info
+    )
 }
 
 #[cfg(test)]

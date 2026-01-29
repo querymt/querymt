@@ -187,7 +187,7 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                 if send_message(
                     &tx_events,
                     UiServerMessage::Event {
-                        agent_id,
+                        agent_id: agent_id.clone(),
                         event: event.clone(),
                     },
                 )
@@ -195,6 +195,37 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                 .is_err()
                 {
                     break;
+                }
+
+                // Replay the child session's ProviderChanged event after SessionForked
+                // registers ownership. The ProviderChanged was emitted during
+                // new_session() before ownership was registered, so the event
+                // forwarder missed it. This mirrors the replay in session.rs for
+                // primary sessions.
+                if let AgentEventKind::SessionForked {
+                    child_session_id,
+                    target_agent_id,
+                    origin: ForkOrigin::Delegation,
+                    ..
+                } = &event.kind
+                    && let Ok(audit) = state_events
+                        .view_store
+                        .get_audit_view(child_session_id)
+                        .await
+                    && let Some(provider_event) = audit
+                        .events
+                        .iter()
+                        .rev()
+                        .find(|e| matches!(e.kind, AgentEventKind::ProviderChanged { .. }))
+                {
+                    let _ = send_message(
+                        &tx_events,
+                        UiServerMessage::Event {
+                            agent_id: target_agent_id.clone(),
+                            event: provider_event.clone(),
+                        },
+                    )
+                    .await;
                 }
             }
         });

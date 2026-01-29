@@ -43,6 +43,12 @@ pub struct SessionSummary {
     pub title: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    /// Public ID of the parent session (if this is a child session)
+    pub parent_session_id: Option<String>,
+    /// Fork origin: "user" or "delegation"
+    pub fork_origin: Option<String>,
+    /// Whether this session has child sessions
+    pub has_children: bool,
 }
 
 /// Group of sessions by working directory.

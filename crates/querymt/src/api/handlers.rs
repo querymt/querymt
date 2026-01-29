@@ -85,6 +85,7 @@ pub async fn handle_chat(
             },
             message_type: MessageType::Text,
             content: msg.content,
+            cache: None,
         })
         .collect();
 

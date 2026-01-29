@@ -6,7 +6,7 @@
 
 use crate::agent::core::{QueryMTAgent, SessionRuntime};
 use crate::delegation::{format_delegation_completion_message, format_delegation_failure_message};
-use crate::events::{AgentEvent, AgentEventKind};
+use crate::events::{AgentEvent, AgentEventKind, ExecutionMetrics, StopType};
 use crate::middleware::{
     ConversationContext, ExecutionState, LlmResponse, ToolCall as MiddlewareToolCall, ToolFunction,
     ToolResult, WaitCondition, WaitReason, calculate_context_tokens,
@@ -14,17 +14,35 @@ use crate::middleware::{
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::TaskStatus;
 use crate::session::runtime::RuntimeContext;
-use agent_client_protocol::{ContentBlock, ContentChunk, SessionUpdate, StopReason, TextContent};
+use agent_client_protocol::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
 use anyhow::Context;
 use futures_util::StreamExt;
 use log::{debug, info};
-use querymt::chat::{ChatRole, FinishReason, StreamChunk};
+use querymt::chat::{CacheHint, ChatMessage, ChatRole, FinishReason, StreamChunk};
 use querymt::plugin::extism_impl::ExtismChatResponse;
 use querymt::{ToolCall, Usage};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 use tracing::instrument;
 use uuid::Uuid;
+
+/// Apply cache breakpoints to the last 2 messages in the conversation.
+/// This enables prompt caching for providers that support it (e.g., Anthropic).
+fn apply_cache_breakpoints(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let len = messages.len();
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| {
+            let mut m = msg.clone();
+            // Mark last 2 messages with ephemeral cache hint (default TTL)
+            if len >= 2 && i >= len - 2 {
+                m.cache = Some(CacheHint::Ephemeral { ttl_seconds: None });
+            }
+            m
+        })
+        .collect()
+}
 
 /// Parameters for processing tool calls transition
 pub(crate) struct ProcessingToolCallsParams<'a> {
@@ -150,9 +168,12 @@ impl QueryMTAgent {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
 
+        // Apply cache breakpoints to last 2 messages for providers that support caching
+        let messages_with_cache = apply_cache_breakpoints(&context.messages);
+
         let response = if tools.is_empty() {
             provider_context
-                .submit_request(&context.messages)
+                .submit_request(&messages_with_cache)
                 .await
                 .map_err(|e| anyhow::anyhow!("LLM request failed: {}", e))?
         } else {
@@ -166,7 +187,7 @@ impl QueryMTAgent {
             // Keep this special-case for now narrow to avoid changing behavior for other providers.
             if context.provider.as_ref() == "codex" {
                 let mut stream = provider
-                    .chat_stream_with_tools(&context.messages, Some(tools))
+                    .chat_stream_with_tools(&messages_with_cache, Some(tools))
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!("LLM streaming request with tools failed: {}", e)
@@ -216,7 +237,7 @@ impl QueryMTAgent {
                 })
             } else {
                 provider
-                    .chat_with_tools(&context.messages, Some(tools))
+                    .chat_with_tools(&messages_with_cache, Some(tools))
                     .await
                     .map_err(|e| anyhow::anyhow!("LLM request with tools failed: {}", e))?
             }
@@ -281,6 +302,10 @@ impl QueryMTAgent {
                 cost_usd: request_cost,
                 cumulative_cost_usd: cumulative_cost,
                 context_tokens,
+                metrics: ExecutionMetrics {
+                    steps: context.stats.steps,
+                    turns: context.user_message_count(),
+                },
             },
         );
 
@@ -465,16 +490,16 @@ impl QueryMTAgent {
             Some(FinishReason::Length) => {
                 // Model hit token limit
                 Ok(ExecutionState::Stopped {
-                    reason: StopReason::MaxTokens,
                     message: "Model hit token limit".into(),
+                    stop_type: StopType::ModelTokenLimit,
                 })
             }
 
             Some(FinishReason::ContentFilter) => {
                 // Response blocked by content filter
                 Ok(ExecutionState::Stopped {
-                    reason: StopReason::EndTurn,
                     message: "Response blocked by content filter".into(),
+                    stop_type: StopType::ContentFilter,
                 })
             }
 
@@ -572,6 +597,7 @@ impl QueryMTAgent {
             is_error: result.is_error,
             tool_name: result.tool_name.clone(),
             tool_arguments: result.tool_arguments.clone(),
+            compacted_at: None,
         }];
         if let Some(ref snapshot) = result.snapshot_part {
             parts.push(snapshot.clone());
@@ -719,8 +745,8 @@ impl QueryMTAgent {
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             return Ok(ExecutionState::Stopped {
-                                reason: StopReason::EndTurn,
                                 message: "Event stream closed while waiting".into(),
+                                stop_type: StopType::Other,
                             });
                         }
                     };

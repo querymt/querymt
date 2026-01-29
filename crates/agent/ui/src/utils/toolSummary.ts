@@ -33,6 +33,8 @@ const TOOL_ICONS: Record<string, string> = {
   grep: '🔎',
   mcp_grep: '🔎',
   search: '🔎',
+  search_text: '🔎',
+  mcp_search_text: '🔎',
   
   // Shell/system
   shell: '💻',
@@ -80,12 +82,17 @@ export function getToolIcon(toolKind: string | undefined): string {
 /**
  * Get display name for a tool (without mcp_ prefix)
  */
-export function getToolDisplayName(toolKind: string | undefined): string {
+export function getToolDisplayName(toolKind: string | undefined, toolName: string | undefined): string {
+  // If we have an actual toolName (from tool_call_id or description), use it as-is
+  if (toolName) {
+    // Remove mcp_ prefix if present, but don't capitalize
+    return toolName.replace(/^mcp_/, '');
+  }
+  
+  // Fallback to toolKind processing
   if (!toolKind) return 'Tool';
-  // Remove mcp_ prefix if present
-  const name = toolKind.replace(/^mcp_/, '');
-  // Capitalize first letter
-  return name.charAt(0).toUpperCase() + name.slice(1);
+  // Remove mcp_ prefix if present, but don't capitalize
+  return toolKind.replace(/^mcp_/, '');
 }
 
 /**
@@ -102,8 +109,10 @@ export function extractKeyParam(toolKind: string | undefined, rawInput: unknown)
   
   switch (normalized) {
     case 'read':
-    case 'read_file':
-      return extractFilePath(obj) || truncate(String(obj.path || obj.filePath || ''), 50);
+    case 'read_file': {
+      const filePath = extractFilePath(obj) || truncate(String(obj.path || obj.filePath || ''), 50);
+      return appendLineRange(filePath, obj);
+    }
       
     case 'write':
     case 'write_file':
@@ -116,6 +125,7 @@ export function extractKeyParam(toolKind: string | undefined, rawInput: unknown)
       return truncate(String(obj.pattern || ''), 40);
       
     case 'grep':
+    case 'search_text':
       return truncate(String(obj.pattern || ''), 40);
       
     case 'bash':
@@ -201,7 +211,7 @@ export function generateToolSummary(
   rawInput: unknown
 ): ToolSummaryInfo {
   const icon = getToolIcon(toolKind || toolName);
-  const name = getToolDisplayName(toolKind || toolName);
+  const name = getToolDisplayName(toolKind, toolName);
   const keyParam = extractKeyParam(toolKind || toolName, rawInput);
   const diffStats = calculateDiffStats(toolKind || toolName, rawInput);
   
@@ -238,6 +248,29 @@ function parseJsonSafe(value: string): unknown {
 function truncate(str: string, maxLen: number): string {
   if (str.length <= maxLen) return str;
   return str.slice(0, maxLen - 3) + '...';
+}
+
+function appendLineRange(filePath: string | undefined, obj: Record<string, unknown>): string | undefined {
+  if (!filePath) return undefined;
+  
+  // Check for both naming conventions: (offset, limit) and (start_line, line_count)
+  const offset = typeof obj.offset === 'number' ? obj.offset : 
+                 (typeof obj.start_line === 'number' ? obj.start_line : undefined);
+  const limit = typeof obj.limit === 'number' ? obj.limit : 
+                (typeof obj.line_count === 'number' ? obj.line_count : 
+                 (typeof obj.length === 'number' ? obj.length : undefined));
+  
+  if (offset != null && limit != null) {
+    // Calculate end line: if start_line=2 and line_count=3, we read lines 2,3,4 (end=4)
+    return `${filePath} [lines ${offset}-${offset + limit - 1}]`;
+  }
+  if (offset != null) {
+    return `${filePath} [from line ${offset}]`;
+  }
+  if (limit != null) {
+    return `${filePath} [first ${limit} lines]`;
+  }
+  return filePath;
 }
 
 function extractFilePath(obj: Record<string, unknown>): string | undefined {

@@ -4,6 +4,7 @@ use crate::agent::core::{
     ClientState, DelegationContextConfig, DelegationContextTiming, QueryMTAgent, SnapshotPolicy,
     ToolConfig, ToolPolicy,
 };
+use crate::config::{CompactionConfig, PruningConfig, ToolOutputConfig};
 use crate::delegation::AgentRegistry;
 use crate::event_bus::EventBus;
 use crate::middleware::{
@@ -129,6 +130,21 @@ pub trait AgentBuilderExt {
 
     /// Sets the delegation context config.
     fn with_delegation_context_config(self, config: DelegationContextConfig) -> Self;
+
+    // Compaction system configuration (3-layer)
+
+    /// Sets the tool output truncation configuration (Layer 1)
+    fn with_tool_output_config(self, config: ToolOutputConfig) -> Self;
+
+    /// Sets the pruning configuration (Layer 2)
+    fn with_pruning_config(self, config: PruningConfig) -> Self;
+
+    /// Sets the AI compaction configuration (Layer 3)
+    fn with_compaction_config(self, config: CompactionConfig) -> Self;
+
+    /// Enables full compaction with default settings
+    /// This enables pruning and auto-compaction, and adds ContextMiddleware if needed
+    fn with_compaction_enabled(self) -> Self;
 }
 
 impl AgentBuilderExt for QueryMTAgent {
@@ -365,6 +381,39 @@ impl AgentBuilderExt for QueryMTAgent {
     fn with_delegation_context_config(mut self, config: DelegationContextConfig) -> Self {
         self.delegation_context_config = config;
         self
+    }
+
+    // Compaction system configuration (3-layer)
+
+    fn with_tool_output_config(mut self, config: ToolOutputConfig) -> Self {
+        self.tool_output_config = config;
+        self
+    }
+
+    fn with_pruning_config(mut self, config: PruningConfig) -> Self {
+        self.pruning_config = config;
+        self
+    }
+
+    fn with_compaction_config(mut self, config: CompactionConfig) -> Self {
+        // If auto compaction is enabled, auto-enable ContextMiddleware
+        if config.auto {
+            log::info!("Auto-enabling ContextMiddleware for compaction");
+            // Add context middleware with default config if not already present
+            let context_middleware = ContextMiddleware::new(ContextConfig::default());
+            self.middleware_drivers
+                .lock()
+                .unwrap()
+                .push(Arc::new(context_middleware));
+        }
+        self.compaction_config = config;
+        self
+    }
+
+    fn with_compaction_enabled(self) -> Self {
+        // Enable pruning and compaction with defaults
+        self.with_pruning_config(PruningConfig::default())
+            .with_compaction_config(CompactionConfig::default())
     }
 }
 

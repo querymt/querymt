@@ -9,16 +9,20 @@
 
 use crate::agent::core::{QueryMTAgent, SessionRuntime};
 use crate::agent::transitions::ProcessingToolCallsParams;
-use crate::agent::utils::format_prompt_blocks;
-use crate::events::AgentEventKind;
+use crate::agent::utils::{format_prompt_blocks, format_prompt_user_text_only};
+use crate::events::{AgentEventKind, ExecutionMetrics, StopType};
 use crate::middleware::{AgentStats, ConversationContext, ExecutionState, MiddlewareDriver};
 use crate::model::{AgentMessage, MessagePart};
+use crate::session::compaction::SessionCompaction;
 use crate::session::provider::SessionContext;
+use crate::session::pruning::{
+    PruneConfig, SimpleTokenEstimator, compute_prune_candidates, extract_call_ids,
+};
 use crate::session::runtime::RuntimeContext;
 use agent_client_protocol::{
     ContentChunk, Error, PromptRequest, PromptResponse, SessionUpdate, StopReason,
 };
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 use querymt::chat::ChatRole;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -89,7 +93,12 @@ impl QueryMTAgent {
             .map_err(|e| Error::new(-32000, e.to_string()))?;
 
         // 4. Store User Messages
-        let content = format_prompt_blocks(&req.prompt, self.max_prompt_bytes);
+        // Full content for LLM and events (includes attachments)
+        let full_content = format_prompt_blocks(&req.prompt, self.max_prompt_bytes);
+
+        // User text only for intent snapshot (clean, no attachments)
+        let user_text = format_prompt_user_text_only(&req.prompt);
+
         for block in &req.prompt {
             self.send_session_update(
                 &session_id,
@@ -99,13 +108,13 @@ impl QueryMTAgent {
         self.emit_event(
             &session_id,
             AgentEventKind::PromptReceived {
-                content: content.clone(),
+                content: full_content.clone(),
             },
         );
 
-        // Update intent snapshot on prompt received
+        // Update intent snapshot with clean user text (no attachment content)
         runtime_context
-            .update_intent_snapshot(content.clone(), None, None)
+            .update_intent_snapshot(user_text, None, None)
             .await
             .map_err(|e| Error::new(-32000, e.to_string()))?;
 
@@ -114,7 +123,7 @@ impl QueryMTAgent {
             session_id: session_id.clone(),
             role: ChatRole::User,
             parts: vec![MessagePart::Text {
-                content: content.clone(),
+                content: full_content.clone(),
             }],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
@@ -131,7 +140,12 @@ impl QueryMTAgent {
             );
             return Err(Error::new(-32000, e.to_string()));
         }
-        self.emit_event(&session_id, AgentEventKind::UserMessageStored { content });
+        self.emit_event(
+            &session_id,
+            AgentEventKind::UserMessageStored {
+                content: full_content.clone(),
+            },
+        );
 
         // 5. Execute Agent Loop using State Machine
         info!("Initializing execution cycle for session {}", session_id);
@@ -317,15 +331,62 @@ impl QueryMTAgent {
 
                 ExecutionState::Complete => {
                     debug!("State machine reached Complete state");
+
+                    // Run pruning if enabled
+                    if self.pruning_config.enabled
+                        && let Err(e) = self.run_pruning(context).await
+                    {
+                        warn!("Pruning failed: {}", e);
+                        // Don't fail the whole operation, just log the warning
+                    }
+
                     return Ok(CycleOutcome::Completed);
                 }
 
                 ExecutionState::Stopped {
-                    reason,
                     ref message,
+                    stop_type,
                 } => {
-                    info!("State machine stopped: {}", message);
-                    return Ok(CycleOutcome::Stopped(reason));
+                    info!("State machine stopped: {} ({:?})", message, stop_type);
+
+                    // Handle context threshold specially - trigger AI compaction if enabled
+                    if stop_type == StopType::ContextThreshold && self.compaction_config.auto {
+                        info!("Context threshold reached, triggering AI compaction");
+
+                        match self.run_ai_compaction(context, &state).await {
+                            Ok(new_state) => {
+                                // Compaction succeeded, continue with the new state
+                                state = new_state;
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!("AI compaction failed: {}", e);
+                                // Fall through to normal stop handling
+                            }
+                        }
+                    }
+
+                    // Get metrics from current context if available
+                    let metrics = state
+                        .context()
+                        .map(|ctx| ExecutionMetrics {
+                            steps: ctx.stats.steps,
+                            turns: ctx.user_message_count(),
+                        })
+                        .unwrap_or_default();
+
+                    // Emit MiddlewareStopped event so UI can display the reason
+                    self.emit_event(
+                        &context.session().public_id,
+                        AgentEventKind::MiddlewareStopped {
+                            stop_type,
+                            reason: message.to_string(),
+                            metrics,
+                        },
+                    );
+
+                    // Convert to protocol StopReason
+                    return Ok(CycleOutcome::Stopped(StopReason::from(stop_type)));
                 }
 
                 ExecutionState::Cancelled => {
@@ -334,5 +395,189 @@ impl QueryMTAgent {
                 }
             };
         }
+    }
+
+    /// Run pruning on the session history
+    ///
+    /// This marks old tool results as compacted based on the pruning configuration.
+    async fn run_pruning(&self, context: &SessionContext) -> Result<(), anyhow::Error> {
+        let session_id = &context.session().public_id;
+        let messages = context
+            .get_agent_history()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get agent history: {}", e))?;
+
+        // Build prune config from agent config
+        let prune_config = PruneConfig {
+            protect_tokens: self.pruning_config.protect_tokens,
+            minimum_tokens: self.pruning_config.minimum_tokens,
+            protected_tools: self.pruning_config.protected_tools.clone(),
+        };
+
+        let estimator = SimpleTokenEstimator;
+        let analysis = compute_prune_candidates(&messages, &prune_config, &estimator);
+
+        if analysis.should_prune && !analysis.candidates.is_empty() {
+            let call_ids = extract_call_ids(&analysis.candidates);
+            info!(
+                "Pruning {} tool results ({} tokens) for session {}",
+                call_ids.len(),
+                analysis.prunable_tokens,
+                session_id
+            );
+
+            let updated = self
+                .provider
+                .history_store()
+                .mark_tool_results_compacted(session_id, &call_ids)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to mark tool results compacted: {}", e))?;
+
+            debug!("Marked {} tool results as compacted", updated);
+        } else {
+            debug!(
+                "Pruning skipped: should_prune={}, candidates={}, prunable_tokens={}",
+                analysis.should_prune,
+                analysis.candidates.len(),
+                analysis.prunable_tokens
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Run AI compaction when context threshold is reached
+    ///
+    /// This generates a summary of the conversation and creates a compaction message,
+    /// then returns a new state to continue execution with filtered history.
+    async fn run_ai_compaction(
+        &self,
+        context: &SessionContext,
+        current_state: &ExecutionState,
+    ) -> Result<ExecutionState, anyhow::Error> {
+        let session_id = &context.session().public_id;
+        let messages = context
+            .get_agent_history()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get agent history: {}", e))?;
+
+        // Emit CompactionStart event
+        let token_estimate = messages
+            .iter()
+            .map(|m| {
+                m.parts
+                    .iter()
+                    .map(|p| match p {
+                        MessagePart::Text { content } => content.len() / 4,
+                        MessagePart::ToolResult { content, .. } => content.len() / 4,
+                        _ => 0,
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+
+        self.emit_event(
+            session_id,
+            AgentEventKind::CompactionStart { token_estimate },
+        );
+
+        // Get the provider for compaction
+        // Use compaction-specific provider/model if configured, otherwise use session's provider
+        let provider = self
+            .provider
+            .with_session(session_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get session provider: {}", e))?;
+
+        let llm_provider = provider
+            .provider()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get LLM provider: {}", e))?;
+
+        let llm_config = self
+            .provider
+            .history_store()
+            .get_session_llm_config(session_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get LLM config: {}", e))?
+            .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
+
+        let model = self
+            .compaction_config
+            .model
+            .as_ref()
+            .unwrap_or(&llm_config.model);
+
+        // Build retry config
+        let retry_config = crate::session::compaction::RetryConfig {
+            max_retries: self.compaction_config.retry.max_retries,
+            initial_backoff_ms: self.compaction_config.retry.initial_backoff_ms,
+            backoff_multiplier: self.compaction_config.retry.backoff_multiplier,
+        };
+
+        // Generate the compaction summary
+        let result = self
+            .compaction
+            .process(&messages, llm_provider, model, &retry_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("Compaction failed: {}", e))?;
+
+        info!(
+            "Compaction generated summary: {} tokens -> {} tokens",
+            result.original_token_count, result.summary_token_count
+        );
+
+        // Create and store the compaction message
+        let compaction_msg = SessionCompaction::create_compaction_message(
+            session_id,
+            &result.summary,
+            result.original_token_count,
+        );
+
+        context
+            .add_message(compaction_msg)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to store compaction message: {}", e))?;
+
+        // Emit CompactionEnd event
+        self.emit_event(
+            session_id,
+            AgentEventKind::CompactionEnd {
+                summary: result.summary.clone(),
+                summary_len: result.summary.len(),
+            },
+        );
+
+        // Get the new filtered history and create a new state to continue
+        let new_messages = context
+            .get_agent_history()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get new history: {}", e))?;
+        let filtered_messages =
+            crate::session::compaction::filter_to_effective_history(new_messages);
+
+        // Convert AgentMessages to ChatMessages for the ConversationContext
+        let chat_messages: Vec<querymt::chat::ChatMessage> = filtered_messages
+            .iter()
+            .map(|m| m.to_chat_message())
+            .collect();
+
+        // Create new conversation context with filtered history
+        let new_context = if let Some(ctx) = current_state.context() {
+            Arc::new(ConversationContext::new(
+                ctx.session_id.clone(),
+                Arc::from(chat_messages.into_boxed_slice()),
+                ctx.stats.clone(),
+                ctx.provider.clone(),
+                ctx.model.clone(),
+            ))
+        } else {
+            return Err(anyhow::anyhow!("No context available for compaction"));
+        };
+
+        // Return BeforeTurn state to continue execution
+        Ok(ExecutionState::BeforeTurn {
+            context: new_context,
+        })
     }
 }

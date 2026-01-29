@@ -110,7 +110,7 @@ impl QueryMTAgent {
             }),
         );
 
-        let (result_json, is_error) = if !self.is_tool_allowed(&call.function.name) {
+        let (raw_result_json, is_error) = if !self.is_tool_allowed(&call.function.name) {
             (
                 format!("Error: tool '{}' is not allowed", call.function.name),
                 true,
@@ -162,6 +162,42 @@ impl QueryMTAgent {
                 Ok(res) => (res, false),
                 Err(e) => (format!("Error: {}", e), true),
             }
+        };
+
+        // Apply Layer 1 truncation: cap tool output by line count and byte size.
+        // This is a safety net that prevents any single tool result from consuming
+        // excessive context, regardless of whether the tool itself limits its output.
+        let result_json = if !is_error {
+            use crate::tools::builtins::helpers::{
+                TruncationDirection, format_truncation_message_with_overflow, save_overflow_output,
+                truncate_output,
+            };
+            let config = &self.tool_output_config;
+            let truncation = truncate_output(
+                &raw_result_json,
+                config.max_lines,
+                config.max_bytes,
+                TruncationDirection::Head,
+            );
+            if truncation.was_truncated {
+                let overflow = save_overflow_output(
+                    &raw_result_json,
+                    &config.overflow_storage,
+                    session_id,
+                    &call.id,
+                    None, // TODO: pass data_dir when available
+                );
+                let suffix = format_truncation_message_with_overflow(
+                    &truncation,
+                    TruncationDirection::Head,
+                    Some(&overflow),
+                );
+                format!("{}{}", truncation.content, suffix)
+            } else {
+                raw_result_json
+            }
+        } else {
+            raw_result_json
         };
 
         // Note: We emit ToolCallEnd event which gets translated to SessionUpdate::ToolCallUpdate
@@ -342,6 +378,7 @@ impl QueryMTAgent {
                 is_error: result.is_error,
                 tool_name: result.tool_name.clone(),
                 tool_arguments: result.tool_arguments.clone(),
+                compacted_at: None,
             }];
             if let Some(ref snapshot) = result.snapshot_part {
                 parts.push(snapshot.clone());

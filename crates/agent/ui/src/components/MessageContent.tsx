@@ -1,6 +1,6 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { ComponentPropsWithoutRef, memo } from 'react';
+import { ComponentPropsWithoutRef, memo, useMemo } from 'react';
 import { parseFileMentions } from '../utils/fileMentionParser';
 import { FileMention } from './FileMention';
 
@@ -14,14 +14,81 @@ interface MessageContentProps {
   };
 }
 
+interface ParsedAttachment {
+  name: string;
+  kind: 'file' | 'dir';
+  body: string;
+}
+
+/**
+ * Split content into main text and attachment blocks.
+ * Attachments follow the pattern produced by the Rust mentions expander:
+ *   \n\nAttachments:\n[file: path]\n```\ncontent\n```\n\n[dir: path]\n...
+ */
+function splitAttachments(content: string): { main: string; attachments: ParsedAttachment[] } {
+  const marker = '\n\nAttachments:\n';
+  const idx = content.indexOf(marker);
+  if (idx === -1) {
+    return { main: content, attachments: [] };
+  }
+
+  const main = content.slice(0, idx);
+  const rest = content.slice(idx + marker.length);
+
+  // Split on attachment headers: [file: ...] or [dir: ...]
+  const headerRe = /^\[(file|dir):\s*([^\]]+)\]/gm;
+  const attachments: ParsedAttachment[] = [];
+  const matches: { kind: 'file' | 'dir'; name: string; start: number; headerEnd: number }[] = [];
+
+  let m: RegExpExecArray | null;
+  while ((m = headerRe.exec(rest)) !== null) {
+    matches.push({
+      kind: m[1] as 'file' | 'dir',
+      name: m[2].trim(),
+      start: m.index,
+      headerEnd: m.index + m[0].length,
+    });
+  }
+
+  for (let i = 0; i < matches.length; i++) {
+    const cur = matches[i];
+    const nextStart = i + 1 < matches.length ? matches[i + 1].start : rest.length;
+    const body = rest.slice(cur.headerEnd, nextStart).replace(/^\n/, '').replace(/\n+$/, '');
+    attachments.push({ kind: cur.kind, name: cur.name, body });
+  }
+
+  return { main, attachments };
+}
+
 export const MessageContent = memo(function MessageContent({ content, type = 'text' }: MessageContentProps) {
   // For now, we'll use markdown for text and pre-formatted code for others
   // In the future, we can integrate @pierre/diffs for better code/diff rendering
   
   if (type === 'text' || !type) {
+    // Split out attachment blocks before rendering
+    const { main: mainContent, attachments } = useMemo(() => splitAttachments(content), [content]);
+
     // Parse content for file mentions
-    const segments = parseFileMentions(content);
+    const segments = parseFileMentions(mainContent);
     const hasMentions = segments.some(seg => seg.type === 'mention');
+
+    // Render attachment blocks as collapsible <details> elements
+    const attachmentElements = attachments.length > 0 ? (
+      <div className="mt-3 space-y-1.5">
+        {attachments.map((att, i) => (
+          <details key={i} className="border border-cyber-border/40 rounded-md overflow-hidden">
+            <summary className="px-3 py-1.5 text-xs font-mono text-gray-400 bg-cyber-surface/40 cursor-pointer hover:text-gray-300 hover:bg-cyber-surface/60 transition-colors select-none">
+              {att.kind === 'dir' ? '\uD83D\uDCC1' : '\uD83D\uDCCE'} {att.name}
+            </summary>
+            <div className="px-3 py-2 bg-cyber-bg/30 border-t border-cyber-border/30">
+              <pre className="text-[11px] font-mono text-gray-300 whitespace-pre-wrap break-words leading-tight overflow-auto max-h-64">
+                {att.body}
+              </pre>
+            </div>
+          </details>
+        ))}
+      </div>
+    ) : null;
 
     // Custom markdown components with better styling (no prose bloat)
     const markdownComponents = {
@@ -139,6 +206,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
               </ReactMarkdown>
             );
           })}
+          {attachmentElements}
         </div>
       );
     }
@@ -150,8 +218,9 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
           remarkPlugins={[remarkGfm]}
           components={markdownComponents}
         >
-          {content}
+          {mainContent}
         </ReactMarkdown>
+        {attachmentElements}
       </div>
     );
   }

@@ -18,6 +18,8 @@ pub trait SessionRepository: Send + Sync {
         &self,
         name: Option<String>,
         cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<String>,
+        fork_origin: Option<ForkOrigin>,
     ) -> SessionResult<Session>;
 
     /// Get session by ID

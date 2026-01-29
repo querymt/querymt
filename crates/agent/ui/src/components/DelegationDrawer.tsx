@@ -1,0 +1,196 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { MouseEvent as ReactMouseEvent } from 'react';
+import { X } from 'lucide-react';
+import { DelegationGroupInfo, EventRow, UiAgentInfo } from '../types';
+import { MessageContent } from './MessageContent';
+import { ToolSummary } from './ToolSummary';
+import { getAgentColor } from '../utils/agentColors';
+import { getAgentShortName } from '../utils/agentNames';
+
+interface DelegationDrawerProps {
+  delegation?: DelegationGroupInfo;
+  agents: UiAgentInfo[];
+  onClose: () => void;
+  onToolClick: (event: EventRow) => void;
+}
+
+function formatTimestamp(ts: number) {
+  return new Date(ts).toLocaleTimeString();
+}
+
+export function DelegationDrawer({ delegation, agents, onClose, onToolClick }: DelegationDrawerProps) {
+  const [drawerWidth, setDrawerWidth] = useState(() => {
+    if (typeof window === 'undefined') return 420;
+    const stored = window.localStorage.getItem('delegationDrawerWidth');
+    const parsed = stored ? Number.parseInt(stored, 10) : 420;
+    return Number.isNaN(parsed) ? 420 : parsed;
+  });
+  const [isMobile, setIsMobile] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return window.innerWidth < 768;
+  });
+  const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  useEffect(() => {
+    const handleResize = () => {
+      setIsMobile(window.innerWidth < 768);
+    };
+    handleResize();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem('delegationDrawerWidth', String(drawerWidth));
+  }, [drawerWidth]);
+
+  useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      if (!dragStateRef.current || isMobile) return;
+      const delta = dragStateRef.current.startX - event.clientX;
+      const maxWidth = Math.max(360, window.innerWidth - 80);
+      const nextWidth = Math.min(
+        maxWidth,
+        Math.max(320, dragStateRef.current.startWidth + delta)
+      );
+      setDrawerWidth(nextWidth);
+    };
+    const handleMouseUp = () => {
+      dragStateRef.current = null;
+    };
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isMobile]);
+
+  if (!delegation) return null;
+
+  const agentId = delegation.targetAgentId ?? delegation.agentId;
+  const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
+  const agentColor = agentId ? getAgentColor(agentId) : '#b026ff';
+  const objective = delegation.objective ??
+    (delegation.delegateEvent.toolCall?.raw_input as { objective?: string } | undefined)?.objective;
+
+  const visibleEvents = useMemo(
+    () => delegation.events
+      .filter((event) =>
+        event.type === 'tool_call' || (event.type === 'agent' && event.isMessage)
+      )
+      .sort((a, b) => a.timestamp - b.timestamp),
+    [delegation.events]
+  );
+
+  const handleDragStart = (event: ReactMouseEvent) => {
+    if (isMobile) return;
+    dragStateRef.current = {
+      startX: event.clientX,
+      startWidth: drawerWidth,
+    };
+  };
+
+  return (
+    <div className="fixed inset-0 z-40 flex justify-end" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="absolute inset-0 bg-black/50"
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+        aria-hidden="true"
+      />
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="relative z-10 h-full bg-cyber-surface border-l border-cyber-border shadow-[0_0_30px_rgba(0,255,249,0.12)] flex flex-col"
+        style={{ width: isMobile ? '100%' : `${drawerWidth}px` }}
+      >
+        {!isMobile && (
+          <div
+            onMouseDown={handleDragStart}
+            className="absolute left-0 top-0 h-full w-1.5 cursor-col-resize bg-cyber-border/40 hover:bg-cyber-cyan/60 transition-colors"
+            title="Drag to resize"
+          />
+        )}
+        <div className="px-5 py-4 border-b border-cyber-border/50 flex items-start justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <span
+                className="text-xs font-semibold uppercase tracking-wide px-2 py-0.5 rounded"
+                style={{
+                  color: agentColor,
+                  backgroundColor: `${agentColor}20`,
+                  border: `1px solid ${agentColor}40`,
+                }}
+              >
+                {agentName}
+              </span>
+              <span className="text-[10px] text-gray-500">
+                Delegation
+              </span>
+            </div>
+            <p className="text-sm text-gray-300 mt-1">
+              {objective ?? 'Delegated task'}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onClose();
+            }}
+            className="p-2 rounded-md hover:bg-cyber-bg/70 transition-colors text-gray-400 hover:text-gray-200"
+            aria-label="Close delegation details"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+          {visibleEvents.length === 0 ? (
+            <div className="text-sm text-gray-500">No delegation events yet.</div>
+          ) : (
+            visibleEvents.map((event) => {
+              if (event.type === 'tool_call') {
+                return (
+                  <ToolSummary
+                    key={event.id}
+                    event={event}
+                    onClick={() => onToolClick(event)}
+                  />
+                );
+              }
+              if (event.type === 'agent' && event.isMessage) {
+                const eventAgentId = event.agentId ?? agentId;
+                const eventAgentName = eventAgentId
+                  ? getAgentShortName(eventAgentId, agents)
+                  : agentName;
+                const eventAgentColor = eventAgentId
+                  ? getAgentColor(eventAgentId)
+                  : agentColor;
+                return (
+                  <div key={event.id} className="rounded-md border border-cyber-border/40 bg-cyber-bg/40 px-3 py-2">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span
+                        className="text-[10px] font-semibold uppercase tracking-wide"
+                        style={{ color: eventAgentColor }}
+                      >
+                        {eventAgentName}
+                      </span>
+                      <span className="text-[10px] text-gray-500">
+                        {formatTimestamp(event.timestamp)}
+                      </span>
+                    </div>
+                    <MessageContent content={event.content} />
+                  </div>
+                );
+              }
+              return null;
+            })
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -16,11 +16,11 @@ export interface TurnCardProps {
   agents: UiAgentInfo[];
   onToolClick: (event: EventRow) => void;
   onDelegateClick: (delegationId: string) => void;
-  renderEvent: (event: EventRow) => React.ReactNode;
   isLastUserMessage?: boolean;
   showModelLabel?: boolean; // Show model label when session has multiple models
   llmConfigCache?: Record<number, LlmConfigDetails>; // Cached LLM configs
   requestLlmConfig?: (configId: number, callback: (config: LlmConfigDetails) => void) => void;
+  activeView?: 'chat' | 'delegations'; // Current view - only show pinned message in chat view
 }
 
 // Interleaved event item types
@@ -107,11 +107,11 @@ export const TurnCard = memo(function TurnCard({
   agents,
   onToolClick,
   onDelegateClick,
-  renderEvent,
   isLastUserMessage = false,
   showModelLabel = false,
   llmConfigCache = {},
   requestLlmConfig,
+  activeView = 'chat',
 }: TurnCardProps) {
   const agentName = turn.agentId ? getAgentShortName(turn.agentId, agents) : 'Agent';
   const agentColor = turn.agentId ? getAgentColor(turn.agentId) : undefined;
@@ -147,8 +147,8 @@ export const TurnCard = memo(function TurnCard({
 
   return (
     <div className="turn-card max-w-4xl mx-auto px-4 py-3">
-      {/* Pinned user message (appears when scrolled past) */}
-      {isPinned && turn.userMessage && (
+      {/* Pinned user message (appears when scrolled past) - only in chat view */}
+      {isPinned && turn.userMessage && activeView === 'chat' && (
         <PinnedUserMessage
           message={turn.userMessage.content}
           timestamp={turn.userMessage.timestamp}
@@ -253,7 +253,6 @@ export const TurnCard = memo(function TurnCard({
                         agents={agents}
                         onToolClick={onToolClick}
                         onDelegateClick={onDelegateClick}
-                        renderEvent={renderEvent}
                       />
                     </div>
                   );

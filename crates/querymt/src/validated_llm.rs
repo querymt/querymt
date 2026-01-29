@@ -152,6 +152,7 @@ impl ChatProvider for ValidatedLLM {
                              Please try again and produce a valid response.",
                             err
                         ),
+                        cache: None,
                     });
                 }
             }

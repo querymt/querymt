@@ -500,7 +500,7 @@
 
 .pinned-user-card {
   position: fixed;
-  top: 80px; /* Below header */
+  top: 124px; /* Below header (80px) + tab bar (44px) */
   /* Position card with equal gaps on both sides */
   /* Right edge: 20px gap to the centered content (which starts at 50% - 28rem) */
   /* Left edge: 20px gap from screen edge */
@@ -569,7 +569,7 @@
   position: fixed;
   left: 0;
   right: 0;
-  top: 60px; /* Below header */
+  top: 124px; /* Below header (80px) + tab bar (44px) */
   height: 44px;
   z-index: 40;
   

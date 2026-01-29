@@ -5,6 +5,7 @@ use crate::agent::core::{
 use crate::agent::execution::CycleOutcome;
 use crate::delegation::{AgentInfo, DefaultAgentRegistry, DelegationOrchestrator};
 use crate::event_bus::EventBus;
+use crate::events::StopType;
 use crate::middleware::{
     AgentStats, ConversationContext, DelegationGuardMiddleware, ExecutionState, LlmResponse,
     MiddlewareDriver,
@@ -294,6 +295,10 @@ impl TestHarness {
             workspace_index_manager: Arc::new(crate::index::WorkspaceIndexManager::new(
                 crate::index::WorkspaceIndexManagerConfig::default(),
             )),
+            tool_output_config: crate::config::ToolOutputConfig::default(),
+            pruning_config: crate::config::PruningConfig::default(),
+            compaction_config: crate::config::CompactionConfig::default(),
+            compaction: crate::session::compaction::SessionCompaction::new(),
         });
 
         if let Ok(mut config) = agent.tool_config.lock() {
@@ -656,7 +661,7 @@ async fn test_delegation_guard_blocks_duplicate() {
     assert!(matches!(
         result,
         ExecutionState::Stopped {
-            reason: StopReason::EndTurn,
+            stop_type: StopType::DelegationBlocked,
             ..
         }
     ));
@@ -730,7 +735,7 @@ async fn test_delegation_guard_blocks_max_retries() {
     assert!(matches!(
         result,
         ExecutionState::Stopped {
-            reason: StopReason::EndTurn,
+            stop_type: StopType::DelegationBlocked,
             ..
         }
     ));

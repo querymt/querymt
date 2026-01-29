@@ -31,7 +31,7 @@ tools = [
     "github.*"  # All tools from github MCP
 ]
 
-system_file = "prompts/planner.md"
+system = [{ file = "prompts/planner.md" }]
 
 # Delegate agents
 [[delegates]]
@@ -50,7 +50,7 @@ tools = [
     "search_text"
 ]
 
-system_file = "prompts/coder.md"
+system = [{ file = "prompts/coder.md" }]
 
 # Inline MCP for this delegate only
 # [[delegates.mcp]]

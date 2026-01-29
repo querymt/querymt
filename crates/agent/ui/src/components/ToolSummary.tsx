@@ -1,9 +1,10 @@
 /**
- * Compact tool card component - shows minimal summary, click to expand in modal
+ * Compact tool card component - shows summary with inline preview for key tools
  */
 
-import { memo } from 'react';
-import { Loader, CheckCircle, XCircle, ChevronRight } from 'lucide-react';
+import { memo, useState, useMemo } from 'react';
+import { Loader, CheckCircle, XCircle, ChevronRight, ChevronDown, Eye } from 'lucide-react';
+import { PatchDiff } from '@pierre/diffs/react';
 import { generateToolSummary } from '../utils/toolSummary';
 import { EventItem } from '../types';
 
@@ -30,86 +31,246 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
   const isCompleted = status === 'completed';
   const isFailed = status === 'failed';
 
+  // Inline preview state - auto-expand for edits/patches
+  const normalized = (toolKind || toolName || '').toLowerCase().replace(/^mcp_/, '');
+  const isEdit = normalized === 'edit';
+  const isPatch = normalized === 'apply_patch';
+  const isShell = normalized === 'shell' || normalized === 'bash';
+  const hasInlinePreview = isEdit || isPatch || isShell;
+  const [showPreview, setShowPreview] = useState(isEdit || isPatch); // Auto-expand diffs
+
+  // Build preview data
+  const previewData = useMemo(() => {
+    if (!hasInlinePreview) return null;
+
+    if ((isEdit || isPatch) && rawInput && typeof rawInput === 'object') {
+      return buildDiffPreview(toolKind, rawInput as Record<string, unknown>);
+    }
+
+    if (isShell && hasMergedResult && event.mergedResult) {
+      return buildShellPreview(event.mergedResult);
+    }
+
+    return null;
+  }, [hasInlinePreview, isEdit, isPatch, isShell, toolKind, rawInput, hasMergedResult, event.mergedResult]);
+
   const handleClick = () => {
     if (isDelegate && onDelegateClick) {
-      // For delegates, clicking the main card scrolls to delegation
-      // but we add a small "details" area for the modal
       onDelegateClick();
     } else {
       onClick();
     }
   };
 
+  const handlePreviewToggle = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setShowPreview(!showPreview);
+  };
+
   return (
-    <div
-      className={`
-        group flex items-center gap-2 px-3 py-1.5 rounded-md cursor-pointer
-        transition-all duration-200
-        bg-cyber-surface/60 border border-cyber-border/50
-        hover:bg-cyber-surface hover:border-cyber-cyan/40 hover:shadow-[0_0_10px_rgba(0,255,249,0.15)]
-        ${isDelegate ? 'border-l-2 border-l-cyber-purple' : ''}
-        ${isFailed ? 'border-l-2 border-l-cyber-orange' : ''}
-      `}
-      onClick={handleClick}
-    >
-      {/* Icon */}
-      <span className="text-base flex-shrink-0" title={summary.name}>
-        {summary.icon}
-      </span>
+    <div className="rounded-md border border-cyber-border/50 overflow-hidden">
+      {/* Summary row */}
+      <div
+        className={`
+          group flex items-center gap-2 px-3 py-1.5 cursor-pointer
+          transition-all duration-200
+          bg-cyber-surface/60
+          hover:bg-cyber-surface hover:border-cyber-cyan/40
+          ${isDelegate ? 'border-l-2 border-l-cyber-purple' : ''}
+          ${isFailed ? 'border-l-2 border-l-cyber-orange' : ''}
+        `}
+        onClick={handleClick}
+      >
+        {/* Preview toggle for tools with inline preview */}
+        {hasInlinePreview && previewData && (
+          <button
+            onClick={handlePreviewToggle}
+            className="flex-shrink-0 p-0.5 rounded hover:bg-cyber-bg/50 text-gray-400 hover:text-cyber-cyan transition-colors"
+            title={showPreview ? 'Hide preview' : 'Show preview'}
+          >
+            {showPreview ? (
+              <ChevronDown className="w-3.5 h-3.5" />
+            ) : (
+              <Eye className="w-3.5 h-3.5" />
+            )}
+          </button>
+        )}
 
-      {/* Summary text */}
-      <span className="flex-1 text-xs text-gray-300 truncate font-mono">
-        {summary.keyParam ? (
-          <>
+        {/* Icon */}
+        <span className="text-base flex-shrink-0" title={summary.name}>
+          {summary.icon}
+        </span>
+
+        {/* Summary text */}
+        <span className="flex-1 text-xs text-gray-300 truncate font-mono">
+          {summary.keyParam ? (
+            <>
+              <span className="text-cyber-cyan">{summary.name}</span>
+              <span className="text-gray-500">: </span>
+              <span className="text-gray-400">{summary.keyParam}</span>
+            </>
+          ) : (
             <span className="text-cyber-cyan">{summary.name}</span>
-            <span className="text-gray-500">: </span>
-            <span className="text-gray-400">{summary.keyParam}</span>
-          </>
-        ) : (
-          <span className="text-cyber-cyan">{summary.name}</span>
-        )}
-      </span>
-
-      {/* Diff stats badge */}
-      {summary.diffStats && (summary.diffStats.additions > 0 || summary.diffStats.deletions > 0) && (
-        <span className="flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyber-bg/80 border border-cyber-border/50">
-          <span className="text-cyber-lime">+{summary.diffStats.additions}</span>
-          <span className="text-gray-500 mx-0.5">/</span>
-          <span className="text-cyber-magenta">-{summary.diffStats.deletions}</span>
+          )}
         </span>
-      )}
 
-      {/* Status indicator */}
-      <span className="flex-shrink-0">
-        {isInProgress && (
-          <Loader className="w-3.5 h-3.5 text-cyber-purple animate-spin" />
+        {/* Diff stats badge */}
+        {summary.diffStats && (summary.diffStats.additions > 0 || summary.diffStats.deletions > 0) && (
+          <span className="flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyber-bg/80 border border-cyber-border/50">
+            <span className="text-cyber-lime">+{summary.diffStats.additions}</span>
+            <span className="text-gray-500 mx-0.5">/</span>
+            <span className="text-cyber-magenta">-{summary.diffStats.deletions}</span>
+          </span>
         )}
-        {isCompleted && (
-          <CheckCircle className="w-3.5 h-3.5 text-cyber-lime" />
-        )}
-        {isFailed && (
-          <XCircle className="w-3.5 h-3.5 text-cyber-orange" />
-        )}
-      </span>
 
-      {/* Expand indicator */}
-      <ChevronRight className="w-3.5 h-3.5 text-gray-500 group-hover:text-cyber-cyan transition-colors flex-shrink-0" />
+        {/* Shell exit code badge (inline) */}
+        {isShell && previewData?.type === 'shell' && previewData.exitCode !== undefined && (
+          <span className={`flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyber-bg/80 border border-cyber-border/50 ${
+            previewData.exitCode === 0 ? 'text-cyber-lime' : 'text-cyber-orange'
+          }`}>
+            exit {previewData.exitCode}
+          </span>
+        )}
 
-      {/* Delegate link indicator */}
-      {isDelegate && (
-        <span
-          className="flex-shrink-0 text-[9px] uppercase tracking-wider text-cyber-purple px-1.5 py-0.5 rounded bg-cyber-purple/10 border border-cyber-purple/30"
-          onClick={(e) => {
-            e.stopPropagation();
-            onClick(); // Show modal for delegate details
-          }}
+        {/* Status indicator */}
+        <span className="flex-shrink-0">
+          {isInProgress && (
+            <Loader className="w-3.5 h-3.5 text-cyber-purple animate-spin" />
+          )}
+          {isCompleted && (
+            <CheckCircle className="w-3.5 h-3.5 text-cyber-lime" />
+          )}
+          {isFailed && (
+            <XCircle className="w-3.5 h-3.5 text-cyber-orange" />
+          )}
+        </span>
+
+        {/* Expand indicator */}
+        <ChevronRight className="w-3.5 h-3.5 text-gray-500 group-hover:text-cyber-cyan transition-colors flex-shrink-0" />
+
+        {/* Delegate link indicator */}
+        {isDelegate && (
+          <span
+            className="flex-shrink-0 text-[9px] uppercase tracking-wider text-cyber-purple px-1.5 py-0.5 rounded bg-cyber-purple/10 border border-cyber-purple/30"
+            onClick={(e) => {
+              e.stopPropagation();
+              onClick(); // Show modal for delegate details
+            }}
+          >
+            details
+          </span>
+        )}
+      </div>
+
+      {/* Inline preview */}
+      {showPreview && previewData && (
+        <div
+          className="border-t border-cyber-border/30 bg-cyber-bg/30 max-h-64 overflow-auto cursor-pointer"
+          onClick={handleClick}
+          title="Click for full details"
         >
-          details
-        </span>
+          {previewData.type === 'diff' && previewData.patch && (
+            <div className="event-diff-container m-0 border-0 text-[11px]">
+              <PatchDiff
+                patch={previewData.patch}
+                options={{
+                  theme: 'pierre-dark',
+                  themeType: 'dark',
+                  diffStyle: 'split',
+                  diffIndicators: 'bars',
+                  lineDiffType: 'word-alt',
+                  overflow: 'wrap',
+                  disableLineNumbers: false,
+                  useCSSClasses: true,
+                  disableBackground: true,
+                }}
+              />
+            </div>
+          )}
+          {previewData.type === 'shell' && (
+            <div className="px-3 py-2 font-mono text-[11px] max-h-32 overflow-auto">
+              {previewData.stdout && (
+                <pre className="whitespace-pre-wrap break-words text-gray-300 leading-tight">
+                  {truncateOutput(previewData.stdout, 500)}
+                </pre>
+              )}
+              {previewData.stderr && (
+                <pre className="whitespace-pre-wrap break-words text-cyber-orange/70 leading-tight mt-1">
+                  {truncateOutput(previewData.stderr, 300)}
+                </pre>
+              )}
+              {!previewData.stdout && !previewData.stderr && (
+                <span className="text-gray-500 italic text-[10px]">No output</span>
+              )}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
 });
+
+// Build diff preview data for edit/patch tools
+type DiffPreviewData = { type: 'diff'; patch: string | null };
+type ShellPreviewData = { type: 'shell'; stdout?: string; stderr?: string; exitCode?: number };
+type PreviewData = DiffPreviewData | ShellPreviewData;
+
+function buildDiffPreview(toolKind: string | undefined, input: Record<string, unknown>): PreviewData | null {
+  const normalized = (toolKind || '').toLowerCase().replace(/^mcp_/, '');
+  
+  if (normalized === 'edit') {
+    const filePath = (input.filePath || input.file_path || input.path || 'file') as string;
+    const oldString = String(input.oldString || input.old_string || '');
+    const newString = String(input.newString || input.new_string || '');
+    
+    if (oldString || newString) {
+      const normalizedPath = filePath.replace(/^\/+/, '') || 'file';
+      const oldLines = oldString.split('\n').length;
+      const newLines = newString.split('\n').length;
+      const oldBlock = oldString.split('\n').map(line => `-${line}`).join('\n');
+      const newBlock = newString.split('\n').map(line => `+${line}`).join('\n');
+      const patch = [
+        `diff --git a/${normalizedPath} b/${normalizedPath}`,
+        `--- a/${normalizedPath}`,
+        `+++ b/${normalizedPath}`,
+        `@@ -1,${oldLines} +1,${newLines} @@`,
+        oldBlock,
+        newBlock,
+      ].join('\n');
+      return { type: 'diff', patch };
+    }
+  }
+  
+  if (normalized === 'apply_patch') {
+    const patch = typeof input.patch === 'string' ? input.patch : null;
+    // Also check nested arguments
+    if (!patch && input.arguments) {
+      const args = parseJsonMaybe(input.arguments);
+      if (args?.patch) return { type: 'diff', patch: args.patch };
+    }
+    return { type: 'diff', patch };
+  }
+  
+  return null;
+}
+
+// Build shell output preview
+function buildShellPreview(resultEvent: EventItem): PreviewData | null {
+  const rawOutput = resultEvent.toolCall?.raw_output ?? resultEvent.content;
+  const parsed = parseJsonMaybe(rawOutput);
+  
+  const stdout = typeof parsed?.stdout === 'string' ? parsed.stdout : '';
+  const stderr = typeof parsed?.stderr === 'string' ? parsed.stderr : '';
+  const exitCode = typeof parsed?.exit_code === 'number' ? parsed.exit_code : undefined;
+  
+  return { type: 'shell', stdout, stderr, exitCode };
+}
+
+// Truncate long output for preview
+function truncateOutput(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen) + '\n… (truncated)';
+}
 
 // Helper: parse tool name from event
 function inferToolName(event: EventItem): string | undefined {

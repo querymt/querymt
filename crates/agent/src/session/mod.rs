@@ -10,6 +10,18 @@ pub mod sqlite_storage;
 pub use sqlite_storage::SqliteStorage;
 pub mod store;
 
+// Compaction system (3-layer)
+pub mod compaction;
+pub mod pruning;
+pub use compaction::{
+    CompactionResult, RetryConfig as CompactionRetryConfig, SessionCompaction,
+    filter_to_effective_history, get_last_compaction, has_compaction,
+};
+pub use pruning::{
+    PrunableToolResult, PruneAnalysis, PruneConfig, SimpleTokenEstimator, TokenEstimator,
+    compute_prune_candidates,
+};
+
 // Storage backend abstraction
 pub mod backend;
 pub use backend::StorageBackend;

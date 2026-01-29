@@ -24,11 +24,31 @@ tools = [
     "search_text"
 ]
 
-# System prompt (inline)
+# System prompt - can be a string, array of strings, or mixed with file references:
+#   system = "inline prompt"
+#   system = ["part1", "part2"]
+#   system = ["inline", { file = "prompts/assistant.md" }]
 system = "You are a helpful coding assistant."
 
-# Or load from file (mutually exclusive with system)
-# system_file = "prompts/assistant.md"
+# Optional: Middleware for advanced behavior
+# Uncomment to enable plan mode (read-only observation and planning)
+# [[middleware]]
+# type = "plan_mode"
+# enabled = true
+# reminder = "You are in plan mode. Only observe, analyze, and plan. Do not make changes."
+
+# Uncomment to enable context management with auto-compaction
+# [[middleware]]
+# type = "context"
+# warn_at_percent = 80
+# auto_compact = true
+# fallback_max_tokens = 64000
+
+# Uncomment to enable duplicate code detection
+# [[middleware]]
+# type = "dedup_check"
+# threshold = 0.85
+# min_lines = 5
 
 # Optional: MCP servers for external tools
 # [[mcp]]

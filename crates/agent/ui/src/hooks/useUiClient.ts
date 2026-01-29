@@ -12,6 +12,7 @@ import {
   FileIndexEntry,
   ModelEntry,
   LlmConfigDetails,
+  SessionLimits,
 } from '../types';
 
 // Callback type for file index updates
@@ -39,6 +40,7 @@ export function useUiClient() {
     Record<string, { status: 'building' | 'ready' | 'error'; message?: string | null }>
   >({});
   const [llmConfigCache, setLlmConfigCache] = useState<Record<number, LlmConfigDetails>>({});
+  const [sessionLimits, setSessionLimits] = useState<SessionLimits | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const fileIndexCallbackRef = useRef<FileIndexCallback | null>(null);
   const fileIndexErrorCallbackRef = useRef<FileIndexErrorCallback | null>(null);
@@ -101,6 +103,7 @@ export function useUiClient() {
           setSessionId(msg.session_id);
           setEvents([]); // Clear events for fresh session
           setSessionAudit(null); // Clear audit data
+          setSessionLimits(null); // Clear session limits, will be set by session_configured event
         }
         break;
       case 'event': {
@@ -134,6 +137,9 @@ export function useUiClient() {
         } else if (eventKind === 'error') {
           // Reset thinking state on error - the agent has stopped processing
           setThinkingAgentId(null);
+        } else if (eventKind === 'cancelled') {
+          // Reset thinking state on cancel - the agent has been stopped by user
+          setThinkingAgentId(null);
         }
         const translated = translateAgentEvent(msg.agent_id, msg.event);
         if (eventKind === 'provider_changed') {
@@ -145,6 +151,10 @@ export function useUiClient() {
               contextLimit: msg.event?.kind?.context_limit,
             },
           }));
+        }
+        // Extract session limits from session_configured event
+        if (eventKind === 'session_configured' && msg.event?.kind?.limits) {
+          setSessionLimits(msg.event.kind.limits);
         }
         setEvents((prev) => [...prev, translated]);
         break;
@@ -181,13 +191,32 @@ export function useUiClient() {
         const flatSessions = msg.groups.flatMap(g => g.sessions);
         setSessionHistory(flatSessions);
         break;
-      case 'session_loaded':
+      case 'session_loaded': {
         setSessionId(msg.session_id);
         // Reset thinking state - loaded sessions are historical, not actively running
         setThinkingAgentId(null);
         setIsConversationComplete(false);
-        // Translate events from full audit view
-        const loadedEvents = msg.audit.events.map(event => translateLoadedEvent(activeAgentId, event));
+        
+        // Build session → agent mapping from session_forked events
+        // This ensures child session events get the correct agent ID
+        const sessionAgentMap = new Map<string, string>();
+        sessionAgentMap.set(msg.session_id, activeAgentId); // parent session → primary agent
+        
+        for (const event of msg.audit.events) {
+          if (event.kind.type === 'session_forked' && event.kind.origin === 'delegation') {
+            const childSessionId = (event.kind as any).child_session_id;
+            const targetAgentId = (event.kind as any).target_agent_id;
+            if (childSessionId && targetAgentId) {
+              sessionAgentMap.set(childSessionId, targetAgentId);
+            }
+          }
+        }
+        
+        // Translate events using the correct agent ID per session
+        const loadedEvents = msg.audit.events.map(event => {
+          const agentId = sessionAgentMap.get(event.session_id) ?? activeAgentId;
+          return translateLoadedEvent(agentId, event);
+        });
         setEvents(loadedEvents);
         const lastProviderEvent = [...loadedEvents]
           .reverse()
@@ -205,6 +234,7 @@ export function useUiClient() {
         // Store full audit for stats (tasks, artifacts, decisions, etc.)
         setSessionAudit(msg.audit);
         break;
+      }
       case 'workspace_index_status':
         setWorkspaceIndexStatus(prev => ({
           ...prev,
@@ -347,6 +377,7 @@ export function useUiClient() {
     workspaceIndexStatus,
     llmConfigCache,
     requestLlmConfig,
+    sessionLimits,
   };
 }
 
@@ -422,6 +453,7 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       cumulativeCostUsd: event.kind?.cumulative_cost_usd,
       contextTokens: event.kind?.context_tokens,
       finishReason: event.kind?.finish_reason,
+      metrics: event.kind?.metrics,
     };
   }
 
@@ -433,6 +465,9 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       content: `Event: delegation_requested`,
       timestamp,
       delegationId: event.kind?.delegation?.public_id,
+      delegationTargetAgentId: event.kind?.delegation?.target_agent_id,
+      delegationObjective: event.kind?.delegation?.objective,
+      delegationEventType: 'requested',
     };
   }
 
@@ -444,6 +479,19 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       content: `Event: delegation_completed`,
       timestamp,
       delegationId: event.kind?.delegation_id,
+      delegationEventType: 'completed',
+    };
+  }
+
+  if (kind === 'delegation_failed') {
+    return {
+      id,
+      agentId,
+      type: 'agent',
+      content: `Event: delegation_failed`,
+      timestamp,
+      delegationId: event.kind?.delegation_id,
+      delegationEventType: 'failed',
     };
   }
 
@@ -572,6 +620,7 @@ function translateLoadedEvent(agentId: string, event: AgentEvent): EventItem {
       cumulative_cost_usd?: number;
       context_tokens?: number;
       finish_reason?: string;
+      metrics?: { steps: number; turns: number };
     };
     return {
       id,
@@ -584,13 +633,14 @@ function translateLoadedEvent(agentId: string, event: AgentEvent): EventItem {
       cumulativeCostUsd: llmRequestEnd.cumulative_cost_usd,
       contextTokens: llmRequestEnd.context_tokens,
       finishReason: llmRequestEnd.finish_reason,
+      metrics: llmRequestEnd.metrics,
     };
   }
 
   if (kind.type === 'delegation_requested') {
     const delegationRequested = kind as {
       type: 'delegation_requested';
-      delegation?: { public_id?: string };
+      delegation?: { public_id?: string; target_agent_id?: string; objective?: string };
     };
     return {
       id,
@@ -599,6 +649,9 @@ function translateLoadedEvent(agentId: string, event: AgentEvent): EventItem {
       content: `Event: delegation_requested`,
       timestamp,
       delegationId: delegationRequested.delegation?.public_id,
+      delegationTargetAgentId: delegationRequested.delegation?.target_agent_id,
+      delegationObjective: delegationRequested.delegation?.objective,
+      delegationEventType: 'requested',
     };
   }
 
@@ -614,6 +667,23 @@ function translateLoadedEvent(agentId: string, event: AgentEvent): EventItem {
       content: `Event: delegation_completed`,
       timestamp,
       delegationId: delegationCompleted.delegation_id,
+      delegationEventType: 'completed',
+    };
+  }
+
+  if (kind.type === 'delegation_failed') {
+    const delegationFailed = kind as {
+      type: 'delegation_failed';
+      delegation_id?: string;
+    };
+    return {
+      id,
+      agentId,
+      type: 'agent',
+      content: `Event: delegation_failed`,
+      timestamp,
+      delegationId: delegationFailed.delegation_id,
+      delegationEventType: 'failed',
     };
   }
 
@@ -635,6 +705,26 @@ function translateLoadedEvent(agentId: string, event: AgentEvent): EventItem {
       model: providerChanged.model,
       contextLimit: providerChanged.context_limit,
       configId: providerChanged.config_id,
+    };
+  }
+
+  if (kind.type === 'middleware_stopped') {
+    const middlewareStopped = kind as {
+      type: 'middleware_stopped';
+      stop_type?: string;
+      reason?: string;
+      metrics?: { steps: number; turns: number };
+    };
+    return {
+      id,
+      agentId,
+      type: 'system',
+      content: middlewareStopped.reason ?? 'Execution stopped',
+      timestamp,
+      isMessage: true,
+      stopType: middlewareStopped.stop_type as import('../types').StopType,
+      stopReason: middlewareStopped.reason,
+      stopMetrics: middlewareStopped.metrics,
     };
   }
 

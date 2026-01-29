@@ -253,6 +253,12 @@ pub struct SessionListItem {
     pub created_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub updated_at: Option<OffsetDateTime>,
+    /// Public ID of the parent session (if this is a child session)
+    pub parent_session_id: Option<String>,
+    /// Fork origin: "user" or "delegation"
+    pub fork_origin: Option<String>,
+    /// Whether this session has child sessions
+    pub has_children: bool,
 }
 
 /// Group of sessions by CWD

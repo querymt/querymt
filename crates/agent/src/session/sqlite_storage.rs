@@ -146,9 +146,12 @@ impl SessionStore for SqliteStorage {
         &self,
         name: Option<String>,
         cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<String>,
+        fork_origin: Option<ForkOrigin>,
     ) -> SessionResult<Session> {
         let repo = SqliteSessionRepository::new(self.conn.clone());
-        repo.create_session(name, cwd).await
+        repo.create_session(name, cwd, parent_session_id, fork_origin)
+            .await
     }
 
     async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>> {
@@ -757,6 +760,89 @@ impl SessionStore for SqliteStorage {
         let repo = SqliteDelegationRepository::new(self.conn.clone());
         repo.update_delegation(delegation).await
     }
+
+    async fn mark_tool_results_compacted(
+        &self,
+        session_id: &str,
+        call_ids: &[String],
+    ) -> SessionResult<usize> {
+        if call_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+        let call_ids_owned: Vec<String> = call_ids.to_vec();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+        self.run_blocking(move |conn| {
+            let tx = conn.transaction()?;
+            let mut total_updated = 0;
+
+            // Get all message_parts for this session that are ToolResult type
+            // Collect into Vec first to avoid borrowing issues with stmt/tx
+            let parts_to_update: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT mp.id, mp.content_json 
+                     FROM message_parts mp 
+                     INNER JOIN messages m ON mp.message_id = m.id 
+                     WHERE m.session_id = ? AND mp.part_type = 'tool_result'",
+                )?;
+
+                stmt.query_map(params![session_internal_id], |row| {
+                    let part_id: i64 = row.get(0)?;
+                    let content_json: String = row.get(1)?;
+                    Ok((part_id, content_json))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+            };
+
+            // Update each matching part
+            for (part_id, content_json) in parts_to_update {
+                // Parse the JSON to check if this is a matching call_id
+                let mut part: serde_json::Value = serde_json::from_str(&content_json)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+                // Check if the call_id matches one we want to compact
+                let call_id = part
+                    .get("data")
+                    .and_then(|d| d.get("call_id"))
+                    .and_then(|v| v.as_str());
+
+                if let Some(cid) = call_id
+                    && call_ids_owned.contains(&cid.to_string())
+                {
+                    // Check if not already compacted
+                    let already_compacted = part
+                        .get("data")
+                        .and_then(|d| d.get("compacted_at"))
+                        .map(|v| !v.is_null())
+                        .unwrap_or(false);
+
+                    if !already_compacted {
+                        // Update the compacted_at field
+                        if let Some(data) = part.get_mut("data")
+                            && let Some(obj) = data.as_object_mut()
+                        {
+                            obj.insert("compacted_at".to_string(), serde_json::json!(now));
+                        }
+
+                        let updated_json = serde_json::to_string(&part)
+                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+                        tx.execute(
+                            "UPDATE message_parts SET content_json = ? WHERE id = ?",
+                            params![updated_json, part_id],
+                        )?;
+                        total_updated += 1;
+                    }
+                }
+            }
+
+            tx.commit()?;
+            Ok(total_updated)
+        })
+        .await
+    }
 }
 
 // ============================================================================
@@ -865,7 +951,18 @@ impl EventStore for SqliteStorage {
 #[async_trait]
 impl ViewStore for SqliteStorage {
     async fn get_audit_view(&self, session_id: &str) -> SessionResult<AuditView> {
-        let events = self.get_session_events(session_id).await?;
+        let mut events = self.get_session_events(session_id).await?;
+
+        // Include child session events (delegations)
+        let session_repo = SqliteSessionRepository::new(self.conn.clone());
+        let child_session_ids = session_repo.list_child_sessions(session_id).await?;
+        for child_id in &child_session_ids {
+            let child_events = self.get_session_events(child_id).await?;
+            events.extend(child_events);
+        }
+
+        // Sort by sequence number for correct chronological order
+        events.sort_by_key(|e| e.seq);
 
         let task_repo = SqliteTaskRepository::new(self.conn.clone());
         let intent_repo = SqliteIntentRepository::new(self.conn.clone());
@@ -1014,7 +1111,7 @@ impl ViewStore for SqliteStorage {
         &self,
         filter: Option<SessionListFilter>,
     ) -> SessionResult<SessionListView> {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
 
         let session_repo = SqliteSessionRepository::new(self.conn.clone());
         let intent_repo = SqliteIntentRepository::new(self.conn.clone());
@@ -1036,24 +1133,52 @@ impl ViewStore for SqliteStorage {
 
         let total_count = sessions.len();
 
-        // Build session list items with titles
+        // Build a map of internal ID -> public ID for parent resolution
+        let mut id_to_public_id: HashMap<i64, String> = HashMap::new();
+        for session in &sessions {
+            id_to_public_id.insert(session.id, session.public_id.clone());
+        }
+
+        // Build a set of sessions that have children
+        let mut sessions_with_children: HashSet<String> = HashSet::new();
+        for session in &sessions {
+            if let Some(parent_id) = session.parent_session_id
+                && let Some(parent_public_id) = id_to_public_id.get(&parent_id)
+            {
+                sessions_with_children.insert(parent_public_id.clone());
+            }
+        }
+
+        // Build session list items with titles and hierarchy info
         let mut items = Vec::with_capacity(sessions.len());
 
         for session in sessions {
             // Get latest intent snapshot for title
-            let title = match intent_repo
+            // Intent snapshots now contain clean user text (no attachments)
+            let title = intent_repo
                 .get_current_intent_snapshot(&session.public_id)
                 .await
-            {
-                Ok(Some(intent)) => Some(intent.summary),
-                _ => {
-                    // Fallback: try to get first user message as excerpt
-                    self.get_first_user_message_excerpt(&session.public_id)
-                        .await
-                        .ok()
-                        .flatten()
-                }
-            };
+                .ok()
+                .flatten()
+                .map(|intent| {
+                    // Truncate to reasonable display length (80 chars)
+                    if intent.summary.len() > 80 {
+                        format!("{}...", &intent.summary[..77])
+                    } else {
+                        intent.summary
+                    }
+                });
+
+            // Resolve parent_session_id from internal ID to public ID
+            let parent_session_id = session
+                .parent_session_id
+                .and_then(|parent_id| id_to_public_id.get(&parent_id).cloned());
+
+            // Check if this session has children
+            let has_children = sessions_with_children.contains(&session.public_id);
+
+            // Convert fork_origin to string
+            let fork_origin = session.fork_origin.map(|fo| fo.to_string());
 
             items.push(SessionListItem {
                 session_id: session.public_id,
@@ -1062,12 +1187,62 @@ impl ViewStore for SqliteStorage {
                 title,
                 created_at: session.created_at,
                 updated_at: session.updated_at,
+                parent_session_id,
+                fork_origin,
+                has_children,
             });
+        }
+
+        // Build a parent-child map to organize sessions hierarchically
+        let mut parent_children_map: HashMap<String, Vec<SessionListItem>> = HashMap::new();
+        let mut root_sessions: Vec<SessionListItem> = Vec::new();
+
+        for item in items {
+            if let Some(ref parent_id) = item.parent_session_id {
+                parent_children_map
+                    .entry(parent_id.clone())
+                    .or_default()
+                    .push(item);
+            } else {
+                root_sessions.push(item);
+            }
+        }
+
+        // Recursively attach children to their parents
+        fn attach_children(
+            session: &mut SessionListItem,
+            children_map: &HashMap<String, Vec<SessionListItem>>,
+        ) -> Vec<SessionListItem> {
+            let mut all_sessions = vec![session.clone()];
+
+            if let Some(children) = children_map.get(&session.session_id) {
+                for mut child in children.clone() {
+                    let child_descendants = attach_children(&mut child, children_map);
+                    all_sessions.extend(child_descendants);
+                }
+            }
+
+            all_sessions
+        }
+
+        // Flatten hierarchy while maintaining parent-child order
+        // Filter out delegated child sessions to prevent empty groups
+        let mut flat_items = Vec::new();
+        for mut root in root_sessions {
+            let sessions_with_descendants = attach_children(&mut root, &parent_children_map);
+            for session in sessions_with_descendants {
+                // Only include parent sessions or non-delegated children
+                let is_delegated_child = session.parent_session_id.is_some()
+                    && session.fork_origin.as_deref() == Some("delegation");
+                if !is_delegated_child {
+                    flat_items.push(session);
+                }
+            }
         }
 
         // Group by CWD
         let mut groups_map: HashMap<Option<String>, Vec<SessionListItem>> = HashMap::new();
-        for item in items {
+        for item in flat_items {
             groups_map.entry(item.cwd.clone()).or_default().push(item);
         }
 
@@ -1126,42 +1301,7 @@ impl ViewStore for SqliteStorage {
 // ============================================================================
 // Helper methods for SqliteStorage
 // ============================================================================
-
-impl SqliteStorage {
-    /// Get first user message excerpt for session title fallback
-    async fn get_first_user_message_excerpt(
-        &self,
-        session_id: &str,
-    ) -> SessionResult<Option<String>> {
-        let conn = self.conn.clone();
-        let session_id = session_id.to_string();
-
-        tokio::task::spawn_blocking(move || -> SessionResult<Option<String>> {
-            let conn = conn.lock().map_err(|e| {
-                SessionError::DatabaseError(format!("Failed to lock connection: {}", e))
-            })?;
-
-            let result: Option<String> = conn.query_row(
-                "SELECT content FROM events WHERE session_id = ? AND kind = 'prompt_received' ORDER BY seq ASC LIMIT 1",
-                params![&session_id],
-                |row| row.get::<_, String>(0),
-            ).optional().map_err(|e| {
-                SessionError::DatabaseError(format!("Failed to query first user message: {}", e))
-            })?;
-
-            Ok(result.map(|content: String| {
-                // Truncate to ~60 characters for display
-                if content.len() > 60 {
-                    format!("{}...", &content[..60])
-                } else {
-                    content
-                }
-            }))
-        })
-        .await
-        .map_err(|e| SessionError::DatabaseError(format!("Task join error: {}", e)))?
-    }
-}
+// (No fallback needed - intent snapshots now contain clean user text)
 
 /// Evaluate a filter expression against a session
 fn evaluate_session_filter(session: &Session, expr: &FilterExpr) -> bool {

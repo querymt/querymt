@@ -1,9 +1,9 @@
+use crate::events::StopType;
 use crate::middleware::factory::MiddlewareFactory;
 use crate::middleware::{
     AgentStats, ConversationContext, ExecutionState, MiddlewareDriver, Result,
 };
 use crate::model_info::{ModelInfoSource, get_model_info};
-use agent_client_protocol::StopReason;
 use async_trait::async_trait;
 use log::{debug, trace};
 use querymt::providers::ModelPricing;
@@ -173,8 +173,8 @@ impl MiddlewareDriver for LimitsMiddleware {
                         context.stats.steps, max_steps
                     );
                     return Ok(ExecutionState::Stopped {
-                        reason: StopReason::MaxTurnRequests,
                         message: format!("Max steps ({}) reached", max_steps).into(),
+                        stop_type: StopType::StepLimit,
                     });
                 }
 
@@ -187,8 +187,8 @@ impl MiddlewareDriver for LimitsMiddleware {
                         max_turns
                     );
                     return Ok(ExecutionState::Stopped {
-                        reason: StopReason::MaxTurnRequests,
                         message: format!("Turn limit ({}) reached", max_turns).into(),
+                        stop_type: StopType::TurnLimit,
                     });
                 }
 
@@ -201,12 +201,12 @@ impl MiddlewareDriver for LimitsMiddleware {
                         total_cost, max_price
                     );
                     return Ok(ExecutionState::Stopped {
-                        reason: StopReason::MaxTokens,
                         message: format!(
                             "Price limit exceeded: ${:.4} > ${:.2}",
                             total_cost, max_price
                         )
                         .into(),
+                        stop_type: StopType::PriceLimit,
                     });
                 }
 
@@ -224,6 +224,14 @@ impl MiddlewareDriver for LimitsMiddleware {
 
     fn name(&self) -> &'static str {
         "LimitsMiddleware"
+    }
+
+    fn get_limits(&self) -> Option<crate::events::SessionLimits> {
+        Some(crate::events::SessionLimits {
+            max_steps: self.config.max_steps,
+            max_turns: self.config.max_turns,
+            max_cost_usd: self.config.max_price_usd,
+        })
     }
 }
 
@@ -261,8 +269,8 @@ impl MiddlewareDriver for MaxStepsMiddleware {
                         current_steps, self.max_steps
                     );
                     Ok(ExecutionState::Stopped {
-                        reason: StopReason::MaxTurnRequests,
                         message: format!("Max steps ({}) reached", self.max_steps).into(),
+                        stop_type: StopType::StepLimit,
                     })
                 } else {
                     trace!("MaxStepsMiddleware: allowing execution to continue");
@@ -285,6 +293,14 @@ impl MiddlewareDriver for MaxStepsMiddleware {
 
     fn name(&self) -> &'static str {
         "MaxStepsMiddleware"
+    }
+
+    fn get_limits(&self) -> Option<crate::events::SessionLimits> {
+        Some(crate::events::SessionLimits {
+            max_steps: Some(self.max_steps),
+            max_turns: None,
+            max_cost_usd: None,
+        })
     }
 }
 
@@ -325,8 +341,8 @@ impl MiddlewareDriver for TurnLimitMiddleware {
                         current_turns, self.max_turns
                     );
                     Ok(ExecutionState::Stopped {
-                        reason: StopReason::MaxTurnRequests,
                         message: format!("Turn limit ({}) reached", self.max_turns).into(),
+                        stop_type: StopType::TurnLimit,
                     })
                 } else {
                     trace!("TurnLimitMiddleware: allowing execution to continue");
@@ -349,6 +365,14 @@ impl MiddlewareDriver for TurnLimitMiddleware {
 
     fn name(&self) -> &'static str {
         "TurnLimitMiddleware"
+    }
+
+    fn get_limits(&self) -> Option<crate::events::SessionLimits> {
+        Some(crate::events::SessionLimits {
+            max_steps: None,
+            max_turns: Some(self.max_turns),
+            max_cost_usd: None,
+        })
     }
 }
 
@@ -401,12 +425,12 @@ impl MiddlewareDriver for PriceLimitMiddleware {
                         total_cost, self.max_cost
                     );
                     Ok(ExecutionState::Stopped {
-                        reason: StopReason::MaxTokens,
                         message: format!(
                             "Price limit exceeded: ${:.4} > ${:.2}",
                             total_cost, self.max_cost
                         )
                         .into(),
+                        stop_type: StopType::PriceLimit,
                     })
                 } else {
                     trace!(
@@ -432,6 +456,14 @@ impl MiddlewareDriver for PriceLimitMiddleware {
 
     fn name(&self) -> &'static str {
         "PriceLimitMiddleware"
+    }
+
+    fn get_limits(&self) -> Option<crate::events::SessionLimits> {
+        Some(crate::events::SessionLimits {
+            max_steps: None,
+            max_turns: None,
+            max_cost_usd: Some(self.max_cost),
+        })
     }
 }
 
@@ -462,7 +494,7 @@ mod tests {
         assert!(matches!(
             result,
             ExecutionState::Stopped {
-                reason: StopReason::MaxTurnRequests,
+                stop_type: StopType::StepLimit,
                 ..
             }
         ));

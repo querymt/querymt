@@ -1,3 +1,4 @@
+use crate::events::StopType;
 use crate::middleware::{
     AgentStats, CompositeDriver, ConversationContext, ExecutionState, LlmResponse,
     driver::MiddlewareDriver,
@@ -6,7 +7,6 @@ use crate::test_utils::{
     AlwaysStopDriver, BeforeTurnToCallLlmDriver, MessageInjectingDriver, StateRecordingDriver,
     test_context,
 };
-use agent_client_protocol::StopReason;
 use querymt::chat::FinishReason;
 use std::sync::Arc;
 
@@ -103,7 +103,7 @@ async fn test_middleware_can_transform_call_llm() {
 #[tokio::test]
 async fn test_middleware_can_transform_to_stopped() {
     let composite = CompositeDriver::new(vec![Arc::new(AlwaysStopDriver {
-        reason: StopReason::EndTurn,
+        stop_type: StopType::Other,
     })]);
     let context = test_context("sess-1", 0);
     let response = Arc::new(LlmResponse::new(
@@ -196,7 +196,7 @@ async fn test_driver_name_returns_correct_value() {
     assert_eq!(composite.name(), "CompositeDriver");
 
     let driver = AlwaysStopDriver {
-        reason: StopReason::EndTurn,
+        stop_type: StopType::Other,
     };
     assert_eq!(driver.name(), "AlwaysStopDriver");
 }
