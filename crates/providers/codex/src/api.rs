@@ -53,6 +53,9 @@ pub trait CodexProviderConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct CodexToolUseState {
+    /// The Responses API item id (e.g. `fc_...`), used to correlate argument delta/done events.
+    pub item_id: Option<String>,
+    /// The tool call id (e.g. `call_...`), which we surface as `ToolCall.id`.
     pub id: Option<String>,
     pub name: Option<String>,
     pub arguments: String,
@@ -173,6 +176,7 @@ struct CodexSseEvent {
     #[serde(rename = "type")]
     kind: String,
     delta: Option<String>,
+    arguments: Option<String>,
     response: Option<Value>,
     item: Option<Value>,
     output_index: Option<usize>,
@@ -448,6 +452,7 @@ pub fn codex_parse_stream_chunk_with_state(
                 handle_function_call_arguments_done(
                     event.output_index,
                     event.item_id.as_deref(),
+                    event.arguments.as_deref(),
                     &mut results,
                     tool_state_buffer,
                 );
@@ -493,9 +498,9 @@ fn handle_output_item_event(
         return;
     }
 
-    let id = item
+    let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
+    let call_id = item
         .get("call_id")
-        .or_else(|| item.get("id"))
         .and_then(Value::as_str)
         .map(str::to_string);
     let name = item.get("name").and_then(Value::as_str).map(str::to_string);
@@ -507,8 +512,11 @@ fn handle_output_item_event(
     let index = resolve_tool_index(output_index, tool_state_buffer);
     let mut buffer = tool_state_buffer.lock().unwrap();
     let state = buffer.entry(index).or_default();
-    if let Some(id) = id {
-        state.id = Some(id);
+    if let Some(item_id) = item_id {
+        state.item_id = Some(item_id);
+    }
+    if let Some(call_id) = call_id {
+        state.id = Some(call_id);
     }
     if let Some(name) = name {
         state.name = Some(name);
@@ -520,7 +528,11 @@ fn handle_output_item_event(
         results.push(StreamChunk::ToolUseStart { index, id, name });
     }
 
-    if let Some(arguments) = arguments {
+    // `response.output_item.added` typically includes empty arguments; only complete when
+    // the backend provides non-empty JSON arguments (e.g. `response.output_item.done`).
+    if let Some(arguments) = arguments
+        && !arguments.trim().is_empty()
+    {
         emit_arguments_delta(index, &arguments, state, results);
         emit_tool_complete(index, state, results);
     }
@@ -552,6 +564,7 @@ fn handle_function_call_arguments_delta(
 fn handle_function_call_arguments_done(
     output_index: Option<usize>,
     item_id: Option<&str>,
+    arguments: Option<&str>,
     results: &mut Vec<StreamChunk>,
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
 ) {
@@ -563,6 +576,11 @@ fn handle_function_call_arguments_done(
         {
             state.started = true;
             results.push(StreamChunk::ToolUseStart { index, id, name });
+        }
+        if let Some(arguments) = arguments
+            && !arguments.trim().is_empty()
+        {
+            emit_arguments_delta(index, arguments, state, results);
         }
         emit_tool_complete(index, state, results);
     }
@@ -583,9 +601,9 @@ fn emit_tool_calls_from_response(
             continue;
         }
 
+        let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
         let id = item
             .get("call_id")
-            .or_else(|| item.get("id"))
             .and_then(Value::as_str)
             .map(str::to_string);
         let name = item.get("name").and_then(Value::as_str).map(str::to_string);
@@ -594,6 +612,9 @@ fn emit_tool_calls_from_response(
         let index = resolve_tool_index(Some(idx), tool_state_buffer);
         let mut buffer = tool_state_buffer.lock().unwrap();
         let state = buffer.entry(index).or_default();
+        if let Some(item_id) = item_id {
+            state.item_id = Some(item_id);
+        }
         if let Some(id) = id {
             state.id = Some(id);
         }
@@ -680,7 +701,7 @@ fn resolve_tool_index_with_item(
         let buffer = tool_state_buffer.lock().unwrap();
         if let Some((index, _)) = buffer
             .iter()
-            .find(|(_, state)| state.id.as_deref() == Some(item_id))
+            .find(|(_, state)| state.item_id.as_deref() == Some(item_id))
         {
             return *index;
         }
