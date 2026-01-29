@@ -46,6 +46,11 @@ pub struct Codex {
     pub client_version: Option<String>,
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<ToolChoice>,
+    /// Extra body fields to include in the API request (e.g. `store`, `promptCacheKey`).
+    /// These are passed through as-is via `#[serde(flatten)]` in the request body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_body: Option<serde_json::Map<String, Value>>,
+
     /// Internal buffer for streaming tool state (not serialized)
     #[serde(skip)]
     #[schemars(skip)]
@@ -118,6 +123,10 @@ impl api::CodexProviderConfig for Codex {
 
     fn client_version(&self) -> Option<&str> {
         self.client_version.as_deref()
+    }
+
+    fn extra_body(&self) -> Option<serde_json::Map<String, Value>> {
+        self.extra_body.clone()
     }
 }
 

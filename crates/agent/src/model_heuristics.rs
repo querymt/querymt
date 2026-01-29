@@ -77,12 +77,9 @@ impl ModelDefaults {
 
         for (key, value) in &self.provider_options {
             if !obj.contains_key(key) {
-                // Special case: substitute session_id placeholder
-                if value == "__session_id__" {
-                    obj.insert(key.clone(), json!(session_id));
-                } else {
-                    obj.insert(key.clone(), value.clone());
-                }
+                let mut v = value.clone();
+                substitute_session_id(&mut v, session_id);
+                obj.insert(key.clone(), v);
             }
         }
 
@@ -141,6 +138,30 @@ impl ModelDefaults {
             && self.max_tokens.is_none()
             && self.provider_options.is_empty()
         // provider is metadata, not a default value, so don't check it
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session ID placeholder substitution
+// ---------------------------------------------------------------------------
+
+/// Recursively replace `"__session_id__"` string placeholders in a JSON value.
+fn substitute_session_id(value: &mut Value, session_id: &str) {
+    match value {
+        Value::String(s) if s == "__session_id__" => {
+            *value = json!(session_id);
+        }
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                substitute_session_id(v, session_id);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                substitute_session_id(v, session_id);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -227,9 +248,15 @@ fn default_provider_options(provider: &str, model: &str) -> HashMap<String, Valu
     // OpenAI:
     //   - disable request storage by default
     //   - enable prompt caching via session ID.
+    //   These are not part of the OpenAI SDK schema so they must be sent via extra_body.
     if provider == "openai" {
-        opts.insert("store".into(), json!(false));
-        opts.insert("promptCacheKey".into(), json!("__session_id__"));
+        opts.insert(
+            "extra_body".into(),
+            json!({
+                "store": false,
+                "promptCacheKey": "__session_id__"
+            }),
+        );
     }
 
     // Google / Google Vertex: enable thinking output
@@ -252,10 +279,16 @@ fn default_provider_options(provider: &str, model: &str) -> HashMap<String, Valu
     // GPT-5 family heuristics
     if id.contains("gpt-5") && !id.contains("gpt-5-chat") {
         if !id.contains("gpt-5-pro") {
-            opts.insert("reasoningEffort".into(), json!("medium"));
+            let eb = opts.entry("extra_body".into()).or_insert_with(|| json!({}));
+            eb.as_object_mut()
+                .unwrap()
+                .insert("reasoningEffort".into(), json!("medium"));
         }
         if id.contains("gpt-5.") && !id.contains("codex") && provider != "azure" {
-            opts.insert("textVerbosity".into(), json!("low"));
+            let eb = opts.entry("extra_body".into()).or_insert_with(|| json!({}));
+            eb.as_object_mut()
+                .unwrap()
+                .insert("verbosity".into(), json!("medium"));
         }
     }
 
@@ -409,18 +442,17 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_openai_store_false() {
+    fn test_openai_extra_body_store_false() {
         let d = ModelDefaults::for_model("openai", "gpt-4o");
-        assert_eq!(d.provider_options.get("store"), Some(&json!(false)));
+        let extra = d.provider_options.get("extra_body").unwrap();
+        assert_eq!(extra["store"], json!(false));
     }
 
     #[test]
-    fn test_openai_prompt_cache_key() {
+    fn test_openai_extra_body_prompt_cache_key() {
         let d = ModelDefaults::for_model("openai", "gpt-4o");
-        assert_eq!(
-            d.provider_options.get("promptCacheKey"),
-            Some(&json!("__session_id__"))
-        );
+        let extra = d.provider_options.get("extra_body").unwrap();
+        assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
     }
 
     #[test]
@@ -473,40 +505,57 @@ mod tests {
     #[test]
     fn test_gpt5_reasoning_effort() {
         let d = ModelDefaults::for_model("openai", "gpt-5");
-        assert_eq!(
-            d.provider_options.get("reasoningEffort"),
-            Some(&json!("medium"))
-        );
+        let extra = d.provider_options.get("extra_body").unwrap();
+        assert_eq!(extra["reasoningEffort"], json!("medium"));
+        // OpenAI store/promptCacheKey should still be present
+        assert_eq!(extra["store"], json!(false));
+        assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
     }
 
     #[test]
     fn test_gpt5_pro_no_reasoning_effort() {
         let d = ModelDefaults::for_model("openai", "gpt-5-pro");
-        assert_eq!(d.provider_options.get("reasoningEffort"), None);
+        let extra = d.provider_options.get("extra_body").unwrap();
+        assert!(extra.get("reasoningEffort").is_none());
+        // OpenAI defaults should still be present
+        assert_eq!(extra["store"], json!(false));
     }
 
     #[test]
     fn test_gpt5_chat_no_reasoning_effort() {
         let d = ModelDefaults::for_model("openai", "gpt-5-chat");
-        assert_eq!(d.provider_options.get("reasoningEffort"), None);
+        let extra = d.provider_options.get("extra_body").unwrap();
+        assert!(extra.get("reasoningEffort").is_none());
     }
 
     #[test]
-    fn test_gpt5_dot_text_verbosity() {
+    fn test_gpt5_dot_verbosity() {
         let d = ModelDefaults::for_model("openai", "gpt-5.1");
-        assert_eq!(d.provider_options.get("textVerbosity"), Some(&json!("low")));
+        let extra = d.provider_options.get("extra_body").unwrap();
+        assert_eq!(extra["verbosity"], json!("medium"));
+        // Should also have reasoningEffort and OpenAI defaults
+        assert_eq!(extra["reasoningEffort"], json!("medium"));
+        assert_eq!(extra["store"], json!(false));
+        assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
     }
 
     #[test]
-    fn test_gpt5_dot_azure_no_text_verbosity() {
+    fn test_gpt5_dot_azure_no_verbosity() {
         let d = ModelDefaults::for_model("azure", "gpt-5.1");
-        assert_eq!(d.provider_options.get("textVerbosity"), None);
+        let extra = d.provider_options.get("extra_body").unwrap();
+        // Azure doesn't get OpenAI store/promptCacheKey, but does get reasoningEffort
+        assert!(extra.get("verbosity").is_none());
+        assert_eq!(extra["reasoningEffort"], json!("medium"));
     }
 
     #[test]
-    fn test_gpt5_codex_no_text_verbosity() {
+    fn test_gpt5_codex_no_verbosity() {
         let d = ModelDefaults::for_model("openai", "gpt-5-codex");
-        assert_eq!(d.provider_options.get("textVerbosity"), None);
+        let extra = d.provider_options.get("extra_body").unwrap();
+        assert!(extra.get("verbosity").is_none());
+        // But should have reasoningEffort and OpenAI defaults
+        assert_eq!(extra["reasoningEffort"], json!("medium"));
+        assert_eq!(extra["store"], json!(false));
     }
 
     #[test]
@@ -553,31 +602,30 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_to_substitutes_session_id() {
+    fn test_apply_to_substitutes_session_id_in_extra_body() {
         let d = ModelDefaults::for_model("openai", "gpt-4o");
         let mut config = json!({"model": "gpt-4o"});
         d.apply_to(&mut config, "sess-abc-123");
 
-        assert_eq!(config["promptCacheKey"], json!("sess-abc-123"));
+        assert_eq!(
+            config["extra_body"]["promptCacheKey"],
+            json!("sess-abc-123")
+        );
+        assert_eq!(config["extra_body"]["store"], json!(false));
     }
 
     #[test]
-    fn test_apply_to_user_prompt_cache_key_wins() {
+    fn test_apply_to_user_extra_body_wins() {
         let d = ModelDefaults::for_model("openai", "gpt-4o");
-        let mut config = json!({"model": "gpt-4o", "promptCacheKey": "custom-key"});
+        let mut config = json!({
+            "model": "gpt-4o",
+            "extra_body": { "promptCacheKey": "custom-key", "store": true }
+        });
         d.apply_to(&mut config, "sess-abc-123");
 
-        assert_eq!(config["promptCacheKey"], json!("custom-key"));
-    }
-
-    #[test]
-    fn test_apply_to_provider_options_respect_user() {
-        let d = ModelDefaults::for_model("openai", "gpt-4o");
-        let mut config = json!({"model": "gpt-4o", "store": true});
-        d.apply_to(&mut config, "session-1");
-
-        // User's store: true wins over heuristic store: false
-        assert_eq!(config["store"], json!(true));
+        // User's extra_body wins entirely over heuristic extra_body
+        assert_eq!(config["extra_body"]["promptCacheKey"], json!("custom-key"));
+        assert_eq!(config["extra_body"]["store"], json!(true));
     }
 
     #[test]
