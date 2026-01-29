@@ -25,4 +25,5 @@ either.workspace = true
 url.workspace = true
 schemars.workspace = true
 http.workspace = true
+heck = "0.5"
 extism-pdk = { workspace = true, optional = true }

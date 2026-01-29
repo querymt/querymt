@@ -17,7 +17,7 @@ use schemars::{
     schema::{InstanceType, Schema, SchemaObject, SingleOrVec},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
@@ -46,6 +46,9 @@ pub trait CodexProviderConfig {
     fn tools(&self) -> Option<&[Tool]>;
     fn tool_choice(&self) -> Option<&ToolChoice>;
     fn client_version(&self) -> Option<&str>;
+    fn extra_body(&self) -> Option<Map<String, Value>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default)]
