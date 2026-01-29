@@ -57,12 +57,14 @@ impl PlanModeMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for PlanModeMiddleware {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         match state {
-            ExecutionState::BeforeTurn { ref context } if self.enabled.load(Ordering::Relaxed) => {
+            ExecutionState::BeforeLlmCall { ref context }
+                if self.enabled.load(Ordering::Relaxed) =>
+            {
                 trace!("PlanModeMiddleware: injecting reminder message");
                 let new_context = context.inject_message(self.reminder.clone());
-                Ok(ExecutionState::BeforeTurn {
+                Ok(ExecutionState::BeforeLlmCall {
                     context: Arc::new(new_context),
                 })
             }

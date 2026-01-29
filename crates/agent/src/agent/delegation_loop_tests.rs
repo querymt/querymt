@@ -656,7 +656,7 @@ async fn test_delegation_guard_blocks_duplicate() {
         )),
     };
 
-    let result = middleware.next_state(state).await.unwrap();
+    let result = middleware.on_after_llm(state).await.unwrap();
 
     assert!(matches!(
         result,
@@ -730,7 +730,7 @@ async fn test_delegation_guard_blocks_max_retries() {
         )),
     };
 
-    let result = middleware.next_state(state).await.unwrap();
+    let result = middleware.on_after_llm(state).await.unwrap();
 
     assert!(matches!(
         result,

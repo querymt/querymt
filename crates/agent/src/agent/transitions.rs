@@ -64,7 +64,7 @@ impl QueryMTAgent {
             steps = %context.stats.steps
         )
     )]
-    pub(crate) async fn transition_before_turn(
+    pub(crate) async fn transition_before_llm_call(
         &self,
         context: &Arc<ConversationContext>,
         runtime: Option<&SessionRuntime>,
@@ -72,7 +72,7 @@ impl QueryMTAgent {
         session_id: &str,
     ) -> Result<ExecutionState, anyhow::Error> {
         debug!(
-            "BeforeTurn: session={}, steps={}",
+            "BeforeLlmCall: session={}, steps={}",
             session_id, context.stats.steps
         );
 
@@ -303,8 +303,8 @@ impl QueryMTAgent {
                 cumulative_cost_usd: cumulative_cost,
                 context_tokens,
                 metrics: ExecutionMetrics {
-                    steps: context.stats.steps,
-                    turns: context.user_message_count(),
+                    steps: context.stats.steps + 1,
+                    turns: context.stats.turns,
                 },
             },
         );
@@ -440,6 +440,9 @@ impl QueryMTAgent {
         if let Some(token_usage) = &response.usage {
             updated_stats.total_input_tokens += token_usage.input_tokens as u64;
             updated_stats.total_output_tokens += token_usage.output_tokens as u64;
+            updated_stats.reasoning_tokens += token_usage.reasoning_tokens as u64;
+            updated_stats.cache_read_tokens += token_usage.cache_read as u64;
+            updated_stats.cache_write_tokens += token_usage.cache_write as u64;
             updated_stats.context_tokens = calculate_context_tokens(Some(token_usage)) as usize;
             updated_stats.steps += 1;
 
@@ -638,7 +641,7 @@ impl QueryMTAgent {
             });
         }
 
-        Ok(ExecutionState::BeforeTurn {
+        Ok(ExecutionState::BeforeLlmCall {
             context: new_context,
         })
     }
@@ -759,7 +762,7 @@ impl QueryMTAgent {
                         let new_context = self
                             .inject_wait_message(context, runtime_context, session_id, message)
                             .await?;
-                        return Ok(ExecutionState::BeforeTurn {
+                        return Ok(ExecutionState::BeforeLlmCall {
                             context: new_context,
                         });
                     }

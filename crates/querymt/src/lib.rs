@@ -169,7 +169,7 @@ pub struct FunctionCall {
 }
 
 /// Represents the usage of tokens in a tool call, supporting multiple JSON formats.
-#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq, Default)]
 pub struct Usage {
     /// Number of input tokens.
     #[serde(
@@ -187,6 +187,18 @@ pub struct Usage {
         alias = "candidatesTokenCount" // Google
     )]
     pub output_tokens: u32,
+
+    /// Reasoning/thinking output tokens.
+    #[serde(default)]
+    pub reasoning_tokens: u32,
+
+    /// Tokens served from a cached prefix.
+    #[serde(default, alias = "cache_read_input_tokens")]
+    pub cache_read: u32,
+
+    /// Tokens used to create a new cache entry.
+    #[serde(default, alias = "cache_creation_input_tokens")]
+    pub cache_write: u32,
 }
 
 // NOTE: We need this part to be a macro instead two separate function for specific implementations

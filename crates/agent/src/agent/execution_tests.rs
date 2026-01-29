@@ -7,7 +7,7 @@ use crate::session::provider::SessionContext;
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::SessionStore;
 use crate::test_utils::{
-    MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, StopOnBeforeTurn,
+    MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, StopOnBeforeLlmCall,
     TestPluginLoader, TestProviderFactory, mock_llm_config, mock_querymt_tool_call, mock_session,
 };
 use crate::tools::ToolRegistry;
@@ -399,7 +399,7 @@ async fn test_llm_error_returns_err() {
 async fn test_middleware_stops_execution() {
     let mut harness = TestHarness::new(vec![], None).await;
     if let Ok(mut drivers) = harness.agent.middleware_drivers.lock() {
-        drivers.push(Arc::new(StopOnBeforeTurn));
+        drivers.push(Arc::new(StopOnBeforeLlmCall));
     }
     harness
         .provider_mut()

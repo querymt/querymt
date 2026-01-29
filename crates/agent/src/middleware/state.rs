@@ -8,6 +8,7 @@ use crate::model::MessagePart;
 #[derive(Debug, Clone, Default)]
 pub struct AgentStats {
     pub steps: usize,
+    pub turns: usize,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub context_tokens: usize,
@@ -17,6 +18,8 @@ pub struct AgentStats {
     pub input_cost_usd: f64,
     /// Output cost in USD
     pub output_cost_usd: f64,
+    /// Reasoning/thinking output tokens
+    pub reasoning_tokens: u64,
     /// Cache read tokens (for providers that support prompt caching)
     pub cache_read_tokens: u64,
     /// Cache write tokens (for providers that support prompt caching)
@@ -68,10 +71,13 @@ impl AgentStats {
 
 /// Calculate current context size from usage.
 /// Single source of truth for context token calculation.
-/// Returns the sum of input and output tokens, or 0 if no usage provided.
+/// Returns the sum of input, output, reasoning, cache_read and cache_write tokens, or 0 if no usage provided.
 pub fn calculate_context_tokens(usage: Option<&querymt::Usage>) -> u64 {
     usage
-        .map(|u| (u.input_tokens + u.output_tokens) as u64)
+        .map(|u| {
+            (u.input_tokens + u.output_tokens + u.reasoning_tokens + u.cache_read + u.cache_write)
+                as u64
+        })
         .unwrap_or(0)
 }
 
@@ -149,7 +155,7 @@ impl ConversationContext {
 
     /// Returns true if this is the first user turn
     pub fn is_first_turn(&self) -> bool {
-        self.user_message_count() == 1
+        self.stats.turns <= 1
     }
 }
 
@@ -266,7 +272,7 @@ impl WaitCondition {
 #[derive(Debug)]
 pub enum ExecutionState {
     /// Before calling the LLM - middleware can inject messages or stop
-    BeforeTurn { context: Arc<ConversationContext> },
+    BeforeLlmCall { context: Arc<ConversationContext> },
 
     /// Ready to call the LLM with tools
     CallLlm {
@@ -325,7 +331,7 @@ impl ExecutionState {
     /// Returns a human-readable name for the state
     pub fn name(&self) -> &'static str {
         match self {
-            ExecutionState::BeforeTurn { .. } => "BeforeTurn",
+            ExecutionState::BeforeLlmCall { .. } => "BeforeLlmCall",
             ExecutionState::CallLlm { .. } => "CallLlm",
             ExecutionState::AfterLlm { .. } => "AfterLlm",
             ExecutionState::BeforeToolCall { .. } => "BeforeToolCall",
@@ -341,7 +347,7 @@ impl ExecutionState {
     /// Returns the context if this state has one
     pub fn context(&self) -> Option<&Arc<ConversationContext>> {
         match self {
-            ExecutionState::BeforeTurn { context } => Some(context),
+            ExecutionState::BeforeLlmCall { context } => Some(context),
             ExecutionState::CallLlm { context, .. } => Some(context),
             ExecutionState::AfterLlm { context, .. } => Some(context),
             ExecutionState::BeforeToolCall { context, .. } => Some(context),
@@ -389,5 +395,56 @@ mod tests {
             assert_eq!(root_hash, test_hash);
             assert_eq!(changed_paths.summary(), "1 modified");
         }
+    }
+
+    #[test]
+    fn test_calculate_context_tokens_with_reasoning() {
+        // Test with all fields populated
+        let usage = querymt::Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            reasoning_tokens: 20,
+            cache_read: 30,
+            cache_write: 10,
+        };
+
+        // Should sum all: 100 + 50 + 20 + 30 + 10 = 210
+        assert_eq!(calculate_context_tokens(Some(&usage)), 210);
+    }
+
+    #[test]
+    fn test_calculate_context_tokens_no_reasoning() {
+        // Test without reasoning tokens
+        let usage = querymt::Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            reasoning_tokens: 0,
+            cache_read: 0,
+            cache_write: 0,
+        };
+
+        // Should sum: 100 + 50 + 0 + 0 + 0 = 150
+        assert_eq!(calculate_context_tokens(Some(&usage)), 150);
+    }
+
+    #[test]
+    fn test_calculate_context_tokens_with_cache() {
+        // Test with cache but no reasoning
+        let usage = querymt::Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            reasoning_tokens: 0,
+            cache_read: 30,
+            cache_write: 10,
+        };
+
+        // Should sum: 100 + 50 + 0 + 30 + 10 = 190
+        assert_eq!(calculate_context_tokens(Some(&usage)), 190);
+    }
+
+    #[test]
+    fn test_calculate_context_tokens_none() {
+        // Test with None
+        assert_eq!(calculate_context_tokens(None), 0);
     }
 }

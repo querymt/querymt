@@ -156,14 +156,14 @@ impl ContextMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for ContextMiddleware {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         trace!(
-            "ContextMiddleware::next_state entering state: {}",
+            "ContextMiddleware::on_step_start entering state: {}",
             state.name()
         );
 
         match state {
-            ExecutionState::BeforeTurn { ref context } => {
+            ExecutionState::BeforeLlmCall { ref context } => {
                 // Check if provider changed
                 self.check_provider_changed(context);
 
@@ -199,7 +199,7 @@ impl MiddlewareDriver for ContextMiddleware {
                         context.session_id
                     );
                     let new_context = context.inject_message(warning);
-                    return Ok(ExecutionState::BeforeTurn {
+                    return Ok(ExecutionState::BeforeLlmCall {
                         context: Arc::new(new_context),
                     });
                 }
@@ -240,14 +240,14 @@ impl AutoCompactMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for AutoCompactMiddleware {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         trace!(
-            "AutoCompactMiddleware::next_state entering state: {}",
+            "AutoCompactMiddleware::on_step_start entering state: {}",
             state.name()
         );
 
         match state {
-            ExecutionState::BeforeTurn { ref context } => {
+            ExecutionState::BeforeLlmCall { ref context } => {
                 let current_tokens = context.stats.context_tokens;
                 trace!(
                     "AutoCompactMiddleware: current tokens = {}, threshold = {}",
@@ -317,14 +317,14 @@ impl ContextWarningMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for ContextWarningMiddleware {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         trace!(
-            "ContextWarningMiddleware::next_state entering state: {}",
+            "ContextWarningMiddleware::on_step_start entering state: {}",
             state.name()
         );
 
         match state {
-            ExecutionState::BeforeTurn { ref context } => {
+            ExecutionState::BeforeLlmCall { ref context } => {
                 let mut warned = self.warned_sessions.lock().unwrap();
                 if warned.contains(&context.session_id) {
                     trace!(
@@ -352,7 +352,7 @@ impl MiddlewareDriver for ContextWarningMiddleware {
                     );
 
                     let new_context = context.inject_message(warning_message);
-                    Ok(ExecutionState::BeforeTurn {
+                    Ok(ExecutionState::BeforeLlmCall {
                         context: Arc::new(new_context),
                     })
                 } else {

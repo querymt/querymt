@@ -423,7 +423,7 @@ impl QueryMTAgent {
             });
         }
 
-        Ok(ExecutionState::BeforeTurn {
+        Ok(ExecutionState::BeforeLlmCall {
             context: new_context,
         })
     }

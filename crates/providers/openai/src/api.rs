@@ -146,11 +146,54 @@ impl std::fmt::Display for DisplayableFunctionCall {
     }
 }
 
+/// Raw usage response from OpenAI's API, before normalization.
+#[derive(Deserialize, Debug, Clone)]
+struct OpenAIRawUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAIPromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<OpenAICompletionTokensDetails>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+struct OpenAIPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+struct OpenAICompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u32,
+}
+
+impl OpenAIRawUsage {
+    fn into_usage(self) -> Usage {
+        let cache_read = self
+            .prompt_tokens_details
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
+        let reasoning = self
+            .completion_tokens_details
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0);
+        Usage {
+            input_tokens: self.prompt_tokens.saturating_sub(cache_read),
+            output_tokens: self.completion_tokens.saturating_sub(reasoning),
+            reasoning_tokens: reasoning,
+            cache_read,
+            cache_write: 0,
+        }
+    }
+}
+
 /// Response from OpenAI's chat API endpoint.
 #[derive(Deserialize, Debug)]
 struct OpenAIChatResponse {
     choices: Vec<OpenAIChatChoice>,
-    usage: Option<Usage>,
+    usage: Option<OpenAIRawUsage>,
 }
 
 /// Individual choice within an OpenAI chat API response.
@@ -245,7 +288,7 @@ impl ChatResponse for OpenAIChatResponse {
     }
 
     fn usage(&self) -> Option<Usage> {
-        self.usage.clone()
+        self.usage.clone().map(|u| u.into_usage())
     }
 
     fn finish_reason(&self) -> Option<FinishReason> {
@@ -900,7 +943,7 @@ pub fn openai_parse_list_models(response: &Response<Vec<u8>>) -> Result<Vec<Stri
 pub struct OpenAIStreamChunk {
     pub choices: Vec<OpenAIStreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
+    pub usage: Option<OpenAIRawUsage>,
 }
 
 /// Individual choice in a streaming response
@@ -1097,7 +1140,7 @@ pub fn parse_openai_sse_chunk(
 
         // Handle usage metadata (typically in final chunk)
         if let Some(usage) = stream_chunk.usage {
-            results.push(StreamChunk::Usage(usage));
+            results.push(StreamChunk::Usage(usage.into_usage()));
         }
     }
 

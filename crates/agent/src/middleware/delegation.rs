@@ -102,7 +102,7 @@ impl DelegationMiddleware {
 
         let should = match self.config.context_timing {
             DelegationContextTiming::FirstTurnOnly => {
-                let user_count = context.user_message_count();
+                let user_count = context.stats.turns;
                 let result = user_count == 1;
                 trace!(
                     "DelegationMiddleware: FirstTurnOnly check - user_count = {}, should_inject = {}",
@@ -197,20 +197,20 @@ impl DelegationMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for DelegationMiddleware {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         trace!(
-            "DelegationMiddleware::next_state entering state: {}",
+            "DelegationMiddleware::on_turn_start entering state: {}",
             state.name()
         );
 
         match state {
-            ExecutionState::BeforeTurn { ref context } => {
+            ExecutionState::BeforeLlmCall { ref context } => {
                 if self.should_inject(context) {
                     let message = self.format_agent_context();
                     if !message.is_empty() {
                         debug!("DelegationMiddleware: injecting agent context message");
                         let new_context = context.inject_message(message);
-                        return Ok(ExecutionState::BeforeTurn {
+                        return Ok(ExecutionState::BeforeLlmCall {
                             context: Arc::new(new_context),
                         });
                     }
@@ -218,6 +218,12 @@ impl MiddlewareDriver for DelegationMiddleware {
 
                 Ok(state)
             }
+            _ => Ok(state),
+        }
+    }
+
+    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+        match state {
             ExecutionState::AfterLlm { ref context, .. } => {
                 if !self.config.prevent_duplicates {
                     return Ok(state);
@@ -351,7 +357,7 @@ impl DelegationContextMiddleware {
         let should = match self.timing {
             DelegationContextTiming::FirstTurnOnly => {
                 // Count user messages, not total history length
-                let user_count = context.user_message_count();
+                let user_count = context.stats.turns;
                 let result = user_count == 1;
                 trace!(
                     "DelegationContextMiddleware: FirstTurnOnly check - user_count = {}, should_inject = {}",
@@ -379,20 +385,20 @@ impl DelegationContextMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for DelegationContextMiddleware {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         trace!(
-            "DelegationContextMiddleware::next_state entering state: {}",
+            "DelegationContextMiddleware::on_turn_start entering state: {}",
             state.name()
         );
 
         match state {
-            ExecutionState::BeforeTurn { ref context } => {
+            ExecutionState::BeforeLlmCall { ref context } => {
                 if self.should_inject(context) {
                     let message = self.format_agent_context();
                     if !message.is_empty() {
                         debug!("DelegationContextMiddleware: injecting agent context message");
                         let new_context = context.inject_message(message);
-                        return Ok(ExecutionState::BeforeTurn {
+                        return Ok(ExecutionState::BeforeLlmCall {
                             context: Arc::new(new_context),
                         });
                     }

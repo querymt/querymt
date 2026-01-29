@@ -26,9 +26,9 @@ impl TaskAutoCompletionMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for TaskAutoCompletionMiddleware {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
         trace!(
-            "TaskAutoCompletionMiddleware::next_state entering state: {}",
+            "TaskAutoCompletionMiddleware::on_after_llm entering state: {}",
             state.name()
         );
 
@@ -242,19 +242,19 @@ impl DuplicateToolCallMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for DuplicateToolCallMiddleware {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         trace!(
-            "DuplicateToolCallMiddleware::next_state entering state: {}",
+            "DuplicateToolCallMiddleware::on_step_start entering state: {}",
             state.name()
         );
 
         match state {
-            ExecutionState::BeforeTurn { ref context } => {
+            ExecutionState::BeforeLlmCall { ref context } => {
                 if let Some(warning) = self.check_for_duplicates(&context.session_id).await {
                     debug!("DuplicateToolCallMiddleware: duplicate detected, injecting warning");
 
                     let new_context = context.inject_message(warning);
-                    Ok(ExecutionState::BeforeTurn {
+                    Ok(ExecutionState::BeforeLlmCall {
                         context: Arc::new(new_context),
                     })
                 } else {

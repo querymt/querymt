@@ -22,6 +22,8 @@ const mentionsInputStyle: MentionsInputStyle = {
     fontSize: 16,
     fontWeight: 'normal',
     width: '100%',
+    maxHeight: '180px',
+    overflow: 'hidden',
   },
   '&singleLine': {
     display: 'flex',
@@ -52,6 +54,8 @@ const mentionsInputStyle: MentionsInputStyle = {
       wordBreak: 'break-word',
       boxSizing: 'border-box',
       width: '100%',
+      maxHeight: '180px',
+      overflow: 'hidden',
     },
     input: {
       padding: '12px 40px 12px 16px',
@@ -65,6 +69,8 @@ const mentionsInputStyle: MentionsInputStyle = {
       resize: 'none',
       boxSizing: 'border-box',
       width: '100%',
+      maxHeight: '180px',
+      overflowY: 'auto',
     },
   },
   suggestions: {

@@ -11,7 +11,7 @@ use crate::agent::core::{QueryMTAgent, SessionRuntime};
 use crate::agent::transitions::ProcessingToolCallsParams;
 use crate::agent::utils::{format_prompt_blocks, format_prompt_user_text_only};
 use crate::events::{AgentEventKind, ExecutionMetrics, StopType};
-use crate::middleware::{AgentStats, ConversationContext, ExecutionState, MiddlewareDriver};
+use crate::middleware::{AgentStats, ConversationContext, ExecutionState};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::compaction::SessionCompaction;
 use crate::session::provider::SessionContext;
@@ -23,7 +23,7 @@ use agent_client_protocol::{
     ContentChunk, Error, PromptRequest, PromptResponse, SessionUpdate, StopReason,
 };
 use log::{debug, info, trace, warn};
-use querymt::chat::ChatRole;
+use querymt::chat::{ChatRole, MessageType};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::instrument;
@@ -191,8 +191,18 @@ impl QueryMTAgent {
 
         let driver = self.create_driver();
 
-        let messages = Arc::from(context.history().await.into_boxed_slice());
-        let stats = Arc::new(AgentStats::default());
+        let messages: Arc<[querymt::chat::ChatMessage]> =
+            Arc::from(context.history().await.into_boxed_slice());
+        let turns = messages
+            .iter()
+            .filter(|msg| matches!(msg.role, ChatRole::User))
+            .filter(|msg| matches!(msg.message_type, MessageType::Text))
+            .count();
+        let stats = AgentStats {
+            turns,
+            ..Default::default()
+        };
+        let stats = Arc::new(stats);
 
         // Fetch current provider/model for this session
         let llm_config = self
@@ -215,10 +225,15 @@ impl QueryMTAgent {
         tracing::Span::current().record("provider", llm_config.provider.as_str());
         tracing::Span::current().record("model", llm_config.model.as_str());
 
-        let mut state = ExecutionState::BeforeTurn {
+        let mut state = ExecutionState::BeforeLlmCall {
             context: initial_context,
         };
         let mut event_rx = self.event_bus.subscribe();
+
+        state = driver
+            .run_turn_start(state)
+            .await
+            .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
 
         loop {
             if *cancel_rx.borrow() {
@@ -236,15 +251,24 @@ impl QueryMTAgent {
                 context.session().public_id
             );
 
-            state = driver
-                .next_state(state)
-                .await
-                .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
-
             state = match state {
-                ExecutionState::BeforeTurn { ref context } => {
-                    self.transition_before_turn(context, runtime, &cancel_rx, &context.session_id)
-                        .await?
+                ExecutionState::BeforeLlmCall { .. } => {
+                    let state = driver
+                        .run_step_start(state)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                    match state {
+                        ExecutionState::BeforeLlmCall { ref context } => {
+                            self.transition_before_llm_call(
+                                context,
+                                runtime,
+                                &cancel_rx,
+                                &context.session_id,
+                            )
+                            .await?
+                        }
+                        other => other,
+                    }
                 }
 
                 ExecutionState::CallLlm {
@@ -255,63 +279,99 @@ impl QueryMTAgent {
                         .await?
                 }
 
-                ExecutionState::AfterLlm {
-                    ref response,
-                    ref context,
-                } => {
-                    self.transition_after_llm(
-                        response,
-                        context,
-                        runtime_context,
-                        &cancel_rx,
-                        &context.session_id,
-                    )
-                    .await?
+                ExecutionState::AfterLlm { .. } => {
+                    let state = driver
+                        .run_after_llm(state)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                    match state {
+                        ExecutionState::AfterLlm {
+                            ref response,
+                            ref context,
+                        } => {
+                            self.transition_after_llm(
+                                response,
+                                context,
+                                runtime_context,
+                                &cancel_rx,
+                                &context.session_id,
+                            )
+                            .await?
+                        }
+                        other => other,
+                    }
                 }
 
-                ExecutionState::BeforeToolCall {
-                    ref call,
-                    ref context,
-                } => {
-                    self.transition_before_tool(
-                        call,
-                        context,
-                        runtime,
-                        runtime_context,
-                        &cancel_rx,
-                        &context.session_id,
-                    )
-                    .await?
+                ExecutionState::BeforeToolCall { .. } => {
+                    let state = driver
+                        .run_before_tool(state)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                    match state {
+                        ExecutionState::BeforeToolCall {
+                            ref call,
+                            ref context,
+                        } => {
+                            self.transition_before_tool(
+                                call,
+                                context,
+                                runtime,
+                                runtime_context,
+                                &cancel_rx,
+                                &context.session_id,
+                            )
+                            .await?
+                        }
+                        other => other,
+                    }
                 }
 
-                ExecutionState::AfterTool {
-                    ref result,
-                    ref context,
-                } => {
-                    self.transition_after_tool(
-                        result,
-                        context,
-                        runtime_context,
-                        &context.session_id,
-                    )
-                    .await?
+                ExecutionState::AfterTool { .. } => {
+                    let state = driver
+                        .run_after_tool(state)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                    match state {
+                        ExecutionState::AfterTool {
+                            ref result,
+                            ref context,
+                        } => {
+                            self.transition_after_tool(
+                                result,
+                                context,
+                                runtime_context,
+                                &context.session_id,
+                            )
+                            .await?
+                        }
+                        other => other,
+                    }
                 }
 
-                ExecutionState::ProcessingToolCalls {
-                    ref remaining_calls,
-                    ref results,
-                    ref context,
-                } => {
-                    self.transition_processing_tool_calls(ProcessingToolCallsParams {
-                        remaining_calls,
-                        results,
-                        context,
-                        runtime,
-                        runtime_context,
-                        cancel_rx: &cancel_rx,
-                        session_id: &context.session_id,
-                    })
-                    .await?
+                ExecutionState::ProcessingToolCalls { .. } => {
+                    let state = driver
+                        .run_processing_tool_calls(state)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                    match state {
+                        ExecutionState::ProcessingToolCalls {
+                            ref remaining_calls,
+                            ref results,
+                            ref context,
+                        } => {
+                            self.transition_processing_tool_calls(ProcessingToolCallsParams {
+                                remaining_calls,
+                                results,
+                                context,
+                                runtime,
+                                runtime_context,
+                                cancel_rx: &cancel_rx,
+                                session_id: &context.session_id,
+                            })
+                            .await?
+                        }
+                        other => other,
+                    }
                 }
 
                 ExecutionState::WaitingForEvent {
@@ -371,7 +431,7 @@ impl QueryMTAgent {
                         .context()
                         .map(|ctx| ExecutionMetrics {
                             steps: ctx.stats.steps,
-                            turns: ctx.user_message_count(),
+                            turns: ctx.stats.turns,
                         })
                         .unwrap_or_default();
 
@@ -575,8 +635,8 @@ impl QueryMTAgent {
             return Err(anyhow::anyhow!("No context available for compaction"));
         };
 
-        // Return BeforeTurn state to continue execution
-        Ok(ExecutionState::BeforeTurn {
+        // Return BeforeLlmCall state to continue execution
+        Ok(ExecutionState::BeforeLlmCall {
             context: new_context,
         })
     }

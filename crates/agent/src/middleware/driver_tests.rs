@@ -15,11 +15,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 async fn test_composite_driver_empty_passes_through() {
     let composite = CompositeDriver::new(vec![]);
     let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.next_state(state).await.unwrap();
+    let result = composite.run_turn_start(state).await.unwrap();
 
-    assert!(matches!(result, ExecutionState::BeforeTurn { .. }));
+    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 }
 
 #[tokio::test]
@@ -27,11 +27,11 @@ async fn test_composite_driver_single_driver() {
     let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![Arc::new(PassThroughDriver)];
     let composite = CompositeDriver::new(drivers);
     let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.next_state(state).await.unwrap();
+    let result = composite.run_turn_start(state).await.unwrap();
 
-    assert!(matches!(result, ExecutionState::BeforeTurn { .. }));
+    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 }
 
 #[tokio::test]
@@ -46,9 +46,9 @@ async fn test_composite_driver_chain_order() {
     let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![counter1.clone(), counter2.clone()];
     let composite = CompositeDriver::new(drivers);
     let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    composite.next_state(state).await.unwrap();
+    composite.run_turn_start(state).await.unwrap();
 
     assert_eq!(counter1.count.load(Ordering::SeqCst), 1);
     assert_eq!(counter2.count.load(Ordering::SeqCst), 1);
@@ -69,9 +69,9 @@ async fn test_composite_driver_stopped_halts() {
     ];
     let composite = CompositeDriver::new(drivers);
     let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.next_state(state).await.unwrap();
+    let result = composite.run_turn_start(state).await.unwrap();
 
     assert!(matches!(result, ExecutionState::Stopped { .. }));
     assert_eq!(counter.count.load(Ordering::SeqCst), 0);
@@ -86,9 +86,9 @@ async fn test_composite_driver_complete_halts() {
     let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![Arc::new(CompleteDriver), counter.clone()];
     let composite = CompositeDriver::new(drivers);
     let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.next_state(state).await.unwrap();
+    let result = composite.run_turn_start(state).await.unwrap();
 
     assert!(matches!(result, ExecutionState::Complete));
     assert_eq!(counter.count.load(Ordering::SeqCst), 0);
@@ -103,9 +103,9 @@ async fn test_composite_driver_cancelled_halts() {
     let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![Arc::new(CancelDriver), counter.clone()];
     let composite = CompositeDriver::new(drivers);
     let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.next_state(state).await.unwrap();
+    let result = composite.run_turn_start(state).await.unwrap();
 
     assert!(matches!(result, ExecutionState::Cancelled));
     assert_eq!(counter.count.load(Ordering::SeqCst), 0);
@@ -135,9 +135,9 @@ async fn test_composite_driver_error_propagates() {
         vec![Arc::new(PassThroughDriver), Arc::new(ErrorDriver)];
     let composite = CompositeDriver::new(drivers);
     let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.next_state(state).await;
+    let result = composite.run_turn_start(state).await;
 
     assert!(result.is_err());
 }
@@ -159,9 +159,9 @@ fn test_composite_driver_len_and_is_empty() {
 async fn test_max_steps_at_limit_stops() {
     let middleware = MaxStepsMiddleware::new(5);
     let context = test_context("sess-1", 5);
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = middleware.next_state(state).await.unwrap();
+    let result = middleware.on_step_start(state).await.unwrap();
 
     assert!(matches!(
         result,
@@ -176,11 +176,11 @@ async fn test_max_steps_at_limit_stops() {
 async fn test_max_steps_below_limit_continues() {
     let middleware = MaxStepsMiddleware::new(5);
     let context = test_context("sess-1", 3);
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = middleware.next_state(state).await.unwrap();
+    let result = middleware.on_step_start(state).await.unwrap();
 
-    assert!(matches!(result, ExecutionState::BeforeTurn { .. }));
+    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 }
 
 #[tokio::test]
@@ -192,11 +192,11 @@ async fn test_max_steps_ignores_other_states() {
         context: context.clone(),
         tools: Arc::from([]),
     };
-    let result = middleware.next_state(state).await.unwrap();
+    let result = middleware.on_step_start(state).await.unwrap();
     assert!(matches!(result, ExecutionState::CallLlm { .. }));
 
     let state = ExecutionState::Complete;
-    let result = middleware.next_state(state).await.unwrap();
+    let result = middleware.on_step_start(state).await.unwrap();
     assert!(matches!(result, ExecutionState::Complete));
 }
 
@@ -206,14 +206,14 @@ async fn test_turn_limit_middleware() {
 
     // With 2 user messages, should continue (2 < 3)
     let context = test_context_with_user_messages("sess-1", 2);
-    let state = ExecutionState::BeforeTurn { context };
-    let result = middleware.next_state(state).await.unwrap();
-    assert!(matches!(result, ExecutionState::BeforeTurn { .. }));
+    let state = ExecutionState::BeforeLlmCall { context };
+    let result = middleware.on_step_start(state).await.unwrap();
+    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 
     // With 3 user messages, should stop (3 >= 3)
     let context = test_context_with_user_messages("sess-1", 3);
-    let state = ExecutionState::BeforeTurn { context };
-    let result = middleware.next_state(state).await.unwrap();
+    let state = ExecutionState::BeforeLlmCall { context };
+    let result = middleware.on_step_start(state).await.unwrap();
     assert!(matches!(result, ExecutionState::Stopped { .. }));
 }
 
@@ -234,9 +234,9 @@ async fn test_price_limit_over_budget() {
         "mock".into(),
         "mock-model".into(),
     ));
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = middleware.next_state(state).await.unwrap();
+    let result = middleware.on_step_start(state).await.unwrap();
 
     assert!(matches!(
         result,
@@ -264,11 +264,11 @@ async fn test_price_limit_under_budget() {
         "mock".into(),
         "mock-model".into(),
     ));
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = middleware.next_state(state).await.unwrap();
+    let result = middleware.on_step_start(state).await.unwrap();
 
-    assert!(matches!(result, ExecutionState::BeforeTurn { .. }));
+    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 }
 
 #[tokio::test]
@@ -290,11 +290,11 @@ async fn test_price_limit_missing_config_passes_through() {
         "mock".into(),
         "mock-model".into(),
     ));
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = middleware.next_state(state).await.unwrap();
+    let result = middleware.on_step_start(state).await.unwrap();
 
-    assert!(matches!(result, ExecutionState::BeforeTurn { .. }));
+    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 }
 
 #[tokio::test]
@@ -306,13 +306,13 @@ async fn test_limits_middleware_combined() {
     let middleware = LimitsMiddleware::new(config);
 
     let context = test_context("sess-1", 2);
-    let state = ExecutionState::BeforeTurn { context };
-    let result = middleware.next_state(state).await.unwrap();
-    assert!(matches!(result, ExecutionState::BeforeTurn { .. }));
+    let state = ExecutionState::BeforeLlmCall { context };
+    let result = middleware.on_step_start(state).await.unwrap();
+    assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 
     let context = test_context("sess-1", 10);
-    let state = ExecutionState::BeforeTurn { context };
-    let result = middleware.next_state(state).await.unwrap();
+    let state = ExecutionState::BeforeLlmCall { context };
+    let result = middleware.on_step_start(state).await.unwrap();
     assert!(matches!(result, ExecutionState::Stopped { .. }));
 }
 

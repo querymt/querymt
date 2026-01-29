@@ -1,10 +1,9 @@
 use crate::events::StopType;
 use crate::middleware::{
-    AgentStats, CompositeDriver, ConversationContext, ExecutionState, LlmResponse,
-    driver::MiddlewareDriver,
+    AgentStats, CompositeDriver, ConversationContext, ExecutionState, LlmResponse, MiddlewareDriver,
 };
 use crate::test_utils::{
-    AlwaysStopDriver, BeforeTurnToCallLlmDriver, MessageInjectingDriver, StateRecordingDriver,
+    AlwaysStopDriver, BeforeLlmCallToCallLlmDriver, MessageInjectingDriver, StateRecordingDriver,
     test_context,
 };
 use querymt::chat::FinishReason;
@@ -15,30 +14,38 @@ async fn test_state_recording_middleware() {
     let (recorder, states) = StateRecordingDriver::new();
     let composite = CompositeDriver::new(vec![Arc::new(recorder)]);
     let context = test_context("sess-1", 0);
+    let response = Arc::new(LlmResponse::new(
+        "".to_string(),
+        vec![],
+        None,
+        Some(FinishReason::Stop),
+    ));
 
     composite
-        .next_state(ExecutionState::BeforeTurn {
+        .run_turn_start(ExecutionState::BeforeLlmCall {
             context: context.clone(),
         })
         .await
         .unwrap();
     composite
-        .next_state(ExecutionState::CallLlm {
+        .run_step_start(ExecutionState::BeforeLlmCall {
             context: context.clone(),
-            tools: Arc::from([]),
         })
         .await
         .unwrap();
     composite
-        .next_state(ExecutionState::Complete)
+        .run_after_llm(ExecutionState::AfterLlm {
+            response,
+            context: context.clone(),
+        })
         .await
         .unwrap();
 
     let recorded = states.lock().unwrap();
     assert_eq!(recorded.len(), 3);
-    assert_eq!(recorded[0], "BeforeTurn");
-    assert_eq!(recorded[1], "CallLlm");
-    assert_eq!(recorded[2], "Complete");
+    assert_eq!(recorded[0], "BeforeLlmCall");
+    assert_eq!(recorded[1], "BeforeLlmCall");
+    assert_eq!(recorded[2], "AfterLlm");
 }
 
 #[tokio::test]
@@ -48,11 +55,11 @@ async fn test_message_injection_flow() {
     };
     let composite = CompositeDriver::new(vec![Arc::new(injector)]);
     let context = test_context("sess-1", 0);
-    let state = ExecutionState::BeforeTurn { context };
+    let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.next_state(state).await.unwrap();
+    let result = composite.run_turn_start(state).await.unwrap();
 
-    if let ExecutionState::BeforeTurn { context } = result {
+    if let ExecutionState::BeforeLlmCall { context } = result {
         assert_eq!(context.messages.len(), 1);
         assert!(
             context.messages[0]
@@ -60,7 +67,7 @@ async fn test_message_injection_flow() {
                 .contains("Remember to be helpful")
         );
     } else {
-        panic!("Expected BeforeTurn state");
+        panic!("Expected BeforeLlmCall state");
     }
 }
 
@@ -74,26 +81,26 @@ async fn test_multiple_middleware_interaction() {
     let context = test_context("sess-1", 0);
 
     let result = composite
-        .next_state(ExecutionState::BeforeTurn { context })
+        .run_turn_start(ExecutionState::BeforeLlmCall { context })
         .await
         .unwrap();
 
     assert_eq!(states.lock().unwrap().len(), 1);
 
-    if let ExecutionState::BeforeTurn { context } = result {
+    if let ExecutionState::BeforeLlmCall { context } = result {
         assert_eq!(context.messages.len(), 1);
     } else {
-        panic!("Expected BeforeTurn state");
+        panic!("Expected BeforeLlmCall state");
     }
 }
 
 #[tokio::test]
 async fn test_middleware_can_transform_call_llm() {
-    let composite = CompositeDriver::new(vec![Arc::new(BeforeTurnToCallLlmDriver)]);
+    let composite = CompositeDriver::new(vec![Arc::new(BeforeLlmCallToCallLlmDriver)]);
     let context = test_context("sess-1", 0);
 
     let result = composite
-        .next_state(ExecutionState::BeforeTurn { context })
+        .run_step_start(ExecutionState::BeforeLlmCall { context })
         .await
         .unwrap();
 
@@ -113,24 +120,30 @@ async fn test_middleware_can_transform_to_stopped() {
         Some(FinishReason::Stop),
     ));
 
-    let states = vec![
-        ExecutionState::BeforeTurn {
+    let result = composite
+        .run_turn_start(ExecutionState::BeforeLlmCall {
             context: context.clone(),
-        },
-        ExecutionState::CallLlm {
+        })
+        .await
+        .unwrap();
+    assert!(matches!(result, ExecutionState::Stopped { .. }));
+
+    let result = composite
+        .run_step_start(ExecutionState::BeforeLlmCall {
             context: context.clone(),
-            tools: Arc::from([]),
-        },
-        ExecutionState::AfterLlm {
+        })
+        .await
+        .unwrap();
+    assert!(matches!(result, ExecutionState::Stopped { .. }));
+
+    let result = composite
+        .run_after_llm(ExecutionState::AfterLlm {
             response,
             context: context.clone(),
-        },
-    ];
-
-    for state in states {
-        let result = composite.next_state(state).await.unwrap();
-        assert!(matches!(result, ExecutionState::Stopped { .. }));
-    }
+        })
+        .await
+        .unwrap();
+    assert!(matches!(result, ExecutionState::Stopped { .. }));
 }
 
 #[tokio::test]
@@ -153,15 +166,15 @@ async fn test_stats_propagate_through_middleware() {
     ));
 
     let result = composite
-        .next_state(ExecutionState::BeforeTurn { context })
+        .run_turn_start(ExecutionState::BeforeLlmCall { context })
         .await
         .unwrap();
 
-    if let ExecutionState::BeforeTurn { context } = result {
+    if let ExecutionState::BeforeLlmCall { context } = result {
         assert_eq!(context.stats.steps, 42);
         assert_eq!(context.stats.total_input_tokens, 1000);
     } else {
-        panic!("Expected BeforeTurn state");
+        panic!("Expected BeforeLlmCall state");
     }
 }
 
@@ -175,7 +188,7 @@ async fn test_context_immutability() {
     let original_len = original.messages.len();
 
     let result = composite
-        .next_state(ExecutionState::BeforeTurn {
+        .run_turn_start(ExecutionState::BeforeLlmCall {
             context: original.clone(),
         })
         .await
@@ -183,10 +196,10 @@ async fn test_context_immutability() {
 
     assert_eq!(original.messages.len(), original_len);
 
-    if let ExecutionState::BeforeTurn { context } = result {
+    if let ExecutionState::BeforeLlmCall { context } = result {
         assert_eq!(context.messages.len(), 1);
     } else {
-        panic!("Expected BeforeTurn state");
+        panic!("Expected BeforeLlmCall state");
     }
 }
 

@@ -315,6 +315,7 @@ impl ChatResponse for OllamaResponse {
         self.prompt_eval_count.map(|input_tokens| Usage {
             input_tokens,
             output_tokens: self.eval_count.unwrap_or(0),
+            ..Default::default()
         })
     }
 

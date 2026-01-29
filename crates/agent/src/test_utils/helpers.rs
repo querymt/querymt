@@ -38,7 +38,10 @@ pub fn test_context_with_user_messages(
     Arc::new(ConversationContext::new(
         session_id.into(),
         Arc::from(messages.into_boxed_slice()),
-        Arc::new(AgentStats::default()),
+        Arc::new(AgentStats {
+            turns: user_message_count,
+            ..Default::default()
+        }),
         "mock".into(),
         "mock-model".into(),
     ))

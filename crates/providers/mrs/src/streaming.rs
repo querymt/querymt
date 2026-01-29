@@ -16,6 +16,7 @@ fn usage_from_mistral(usage: &mistralrs::Usage) -> Usage {
     Usage {
         input_tokens: u32::try_from(usage.prompt_tokens).unwrap_or(u32::MAX),
         output_tokens: u32::try_from(usage.completion_tokens).unwrap_or(u32::MAX),
+        ..Default::default()
     }
 }
 

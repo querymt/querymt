@@ -5,11 +5,38 @@ use log::{debug, trace};
 use std::sync::Arc;
 use tracing::{Instrument, info_span, instrument};
 
-/// Trait for middleware that drives state transitions
+/// Trait for middleware that runs at specific lifecycle phases
 #[async_trait]
 pub trait MiddlewareDriver: Send + Sync {
-    /// Transform the current execution state to the next state
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState>;
+    /// Runs once at the start of a user turn
+    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+        Ok(state)
+    }
+
+    /// Runs before each LLM call (including tool-loop continuations)
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+        Ok(state)
+    }
+
+    /// Runs after receiving the LLM response
+    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+        Ok(state)
+    }
+
+    /// Runs before executing a tool call
+    async fn on_before_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
+        Ok(state)
+    }
+
+    /// Runs after a tool call completes
+    async fn on_after_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
+        Ok(state)
+    }
+
+    /// Runs while processing multiple tool calls
+    async fn on_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
+        Ok(state)
+    }
 
     /// Reset internal state (called at start of execute_cycle)
     fn reset(&self);
@@ -42,22 +69,92 @@ impl CompositeDriver {
     pub fn len(&self) -> usize {
         self.drivers.len()
     }
-}
 
-#[async_trait]
-impl MiddlewareDriver for CompositeDriver {
+    pub async fn run_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.run_phase(state, MiddlewarePhase::TurnStart).await
+    }
+
+    pub async fn run_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.run_phase(state, MiddlewarePhase::StepStart).await
+    }
+
+    pub async fn run_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.run_phase(state, MiddlewarePhase::AfterLlm).await
+    }
+
+    pub async fn run_before_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.run_phase(state, MiddlewarePhase::BeforeTool).await
+    }
+
+    pub async fn run_after_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.run_phase(state, MiddlewarePhase::AfterTool).await
+    }
+
+    pub async fn run_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.run_phase(state, MiddlewarePhase::ProcessingToolCalls)
+            .await
+    }
+
+    pub fn reset(&self) {
+        debug!(
+            "Resetting CompositeDriver with {} middleware",
+            self.drivers.len()
+        );
+        for driver in &self.drivers {
+            trace!("Resetting driver: {}", driver.name());
+            driver.reset();
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        "CompositeDriver"
+    }
+
+    pub fn get_limits(&self) -> Option<SessionLimits> {
+        // Aggregate limits from all drivers
+        let mut limits = SessionLimits::default();
+        let mut has_any = false;
+
+        for driver in &self.drivers {
+            if let Some(driver_limits) = driver.get_limits() {
+                has_any = true;
+                // Take the first non-None value for each limit
+                if limits.max_steps.is_none() && driver_limits.max_steps.is_some() {
+                    limits.max_steps = driver_limits.max_steps;
+                }
+                if limits.max_turns.is_none() && driver_limits.max_turns.is_some() {
+                    limits.max_turns = driver_limits.max_turns;
+                }
+                if limits.max_cost_usd.is_none() && driver_limits.max_cost_usd.is_some() {
+                    limits.max_cost_usd = driver_limits.max_cost_usd;
+                }
+            }
+        }
+
+        if has_any { Some(limits) } else { None }
+    }
+
     #[instrument(
-        name = "middleware.pipeline",
+        name = "middleware.phase",
         skip(self, state),
         fields(
+            phase = %phase.name(),
             input_state = %state.name(),
             output_state = tracing::field::Empty,
             drivers_count = %self.drivers.len()
         )
     )]
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn run_phase(
+        &self,
+        state: ExecutionState,
+        phase: MiddlewarePhase,
+    ) -> Result<ExecutionState> {
         let state_name = state.name();
-        trace!("CompositeDriver::next_state entering state: {}", state_name);
+        trace!(
+            "CompositeDriver::run_phase entering {} with state: {}",
+            phase.name(),
+            state_name
+        );
 
         let mut current = state;
 
@@ -66,17 +163,36 @@ impl MiddlewareDriver for CompositeDriver {
             let current_state_name = current.name();
 
             trace!(
-                "  Running driver {}/{}: {} on state: {}",
+                "  Running driver {}/{}: {} on phase {} with state: {}",
                 idx + 1,
                 self.drivers.len(),
                 driver_name,
+                phase.name(),
                 current_state_name
             );
 
-            current = driver
-                .next_state(current)
-                .instrument(info_span!("middleware.driver", name = %driver_name))
-                .await?;
+            let span = info_span!("middleware.driver", name = %driver_name, phase = %phase.name());
+            current = match phase {
+                MiddlewarePhase::TurnStart => {
+                    driver.on_turn_start(current).instrument(span).await?
+                }
+                MiddlewarePhase::StepStart => {
+                    driver.on_step_start(current).instrument(span).await?
+                }
+                MiddlewarePhase::AfterLlm => driver.on_after_llm(current).instrument(span).await?,
+                MiddlewarePhase::BeforeTool => {
+                    driver.on_before_tool(current).instrument(span).await?
+                }
+                MiddlewarePhase::AfterTool => {
+                    driver.on_after_tool(current).instrument(span).await?
+                }
+                MiddlewarePhase::ProcessingToolCalls => {
+                    driver
+                        .on_processing_tool_calls(current)
+                        .instrument(span)
+                        .await?
+                }
+            };
 
             let new_state_name = current.name();
             trace!(
@@ -101,7 +217,8 @@ impl MiddlewareDriver for CompositeDriver {
 
         let final_state_name = current.name();
         trace!(
-            "CompositeDriver::next_state exiting state: {}",
+            "CompositeDriver::run_phase exiting {} with state: {}",
+            phase.name(),
             final_state_name
         );
 
@@ -110,44 +227,28 @@ impl MiddlewareDriver for CompositeDriver {
 
         Ok(current)
     }
+}
 
-    fn reset(&self) {
-        debug!(
-            "Resetting CompositeDriver with {} middleware",
-            self.drivers.len()
-        );
-        for driver in &self.drivers {
-            trace!("Resetting driver: {}", driver.name());
-            driver.reset();
-        }
-    }
+#[derive(Clone, Copy, Debug)]
+enum MiddlewarePhase {
+    TurnStart,
+    StepStart,
+    AfterLlm,
+    BeforeTool,
+    AfterTool,
+    ProcessingToolCalls,
+}
 
+impl MiddlewarePhase {
     fn name(&self) -> &'static str {
-        "CompositeDriver"
-    }
-
-    fn get_limits(&self) -> Option<SessionLimits> {
-        // Aggregate limits from all drivers
-        let mut limits = SessionLimits::default();
-        let mut has_any = false;
-
-        for driver in &self.drivers {
-            if let Some(driver_limits) = driver.get_limits() {
-                has_any = true;
-                // Take the first non-None value for each limit
-                if limits.max_steps.is_none() && driver_limits.max_steps.is_some() {
-                    limits.max_steps = driver_limits.max_steps;
-                }
-                if limits.max_turns.is_none() && driver_limits.max_turns.is_some() {
-                    limits.max_turns = driver_limits.max_turns;
-                }
-                if limits.max_cost_usd.is_none() && driver_limits.max_cost_usd.is_some() {
-                    limits.max_cost_usd = driver_limits.max_cost_usd;
-                }
-            }
+        match self {
+            MiddlewarePhase::TurnStart => "turn_start",
+            MiddlewarePhase::StepStart => "step_start",
+            MiddlewarePhase::AfterLlm => "after_llm",
+            MiddlewarePhase::BeforeTool => "before_tool",
+            MiddlewarePhase::AfterTool => "after_tool",
+            MiddlewarePhase::ProcessingToolCalls => "processing_tool_calls",
         }
-
-        if has_any { Some(limits) } else { None }
     }
 }
 
@@ -165,7 +266,7 @@ mod tests {
 
     #[async_trait]
     impl MiddlewareDriver for TestDriver {
-        async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+        async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
             if self.should_stop {
                 Ok(ExecutionState::Stopped {
                     message: "test stop".into(),
@@ -205,10 +306,10 @@ mod tests {
             model: "mock-model".into(),
         });
 
-        let state = ExecutionState::BeforeTurn { context };
-        let result = composite.next_state(state).await.unwrap();
+        let state = ExecutionState::BeforeLlmCall { context };
+        let result = composite.run_turn_start(state).await.unwrap();
 
-        assert!(matches!(result, ExecutionState::BeforeTurn { .. }));
+        assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
     }
 
     #[tokio::test]
@@ -237,8 +338,8 @@ mod tests {
             model: "mock-model".into(),
         });
 
-        let state = ExecutionState::BeforeTurn { context };
-        let result = composite.next_state(state).await.unwrap();
+        let state = ExecutionState::BeforeLlmCall { context };
+        let result = composite.run_turn_start(state).await.unwrap();
 
         // Should stop at the second driver and not run third
         assert!(matches!(result, ExecutionState::Stopped { .. }));

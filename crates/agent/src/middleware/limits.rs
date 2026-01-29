@@ -33,7 +33,7 @@ use std::sync::Arc;
 pub struct LimitsConfig {
     /// Maximum number of LLM calls (including tool use loops)
     pub max_steps: Option<usize>,
-    /// Maximum number of user/assistant conversation turns (based on user message count)
+    /// Maximum number of user/assistant conversation turns (based on recorded turns)
     pub max_turns: Option<usize>,
     /// Maximum total cost in USD
     pub max_price_usd: Option<f64>,
@@ -90,7 +90,7 @@ impl LimitsConfig {
 /// Middleware that enforces step, turn, and price limits
 ///
 /// - **Steps**: Counts every LLM API call (via `context.stats.steps`)
-/// - **Turns**: Counts user/assistant message pairs (via `context.user_message_count()`)
+/// - **Turns**: Counts user/assistant message pairs (via `context.stats.turns`)
 /// - **Price**: Calculates cumulative cost based on token usage
 pub struct LimitsMiddleware {
     config: LimitsConfig,
@@ -155,14 +155,14 @@ impl LimitsMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for LimitsMiddleware {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         trace!(
-            "LimitsMiddleware::next_state entering state: {}",
+            "LimitsMiddleware::on_step_start entering state: {}",
             state.name()
         );
 
         match state {
-            ExecutionState::BeforeTurn { ref context } => {
+            ExecutionState::BeforeLlmCall { ref context } => {
                 self.check_provider_changed(context);
 
                 if let Some(max_steps) = self.config.max_steps
@@ -179,12 +179,11 @@ impl MiddlewareDriver for LimitsMiddleware {
                 }
 
                 if let Some(max_turns) = self.config.max_turns
-                    && context.user_message_count() >= max_turns
+                    && context.stats.turns >= max_turns
                 {
                     debug!(
                         "LimitsMiddleware: stopping execution, {} turns >= {}",
-                        context.user_message_count(),
-                        max_turns
+                        context.stats.turns, max_turns
                     );
                     return Ok(ExecutionState::Stopped {
                         message: format!("Turn limit ({}) reached", max_turns).into(),
@@ -249,14 +248,14 @@ impl MaxStepsMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for MaxStepsMiddleware {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         trace!(
-            "MaxStepsMiddleware::next_state entering state: {}",
+            "MaxStepsMiddleware::on_step_start entering state: {}",
             state.name()
         );
 
         match state {
-            ExecutionState::BeforeTurn { ref context } => {
+            ExecutionState::BeforeLlmCall { ref context } => {
                 let current_steps = context.stats.steps;
                 trace!(
                     "MaxStepsMiddleware: current steps = {}, max = {}",
@@ -321,15 +320,15 @@ impl TurnLimitMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for TurnLimitMiddleware {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         trace!(
-            "TurnLimitMiddleware::next_state entering state: {}",
+            "TurnLimitMiddleware::on_step_start entering state: {}",
             state.name()
         );
 
         match state {
-            ExecutionState::BeforeTurn { ref context } => {
-                let current_turns = context.user_message_count();
+            ExecutionState::BeforeLlmCall { ref context } => {
+                let current_turns = context.stats.turns;
                 trace!(
                     "TurnLimitMiddleware: current turns = {}, max = {}",
                     current_turns, self.max_turns
@@ -409,14 +408,14 @@ impl PriceLimitMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for PriceLimitMiddleware {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         trace!(
-            "PriceLimitMiddleware::next_state entering state: {}",
+            "PriceLimitMiddleware::on_step_start entering state: {}",
             state.name()
         );
 
         match state {
-            ExecutionState::BeforeTurn { ref context } => {
+            ExecutionState::BeforeLlmCall { ref context } => {
                 let total_cost = self.total_cost(&context.stats);
 
                 if total_cost > self.max_cost {
@@ -488,8 +487,8 @@ mod tests {
             model: "mock-model".into(),
         });
 
-        let state = ExecutionState::BeforeTurn { context };
-        let result = middleware.next_state(state).await.unwrap();
+        let state = ExecutionState::BeforeLlmCall { context };
+        let result = middleware.on_step_start(state).await.unwrap();
 
         assert!(matches!(
             result,
@@ -515,10 +514,10 @@ mod tests {
             model: "mock-model".into(),
         });
 
-        let state = ExecutionState::BeforeTurn { context };
-        let result = middleware.next_state(state).await.unwrap();
+        let state = ExecutionState::BeforeLlmCall { context };
+        let result = middleware.on_step_start(state).await.unwrap();
 
-        assert!(matches!(result, ExecutionState::BeforeTurn { .. }));
+        assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
     }
 }
 

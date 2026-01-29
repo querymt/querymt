@@ -24,15 +24,44 @@ impl StateRecordingDriver {
             states,
         )
     }
-}
 
-#[async_trait]
-impl MiddlewareDriver for StateRecordingDriver {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    fn record(&self, state: &ExecutionState) {
         self.seen_states
             .lock()
             .unwrap()
             .push(state.name().to_string());
+    }
+}
+
+#[async_trait]
+impl MiddlewareDriver for StateRecordingDriver {
+    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.record(&state);
+        Ok(state)
+    }
+
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.record(&state);
+        Ok(state)
+    }
+
+    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.record(&state);
+        Ok(state)
+    }
+
+    async fn on_before_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.record(&state);
+        Ok(state)
+    }
+
+    async fn on_after_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.record(&state);
+        Ok(state)
+    }
+
+    async fn on_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.record(&state);
         Ok(state)
     }
 
@@ -46,7 +75,7 @@ impl MiddlewareDriver for StateRecordingDriver {
 }
 
 // ============================================================================
-// MessageInjectingDriver - Injects a message into BeforeTurn state
+// MessageInjectingDriver - Injects a message into BeforeLlmCall state
 // ============================================================================
 
 pub struct MessageInjectingDriver {
@@ -55,19 +84,29 @@ pub struct MessageInjectingDriver {
 
 #[async_trait]
 impl MiddlewareDriver for MessageInjectingDriver {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
-        match state {
-            ExecutionState::BeforeTurn { context } => Ok(ExecutionState::BeforeTurn {
-                context: Arc::new(context.inject_message(self.inject_content.clone())),
-            }),
-            other => Ok(other),
-        }
+    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.inject(state)
+    }
+
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.inject(state)
     }
 
     fn reset(&self) {}
 
     fn name(&self) -> &'static str {
         "MessageInjectingDriver"
+    }
+}
+
+impl MessageInjectingDriver {
+    fn inject(&self, state: ExecutionState) -> Result<ExecutionState> {
+        match state {
+            ExecutionState::BeforeLlmCall { context } => Ok(ExecutionState::BeforeLlmCall {
+                context: Arc::new(context.inject_message(self.inject_content.clone())),
+            }),
+            other => Ok(other),
+        }
     }
 }
 
@@ -79,10 +118,6 @@ pub struct PassThroughDriver;
 
 #[async_trait]
 impl MiddlewareDriver for PassThroughDriver {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
-        Ok(state)
-    }
-
     fn reset(&self) {}
 
     fn name(&self) -> &'static str {
@@ -103,15 +138,39 @@ impl StopDriver {
     pub fn new(stop_type: StopType, message: &'static str) -> Self {
         Self { stop_type, message }
     }
+
+    fn stopped_state(&self) -> ExecutionState {
+        ExecutionState::Stopped {
+            message: self.message.into(),
+            stop_type: self.stop_type,
+        }
+    }
 }
 
 #[async_trait]
 impl MiddlewareDriver for StopDriver {
-    async fn next_state(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        Ok(ExecutionState::Stopped {
-            message: self.message.into(),
-            stop_type: self.stop_type,
-        })
+    async fn on_turn_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        Ok(self.stopped_state())
+    }
+
+    async fn on_step_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        Ok(self.stopped_state())
+    }
+
+    async fn on_after_llm(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        Ok(self.stopped_state())
+    }
+
+    async fn on_before_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        Ok(self.stopped_state())
+    }
+
+    async fn on_after_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        Ok(self.stopped_state())
+    }
+
+    async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        Ok(self.stopped_state())
     }
 
     fn reset(&self) {}
@@ -131,11 +190,31 @@ pub struct AlwaysStopDriver {
 
 #[async_trait]
 impl MiddlewareDriver for AlwaysStopDriver {
-    async fn next_state(&self, _state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
         Ok(ExecutionState::Stopped {
             message: "stopped by middleware".into(),
             stop_type: self.stop_type,
         })
+    }
+
+    async fn on_step_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_after_llm(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_before_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_after_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
     }
 
     fn reset(&self) {}
@@ -153,8 +232,28 @@ pub struct CompleteDriver;
 
 #[async_trait]
 impl MiddlewareDriver for CompleteDriver {
-    async fn next_state(&self, _state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
         Ok(ExecutionState::Complete)
+    }
+
+    async fn on_step_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_after_llm(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_before_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_after_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
     }
 
     fn reset(&self) {}
@@ -172,8 +271,28 @@ pub struct CancelDriver;
 
 #[async_trait]
 impl MiddlewareDriver for CancelDriver {
-    async fn next_state(&self, _state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
         Ok(ExecutionState::Cancelled)
+    }
+
+    async fn on_step_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_after_llm(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_before_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_after_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
     }
 
     fn reset(&self) {}
@@ -184,7 +303,7 @@ impl MiddlewareDriver for CancelDriver {
 }
 
 // ============================================================================
-// CountingDriver - Counts how many times next_state is called
+// CountingDriver - Counts how many times hook methods are called
 // ============================================================================
 
 pub struct CountingDriver {
@@ -203,6 +322,10 @@ impl CountingDriver {
             count: AtomicUsize::new(initial),
         }
     }
+
+    fn bump(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl Default for CountingDriver {
@@ -213,8 +336,33 @@ impl Default for CountingDriver {
 
 #[async_trait]
 impl MiddlewareDriver for CountingDriver {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
-        self.count.fetch_add(1, Ordering::SeqCst);
+    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.bump();
+        Ok(state)
+    }
+
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.bump();
+        Ok(state)
+    }
+
+    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.bump();
+        Ok(state)
+    }
+
+    async fn on_before_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.bump();
+        Ok(state)
+    }
+
+    async fn on_after_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.bump();
+        Ok(state)
+    }
+
+    async fn on_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.bump();
         Ok(state)
     }
 
@@ -235,10 +383,30 @@ pub struct ErrorDriver;
 
 #[async_trait]
 impl MiddlewareDriver for ErrorDriver {
-    async fn next_state(&self, _state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
         Err(crate::middleware::MiddlewareError::ExecutionError(
             "test error".into(),
         ))
+    }
+
+    async fn on_step_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_after_llm(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_before_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_after_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
+    }
+
+    async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
+        self.on_turn_start(_state).await
     }
 
     fn reset(&self) {}
@@ -249,16 +417,16 @@ impl MiddlewareDriver for ErrorDriver {
 }
 
 // ============================================================================
-// BeforeTurnToCallLlmDriver - Transforms BeforeTurn to CallLlm
+// BeforeLlmCallToCallLlmDriver - Transforms BeforeLlmCall to CallLlm
 // ============================================================================
 
-pub struct BeforeTurnToCallLlmDriver;
+pub struct BeforeLlmCallToCallLlmDriver;
 
 #[async_trait]
-impl MiddlewareDriver for BeforeTurnToCallLlmDriver {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+impl MiddlewareDriver for BeforeLlmCallToCallLlmDriver {
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         match state {
-            ExecutionState::BeforeTurn { context } => Ok(ExecutionState::CallLlm {
+            ExecutionState::BeforeLlmCall { context } => Ok(ExecutionState::CallLlm {
                 context,
                 tools: Arc::from([]),
             }),
@@ -269,21 +437,21 @@ impl MiddlewareDriver for BeforeTurnToCallLlmDriver {
     fn reset(&self) {}
 
     fn name(&self) -> &'static str {
-        "BeforeTurnToCallLlmDriver"
+        "BeforeLlmCallToCallLlmDriver"
     }
 }
 
 // ============================================================================
-// StopOnBeforeTurn - Stops execution when it sees BeforeTurn state
+// StopOnBeforeLlmCall - Stops execution when it sees BeforeLlmCall state
 // ============================================================================
 
-pub struct StopOnBeforeTurn;
+pub struct StopOnBeforeLlmCall;
 
 #[async_trait]
-impl MiddlewareDriver for StopOnBeforeTurn {
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+impl MiddlewareDriver for StopOnBeforeLlmCall {
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         match state {
-            ExecutionState::BeforeTurn { .. } => Ok(ExecutionState::Stopped {
+            ExecutionState::BeforeLlmCall { .. } => Ok(ExecutionState::Stopped {
                 message: "stopped".into(),
                 stop_type: StopType::Other,
             }),
@@ -294,6 +462,6 @@ impl MiddlewareDriver for StopOnBeforeTurn {
     fn reset(&self) {}
 
     fn name(&self) -> &'static str {
-        "StopOnBeforeTurn"
+        "StopOnBeforeLlmCall"
     }
 }

@@ -323,6 +323,21 @@ impl DedupCheckMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for DedupCheckMiddleware {
+    async fn on_after_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
+        if !self.enabled {
+            return Ok(state);
+        }
+
+        match state {
+            ExecutionState::AfterTool { ref result, .. } => {
+                let mut pending = self.pending_results.lock().await;
+                pending.push((**result).clone());
+                Ok(state)
+            }
+            _ => Ok(state),
+        }
+    }
+
     #[instrument(
         name = "middleware.dedup_check",
         skip(self, state),
@@ -334,22 +349,13 @@ impl MiddlewareDriver for DedupCheckMiddleware {
             warning_injected = tracing::field::Empty
         )
     )]
-    async fn next_state(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
         if !self.enabled {
             tracing::Span::current().record("output_state", state.name());
             return Ok(state);
         }
 
         match state {
-            // Collect tool results as they come through
-            ExecutionState::AfterTool { ref result, .. } => {
-                // Accumulate results
-                let mut pending = self.pending_results.lock().await;
-                pending.push((**result).clone());
-                tracing::Span::current().record("output_state", state.name());
-                Ok(state)
-            }
-
             // When all tools are done and we're about to return to LLM, check for duplicates
             ExecutionState::ProcessingToolCalls {
                 remaining_calls,

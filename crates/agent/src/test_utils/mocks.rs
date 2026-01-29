@@ -312,6 +312,7 @@ impl MockChatResponse {
             usage: Some(Usage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             }),
         }
     }
@@ -323,6 +324,7 @@ impl MockChatResponse {
             usage: Some(Usage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             }),
         }
     }

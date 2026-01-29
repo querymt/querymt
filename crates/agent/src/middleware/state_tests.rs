@@ -26,10 +26,10 @@ fn test_execution_state_name_all_variants() {
     ));
     let states = vec![
         (
-            ExecutionState::BeforeTurn {
+            ExecutionState::BeforeLlmCall {
                 context: context.clone(),
             },
-            "BeforeTurn",
+            "BeforeLlmCall",
         ),
         (
             ExecutionState::CallLlm {
@@ -109,7 +109,7 @@ fn test_execution_state_context_accessors() {
     ));
 
     let stateful_states = vec![
-        ExecutionState::BeforeTurn {
+        ExecutionState::BeforeLlmCall {
             context: context.clone(),
         },
         ExecutionState::CallLlm {
@@ -179,10 +179,14 @@ fn test_conversation_context_counts_user_messages() {
             cache: None,
         },
     ];
+    let stats = AgentStats {
+        turns: 2,
+        ..Default::default()
+    };
     let context = ConversationContext::new(
         "sess-1".into(),
         Arc::from(messages.into_boxed_slice()),
-        Arc::new(AgentStats::default()),
+        Arc::new(stats),
         "mock".into(),
         "mock-model".into(),
     );
@@ -264,6 +268,7 @@ fn test_wait_condition_merge() {
 fn test_agent_stats_default() {
     let stats = AgentStats::default();
     assert_eq!(stats.steps, 0);
+    assert_eq!(stats.turns, 0);
     assert_eq!(stats.total_input_tokens, 0);
     assert_eq!(stats.total_output_tokens, 0);
     assert_eq!(stats.context_tokens, 0);

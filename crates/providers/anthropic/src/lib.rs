@@ -1345,4 +1345,36 @@ mod tests {
             other => panic!("Expected Blocks variant, got {:?}", other),
         }
     }
+
+    #[test]
+    fn test_usage_deserialization_with_cache() {
+        // Real fixture from Anthropic API response with cache creation and read tokens
+        let json = r#"{
+            "input_tokens": 12,
+            "cache_creation_input_tokens": 1495,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 1495,
+                "ephemeral_1h_input_tokens": 0
+            },
+            "output_tokens": 1024,
+            "service_tier": "standard"
+        }"#;
+
+        let usage: Usage = serde_json::from_str(json).unwrap();
+
+        // Verify standard token counts
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 1024);
+
+        // Verify cache-related fields (using Anthropic aliases)
+        assert_eq!(usage.cache_write, 1495); // from cache_creation_input_tokens
+        assert_eq!(usage.cache_read, 0); // from cache_read_input_tokens
+
+        // Verify default values for fields not in the JSON
+        assert_eq!(usage.reasoning_tokens, 0);
+
+        // Note: Extra fields like "cache_creation" and "service_tier" are
+        // silently ignored during deserialization as they're not part of Usage struct
+    }
 }

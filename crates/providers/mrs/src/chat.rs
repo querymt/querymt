@@ -50,6 +50,7 @@ impl From<ChatCompletionResponse> for MistralChatResponse {
         let usage = Some(Usage {
             input_tokens: u32::try_from(value.usage.prompt_tokens).unwrap_or(u32::MAX),
             output_tokens: u32::try_from(value.usage.completion_tokens).unwrap_or(u32::MAX),
+            ..Default::default()
         });
         let finish_reason = choice.map(|choice| choice.finish_reason.clone());
 
