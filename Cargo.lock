@@ -7320,6 +7320,7 @@ version = "0.2.0"
 dependencies = [
  "either",
  "extism-pdk",
+ "heck 0.5.0",
  "http",
  "querymt",
  "querymt-extism-macros",

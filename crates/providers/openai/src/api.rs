@@ -23,7 +23,55 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use url::Url;
 
+use heck::ToSnakeCase;
+
 use crate::AuthType;
+
+fn should_snakecase_extra_body(base_url: &Url) -> bool {
+    // Why: `extra_body` is an untyped string->JSON map that gets flattened into the
+    // request body, so serde can't apply `rename_all = "snake_case"` to its keys.
+    //
+    // The OpenAI API expects snake_case parameter names (e.g. `prompt_cache_key`),
+    // but some internal/default heuristics and user configs use camelCase
+    // (e.g. `promptCacheKey`). We normalize here so callers can supply either.
+    //
+    // Scope: only apply this normalization for the real OpenAI API. Many
+    // OpenAI-compatible providers accept different parameter names and/or casing,
+    // so rewriting keys could break them.
+    matches!(base_url.host_str(), Some("api.openai.com"))
+}
+
+fn normalize_extra_body_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(normalize_extra_body_map(map)),
+        Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(normalize_extra_body_value).collect())
+        }
+        other => other,
+    }
+}
+
+fn normalize_extra_body_map(map: Map<String, Value>) -> Map<String, Value> {
+    // Two-pass to prefer keys that are already snake_case.
+    let entries: Vec<(String, Value)> = map.into_iter().collect();
+    let mut out = Map::with_capacity(entries.len());
+
+    for (k, v) in &entries {
+        let nk = k.to_snake_case();
+        if &nk == k {
+            out.insert(k.clone(), normalize_extra_body_value(v.clone()));
+        }
+    }
+
+    for (k, v) in entries {
+        let nk = k.to_snake_case();
+        if nk != k && !out.contains_key(&nk) {
+            out.insert(nk, normalize_extra_body_value(v));
+        }
+    }
+
+    out
+}
 
 pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
     Schema::Object(SchemaObject {
@@ -769,6 +817,14 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
         None
     };
 
+    let extra_body = cfg.extra_body().map(|m| {
+        if should_snakecase_extra_body(cfg.base_url()) {
+            normalize_extra_body_map(m)
+        } else {
+            m
+        }
+    });
+
     let body = OpenAIChatRequest {
         model: cfg.model(),
         messages: openai_msgs,
@@ -781,7 +837,7 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
         tool_choice: request_tool_choice,
         reasoning_effort: cfg.reasoning_effort().cloned(),
         response_format,
-        extra_body: cfg.extra_body(),
+        extra_body,
     };
 
     let json_body = serde_json::to_vec(&body)?;
