@@ -147,6 +147,7 @@ pub enum UiServerMessage {
     },
     SessionLoaded {
         session_id: String,
+        agent_id: String,
         audit: AuditView,
     },
     WorkspaceIndexStatus {

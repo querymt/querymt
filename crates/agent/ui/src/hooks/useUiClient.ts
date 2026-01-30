@@ -282,11 +282,36 @@ export function useUiClient() {
       case 'session_loaded': {
         setSessionId(msg.session_id);
         setMainSessionId(msg.session_id);
-        setEventsBySession(new Map()); // Clear buckets
         setSessionAudit(msg.audit);
         
-        // The backend will send session_events replay automatically since
-        // we auto-subscribe on load. But also subscribe to child delegation sessions.
+        // Populate eventsBySession from the audit events (for old session history)
+        const translated = msg.audit.events.map((e: any) => {
+          const item = translateAgentEvent(msg.agent_id, e);
+          item.sessionId = msg.session_id;
+          item.seq = e.seq;
+          return item;
+        });
+        
+        // Initialize eventsBySession with the main session's events
+        const eventsMap = new Map();
+        eventsMap.set(msg.session_id, translated);
+        setEventsBySession(eventsMap);
+        
+        // Update agentModels from the last provider event in the loaded session
+        const lastProvider = [...translated].reverse()
+          .find(e => e.provider || e.model);
+        if (lastProvider) {
+          setAgentModels(prev => ({
+            ...prev,
+            [msg.agent_id]: {
+              provider: lastProvider.provider,
+              model: lastProvider.model,
+              contextLimit: lastProvider.contextLimit,
+            },
+          }));
+        }
+        
+        // Subscribe to child delegation sessions
         for (const event of msg.audit.events) {
           if (
             (event.kind as any)?.type === 'session_forked' &&

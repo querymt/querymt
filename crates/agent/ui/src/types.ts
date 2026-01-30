@@ -316,7 +316,7 @@ export type UiServerMessage =
       message: string;
     }
   | { type: 'session_list'; groups: SessionGroup[] }
-  | { type: 'session_loaded'; session_id: string; audit: AuditView }
+  | { type: 'session_loaded'; session_id: string; agent_id: string; audit: AuditView }
   | {
       type: 'workspace_index_status';
       session_id: string;

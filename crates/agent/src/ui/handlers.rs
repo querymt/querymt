@@ -213,7 +213,7 @@ pub async fn handle_load_session(
     // 4. Register agent mapping
     {
         let mut agents = state.session_agents.lock().await;
-        agents.insert(session_id.to_string(), agent_id);
+        agents.insert(session_id.to_string(), agent_id.clone());
     }
 
     // 5. Send loaded audit view
@@ -221,6 +221,7 @@ pub async fn handle_load_session(
         tx,
         UiServerMessage::SessionLoaded {
             session_id: session_id.to_string(),
+            agent_id,
             audit,
         },
     )
