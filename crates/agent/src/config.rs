@@ -614,6 +614,29 @@ pub struct ResolvedTools {
     pub mcp_servers: HashMap<String, (McpServerConfig, Option<Vec<String>>)>,
 }
 
+/// Recursively interpolate environment variables in a TOML value
+/// Only interpolates strings; leaves comments untouched (they're stripped during parsing)
+fn interpolate_toml_value(value: &mut toml::Value) -> Result<()> {
+    match value {
+        toml::Value::String(s) => {
+            *s = interpolate_env_vars(s)?;
+        }
+        toml::Value::Array(arr) => {
+            for item in arr {
+                interpolate_toml_value(item)?;
+            }
+        }
+        toml::Value::Table(table) => {
+            for (_key, val) in table {
+                interpolate_toml_value(val)?;
+            }
+        }
+        // Other types (Integer, Float, Boolean, Datetime) don't contain env vars
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Load and parse a config file
 pub async fn load_config(path: impl AsRef<Path>) -> Result<Config> {
     let path = path.as_ref();
@@ -621,37 +644,43 @@ pub async fn load_config(path: impl AsRef<Path>) -> Result<Config> {
         .await
         .with_context(|| format!("Failed to read config file: {:?}", path))?;
 
-    // Step 1: Interpolate environment variables
-    let processed = interpolate_env_vars(&content)?;
+    // Step 1: Parse TOML to strip comments and get structured data
+    let mut value: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse TOML config file: {:?}", path))?;
 
-    // Step 2: Detect config type and parse
+    // Step 2: Interpolate environment variables only in string values
+    interpolate_toml_value(&mut value)?;
+
+    // Step 3: Detect config type and deserialize
     let base_path = path.parent().unwrap_or(Path::new("."));
 
-    let config = if processed.contains("[agent]") {
+    let config = if value.get("agent").is_some() {
         // Single agent config
-        let mut config: SingleAgentConfig =
-            toml::from_str(&processed).with_context(|| "Failed to parse single agent config")?;
+        let mut config: SingleAgentConfig = value
+            .try_into()
+            .with_context(|| "Failed to deserialize single agent config")?;
 
-        // Step 3: Validate
+        // Step 4: Validate
         validate_mcp_servers(&config.mcp)?;
 
-        // Step 4: Resolve system prompt file references
+        // Step 5: Resolve system prompt file references
         let resolved = resolve_system_parts(&config.agent.system, base_path, "agent").await?;
         config.agent.system = resolved.into_iter().map(SystemPart::Inline).collect();
 
         Config::Single(config)
-    } else if processed.contains("[quorum]") || processed.contains("[planner]") {
+    } else if value.get("quorum").is_some() || value.get("planner").is_some() {
         // Multi-agent config
-        let mut config: QuorumConfig =
-            toml::from_str(&processed).with_context(|| "Failed to parse quorum config")?;
+        let mut config: QuorumConfig = value
+            .try_into()
+            .with_context(|| "Failed to deserialize quorum config")?;
 
-        // Step 3: Validate
+        // Step 4: Validate
         validate_mcp_servers(&config.mcp)?;
         for delegate in &config.delegates {
             validate_mcp_servers(&delegate.mcp)?;
         }
 
-        // Step 4: Resolve system prompt file references
+        // Step 5: Resolve system prompt file references
         let resolved = resolve_system_parts(&config.planner.system, base_path, "planner").await?;
         config.planner.system = resolved.into_iter().map(SystemPart::Inline).collect();
         for delegate in &mut config.delegates {
@@ -941,5 +970,189 @@ mod tests {
         let parts = vec![SystemPart::File { file }];
         let result = resolve_system_parts(&parts, &dir, "test").await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_interpolate_toml_value_strings() {
+        unsafe {
+            std::env::set_var("TOML_TEST_VAR", "interpolated");
+        }
+
+        let toml_str = r#"
+            provider = "${TOML_TEST_VAR}"
+            model = "gpt-4"
+        "#;
+        let mut value: toml::Value = toml::from_str(toml_str).unwrap();
+        interpolate_toml_value(&mut value).unwrap();
+
+        let table = value.as_table().unwrap();
+        assert_eq!(
+            table.get("provider").unwrap().as_str().unwrap(),
+            "interpolated"
+        );
+        assert_eq!(table.get("model").unwrap().as_str().unwrap(), "gpt-4");
+    }
+
+    #[test]
+    fn test_interpolate_toml_value_arrays() {
+        unsafe {
+            std::env::set_var("TOML_ARRAY_VAR", "value1");
+        }
+
+        let toml_str = r#"
+            tools = ["${TOML_ARRAY_VAR}", "tool2"]
+        "#;
+        let mut value: toml::Value = toml::from_str(toml_str).unwrap();
+        interpolate_toml_value(&mut value).unwrap();
+
+        let table = value.as_table().unwrap();
+        let tools = table.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools[0].as_str().unwrap(), "value1");
+        assert_eq!(tools[1].as_str().unwrap(), "tool2");
+    }
+
+    #[test]
+    fn test_interpolate_toml_value_nested_tables() {
+        unsafe {
+            std::env::set_var("TOML_NESTED_VAR", "nested_value");
+        }
+
+        let toml_str = r#"
+            [agent]
+            provider = "${TOML_NESTED_VAR}"
+            model = "gpt-4"
+        "#;
+        let mut value: toml::Value = toml::from_str(toml_str).unwrap();
+        interpolate_toml_value(&mut value).unwrap();
+
+        let table = value.as_table().unwrap();
+        let agent = table.get("agent").unwrap().as_table().unwrap();
+        assert_eq!(
+            agent.get("provider").unwrap().as_str().unwrap(),
+            "nested_value"
+        );
+    }
+
+    #[test]
+    fn test_interpolate_toml_value_with_default() {
+        let toml_str = r#"
+            provider = "${TOML_MISSING_VAR:-default_provider}"
+        "#;
+        let mut value: toml::Value = toml::from_str(toml_str).unwrap();
+        interpolate_toml_value(&mut value).unwrap();
+
+        let table = value.as_table().unwrap();
+        assert_eq!(
+            table.get("provider").unwrap().as_str().unwrap(),
+            "default_provider"
+        );
+    }
+
+    #[test]
+    fn test_comments_with_env_vars_full_line() {
+        // Full-line comments with ${VAR} should not cause errors
+        let toml_str = r#"
+            # This is a comment with ${SOME_VAR} that should be ignored
+            provider = "anthropic"
+            # Another comment: ${ANOTHER_VAR}
+            model = "claude-3-5-sonnet-20241022"
+        "#;
+        let mut value: toml::Value = toml::from_str(toml_str).unwrap();
+        // Should not error even though SOME_VAR and ANOTHER_VAR are not set
+        assert!(interpolate_toml_value(&mut value).is_ok());
+
+        let table = value.as_table().unwrap();
+        assert_eq!(
+            table.get("provider").unwrap().as_str().unwrap(),
+            "anthropic"
+        );
+        assert_eq!(
+            table.get("model").unwrap().as_str().unwrap(),
+            "claude-3-5-sonnet-20241022"
+        );
+    }
+
+    #[test]
+    fn test_comments_with_env_vars_inline() {
+        // Inline comments with ${VAR} should not cause errors
+        let toml_str = r#"
+            provider = "anthropic"  # Uses ${API_KEY} for auth
+            model = "claude-3-5-sonnet-20241022"  # Or use ${MODEL_OVERRIDE}
+        "#;
+        let mut value: toml::Value = toml::from_str(toml_str).unwrap();
+        // Should not error even though API_KEY and MODEL_OVERRIDE are not set
+        assert!(interpolate_toml_value(&mut value).is_ok());
+
+        let table = value.as_table().unwrap();
+        assert_eq!(
+            table.get("provider").unwrap().as_str().unwrap(),
+            "anthropic"
+        );
+        assert_eq!(
+            table.get("model").unwrap().as_str().unwrap(),
+            "claude-3-5-sonnet-20241022"
+        );
+    }
+
+    #[test]
+    fn test_strings_still_interpolate_with_comments_present() {
+        unsafe {
+            std::env::set_var("TEST_PROVIDER_VAR", "openai");
+            std::env::set_var("TEST_MODEL_VAR", "gpt-4");
+        }
+
+        let toml_str = r#"
+            # Comment with ${UNSET_VAR}
+            provider = "${TEST_PROVIDER_VAR}"  # Another ${COMMENT_VAR}
+            model = "${TEST_MODEL_VAR}"
+        "#;
+        let mut value: toml::Value = toml::from_str(toml_str).unwrap();
+        interpolate_toml_value(&mut value).unwrap();
+
+        let table = value.as_table().unwrap();
+        assert_eq!(table.get("provider").unwrap().as_str().unwrap(), "openai");
+        assert_eq!(table.get("model").unwrap().as_str().unwrap(), "gpt-4");
+    }
+
+    #[test]
+    fn test_mixed_comments_and_interpolation() {
+        unsafe {
+            std::env::set_var("REAL_VAR", "real_value");
+        }
+
+        let toml_str = r#"
+            # Top comment ${FAKE_VAR}
+            [agent]
+            # Section comment ${ANOTHER_FAKE}
+            provider = "${REAL_VAR}"  # inline ${INLINE_FAKE}
+            model = "test"
+            # tools = ["${COMMENTED_OUT_VAR}"]
+        "#;
+        let mut value: toml::Value = toml::from_str(toml_str).unwrap();
+        assert!(interpolate_toml_value(&mut value).is_ok());
+
+        let table = value.as_table().unwrap();
+        let agent = table.get("agent").unwrap().as_table().unwrap();
+        assert_eq!(
+            agent.get("provider").unwrap().as_str().unwrap(),
+            "real_value"
+        );
+        assert_eq!(agent.get("model").unwrap().as_str().unwrap(), "test");
+    }
+
+    #[test]
+    fn test_interpolate_missing_var_in_string_still_errors() {
+        let toml_str = r#"
+            provider = "${DEFINITELY_MISSING_VAR}"
+        "#;
+        let mut value: toml::Value = toml::from_str(toml_str).unwrap();
+        let result = interpolate_toml_value(&mut value);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("DEFINITELY_MISSING_VAR")
+        );
     }
 }
