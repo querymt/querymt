@@ -46,9 +46,9 @@ impl GitSnapshotBackend {
             return Ok(base.join(format!("{:016x}", hash.as_u64())));
         }
 
-        let home = dirs::home_dir().context("HOME directory must be set")?;
-        Ok(home
-            .join(".qmt")
+        let cache_dir = dirs::cache_dir().context("HOME directory must be set")?;
+        Ok(cache_dir
+            .join("querymt")
             .join("snapshots")
             .join(format!("{:016x}", hash.as_u64())))
     }
