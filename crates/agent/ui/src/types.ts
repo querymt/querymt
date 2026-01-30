@@ -179,6 +179,7 @@ export type AgentEventKind =
   | { type: 'tool_call_start'; tool_call_id: string; tool_name: string; arguments?: string }
   | { type: 'tool_call_end'; tool_call_id: string; tool_name: string; result?: string; is_error?: boolean }
   | { type: 'error'; message: string }
+  | { type: 'delegation_cancelled'; delegation_id: string }
   | { type: string; [key: string]: unknown };
 
 // Full AuditView matching Rust struct (for session loading)

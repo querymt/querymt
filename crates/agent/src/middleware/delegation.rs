@@ -186,7 +186,7 @@ impl DelegationMiddleware {
                             }
                         }
                     }
-                    DelegationStatus::Complete => {}
+                    DelegationStatus::Complete | DelegationStatus::Cancelled => {}
                 }
             }
         }

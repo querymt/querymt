@@ -116,8 +116,8 @@ impl DelegationGuardMiddleware {
                             }
                         }
                     }
-                    DelegationStatus::Complete => {
-                        // Complete is fine, allow new delegation
+                    DelegationStatus::Complete | DelegationStatus::Cancelled => {
+                        // Complete or Cancelled is fine, allow new delegation
                     }
                 }
             }

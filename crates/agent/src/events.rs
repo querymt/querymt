@@ -196,6 +196,9 @@ pub enum AgentEventKind {
         delegation_id: String,
         error: String,
     },
+    DelegationCancelled {
+        delegation_id: String,
+    },
     UncertaintyEscalated {
         task_id: Option<String>,
         description: String,

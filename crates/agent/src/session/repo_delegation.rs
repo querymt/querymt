@@ -66,6 +66,7 @@ impl fmt::Display for DelegationStatus {
             DelegationStatus::Running => write!(f, "running"),
             DelegationStatus::Complete => write!(f, "complete"),
             DelegationStatus::Failed => write!(f, "failed"),
+            DelegationStatus::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -79,6 +80,7 @@ impl FromStr for DelegationStatus {
             "running" => Ok(DelegationStatus::Running),
             "complete" => Ok(DelegationStatus::Complete),
             "failed" => Ok(DelegationStatus::Failed),
+            "cancelled" => Ok(DelegationStatus::Cancelled),
             _ => Err(format!("Unknown delegation status: {}", s)),
         }
     }

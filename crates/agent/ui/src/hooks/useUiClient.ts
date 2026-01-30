@@ -193,6 +193,13 @@ export function useUiClient() {
             next.delete(msg.agent_id);
             return next;
           });
+        } else if (eventKind === 'delegation_cancelled') {
+          // When a delegation is cancelled, the delegate agent should be removed from thinking state
+          // The msg.agent_id here is the delegator (parent), but we need to clear thinking state
+          // for the delegate agent. Since we track thinking per agent, and cancellation of the
+          // delegation will also trigger 'cancelled' on the child session, we rely on that.
+          // However, we can defensively clear all thinking state to ensure UI responsiveness.
+          // For now, just trust the child session's 'cancelled' event will arrive.
         }
 
         // Auto-subscribe to delegation child sessions

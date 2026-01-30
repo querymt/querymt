@@ -162,6 +162,7 @@ pub enum DelegationStatus {
     Running,
     Complete,
     Failed,
+    Cancelled,
 }
 
 /// Agent-to-agent delegation record

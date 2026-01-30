@@ -7,15 +7,20 @@ use crate::session::store::SessionStore;
 use crate::verification::VerificationSpec;
 use crate::verification::service::{VerificationContext, VerificationService};
 use agent_client_protocol::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion, TextContent,
+    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
+    ProtocolVersion, TextContent,
 };
 use async_trait::async_trait;
 use log::{error, warn};
 use querymt::chat::ChatRole;
 use querymt::error::LLMError;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
@@ -83,6 +88,9 @@ pub struct DelegationOrchestrator {
     store: Arc<dyn SessionStore>,
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     config: DelegationOrchestratorConfig,
+    /// Maps delegation_id -> (parent_session_id, cancellation_token, join_handle)
+    active_delegations:
+        Arc<Mutex<HashMap<String, (String, CancellationToken, JoinHandle<()>)>>>,
 }
 
 impl DelegationOrchestrator {
@@ -97,6 +105,7 @@ impl DelegationOrchestrator {
             store,
             agent_registry,
             config: DelegationOrchestratorConfig::new(cwd),
+            active_delegations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -114,25 +123,63 @@ impl DelegationOrchestrator {
 #[async_trait]
 impl EventObserver for DelegationOrchestrator {
     async fn on_event(&self, event: &AgentEvent) -> Result<(), LLMError> {
-        if let AgentEventKind::DelegationRequested { delegation } = &event.kind {
-            let delegator = self.delegator.clone();
-            let store = self.store.clone();
-            let agent_registry = self.agent_registry.clone();
-            let config = self.config.clone();
-            let parent_session_id = event.session_id.clone();
-            let delegation = delegation.clone();
+        match &event.kind {
+            AgentEventKind::DelegationRequested { delegation } => {
+                let delegator = self.delegator.clone();
+                let store = self.store.clone();
+                let agent_registry = self.agent_registry.clone();
+                let config = self.config.clone();
+                let parent_session_id = event.session_id.clone();
+                let parent_session_id_for_insert = parent_session_id.clone();
+                let delegation = delegation.clone();
+                let cancel_token = CancellationToken::new();
+                let active_delegations = self.active_delegations.clone();
+                let active_delegations_for_spawn = active_delegations.clone();
 
-            tokio::spawn(async move {
-                handle_delegation(
-                    delegator,
-                    store,
-                    agent_registry,
-                    config,
-                    parent_session_id,
-                    delegation,
-                )
-                .await;
-            });
+                // Store the cancellation token and join handle
+                let delegation_id = delegation.public_id.clone();
+                let cancel_token_clone = cancel_token.clone();
+
+                let handle = tokio::spawn(async move {
+                    handle_delegation(
+                        delegator,
+                        store,
+                        agent_registry,
+                        config,
+                        parent_session_id,
+                        delegation,
+                        cancel_token,
+                        active_delegations_for_spawn,
+                    )
+                    .await;
+                });
+
+                let mut active = active_delegations.lock().await;
+                active.insert(
+                    delegation_id,
+                    (parent_session_id_for_insert, cancel_token_clone, handle),
+                );
+            }
+            AgentEventKind::Cancelled => {
+                // Cancel all delegations for this session
+                let session_id = &event.session_id;
+                let active = self.active_delegations.lock().await;
+
+                // Find all delegations for this session
+                let to_cancel: Vec<String> = active
+                    .iter()
+                    .filter(|(_, (parent_id, _, _))| parent_id == session_id)
+                    .map(|(delegation_id, _)| delegation_id.clone())
+                    .collect();
+
+                // Cancel each delegation
+                for delegation_id in to_cancel {
+                    if let Some((_, cancel_token, _)) = active.get(&delegation_id) {
+                        cancel_token.cancel();
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -145,7 +192,10 @@ async fn handle_delegation(
     config: DelegationOrchestratorConfig,
     parent_session_id: String,
     delegation: Delegation,
+    cancel_token: CancellationToken,
+    active_delegations: Arc<Mutex<HashMap<String, (String, CancellationToken, JoinHandle<()>)>>>,
 ) {
+    let delegation_id = delegation.public_id.clone();
     // Validate target's capability requirements
     if let Some(target_info) = agent_registry.get_agent(&delegation.target_agent_id)
         && target_info
@@ -297,8 +347,40 @@ async fn handle_delegation(
         vec![ContentBlock::Text(TextContent::new(prompt_text))],
     );
 
-    match delegate_agent.prompt(prompt_req).await {
-        Ok(_) => {
+    let child_session_id = delegate_session.session_id.to_string();
+
+    // Use select! to race between prompt completion and cancellation
+    let prompt_result = tokio::select! {
+        result = delegate_agent.prompt(prompt_req) => Some(result),
+        _ = cancel_token.cancelled() => {
+            // Cancellation requested - cancel the child session and exit
+            let cancel_notif = CancelNotification::new(child_session_id.clone());
+            let _ = delegate_agent.cancel(cancel_notif).await;
+
+            if let Err(e) = store
+                .update_delegation_status(&delegation_id, DelegationStatus::Cancelled)
+                .await
+            {
+                warn!("Failed to update delegation status to Cancelled: {}", e);
+            }
+
+            delegator.emit_event(
+                &parent_session_id,
+                AgentEventKind::DelegationCancelled {
+                    delegation_id: delegation_id.clone(),
+                },
+            );
+
+            // Clean up from active_delegations map
+            let mut active = active_delegations.lock().await;
+            active.remove(&delegation_id);
+
+            return;
+        }
+    };
+
+    match prompt_result {
+        Some(Ok(_)) => {
             let verification_passed = if config.run_verification {
                 // Use new verification framework if verification_spec is available or legacy expected_output exists
                 match VerificationSpecBuilder::from_delegation(&delegation) {
@@ -385,18 +467,29 @@ async fn handle_delegation(
                 )
                 .await;
             }
+
+            // Clean up from active_delegations map
+            let mut active = active_delegations.lock().await;
+            active.remove(&delegation_id);
         }
-        Err(e) => {
+        Some(Err(e)) => {
             let error_message = format!("Delegation failed: {}", e);
             fail_delegation(
                 &delegator,
                 &store,
                 &config,
                 &parent_session_id,
-                &delegation.public_id,
+                &delegation_id,
                 &error_message,
             )
             .await;
+
+            // Clean up from active_delegations map
+            let mut active = active_delegations.lock().await;
+            active.remove(&delegation_id);
+        }
+        None => {
+            // Already handled in the select! cancellation branch
         }
     }
 }
