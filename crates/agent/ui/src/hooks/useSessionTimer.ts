@@ -43,14 +43,14 @@ interface SessionTimerResult {
  */
 export function useSessionTimer(
   events: EventItem[],
-  thinkingAgentId: string | null,
+  thinkingAgentIds: Set<string>,
   isConversationComplete: boolean
 ): SessionTimerResult {
   const [currentTime, setCurrentTime] = useState(Date.now());
   
   // Determine if session should be considered active
   // This is computed early so we can use it to conditionally run the timer
-  const shouldTimerRun = thinkingAgentId !== null && !isConversationComplete;
+  const shouldTimerRun = thinkingAgentIds.size > 0 && !isConversationComplete;
   
   // Update current time every second ONLY when session is active
   // This is the key optimization - no interval when idle
@@ -119,9 +119,14 @@ export function useSessionTimer(
       const finishReason = event.finishReason?.toLowerCase();
       
       // GLOBAL TIMER: Start from first prompt_received
-      if (isPromptReceived && !globalState.hasStarted) {
-        globalState.hasStarted = true;
-        globalState.lastActiveAt = timestamp;
+      if (isPromptReceived) {
+        if (!globalState.hasStarted) {
+          globalState.hasStarted = true;
+          globalState.lastActiveAt = timestamp;
+        } else if (globalState.lastActiveAt === undefined) {
+          // Resume after pause - re-anchor the live timer
+          globalState.lastActiveAt = timestamp;
+        }
       }
       
       // PER-AGENT: Start working when prompt received
@@ -194,9 +199,9 @@ export function useSessionTimer(
   
   // Calculate live elapsed times
   // GLOBAL TIMER: Add live delta only if session is active
-  // Use thinkingAgentId as the sole source of truth for active state
+  // Use thinkingAgentIds as the sole source of truth for active state
   // This ensures loaded historical sessions are never shown as active
-  const isSessionActive = thinkingAgentId !== null && !isConversationComplete;
+  const isSessionActive = thinkingAgentIds.size > 0 && !isConversationComplete;
   
   let globalElapsedMs = globalState.accumulatedMs;
   if (globalState.lastActiveAt !== undefined && isSessionActive) {

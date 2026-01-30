@@ -92,6 +92,11 @@ impl QueryMTAgent {
             .await
             .map_err(|e| Error::new(-32000, e.to_string()))?;
 
+        // 3a. Clean up revert state if a new prompt is sent while in reverted state
+        if let Err(e) = self.cleanup_revert_on_prompt(&session_id).await {
+            warn!("Failed to clean up revert state: {}", e);
+        }
+
         // 4. Store User Messages
         // Full content for LLM and events (includes attachments)
         let full_content = format_prompt_blocks(&req.prompt, self.max_prompt_bytes);
@@ -105,10 +110,15 @@ impl QueryMTAgent {
                 SessionUpdate::UserMessageChunk(ContentChunk::new(block.clone())),
             );
         }
+
+        // Generate message ID first so we can include it in the event
+        let message_id = Uuid::new_v4().to_string();
+
         self.emit_event(
             &session_id,
             AgentEventKind::PromptReceived {
                 content: full_content.clone(),
+                message_id: Some(message_id.clone()),
             },
         );
 
@@ -119,7 +129,7 @@ impl QueryMTAgent {
             .map_err(|e| Error::new(-32000, e.to_string()))?;
 
         let agent_msg = AgentMessage {
-            id: Uuid::new_v4().to_string(),
+            id: message_id,
             session_id: session_id.clone(),
             role: ChatRole::User,
             parts: vec![MessagePart::Text {
@@ -257,13 +267,70 @@ impl QueryMTAgent {
                         .run_step_start(state)
                         .await
                         .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+
+                    // Take pre-step snapshot for undo/redo support
+                    // Store step_id and snapshot_id temporarily for persistence
+                    let mut snapshot_data: Option<(String, String)> = None;
+
+                    if let Some(ref backend) = self.snapshot_backend
+                        && let Some(ref worktree) = self.snapshot_root
+                    {
+                        let step_id = Uuid::new_v4().to_string();
+                        if let Some(rt) = runtime {
+                            *rt.current_step_id.lock().unwrap() = Some(step_id.clone());
+                        }
+                        match backend.track(worktree).await {
+                            Ok(snapshot_id) => {
+                                if let Some(rt) = runtime {
+                                    *rt.pre_step_snapshot.lock().unwrap() =
+                                        Some(snapshot_id.clone());
+                                }
+                                debug!(
+                                    "Pre-step snapshot created: {} (step {})",
+                                    snapshot_id, step_id
+                                );
+                                // Store for persistence below
+                                snapshot_data = Some((step_id, snapshot_id));
+                            }
+                            Err(e) => {
+                                warn!("Pre-step snapshot failed: {}", e);
+                            }
+                        }
+                    }
+
                     match state {
-                        ExecutionState::BeforeLlmCall { ref context } => {
+                        ExecutionState::BeforeLlmCall {
+                            context: ref conv_context,
+                        } => {
+                            // Persist StepSnapshotStart message part if we took a snapshot
+                            // Note: `context` here refers to the outer SessionContext parameter
+                            if let Some((step_id, snapshot_id)) = snapshot_data {
+                                let start_part = MessagePart::StepSnapshotStart {
+                                    step_id: step_id.clone(),
+                                    snapshot_id: snapshot_id.clone(),
+                                };
+
+                                let snapshot_msg = AgentMessage {
+                                    id: Uuid::new_v4().to_string(),
+                                    session_id: context.session().public_id.clone(),
+                                    role: ChatRole::Assistant,
+                                    parts: vec![start_part],
+                                    created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                                    parent_message_id: None,
+                                };
+
+                                if let Err(e) = context.add_message(snapshot_msg).await {
+                                    warn!("Failed to store snapshot start: {}", e);
+                                } else {
+                                    debug!("Pre-step snapshot start stored (step {})", step_id);
+                                }
+                            }
+
                             self.transition_before_llm_call(
-                                context,
+                                conv_context,
                                 runtime,
                                 &cancel_rx,
-                                &context.session_id,
+                                &conv_context.session_id,
                             )
                             .await?
                         }
@@ -391,6 +458,66 @@ impl QueryMTAgent {
 
                 ExecutionState::Complete => {
                     debug!("State machine reached Complete state");
+
+                    // Take post-step snapshot and record changes for undo/redo
+                    if let Some(ref backend) = self.snapshot_backend
+                        && let Some(ref worktree) = self.snapshot_root
+                    {
+                        let pre_id =
+                            runtime.and_then(|rt| rt.pre_step_snapshot.lock().unwrap().take());
+                        let step_id =
+                            runtime.and_then(|rt| rt.current_step_id.lock().unwrap().take());
+
+                        if let (Some(pre_id), Some(step_id)) = (pre_id, step_id) {
+                            match backend.track(worktree).await {
+                                Ok(post_id) => {
+                                    if pre_id != post_id {
+                                        let changed = backend
+                                            .diff(worktree, &pre_id, &post_id)
+                                            .await
+                                            .unwrap_or_default();
+                                        if !changed.is_empty() {
+                                            let patch_part = MessagePart::StepSnapshotPatch {
+                                                step_id: step_id.clone(),
+                                                snapshot_id: post_id.clone(),
+                                                changed_paths: changed
+                                                    .iter()
+                                                    .map(|p| p.to_string_lossy().to_string())
+                                                    .collect(),
+                                            };
+
+                                            // Store patch as a system message
+                                            let snapshot_msg = AgentMessage {
+                                                id: Uuid::new_v4().to_string(),
+                                                session_id: context.session().public_id.clone(),
+                                                role: ChatRole::Assistant,
+                                                parts: vec![patch_part],
+                                                created_at: time::OffsetDateTime::now_utc()
+                                                    .unix_timestamp(),
+                                                parent_message_id: None,
+                                            };
+                                            if let Err(e) = context.add_message(snapshot_msg).await
+                                            {
+                                                warn!("Failed to store snapshot patch: {}", e);
+                                            } else {
+                                                debug!(
+                                                    "Post-step snapshot patch stored: {} changed files (step {})",
+                                                    changed.len(),
+                                                    step_id
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Post-step snapshot failed: {}", e);
+                                }
+                            }
+                        }
+
+                        // Run GC if snapshot backend is configured
+                        let _ = backend.gc(worktree, &self.snapshot_gc_config).await;
+                    }
 
                     // Run pruning if enabled
                     if self.pruning_config.enabled

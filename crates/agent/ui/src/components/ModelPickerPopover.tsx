@@ -1,11 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { RefreshCw, Search, X, ChevronRight } from 'lucide-react';
+import { useCallback, useMemo, useState } from 'react';
+import { Command } from 'cmdk';
+import * as Popover from '@radix-ui/react-popover';
+import { RefreshCw, Search, X, ChevronRight, ChevronDown } from 'lucide-react';
 import type { ModelEntry, RoutingMode, UiAgentInfo } from '../types';
 
+/* ------------------------------------------------------------------ */
+/*  Types                                                              */
+/* ------------------------------------------------------------------ */
+
 interface ModelPickerPopoverProps {
-  isOpen: boolean;
-  onClose: () => void;
-  anchorRef: React.RefObject<HTMLElement>;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   connected: boolean;
   routingMode: RoutingMode;
   activeAgentId: string;
@@ -22,6 +27,10 @@ interface ModelPickerPopoverProps {
 const TARGET_ACTIVE = 'active';
 const TARGET_ALL = 'all';
 
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
+
 interface GroupedModels {
   provider: string;
   models: string[];
@@ -37,10 +46,13 @@ function groupByProvider(models: ModelEntry[]): GroupedModels[] {
   return Array.from(map.entries()).map(([provider, models]) => ({ provider, models }));
 }
 
+/* ------------------------------------------------------------------ */
+/*  Component                                                          */
+/* ------------------------------------------------------------------ */
+
 export function ModelPickerPopover({
-  isOpen,
-  onClose,
-  anchorRef,
+  open,
+  onOpenChange,
   connected,
   routingMode,
   activeAgentId: _activeAgentId,
@@ -54,317 +66,241 @@ export function ModelPickerPopover({
   onSetSessionModel,
 }: ModelPickerPopoverProps) {
   const [target, setTarget] = useState(TARGET_ACTIVE);
-  const [filter, setFilter] = useState('');
-  const [selectedModel, setSelectedModel] = useState<{ provider: string; model: string } | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [highlightIndex, setHighlightIndex] = useState(0);
-  const popoverRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const listRef = useRef<HTMLDivElement>(null);
+  const [selectedValue, setSelectedValue] = useState('');
 
   const targetAgents = useMemo(
     () => agents.filter((agent) => sessionsByAgent[agent.id]),
-    [agents, sessionsByAgent]
+    [agents, sessionsByAgent],
   );
 
   const grouped = useMemo(() => groupByProvider(allModels), [allModels]);
 
-  const filteredGroups = useMemo(() => {
-    const lowerFilter = filter.toLowerCase();
-    if (!lowerFilter) return grouped;
-    return grouped
-      .map((group) => ({
-        provider: group.provider,
-        models: group.models.filter(
-          (model) =>
-            model.toLowerCase().includes(lowerFilter) ||
-            group.provider.toLowerCase().includes(lowerFilter)
-        ),
-      }))
-      .filter((group) => group.models.length > 0);
-  }, [grouped, filter]);
-
-  // Flatten for keyboard navigation
-  const flatItems = useMemo(() => {
-    const items: { provider: string; model: string }[] = [];
-    for (const group of filteredGroups) {
-      for (const model of group.models) {
-        items.push({ provider: group.provider, model });
-      }
+  // Build a lookup map so we can resolve provider from the cmdk value
+  const modelMap = useMemo(() => {
+    const m = new Map<string, { provider: string; model: string }>();
+    for (const entry of allModels) {
+      m.set(`${entry.provider}/${entry.model}`, { provider: entry.provider, model: entry.model });
     }
-    return items;
-  }, [filteredGroups]);
-
-  // Reset highlight when filter changes
-  useEffect(() => {
-    setHighlightIndex(0);
-  }, [filter]);
-
-  // Focus input when popover opens
-  useEffect(() => {
-    if (isOpen && inputRef.current) {
-      inputRef.current.focus();
-    }
-  }, [isOpen]);
-
-  // Close on outside click
-  useEffect(() => {
-    if (!isOpen) return;
-    const handleClick = (e: MouseEvent) => {
-      if (
-        popoverRef.current &&
-        !popoverRef.current.contains(e.target as Node) &&
-        anchorRef.current &&
-        !anchorRef.current.contains(e.target as Node)
-      ) {
-        onClose();
-      }
-    };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [isOpen, onClose, anchorRef]);
-
-  // Close on escape
-  useEffect(() => {
-    if (!isOpen) return;
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onClose();
-      }
-    };
-    document.addEventListener('keydown', handleKey);
-    return () => document.removeEventListener('keydown', handleKey);
-  }, [isOpen, onClose]);
-
-  const handleRefresh = () => {
-    setIsRefreshing(true);
-    onRefresh();
-    setTimeout(() => setIsRefreshing(false), 1000);
-  };
+    return m;
+  }, [allModels]);
 
   const hasTargetSession =
     target === TARGET_ALL
       ? Object.values(sessionsByAgent).length > 0
       : target === TARGET_ACTIVE
-      ? Boolean(sessionId)
-      : Boolean(sessionsByAgent[target]);
+        ? Boolean(sessionId)
+        : Boolean(sessionsByAgent[target]);
 
-  const canSwitch = connected && selectedModel !== null && hasTargetSession;
+  const selectedEntry = modelMap.get(selectedValue);
+  const canSwitch = connected && selectedEntry !== undefined && hasTargetSession;
 
-  const handleSwitch = () => {
-    if (!selectedModel) return;
-    const modelId = `${selectedModel.provider}/${selectedModel.model}`;
-    const sessionIds = new Set<string>();
+  /* ---- actions ---- */
 
-    if (target === TARGET_ALL) {
-      Object.values(sessionsByAgent).forEach((id) => sessionIds.add(id));
-    } else if (target === TARGET_ACTIVE) {
-      if (sessionId) sessionIds.add(sessionId);
-    } else if (sessionsByAgent[target]) {
-      sessionIds.add(sessionsByAgent[target]);
-    }
+  const handleRefresh = useCallback(() => {
+    setIsRefreshing(true);
+    onRefresh();
+    setTimeout(() => setIsRefreshing(false), 1000);
+  }, [onRefresh]);
 
-    if (sessionIds.size === 0) return;
-    sessionIds.forEach((id) => onSetSessionModel(id, modelId));
-    onClose();
-  };
+  const switchModel = useCallback(
+    (value: string) => {
+      const entry = modelMap.get(value);
+      if (!entry) return;
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      setHighlightIndex((prev) => Math.min(prev + 1, flatItems.length - 1));
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      setHighlightIndex((prev) => Math.max(prev - 1, 0));
-    } else if (e.key === 'Enter') {
-      e.preventDefault();
-      const highlightedItem = flatItems[highlightIndex];
-      if (highlightedItem && connected && hasTargetSession) {
-        // Switch directly to the highlighted model
-        const modelId = `${highlightedItem.provider}/${highlightedItem.model}`;
-        const sessionIds = new Set<string>();
+      const modelId = `${entry.provider}/${entry.model}`;
+      const sessionIds = new Set<string>();
 
-        if (target === TARGET_ALL) {
-          Object.values(sessionsByAgent).forEach((id) => sessionIds.add(id));
-        } else if (target === TARGET_ACTIVE) {
-          if (sessionId) sessionIds.add(sessionId);
-        } else if (sessionsByAgent[target]) {
-          sessionIds.add(sessionsByAgent[target]);
-        }
-
-        if (sessionIds.size > 0) {
-          sessionIds.forEach((id) => onSetSessionModel(id, modelId));
-          onClose();
-        }
+      if (target === TARGET_ALL) {
+        Object.values(sessionsByAgent).forEach((id) => sessionIds.add(id));
+      } else if (target === TARGET_ACTIVE) {
+        if (sessionId) sessionIds.add(sessionId);
+      } else if (sessionsByAgent[target]) {
+        sessionIds.add(sessionsByAgent[target]);
       }
-    }
-  };
 
-  // Scroll highlighted item into view
-  useEffect(() => {
-    if (!listRef.current) return;
-    const highlighted = listRef.current.querySelector('[data-highlighted="true"]');
-    if (highlighted) {
-      highlighted.scrollIntoView({ block: 'nearest' });
-    }
-  }, [highlightIndex]);
+      if (sessionIds.size === 0) return;
+      sessionIds.forEach((id) => onSetSessionModel(id, modelId));
+      onOpenChange(false);
+    },
+    [modelMap, target, sessionsByAgent, sessionId, onSetSessionModel, onOpenChange],
+  );
 
-  if (!isOpen) return null;
+  const handleSwitchClick = useCallback(() => {
+    if (canSwitch) switchModel(selectedValue);
+  }, [canSwitch, selectedValue, switchModel]);
+
+  /* ---- trigger label ---- */
+  const triggerLabel =
+    currentProvider && currentModel
+      ? `${currentProvider} / ${currentModel}`
+      : 'Select model';
+
+  /* ---- render ---- */
 
   return (
-    <div
-      ref={popoverRef}
-      className="absolute top-full right-0 mt-2 z-50 w-[480px] max-h-[420px] flex flex-col rounded-xl border border-cyber-cyan/30 bg-cyber-bg shadow-lg shadow-cyber-cyan/25 animate-fade-in"
-    >
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-cyber-border/60">
-        <span className="text-xs font-semibold text-gray-300 uppercase tracking-wider">
-          Switch Model
-        </span>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={handleRefresh}
-            disabled={!connected || isRefreshing}
-            className="p-1 rounded text-gray-400 hover:text-cyber-cyan hover:bg-cyber-cyan/10 transition-colors disabled:opacity-50"
-            title="Refresh model list"
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
-          </button>
-          <button
-            type="button"
-            onClick={onClose}
-            className="p-1 rounded text-gray-400 hover:text-gray-200 hover:bg-cyber-surface/60 transition-colors"
-          >
-            <X className="h-3.5 w-3.5" />
-          </button>
-        </div>
-      </div>
-
-      {/* Target selector */}
-      <div className="px-3 py-2 border-b border-cyber-border/40">
-        <div className="flex items-center gap-2 text-xs">
-          <span className="text-[10px] uppercase tracking-widest text-gray-500">Target</span>
-          <select
-            value={target}
-            onChange={(e) => setTarget(e.target.value)}
-            className="flex-1 rounded-lg border border-cyber-border bg-cyber-surface/70 px-2 py-1 text-xs text-gray-200 focus:border-cyber-cyan focus:outline-none"
-            disabled={!connected}
-          >
-            <option value={TARGET_ACTIVE}>Active agent</option>
-            <option value={TARGET_ALL}>All agents</option>
-            {targetAgents.map((agent) => (
-              <option key={agent.id} value={agent.id}>
-                {agent.name}
-              </option>
-            ))}
-          </select>
-        </div>
-      </div>
-
-      {/* Filter input */}
-      <div className="px-3 py-2 border-b border-cyber-border/40">
-        <div className="relative">
-          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-500" />
-          <input
-            ref={inputRef}
-            type="text"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Filter models..."
-            className="w-full rounded-lg border border-cyber-border bg-cyber-surface/70 pl-8 pr-3 py-1.5 text-xs text-gray-200 placeholder:text-gray-500 focus:border-cyber-cyan focus:outline-none"
+    <Popover.Root open={open} onOpenChange={onOpenChange}>
+      <Popover.Trigger asChild>
+        <button
+          type="button"
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-cyber-border bg-cyber-bg/60 text-xs text-gray-300 hover:border-cyber-cyan/60 hover:text-cyber-cyan transition-colors max-w-[280px]"
+          title={currentProvider && currentModel ? `${currentProvider} / ${currentModel}` : 'No model selected'}
+        >
+          <span className="truncate">{triggerLabel}</span>
+          <ChevronDown
+            className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`}
           />
-        </div>
-      </div>
+        </button>
+      </Popover.Trigger>
 
-      {/* Model list */}
-      <div ref={listRef} className="flex-1 overflow-y-auto px-1 py-1">
-        {allModels.length === 0 ? (
-          <div className="px-3 py-6 text-center text-xs text-gray-500">
-            Loading models...
-          </div>
-        ) : filteredGroups.length === 0 ? (
-          <div className="px-3 py-6 text-center text-xs text-gray-500">
-            No models match "{filter}"
-          </div>
-        ) : (
-          filteredGroups.map((group) => (
-            <div key={group.provider} className="mb-1">
-              {/* Provider header */}
-              <div className="sticky top-0 z-10 px-2 py-1 text-[10px] font-semibold uppercase tracking-widest text-gray-500 bg-cyber-bg/95">
-                {group.provider}
-              </div>
-              {/* Models */}
-              {group.models.map((model) => {
-                const flatIndex = flatItems.findIndex(
-                  (item) => item.provider === group.provider && item.model === model
-                );
-                const isHighlighted = flatIndex === highlightIndex;
-                const isSelected =
-                  selectedModel?.provider === group.provider && selectedModel?.model === model;
-                const isCurrent =
-                  currentProvider === group.provider && currentModel === model;
-
-                return (
-                  <button
-                    key={model}
-                    type="button"
-                    data-highlighted={isHighlighted}
-                    onClick={() => setSelectedModel({ provider: group.provider, model })}
-                    className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors ${
-                      isSelected
-                        ? 'bg-cyber-cyan/20 text-cyber-cyan border border-cyber-cyan/40'
-                        : isHighlighted
-                        ? 'bg-cyber-surface/80 text-gray-200'
-                        : 'text-gray-300 hover:bg-cyber-surface/60'
-                    }`}
-                  >
-                    <ChevronRight
-                      className={`h-3 w-3 flex-shrink-0 transition-opacity ${
-                        isSelected ? 'opacity-100 text-cyber-cyan' : 'opacity-0'
-                      }`}
-                    />
-                    <span className="flex-1 truncate">{model}</span>
-                    {isCurrent && (
-                      <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-cyber-purple/20 text-cyber-purple border border-cyber-purple/30">
-                        current
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
+      <Popover.Portal>
+        <Popover.Content
+          align="end"
+          sideOffset={8}
+          className="z-50 w-[480px] max-h-[420px] flex flex-col rounded-xl border border-cyber-cyan/30 bg-cyber-bg shadow-lg shadow-cyber-cyan/25 animate-fade-in"
+          onOpenAutoFocus={(e) => e.preventDefault()} // cmdk manages focus
+        >
+          {/* Header */}
+          <div className="flex items-center justify-between px-3 py-2 border-b border-cyber-border/60">
+            <span className="text-xs font-semibold text-gray-300 uppercase tracking-wider">
+              Switch Model
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleRefresh}
+                disabled={!connected || isRefreshing}
+                className="p-1 rounded text-gray-400 hover:text-cyber-cyan hover:bg-cyber-cyan/10 transition-colors disabled:opacity-50"
+                title="Refresh model list"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
+              </button>
+              <Popover.Close className="p-1 rounded text-gray-400 hover:text-gray-200 hover:bg-cyber-surface/60 transition-colors">
+                <X className="h-3.5 w-3.5" />
+              </Popover.Close>
             </div>
-          ))
-        )}
-      </div>
-
-      {/* Footer with switch button */}
-      <div className="px-3 py-2 border-t border-cyber-border/60 bg-cyber-surface/30">
-        <div className="flex items-center justify-between gap-3">
-          <div className="text-[10px] text-gray-500 truncate flex-1">
-            {selectedModel ? (
-              <span className="text-gray-300">
-                {selectedModel.provider} / {selectedModel.model}
-              </span>
-            ) : (
-              'Select a model above'
-            )}
           </div>
-          <button
-            type="button"
-            onClick={handleSwitch}
-            disabled={!canSwitch}
-            className={`px-4 py-1.5 rounded-lg text-xs font-medium transition-all ${
-              canSwitch
-                ? 'bg-cyber-cyan/20 border border-cyber-cyan text-cyber-cyan hover:bg-cyber-cyan/30 hover:shadow-neon-cyan'
-                : 'bg-cyber-surface/50 border border-cyber-border text-gray-500 cursor-not-allowed'
-            }`}
+
+          {/* Target selector */}
+          <div className="px-3 py-2 border-b border-cyber-border/40">
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-[10px] uppercase tracking-widest text-gray-500">Target</span>
+              <select
+                value={target}
+                onChange={(e) => setTarget(e.target.value)}
+                className="flex-1 rounded-lg border border-cyber-border bg-cyber-surface/70 px-2 py-1 text-xs text-gray-200 focus:border-cyber-cyan focus:outline-none"
+                disabled={!connected}
+              >
+                <option value={TARGET_ACTIVE}>Active agent</option>
+                <option value={TARGET_ALL}>All agents</option>
+                {targetAgents.map((agent) => (
+                  <option key={agent.id} value={agent.id}>
+                    {agent.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* Command palette (filter + list) */}
+          <Command
+            label="Model picker"
+            value={selectedValue}
+            onValueChange={setSelectedValue}
+            className="flex flex-col flex-1 min-h-0"
+            filter={(value, search) => {
+              // value is "provider/model", search is the user query
+              if (value.toLowerCase().includes(search.toLowerCase())) return 1;
+              return 0;
+            }}
           >
-            {routingMode === 'broadcast' && target === TARGET_ALL ? 'Switch all' : 'Switch'}
-          </button>
-        </div>
-      </div>
-    </div>
+            {/* Filter input */}
+            <div className="px-3 py-2 border-b border-cyber-border/40">
+              <div className="relative">
+                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-500 pointer-events-none" />
+                <Command.Input
+                  placeholder="Filter models..."
+                  className="w-full rounded-lg border border-cyber-border bg-cyber-surface/70 pl-8 pr-3 py-1.5 text-xs text-gray-200 placeholder:text-gray-500 focus:border-cyber-cyan focus:outline-none"
+                />
+              </div>
+            </div>
+
+            {/* Model list */}
+            <Command.List className="flex-1 overflow-y-auto px-1 py-1 max-h-[240px]">
+              {allModels.length === 0 ? (
+                <Command.Loading className="px-3 py-6 text-center text-xs text-gray-500">
+                  Loading models...
+                </Command.Loading>
+              ) : (
+                <>
+                  <Command.Empty className="px-3 py-6 text-center text-xs text-gray-500">
+                    No models match your search
+                  </Command.Empty>
+
+                  {grouped.map((group) => (
+                    <Command.Group
+                      key={group.provider}
+                      heading={group.provider}
+                      className="mb-1 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-gray-500 [&_[cmdk-group-heading]]:bg-cyber-bg/95"
+                    >
+                      {group.models.map((model) => {
+                        const itemValue = `${group.provider}/${model}`;
+                        const isCurrent =
+                          currentProvider === group.provider && currentModel === model;
+
+                        return (
+                          <Command.Item
+                            key={itemValue}
+                            value={itemValue}
+                            keywords={[group.provider, model]}
+                            onSelect={(val) => switchModel(val)}
+                            className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-gray-300 data-[selected=true]:bg-cyber-cyan/20 data-[selected=true]:text-cyber-cyan data-[selected=true]:border data-[selected=true]:border-cyber-cyan/40 hover:bg-cyber-surface/60 cursor-pointer"
+                          >
+                            <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-cyber-cyan transition-opacity" />
+                            <span className="flex-1 truncate">{model}</span>
+                            {isCurrent && (
+                              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-cyber-purple/20 text-cyber-purple border border-cyber-purple/30">
+                                current
+                              </span>
+                            )}
+                          </Command.Item>
+                        );
+                      })}
+                    </Command.Group>
+                  ))}
+                </>
+              )}
+            </Command.List>
+          </Command>
+
+          {/* Footer with switch button */}
+          <div className="px-3 py-2 border-t border-cyber-border/60 bg-cyber-surface/30">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-[10px] text-gray-500 truncate flex-1">
+                {selectedEntry ? (
+                  <span className="text-gray-300">
+                    {selectedEntry.provider} / {selectedEntry.model}
+                  </span>
+                ) : (
+                  'Select a model above'
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={handleSwitchClick}
+                disabled={!canSwitch}
+                className={`px-4 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                  canSwitch
+                    ? 'bg-cyber-cyan/20 border border-cyber-cyan text-cyber-cyan hover:bg-cyber-cyan/30 hover:shadow-neon-cyan'
+                    : 'bg-cyber-surface/50 border border-cyber-border text-gray-500 cursor-not-allowed'
+                }`}
+              >
+                {routingMode === 'broadcast' && target === TARGET_ALL ? 'Switch all' : 'Switch'}
+              </button>
+            </div>
+          </div>
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
   );
 }

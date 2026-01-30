@@ -176,6 +176,8 @@ impl TestHarness {
             pruning_config: crate::config::PruningConfig::default(),
             compaction_config: crate::config::CompactionConfig::default(),
             compaction: crate::session::compaction::SessionCompaction::new(),
+            snapshot_backend: None,
+            snapshot_gc_config: crate::snapshot::GcConfig::default(),
         };
 
         if let Ok(mut config) = agent.tool_config.lock() {

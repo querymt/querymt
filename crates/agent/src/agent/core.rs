@@ -55,6 +55,12 @@ pub struct QueryMTAgent {
     pub(crate) compaction_config: CompactionConfig,
     /// Session compaction service for AI summaries
     pub(crate) compaction: SessionCompaction,
+
+    // Snapshot system for undo/redo
+    /// Snapshot backend implementation (e.g., git-based)
+    pub(crate) snapshot_backend: Option<Arc<dyn crate::snapshot::SnapshotBackend>>,
+    /// GC configuration for snapshot cleanup
+    pub(crate) snapshot_gc_config: crate::snapshot::GcConfig,
 }
 
 /// Configuration for when and how delegation context is injected into conversations.
@@ -92,6 +98,10 @@ pub struct SessionRuntime {
     pub current_tools_hash: StdMutex<Option<crate::hash::RapidHash>>,
     /// Function index for duplicate code detection (built asynchronously on session start)
     pub function_index: Arc<OnceCell<Arc<tokio::sync::RwLock<crate::index::FunctionIndex>>>>,
+    /// Snapshot ID taken at the start of the current step (for diffing at step end)
+    pub pre_step_snapshot: StdMutex<Option<String>>,
+    /// Step ID for the current step (for associating snapshots)
+    pub current_step_id: StdMutex<Option<String>>,
 }
 
 /// Policy for tool usage and availability.
@@ -200,6 +210,9 @@ impl QueryMTAgent {
             pruning_config: PruningConfig::default(),
             compaction_config: CompactionConfig::default(),
             compaction: SessionCompaction::new(),
+            // Snapshot system - disabled by default
+            snapshot_backend: None,
+            snapshot_gc_config: crate::snapshot::GcConfig::default(),
         }
     }
 
@@ -362,8 +375,47 @@ impl QueryMTAgent {
         provider: &str,
         model: &str,
     ) -> Result<(), Error> {
-        let config = LLMParams::new().provider(provider).model(model);
+        // Preserve the system prompt when switching models
+        let system_prompt = self.get_session_system_prompt(session_id).await;
+
+        let mut config = LLMParams::new().provider(provider).model(model);
+
+        // Add system prompt to config
+        for prompt_part in system_prompt {
+            config = config.system(prompt_part);
+        }
+
         self.set_llm_config(session_id, config).await
+    }
+
+    /// Helper method to extract system prompt from current session config
+    pub(crate) async fn get_session_system_prompt(&self, session_id: &str) -> Vec<String> {
+        // Try to get the current session's LLM config
+        if let Ok(Some(current_config)) = self
+            .provider
+            .history_store()
+            .get_session_llm_config(session_id)
+            .await
+        {
+            // Try to extract system prompt from params JSON
+            if let Some(params) = &current_config.params
+                && let Some(system_array) = params.get("system").and_then(|v| v.as_array())
+            {
+                // Parse the array of strings
+                let mut system_parts = Vec::new();
+                for item in system_array {
+                    if let Some(s) = item.as_str() {
+                        system_parts.push(s.to_string());
+                    }
+                }
+                if !system_parts.is_empty() {
+                    return system_parts;
+                }
+            }
+        }
+
+        // Fall back to initial_config system prompt
+        self.provider.initial_config().system.clone()
     }
 
     /// Switch provider configuration for a session (advanced form)

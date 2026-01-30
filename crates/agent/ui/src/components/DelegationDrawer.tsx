@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
+import * as Dialog from '@radix-ui/react-dialog';
 import { X } from 'lucide-react';
-import { DelegationGroupInfo, EventRow, UiAgentInfo } from '../types';
+import { DelegationGroupInfo, EventRow, UiAgentInfo, LlmConfigDetails } from '../types';
 import { MessageContent } from './MessageContent';
 import { ToolSummary } from './ToolSummary';
+import { ModelConfigPopover } from './ModelConfigPopover';
 import { getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
 
@@ -12,13 +14,15 @@ interface DelegationDrawerProps {
   agents: UiAgentInfo[];
   onClose: () => void;
   onToolClick: (event: EventRow) => void;
+  llmConfigCache?: Record<number, LlmConfigDetails>;
+  requestLlmConfig?: (configId: number, callback: (config: LlmConfigDetails) => void) => void;
 }
 
 function formatTimestamp(ts: number) {
   return new Date(ts).toLocaleTimeString();
 }
 
-export function DelegationDrawer({ delegation, agents, onClose, onToolClick }: DelegationDrawerProps) {
+export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llmConfigCache = {}, requestLlmConfig }: DelegationDrawerProps) {
   const [drawerWidth, setDrawerWidth] = useState(() => {
     if (typeof window === 'undefined') return 420;
     const stored = window.localStorage.getItem('delegationDrawerWidth');
@@ -75,14 +79,18 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick }: D
   const objective = delegation.objective ??
     (delegation.delegateEvent.toolCall?.raw_input as { objective?: string } | undefined)?.objective;
 
-  const visibleEvents = useMemo(
-    () => delegation.events
-      .filter((event) =>
-        event.type === 'tool_call' || (event.type === 'agent' && event.isMessage)
-      )
-      .sort((a, b) => a.timestamp - b.timestamp),
-    [delegation.events]
-  );
+  // Extract model info from the first event with provider/model
+  const modelEvent = delegation.events.find(e => e.provider && e.model);
+  const modelLabel = modelEvent ? `${modelEvent.provider} / ${modelEvent.model}` : undefined;
+  const modelConfigId = modelEvent?.configId;
+
+  const visibleEvents = delegation.events
+    .filter((event) =>
+      event.type === 'tool_call' || (event.type === 'agent' && event.isMessage)
+    )
+    .sort((a, b) => a.timestamp - b.timestamp);
+
+  const [showConfigPopover, setShowConfigPopover] = useState(false);
 
   const handleDragStart = (event: ReactMouseEvent) => {
     if (isMobile) return;
@@ -93,104 +101,125 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick }: D
   };
 
   return (
-    <div className="fixed inset-0 z-40 flex justify-end" onClick={(e) => e.stopPropagation()}>
-      <div
-        className="absolute inset-0 bg-black/50"
-        onClick={(e) => {
-          e.stopPropagation();
-          onClose();
-        }}
-        aria-hidden="true"
-      />
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="relative z-10 h-full bg-cyber-surface border-l border-cyber-border shadow-[0_0_30px_rgba(0,255,249,0.12)] flex flex-col"
-        style={{ width: isMobile ? '100%' : `${drawerWidth}px` }}
-      >
-        {!isMobile && (
-          <div
-            onMouseDown={handleDragStart}
-            className="absolute left-0 top-0 h-full w-1.5 cursor-col-resize bg-cyber-border/40 hover:bg-cyber-cyan/60 transition-colors"
-            title="Drag to resize"
-          />
-        )}
-        <div className="px-5 py-4 border-b border-cyber-border/50 flex items-start justify-between gap-3">
-          <div>
-            <div className="flex items-center gap-2">
-              <span
-                className="text-xs font-semibold uppercase tracking-wide px-2 py-0.5 rounded"
-                style={{
-                  color: agentColor,
-                  backgroundColor: `${agentColor}20`,
-                  border: `1px solid ${agentColor}40`,
-                }}
-              >
-                {agentName}
-              </span>
-              <span className="text-[10px] text-gray-500">
-                Delegation
-              </span>
-            </div>
-            <p className="text-sm text-gray-300 mt-1">
-              {objective ?? 'Delegated task'}
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onClose();
-            }}
-            className="p-2 rounded-md hover:bg-cyber-bg/70 transition-colors text-gray-400 hover:text-gray-200"
-            aria-label="Close delegation details"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
-          {visibleEvents.length === 0 ? (
-            <div className="text-sm text-gray-500">No delegation events yet.</div>
-          ) : (
-            visibleEvents.map((event) => {
-              if (event.type === 'tool_call') {
-                return (
-                  <ToolSummary
-                    key={event.id}
-                    event={event}
-                    onClick={() => onToolClick(event)}
-                  />
-                );
-              }
-              if (event.type === 'agent' && event.isMessage) {
-                const eventAgentId = event.agentId ?? agentId;
-                const eventAgentName = eventAgentId
-                  ? getAgentShortName(eventAgentId, agents)
-                  : agentName;
-                const eventAgentColor = eventAgentId
-                  ? getAgentColor(eventAgentId)
-                  : agentColor;
-                return (
-                  <div key={event.id} className="rounded-md border border-cyber-border/40 bg-cyber-bg/40 px-3 py-2">
-                    <div className="flex items-center gap-2 mb-1">
-                      <span
-                        className="text-[10px] font-semibold uppercase tracking-wide"
-                        style={{ color: eventAgentColor }}
-                      >
-                        {eventAgentName}
-                      </span>
-                      <span className="text-[10px] text-gray-500">
-                        {formatTimestamp(event.timestamp)}
-                      </span>
-                    </div>
-                    <MessageContent content={event.content} />
-                  </div>
-                );
-              }
-              return null;
-            })
+    <Dialog.Root open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-40 bg-black/50" />
+        <Dialog.Content
+          className="fixed top-0 right-0 z-50 h-full bg-cyber-surface border-l border-cyber-border shadow-[0_0_30px_rgba(0,255,249,0.12)] flex flex-col"
+          style={{ width: isMobile ? '100%' : `${drawerWidth}px` }}
+          aria-describedby={undefined}
+          onOpenAutoFocus={(e) => e.preventDefault()}
+        >
+          {/* Resize handle */}
+          {!isMobile && (
+            <div
+              onMouseDown={handleDragStart}
+              className="absolute left-0 top-0 h-full w-1.5 cursor-col-resize bg-cyber-border/40 hover:bg-cyber-cyan/60 transition-colors"
+              title="Drag to resize"
+            />
           )}
-        </div>
-      </div>
-    </div>
+
+          {/* Header */}
+          <div className="px-5 py-4 border-b border-cyber-border/50 flex items-start justify-between gap-3">
+            <div className="flex-1">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span
+                  className="text-xs font-semibold uppercase tracking-wide px-2 py-0.5 rounded"
+                  style={{
+                    color: agentColor,
+                    backgroundColor: `${agentColor}20`,
+                    border: `1px solid ${agentColor}40`,
+                  }}
+                >
+                  {agentName}
+                </span>
+                <span className="text-[10px] text-gray-500">
+                  Delegation
+                </span>
+                {/* Model label in header */}
+                {modelLabel && modelConfigId && requestLlmConfig ? (
+                  <ModelConfigPopover
+                    configId={modelConfigId}
+                    open={showConfigPopover}
+                    onOpenChange={setShowConfigPopover}
+                    requestConfig={requestLlmConfig}
+                    cachedConfig={llmConfigCache[modelConfigId]}
+                  >
+                    <button
+                      type="button"
+                      className="text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-gray-400 truncate max-w-[160px] hover:border-cyber-cyan/40 hover:text-gray-300 cursor-pointer transition-colors"
+                      title={modelLabel}
+                    >
+                      {modelLabel}
+                    </button>
+                  </ModelConfigPopover>
+                ) : modelLabel ? (
+                  <span
+                    className="text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-gray-400 truncate max-w-[160px] cursor-default"
+                    title={modelLabel}
+                  >
+                    {modelLabel}
+                  </span>
+                ) : null}
+              </div>
+              <Dialog.Title className="text-sm text-gray-300 mt-1">
+                {objective ?? 'Delegated task'}
+              </Dialog.Title>
+            </div>
+            <Dialog.Close
+              className="p-2 rounded-md hover:bg-cyber-bg/70 transition-colors text-gray-400 hover:text-gray-200"
+              aria-label="Close delegation details"
+            >
+              <X className="w-4 h-4" />
+            </Dialog.Close>
+          </div>
+
+          {/* Events list */}
+          <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+            {visibleEvents.length === 0 ? (
+              <div className="text-sm text-gray-500">No delegation events yet.</div>
+            ) : (
+              visibleEvents.map((event) => {
+                if (event.type === 'tool_call') {
+                  return (
+                    <ToolSummary
+                      key={event.id}
+                      event={event}
+                      onClick={() => onToolClick(event)}
+                    />
+                  );
+                }
+                if (event.type === 'agent' && event.isMessage) {
+                  const eventAgentId = event.agentId ?? agentId;
+                  const eventAgentName = eventAgentId
+                    ? getAgentShortName(eventAgentId, agents)
+                    : agentName;
+                  const eventAgentColor = eventAgentId
+                    ? getAgentColor(eventAgentId)
+                    : agentColor;
+                  return (
+                    <div key={event.id} className="rounded-md border border-cyber-border/40 bg-cyber-bg/40 px-3 py-2">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span
+                          className="text-[10px] font-semibold uppercase tracking-wide"
+                          style={{ color: eventAgentColor }}
+                        >
+                          {eventAgentName}
+                        </span>
+                        <span className="text-[10px] text-gray-500">
+                          {formatTimestamp(event.timestamp)}
+                        </span>
+                      </div>
+                      <MessageContent content={event.content} />
+                    </div>
+                  );
+                }
+                return null;
+              })
+            )}
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }

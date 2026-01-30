@@ -83,12 +83,16 @@ pub enum AgentEventKind {
     SessionCreated,
     PromptReceived {
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     UserMessageStored {
         content: String,
     },
     AssistantMessageStored {
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     LlmRequestStart {
         message_count: usize,

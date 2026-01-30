@@ -290,7 +290,7 @@ impl ATIFBuilder {
                 }
 
                 // User messages -> user step
-                AgentEventKind::PromptReceived { content }
+                AgentEventKind::PromptReceived { content, .. }
                 | AgentEventKind::UserMessageStored { content } => {
                     self.add_user_step(event.timestamp, content.clone());
                 }
@@ -375,7 +375,7 @@ impl ATIFBuilder {
         // Look for AssistantMessageStored and ToolCall events
         for event in &events[start_idx..=end_idx] {
             match &event.kind {
-                AgentEventKind::AssistantMessageStored { content } => {
+                AgentEventKind::AssistantMessageStored { content, .. } => {
                     message_text.push_str(content);
                 }
                 AgentEventKind::ToolCallStart {

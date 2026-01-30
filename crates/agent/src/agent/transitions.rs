@@ -429,6 +429,7 @@ impl QueryMTAgent {
             session_id,
             AgentEventKind::AssistantMessageStored {
                 content: response.content.clone(),
+                message_id: Some(assistant_msg.id.clone()),
             },
         );
 

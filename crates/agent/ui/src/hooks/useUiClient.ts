@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   EventItem,
   RoutingMode,
@@ -8,7 +8,6 @@ import {
   SessionSummary,
   SessionGroup,
   AuditView,
-  AgentEvent,
   FileIndexEntry,
   ModelEntry,
   LlmConfigDetails,
@@ -20,7 +19,8 @@ type FileIndexCallback = (files: FileIndexEntry[], generatedAt: number) => void;
 type FileIndexErrorCallback = (message: string) => void;
 
 export function useUiClient() {
-  const [events, setEvents] = useState<EventItem[]>([]);
+  const [eventsBySession, setEventsBySession] = useState<Map<string, EventItem[]>>(new Map());
+  const [mainSessionId, setMainSessionId] = useState<string | null>(null);
   const [agents, setAgents] = useState<UiAgentInfo[]>([]);
   const [routingMode, setRoutingMode] = useState<RoutingMode>('single');
   const [activeAgentId, setActiveAgentId] = useState<string>('primary');
@@ -34,17 +34,24 @@ export function useUiClient() {
     Record<string, { provider?: string; model?: string; contextLimit?: number }>
   >({});
   const [sessionAudit, setSessionAudit] = useState<AuditView | null>(null);
-  const [thinkingAgentId, setThinkingAgentId] = useState<string | null>(null);
+  const [thinkingAgentIds, setThinkingAgentIds] = useState<Set<string>>(new Set());
   const [isConversationComplete, setIsConversationComplete] = useState(false);
   const [workspaceIndexStatus, setWorkspaceIndexStatus] = useState<
     Record<string, { status: 'building' | 'ready' | 'error'; message?: string | null }>
   >({});
   const [llmConfigCache, setLlmConfigCache] = useState<Record<number, LlmConfigDetails>>({});
   const [sessionLimits, setSessionLimits] = useState<SessionLimits | null>(null);
+  const [undoState, setUndoState] = useState<{ turnId: string; revertedFiles: string[] } | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const fileIndexCallbackRef = useRef<FileIndexCallback | null>(null);
   const fileIndexErrorCallbackRef = useRef<FileIndexErrorCallback | null>(null);
   const llmConfigCallbacksRef = useRef<Map<number, (config: LlmConfigDetails) => void>>(new Map());
+
+  // Derive main session events for backward compatibility
+  const events = useMemo(
+    () => (mainSessionId ? eventsBySession.get(mainSessionId) ?? [] : []),
+    [eventsBySession, mainSessionId]
+  );
 
   useEffect(() => {
     let mounted = true;
@@ -101,68 +108,141 @@ export function useUiClient() {
       case 'session_created':
         if (msg.agent_id === activeAgentId) {
           setSessionId(msg.session_id);
-          setEvents([]); // Clear events for fresh session
+          setMainSessionId(msg.session_id);
+          setEventsBySession(new Map()); // Clear all event buckets for fresh session
           setSessionAudit(null); // Clear audit data
           setSessionLimits(null); // Clear session limits, will be set by session_configured event
         }
         break;
+      case 'session_events': {
+        // Replay batch - set all events for this session
+        const translated = msg.events.map((e: any) => {
+          const item = translateAgentEvent(msg.agent_id, e);
+          item.sessionId = msg.session_id;
+          item.seq = e.seq;
+          return item;
+        });
+        setEventsBySession(prev => {
+          const next = new Map(prev);
+          next.set(msg.session_id, translated);
+          return next;
+        });
+
+        // If this is the main session, update agentModels from last provider event
+        if (msg.session_id === mainSessionId) {
+          const lastProvider = [...translated].reverse()
+            .find(e => e.provider || e.model);
+          if (lastProvider) {
+            setAgentModels(prev => ({
+              ...prev,
+              [msg.agent_id]: {
+                provider: lastProvider.provider,
+                model: lastProvider.model,
+                contextLimit: lastProvider.contextLimit,
+              },
+            }));
+          }
+        }
+        break;
+      }
       case 'event': {
         const eventKind = msg.event?.kind?.type ?? msg.event?.kind?.type_name;
-        // Track LLM thinking state and conversation completion
+        
+        // Track LLM thinking state and conversation completion (applies to all agents)
         if (eventKind === 'llm_request_start') {
-          setThinkingAgentId(msg.agent_id);
+          setThinkingAgentIds(prev => new Set(prev).add(msg.agent_id));
           setIsConversationComplete(false);
         } else if (eventKind === 'llm_request_end') {
-          // Check finish_reason to determine if turn is complete
           const finishReason = msg.event?.kind?.finish_reason;
           if (finishReason === 'stop' || finishReason === 'Stop') {
-            setThinkingAgentId(null);
-            setIsConversationComplete(true);
-            // Auto-reset completion indicator after 2 seconds
-            setTimeout(() => setIsConversationComplete(false), 2000);
+            setThinkingAgentIds(prev => {
+              const next = new Set(prev);
+              next.delete(msg.agent_id);
+              if (next.size === 0) {
+                setIsConversationComplete(true);
+                setTimeout(() => setIsConversationComplete(false), 2000);
+              }
+              return next;
+            });
           } else if (finishReason === 'tool_calls' || finishReason === 'ToolCalls') {
-            // Tool calls requested, still thinking - keep thinkingAgentId set
+            // Tool calls requested, still thinking
           } else {
-            // Other finish reasons (length, error, etc.) - stop thinking
-            setThinkingAgentId(null);
+            setThinkingAgentIds(prev => {
+              const next = new Set(prev);
+              next.delete(msg.agent_id);
+              return next;
+            });
           }
         } else if (eventKind === 'prompt_received') {
-          // New prompt, reset completion state
           setIsConversationComplete(false);
         } else if (eventKind === 'assistant_message_stored') {
-          // Fallback: if we somehow missed llm_request_end, stop thinking
-          if (thinkingAgentId !== null) {
-            setThinkingAgentId(null);
-          }
+          setThinkingAgentIds(prev => {
+            const next = new Set(prev);
+            next.delete(msg.agent_id);
+            return next;
+          });
         } else if (eventKind === 'error') {
-          // Reset thinking state on error - the agent has stopped processing
-          setThinkingAgentId(null);
+          setThinkingAgentIds(prev => {
+            const next = new Set(prev);
+            next.delete(msg.agent_id);
+            return next;
+          });
         } else if (eventKind === 'cancelled') {
-          // Reset thinking state on cancel - the agent has been stopped by user
-          setThinkingAgentId(null);
+          setThinkingAgentIds(prev => {
+            const next = new Set(prev);
+            next.delete(msg.agent_id);
+            return next;
+          });
         }
+
+        // Auto-subscribe to delegation child sessions
+        if (eventKind === 'session_forked' && msg.event?.kind?.origin === 'delegation') {
+          sendMessage({
+            type: 'subscribe_session',
+            session_id: msg.event.kind.child_session_id,
+            agent_id: msg.event.kind.target_agent_id,
+          });
+        }
+
+        // Translate and route to correct session bucket with dedup
         const translated = translateAgentEvent(msg.agent_id, msg.event);
-        if (eventKind === 'provider_changed') {
-          setAgentModels((prev) => ({
-            ...prev,
-            [msg.agent_id]: {
-              provider: msg.event?.kind?.provider,
-              model: msg.event?.kind?.model,
-              contextLimit: msg.event?.kind?.context_limit,
-            },
-          }));
+        translated.sessionId = msg.session_id;
+        translated.seq = msg.event.seq;
+
+        setEventsBySession(prev => {
+          const next = new Map(prev);
+          const existing = next.get(msg.session_id) ?? [];
+          // Dedup: skip if we already have this seq
+          if (existing.length > 0 && translated.seq != null) {
+            const lastSeq = existing[existing.length - 1].seq ?? -1;
+            if (translated.seq <= lastSeq) return prev;
+          }
+          next.set(msg.session_id, [...existing, translated]);
+          return next;
+        });
+
+        // Provider/limits updates - only for main session
+        if (msg.session_id === mainSessionId) {
+          if (eventKind === 'provider_changed') {
+            setAgentModels((prev) => ({
+              ...prev,
+              [msg.agent_id]: {
+                provider: msg.event?.kind?.provider,
+                model: msg.event?.kind?.model,
+                contextLimit: msg.event?.kind?.context_limit,
+              },
+            }));
+          }
+          if (eventKind === 'session_configured' && msg.event?.kind?.limits) {
+            setSessionLimits(msg.event.kind.limits);
+          }
         }
-        // Extract session limits from session_configured event
-        if (eventKind === 'session_configured' && msg.event?.kind?.limits) {
-          setSessionLimits(msg.event.kind.limits);
-        }
-        setEvents((prev) => [...prev, translated]);
         break;
       }
       case 'error': {
         console.error('UI server error:', msg.message);
-        // Reset thinking state on error - the agent has stopped processing
-        setThinkingAgentId(null);
+        // Reset thinking state on error - clear all agents (connection-level error)
+        setThinkingAgentIds(new Set());
         // Check if this is a file index related error and notify
         if (
           fileIndexErrorCallbackRef.current &&
@@ -172,17 +252,25 @@ export function useUiClient() {
         ) {
           fileIndexErrorCallbackRef.current(msg.message);
         }
-        setEvents((prev) => [
-          ...prev,
-          {
-            id: `ui-error-${Date.now()}-${Math.random()}`,
-            agentId: 'system',
-            type: 'system',
-            content: msg.message,
-            timestamp: Date.now(),
-            isMessage: true,
-          },
-        ]);
+        // Add error to main session events if we have one
+        if (mainSessionId) {
+          setEventsBySession((prev) => {
+            const next = new Map(prev);
+            const existing = next.get(mainSessionId) ?? [];
+            next.set(mainSessionId, [
+              ...existing,
+              {
+                id: `ui-error-${Date.now()}-${Math.random()}`,
+                agentId: 'system',
+                type: 'system',
+                content: msg.message,
+                timestamp: Date.now(),
+                isMessage: true,
+              },
+            ]);
+            return next;
+          });
+        }
         break;
       }
       case 'session_list':
@@ -193,46 +281,24 @@ export function useUiClient() {
         break;
       case 'session_loaded': {
         setSessionId(msg.session_id);
-        // Reset thinking state - loaded sessions are historical, not actively running
-        setThinkingAgentId(null);
-        setIsConversationComplete(false);
+        setMainSessionId(msg.session_id);
+        setEventsBySession(new Map()); // Clear buckets
+        setSessionAudit(msg.audit);
         
-        // Build session → agent mapping from session_forked events
-        // This ensures child session events get the correct agent ID
-        const sessionAgentMap = new Map<string, string>();
-        sessionAgentMap.set(msg.session_id, activeAgentId); // parent session → primary agent
-        
+        // The backend will send session_events replay automatically since
+        // we auto-subscribe on load. But also subscribe to child delegation sessions.
         for (const event of msg.audit.events) {
-          if (event.kind.type === 'session_forked' && event.kind.origin === 'delegation') {
-            const childSessionId = (event.kind as any).child_session_id;
-            const targetAgentId = (event.kind as any).target_agent_id;
-            if (childSessionId && targetAgentId) {
-              sessionAgentMap.set(childSessionId, targetAgentId);
-            }
+          if (
+            (event.kind as any)?.type === 'session_forked' &&
+            (event.kind as any)?.origin === 'delegation'
+          ) {
+            sendMessage({
+              type: 'subscribe_session',
+              session_id: (event.kind as any)?.child_session_id,
+              agent_id: (event.kind as any)?.target_agent_id,
+            });
           }
         }
-        
-        // Translate events using the correct agent ID per session
-        const loadedEvents = msg.audit.events.map(event => {
-          const agentId = sessionAgentMap.get(event.session_id) ?? activeAgentId;
-          return translateLoadedEvent(agentId, event);
-        });
-        setEvents(loadedEvents);
-        const lastProviderEvent = [...loadedEvents]
-          .reverse()
-          .find((event) => event.provider || event.model || event.contextLimit !== undefined);
-        if (lastProviderEvent) {
-          setAgentModels((prev) => ({
-            ...prev,
-            [activeAgentId]: {
-              provider: lastProviderEvent.provider,
-              model: lastProviderEvent.model,
-              contextLimit: lastProviderEvent.contextLimit,
-            },
-          }));
-        }
-        // Store full audit for stats (tasks, artifacts, decisions, etc.)
-        setSessionAudit(msg.audit);
         break;
       }
       case 'workspace_index_status':
@@ -263,6 +329,27 @@ export function useUiClient() {
         if (callback) {
           callback(config);
           llmConfigCallbacksRef.current.delete(msg.config_id);
+        }
+        break;
+      }
+      case 'undo_result': {
+        if (msg.success) {
+          // Undo succeeded - update with the actual reverted files
+          setUndoState(prev => prev ? { ...prev, revertedFiles: msg.reverted_files } : null);
+          console.log('[useUiClient] Undo succeeded, reverted files:', msg.reverted_files);
+        } else {
+          console.error('[useUiClient] Undo failed:', msg.message);
+          setUndoState(null);
+        }
+        break;
+      }
+      case 'redo_result': {
+        if (msg.success) {
+          // Redo succeeded - clear undo state
+          setUndoState(null);
+          console.log('[useUiClient] Redo succeeded');
+        } else {
+          console.error('[useUiClient] Redo failed:', msg.message);
         }
         break;
       }
@@ -348,8 +435,31 @@ export function useUiClient() {
     sendMessage({ type: 'get_llm_config', config_id: configId });
   }, [llmConfigCache]);
 
+  // Derive thinkingAgentId for backward compatibility
+  const thinkingAgentId = thinkingAgentIds.size > 0 ? Array.from(thinkingAgentIds).pop()! : null;
+
+  const subscribeSession = useCallback((sessionId: string, agentId?: string) => {
+    sendMessage({ type: 'subscribe_session', session_id: sessionId, agent_id: agentId });
+  }, []);
+
+  const unsubscribeSession = useCallback((sessionId: string) => {
+    sendMessage({ type: 'unsubscribe_session', session_id: sessionId });
+  }, []);
+
+  const sendUndo = useCallback((messageId: string, turnId: string) => {
+    sendMessage({ type: 'undo', message_id: messageId });
+    // Temporarily set undo state with empty files - will be updated by undo_result
+    setUndoState({ turnId, revertedFiles: [] });
+  }, []);
+
+  const sendRedo = useCallback(() => {
+    sendMessage({ type: 'redo' });
+  }, []);
+
   return {
     events,
+    eventsBySession,
+    mainSessionId,
     sessionId,
     connected,
     newSession,
@@ -370,6 +480,7 @@ export function useUiClient() {
     setSessionModel,
     sessionAudit,
     thinkingAgentId,
+    thinkingAgentIds,
     isConversationComplete,
     setFileIndexCallback,
     setFileIndexErrorCallback,
@@ -378,6 +489,11 @@ export function useUiClient() {
     llmConfigCache,
     requestLlmConfig,
     sessionLimits,
+    subscribeSession,
+    unsubscribeSession,
+    sendUndo,
+    sendRedo,
+    undoState,
   };
 }
 
@@ -385,11 +501,13 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
   const kind = event?.kind?.type ?? event?.kind?.type_name ?? event?.kind?.type;
   const timestamp = typeof event.timestamp === 'number' ? event.timestamp * 1000 : Date.now();
   const id = event.seq ? String(event.seq) : `${Date.now()}-${Math.random()}`;
+  const seq = event.seq;
 
   if (kind === 'tool_call_start') {
     return {
       id,
       agentId,
+      seq: seq,
       type: 'tool_call',
       content: event.kind?.tool_name ?? 'tool_call',
       timestamp,
@@ -407,6 +525,7 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
     return {
       id,
       agentId,
+      seq: seq,
       type: 'tool_result',
       content: event.kind?.result ?? '',
       timestamp,
@@ -423,10 +542,12 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
     return {
       id,
       agentId,
+      seq: seq,
       type: 'user',
       content: event.kind?.content ?? '',
       timestamp,
       isMessage: true,
+      messageId: event.kind?.message_id,
     };
   }
 
@@ -434,10 +555,12 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
     return {
       id,
       agentId,
+      seq: seq,
       type: 'agent',
       content: event.kind?.content ?? '',
       timestamp,
       isMessage: true,
+      messageId: event.kind?.message_id,
     };
   }
 
@@ -495,6 +618,18 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
     };
   }
 
+  if (kind === 'session_forked') {
+    return {
+      id,
+      agentId,
+      type: 'agent',
+      content: `Event: session_forked`,
+      timestamp,
+      forkChildSessionId: event.kind?.child_session_id,
+      forkDelegationId: event.kind?.fork_point_ref,
+    };
+  }
+
   if (kind === 'provider_changed') {
     return {
       id,
@@ -548,203 +683,3 @@ function summarizeUnknownEvent(event: any): string {
   return 'Event';
 }
 
-function translateLoadedEvent(agentId: string, event: AgentEvent): EventItem {
-  // Similar to translateAgentEvent but for loaded history
-  const kind = event.kind;
-  const timestamp = event.timestamp * 1000;
-  const id = String(event.seq);
-
-  if (kind.type === 'tool_call_start') {
-    const toolCallStart = kind as { type: 'tool_call_start'; tool_call_id: string; tool_name: string; arguments?: string };
-    return {
-      id,
-      agentId,
-      type: 'tool_call',
-      content: toolCallStart.tool_name ?? 'tool_call',
-      timestamp,
-      toolCall: {
-        tool_call_id: toolCallStart.tool_call_id,
-        kind: toolCallStart.tool_name,
-        status: 'in_progress',
-        raw_input: parseJsonMaybe(toolCallStart.arguments),
-      },
-    };
-  }
-
-  if (kind.type === 'tool_call_end') {
-    const toolCallEnd = kind as { type: 'tool_call_end'; tool_call_id: string; tool_name: string; result?: string; is_error?: boolean };
-    return {
-      id,
-      agentId,
-      type: 'tool_result',
-      content: toolCallEnd.result ?? '',
-      timestamp,
-      toolCall: {
-        tool_call_id: toolCallEnd.tool_call_id,
-        kind: toolCallEnd.tool_name,
-        status: toolCallEnd.is_error ? 'failed' : 'completed',
-        raw_output: parseJsonMaybe(toolCallEnd.result),
-      },
-    };
-  }
-
-  if (kind.type === 'prompt_received') {
-    const promptReceived = kind as { type: 'prompt_received'; content: string };
-    return {
-      id,
-      agentId,
-      type: 'user',
-      content: promptReceived.content ?? '',
-      timestamp,
-      isMessage: true,
-    };
-  }
-
-  if (kind.type === 'assistant_message_stored') {
-    const assistantMessage = kind as { type: 'assistant_message_stored'; content: string };
-    return {
-      id,
-      agentId,
-      type: 'agent',
-      content: assistantMessage.content ?? '',
-      timestamp,
-      isMessage: true,
-    };
-  }
-
-  if (kind.type === 'llm_request_end') {
-    const llmRequestEnd = kind as { 
-      type: 'llm_request_end'; 
-      usage?: { input_tokens: number; output_tokens: number };
-      cost_usd?: number;
-      cumulative_cost_usd?: number;
-      context_tokens?: number;
-      finish_reason?: string;
-      metrics?: { steps: number; turns: number };
-    };
-    return {
-      id,
-      agentId,
-      type: 'agent',
-      content: `Event: llm_request_end`,
-      timestamp,
-      usage: llmRequestEnd.usage,
-      costUsd: llmRequestEnd.cost_usd,
-      cumulativeCostUsd: llmRequestEnd.cumulative_cost_usd,
-      contextTokens: llmRequestEnd.context_tokens,
-      finishReason: llmRequestEnd.finish_reason,
-      metrics: llmRequestEnd.metrics,
-    };
-  }
-
-  if (kind.type === 'delegation_requested') {
-    const delegationRequested = kind as {
-      type: 'delegation_requested';
-      delegation?: { public_id?: string; target_agent_id?: string; objective?: string };
-    };
-    return {
-      id,
-      agentId,
-      type: 'agent',
-      content: `Event: delegation_requested`,
-      timestamp,
-      delegationId: delegationRequested.delegation?.public_id,
-      delegationTargetAgentId: delegationRequested.delegation?.target_agent_id,
-      delegationObjective: delegationRequested.delegation?.objective,
-      delegationEventType: 'requested',
-    };
-  }
-
-  if (kind.type === 'delegation_completed') {
-    const delegationCompleted = kind as {
-      type: 'delegation_completed';
-      delegation_id?: string;
-    };
-    return {
-      id,
-      agentId,
-      type: 'agent',
-      content: `Event: delegation_completed`,
-      timestamp,
-      delegationId: delegationCompleted.delegation_id,
-      delegationEventType: 'completed',
-    };
-  }
-
-  if (kind.type === 'delegation_failed') {
-    const delegationFailed = kind as {
-      type: 'delegation_failed';
-      delegation_id?: string;
-    };
-    return {
-      id,
-      agentId,
-      type: 'agent',
-      content: `Event: delegation_failed`,
-      timestamp,
-      delegationId: delegationFailed.delegation_id,
-      delegationEventType: 'failed',
-    };
-  }
-
-  if (kind.type === 'provider_changed') {
-    const providerChanged = kind as {
-      type: 'provider_changed';
-      provider?: string;
-      model?: string;
-      config_id?: number;
-      context_limit?: number;
-    };
-    return {
-      id,
-      agentId,
-      type: 'agent',
-      content: `Event: provider_changed`,
-      timestamp,
-      provider: providerChanged.provider,
-      model: providerChanged.model,
-      contextLimit: providerChanged.context_limit,
-      configId: providerChanged.config_id,
-    };
-  }
-
-  if (kind.type === 'middleware_stopped') {
-    const middlewareStopped = kind as {
-      type: 'middleware_stopped';
-      stop_type?: string;
-      reason?: string;
-      metrics?: { steps: number; turns: number };
-    };
-    return {
-      id,
-      agentId,
-      type: 'system',
-      content: middlewareStopped.reason ?? 'Execution stopped',
-      timestamp,
-      isMessage: true,
-      stopType: middlewareStopped.stop_type as import('../types').StopType,
-      stopReason: middlewareStopped.reason,
-      stopMetrics: middlewareStopped.metrics,
-    };
-  }
-
-  if (kind.type === 'error') {
-    const errorEvent = kind as { type: 'error'; message?: string };
-    return {
-      id,
-      agentId: 'system',
-      type: 'system',
-      content: errorEvent.message ?? 'Error',
-      timestamp,
-      isMessage: true,
-    };
-  }
-
-  return {
-    id,
-    agentId,
-    type: 'agent',
-    content: `Event: ${kind.type}`,
-    timestamp,
-  };
-}

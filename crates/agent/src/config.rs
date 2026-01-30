@@ -209,6 +209,53 @@ impl Default for CompactionConfig {
 // End Compaction Configuration
 // ============================================================================
 
+// ============================================================================
+// Snapshot Backend Configuration
+// ============================================================================
+
+fn default_snapshot_backend() -> String {
+    "none".to_string()
+}
+
+fn default_max_snapshots() -> Option<usize> {
+    Some(100)
+}
+
+fn default_max_age_days() -> Option<u64> {
+    Some(30)
+}
+
+/// Configuration for snapshot backend (undo/redo support)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotBackendConfig {
+    /// Backend type: "git" or "none" (default: "none")
+    #[serde(default = "default_snapshot_backend")]
+    pub backend: String,
+
+    /// Maximum number of snapshots to keep (oldest are removed first)
+    #[serde(default = "default_max_snapshots")]
+    pub max_snapshots: Option<usize>,
+
+    /// Maximum age of snapshots in days (older are removed)
+    #[serde(default = "default_max_age_days")]
+    pub max_age_days: Option<u64>,
+}
+
+impl Default for SnapshotBackendConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_snapshot_backend(),
+            max_snapshots: default_max_snapshots(),
+            max_age_days: default_max_age_days(),
+        }
+    }
+}
+
+// ============================================================================
+// End Snapshot Backend Configuration
+// ============================================================================
+
 /// A single part of a system prompt, either an inline string or a file reference.
 ///
 /// In TOML configs, the `system` field accepts a mixed array of strings and
@@ -347,6 +394,9 @@ pub struct AgentSettings {
     /// AI compaction settings - runs on context overflow (Layer 3)
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// Snapshot backend for undo/redo support
+    #[serde(default)]
+    pub snapshot: SnapshotBackendConfig,
 }
 
 /// Multi-agent quorum configuration

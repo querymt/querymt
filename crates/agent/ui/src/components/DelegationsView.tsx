@@ -1,4 +1,4 @@
-import { DelegationGroupInfo, Turn, UiAgentInfo } from '../types';
+import { DelegationGroupInfo, Turn, UiAgentInfo, LlmConfigDetails } from '../types';
 import { DelegationDetailPanel } from './DelegationDetailPanel';
 import { DelegationsPanel } from './DelegationsPanel';
 
@@ -9,6 +9,8 @@ interface DelegationsViewProps {
   activeTurn?: Turn | null;
   onSelectDelegation: (delegationId: string) => void;
   onToolClick: (event: Turn['toolCalls'][number]) => void;
+  llmConfigCache?: Record<number, LlmConfigDetails>;
+  requestLlmConfig?: (configId: number, callback: (config: LlmConfigDetails) => void) => void;
 }
 
 export function DelegationsView({
@@ -18,6 +20,8 @@ export function DelegationsView({
   activeTurn,
   onSelectDelegation,
   onToolClick,
+  llmConfigCache,
+  requestLlmConfig,
 }: DelegationsViewProps) {
   return (
     <div className="flex flex-col lg:flex-row h-full overflow-hidden">
@@ -34,6 +38,8 @@ export function DelegationsView({
         turn={activeTurn}
         agents={agents}
         onToolClick={onToolClick}
+        llmConfigCache={llmConfigCache}
+        requestLlmConfig={requestLlmConfig}
       />
     </div>
   );

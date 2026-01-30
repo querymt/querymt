@@ -2,7 +2,8 @@
  * Large modal for showing full tool details - input, output, diffs
  */
 
-import { useEffect, useCallback, useState } from 'react';
+import { useState } from 'react';
+import * as Dialog from '@radix-ui/react-dialog';
 import { X, Clock, CheckCircle, XCircle, Loader, Copy, Check } from 'lucide-react';
 import { PatchDiff } from '@pierre/diffs/react';
 import { EventItem } from '../types';
@@ -18,24 +19,6 @@ export interface ToolDetailModalProps {
 
 export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
   const [copiedSection, setCopiedSection] = useState<string | null>(null);
-
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
-
-  // Close on backdrop click
-  const handleBackdropClick = useCallback((e: React.MouseEvent) => {
-    if (e.target === e.currentTarget) {
-      onClose();
-    }
-  }, [onClose]);
 
   const toolKind = event.toolCall?.kind;
   const toolName = inferToolName(event);
@@ -70,124 +53,123 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
   const isRead = toolKind === 'read' || toolKind === 'read_file' || toolKind === 'mcp_read';
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 animate-fade-in"
-      onClick={handleBackdropClick}
-    >
-      <div
-        className="
-          relative w-[90vw] max-w-5xl h-[85vh] max-h-[900px]
-          bg-cyber-surface border border-cyber-cyan/30 rounded-lg
-          shadow-lg shadow-cyber-cyan/25
-          flex flex-col overflow-hidden
-        "
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-3 border-b border-cyber-border bg-cyber-bg/50">
-          <div className="flex items-center gap-3">
-            <span className="text-xl">{summary.icon}</span>
-            <div>
-              <h2 className="text-lg font-semibold text-cyber-cyan">
-                {summary.name}
-              </h2>
-              {summary.keyParam && (
-                <p className="text-xs text-gray-400 font-mono truncate max-w-md">
-                  {summary.keyParam}
-                </p>
-              )}
+    <Dialog.Root open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/80 animate-fade-in" />
+        <Dialog.Content
+          className="
+            fixed z-50 top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2
+            w-[90vw] max-w-5xl h-[85vh] max-h-[900px]
+            bg-cyber-surface border border-cyber-cyan/30 rounded-lg
+            shadow-lg shadow-cyber-cyan/25
+            flex flex-col overflow-hidden
+            animate-fade-in
+          "
+          aria-describedby={undefined}
+        >
+          {/* Header */}
+          <div className="flex items-center justify-between px-5 py-3 border-b border-cyber-border bg-cyber-bg/50">
+            <div className="flex items-center gap-3">
+              <span className="text-xl">{summary.icon}</span>
+              <div>
+                <Dialog.Title className="text-lg font-semibold text-cyber-cyan">
+                  {summary.name}
+                </Dialog.Title>
+                {summary.keyParam && (
+                  <p className="text-xs text-gray-400 font-mono truncate max-w-md">
+                    {summary.keyParam}
+                  </p>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center gap-4">
+              {/* Status */}
+              <div className="flex items-center gap-2">
+                {isInProgress && (
+                  <span className="flex items-center gap-1.5 text-xs text-cyber-purple">
+                    <Loader className="w-4 h-4 animate-spin" />
+                    Running...
+                  </span>
+                )}
+                {isCompleted && (
+                  <span className="flex items-center gap-1.5 text-xs text-cyber-lime">
+                    <CheckCircle className="w-4 h-4" />
+                    Completed
+                  </span>
+                )}
+                {isFailed && (
+                  <span className="flex items-center gap-1.5 text-xs text-cyber-orange">
+                    <XCircle className="w-4 h-4" />
+                    Failed
+                  </span>
+                )}
+              </div>
+              {/* Timestamp */}
+              <span className="flex items-center gap-1 text-xs text-gray-500">
+                <Clock className="w-3.5 h-3.5" />
+                {new Date(event.timestamp).toLocaleTimeString()}
+              </span>
+              {/* Close button */}
+              <Dialog.Close className="p-1.5 rounded hover:bg-cyber-bg transition-colors text-gray-400 hover:text-gray-200">
+                <X className="w-5 h-5" />
+              </Dialog.Close>
             </div>
           </div>
-          <div className="flex items-center gap-4">
-            {/* Status */}
-            <div className="flex items-center gap-2">
-              {isInProgress && (
-                <span className="flex items-center gap-1.5 text-xs text-cyber-purple">
-                  <Loader className="w-4 h-4 animate-spin" />
-                  Running...
-                </span>
-              )}
-              {isCompleted && (
-                <span className="flex items-center gap-1.5 text-xs text-cyber-lime">
-                  <CheckCircle className="w-4 h-4" />
-                  Completed
-                </span>
-              )}
-              {isFailed && (
-                <span className="flex items-center gap-1.5 text-xs text-cyber-orange">
-                  <XCircle className="w-4 h-4" />
-                  Failed
-                </span>
-              )}
-            </div>
-            {/* Timestamp */}
-            <span className="flex items-center gap-1 text-xs text-gray-500">
-              <Clock className="w-3.5 h-3.5" />
-              {new Date(event.timestamp).toLocaleTimeString()}
-            </span>
-            {/* Close button */}
-            <button
-              onClick={onClose}
-              className="p-1.5 rounded hover:bg-cyber-bg transition-colors text-gray-400 hover:text-gray-200"
-            >
-              <X className="w-5 h-5" />
-            </button>
+
+          {/* Content */}
+          <div className="flex-1 overflow-auto p-5 space-y-5">
+            {/* Input Section */}
+            {rawInput && (
+              <Section
+                title="Input"
+                copyable
+                onCopy={() => copyToClipboard(JSON.stringify(rawInput, null, 2), 'input')}
+                copied={copiedSection === 'input'}
+              >
+                {(isEdit || isPatch) ? (
+                  <DiffView toolKind={toolKind} rawInput={rawInput} />
+                ) : (
+                  <JsonView data={rawInput} />
+                )}
+              </Section>
+            )}
+
+            {/* Result Section */}
+            {resultEvent && (
+              <Section
+                title="Result"
+                copyable
+                onCopy={() => copyToClipboard(
+                  resultEvent.toolCall?.raw_output
+                    ? JSON.stringify(resultEvent.toolCall.raw_output, null, 2)
+                    : resultEvent.content || '',
+                  'result'
+                )}
+                copied={copiedSection === 'result'}
+              >
+                {isShell ? (
+                  <ShellResultView event={resultEvent} />
+                ) : isRead ? (
+                  <FileReadView event={resultEvent} />
+                ) : (
+                  <ResultView event={resultEvent} />
+                )}
+              </Section>
+            )}
+
+            {/* Raw Data Section (collapsed by default) */}
+            <details className="group">
+              <summary className="text-xs text-gray-500 cursor-pointer hover:text-gray-400 transition-colors py-2">
+                Show raw event data
+              </summary>
+              <div className="mt-2">
+                <JsonView data={event} />
+              </div>
+            </details>
           </div>
-        </div>
-
-        {/* Content */}
-        <div className="flex-1 overflow-auto p-5 space-y-5">
-          {/* Input Section */}
-          {rawInput && (
-            <Section
-              title="Input"
-              copyable
-              onCopy={() => copyToClipboard(JSON.stringify(rawInput, null, 2), 'input')}
-              copied={copiedSection === 'input'}
-            >
-              {(isEdit || isPatch) ? (
-                <DiffView toolKind={toolKind} rawInput={rawInput} />
-              ) : (
-                <JsonView data={rawInput} />
-              )}
-            </Section>
-          )}
-
-          {/* Result Section */}
-          {resultEvent && (
-            <Section
-              title="Result"
-              copyable
-              onCopy={() => copyToClipboard(
-                resultEvent.toolCall?.raw_output
-                  ? JSON.stringify(resultEvent.toolCall.raw_output, null, 2)
-                  : resultEvent.content || '',
-                'result'
-              )}
-              copied={copiedSection === 'result'}
-            >
-              {isShell ? (
-                <ShellResultView event={resultEvent} />
-              ) : isRead ? (
-                <FileReadView event={resultEvent} />
-              ) : (
-                <ResultView event={resultEvent} />
-              )}
-            </Section>
-          )}
-
-          {/* Raw Data Section (collapsed by default) */}
-          <details className="group">
-            <summary className="text-xs text-gray-500 cursor-pointer hover:text-gray-400 transition-colors py-2">
-              Show raw event data
-            </summary>
-            <div className="mt-2">
-              <JsonView data={event} />
-            </div>
-          </details>
-        </div>
-      </div>
-    </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
 

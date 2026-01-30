@@ -201,6 +201,20 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
         CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 
+        -- Revert states for undo/redo support
+        CREATE TABLE IF NOT EXISTS revert_states (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT NOT NULL UNIQUE,
+            session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            message_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            backend_id TEXT NOT NULL DEFAULT 'git',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(session_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_revert_states_session ON revert_states(session_id);
+
         -- Legacy message parts
         CREATE TABLE IF NOT EXISTS message_parts (
             id INTEGER PRIMARY KEY,

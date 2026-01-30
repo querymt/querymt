@@ -96,6 +96,22 @@ pub enum UiClientMessage {
     },
     /// Cancel the active session for the current agent
     CancelSession,
+    /// Undo filesystem changes to a specific message point
+    Undo {
+        message_id: String,
+    },
+    /// Redo: restore filesystem to pre-undo state
+    Redo,
+    /// Subscribe to a session's event stream
+    SubscribeSession {
+        session_id: String,
+        #[serde(default)]
+        agent_id: Option<String>,
+    },
+    /// Unsubscribe from a session's event stream
+    UnsubscribeSession {
+        session_id: String,
+    },
 }
 
 /// Messages from server to UI client.
@@ -115,7 +131,13 @@ pub enum UiServerMessage {
     },
     Event {
         agent_id: String,
+        session_id: String,
         event: AgentEvent,
+    },
+    SessionEvents {
+        session_id: String,
+        agent_id: String,
+        events: Vec<AgentEvent>,
     },
     Error {
         message: String,
@@ -147,6 +169,17 @@ pub enum UiServerMessage {
         model: String,
         params: Option<Value>,
     },
+    /// Result of an undo operation
+    UndoResult {
+        success: bool,
+        message: Option<String>,
+        reverted_files: Vec<String>,
+    },
+    /// Result of a redo operation
+    RedoResult {
+        success: bool,
+        message: Option<String>,
+    },
 }
 
 impl UiServerMessage {
@@ -163,6 +196,9 @@ impl UiServerMessage {
             Self::AllModelsList { .. } => "all_models_list",
             Self::FileIndex { .. } => "file_index",
             Self::LlmConfig { .. } => "llm_config",
+            Self::SessionEvents { .. } => "session_events",
+            Self::UndoResult { .. } => "undo_result",
+            Self::RedoResult { .. } => "redo_result",
         }
     }
 }

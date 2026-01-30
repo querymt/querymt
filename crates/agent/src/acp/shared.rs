@@ -67,10 +67,10 @@ pub fn translate_event_to_notification(event: &AgentEvent) -> Option<serde_json:
 /// Returns `None` if the event should not be sent to the client.
 pub fn translate_event_to_update(event: &AgentEvent) -> Option<SessionUpdate> {
     match &event.kind {
-        AgentEventKind::PromptReceived { content } => Some(SessionUpdate::UserMessageChunk(
+        AgentEventKind::PromptReceived { content, .. } => Some(SessionUpdate::UserMessageChunk(
             ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone()))),
         )),
-        AgentEventKind::AssistantMessageStored { content } => {
+        AgentEventKind::AssistantMessageStored { content, .. } => {
             if content.is_empty() {
                 return None;
             }

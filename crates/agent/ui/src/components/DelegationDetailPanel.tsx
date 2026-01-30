@@ -1,5 +1,5 @@
 import { CheckCircle, Clock, Loader, XCircle } from 'lucide-react';
-import { DelegationGroupInfo, Turn, UiAgentInfo } from '../types';
+import { DelegationGroupInfo, Turn, UiAgentInfo, LlmConfigDetails } from '../types';
 import { TurnCard } from './TurnCard';
 import { getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
@@ -9,6 +9,8 @@ interface DelegationDetailPanelProps {
   turn?: Turn | null;
   agents: UiAgentInfo[];
   onToolClick: (event: Turn['toolCalls'][number]) => void;
+  llmConfigCache?: Record<number, LlmConfigDetails>;
+  requestLlmConfig?: (configId: number, callback: (config: LlmConfigDetails) => void) => void;
 }
 
 function formatDuration(startTime: number, endTime?: number): string {
@@ -28,6 +30,8 @@ export function DelegationDetailPanel({
   turn,
   agents,
   onToolClick,
+  llmConfigCache = {},
+  requestLlmConfig,
 }: DelegationDetailPanelProps) {
   if (!delegation || !turn) {
     return (
@@ -85,7 +89,9 @@ export function DelegationDetailPanel({
           onToolClick={onToolClick}
           onDelegateClick={() => {}}
           isLastUserMessage={false}
-          showModelLabel={false}
+          showModelLabel={true}
+          llmConfigCache={llmConfigCache}
+          requestLlmConfig={requestLlmConfig}
         />
       </div>
     </div>

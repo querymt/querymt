@@ -32,7 +32,7 @@ use axum::{
 use messages::{ModelEntry, RoutingMode as MsgRoutingMode};
 use moka::future::Cache;
 use session::collect_event_sources;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,7 +47,6 @@ pub struct UiServer {
     view_store: Arc<dyn ViewStore>,
     event_sources: Vec<Arc<EventBus>>,
     connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
-    session_owners: Arc<Mutex<HashMap<String, String>>>,
     session_agents: Arc<Mutex<HashMap<String, String>>>,
     session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     workspace_manager: Arc<WorkspaceIndexManager>,
@@ -61,7 +60,6 @@ pub(crate) struct ServerState {
     pub view_store: Arc<dyn ViewStore>,
     pub event_sources: Vec<Arc<EventBus>>,
     pub connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
-    pub session_owners: Arc<Mutex<HashMap<String, String>>>,
     pub session_agents: Arc<Mutex<HashMap<String, String>>>,
     pub session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     pub workspace_manager: Arc<WorkspaceIndexManager>,
@@ -74,6 +72,7 @@ pub(crate) struct ConnectionState {
     pub routing_mode: MsgRoutingMode,
     pub active_agent_id: String,
     pub sessions: HashMap<String, String>,
+    pub subscribed_sessions: HashSet<String>,
 }
 
 impl UiServer {
@@ -87,7 +86,6 @@ impl UiServer {
             view_store,
             event_sources,
             connections: Arc::new(Mutex::new(HashMap::new())),
-            session_owners: Arc::new(Mutex::new(HashMap::new())),
             session_agents: Arc::new(Mutex::new(HashMap::new())),
             session_cwds: Arc::new(Mutex::new(HashMap::new())),
             workspace_manager: agent.workspace_index_manager(),
@@ -102,7 +100,6 @@ impl UiServer {
             view_store: self.view_store,
             event_sources: self.event_sources,
             connections: self.connections,
-            session_owners: self.session_owners,
             session_agents: self.session_agents,
             session_cwds: self.session_cwds,
             workspace_manager: self.workspace_manager,

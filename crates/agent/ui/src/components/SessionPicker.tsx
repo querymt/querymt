@@ -1,4 +1,5 @@
 import { useState, useMemo } from 'react';
+import * as Collapsible from '@radix-ui/react-collapsible';
 import { SessionGroup, SessionSummary } from '../types';
 import { GlitchText } from './GlitchText';
 import { ChevronDown, ChevronRight, Search, Plus, Clock, GitBranch } from 'lucide-react';
@@ -201,12 +202,14 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled 
               const groupLabel = group.cwd || 'No workspace';
               
               return (
-                <div key={groupId} className="session-group">
+                <Collapsible.Root
+                  key={groupId}
+                  className="session-group"
+                  open={isExpanded}
+                  onOpenChange={() => toggleGroup(groupIndex)}
+                >
                   {/* Group header */}
-                  <button
-                    onClick={() => toggleGroup(groupIndex)}
-                    className="w-full flex items-center gap-3 px-4 py-3 bg-cyber-surface/60 hover:bg-cyber-surface rounded-lg transition-colors session-group-header"
-                  >
+                  <Collapsible.Trigger className="w-full flex items-center gap-3 px-4 py-3 bg-cyber-surface/60 hover:bg-cyber-surface rounded-lg transition-colors session-group-header">
                     {isExpanded ? (
                       <ChevronDown className="w-5 h-5 text-cyber-cyan" />
                     ) : (
@@ -218,17 +221,15 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled 
                     <span className="text-xs text-gray-500">
                       {group.sessions.length} session{group.sessions.length !== 1 ? 's' : ''}
                     </span>
-                  </button>
+                  </Collapsible.Trigger>
                   
                   {/* Sessions in group */}
-                  {isExpanded && (
-                    <div className="mt-2 space-y-2 pl-4">
-                      {group.sessions.map((session, sessionIndex) => 
-                        renderSessionCard(session, sessionIndex, 0)
-                      )}
-                    </div>
-                  )}
-                </div>
+                  <Collapsible.Content className="mt-2 space-y-2 pl-4">
+                    {group.sessions.map((session, sessionIndex) => 
+                      renderSessionCard(session, sessionIndex, 0)
+                    )}
+                  </Collapsible.Content>
+                </Collapsible.Root>
               );
             })
           )}

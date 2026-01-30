@@ -6,11 +6,9 @@
 use super::messages::{RoutingMode, UiClientMessage, UiServerMessage};
 use super::session::{PRIMARY_AGENT_ID, build_agent_list};
 use super::{ConnectionState, ServerState};
-use crate::events::{AgentEvent, AgentEventKind};
-use crate::session::domain::ForkOrigin;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{sink::SinkExt, stream::StreamExt as FuturesStreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -28,6 +26,7 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
                 routing_mode: RoutingMode::Single,
                 active_agent_id: PRIMARY_AGENT_ID.to_string(),
                 sessions: HashMap::new(),
+                subscribed_sessions: HashSet::new(),
             },
         );
     }
@@ -172,7 +171,16 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
         let state_events = state.clone();
         tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
-                if !is_event_owned(&state_events, &conn_id_events, &event).await {
+                // Check if this connection is subscribed to this session
+                let is_subscribed = {
+                    let connections = state_events.connections.lock().await;
+                    connections
+                        .get(&conn_id_events)
+                        .map(|conn| conn.subscribed_sessions.contains(&event.session_id))
+                        .unwrap_or(false)
+                };
+
+                if !is_subscribed {
                     continue;
                 }
 
@@ -187,7 +195,8 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                 if send_message(
                     &tx_events,
                     UiServerMessage::Event {
-                        agent_id: agent_id.clone(),
+                        agent_id,
+                        session_id: event.session_id.clone(),
                         event: event.clone(),
                     },
                 )
@@ -196,65 +205,7 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                 {
                     break;
                 }
-
-                // Replay the child session's ProviderChanged event after SessionForked
-                // registers ownership. The ProviderChanged was emitted during
-                // new_session() before ownership was registered, so the event
-                // forwarder missed it. This mirrors the replay in session.rs for
-                // primary sessions.
-                if let AgentEventKind::SessionForked {
-                    child_session_id,
-                    target_agent_id,
-                    origin: ForkOrigin::Delegation,
-                    ..
-                } = &event.kind
-                    && let Ok(audit) = state_events
-                        .view_store
-                        .get_audit_view(child_session_id)
-                        .await
-                    && let Some(provider_event) = audit
-                        .events
-                        .iter()
-                        .rev()
-                        .find(|e| matches!(e.kind, AgentEventKind::ProviderChanged { .. }))
-                {
-                    let _ = send_message(
-                        &tx_events,
-                        UiServerMessage::Event {
-                            agent_id: target_agent_id.clone(),
-                            event: provider_event.clone(),
-                        },
-                    )
-                    .await;
-                }
             }
         });
     }
-}
-
-/// Check if an event belongs to a connection's sessions.
-async fn is_event_owned(state: &ServerState, conn_id: &str, event: &AgentEvent) -> bool {
-    if let AgentEventKind::SessionForked {
-        parent_session_id,
-        child_session_id,
-        target_agent_id,
-        origin,
-        ..
-    } = &event.kind
-        && matches!(origin, ForkOrigin::Delegation)
-    {
-        let mut owners = state.session_owners.lock().await;
-        if let Some(owner) = owners.get(parent_session_id).cloned() {
-            owners.insert(child_session_id.clone(), owner);
-            drop(owners);
-            let mut agents = state.session_agents.lock().await;
-            agents.insert(child_session_id.clone(), target_agent_id.clone());
-        }
-    }
-
-    let owners = state.session_owners.lock().await;
-    owners
-        .get(&event.session_id)
-        .map(|owner| owner == conn_id)
-        .unwrap_or(false)
 }

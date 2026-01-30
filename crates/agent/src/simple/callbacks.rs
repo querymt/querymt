@@ -145,7 +145,7 @@ fn dispatch_event(callbacks: &EventCallbacks, event: &AgentEvent) {
                 callback("user".to_string(), content.clone());
             }
         }
-        AgentEventKind::AssistantMessageStored { content } => {
+        AgentEventKind::AssistantMessageStored { content, .. } => {
             if let Some(callback) = callbacks.on_message.as_ref() {
                 callback("assistant".to_string(), content.clone());
             }

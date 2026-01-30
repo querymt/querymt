@@ -53,12 +53,10 @@ pub async fn handle_ui_message(
 
                     drop(connections);
 
-                    // Clean up ownership maps
-                    let mut owners = state.session_owners.lock().await;
+                    // Clean up session metadata maps
                     let mut agents = state.session_agents.lock().await;
                     let mut cwds = state.session_cwds.lock().await;
                     for sid in session_ids {
-                        owners.remove(&sid);
                         agents.remove(&sid);
                         cwds.remove(&sid);
                     }
@@ -116,6 +114,21 @@ pub async fn handle_ui_message(
         }
         UiClientMessage::CancelSession => {
             handle_cancel_session(state, conn_id, tx).await;
+        }
+        UiClientMessage::Undo { message_id } => {
+            handle_undo(state, conn_id, &message_id, tx).await;
+        }
+        UiClientMessage::Redo => {
+            handle_redo(state, conn_id, tx).await;
+        }
+        UiClientMessage::SubscribeSession {
+            session_id,
+            agent_id,
+        } => {
+            handle_subscribe_session(state, conn_id, &session_id, agent_id.as_deref(), tx).await;
+        }
+        UiClientMessage::UnsubscribeSession { session_id } => {
+            handle_unsubscribe_session(state, conn_id, &session_id).await;
         }
     }
 }
@@ -183,31 +196,27 @@ pub async fn handle_load_session(
         cwds.insert(session_id.to_string(), cwd);
     }
 
-    // 2. Register session ownership
-    {
-        let mut owners = state.session_owners.lock().await;
-        owners.insert(session_id.to_string(), conn_id.to_string());
-    }
-
-    // 3. Determine agent ID (default to primary)
+    // 2. Determine agent ID (default to primary)
     let agent_id = PRIMARY_AGENT_ID.to_string();
 
-    // 4. Register in connection state
+    // 3. Register in connection state
     {
         let mut connections = state.connections.lock().await;
         if let Some(conn) = connections.get_mut(conn_id) {
             conn.sessions
                 .insert(agent_id.clone(), session_id.to_string());
+            // Auto-subscribe to the loaded session
+            conn.subscribed_sessions.insert(session_id.to_string());
         }
     }
 
-    // 5. Register agent mapping
+    // 4. Register agent mapping
     {
         let mut agents = state.session_agents.lock().await;
         agents.insert(session_id.to_string(), agent_id);
     }
 
-    // 6. Send loaded audit view
+    // 5. Send loaded audit view
     let _ = send_message(
         tx,
         UiServerMessage::SessionLoaded {
@@ -217,7 +226,7 @@ pub async fn handle_load_session(
     )
     .await;
 
-    // 7. Send updated state
+    // 6. Send updated state
     send_state(state, conn_id, tx).await;
 }
 
@@ -440,4 +449,152 @@ async fn resolve_provider_api_key(
         }
     }
     std::env::var(api_key_name).ok()
+}
+
+/// Handle session subscription request with replay.
+pub async fn handle_subscribe_session(
+    state: &ServerState,
+    conn_id: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+    tx: &mpsc::Sender<String>,
+) {
+    // 1. Register subscription FIRST (so live events start flowing)
+    {
+        let mut connections = state.connections.lock().await;
+        if let Some(conn) = connections.get_mut(conn_id) {
+            conn.subscribed_sessions.insert(session_id.to_string());
+        }
+    }
+
+    // 2. Register agent_id if provided
+    if let Some(agent_id) = agent_id {
+        let mut agents = state.session_agents.lock().await;
+        agents.insert(session_id.to_string(), agent_id.to_string());
+    }
+
+    // 3. Replay stored events (ViewStore has everything persisted)
+    let (events, resolved_agent_id) = match state.view_store.get_audit_view(session_id).await {
+        Ok(audit) => {
+            let resolved_agent_id = {
+                let agents = state.session_agents.lock().await;
+                agents
+                    .get(session_id)
+                    .cloned()
+                    .unwrap_or_else(|| PRIMARY_AGENT_ID.to_string())
+            };
+            (audit.events, resolved_agent_id)
+        }
+        Err(_) => {
+            // Session may be brand new with no stored events yet — that's OK
+            (
+                vec![],
+                agent_id
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| PRIMARY_AGENT_ID.to_string()),
+            )
+        }
+    };
+
+    // 4. Send replay batch
+    let _ = send_message(
+        tx,
+        UiServerMessage::SessionEvents {
+            session_id: session_id.to_string(),
+            agent_id: resolved_agent_id,
+            events,
+        },
+    )
+    .await;
+}
+
+/// Handle undo request.
+pub async fn handle_undo(
+    state: &ServerState,
+    conn_id: &str,
+    message_id: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    let session_id = {
+        let connections = state.connections.lock().await;
+        connections
+            .get(conn_id)
+            .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
+    };
+
+    let Some(session_id) = session_id else {
+        let _ = send_error(tx, "No active session".to_string()).await;
+        return;
+    };
+
+    match state.agent.undo(&session_id, message_id).await {
+        Ok(result) => {
+            let _ = send_message(
+                tx,
+                UiServerMessage::UndoResult {
+                    success: true,
+                    message: None,
+                    reverted_files: result.reverted_files,
+                },
+            )
+            .await;
+        }
+        Err(e) => {
+            let _ = send_message(
+                tx,
+                UiServerMessage::UndoResult {
+                    success: false,
+                    message: Some(e.to_string()),
+                    reverted_files: vec![],
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle redo request.
+pub async fn handle_redo(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<String>) {
+    let session_id = {
+        let connections = state.connections.lock().await;
+        connections
+            .get(conn_id)
+            .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
+    };
+
+    let Some(session_id) = session_id else {
+        let _ = send_error(tx, "No active session".to_string()).await;
+        return;
+    };
+
+    match state.agent.redo(&session_id).await {
+        Ok(_result) => {
+            let _ = send_message(
+                tx,
+                UiServerMessage::RedoResult {
+                    success: true,
+                    message: None,
+                },
+            )
+            .await;
+        }
+        Err(e) => {
+            let _ = send_message(
+                tx,
+                UiServerMessage::RedoResult {
+                    success: false,
+                    message: Some(e.to_string()),
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle session unsubscription request.
+pub async fn handle_unsubscribe_session(state: &ServerState, conn_id: &str, session_id: &str) {
+    let mut connections = state.connections.lock().await;
+    if let Some(conn) = connections.get_mut(conn_id) {
+        conn.subscribed_sessions.remove(session_id);
+    }
 }

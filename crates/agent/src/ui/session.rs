@@ -139,13 +139,16 @@ pub async fn ensure_session(
     }
 
     {
-        let mut owners = state.session_owners.lock().await;
-        owners.insert(session_id.clone(), conn_id.to_string());
-    }
-
-    {
         let mut agents = state.session_agents.lock().await;
         agents.insert(session_id.clone(), agent_id.to_string());
+    }
+
+    // Auto-subscribe the connection to this session
+    {
+        let mut connections = state.connections.lock().await;
+        if let Some(conn) = connections.get_mut(conn_id) {
+            conn.subscribed_sessions.insert(session_id.clone());
+        }
     }
 
     let _ = super::connection::send_message(
@@ -157,21 +160,14 @@ pub async fn ensure_session(
     )
     .await;
 
-    // Replay provider_changed event that was emitted during session creation
-    // (the event forwarder missed it because ownership wasn't registered yet)
-    if let Ok(audit) = state.view_store.get_audit_view(&session_id).await
-        && let Some(event) = audit.events.iter().rev().find(|e| {
-            matches!(
-                e.kind,
-                crate::events::AgentEventKind::ProviderChanged { .. }
-            )
-        })
-    {
+    // Replay stored events for the new session (includes ProviderChanged)
+    if let Ok(audit) = state.view_store.get_audit_view(&session_id).await {
         let _ = super::connection::send_message(
             tx,
-            UiServerMessage::Event {
+            UiServerMessage::SessionEvents {
+                session_id: session_id.clone(),
                 agent_id: agent_id.to_string(),
-                event: event.clone(),
+                events: audit.events,
             },
         )
         .await;

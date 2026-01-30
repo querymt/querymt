@@ -145,6 +145,12 @@ pub trait AgentBuilderExt {
     /// Enables full compaction with default settings
     /// This enables pruning and auto-compaction, and adds ContextMiddleware if needed
     fn with_compaction_enabled(self) -> Self;
+
+    /// Sets the snapshot backend for undo/redo support.
+    fn with_snapshot_backend(self, backend: Arc<dyn crate::snapshot::SnapshotBackend>) -> Self;
+
+    /// Sets the snapshot GC configuration.
+    fn with_snapshot_gc_config(self, config: crate::snapshot::GcConfig) -> Self;
 }
 
 impl AgentBuilderExt for QueryMTAgent {
@@ -414,6 +420,16 @@ impl AgentBuilderExt for QueryMTAgent {
         // Enable pruning and compaction with defaults
         self.with_pruning_config(PruningConfig::default())
             .with_compaction_config(CompactionConfig::default())
+    }
+
+    fn with_snapshot_backend(mut self, backend: Arc<dyn crate::snapshot::SnapshotBackend>) -> Self {
+        self.snapshot_backend = Some(backend);
+        self
+    }
+
+    fn with_snapshot_gc_config(mut self, config: crate::snapshot::GcConfig) -> Self {
+        self.snapshot_gc_config = config;
+        self
     }
 }
 

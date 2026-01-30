@@ -1,0 +1,102 @@
+name: Nightly
+
+on:
+  schedule:
+    # Runs at 03:00 UTC every day
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-changes:
+    name: Check for changes since last nightly
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+      last_commit: ${{ steps.check.outputs.last_commit }}
+      version_name: ${{ steps.version.outputs.name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # Need full history to compare
+      
+      - name: Check for changes
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get the commit SHA from the last nightly release
+          LAST_NIGHTLY_SHA=$(gh release view nightly --json targetCommitish --jq '.targetCommitish' 2>/dev/null || echo "")
+          
+          CURRENT_SHA=$(git rev-parse HEAD)
+          
+          # If no previous nightly exists, or SHAs differ, we have changes
+          if [ -z "$LAST_NIGHTLY_SHA" ] || [ "$LAST_NIGHTLY_SHA" != "$CURRENT_SHA" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Changes detected or first nightly build"
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No changes since last nightly build ($LAST_NIGHTLY_SHA)"
+          fi
+          
+          echo "last_commit=$LAST_NIGHTLY_SHA" >> $GITHUB_OUTPUT
+
+      - name: Generate version string
+        id: version
+        shell: bash
+        run: echo "name=nightly-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build Nightly Binaries
+    needs: check-changes
+    if: needs.check-changes.outputs.has_changes == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/build.yml
+    with:
+      version_name: ${{ needs.check-changes.outputs.version_name }}
+      is_nightly: true
+
+  release:
+    name: Create Nightly GitHub Release
+    needs: [check-changes, build]
+    if: needs.check-changes.outputs.has_changes == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts/
+          pattern: '*-*'
+          merge-multiple: true
+
+      # Delete the existing nightly tag and release to ensure fresh artifacts
+      # and updated source archives on each run.
+      - name: Delete existing nightly release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --yes --cleanup-tag || true
+
+      # This step creates a fresh "Nightly" pre-release.
+      - name: Create Nightly Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly Build
+          body: |
+            **This is a pre-release build from the `main` branch.**
+
+            It is not intended for production use.
+
+            Commit: `${{ github.sha }}`
+          prerelease: true
+          draft: false
+          files: artifacts/*

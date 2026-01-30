@@ -653,6 +653,18 @@
   }
 }
 
+/* ===== cmdk Model Picker Styles ===== */
+
+/* Hide cmdk groups when they have no matching items */
+[cmdk-group][hidden] {
+  display: none;
+}
+
+/* Chevron indicator visibility on selected cmdk item */
+[cmdk-item][data-selected="true"] .cmdk-chevron {
+  opacity: 1;
+}
+
 /* ===== Session Picker Styles ===== */
 
 /* Filter input glow */

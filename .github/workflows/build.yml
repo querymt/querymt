@@ -1,0 +1,190 @@
+name: Build Binaries (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      version_name:
+        description: 'Version identifier (e.g., v1.0.0 or nightly-abc1234)'
+        required: true
+        type: string
+      is_nightly:
+        description: 'Whether this is a nightly build'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.binary }} for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ─── Linux (Static MUSL) ──────────────────────────────────────────
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: qmt
+            bin_name: qmt
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            binary: qmt
+            bin_name: qmt
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: coder_agent
+            bin_name: coder_agent
+            archive_ext: tar.gz
+            cargo_package: qmt-agent
+            cargo_features: oauth,dashboard
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            binary: coder_agent
+            bin_name: coder_agent
+            archive_ext: tar.gz
+            cargo_package: qmt-agent
+            cargo_features: oauth,dashboard
+
+          # ─── macOS ─────────────────────────────────────────────────────────
+          - os: macos-14
+            target: x86_64-apple-darwin
+            binary: qmt
+            bin_name: qmt
+            archive_ext: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: qmt
+            bin_name: qmt
+            archive_ext: tar.gz
+          - os: macos-14
+            target: x86_64-apple-darwin
+            binary: coder_agent
+            bin_name: coder_agent
+            archive_ext: tar.gz
+            cargo_package: qmt-agent
+            cargo_features: oauth,dashboard
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: coder_agent
+            bin_name: coder_agent
+            archive_ext: tar.gz
+            cargo_package: qmt-agent
+            cargo_features: oauth,dashboard
+
+          # ─── Windows (Static CRT) ────────────────────────────────────────
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: qmt
+            bin_name: qmt.exe
+            archive_ext: zip
+            rust_flags: "-C target-feature=+crt-static"
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            binary: qmt
+            bin_name: qmt.exe
+            archive_ext: zip
+            rust_flags: "-C target-feature=+crt-static"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: coder_agent
+            bin_name: coder_agent.exe
+            archive_ext: zip
+            cargo_package: qmt-agent
+            cargo_features: oauth,dashboard
+            rust_flags: "-C target-feature=+crt-static"
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            binary: coder_agent
+            bin_name: coder_agent.exe
+            archive_ext: zip
+            cargo_package: qmt-agent
+            cargo_features: oauth,dashboard
+            rust_flags: "-C target-feature=+crt-static"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain & targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation toolchain
+        if: runner.os == 'Linux'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.binary }}
+
+      # Build qmt binary (default package)
+      - name: Build qmt with Cargo
+        if: matrix.binary == 'qmt'
+        env:
+          RUSTFLAGS: ${{ matrix.rust_flags || '' }}
+        run: cargo build --release --bin qmt --target ${{ matrix.target }}
+
+      # Build coder_agent example binary
+      - name: Build coder_agent with Cargo
+        if: matrix.binary == 'coder_agent'
+        env:
+          RUSTFLAGS: ${{ matrix.rust_flags || '' }}
+        run: cargo build --release -p ${{ matrix.cargo_package }} --example coder_agent --features ${{ matrix.cargo_features }} --target ${{ matrix.target }}
+
+      - name: Prepare artifact for upload (Linux & macOS)
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          ARTIFACT_DIR="dist"
+          PKG="${{ matrix.binary }}-${{ inputs.version_name }}-${{ matrix.target }}"
+          STAGING="$ARTIFACT_DIR/$PKG"
+          mkdir -p "$STAGING"
+          
+          # Copy binary from appropriate location
+          if [ "${{ matrix.binary }}" = "qmt" ]; then
+            cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$STAGING/"
+          else
+            cp "target/${{ matrix.target }}/release/examples/${{ matrix.bin_name }}" "$STAGING/"
+          fi
+          
+          cp README.md LICENSE "$STAGING/"
+          tar -czf "$ARTIFACT_DIR/${PKG}.tar.gz" -C "$ARTIFACT_DIR" "$PKG"
+          echo "ASSET_PATH=$ARTIFACT_DIR/${PKG}.tar.gz" >> $GITHUB_ENV
+
+      - name: Prepare artifact for upload (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $ARTIFACT_DIR = "dist"
+          $PKG = "${{ matrix.binary }}-${{ inputs.version_name }}-${{ matrix.target }}"
+          $STAGING = Join-Path $ARTIFACT_DIR $PKG
+          New-Item -ItemType Directory -Force -Path $STAGING
+          
+          # Copy binary from appropriate location
+          if ("${{ matrix.binary }}" -eq "qmt") {
+            Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -Destination $STAGING
+          } else {
+            Copy-Item "target/${{ matrix.target }}/release/examples/${{ matrix.bin_name }}" -Destination $STAGING
+          }
+          
+          Copy-Item README.md, LICENSE -Destination $STAGING
+          $ZIP_PATH = "$ARTIFACT_DIR/${PKG}.zip"
+          Compress-Archive -Path (Join-Path $STAGING '*') -DestinationPath $ZIP_PATH -Force
+          echo "ASSET_PATH=${ZIP_PATH}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.binary }}-${{ matrix.target }}
+          path: ${{ env.ASSET_PATH }}

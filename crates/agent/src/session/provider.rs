@@ -86,6 +86,10 @@ impl SessionProvider {
         self.plugin_registry.clone()
     }
 
+    pub fn initial_config(&self) -> &LLMParams {
+        &self.initial_config
+    }
+
     pub async fn build_provider_for_session(
         &self,
         session_id: &str,

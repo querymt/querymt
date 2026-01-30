@@ -12,6 +12,7 @@ pub mod snapshots;
 pub mod tool_execution;
 pub mod tools;
 pub mod transitions;
+pub mod undo;
 pub mod utils;
 
 // Re-export main types for convenience

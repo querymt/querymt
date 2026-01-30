@@ -41,10 +41,13 @@ export interface FileIndexEntry {
 export interface EventItem {
   id: string;
   agentId?: string;
+  sessionId?: string;
+  seq?: number;
   type: 'user' | 'agent' | 'tool_call' | 'tool_result' | 'system';
   content: string;
   timestamp: number;
   isMessage?: boolean;  // True for actual user/assistant messages (not internal events)
+  messageId?: string;  // Message UUID from the database (for undo/redo)
   toolCall?: {
     tool_call_id?: string;
     description?: string;
@@ -69,6 +72,9 @@ export interface EventItem {
   delegationTargetAgentId?: string;
   delegationObjective?: string;
   delegationEventType?: 'requested' | 'completed' | 'failed';
+  // Session fork tracking (from session_forked events)
+  forkChildSessionId?: string;
+  forkDelegationId?: string;
   // Context limit from provider_changed events
   contextLimit?: number;
   provider?: string;
@@ -256,6 +262,7 @@ export interface DelegationGroupInfo {
   targetAgentId?: string;
   objective?: string;
   agentId?: string;
+  childSessionId?: string;
   events: EventRow[];
   status: 'in_progress' | 'completed' | 'failed';
   startTime: number;
@@ -295,7 +302,14 @@ export type UiServerMessage =
   | {
       type: 'event';
       agent_id: string;
+      session_id: string;
       event: any;
+    }
+  | {
+      type: 'session_events';
+      session_id: string;
+      agent_id: string;
+      events: any[];
     }
   | {
       type: 'error';
@@ -311,7 +325,9 @@ export type UiServerMessage =
     }
   | { type: 'all_models_list'; models: ModelEntry[] }
   | { type: 'file_index'; files: FileIndexEntry[]; generated_at: number }
-  | { type: 'llm_config'; config_id: number; provider: string; model: string; params?: Record<string, unknown> | null };
+  | { type: 'llm_config'; config_id: number; provider: string; model: string; params?: Record<string, unknown> | null }
+  | { type: 'undo_result'; success: boolean; message?: string | null; reverted_files: string[] }
+  | { type: 'redo_result'; success: boolean; message?: string | null };
 
 export interface ModelEntry {
   provider: string;
@@ -338,4 +354,8 @@ export type UiClientMessage =
   | { type: 'set_session_model'; session_id: string; model_id: string }
   | { type: 'get_file_index' }
   | { type: 'get_llm_config'; config_id: number }
-  | { type: 'cancel_session' };
+  | { type: 'cancel_session' }
+  | { type: 'undo'; message_id: string }
+  | { type: 'redo' }
+  | { type: 'subscribe_session'; session_id: string; agent_id?: string }
+  | { type: 'unsubscribe_session'; session_id: string };

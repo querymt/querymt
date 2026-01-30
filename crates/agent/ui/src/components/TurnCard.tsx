@@ -10,6 +10,7 @@ import { PinnedUserMessage } from './PinnedUserMessage';
 import { ModelConfigPopover } from './ModelConfigPopover';
 import { getAgentShortName } from '../utils/agentNames';
 import { getAgentColor } from '../utils/agentColors';
+import { Undo2, Redo2 } from 'lucide-react';
 
 export interface TurnCardProps {
   turn: Turn;
@@ -21,6 +22,11 @@ export interface TurnCardProps {
   llmConfigCache?: Record<number, LlmConfigDetails>; // Cached LLM configs
   requestLlmConfig?: (configId: number, callback: (config: LlmConfigDetails) => void) => void;
   activeView?: 'chat' | 'delegations'; // Current view - only show pinned message in chat view
+  onUndo?: () => void; // Callback to undo this turn
+  onRedo?: () => void; // Callback to redo this turn
+  isUndone?: boolean; // This turn was undone
+  revertedFiles?: string[]; // Files that were reverted
+  canUndo?: boolean; // Whether undo button should be shown
 }
 
 // Interleaved event item types
@@ -112,6 +118,11 @@ export const TurnCard = memo(function TurnCard({
   llmConfigCache = {},
   requestLlmConfig,
   activeView = 'chat',
+  onUndo,
+  onRedo,
+  isUndone = false,
+  revertedFiles = [],
+  canUndo = false,
 }: TurnCardProps) {
   const agentName = turn.agentId ? getAgentShortName(turn.agentId, agents) : 'Agent';
   const agentColor = turn.agentId ? getAgentColor(turn.agentId) : undefined;
@@ -125,7 +136,6 @@ export const TurnCard = memo(function TurnCard({
   
   // Model config popover state
   const [showConfigPopover, setShowConfigPopover] = useState(false);
-  const modelLabelRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!isLastUserMessage || !userMessageRef.current || !turn.userMessage) return;
@@ -146,7 +156,7 @@ export const TurnCard = memo(function TurnCard({
   };
 
   return (
-    <div className="turn-card max-w-4xl mx-auto px-4 py-3">
+    <div className="turn-card max-w-4xl mx-auto px-4 py-3 group">
       {/* Pinned user message (appears when scrolled past) - only in chat view */}
       {isPinned && turn.userMessage && activeView === 'chat' && (
         <PinnedUserMessage
@@ -196,37 +206,34 @@ export const TurnCard = memo(function TurnCard({
             )}
           </div>
           {/* Right: model label */}
-          {showModelLabel && turn.modelLabel && (
-            <div className="relative flex-shrink-0">
+          {showModelLabel && turn.modelLabel && turn.modelConfigId && requestLlmConfig ? (
+            <ModelConfigPopover
+              configId={turn.modelConfigId}
+              open={showConfigPopover}
+              onOpenChange={setShowConfigPopover}
+              requestConfig={requestLlmConfig}
+              cachedConfig={llmConfigCache[turn.modelConfigId]}
+            >
               <button
-                ref={modelLabelRef}
                 type="button"
-                onClick={() => turn.modelConfigId && requestLlmConfig && setShowConfigPopover(true)}
-                className={`text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-gray-400 truncate max-w-[200px] ${
-                  turn.modelConfigId && requestLlmConfig
-                    ? 'hover:border-cyber-cyan/40 hover:text-gray-300 cursor-pointer transition-colors'
-                    : 'cursor-default'
-                }`}
+                className="flex-shrink-0 text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-gray-400 truncate max-w-[200px] hover:border-cyber-cyan/40 hover:text-gray-300 cursor-pointer transition-colors"
                 title={turn.modelLabel}
-                disabled={!turn.modelConfigId || !requestLlmConfig}
               >
                 {turn.modelLabel}
               </button>
-              {showConfigPopover && turn.modelConfigId && requestLlmConfig && (
-                <ModelConfigPopover
-                  configId={turn.modelConfigId}
-                  anchorRef={modelLabelRef}
-                  onClose={() => setShowConfigPopover(false)}
-                  requestConfig={requestLlmConfig}
-                  cachedConfig={llmConfigCache[turn.modelConfigId]}
-                />
-              )}
-            </div>
-          )}
+            </ModelConfigPopover>
+          ) : showModelLabel && turn.modelLabel ? (
+            <span
+              className="flex-shrink-0 text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-gray-400 truncate max-w-[200px] cursor-default"
+              title={turn.modelLabel}
+            >
+              {turn.modelLabel}
+            </span>
+          ) : null}
         </div>
 
         <div
-          className="bg-cyber-surface/40 border rounded-lg px-4 py-3"
+          className="bg-cyber-surface/40 border rounded-lg px-4 py-3 relative"
           style={{
             borderColor: agentColor ? `${agentColor}40` : 'rgba(0, 255, 249, 0.2)',
             borderLeftWidth: '3px',
@@ -262,7 +269,66 @@ export const TurnCard = memo(function TurnCard({
           ) : turn.isActive ? (
             <div className="text-sm text-gray-500 italic">Working...</div>
           ) : null}
+
+          {/* Undone state overlay */}
+          {isUndone && (
+            <div className="absolute inset-0 bg-cyber-bg/90 backdrop-blur-sm rounded-lg flex items-center justify-center p-6">
+              <div className="max-w-md w-full space-y-4">
+                <div className="text-center">
+                  <h3 className="text-lg font-semibold text-cyber-orange mb-2">Changes Undone</h3>
+                  <p className="text-sm text-gray-400">
+                    {revertedFiles.length > 0 
+                      ? `${revertedFiles.length} file${revertedFiles.length !== 1 ? 's' : ''} reverted`
+                      : 'No filesystem changes were made in this turn'}
+                  </p>
+                </div>
+                
+                {/* File list - only show if there are files */}
+                {revertedFiles.length > 0 && (
+                  <div className="bg-cyber-surface/60 border border-cyber-border/40 rounded-lg p-3 max-h-40 overflow-y-auto">
+                    <div className="space-y-1">
+                      {revertedFiles.slice(0, 5).map((file, idx) => (
+                        <div key={idx} className="text-xs text-gray-300 font-mono truncate" title={file}>
+                          {file}
+                        </div>
+                      ))}
+                      {revertedFiles.length > 5 && (
+                        <div className="text-xs text-gray-500 italic">
+                          +{revertedFiles.length - 5} more file{revertedFiles.length - 5 !== 1 ? 's' : ''}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Redo button */}
+                {onRedo && (
+                  <button
+                    onClick={onRedo}
+                    className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-cyber-cyan/10 border border-cyber-cyan/40 text-cyber-cyan hover:bg-cyber-cyan/20 hover:border-cyber-cyan transition-colors"
+                  >
+                    <Redo2 className="w-4 h-4" />
+                    <span className="text-sm font-medium">Redo Changes</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
         </div>
+
+        {/* Undo button - subtly visible, fully visible on hover */}
+        {canUndo && onUndo && !isUndone && !turn.isActive && (
+          <div className="mt-2 flex justify-end opacity-60 group-hover:opacity-100 transition-opacity">
+            <button
+              onClick={onUndo}
+              className="flex items-center gap-1.5 px-2 py-1 rounded text-xs text-gray-400 hover:text-cyber-orange hover:bg-cyber-orange/10 border border-transparent hover:border-cyber-orange/40 transition-colors"
+              title="Undo changes from this turn"
+            >
+              <Undo2 className="w-3.5 h-3.5" />
+              <span>Undo</span>
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -251,6 +251,21 @@ impl std::str::FromStr for ForkPointType {
     }
 }
 
+/// State saved during an undo operation, enabling redo
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevertState {
+    pub public_id: String,
+    pub session_id: String,
+    /// The message ID we reverted to
+    pub message_id: String,
+    /// Snapshot taken before the undo (for redo)
+    pub snapshot_id: String,
+    /// Backend type used (e.g., "git")
+    pub backend_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
 /// Information about a forked session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkInfo {

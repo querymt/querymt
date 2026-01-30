@@ -409,27 +409,46 @@ impl ToolTrait for CodeSurgeonTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: r#"A code surgeon tool for precise, language-aware source code search and transformation.
+                description: r#"Language-aware source code search and transformation using tree-sitter grammars.
 
-This tool uses tree-sitter grammars to understand source code syntax, enabling surgical 
-operations that would be impossible or error-prone with plain regex. It operates in two modes:
+MODE SELECTION:
+- SEARCH mode: No action/replacement specified → returns matches with line/column info
+- TRANSFORM mode: action or replacement specified → returns modified content (caller must write back)
 
-**SEARCH MODE** (when no action/replacement specified):
-Returns matches with line numbers and context, similar to grep but scoped to specific 
-language constructs. Use this to find patterns ONLY within comments, strings, function 
-bodies, etc. - not everywhere in the file.
+REQUIRED INPUTS:
+- One of: content (string) OR file_path (path to read)
+- If scope is set, then language is required
 
-**TRANSFORM MODE** (when action or replacement specified):
-Modifies the scoped content and returns the transformed result. The caller is responsible 
-for writing the result back to the file if desired.
+BEHAVIOR:
+- scope: Selects AST nodes (e.g., comments, strings, function, class). Entire node is selected.
+- pattern: Optional regex filter applied within scope. If omitted, entire scope is selected.
+- replacement: Applied to pattern matches within scope (enables TRANSFORM mode)
+- action: Applied to matched content after replacement (enables TRANSFORM mode)
 
-Supported languages: Python, Rust, Go, TypeScript, C, C#, HCL (Terraform)
+RETURN SCHEMA:
+Search mode: { "mode": "search", "matches": [{"line": int, "column": int, "text": str}], "total_matches": int, "file": str? }
+Transform mode: { "mode": "transform", "original_length": int, "transformed_length": int, "content": str, "changes_made": bool }
+
+SUPPORTED SCOPES BY LANGUAGE:
+Python: comments, strings, doc-strings, imports, class, function, function-calls, function-names
+Rust: comments, strings, doc-comments, uses, struct, enum, function, impl, trait, attribute, unsafe, pub-enum, type-identifier
+  (struct, enum, trait support scope_pattern for name filtering)
+Go: comments, strings, imports, struct, function, interface
+  (struct, interface support scope_pattern for name filtering)
+TypeScript: comments, strings, imports, class, function, interface
+C: comments, strings, function, struct
+C#: comments, strings, class, function (or method)
+HCL: comments, strings, resource, variable
+
+ACTIONS: delete, squeeze, upper, lower, titlecase, normalize, symbols, german
+
+LIMITATION: custom_query is not supported.
 
 Examples:
-- Search TODOs in comments only: { "language": "python", "scope": "comments", "pattern": "TODO" }
-- Delete all comments: { "language": "python", "scope": "comments", "action": "delete" }
-- Rename imports: { "language": "rust", "scope": "uses", "pattern": "old_crate", "replacement": "new_crate" }
-- Uppercase string literals: { "language": "python", "scope": "strings", "action": "upper" }
+- Search TODOs in comments: {"language": "python", "scope": "comments", "pattern": "TODO", "content": "..."}
+- Delete comments: {"language": "rust", "scope": "comments", "action": "delete", "file_path": "main.rs"}
+- Rename in imports: {"language": "python", "scope": "imports", "pattern": "old_name", "replacement": "new_name", "content": "..."}
+- Uppercase strings: {"language": "go", "scope": "strings", "action": "upper", "content": "..."}
 "#.to_string(),
                 parameters: json!({
                     "type": "object",
@@ -467,10 +486,6 @@ Examples:
                             "type": "string",
                             "description": "Action to perform on matched content. Specifying this enables TRANSFORM MODE. If both replacement and action are given, replacement is applied first.",
                             "enum": ["delete", "squeeze", "upper", "lower", "titlecase", "normalize", "symbols", "german"]
-                        },
-                        "custom_query": {
-                            "type": "string",
-                            "description": "Advanced: custom tree-sitter S-expression query for complex scoping beyond prepared queries."
                         }
                     },
                     "anyOf": [

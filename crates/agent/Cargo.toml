@@ -65,6 +65,10 @@ infer = "0.16"
 rayon = "1.11"
 indexmap = { version = "2", features = ["serde"] }
 
+# Snapshot backend support
+gix = { version = "0.78", default-features = false, features = ["basic", "worktree-mutation", "attributes"] }
+dirs.workspace = true
+
 # OAuth support (optional, feature-gated)
 anthropic-auth = { version = "0.1", default-features = false, features = ["async", "rustls-tls"], optional = true }
 openai-auth = { version = "1.0", features = ["async"], optional = true }

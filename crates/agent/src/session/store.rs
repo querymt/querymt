@@ -277,6 +277,29 @@ pub trait SessionStore: Send + Sync {
     ) -> SessionResult<()>;
     async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()>;
 
+    // Undo/Redo methods
+
+    /// Get the current revert state for a session (if any)
+    async fn get_revert_state(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<crate::session::domain::RevertState>>;
+
+    /// Set or clear the revert state for a session
+    async fn set_revert_state(
+        &self,
+        session_id: &str,
+        state: Option<crate::session::domain::RevertState>,
+    ) -> SessionResult<()>;
+
+    /// Delete all messages after a given message ID in a session
+    /// Returns the number of deleted messages
+    async fn delete_messages_after(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> SessionResult<usize>;
+
     // Compaction methods
 
     /// Mark tool results as compacted (pruned) by their call IDs.

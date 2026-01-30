@@ -22,6 +22,8 @@ import { ModelPickerPopover } from './components/ModelPickerPopover';
 function App() {
   const {
     events,
+    eventsBySession,
+    mainSessionId,
     sessionId,
     connected,
     newSession,
@@ -36,6 +38,7 @@ function App() {
     sessionGroups,
     loadSession,
     thinkingAgentId,
+    thinkingAgentIds,
     isConversationComplete,
     setFileIndexCallback,
     setFileIndexErrorCallback,
@@ -49,12 +52,15 @@ function App() {
     llmConfigCache,
     requestLlmConfig,
     sessionLimits,
+    sendUndo,
+    sendRedo,
+    undoState,
   } = useUiClient();
   
   // Live timer hook
   const { globalElapsedMs, agentElapsedMs, isSessionActive } = useSessionTimer(
     events,
-    thinkingAgentId,
+    thinkingAgentIds,
     isConversationComplete
   );
   const [prompt, setPrompt] = useState('');
@@ -74,7 +80,7 @@ function App() {
   
   // Model picker popover state
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
-  const modelBadgeRef = useRef<HTMLButtonElement>(null);
+
   
   // File mention hook
   const fileMention = useFileMention(requestFileIndex);
@@ -121,17 +127,28 @@ function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [connected, loading]);
 
-  // Keyboard shortcut: Escape to cancel active session
+  // Keyboard shortcut: Double Escape (within 500ms) to cancel active session
   useEffect(() => {
+    let lastEscapeTime = 0;
+    
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && thinkingAgentId !== null) {
-        e.preventDefault();
-        cancelSession();
+      if (e.key === 'Escape') {
+        const now = Date.now();
+        const timeSinceLastEsc = now - lastEscapeTime;
+        
+        if (timeSinceLastEsc < 500 && thinkingAgentId !== null) {
+          e.preventDefault();
+          e.stopPropagation();
+          cancelSession();
+          lastEscapeTime = 0;
+        } else {
+          lastEscapeTime = now;
+        }
       }
     };
     
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
   }, [thinkingAgentId, cancelSession]);
 
   const handleSendPrompt = async () => {
@@ -190,18 +207,46 @@ function App() {
 
   // Calculate session info
   const sessionInfo = sessionId ? {
-    messageCount: events.filter((event) => event.type !== 'system').length,
+    messageCount: events.filter((event: EventItem) => event.type !== 'system').length,
     createdAt: events.length > 0 ? events[0].timestamp : Date.now(),
   } : undefined;
 
-  // Build turns from events
+  // Build turns from events and enrich delegations with child session events
   const {
     turns,
     delegations,
     hasMultipleModels: sessionHasMultipleModels,
-  } = useMemo(() => buildTurns(events, thinkingAgentId), [events, thinkingAgentId]);
+  } = useMemo(() => {
+    const result = buildTurns(events, thinkingAgentId);
+    
+    // Enrich delegations with child session events from eventsBySession
+    for (const delegation of result.delegations) {
+      // Use the childSessionId directly if available (set from session_forked event)
+      if (delegation.childSessionId) {
+        const sessionEvents = eventsBySession.get(delegation.childSessionId);
+        if (sessionEvents) {
+          const { rows } = buildEventRowsWithDelegations(sessionEvents);
+          delegation.events = rows;
+        }
+      } else if (delegation.targetAgentId) {
+        // Fallback: scan for child session by matching target agent ID
+        for (const [sessionId, sessionEvents] of eventsBySession.entries()) {
+          if (sessionId === mainSessionId) continue; // Skip main session
+          const hasMatchingAgent = sessionEvents.some(e => e.agentId === delegation.targetAgentId);
+          if (hasMatchingAgent) {
+            delegation.childSessionId = sessionId;
+            const { rows } = buildEventRowsWithDelegations(sessionEvents);
+            delegation.events = rows;
+            break;
+          }
+        }
+      }
+    }
+    
+    return result;
+  }, [events, eventsBySession, mainSessionId, thinkingAgentId]);
   const systemEvents = useMemo(
-    () => events.filter((event) => event.type === 'system'),
+    () => events.filter((event: EventItem) => event.type === 'system'),
     [events]
   );
   const [systemClearIndex, setSystemClearIndex] = useState(0);
@@ -240,6 +285,34 @@ function App() {
     }
     return -1;
   }, [filteredTurns]);
+
+  // Calculate last turn with tool calls (for undo button)
+  const lastTurnWithToolCallsIndex = useMemo(() => {
+    for (let i = filteredTurns.length - 1; i >= 0; i--) {
+      if (filteredTurns[i].toolCalls.length > 0) {
+        return i;
+      }
+    }
+    return -1;
+  }, [filteredTurns]);
+
+  // Handle undo for a specific turn
+  const handleUndo = useCallback((turnIndex: number) => {
+    const turn = filteredTurns[turnIndex];
+    const userMessage = turn.userMessage;
+    if (!userMessage?.messageId) {
+      console.error('[App] Cannot undo: no message ID found for turn', turn.id);
+      return;
+    }
+    console.log('[App] Undoing turn', turn.id, 'with message ID', userMessage.messageId);
+    sendUndo(userMessage.messageId, turn.id);
+  }, [filteredTurns, sendUndo]);
+
+  // Handle redo
+  const handleRedo = useCallback(() => {
+    console.log('[App] Redoing changes');
+    sendRedo();
+  }, [sendRedo]);
 
   // Handle tool click to open modal
   const handleToolClick = useCallback((event: EventRow) => {
@@ -280,24 +353,41 @@ function App() {
     }
   }, [activeTimelineView, delegations.length]);
 
+  // Handle view switch - only select first if no valid selection exists
   useEffect(() => {
     if (activeTimelineView === 'delegations') {
       // Auto-close drawer when switching to delegations tab
       setActiveDelegationId(null);
-      // Auto-select first delegation in delegations view
+      
+      // Only auto-select first if:
+      // 1. We have delegations AND
+      // 2. No current selection OR current selection is invalid
       if (delegations.length > 0) {
+        const currentSelectionExists = delegations.some(d => d.id === activeDelegationId);
+        if (!activeDelegationId || !currentSelectionExists) {
+          setActiveDelegationId(delegations[0].id);
+        }
+      }
+    }
+  }, [activeTimelineView]); // Only depends on view switch
+
+  // Fallback to first when selected delegation disappears (due to updates/changes)
+  useEffect(() => {
+    if (activeTimelineView === 'delegations' && activeDelegationId) {
+      const stillExists = delegations.some(d => d.id === activeDelegationId);
+      if (!stillExists && delegations.length > 0) {
         setActiveDelegationId(delegations[0].id);
       }
     }
-  }, [activeTimelineView, delegations]);
+  }, [delegations, activeTimelineView, activeDelegationId]);
 
   return (
     <div className="flex flex-col h-screen bg-cyber-bg text-gray-100 relative">
       
       {/* Sidebar */}
       <Sidebar
-        isOpen={sidebarOpen}
-        onClose={() => setSidebarOpen(false)}
+        open={sidebarOpen}
+        onOpenChange={setSidebarOpen}
         sessionId={sessionId}
         connected={connected}
         onNewSession={handleNewSession}
@@ -331,38 +421,21 @@ function App() {
             </span>
           )}
           {/* Model badge + popover */}
-          <div className="relative">
-            <button
-              ref={modelBadgeRef}
-              type="button"
-              onClick={() => setModelPickerOpen(!modelPickerOpen)}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-cyber-border bg-cyber-bg/60 text-xs text-gray-300 hover:border-cyber-cyan/60 hover:text-cyber-cyan transition-colors max-w-[280px]"
-              title={agentModels[activeAgentId] ? `${agentModels[activeAgentId].provider} / ${agentModels[activeAgentId].model}` : 'No model selected'}
-            >
-              <span className="truncate">
-                {agentModels[activeAgentId]?.provider && agentModels[activeAgentId]?.model
-                  ? `${agentModels[activeAgentId].provider} / ${agentModels[activeAgentId].model}`
-                  : 'Select model'}
-              </span>
-              <ChevronDown className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${modelPickerOpen ? 'rotate-180' : ''}`} />
-            </button>
-            <ModelPickerPopover
-              isOpen={modelPickerOpen}
-              onClose={() => setModelPickerOpen(false)}
-              anchorRef={modelBadgeRef}
-              connected={connected}
-              routingMode={routingMode}
-              activeAgentId={activeAgentId}
-              sessionId={sessionId}
-              sessionsByAgent={sessionsByAgent}
-              agents={agents}
-              allModels={allModels}
-              currentProvider={agentModels[activeAgentId]?.provider}
-              currentModel={agentModels[activeAgentId]?.model}
-              onRefresh={refreshAllModels}
-              onSetSessionModel={setSessionModel}
-            />
-          </div>
+          <ModelPickerPopover
+            open={modelPickerOpen}
+            onOpenChange={setModelPickerOpen}
+            connected={connected}
+            routingMode={routingMode}
+            activeAgentId={activeAgentId}
+            sessionId={sessionId}
+            sessionsByAgent={sessionsByAgent}
+            agents={agents}
+            allModels={allModels}
+            currentProvider={agentModels[activeAgentId]?.provider}
+            currentModel={agentModels[activeAgentId]?.model}
+            onRefresh={refreshAllModels}
+            onSetSessionModel={setSessionModel}
+          />
           <div className="flex items-center gap-2">
             {connected ? (
               <>
@@ -442,6 +515,8 @@ function App() {
               activeTurn={activeDelegationTurn}
               onSelectDelegation={handleDelegateClick}
               onToolClick={handleToolClick}
+              llmConfigCache={llmConfigCache}
+              requestLlmConfig={requestLlmConfig}
             />
           ) : !hasTurns ? (
             <div className="flex items-center justify-center h-full">
@@ -508,20 +583,31 @@ function App() {
             <Virtuoso
               ref={virtuosoRef}
               data={filteredTurns}
-              itemContent={(index, turn) => (
-                <TurnCard
-                  key={turn.id}
-                  turn={turn}
-                  agents={agents}
-                  onToolClick={handleToolClick}
-                  onDelegateClick={handleDelegateClick}
-                  isLastUserMessage={index === lastUserMessageTurnIndex}
-                  showModelLabel={sessionHasMultipleModels}
-                  llmConfigCache={llmConfigCache}
-                  requestLlmConfig={requestLlmConfig}
-                  activeView={activeTimelineView}
-                />
-              )}
+              itemContent={(index, turn) => {
+                const canUndo = index === lastTurnWithToolCallsIndex;
+                const isUndone = undoState?.turnId === turn.id;
+                const revertedFiles = isUndone ? undoState.revertedFiles : [];
+                
+                return (
+                  <TurnCard
+                    key={turn.id}
+                    turn={turn}
+                    agents={agents}
+                    onToolClick={handleToolClick}
+                    onDelegateClick={handleDelegateClick}
+                    isLastUserMessage={index === lastUserMessageTurnIndex}
+                    showModelLabel={sessionHasMultipleModels}
+                    llmConfigCache={llmConfigCache}
+                    requestLlmConfig={requestLlmConfig}
+                    activeView={activeTimelineView}
+                    canUndo={canUndo}
+                    isUndone={isUndone}
+                    revertedFiles={revertedFiles}
+                    onUndo={() => handleUndo(index)}
+                    onRedo={handleRedo}
+                  />
+                );
+              }}
               followOutput="smooth"
               atBottomStateChange={setIsAtBottom}
               className="h-full"
@@ -598,7 +684,7 @@ function App() {
                 hover:bg-cyber-orange/20 hover:shadow-[0_0_15px_rgba(255,165,0,0.3)]
                 flex items-center gap-2 overflow-visible self-end min-h-[48px]
               "
-              title="Stop generation (Esc)"
+              title="Stop generation (Esc Esc)"
             >
               <Square className="w-5 h-5" />
               <span>Stop</span>
@@ -648,6 +734,8 @@ function App() {
           setActiveDelegationId(null);
         }}
           onToolClick={handleToolClick}
+          llmConfigCache={llmConfigCache}
+          requestLlmConfig={requestLlmConfig}
         />
       )}
 
@@ -828,6 +916,10 @@ function buildDelegationTurn(group: DelegationGroupInfo): Turn {
   const firstTimestamp = group.events[0]?.timestamp ?? group.startTime;
   const lastTimestamp = group.events[group.events.length - 1]?.timestamp ?? group.endTime ?? group.startTime;
 
+  // Build model timeline from the delegation's own child session events
+  const modelTimeline = buildModelTimeline(group.events);
+  const activeModel = getActiveModelAt(modelTimeline, firstTimestamp);
+
   return {
     id: `delegation-${group.id}`,
     userMessage: undefined,
@@ -838,6 +930,8 @@ function buildDelegationTurn(group: DelegationGroupInfo): Turn {
     startTime: firstTimestamp,
     endTime: group.endTime ?? lastTimestamp,
     isActive: group.status === 'in_progress',
+    modelLabel: activeModel?.label,
+    modelConfigId: activeModel?.configId,
   };
 }
 
@@ -932,6 +1026,15 @@ function buildEventRowsWithDelegations(events: EventItem[]): {
        group.startTime = event.timestamp;
        if (targetAgentId) {
          activeDelegationByAgent.set(targetAgentId, delegationKey);
+       }
+     }
+
+     // Handle session_forked events to capture child session ID
+     if (event.forkChildSessionId && event.forkDelegationId) {
+       const delegationKey = delegationIdToToolCall.get(event.forkDelegationId) ?? event.forkDelegationId;
+       const group = delegationGroups.get(delegationKey);
+       if (group) {
+         group.childSessionId = event.forkChildSessionId;
        }
      }
 

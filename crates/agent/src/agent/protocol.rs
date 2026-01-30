@@ -164,6 +164,8 @@ impl SendAgent for QueryMTAgent {
             permission_cache: std::sync::Mutex::new(HashMap::new()),
             current_tools_hash: std::sync::Mutex::new(None),
             function_index,
+            pre_step_snapshot: std::sync::Mutex::new(None),
+            current_step_id: std::sync::Mutex::new(None),
         });
 
         {
@@ -298,6 +300,8 @@ impl SendAgent for QueryMTAgent {
             permission_cache: std::sync::Mutex::new(HashMap::new()),
             current_tools_hash: std::sync::Mutex::new(None),
             function_index: Arc::new(tokio::sync::OnceCell::new()),
+            pre_step_snapshot: std::sync::Mutex::new(None),
+            current_step_id: std::sync::Mutex::new(None),
         });
 
         {
@@ -484,6 +488,8 @@ impl SendAgent for QueryMTAgent {
             permission_cache: std::sync::Mutex::new(HashMap::new()),
             current_tools_hash: std::sync::Mutex::new(None),
             function_index: Arc::new(tokio::sync::OnceCell::new()),
+            pre_step_snapshot: std::sync::Mutex::new(None),
+            current_step_id: std::sync::Mutex::new(None),
         });
 
         {
@@ -537,10 +543,18 @@ impl SendAgent for QueryMTAgent {
             (provider, model_id)
         };
 
-        // Create or get LLM config
-        let llm_config_input = querymt::LLMParams::new()
+        // Preserve system prompt when switching models
+        let system_prompt = self.get_session_system_prompt(&session_id).await;
+
+        // Create or get LLM config with preserved system prompt
+        let mut llm_config_input = querymt::LLMParams::new()
             .provider(provider.clone())
             .model(model.clone());
+
+        // Add system prompt to config
+        for prompt_part in system_prompt {
+            llm_config_input = llm_config_input.system(prompt_part);
+        }
         let llm_config = self
             .provider
             .history_store()

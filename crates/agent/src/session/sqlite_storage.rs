@@ -761,6 +761,118 @@ impl SessionStore for SqliteStorage {
         repo.update_delegation(delegation).await
     }
 
+    async fn get_revert_state(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<crate::session::domain::RevertState>> {
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+        let session_id_str = session_id.to_string();
+
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT public_id, message_id, snapshot_id, backend_id, created_at FROM revert_states WHERE session_id = ?",
+                params![session_internal_id],
+                |row| {
+                    let public_id: String = row.get(0)?;
+                    let message_id: String = row.get(1)?;
+                    let snapshot_id: String = row.get(2)?;
+                    let backend_id: String = row.get(3)?;
+                    let created_at_str: String = row.get(4)?;
+                    let created_at = OffsetDateTime::parse(
+                        &created_at_str,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .unwrap_or_else(|_| OffsetDateTime::now_utc());
+
+                    Ok(crate::session::domain::RevertState {
+                        public_id,
+                        session_id: session_id_str.clone(),
+                        message_id,
+                        snapshot_id,
+                        backend_id,
+                        created_at,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    async fn set_revert_state(
+        &self,
+        session_id: &str,
+        state: Option<crate::session::domain::RevertState>,
+    ) -> SessionResult<()> {
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+
+        self.run_blocking(move |conn| {
+            // Always delete existing revert state for this session
+            conn.execute(
+                "DELETE FROM revert_states WHERE session_id = ?",
+                params![session_internal_id],
+            )?;
+
+            // Insert new state if provided
+            if let Some(state) = state {
+                let now = OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default();
+                conn.execute(
+                    "INSERT INTO revert_states (public_id, session_id, message_id, snapshot_id, backend_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    params![
+                        state.public_id,
+                        session_internal_id,
+                        state.message_id,
+                        state.snapshot_id,
+                        state.backend_id,
+                        now,
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_messages_after(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> SessionResult<usize> {
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+        let message_internal_id = self.resolve_message_internal_id(message_id).await?;
+
+        self.run_blocking(move |conn| {
+            let tx = conn.transaction()?;
+
+            // Get the created_at timestamp of the target message
+            let target_created_at: i64 = tx.query_row(
+                "SELECT created_at FROM messages WHERE id = ?",
+                params![message_internal_id],
+                |row| row.get(0),
+            )?;
+
+            // Delete message_parts for messages after the target
+            tx.execute(
+                "DELETE FROM message_parts WHERE message_id IN (
+                    SELECT id FROM messages WHERE session_id = ? AND created_at > ?
+                )",
+                params![session_internal_id, target_created_at],
+            )?;
+
+            // Delete messages after the target
+            let deleted: usize = tx.execute(
+                "DELETE FROM messages WHERE session_id = ? AND created_at > ?",
+                params![session_internal_id, target_created_at],
+            )?;
+
+            tx.commit()?;
+            Ok(deleted)
+        })
+        .await
+    }
+
     async fn mark_tool_results_compacted(
         &self,
         session_id: &str,
