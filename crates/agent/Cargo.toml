@@ -63,6 +63,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 base64.workspace = true
 infer = "0.16"
 rayon = "1.11"
+indexmap = { version = "2", features = ["serde"] }
 
 # OAuth support (optional, feature-gated)
 anthropic-auth = { version = "0.1", default-features = false, features = ["async", "rustls-tls"], optional = true }

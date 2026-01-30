@@ -7130,6 +7130,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "indexmap 2.13.0",
  "infer",
  "keyring",
  "log",
