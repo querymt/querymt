@@ -5,11 +5,11 @@ use std::{
 };
 
 use hf_hub::{Cache, Repo, RepoType, api::sync::ApiBuilder};
+use mistralrs::core::{EmbeddingLoaderType, NormalLoaderType, PagedCacheType, VisionLoaderType};
 use mistralrs::{
-    DeviceMapSetting, EmbeddingLoaderType, EmbeddingModelBuilder, EmbeddingRequestBuilder,
-    GgufModelBuilder, IsqType, MemoryGpuConfig, Model, ModelDType, NormalLoaderType,
-    PagedAttentionConfig, PagedCacheType, TextModelBuilder, TokenSource, Topology,
-    VisionLoaderType, VisionModelBuilder, parse_isq_value,
+    DeviceMapSetting, EmbeddingModelBuilder, EmbeddingRequestBuilder, GgufModelBuilder, IsqType,
+    MemoryGpuConfig, Model, ModelDType, PagedAttentionConfig, TextModelBuilder, TokenSource,
+    Topology, VisionModelBuilder, parse_isq_value,
 };
 use querymt::chat::Tool;
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
