@@ -1,4 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use heck::ToSnakeCase;
 use http::{
     Method, Request, Response,
     header::{AUTHORIZATION, CONTENT_TYPE},
@@ -29,6 +30,45 @@ pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
         format: Some("uri".to_string()),
         ..Default::default()
     })
+}
+
+fn should_snakecase_extra_body(base_url: &Url) -> bool {
+    // The Codex Responses API (chatgpt.com/backend-api/codex/) expects snake_case
+    // parameter names (e.g. `prompt_cache_key`), but heuristics and user configs
+    // may use camelCase (e.g. `promptCacheKey`). Normalize here.
+    matches!(base_url.host_str(), Some("chatgpt.com"))
+}
+
+fn normalize_extra_body_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(normalize_extra_body_map(map)),
+        Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(normalize_extra_body_value).collect())
+        }
+        other => other,
+    }
+}
+
+fn normalize_extra_body_map(map: Map<String, Value>) -> Map<String, Value> {
+    // Two-pass to prefer keys that are already snake_case.
+    let entries: Vec<(String, Value)> = map.into_iter().collect();
+    let mut out = Map::with_capacity(entries.len());
+
+    for (k, v) in &entries {
+        let nk = k.to_snake_case();
+        if &nk == k {
+            out.insert(k.clone(), normalize_extra_body_value(v.clone()));
+        }
+    }
+
+    for (k, v) in entries {
+        let nk = k.to_snake_case();
+        if nk != k && !out.contains_key(&nk) {
+            out.insert(nk, normalize_extra_body_value(v));
+        }
+    }
+
+    out
 }
 
 pub trait CodexProviderConfig {
@@ -128,6 +168,8 @@ struct CodexChatRequest<'a> {
     tools: Option<Vec<CodexTool<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoice>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    extra_body: Option<Map<String, Value>>,
 }
 
 #[derive(Serialize, Debug)]
@@ -143,7 +185,7 @@ struct CodexTool<'a> {
 #[derive(Deserialize, Debug)]
 struct CodexChatResponse {
     output: Vec<CodexOutput>,
-    usage: Option<Usage>,
+    usage: Option<CodexRawUsage>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -169,6 +211,51 @@ struct CodexOutputContent {
     content_type: String,
     text: Option<String>,
     tool_calls: Vec<ToolCall>,
+}
+
+/// Raw usage response from Codex API, before normalization.
+#[derive(Deserialize, Debug, Clone)]
+struct CodexRawUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+    #[serde(default)]
+    input_tokens_details: Option<CodexInputTokensDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<CodexOutputTokensDetails>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+struct CodexInputTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+struct CodexOutputTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u32,
+}
+
+impl CodexRawUsage {
+    fn into_usage(self) -> Usage {
+        let cache_read = self
+            .input_tokens_details
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
+        let reasoning = self
+            .output_tokens_details
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0);
+
+        let usage = Usage {
+            input_tokens: self.input_tokens.saturating_sub(cache_read),
+            output_tokens: self.output_tokens.saturating_sub(reasoning),
+            reasoning_tokens: reasoning,
+            cache_read,
+            cache_write: 0,
+        };
+        usage
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -213,7 +300,7 @@ impl ChatResponse for CodexChatResponse {
     }
 
     fn usage(&self) -> Option<Usage> {
-        self.usage.clone()
+        self.usage.clone().map(|u| u.into_usage())
     }
 
     fn finish_reason(&self) -> Option<FinishReason> {
@@ -310,6 +397,14 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
         None
     };
 
+    let extra_body = cfg.extra_body().map(|m| {
+        if should_snakecase_extra_body(cfg.base_url()) {
+            normalize_extra_body_map(m)
+        } else {
+            m
+        }
+    });
+
     let body = CodexChatRequest {
         model: cfg.model(),
         input: inputs,
@@ -323,6 +418,7 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
         top_k: cfg.top_k().copied(),
         tools: request_tools,
         tool_choice: request_tool_choice,
+        extra_body,
     };
 
     let json_body = serde_json::to_vec(&body)?;

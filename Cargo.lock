@@ -7206,6 +7206,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "extism-pdk",
+ "heck 0.5.0",
  "http",
  "querymt",
  "querymt-extism-macros",

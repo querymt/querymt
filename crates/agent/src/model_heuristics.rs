@@ -245,11 +245,11 @@ fn default_provider_options(provider: &str, model: &str) -> HashMap<String, Valu
     let mut opts = HashMap::new();
     let id = model.to_lowercase();
 
-    // OpenAI:
+    // OpenAI & Codex:
     //   - disable request storage by default
     //   - enable prompt caching via session ID.
     //   These are not part of the OpenAI SDK schema so they must be sent via extra_body.
-    if provider == "openai" {
+    if provider == "openai" || provider == "codex" {
         opts.insert(
             "extra_body".into(),
             json!({
@@ -280,9 +280,17 @@ fn default_provider_options(provider: &str, model: &str) -> HashMap<String, Valu
     if id.contains("gpt-5") && !id.contains("gpt-5-chat") {
         if !id.contains("gpt-5-pro") {
             let eb = opts.entry("extra_body".into()).or_insert_with(|| json!({}));
-            eb.as_object_mut()
-                .unwrap()
-                .insert("reasoningEffort".into(), json!("medium"));
+            if provider == "codex" {
+                // Codex uses reasoning: {effort: "..."} format
+                eb.as_object_mut()
+                    .unwrap()
+                    .insert("reasoning".into(), json!({"effort": "medium"}));
+            } else {
+                // OpenAI/Azure use flat reasoningEffort string
+                eb.as_object_mut()
+                    .unwrap()
+                    .insert("reasoningEffort".into(), json!("medium"));
+            }
         }
         if id.contains("gpt-5.") && !id.contains("codex") && provider != "azure" {
             let eb = opts.entry("extra_body".into()).or_insert_with(|| json!({}));
@@ -507,7 +515,7 @@ mod tests {
         let d = ModelDefaults::for_model("openai", "gpt-5");
         let extra = d.provider_options.get("extra_body").unwrap();
         assert_eq!(extra["reasoningEffort"], json!("medium"));
-        // OpenAI store/promptCacheKey should still be present
+        // OpenAI store/prompt_cache_key should still be present
         assert_eq!(extra["store"], json!(false));
         assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
     }
@@ -553,7 +561,7 @@ mod tests {
         let d = ModelDefaults::for_model("openai", "gpt-5-codex");
         let extra = d.provider_options.get("extra_body").unwrap();
         assert!(extra.get("verbosity").is_none());
-        // But should have reasoningEffort and OpenAI defaults
+        // OpenAI provider should have reasoningEffort (not reasoning object)
         assert_eq!(extra["reasoningEffort"], json!("medium"));
         assert_eq!(extra["store"], json!(false));
     }
@@ -750,5 +758,34 @@ mod tests {
         // Non-Anthropic providers should not transform system prompt
         assert!(config["system"].is_string());
         assert_eq!(config["system"], "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn test_codex_provider_prompt_cache_key() {
+        let d = ModelDefaults::for_model("codex", "gpt-5.1-codex");
+        let extra = d.provider_options.get("extra_body").unwrap();
+        assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
+        assert_eq!(extra["store"], json!(false));
+    }
+
+    #[test]
+    fn test_gpt5_codex_reasoning_object() {
+        let d = ModelDefaults::for_model("codex", "gpt-5.1-codex");
+        let extra = d.provider_options.get("extra_body").unwrap();
+        // Codex uses reasoning object format, not reasoningEffort string
+        assert_eq!(extra["reasoning"]["effort"], json!("medium"));
+        assert!(extra.get("reasoningEffort").is_none());
+        // Should also have codex defaults
+        assert_eq!(extra["store"], json!(false));
+        assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
+    }
+
+    #[test]
+    fn test_gpt5_codex_max_reasoning_object() {
+        let d = ModelDefaults::for_model("codex", "gpt-5.1-codex-max");
+        let extra = d.provider_options.get("extra_body").unwrap();
+        // Codex uses reasoning object format for codex-max too
+        assert_eq!(extra["reasoning"]["effort"], json!("medium"));
+        assert!(extra.get("reasoningEffort").is_none());
     }
 }
