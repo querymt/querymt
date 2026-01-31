@@ -109,7 +109,17 @@ pub trait EventStore: Send + Sync {
 #[async_trait]
 pub trait ViewStore: Send + Sync {
     /// Generate a full audit view for a session
-    async fn get_audit_view(&self, session_id: &str) -> SessionResult<AuditView>;
+    ///
+    /// # Arguments
+    /// * `session_id` - The session to get the audit view for
+    /// * `include_children` - Whether to include child session events (e.g., delegations)
+    ///   Set to `true` for complete trajectory exports, `false` for UI rendering
+    ///   (UI subscribes to child sessions separately)
+    async fn get_audit_view(
+        &self,
+        session_id: &str,
+        include_children: bool,
+    ) -> SessionResult<AuditView>;
 
     /// Generate a redacted view for a session
     async fn get_redacted_view(

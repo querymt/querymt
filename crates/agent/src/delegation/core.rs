@@ -11,7 +11,7 @@ use agent_client_protocol::{
     ProtocolVersion, TextContent,
 };
 use async_trait::async_trait;
-use log::{error, warn};
+use log::{debug, error, warn};
 use querymt::chat::ChatRole;
 use querymt::error::LLMError;
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,8 @@ pub struct DelegationOrchestrator {
     config: DelegationOrchestratorConfig,
     /// Maps delegation_id -> (parent_session_id, cancellation_token, join_handle)
     active_delegations: ActiveDelegations,
+    /// Optional summarizer for generating planning context
+    delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
 }
 
 impl DelegationOrchestrator {
@@ -108,6 +110,7 @@ impl DelegationOrchestrator {
             agent_registry,
             config: DelegationOrchestratorConfig::new(cwd),
             active_delegations: Arc::new(Mutex::new(HashMap::new())),
+            delegation_summarizer: None,
         }
     }
 
@@ -118,6 +121,14 @@ impl DelegationOrchestrator {
 
     pub fn with_verification(mut self, enabled: bool) -> Self {
         self.config.run_verification = enabled;
+        self
+    }
+
+    pub fn with_summarizer(
+        mut self,
+        summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
+    ) -> Self {
+        self.delegation_summarizer = summarizer;
         self
     }
 }
@@ -131,6 +142,7 @@ impl EventObserver for DelegationOrchestrator {
                 let store = self.store.clone();
                 let agent_registry = self.agent_registry.clone();
                 let config = self.config.clone();
+                let delegation_summarizer = self.delegation_summarizer.clone();
                 let parent_session_id = event.session_id.clone();
                 let parent_session_id_for_insert = parent_session_id.clone();
                 let delegation = delegation.clone();
@@ -149,6 +161,7 @@ impl EventObserver for DelegationOrchestrator {
                         agent_registry,
                         config,
                         active_delegations: active_delegations_for_spawn,
+                        delegation_summarizer,
                     };
                     handle_delegation(ctx, parent_session_id, delegation, cancel_token).await;
                 });
@@ -162,20 +175,38 @@ impl EventObserver for DelegationOrchestrator {
             AgentEventKind::Cancelled => {
                 // Cancel all delegations for this session
                 let session_id = &event.session_id;
-                let active = self.active_delegations.lock().await;
+                let mut active = self.active_delegations.lock().await;
 
                 // Find all delegations for this session
-                let to_cancel: Vec<String> = active
-                    .iter()
+                let to_cancel: Vec<(String, tokio::task::JoinHandle<()>)> = active
+                    .iter_mut()
                     .filter(|(_, (parent_id, _, _))| parent_id == session_id)
-                    .map(|(delegation_id, _)| delegation_id.clone())
+                    .map(|(delegation_id, (_, cancel_token, handle))| {
+                        cancel_token.cancel();
+                        // Replace the handle with a dummy handle that immediately completes
+                        // so we can take ownership of the real handle for timeout monitoring
+                        let dummy_handle = tokio::spawn(async {});
+                        let real_handle = std::mem::replace(handle, dummy_handle);
+                        (delegation_id.clone(), real_handle)
+                    })
                     .collect();
 
-                // Cancel each delegation
-                for delegation_id in to_cancel {
-                    if let Some((_, cancel_token, _)) = active.get(&delegation_id) {
-                        cancel_token.cancel();
-                    }
+                // Drop the lock before spawning watchdog tasks
+                drop(active);
+
+                // Spawn watchdog tasks to force-abort delegations that don't terminate within timeout
+                for (delegation_id, mut handle) in to_cancel {
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = &mut handle => {
+                                debug!("Delegation {} terminated gracefully after cancel", delegation_id);
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                                warn!("Delegation {} did not terminate within 5s timeout, force aborting", delegation_id);
+                                handle.abort();
+                            }
+                        }
+                    });
                 }
             }
             _ => {}
@@ -191,6 +222,52 @@ struct DelegationContext {
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     config: DelegationOrchestratorConfig,
     active_delegations: ActiveDelegations,
+    delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
+}
+
+/// Inject planning summary into delegate session's system prompt
+///
+/// This modifies the delegate session's LLM config to append the planning summary
+/// to the system prompt. The summary persists across all turns of the coder's session.
+async fn inject_planning_summary(
+    store: &Arc<dyn SessionStore>,
+    child_session_id: &str,
+    summary: &str,
+) -> crate::session::error::SessionResult<()> {
+    // 1. Get current LLM config for the delegate session
+    let config = store
+        .get_session_llm_config(child_session_id)
+        .await?
+        .ok_or_else(|| {
+            crate::session::error::SessionError::InvalidOperation(
+                "Delegate session has no LLM config".to_string(),
+            )
+        })?;
+
+    // 2. Extract current params, including system prompt
+    let mut params: querymt::LLMParams = if let Some(params_value) = config.params {
+        serde_json::from_value(params_value).unwrap_or_default()
+    } else {
+        querymt::LLMParams::default()
+    };
+
+    // Ensure provider and model are set from config
+    params.provider = Some(config.provider.clone());
+    params.model = Some(config.model.clone());
+
+    // 3. Append planning summary to system prompt
+    let summary_context = format!("\n\n<planning-context>\n{}\n</planning-context>", summary);
+    params.system.push(summary_context);
+
+    // 4. Create new LLM config with updated params
+    let new_config = store.create_or_get_llm_config(&params).await?;
+
+    // 5. Update session to use new config
+    store
+        .set_session_llm_config(child_session_id, new_config.id)
+        .await?;
+
+    Ok(())
 }
 
 async fn handle_delegation(
@@ -347,6 +424,61 @@ async fn handle_delegation(
             instructions: delegation.context.clone(),
         },
     );
+
+    // ──── Generate and inject planning summary ────
+    let _planning_summary = if let Some(ref summarizer) = ctx.delegation_summarizer {
+        match ctx
+            .delegator
+            .provider
+            .history_store()
+            .get_history(&parent_session_id)
+            .await
+        {
+            Ok(history) => {
+                match summarizer.summarize(&history, &delegation.objective).await {
+                    Ok(summary) => {
+                        // Persist to delegation record
+                        let mut updated_delegation = delegation.clone();
+                        updated_delegation.planning_summary = Some(summary.clone());
+                        if let Err(e) = ctx.store.update_delegation(updated_delegation).await {
+                            warn!("Failed to persist delegation summary: {}", e);
+                        }
+
+                        // Inject into delegate session's system prompt
+                        if let Err(e) = inject_planning_summary(
+                            &ctx.store,
+                            &delegate_session.session_id.to_string(),
+                            &summary,
+                        )
+                        .await
+                        {
+                            warn!(
+                                "Failed to inject planning summary into delegate session: {}",
+                                e
+                            );
+                        } else {
+                            log::info!(
+                                "Injected planning summary into delegate session {}",
+                                delegate_session.session_id
+                            );
+                        }
+
+                        Some(summary)
+                    }
+                    Err(e) => {
+                        warn!("Delegation summary generation failed: {}", e);
+                        None // Proceed without summary — graceful degradation
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load parent history for summary: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let prompt_text = build_delegation_prompt(&delegation);
     let prompt_req = PromptRequest::new(

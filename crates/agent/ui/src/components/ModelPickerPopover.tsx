@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState, useRef } from 'react';
 import { Command } from 'cmdk';
 import * as Popover from '@radix-ui/react-popover';
 import { RefreshCw, Search, X, ChevronRight, ChevronDown } from 'lucide-react';
@@ -36,6 +36,8 @@ interface GroupedModels {
   models: string[];
 }
 
+const localeCompare = new Intl.Collator(undefined, { sensitivity: 'base' }).compare;
+
 function groupByProvider(models: ModelEntry[]): GroupedModels[] {
   const map = new Map<string, string[]>();
   for (const entry of models) {
@@ -43,7 +45,12 @@ function groupByProvider(models: ModelEntry[]): GroupedModels[] {
     existing.push(entry.model);
     map.set(entry.provider, existing);
   }
-  return Array.from(map.entries()).map(([provider, models]) => ({ provider, models }));
+  return Array.from(map.entries())
+    .sort(([a], [b]) => localeCompare(a, b))
+    .map(([provider, models]) => ({
+      provider,
+      models: [...models].sort(localeCompare),
+    }));
 }
 
 /* ------------------------------------------------------------------ */
@@ -68,6 +75,7 @@ export function ModelPickerPopover({
   const [target, setTarget] = useState(TARGET_ACTIVE);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedValue, setSelectedValue] = useState('');
+  const inputRef = useRef<HTMLInputElement>(null);
 
   const targetAgents = useMemo(
     () => agents.filter((agent) => sessionsByAgent[agent.id]),
@@ -158,7 +166,10 @@ export function ModelPickerPopover({
           align="end"
           sideOffset={8}
           className="z-50 w-[480px] max-h-[420px] flex flex-col rounded-xl border border-cyber-cyan/30 bg-cyber-bg shadow-lg shadow-cyber-cyan/25 animate-fade-in"
-          onOpenAutoFocus={(e) => e.preventDefault()} // cmdk manages focus
+          onOpenAutoFocus={(e) => {
+            e.preventDefault();
+            inputRef.current?.focus();
+          }}
         >
           {/* Header */}
           <div className="flex items-center justify-between px-3 py-2 border-b border-cyber-border/60">
@@ -219,6 +230,7 @@ export function ModelPickerPopover({
               <div className="relative">
                 <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-500 pointer-events-none" />
                 <Command.Input
+                  ref={inputRef}
                   placeholder="Filter models..."
                   className="w-full rounded-lg border border-cyber-border bg-cyber-surface/70 pl-8 pr-3 py-1.5 text-xs text-gray-200 placeholder:text-gray-500 focus:border-cyber-cyan focus:outline-none"
                 />

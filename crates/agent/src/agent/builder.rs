@@ -405,7 +405,8 @@ impl AgentBuilderExt for QueryMTAgent {
         // If auto compaction is enabled, auto-enable ContextMiddleware
         if config.auto {
             log::info!("Auto-enabling ContextMiddleware for compaction");
-            // Add context middleware with default config if not already present
+            // Add context middleware with default config
+            // (duplicates will be removed by CompositeDriver::new())
             let context_middleware = ContextMiddleware::new(ContextConfig::default());
             self.middleware_drivers
                 .lock()

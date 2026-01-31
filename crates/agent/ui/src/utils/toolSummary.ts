@@ -136,6 +136,12 @@ export function extractKeyParam(toolKind: string | undefined, rawInput: unknown)
     case 'delegate':
       return extractDelegateInfo(obj);
       
+    case 'todowrite':
+      return extractTodoWriteSummary(obj);
+      
+    case 'todoread':
+      return 'Reading task list';
+      
     case 'webfetch':
     case 'fetch':
       return truncate(String(obj.url || ''), 50);
@@ -341,4 +347,18 @@ function countDeletedLines(oldStr: string, newStr: string): number {
   // Simple heuristic - count lines that appear in old but not new
   const newLines = new Set(newStr.split('\n'));
   return oldStr.split('\n').filter(line => !newLines.has(line)).length;
+}
+
+function extractTodoWriteSummary(obj: Record<string, unknown>): string | undefined {
+  const todos = obj.todos;
+  if (!Array.isArray(todos)) return undefined;
+  
+  const total = todos.length;
+  const completed = todos.filter((t: any) => t?.status === 'completed').length;
+  const inProgress = todos.filter((t: any) => t?.status === 'in_progress').length;
+  
+  if (inProgress > 0) {
+    return `Updated tasks (${completed}/${total} done, ${inProgress} active)`;
+  }
+  return `Updated tasks (${completed}/${total} done)`;
 }

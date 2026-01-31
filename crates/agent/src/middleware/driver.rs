@@ -23,16 +23,6 @@ pub trait MiddlewareDriver: Send + Sync {
         Ok(state)
     }
 
-    /// Runs before executing a tool call
-    async fn on_before_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
-        Ok(state)
-    }
-
-    /// Runs after a tool call completes
-    async fn on_after_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
-        Ok(state)
-    }
-
     /// Runs while processing multiple tool calls
     async fn on_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
         Ok(state)
@@ -57,8 +47,25 @@ pub struct CompositeDriver {
 }
 
 impl CompositeDriver {
-    pub fn new(drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
-        debug!("Creating CompositeDriver with {} middleware", drivers.len());
+    pub fn new(mut drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
+        let original_len = drivers.len();
+
+        // Deduplicate by name, keeping first occurrence (preserves order)
+        let mut seen = std::collections::HashSet::new();
+        drivers.retain(|d| seen.insert(d.name()));
+
+        let removed = original_len - drivers.len();
+        if removed > 0 {
+            log::warn!(
+                "Removed {} duplicate middleware from pipeline — check config for redundant entries",
+                removed
+            );
+        }
+
+        debug!(
+            "Creating CompositeDriver with {} middleware (after dedup)",
+            drivers.len()
+        );
         Self { drivers }
     }
 
@@ -80,14 +87,6 @@ impl CompositeDriver {
 
     pub async fn run_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
         self.run_phase(state, MiddlewarePhase::AfterLlm).await
-    }
-
-    pub async fn run_before_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
-        self.run_phase(state, MiddlewarePhase::BeforeTool).await
-    }
-
-    pub async fn run_after_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
-        self.run_phase(state, MiddlewarePhase::AfterTool).await
     }
 
     pub async fn run_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
@@ -180,12 +179,6 @@ impl CompositeDriver {
                     driver.on_step_start(current).instrument(span).await?
                 }
                 MiddlewarePhase::AfterLlm => driver.on_after_llm(current).instrument(span).await?,
-                MiddlewarePhase::BeforeTool => {
-                    driver.on_before_tool(current).instrument(span).await?
-                }
-                MiddlewarePhase::AfterTool => {
-                    driver.on_after_tool(current).instrument(span).await?
-                }
                 MiddlewarePhase::ProcessingToolCalls => {
                     driver
                         .on_processing_tool_calls(current)
@@ -234,8 +227,6 @@ enum MiddlewarePhase {
     TurnStart,
     StepStart,
     AfterLlm,
-    BeforeTool,
-    AfterTool,
     ProcessingToolCalls,
 }
 
@@ -245,8 +236,6 @@ impl MiddlewarePhase {
             MiddlewarePhase::TurnStart => "turn_start",
             MiddlewarePhase::StepStart => "step_start",
             MiddlewarePhase::AfterLlm => "after_llm",
-            MiddlewarePhase::BeforeTool => "before_tool",
-            MiddlewarePhase::AfterTool => "after_tool",
             MiddlewarePhase::ProcessingToolCalls => "processing_tool_calls",
         }
     }

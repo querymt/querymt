@@ -89,7 +89,9 @@ macro_rules! impl_extism_http_plugin {
         factory = $Factory:path,
         name = $name:expr,
     ) => {
-        use extism_pdk::{Error as PdkError, FnResult, FromBytes, Json, ToBytes, plugin_fn};
+        use extism_pdk::{
+            Error as PdkError, FnResult, FromBytes, Json, ToBytes, WithReturnCode, plugin_fn,
+        };
         use querymt::{
             HTTPLLMProvider,
             chat::http::HTTPChatProvider,
@@ -100,13 +102,20 @@ macro_rules! impl_extism_http_plugin {
                 extism_impl::{
                     BinaryCodec, ExtismChatRequest, ExtismChatResponse, ExtismCompleteRequest,
                     ExtismEmbedRequest, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
-                    ExtismTtsResponse,
+                    ExtismTtsResponse, PluginError,
                 },
             },
             stt, tts,
         };
         use serde_json::Value;
         use $crate::qmt_http_request_wrapper;
+
+        /// Convert an LLMError into a WithReturnCode<PdkError> with the
+        /// appropriate error code and JSON-serialized payload.
+        fn llm_err_to_pdk(e: querymt::error::LLMError) -> WithReturnCode<PdkError> {
+            let (json, code) = PluginError::encode(&e);
+            WithReturnCode::new(PdkError::msg(json), code)
+        }
 
         // Export the factory name
         #[plugin_fn]
@@ -146,11 +155,11 @@ macro_rules! impl_extism_http_plugin {
         #[plugin_fn]
         pub fn list_models(cfg: Json<Value>) -> FnResult<Json<Vec<String>>> {
             let req = HTTPLLMProviderFactory::list_models_request(&$Factory, &cfg.0)
-                .map_err(PdkError::new)?;
+                .map_err(llm_err_to_pdk)?;
             let native_resp = qmt_http_request_wrapper(&req)?;
 
             let models = HTTPLLMProviderFactory::parse_list_models(&$Factory, native_resp)
-                .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
+                .map_err(llm_err_to_pdk)?;
             Ok(Json(models))
         }
 
@@ -162,13 +171,10 @@ macro_rules! impl_extism_http_plugin {
             let req = input
                 .cfg
                 .chat_request(&input.messages, input.tools.as_deref())
-                .map_err(PdkError::new)?;
+                .map_err(llm_err_to_pdk)?;
             let native_resp = qmt_http_request_wrapper(&req)?;
 
-            let chat_response = input
-                .cfg
-                .parse_chat(native_resp)
-                .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
+            let chat_response = input.cfg.parse_chat(native_resp).map_err(llm_err_to_pdk)?;
             let dto: ExtismChatResponse = chat_response.into();
             Ok(Json(dto))
         }
@@ -186,7 +192,7 @@ macro_rules! impl_extism_http_plugin {
             let req = input
                 .cfg
                 .chat_request(&input.messages, input.tools.as_deref())
-                .map_err(PdkError::new)?;
+                .map_err(llm_err_to_pdk)?;
 
             let stream_id = qmt_http_stream_open_wrapper(&req)?.0;
 
@@ -263,13 +269,10 @@ macro_rules! impl_extism_http_plugin {
             let req = input
                 .cfg
                 .embed_request(&input.inputs)
-                .map_err(PdkError::new)?;
+                .map_err(llm_err_to_pdk)?;
             let native_resp = qmt_http_request_wrapper(&req)?;
 
-            let embed_response = input
-                .cfg
-                .parse_embed(native_resp)
-                .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
+            let embed_response = input.cfg.parse_embed(native_resp).map_err(llm_err_to_pdk)?;
             Ok(Json(embed_response))
         }
 
@@ -280,13 +283,13 @@ macro_rules! impl_extism_http_plugin {
             let req = input
                 .cfg
                 .complete_request(&input.req)
-                .map_err(PdkError::new)?;
+                .map_err(llm_err_to_pdk)?;
             let native_resp = qmt_http_request_wrapper(&req)?;
 
             let complete_response = input
                 .cfg
                 .parse_complete(native_resp)
-                .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
+                .map_err(llm_err_to_pdk)?;
             Ok(Json(complete_response))
         }
 
@@ -303,12 +306,9 @@ macro_rules! impl_extism_http_plugin {
                 language: input.language,
             };
 
-            let req = input.cfg.stt_request(&stt_req).map_err(PdkError::new)?;
+            let req = input.cfg.stt_request(&stt_req).map_err(llm_err_to_pdk)?;
             let native_resp = qmt_http_request_wrapper(&req)?;
-            let resp = input
-                .cfg
-                .parse_stt(native_resp)
-                .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
+            let resp = input.cfg.parse_stt(native_resp).map_err(llm_err_to_pdk)?;
 
             Ok(Json(ExtismSttResponse { text: resp.text }))
         }
@@ -325,12 +325,9 @@ macro_rules! impl_extism_http_plugin {
                 speed: input.speed,
             };
 
-            let req = input.cfg.tts_request(&tts_req).map_err(PdkError::new)?;
+            let req = input.cfg.tts_request(&tts_req).map_err(llm_err_to_pdk)?;
             let native_resp = qmt_http_request_wrapper(&req)?;
-            let resp = input
-                .cfg
-                .parse_tts(native_resp)
-                .map_err(|e| PdkError::msg(format!("{:#}", e)))?;
+            let resp = input.cfg.parse_tts(native_resp).map_err(llm_err_to_pdk)?;
 
             Ok(Json(ExtismTtsResponse {
                 audio_base64: $crate::encode_base64_standard(&resp.audio),

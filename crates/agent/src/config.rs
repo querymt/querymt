@@ -210,6 +210,74 @@ impl Default for CompactionConfig {
 // ============================================================================
 
 // ============================================================================
+// Delegation Summary Configuration
+// ============================================================================
+
+/// Configuration for delegation summary LLM call
+/// This generates an Implementation Brief from the parent planning conversation
+/// before delegation to provide context to the coder agent
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationSummaryConfig {
+    /// LLM provider for the summary call (can be different from main agent)
+    pub provider: String,
+
+    /// Model for the summary call (should be cheap/fast, e.g., claude-haiku)
+    pub model: String,
+
+    /// API key override (optional, falls back to env)
+    pub api_key: Option<String>,
+
+    /// Enable/disable (default: true when config section present)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Maximum tokens for the summary (prevents runaway context consumption)
+    #[serde(default = "default_summary_max_tokens")]
+    pub max_tokens: Option<usize>,
+
+    /// Timeout in seconds for the summarizer LLM call (default: 30)
+    #[serde(default = "default_summary_timeout")]
+    pub timeout_secs: u64,
+
+    /// Minimum estimated tokens in parent history before triggering LLM summarization.
+    /// Below this, raw formatted history is injected directly (no LLM call).
+    /// Default: 2000 (~8000 chars / ~10-15 messages)
+    #[serde(default = "default_min_history_tokens")]
+    pub min_history_tokens: usize,
+}
+
+fn default_summary_max_tokens() -> Option<usize> {
+    Some(2000)
+}
+
+fn default_summary_timeout() -> u64 {
+    30
+}
+
+fn default_min_history_tokens() -> usize {
+    2000
+}
+
+impl Default for DelegationSummaryConfig {
+    fn default() -> Self {
+        Self {
+            provider: "anthropic".to_string(),
+            model: "claude-haiku".to_string(),
+            api_key: None,
+            enabled: true,
+            max_tokens: default_summary_max_tokens(),
+            timeout_secs: default_summary_timeout(),
+            min_history_tokens: default_min_history_tokens(),
+        }
+    }
+}
+
+// ============================================================================
+// End Delegation Summary Configuration
+// ============================================================================
+
+// ============================================================================
 // Snapshot Backend Configuration
 // ============================================================================
 
@@ -423,6 +491,8 @@ pub struct QuorumSettings {
     pub verification: bool,
     #[serde(default = "default_snapshot_policy")]
     pub snapshot_policy: Option<String>,
+    /// Optional: Configure delegation summary LLM for enriching context
+    pub delegation_summary: Option<DelegationSummaryConfig>,
 }
 
 fn default_true() -> bool {
@@ -448,6 +518,14 @@ pub struct PlannerConfig {
     pub parameters: Option<HashMap<String, Value>>,
     #[serde(default)]
     pub middleware: Vec<MiddlewareEntry>,
+    #[serde(default)]
+    pub tool_output: ToolOutputConfig,
+    #[serde(default)]
+    pub pruning: PruningConfig,
+    #[serde(default)]
+    pub compaction: CompactionConfig,
+    #[serde(default)]
+    pub snapshot: SnapshotBackendConfig,
 }
 
 /// Delegate agent configuration
@@ -471,6 +549,14 @@ pub struct DelegateConfig {
     pub mcp: Vec<McpServerConfig>,
     #[serde(default)]
     pub middleware: Vec<MiddlewareEntry>,
+    #[serde(default)]
+    pub tool_output: ToolOutputConfig,
+    #[serde(default)]
+    pub pruning: PruningConfig,
+    #[serde(default)]
+    pub compaction: CompactionConfig,
+    #[serde(default)]
+    pub snapshot: SnapshotBackendConfig,
 }
 
 /// MCP server configuration

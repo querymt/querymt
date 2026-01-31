@@ -185,6 +185,8 @@ pub struct Delegation {
     /// Optional structured verification specification (preferred over parsing expected_output)
     #[serde(default)]
     pub verification_spec: Option<crate::verification::VerificationSpec>,
+    /// AI-generated summary of parent planning conversation for coder context
+    pub planning_summary: Option<String>,
     pub status: DelegationStatus,
     /// Number of retry attempts for this objective
     pub retry_count: u32,

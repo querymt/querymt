@@ -17,6 +17,7 @@ use crate::session::runtime::RuntimeContext;
 use agent_client_protocol::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
 use anyhow::Context;
 use futures_util::StreamExt;
+use futures_util::future::join_all;
 use log::{debug, info};
 use querymt::chat::{CacheHint, ChatMessage, ChatRole, FinishReason, StreamChunk};
 use querymt::plugin::extism_impl::ExtismChatResponse;
@@ -50,7 +51,7 @@ pub(crate) struct ProcessingToolCallsParams<'a> {
     pub results: &'a Arc<[ToolResult]>,
     pub context: &'a Arc<ConversationContext>,
     pub runtime: Option<&'a SessionRuntime>,
-    pub runtime_context: &'a mut RuntimeContext,
+    pub runtime_context: &'a RuntimeContext,
     pub cancel_rx: &'a watch::Receiver<bool>,
     pub session_id: &'a str,
 }
@@ -172,10 +173,16 @@ impl QueryMTAgent {
         let messages_with_cache = apply_cache_breakpoints(&context.messages);
 
         let response = if tools.is_empty() {
-            provider_context
-                .submit_request(&messages_with_cache)
-                .await
-                .map_err(|e| anyhow::anyhow!("LLM request failed: {}", e))?
+            // Race the LLM request with cancellation for faster cancellation
+            let mut cancel_rx_clone = cancel_rx.clone();
+            tokio::select! {
+                result = provider_context.submit_request(&messages_with_cache) => {
+                    result.map_err(|e| anyhow::anyhow!("LLM request failed: {}", e))?
+                }
+                _ = cancel_rx_clone.changed() => {
+                    return Ok(ExecutionState::Cancelled);
+                }
+            }
         } else {
             let provider = provider_context
                 .provider()
@@ -236,10 +243,16 @@ impl QueryMTAgent {
                     finish_reason,
                 })
             } else {
-                provider
-                    .chat_with_tools(&messages_with_cache, Some(tools))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("LLM request with tools failed: {}", e))?
+                // Race the LLM request with cancellation for faster cancellation
+                let mut cancel_rx_clone = cancel_rx.clone();
+                tokio::select! {
+                    result = provider.chat_with_tools(&messages_with_cache, Some(tools)) => {
+                        result.map_err(|e| anyhow::anyhow!("LLM request with tools failed: {}", e))?
+                    }
+                    _ = cancel_rx_clone.changed() => {
+                        return Ok(ExecutionState::Cancelled);
+                    }
+                }
             }
         };
 
@@ -464,18 +477,15 @@ impl QueryMTAgent {
         // Use finish_reason as the source of truth for execution flow control
         match response.finish_reason {
             Some(FinishReason::ToolCalls) => {
-                // Model wants to call tools - process them
-                if response.tool_calls.len() == 1 {
-                    Ok(ExecutionState::BeforeToolCall {
-                        call: Arc::new(response.tool_calls[0].clone()),
-                        context: new_context,
-                    })
-                } else {
+                // Model wants to call tools - always use ProcessingToolCalls, even for 1 tool
+                if !response.tool_calls.is_empty() {
                     Ok(ExecutionState::ProcessingToolCalls {
                         remaining_calls: Arc::from(response.tool_calls.clone().into_boxed_slice()),
                         results: Arc::from(Vec::new().into_boxed_slice()),
                         context: new_context,
                     })
+                } else {
+                    Ok(ExecutionState::Complete)
                 }
             }
 
@@ -514,11 +524,6 @@ impl QueryMTAgent {
                 // Fallback for backwards compatibility - check tool_calls
                 if response.tool_calls.is_empty() {
                     Ok(ExecutionState::Complete)
-                } else if response.tool_calls.len() == 1 {
-                    Ok(ExecutionState::BeforeToolCall {
-                        call: Arc::new(response.tool_calls[0].clone()),
-                        context: new_context,
-                    })
                 } else {
                     Ok(ExecutionState::ProcessingToolCalls {
                         remaining_calls: Arc::from(response.tool_calls.clone().into_boxed_slice()),
@@ -528,123 +533,6 @@ impl QueryMTAgent {
                 }
             }
         }
-    }
-
-    #[instrument(
-        name = "agent.state.before_tool",
-        skip(self, call, context, runtime, runtime_context, cancel_rx),
-        fields(
-            session_id = %session_id,
-            tool_name = %call.function.name
-        )
-    )]
-    pub(crate) async fn transition_before_tool(
-        &self,
-        call: &Arc<MiddlewareToolCall>,
-        context: &Arc<ConversationContext>,
-        runtime: Option<&SessionRuntime>,
-        runtime_context: &mut RuntimeContext,
-        cancel_rx: &watch::Receiver<bool>,
-        session_id: &str,
-    ) -> Result<ExecutionState, anyhow::Error> {
-        debug!(
-            "BeforeToolCall: session={}, tool={}",
-            session_id, call.function.name
-        );
-
-        if *cancel_rx.borrow() {
-            return Ok(ExecutionState::Cancelled);
-        }
-
-        let tool_result = self
-            .execute_tool_call(call, context, runtime, runtime_context, session_id)
-            .await?;
-
-        Ok(ExecutionState::AfterTool {
-            result: Arc::new(tool_result),
-            context: context.clone(),
-        })
-    }
-
-    #[instrument(
-        name = "agent.state.after_tool",
-        skip(self, result, context, runtime_context),
-        fields(
-            session_id = %session_id,
-            tool_name = %result.tool_name.as_deref().unwrap_or("unknown"),
-            is_error = %result.is_error
-        )
-    )]
-    pub(crate) async fn transition_after_tool(
-        &self,
-        result: &Arc<ToolResult>,
-        context: &Arc<ConversationContext>,
-        runtime_context: &mut RuntimeContext,
-        session_id: &str,
-    ) -> Result<ExecutionState, anyhow::Error> {
-        debug!(
-            "AfterTool: session={}, tool={}, is_error={}",
-            session_id,
-            result.tool_name.as_deref().unwrap_or("unknown"),
-            result.is_error
-        );
-
-        let provider_context = self
-            .provider
-            .with_session(session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
-
-        let mut parts = vec![MessagePart::ToolResult {
-            call_id: result.call_id.clone(),
-            content: result.content.clone(),
-            is_error: result.is_error,
-            tool_name: result.tool_name.clone(),
-            tool_arguments: result.tool_arguments.clone(),
-            compacted_at: None,
-        }];
-        if let Some(ref snapshot) = result.snapshot_part {
-            parts.push(snapshot.clone());
-        }
-
-        let result_msg = crate::model::AgentMessage {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: ChatRole::User,
-            parts,
-            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
-            parent_message_id: None,
-        };
-
-        provider_context
-            .add_message(result_msg.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to store tool result: {}", e))?;
-
-        let mut messages = (*context.messages).to_vec();
-        messages.push(result_msg.to_chat_message());
-
-        let new_context = Arc::new(ConversationContext::new(
-            context.session_id.clone(),
-            Arc::from(messages.into_boxed_slice()),
-            context.stats.clone(),
-            context.provider.clone(),
-            context.model.clone(),
-        ));
-
-        if let Some(wait_condition) = self
-            .record_tool_side_effects(result, runtime_context, session_id)
-            .await
-        {
-            return Ok(ExecutionState::WaitingForEvent {
-                context: new_context,
-                wait: wait_condition,
-            });
-        }
-
-        Ok(ExecutionState::BeforeLlmCall {
-            context: new_context,
-        })
     }
 
     #[instrument(
@@ -688,22 +576,44 @@ impl QueryMTAgent {
                 .await;
         }
 
-        // Process the next tool call
-        let current_call = &remaining_calls[0];
-        let tool_result = self
-            .execute_tool_call(current_call, context, runtime, runtime_context, session_id)
-            .await?;
+        // Execute ALL remaining tool calls in parallel
+        debug!(
+            "Executing {} tool calls in parallel for session {}",
+            remaining_calls.len(),
+            session_id
+        );
 
-        // Add result to accumulated results
-        let mut new_results = (*results).to_vec();
-        new_results.push(tool_result);
+        let futures: Vec<_> = remaining_calls
+            .iter()
+            .map(|call| self.execute_tool_call(call, context, runtime, runtime_context, session_id))
+            .collect();
 
-        // Remove the processed call from remaining
-        let new_remaining = &remaining_calls[1..];
+        // Race tool execution with cancellation for faster cancellation
+        let mut cancel_rx_clone = cancel_rx.clone();
+        let tool_results = tokio::select! {
+            results = join_all(futures) => results,
+            _ = cancel_rx_clone.changed() => {
+                return Ok(ExecutionState::Cancelled);
+            }
+        };
 
+        // Collect results, propagating errors
+        let mut all_results = (*results).to_vec();
+        for result in tool_results {
+            all_results.push(result?);
+        }
+
+        debug!(
+            "Completed {} tool calls for session {}",
+            all_results.len() - results.len(),
+            session_id
+        );
+
+        // All tools processed — return with empty remaining_calls
+        // Next iteration will hit the is_empty() branch and call store_all_tool_results
         Ok(ExecutionState::ProcessingToolCalls {
-            remaining_calls: Arc::from(new_remaining),
-            results: Arc::from(new_results.into_boxed_slice()),
+            remaining_calls: Arc::from(Vec::<MiddlewareToolCall>::new().into_boxed_slice()),
+            results: Arc::from(all_results.into_boxed_slice()),
             context: context.clone(),
         })
     }
@@ -720,7 +630,7 @@ impl QueryMTAgent {
         &self,
         wait: &WaitCondition,
         context: &Arc<ConversationContext>,
-        runtime_context: &mut RuntimeContext,
+        runtime_context: &RuntimeContext,
         cancel_rx: &mut watch::Receiver<bool>,
         event_rx: &mut broadcast::Receiver<AgentEvent>,
         session_id: &str,
@@ -775,7 +685,7 @@ impl QueryMTAgent {
     async fn inject_wait_message(
         &self,
         context: &Arc<ConversationContext>,
-        _runtime_context: &mut RuntimeContext,
+        _runtime_context: &RuntimeContext,
         session_id: &str,
         content: String,
     ) -> Result<Arc<ConversationContext>, anyhow::Error> {

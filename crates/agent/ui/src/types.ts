@@ -204,6 +204,14 @@ export interface Task {
   created_at: string;
 }
 
+// TodoItem - agent's working task list (from todowrite tool)
+export interface TodoItem {
+  id: string;
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed' | 'cancelled';
+  priority: 'high' | 'medium' | 'low';
+}
+
 export interface IntentSnapshot {
   public_id: string;
   session_id: string;

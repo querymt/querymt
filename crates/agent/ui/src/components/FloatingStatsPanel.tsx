@@ -4,6 +4,7 @@ import { EventItem, UiAgentInfo, SessionLimits } from '../types';
 import { calculateStats } from '../utils/statsCalculator';
 import { getAgentColor } from '../utils/agentColors';
 import { getAgentDisplayName } from '../utils/agentNames';
+import { TodoStats } from '../hooks/useTodoState';
 
 interface FloatingStatsPanelProps {
   events: EventItem[];
@@ -14,6 +15,8 @@ interface FloatingStatsPanelProps {
   isSessionActive: boolean;
   agentModels: Record<string, { provider?: string; model?: string; contextLimit?: number }>;
   sessionLimits?: SessionLimits | null;
+  todoStats?: TodoStats | null;
+  hasTodos?: boolean;
 }
 
 // Format percentage for progress indicators
@@ -53,7 +56,7 @@ const STORAGE_KEY_POSITION = 'floatingStatsPosition';
 const STORAGE_KEY_COLLAPSED = 'floatingStatsCollapsed';
 const STORAGE_KEY_MINIMIZED = 'floatingStatsMinimized';
 
-export const FloatingStatsPanel = memo(function FloatingStatsPanel({ 
+export const FloatingStatsPanel = memo(function FloatingStatsPanel({
   events, 
   agents, 
   expertMode = false,
@@ -62,6 +65,8 @@ export const FloatingStatsPanel = memo(function FloatingStatsPanel({
   isSessionActive,
   agentModels,
   sessionLimits,
+  todoStats = null,
+  hasTodos = false,
 }: FloatingStatsPanelProps) {
   const [isCollapsed, setIsCollapsed] = useState(() => {
     const stored = localStorage.getItem(STORAGE_KEY_COLLAPSED);
@@ -316,6 +321,23 @@ export const FloatingStatsPanel = memo(function FloatingStatsPanel({
                     <span className="text-gray-500">Tool Calls</span>
                     <span className="text-gray-300">{session.totalToolCalls}</span>
                   </div>
+                  {/* Todo stats */}
+                  {hasTodos && todoStats && (
+                    <div className="flex justify-between items-center pt-1 border-t border-cyber-border/30">
+                      <span className="text-gray-500 flex items-center gap-1">
+                        <span>📋</span>
+                        Tasks
+                      </span>
+                      <span className="text-gray-300">
+                        {todoStats.completed}/{todoStats.total}
+                        {todoStats.inProgress > 0 && (
+                          <span className="ml-1 text-cyber-cyan text-[10px]">
+                            ({todoStats.inProgress} active)
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                  )}
                   {/* Show steps/turns with limits if available */}
                   {(session.totalSteps > 0 || session.limits?.max_steps) && (
                     <div className="flex justify-between">

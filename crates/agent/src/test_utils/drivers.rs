@@ -50,16 +50,6 @@ impl MiddlewareDriver for StateRecordingDriver {
         Ok(state)
     }
 
-    async fn on_before_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
-        self.record(&state);
-        Ok(state)
-    }
-
-    async fn on_after_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
-        self.record(&state);
-        Ok(state)
-    }
-
     async fn on_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
         self.record(&state);
         Ok(state)
@@ -161,14 +151,6 @@ impl MiddlewareDriver for StopDriver {
         Ok(self.stopped_state())
     }
 
-    async fn on_before_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        Ok(self.stopped_state())
-    }
-
-    async fn on_after_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        Ok(self.stopped_state())
-    }
-
     async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
         Ok(self.stopped_state())
     }
@@ -205,14 +187,6 @@ impl MiddlewareDriver for AlwaysStopDriver {
         self.on_turn_start(_state).await
     }
 
-    async fn on_before_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
-    }
-
-    async fn on_after_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
-    }
-
     async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
         self.on_turn_start(_state).await
     }
@@ -244,14 +218,6 @@ impl MiddlewareDriver for CompleteDriver {
         self.on_turn_start(_state).await
     }
 
-    async fn on_before_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
-    }
-
-    async fn on_after_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
-    }
-
     async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
         self.on_turn_start(_state).await
     }
@@ -280,14 +246,6 @@ impl MiddlewareDriver for CancelDriver {
     }
 
     async fn on_after_llm(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
-    }
-
-    async fn on_before_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
-    }
-
-    async fn on_after_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
         self.on_turn_start(_state).await
     }
 
@@ -351,16 +309,6 @@ impl MiddlewareDriver for CountingDriver {
         Ok(state)
     }
 
-    async fn on_before_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
-        self.bump();
-        Ok(state)
-    }
-
-    async fn on_after_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
-        self.bump();
-        Ok(state)
-    }
-
     async fn on_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
         self.bump();
         Ok(state)
@@ -394,14 +342,6 @@ impl MiddlewareDriver for ErrorDriver {
     }
 
     async fn on_after_llm(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
-    }
-
-    async fn on_before_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
-    }
-
-    async fn on_after_tool(&self, _state: ExecutionState) -> Result<ExecutionState> {
         self.on_turn_start(_state).await
     }
 

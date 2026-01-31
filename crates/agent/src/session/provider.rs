@@ -102,72 +102,14 @@ impl SessionProvider {
                 SessionError::InvalidOperation("Session has no LLM config".to_string())
             })?;
 
-        let factory = self
-            .plugin_registry
-            .get(&config.provider)
-            .await
-            .ok_or_else(|| {
-                SessionError::InvalidOperation(format!("Unknown provider: {}", config.provider))
-            })?;
-        let mut builder_config = serde_json::json!({ "model": config.model });
-        if let Some(params) = &config.params
-            && let Some(obj) = params.as_object()
-        {
-            for (key, value) in obj {
-                builder_config[key] = value.clone();
-            }
-        }
-
-        // Apply model/provider heuristic defaults (only fills keys not already present)
-        let defaults = ModelDefaults::for_model(&config.provider, &config.model);
-        defaults.apply_to(&mut builder_config, session_id);
-
-        // Get API key - try OAuth first (if feature enabled), then fall back to env var
-        if let Some(http_factory) = factory.as_http()
-            && let Some(env_var_name) = http_factory.api_key_name()
-        {
-            let api_key = {
-                #[cfg(feature = "oauth")]
-                {
-                    use crate::auth::get_or_refresh_token;
-
-                    log::debug!("Resolving API key for provider: {}", config.provider);
-
-                    // Try OAuth tokens first
-                    match get_or_refresh_token(&config.provider).await {
-                        Ok(token) => {
-                            log::debug!("Using OAuth token for provider: {}", config.provider);
-                            Some(token)
-                        }
-                        Err(e) => {
-                            // OAuth failed - fall back to environment variable
-                            log::debug!("OAuth unavailable for {}: {}", config.provider, e);
-                            log::debug!("Falling back to env var: {}", env_var_name);
-                            std::env::var(&env_var_name).ok()
-                        }
-                    }
-                }
-                #[cfg(not(feature = "oauth"))]
-                {
-                    std::env::var(&env_var_name).ok()
-                }
-            };
-
-            if let Some(key) = api_key {
-                builder_config["api_key"] = key.into();
-            } else {
-                // Both OAuth and env var failed
-                log::warn!(
-                    "No API key found for provider '{}'. Set {} or run 'qmt auth login {}'",
-                    config.provider,
-                    env_var_name,
-                    config.provider
-                );
-            }
-        }
-
-        let provider = factory.from_config(&builder_config)?;
-        Ok(Arc::from(provider))
+        build_provider_from_config(
+            &self.plugin_registry,
+            &config.provider,
+            &config.model,
+            config.params.as_ref(),
+            None,
+        )
+        .await
     }
 
     /// Get pricing information for a session's model
@@ -253,6 +195,18 @@ impl SessionContext {
                     .unwrap_or(0);
                 agent_msgs[start_index..]
                     .iter()
+                    // Filter out messages that only contain snapshot metadata parts
+                    // These are for undo/redo tracking and should not be sent to the LLM
+                    // Keeping them creates empty messages that break tool_use -> tool_result sequencing
+                    .filter(|m| {
+                        m.parts.iter().any(|p| {
+                            !matches!(
+                                p,
+                                MessagePart::StepSnapshotStart { .. }
+                                    | MessagePart::StepSnapshotPatch { .. }
+                            )
+                        })
+                    })
                     .map(|m| m.to_chat_message())
                     .collect()
             }
@@ -366,4 +320,91 @@ impl SessionContext {
             parent_message_id: None,
         }
     }
+}
+
+/// Build an LLM provider from configuration parameters (reusable helper)
+///
+/// This function encapsulates the provider construction logic, including:
+/// - Looking up the factory from the plugin registry
+/// - Merging model and params into a builder config
+/// - Resolving API keys (OAuth first, then env var fallback)
+/// - Applying model-specific heuristic defaults
+///
+/// Used by both session-based provider construction and standalone providers
+/// (e.g., for delegation summarization).
+pub async fn build_provider_from_config(
+    plugin_registry: &PluginRegistry,
+    provider_name: &str,
+    model: &str,
+    params: Option<&serde_json::Value>,
+    api_key_override: Option<&str>,
+) -> SessionResult<Arc<dyn LLMProvider>> {
+    let factory = plugin_registry.get(provider_name).await.ok_or_else(|| {
+        SessionError::InvalidOperation(format!("Unknown provider: {}", provider_name))
+    })?;
+
+    // Build config JSON, starting with model
+    let mut builder_config = serde_json::json!({ "model": model });
+
+    // Merge params if provided
+    if let Some(params_value) = params
+        && let Some(obj) = params_value.as_object()
+    {
+        for (key, value) in obj {
+            builder_config[key] = value.clone();
+        }
+    }
+
+    // Apply model/provider heuristic defaults (only fills keys not already present)
+    let defaults = ModelDefaults::for_model(provider_name, model);
+    defaults.apply_to(&mut builder_config, "standalone");
+
+    // Get API key - try override, then OAuth (if feature enabled), then env var
+    if let Some(http_factory) = factory.as_http()
+        && let Some(env_var_name) = http_factory.api_key_name()
+    {
+        let api_key = if let Some(key) = api_key_override {
+            Some(key.to_string())
+        } else {
+            #[cfg(feature = "oauth")]
+            {
+                use crate::auth::get_or_refresh_token;
+
+                log::debug!("Resolving API key for provider: {}", provider_name);
+
+                // Try OAuth tokens first
+                match get_or_refresh_token(provider_name).await {
+                    Ok(token) => {
+                        log::debug!("Using OAuth token for provider: {}", provider_name);
+                        Some(token)
+                    }
+                    Err(e) => {
+                        // OAuth failed - fall back to environment variable
+                        log::debug!("OAuth unavailable for {}: {}", provider_name, e);
+                        log::debug!("Falling back to env var: {}", env_var_name);
+                        std::env::var(&env_var_name).ok()
+                    }
+                }
+            }
+            #[cfg(not(feature = "oauth"))]
+            {
+                std::env::var(&env_var_name).ok()
+            }
+        };
+
+        if let Some(key) = api_key {
+            builder_config["api_key"] = key.into();
+        } else {
+            // Both OAuth and env var failed
+            log::warn!(
+                "No API key found for provider '{}'. Set {} or run 'qmt auth login {}'",
+                provider_name,
+                env_var_name,
+                provider_name
+            );
+        }
+    }
+
+    let provider = factory.from_config(&builder_config)?;
+    Ok(Arc::from(provider))
 }

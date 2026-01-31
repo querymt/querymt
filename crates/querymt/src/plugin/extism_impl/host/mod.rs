@@ -31,7 +31,16 @@ pub use loader::ExtismLoader;
 
 mod functions;
 
-use super::ExtismCompleteRequest;
+use super::{ExtismCompleteRequest, PluginError};
+
+/// Decode a `(Error, i32)` pair from `call_get_error_code` into a typed [`LLMError`].
+///
+/// The error code identifies the [`LLMError`] variant, and the error string
+/// is JSON-serialized [`PluginError`] payload.
+fn decode_plugin_error(e: extism::Error, code: i32) -> LLMError {
+    let raw = format!("{:#}", e);
+    PluginError::decode(code, &raw)
+}
 
 macro_rules! with_host_functions {
     ($builder:expr, $user_data:expr) => {
@@ -297,8 +306,8 @@ impl ChatProvider for ExtismProvider {
         };
         let mut plug = self.plugin.lock().unwrap();
         let out: Json<ExtismChatResponse> = plug
-            .call("chat", Json(arg))
-            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
+            .call_get_error_code("chat", Json(arg))
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
 
         Ok(Box::new(out.0) as Box<dyn ChatResponse>)
     }
@@ -350,9 +359,10 @@ impl ChatProvider for ExtismProvider {
         std::thread::spawn(move || {
             log::debug!("Extism plugin chat_stream thread started");
             let mut plug = plugin.lock().unwrap();
-            let res: Result<(), _> = plug.call("chat_stream", Json(arg));
+            let res: Result<(), (extism::Error, i32)> =
+                plug.call_get_error_code("chat_stream", Json(arg));
 
-            if let Err(e) = res {
+            if let Err((e, _code)) = res {
                 let cancel_state = user_data_clone
                     .get()
                     .ok()
@@ -458,10 +468,10 @@ impl EmbeddingProvider for ExtismProvider {
         };
 
         let mut plug = self.plugin.lock().unwrap();
-        let out: Result<Json<Vec<Vec<f32>>>, LLMError> = plug
-            .call("embed", Json(arg))
-            .map_err(|e| LLMError::PluginError(format!("{:#}", e)));
-        out.map(|v| v.0)
+        let out: Json<Vec<Vec<f32>>> = plug
+            .call_get_error_code("embed", Json(arg))
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        Ok(out.0)
     }
 }
 
@@ -475,10 +485,10 @@ impl CompletionProvider for ExtismProvider {
         };
 
         let mut plug = self.plugin.lock().unwrap();
-        let out: Result<Json<CompletionResponse>, LLMError> = plug
-            .call("complete", Json(arg))
-            .map_err(|e| LLMError::PluginError(format!("{:#}", e)));
-        out.map(|v| v.0)
+        let out: Json<CompletionResponse> = plug
+            .call_get_error_code("complete", Json(arg))
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        Ok(out.0)
     }
 }
 
@@ -503,8 +513,8 @@ impl LLMProvider for ExtismProvider {
         };
 
         let out: Json<ExtismSttResponse> = plug
-            .call("transcribe", Json(arg))
-            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
+            .call_get_error_code("transcribe", Json(arg))
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
 
         Ok(stt::SttResponse { text: out.0.text })
     }
@@ -528,8 +538,8 @@ impl LLMProvider for ExtismProvider {
         };
 
         let out: Json<ExtismTtsResponse> = plug
-            .call("speech", Json(arg))
-            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
+            .call_get_error_code("speech", Json(arg))
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
 
         out.0
             .into_tts_response()

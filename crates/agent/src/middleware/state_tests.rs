@@ -16,14 +16,6 @@ fn test_execution_state_name_all_variants() {
         None,
         Some(FinishReason::Stop),
     ));
-    let tool_call = Arc::new(mock_tool_call("call-1", "tool", "{}"));
-    let tool_result = Arc::new(ToolResult::new(
-        "call-1".to_string(),
-        "ok".to_string(),
-        false,
-        None,
-        None,
-    ));
     let states = vec![
         (
             ExecutionState::BeforeLlmCall {
@@ -44,20 +36,6 @@ fn test_execution_state_name_all_variants() {
                 context: context.clone(),
             },
             "AfterLlm",
-        ),
-        (
-            ExecutionState::BeforeToolCall {
-                call: tool_call.clone(),
-                context: context.clone(),
-            },
-            "BeforeToolCall",
-        ),
-        (
-            ExecutionState::AfterTool {
-                result: tool_result.clone(),
-                context: context.clone(),
-            },
-            "AfterTool",
         ),
         (
             ExecutionState::ProcessingToolCalls {
@@ -99,14 +77,6 @@ fn test_execution_state_context_accessors() {
         None,
         Some(FinishReason::Stop),
     ));
-    let tool_call = Arc::new(mock_tool_call("call-1", "tool", "{}"));
-    let tool_result = Arc::new(ToolResult::new(
-        "call-1".to_string(),
-        "ok".to_string(),
-        false,
-        None,
-        None,
-    ));
 
     let stateful_states = vec![
         ExecutionState::BeforeLlmCall {
@@ -118,14 +88,6 @@ fn test_execution_state_context_accessors() {
         },
         ExecutionState::AfterLlm {
             response: response.clone(),
-            context: context.clone(),
-        },
-        ExecutionState::BeforeToolCall {
-            call: tool_call.clone(),
-            context: context.clone(),
-        },
-        ExecutionState::AfterTool {
-            result: tool_result.clone(),
             context: context.clone(),
         },
         ExecutionState::ProcessingToolCalls {

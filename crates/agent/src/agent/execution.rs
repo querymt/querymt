@@ -378,52 +378,6 @@ impl QueryMTAgent {
                     }
                 }
 
-                ExecutionState::BeforeToolCall { .. } => {
-                    let state = driver
-                        .run_before_tool(state)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
-                    match state {
-                        ExecutionState::BeforeToolCall {
-                            ref call,
-                            ref context,
-                        } => {
-                            self.transition_before_tool(
-                                call,
-                                context,
-                                runtime,
-                                runtime_context,
-                                &cancel_rx,
-                                &context.session_id,
-                            )
-                            .await?
-                        }
-                        other => other,
-                    }
-                }
-
-                ExecutionState::AfterTool { .. } => {
-                    let state = driver
-                        .run_after_tool(state)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
-                    match state {
-                        ExecutionState::AfterTool {
-                            ref result,
-                            ref context,
-                        } => {
-                            self.transition_after_tool(
-                                result,
-                                context,
-                                runtime_context,
-                                &context.session_id,
-                            )
-                            .await?
-                        }
-                        other => other,
-                    }
-                }
-
                 ExecutionState::ProcessingToolCalls { .. } => {
                     let state = driver
                         .run_processing_tool_calls(state)

@@ -9,7 +9,10 @@ use crate::acp::stdio::serve_stdio;
 use crate::acp::websocket::serve_websocket;
 use crate::agent::builder::AgentBuilderExt;
 use crate::agent::core::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
-use crate::config::{MiddlewareEntry, SingleAgentConfig};
+use crate::config::{
+    CompactionConfig, MiddlewareEntry, PruningConfig, SingleAgentConfig, SnapshotBackendConfig,
+    ToolOutputConfig,
+};
 use crate::events::AgentEvent;
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
 use crate::runner::{ChatRunner, ChatSession};
@@ -38,6 +41,10 @@ pub struct AgentBuilder {
     pub(super) db_path: Option<PathBuf>,
     middleware_factories: Vec<MiddlewareFactory>,
     middleware_entries: Vec<MiddlewareEntry>,
+    tool_output_config: Option<ToolOutputConfig>,
+    pruning_config: Option<PruningConfig>,
+    compaction_config: Option<CompactionConfig>,
+    snapshot_backend_config: Option<SnapshotBackendConfig>,
 }
 
 impl Default for AgentBuilder {
@@ -56,6 +63,10 @@ impl AgentBuilder {
             db_path: None,
             middleware_factories: Vec::new(),
             middleware_entries: Vec::new(),
+            tool_output_config: None,
+            pruning_config: None,
+            compaction_config: None,
+            snapshot_backend_config: None,
         }
     }
 
@@ -178,6 +189,33 @@ impl AgentBuilder {
             agent = agent
                 .with_tool_policy(ToolPolicy::BuiltInOnly)
                 .with_allowed_tools(self.tools.clone());
+        }
+
+        // Thread through config fields that were previously silently dropped
+        if let Some(config) = self.tool_output_config {
+            agent = agent.with_tool_output_config(config);
+        }
+        if let Some(config) = self.pruning_config {
+            agent = agent.with_pruning_config(config);
+        }
+        if let Some(config) = self.compaction_config {
+            agent = agent.with_compaction_config(config);
+        }
+
+        // Handle snapshot backend from config
+        if let Some(snapshot_config) = self.snapshot_backend_config {
+            match snapshot_config.backend.as_str() {
+                "git" => {
+                    use crate::snapshot::git::GitSnapshotBackend;
+                    agent = agent.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+                }
+                "none" | "" => {
+                    // No backend - leave as default
+                }
+                other => {
+                    log::warn!("Unknown snapshot backend '{}', ignoring", other);
+                }
+            }
         }
 
         // Apply middleware factories - each factory receives the agent and returns a middleware
@@ -445,6 +483,12 @@ impl Agent {
         if !config.middleware.is_empty() {
             builder = builder.middleware_from_config(config.middleware);
         }
+
+        // Thread through config fields that were previously silently dropped
+        builder.tool_output_config = Some(config.agent.tool_output);
+        builder.pruning_config = Some(config.agent.pruning);
+        builder.compaction_config = Some(config.agent.compaction);
+        builder.snapshot_backend_config = Some(config.agent.snapshot);
 
         builder.build().await
     }

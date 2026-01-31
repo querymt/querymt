@@ -161,7 +161,8 @@ pub async fn ensure_session(
     .await;
 
     // Replay stored events for the new session (includes ProviderChanged)
-    if let Ok(audit) = state.view_store.get_audit_view(&session_id).await {
+    // No child sessions for a new session
+    if let Ok(audit) = state.view_store.get_audit_view(&session_id, false).await {
         let _ = super::connection::send_message(
             tx,
             UiServerMessage::SessionEvents {

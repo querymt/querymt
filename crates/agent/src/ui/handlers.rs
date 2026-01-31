@@ -179,8 +179,8 @@ pub async fn handle_load_session(
     session_id: &str,
     tx: &mpsc::Sender<String>,
 ) {
-    // 1. Get full audit view (includes events, tasks, decisions, artifacts, etc.)
-    let audit = match state.view_store.get_audit_view(session_id).await {
+    // 1. Get audit view for this session only (child sessions loaded separately)
+    let audit = match state.view_store.get_audit_view(session_id, false).await {
         Ok(audit) => audit,
         Err(e) => {
             let _ = send_error(tx, format!("Failed to load session: {}", e)).await;
@@ -475,7 +475,9 @@ pub async fn handle_subscribe_session(
     }
 
     // 3. Replay stored events (ViewStore has everything persisted)
-    let (events, resolved_agent_id) = match state.view_store.get_audit_view(session_id).await {
+    // Don't include child sessions - they are subscribed to separately
+    let (events, resolved_agent_id) = match state.view_store.get_audit_view(session_id, false).await
+    {
         Ok(audit) => {
             let resolved_agent_id = {
                 let agents = state.session_agents.lock().await;

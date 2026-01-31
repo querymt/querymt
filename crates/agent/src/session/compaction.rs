@@ -239,10 +239,25 @@ pub fn filter_to_effective_history(messages: Vec<AgentMessage>) -> Vec<AgentMess
             .any(|p| matches!(p, MessagePart::Compaction { .. }))
     });
 
-    match last_compaction_idx {
+    let filtered: Vec<AgentMessage> = match last_compaction_idx {
         Some(idx) => messages.into_iter().skip(idx).collect(),
         None => messages, // No compaction found, return all messages
-    }
+    };
+
+    // Filter out messages that only contain snapshot metadata parts
+    // These are for undo/redo tracking and should not be sent to the LLM
+    // Keeping them creates empty messages that break tool_use -> tool_result sequencing
+    filtered
+        .into_iter()
+        .filter(|m| {
+            m.parts.iter().any(|p| {
+                !matches!(
+                    p,
+                    MessagePart::StepSnapshotStart { .. } | MessagePart::StepSnapshotPatch { .. }
+                )
+            })
+        })
+        .collect()
 }
 
 /// Check if messages contain a compaction summary

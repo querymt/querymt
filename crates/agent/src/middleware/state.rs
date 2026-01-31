@@ -286,18 +286,6 @@ pub enum ExecutionState {
         context: Arc<ConversationContext>,
     },
 
-    /// Before executing a tool call - middleware can block or modify
-    BeforeToolCall {
-        call: Arc<ToolCall>,
-        context: Arc<ConversationContext>,
-    },
-
-    /// After tool execution completed
-    AfterTool {
-        result: Arc<ToolResult>,
-        context: Arc<ConversationContext>,
-    },
-
     /// Processing multiple tool calls from a single LLM response
     ProcessingToolCalls {
         /// Remaining tool calls to process
@@ -334,8 +322,6 @@ impl ExecutionState {
             ExecutionState::BeforeLlmCall { .. } => "BeforeLlmCall",
             ExecutionState::CallLlm { .. } => "CallLlm",
             ExecutionState::AfterLlm { .. } => "AfterLlm",
-            ExecutionState::BeforeToolCall { .. } => "BeforeToolCall",
-            ExecutionState::AfterTool { .. } => "AfterTool",
             ExecutionState::ProcessingToolCalls { .. } => "ProcessingToolCalls",
             ExecutionState::WaitingForEvent { .. } => "WaitingForEvent",
             ExecutionState::Complete => "Complete",
@@ -350,8 +336,6 @@ impl ExecutionState {
             ExecutionState::BeforeLlmCall { context } => Some(context),
             ExecutionState::CallLlm { context, .. } => Some(context),
             ExecutionState::AfterLlm { context, .. } => Some(context),
-            ExecutionState::BeforeToolCall { context, .. } => Some(context),
-            ExecutionState::AfterTool { context, .. } => Some(context),
             ExecutionState::ProcessingToolCalls { context, .. } => Some(context),
             ExecutionState::WaitingForEvent { context, .. } => Some(context),
             _ => None,

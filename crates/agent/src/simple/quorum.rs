@@ -38,6 +38,7 @@ pub struct QuorumBuilder {
     pub(super) delegation_enabled: bool,
     pub(super) verification_enabled: bool,
     pub(super) snapshot_policy: SnapshotPolicy,
+    pub(super) delegation_summary_config: Option<crate::config::DelegationSummaryConfig>,
 }
 
 impl Default for QuorumBuilder {
@@ -56,6 +57,7 @@ impl QuorumBuilder {
             delegation_enabled: true,
             verification_enabled: false,
             snapshot_policy: SnapshotPolicy::None,
+            delegation_summary_config: None,
         }
     }
 
@@ -153,6 +155,10 @@ impl QuorumBuilder {
             let llm_config = build_llm_config(&delegate)?;
             let tools = delegate.tools.clone();
             let middleware_entries = delegate.middleware.clone();
+            let tool_output_config = delegate.tool_output.clone();
+            let pruning_config = delegate.pruning.clone();
+            let compaction_config = delegate.compaction.clone();
+            let snapshot_backend_config = delegate.snapshot.clone();
             let registry = registry.clone();
             let snapshot_policy_for_delegate = self.snapshot_policy;
             let cwd_for_delegate = cwd.clone();
@@ -178,6 +184,28 @@ impl QuorumBuilder {
                 // Apply middleware from config
                 apply_middleware_from_config(&mut agent, &middleware_entries);
 
+                // Thread through config fields
+                agent = agent
+                    .with_tool_output_config(tool_output_config)
+                    .with_pruning_config(pruning_config)
+                    .with_compaction_config(compaction_config);
+
+                // Handle snapshot backend from config (can override the policy-based one above)
+                match snapshot_backend_config.backend.as_str() {
+                    "git" => {
+                        agent = agent.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+                    }
+                    "none" | "" => {
+                        // Explicitly disable snapshot backend or use default
+                    }
+                    other => {
+                        log::warn!(
+                            "Unknown snapshot backend '{}' for delegate, ignoring",
+                            other
+                        );
+                    }
+                }
+
                 Arc::new(agent)
             });
         }
@@ -185,6 +213,10 @@ impl QuorumBuilder {
         let planner_llm = build_llm_config(&planner_config)?;
         let planner_tools = planner_config.tools.clone();
         let planner_middleware = planner_config.middleware.clone();
+        let planner_tool_output = planner_config.tool_output.clone();
+        let planner_pruning = planner_config.pruning.clone();
+        let planner_compaction = planner_config.compaction.clone();
+        let planner_snapshot = planner_config.snapshot.clone();
         let registry_for_planner = registry.clone();
         let snapshot_policy_for_planner = self.snapshot_policy;
         let cwd_for_planner = cwd.clone();
@@ -213,12 +245,60 @@ impl QuorumBuilder {
             // Apply middleware from config
             apply_middleware_from_config(&mut agent, &planner_middleware);
 
+            // Thread through config fields
+            agent = agent
+                .with_tool_output_config(planner_tool_output)
+                .with_pruning_config(planner_pruning)
+                .with_compaction_config(planner_compaction);
+
+            // Handle snapshot backend from config (can override the policy-based one above)
+            match planner_snapshot.backend.as_str() {
+                "git" => {
+                    agent = agent.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+                }
+                "none" | "" => {
+                    // Explicitly disable snapshot backend or use default
+                }
+                other => {
+                    log::warn!("Unknown snapshot backend '{}' for planner, ignoring", other);
+                }
+            }
+
             Arc::new(agent)
         });
 
         builder = builder
             .with_delegation(self.delegation_enabled)
             .with_verification(self.verification_enabled);
+
+        // Build delegation summarizer if configured
+        if let Some(ref summary_config) = self.delegation_summary_config {
+            if summary_config.enabled {
+                match crate::delegation::DelegationSummarizer::from_config(
+                    summary_config,
+                    registry.clone(),
+                )
+                .await
+                {
+                    Ok(summarizer) => {
+                        log::info!(
+                            "Delegation summarizer enabled with provider: {}, model: {}",
+                            summary_config.provider,
+                            summary_config.model
+                        );
+                        builder = builder.with_delegation_summarizer(Some(Arc::new(summarizer)));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to build delegation summarizer: {}. Proceeding without summary.",
+                            e
+                        );
+                    }
+                }
+            } else {
+                log::debug!("Delegation summarizer disabled in config");
+            }
+        }
 
         let quorum = builder.build().map_err(|e| anyhow!(e.to_string()))?;
         let view_store = quorum.view_store();
@@ -358,6 +438,7 @@ impl Quorum {
 
         builder.delegation_enabled = config.quorum.delegation;
         builder.verification_enabled = config.quorum.verification;
+        builder.delegation_summary_config = config.quorum.delegation_summary;
 
         // Parse snapshot policy
         let snapshot_policy = parse_snapshot_policy(config.quorum.snapshot_policy)?;
@@ -406,6 +487,12 @@ impl Quorum {
         // Copy middleware config for planner
         planner_config.middleware = config.planner.middleware;
 
+        // Copy compaction/pruning/tool_output/snapshot configs for planner
+        planner_config.tool_output = config.planner.tool_output;
+        planner_config.pruning = config.planner.pruning;
+        planner_config.compaction = config.planner.compaction;
+        planner_config.snapshot = config.planner.snapshot;
+
         builder.planner_config = Some(planner_config);
 
         // Configure delegates with tool resolution
@@ -450,6 +537,12 @@ impl Quorum {
 
             // Copy middleware config for this delegate
             delegate_config.middleware = delegate.middleware;
+
+            // Copy compaction/pruning/tool_output/snapshot configs for this delegate
+            delegate_config.tool_output = delegate.tool_output;
+            delegate_config.pruning = delegate.pruning;
+            delegate_config.compaction = delegate.compaction;
+            delegate_config.snapshot = delegate.snapshot;
 
             builder.delegates.push(delegate_config);
         }

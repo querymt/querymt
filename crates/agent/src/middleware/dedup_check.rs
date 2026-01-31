@@ -323,21 +323,6 @@ impl DedupCheckMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for DedupCheckMiddleware {
-    async fn on_after_tool(&self, state: ExecutionState) -> Result<ExecutionState> {
-        if !self.enabled {
-            return Ok(state);
-        }
-
-        match state {
-            ExecutionState::AfterTool { ref result, .. } => {
-                let mut pending = self.pending_results.lock().await;
-                pending.push((**result).clone());
-                Ok(state)
-            }
-            _ => Ok(state),
-        }
-    }
-
     #[instrument(
         name = "middleware.dedup_check",
         skip(self, state),

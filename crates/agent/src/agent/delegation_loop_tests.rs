@@ -628,6 +628,7 @@ async fn test_delegation_guard_blocks_duplicate() {
         retry_count: 0,
         created_at: OffsetDateTime::now_utc(),
         completed_at: None,
+        planning_summary: None,
     };
 
     store
@@ -702,6 +703,7 @@ async fn test_delegation_guard_blocks_max_retries() {
         retry_count: 3,
         created_at: OffsetDateTime::now_utc(),
         completed_at: Some(OffsetDateTime::now_utc() - time::Duration::seconds(10)),
+        planning_summary: None,
     };
 
     store

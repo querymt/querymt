@@ -36,7 +36,7 @@ impl QueryMTAgent {
         call: &MiddlewareToolCall,
         _context: &Arc<ConversationContext>,
         runtime: Option<&SessionRuntime>,
-        runtime_context: &mut RuntimeContext,
+        runtime_context: &RuntimeContext,
         session_id: &str,
     ) -> Result<ToolResult, anyhow::Error> {
         debug!(
@@ -257,7 +257,7 @@ impl QueryMTAgent {
     pub(crate) async fn record_tool_side_effects(
         &self,
         result: &ToolResult,
-        runtime_context: &mut RuntimeContext,
+        runtime_context: &RuntimeContext,
         session_id: &str,
     ) -> Option<WaitCondition> {
         if result.is_error {
@@ -352,7 +352,7 @@ impl QueryMTAgent {
         &self,
         results: &Arc<[ToolResult]>,
         context: &Arc<ConversationContext>,
-        runtime_context: &mut RuntimeContext,
+        runtime_context: &RuntimeContext,
         session_id: &str,
     ) -> Result<ExecutionState, anyhow::Error> {
         debug!(

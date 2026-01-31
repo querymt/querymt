@@ -312,6 +312,7 @@ impl RuntimeContext {
             expected_output,
             status: DelegationStatus::Requested,
             verification_spec: None,
+            planning_summary: None,
             retry_count,
             created_at: OffsetDateTime::now_utc(),
             completed_at: None,

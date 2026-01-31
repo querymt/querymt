@@ -1062,15 +1062,21 @@ impl EventStore for SqliteStorage {
 
 #[async_trait]
 impl ViewStore for SqliteStorage {
-    async fn get_audit_view(&self, session_id: &str) -> SessionResult<AuditView> {
+    async fn get_audit_view(
+        &self,
+        session_id: &str,
+        include_children: bool,
+    ) -> SessionResult<AuditView> {
         let mut events = self.get_session_events(session_id).await?;
 
-        // Include child session events (delegations)
-        let session_repo = SqliteSessionRepository::new(self.conn.clone());
-        let child_session_ids = session_repo.list_child_sessions(session_id).await?;
-        for child_id in &child_session_ids {
-            let child_events = self.get_session_events(child_id).await?;
-            events.extend(child_events);
+        // Include child session events (delegations) if requested
+        if include_children {
+            let session_repo = SqliteSessionRepository::new(self.conn.clone());
+            let child_session_ids = session_repo.list_child_sessions(session_id).await?;
+            for child_id in &child_session_ids {
+                let child_events = self.get_session_events(child_id).await?;
+                events.extend(child_events);
+            }
         }
 
         // Sort by sequence number for correct chronological order
@@ -1399,7 +1405,8 @@ impl ViewStore for SqliteStorage {
         use crate::export::ATIFBuilder;
 
         // Get the full audit view which contains all events and domain data
-        let audit_view = self.get_audit_view(session_id).await?;
+        // Include child sessions for complete trajectory export
+        let audit_view = self.get_audit_view(session_id, true).await?;
 
         // Build the ATIF trajectory from the audit view
         // Tool definitions will be extracted from ToolsAvailable events

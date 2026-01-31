@@ -105,6 +105,7 @@ pub struct AgentQuorumBuilder {
     planner_factory: Option<PlannerFactory>,
     delegation_enabled: bool,
     verification_enabled: bool,
+    delegation_summarizer: Option<Arc<crate::delegation::DelegationSummarizer>>,
 }
 
 impl AgentQuorumBuilder {
@@ -118,6 +119,7 @@ impl AgentQuorumBuilder {
             planner_factory: None,
             delegation_enabled: true,
             verification_enabled: false,
+            delegation_summarizer: None,
         }
     }
 
@@ -136,6 +138,7 @@ impl AgentQuorumBuilder {
             planner_factory: None,
             delegation_enabled: true,
             verification_enabled: false,
+            delegation_summarizer: None,
         }
     }
 
@@ -181,6 +184,14 @@ impl AgentQuorumBuilder {
         self
     }
 
+    pub fn with_delegation_summarizer(
+        mut self,
+        summarizer: Option<Arc<crate::delegation::DelegationSummarizer>>,
+    ) -> Self {
+        self.delegation_summarizer = summarizer;
+        self
+    }
+
     pub fn build(self) -> Result<AgentQuorum, AgentQuorumError> {
         // Capability validation
         let mut all_required_caps = std::collections::HashSet::new();
@@ -220,7 +231,8 @@ impl AgentQuorumBuilder {
                     registry.clone(),
                     self.cwd.clone(),
                 )
-                .with_verification(self.verification_enabled),
+                .with_verification(self.verification_enabled)
+                .with_summarizer(self.delegation_summarizer.clone()),
             );
             planner.add_observer(orchestrator.clone());
             Some(orchestrator)

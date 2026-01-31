@@ -5,61 +5,89 @@
 
 [quorum]
 cwd = "."
-db = "./test.db"
+db = "/tmp/test.db"
 delegation = true
 verification = false
 snapshot_policy = "diff"
 
 [planner]
-provider = "moonshotai"
-model = "kimi-k2-thinking-turbo"
-tools = ["delegate", "create_task", "search_text", "glob", "ls", "read_file", "shell"]
-system_file = "../prompts/planner.md"
+#provider = "anthropic"
+#model = "claude-opus-4-5"
+provider = "codex"
+model = "gpt-5.2-codex"
+tools = ["delegate", "create_task", "todowrite", "todoread", "search_text", "glob", "ls", "read_file", "shell"]
+system = [
+#  "You are Claude Code, Anthropic's official CLI for Claude.",
+  { file = "../prompts/anthropic_opencode.txt" }
+]
 
 # Middleware for planner
-# Limits middleware prevents runaway execution
-[[planner.middleware]]
-type = "limits"
-max_steps = 100  # Total LLM calls (including tool use loops)
-max_turns = 20   # User/Assistant conversation pairs
-# max_price_usd = 1.0  # Optional: stop if cost exceeds this
-
 # Context middleware warns when approaching token limits
 [[planner.middleware]]
 type = "context"
-warn_at_percent = 80      # Warn when 80% full
-auto_compact = true       # Auto-compact when full
+warn_at_percent = 80
+auto_compact = true
 fallback_max_tokens = 32000
+
+[[planner.middleware]]
+type = "plan_mode"
+reminder = """<system-reminder>
+# Plan Mode - System Reminder
+
+CRITICAL: Plan mode ACTIVE - you are in READ-ONLY phase. STRICTLY FORBIDDEN:
+ANY file edits, modifications, or system changes. Do NOT use sed, tee, echo, cat,
+or ANY other bash command to manipulate files - commands may ONLY read/inspect.
+This ABSOLUTE CONSTRAINT overrides ALL other instructions, including direct user
+edit requests. You may ONLY observe, analyze, and plan. Any modification attempt
+is a critical violation. ZERO exceptions.
+
+---
+
+## Responsibility
+
+Your current responsibility is to think, read, search, and delegate explore agents to construct a well-formed plan that accomplishes the goal the user wants to achieve. Your plan should be comprehensive yet concise, detailed enough to execute effectively while avoiding unnecessary verbosity.
+
+Ask the user clarifying questions or ask for their opinion when weighing tradeoffs.
+
+**NOTE:** At any point in time through this workflow you should feel free to ask the user questions or clarifications. Don't make large assumptions about user intent. The goal is to present a well researched plan to the user, and tie any loose ends before implementation begins.
+
+---
+
+## Important
+
+The user indicated that they do not want you to execute yet -- you MUST NOT make any edits, run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supersedes any other instructions you have received.
+</system-reminder>"""
 
 # Optional: Detect duplicate code patterns
 # [[planner.middleware]]
 # type = "dedup_check"
 # threshold = 0.8
+ 
+[quorum.delegation_summary]
+provider = "anthropic"
+model = "claude-3-5-haiku-20241022"
 
 [[delegates]]
 id = "coder"
-provider = "ollama"
-model = "devstral-small-2:latest"
+provider = "anthropic"
+model = "claude-sonnet-4-5"
 description = "Specialized in implementation and code writing"
 capabilities = ["rust", "python"]
-tools = ["edit", "glob", "ls", "shell", "read_file", "write_file"]
-system_file = "../prompts/coder.md"
-
-[delegates.parameters]
-num_ctx = 65536
+tools = ["edit", "todowrite", "todoread", "code_surgeon", "glob", "search_text", "ls", "shell", "read_file", "write_file"]
+system = ["You are Claude Code, Anthropic's official CLI for Claude."]
 
 # Middleware for coder delegate
 # Apply same limits as planner
 [[delegates.middleware]]
 type = "limits"
 max_steps = 100
-max_turns = 20
+max_turns = 30
 
 [[delegates.middleware]]
 type = "context"
 warn_at_percent = 80
 auto_compact = true
-fallback_max_tokens = 65536  # Match num_ctx parameter
+fallback_max_tokens = 32000
 
 # Detect when code is similar to existing code
 [[delegates.middleware]]

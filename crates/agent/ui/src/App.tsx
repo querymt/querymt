@@ -4,6 +4,7 @@ import { Activity, Send, CheckCircle, XCircle, Loader, Menu, Plus, Code, Chevron
 import { useUiClient } from './hooks/useUiClient';
 import { useSessionTimer } from './hooks/useSessionTimer';
 import { useFileMention } from './hooks/useFileMention';
+import { useTodoState } from './hooks/useTodoState';
 import { EventItem, EventRow, DelegationGroupInfo, Turn } from './types';
 import { Sidebar } from './components/Sidebar';
 import { ThinkingIndicator } from './components/ThinkingIndicator';
@@ -13,6 +14,7 @@ import { ToolDetailModal } from './components/ToolDetailModal';
 import { TurnCard } from './components/TurnCard';
 import { DelegationsView } from './components/DelegationsView';
 import { DelegationDrawer } from './components/DelegationDrawer';
+import { TodoRail } from './components/TodoRail';
 
 import { GlitchText } from './components/GlitchText';
 import { SessionPicker } from './components/SessionPicker';
@@ -64,6 +66,12 @@ function App() {
     thinkingAgentIds,
     isConversationComplete
   );
+  
+  // Todo rail collapsed state (todo state hook moved below activeDelegation for delegation-aware event selection)
+  const [todoRailCollapsed, setTodoRailCollapsed] = useState(
+    () => localStorage.getItem('todoRailCollapsed') === 'true'
+  );
+  
   const [prompt, setPrompt] = useState('');
   const [loading, setLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -151,6 +159,11 @@ function App() {
     window.addEventListener('keydown', handleKeyDown, { capture: true });
     return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
   }, [thinkingAgentId, cancelSession]);
+
+  // Persist todo rail collapsed state to localStorage
+  useEffect(() => {
+    localStorage.setItem('todoRailCollapsed', todoRailCollapsed.toString());
+  }, [todoRailCollapsed]);
 
   const handleSendPrompt = async () => {
     if (!prompt.trim() || loading || !sessionId) return;
@@ -342,6 +355,40 @@ function App() {
     [activeDelegation]
   );
 
+  // Delegation-aware todo event selection
+  const todoEvents = useMemo(() => {
+    if (activeTimelineView === 'delegations' && activeDelegation?.events) {
+      return activeDelegation.events;
+    }
+    return events; // Default to main session events
+  }, [activeTimelineView, activeDelegation, events]);
+
+  // Todo state hook with delegation-aware events
+  const { todos, hasTodos, stats: todoStats, recentlyChangedIds } = useTodoState(todoEvents);
+
+  // Compute showTodoRail with delegation-aware logic
+  const showTodoRail = useMemo(() => {
+    if (activeTimelineView === 'delegations') {
+      // In delegations view, only show if a delegation is selected and has todos
+      return !!activeDelegation && hasTodos;
+    }
+    // In chat view, show if main session has todos
+    return hasTodos;
+  }, [activeTimelineView, activeDelegation, hasTodos]);
+
+  // Keyboard shortcut: Cmd+Shift+T / Ctrl+Shift+T to toggle todo rail
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'T' && showTodoRail) {
+        e.preventDefault();
+        setTodoRailCollapsed(prev => !prev);
+      }
+    };
+    
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showTodoRail]);
+
   useEffect(() => {
     if (activeDelegationId && !activeDelegation) {
       setActiveDelegationId(null);
@@ -353,24 +400,6 @@ function App() {
       setActiveTimelineView('chat');
     }
   }, [activeTimelineView, delegations.length]);
-
-  // Handle view switch - only select first if no valid selection exists
-  useEffect(() => {
-    if (activeTimelineView === 'delegations') {
-      // Auto-close drawer when switching to delegations tab
-      setActiveDelegationId(null);
-      
-      // Only auto-select first if:
-      // 1. We have delegations AND
-      // 2. No current selection OR current selection is invalid
-      if (delegations.length > 0) {
-        const currentSelectionExists = delegations.some(d => d.id === activeDelegationId);
-        if (!activeDelegationId || !currentSelectionExists) {
-          setActiveDelegationId(delegations[0].id);
-        }
-      }
-    }
-  }, [activeTimelineView]); // Only depends on view switch
 
   // Fallback to first when selected delegation disappears (due to updates/changes)
   useEffect(() => {
@@ -476,13 +505,17 @@ function App() {
         </div>
       </header>
 
-      {/* Event Timeline */}
-      <div className="flex-1 overflow-hidden flex flex-col relative">
+      {/* Event Timeline with Todo Rail */}
+      <div className="flex-1 overflow-hidden flex flex-row relative">
+        <div className="flex-1 overflow-hidden flex flex-col min-w-0 relative">
         {sessionId && (hasTurns || hasDelegations) && (
           <div className="px-6 py-2 border-b border-cyber-border/60 bg-cyber-surface/40 flex items-center gap-2">
             <button
               type="button"
-              onClick={() => setActiveTimelineView('chat')}
+              onClick={() => {
+                setActiveTimelineView('chat');
+                setActiveDelegationId(null);
+              }}
               className={`text-xs uppercase tracking-wider px-3 py-1.5 rounded-full border transition-colors ${
                 activeTimelineView === 'chat'
                   ? 'border-cyber-cyan text-cyber-cyan bg-cyber-cyan/10'
@@ -493,7 +526,17 @@ function App() {
             </button>
             <button
               type="button"
-              onClick={() => setActiveTimelineView('delegations')}
+              onClick={() => {
+                setActiveTimelineView('delegations');
+                if (delegations.length > 0) {
+                  const currentValid = delegations.some(d => d.id === activeDelegationId);
+                  if (!activeDelegationId || !currentValid) {
+                    setActiveDelegationId(delegations[0].id);
+                  }
+                } else {
+                  setActiveDelegationId(null);
+                }
+              }}
               className={`text-xs uppercase tracking-wider px-3 py-1.5 rounded-full border transition-colors ${
                 activeTimelineView === 'delegations'
                   ? 'border-cyber-purple text-cyber-purple bg-cyber-purple/10'
@@ -611,7 +654,6 @@ function App() {
                   />
                 );
               }}
-              followOutput="smooth"
               atBottomStateChange={setIsAtBottom}
               className="h-full"
             />
@@ -647,6 +689,20 @@ function App() {
             isSessionActive={isSessionActive}
             agentModels={agentModels}
             sessionLimits={sessionLimits}
+            todoStats={hasTodos ? todoStats : null}
+            hasTodos={hasTodos}
+          />
+        )}
+        </div>
+
+        {/* Todo Rail */}
+        {showTodoRail && (
+          <TodoRail
+            todos={todos}
+            stats={todoStats}
+            collapsed={todoRailCollapsed}
+            onToggleCollapse={() => setTodoRailCollapsed(prev => !prev)}
+            recentlyChangedIds={recentlyChangedIds}
           />
         )}
       </div>
