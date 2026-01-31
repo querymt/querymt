@@ -9,9 +9,11 @@ interface SessionPickerProps {
   onSelectSession: (sessionId: string) => void;
   onNewSession: () => void;
   disabled?: boolean;
+  activeSessionId?: string | null;
+  thinkingBySession?: Map<string, Set<string>>;
 }
 
-export function SessionPicker({ groups, onSelectSession, onNewSession, disabled }: SessionPickerProps) {
+export function SessionPicker({ groups, onSelectSession, onNewSession, disabled, activeSessionId, thinkingBySession }: SessionPickerProps) {
   const [filterText, setFilterText] = useState('');
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set(groups.map((_, i) => `group-${i}`)));
   
@@ -106,6 +108,8 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled 
     const isChild = !!session.parent_session_id;
     const isDelegation = session.fork_origin === 'delegation';
     const indentClass = depth > 0 ? `ml-${depth * 6}` : '';
+    const isActive = activeSessionId === session.session_id;
+    const isThinking = thinkingBySession?.get(session.session_id)?.size ?? 0 > 0;
     
     return (
       <div key={session.session_id}>
@@ -114,7 +118,9 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled 
           disabled={disabled}
           className={`w-full text-left px-4 py-3 bg-cyber-surface/40 hover:bg-cyber-surface border ${
             isChild ? 'border-l-2 border-l-cyber-cyan/60' : ''
-          } border-cyber-border/50 hover:border-cyber-cyan/40 rounded-lg transition-all duration-200 group session-card disabled:opacity-50 disabled:cursor-not-allowed overflow-visible ${indentClass}`}
+          } border-cyber-border/50 hover:border-cyber-cyan/40 rounded-lg transition-all duration-200 group session-card disabled:opacity-50 disabled:cursor-not-allowed overflow-visible ${indentClass} ${
+            isActive ? 'ring-2 ring-cyber-cyan/50 bg-cyber-surface/60' : ''
+          }`}
           style={{
             animation: `session-card-entrance 0.3s ease-out ${sessionIndex * 0.05}s both`,
             marginLeft: depth > 0 ? `${depth * 1.5}rem` : '0',
@@ -128,6 +134,22 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled 
             <span className={isChild ? 'text-sm' : ''}>
               {session.title || session.name || 'Untitled session'}
             </span>
+            {isActive && (
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-cyber-cyan animate-pulse" />
+                <span className="text-[10px] px-1.5 py-0.5 bg-cyber-cyan/20 text-cyber-cyan rounded border border-cyber-cyan/30">
+                  active
+                </span>
+              </span>
+            )}
+            {isThinking && (
+              <span className="flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-cyber-purple animate-pulse" />
+                <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded border border-purple-500/30">
+                  thinking
+                </span>
+              </span>
+            )}
             {isDelegation && (
               <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded border border-purple-500/30">
                 delegated

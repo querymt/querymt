@@ -22,6 +22,9 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+// Type alias to simplify complex type signature
+type ActiveDelegations = Arc<Mutex<HashMap<String, (String, CancellationToken, JoinHandle<()>)>>>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub id: String,
@@ -89,8 +92,7 @@ pub struct DelegationOrchestrator {
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     config: DelegationOrchestratorConfig,
     /// Maps delegation_id -> (parent_session_id, cancellation_token, join_handle)
-    active_delegations:
-        Arc<Mutex<HashMap<String, (String, CancellationToken, JoinHandle<()>)>>>,
+    active_delegations: ActiveDelegations,
 }
 
 impl DelegationOrchestrator {
@@ -141,17 +143,14 @@ impl EventObserver for DelegationOrchestrator {
                 let cancel_token_clone = cancel_token.clone();
 
                 let handle = tokio::spawn(async move {
-                    handle_delegation(
+                    let ctx = DelegationContext {
                         delegator,
                         store,
                         agent_registry,
                         config,
-                        parent_session_id,
-                        delegation,
-                        cancel_token,
-                        active_delegations_for_spawn,
-                    )
-                    .await;
+                        active_delegations: active_delegations_for_spawn,
+                    };
+                    handle_delegation(ctx, parent_session_id, delegation, cancel_token).await;
                 });
 
                 let mut active = active_delegations.lock().await;
@@ -185,32 +184,37 @@ impl EventObserver for DelegationOrchestrator {
     }
 }
 
-async fn handle_delegation(
+/// Context structure to group delegation handler parameters
+struct DelegationContext {
     delegator: Arc<QueryMTAgent>,
     store: Arc<dyn SessionStore>,
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     config: DelegationOrchestratorConfig,
+    active_delegations: ActiveDelegations,
+}
+
+async fn handle_delegation(
+    ctx: DelegationContext,
     parent_session_id: String,
     delegation: Delegation,
     cancel_token: CancellationToken,
-    active_delegations: Arc<Mutex<HashMap<String, (String, CancellationToken, JoinHandle<()>)>>>,
 ) {
     let delegation_id = delegation.public_id.clone();
     // Validate target's capability requirements
-    if let Some(target_info) = agent_registry.get_agent(&delegation.target_agent_id)
+    if let Some(target_info) = ctx.agent_registry.get_agent(&delegation.target_agent_id)
         && target_info
             .required_capabilities
             .contains(&crate::tools::CapabilityRequirement::Filesystem)
-        && config.cwd.is_none()
+        && ctx.config.cwd.is_none()
     {
         let error_message = format!(
             "Cannot delegate to '{}': agent requires filesystem access but no working directory is set",
             delegation.target_agent_id
         );
         fail_delegation(
-            &delegator,
-            &store,
-            &config,
+            &ctx.delegator,
+            &ctx.store,
+            &ctx.config,
             &parent_session_id,
             &delegation.public_id,
             &error_message,
@@ -219,14 +223,16 @@ async fn handle_delegation(
         return;
     }
 
-    let Some(delegate_agent) = agent_registry.get_agent_instance(&delegation.target_agent_id)
+    let Some(delegate_agent) = ctx
+        .agent_registry
+        .get_agent_instance(&delegation.target_agent_id)
     else {
         let error_message = format!("Unknown agent ID: {}", delegation.target_agent_id);
         warn!("{}", error_message);
         fail_delegation(
-            &delegator,
-            &store,
-            &config,
+            &ctx.delegator,
+            &ctx.store,
+            &ctx.config,
             &parent_session_id,
             &delegation.public_id,
             &error_message,
@@ -235,7 +241,8 @@ async fn handle_delegation(
         return;
     };
 
-    if let Err(e) = store
+    if let Err(e) = ctx
+        .store
         .update_delegation_status(&delegation.public_id, DelegationStatus::Running)
         .await
     {
@@ -250,9 +257,9 @@ async fn handle_delegation(
         Err(e) => {
             let error_message = format!("Failed to initialize agent: {}", e);
             fail_delegation(
-                &delegator,
-                &store,
-                &config,
+                &ctx.delegator,
+                &ctx.store,
+                &ctx.config,
                 &parent_session_id,
                 &delegation.public_id,
                 &error_message,
@@ -266,9 +273,9 @@ async fn handle_delegation(
         let error_message =
             "Delegated agent requires authentication, which is not yet supported".to_string();
         fail_delegation(
-            &delegator,
-            &store,
-            &config,
+            &ctx.delegator,
+            &ctx.store,
+            &ctx.config,
             &parent_session_id,
             &delegation.public_id,
             &error_message,
@@ -277,7 +284,7 @@ async fn handle_delegation(
         return;
     }
 
-    let delegate_session = match &config.cwd {
+    let delegate_session = match &ctx.config.cwd {
         Some(cwd) => {
             let mut req = NewSessionRequest::new(cwd.clone());
             // Pass parent_session_id via meta so it gets set in the session record
@@ -290,9 +297,9 @@ async fn handle_delegation(
                 Err(e) => {
                     let error_message = format!("Failed to create session: {}", e);
                     fail_delegation(
-                        &delegator,
-                        &store,
-                        &config,
+                        &ctx.delegator,
+                        &ctx.store,
+                        &ctx.config,
                         &parent_session_id,
                         &delegation.public_id,
                         &error_message,
@@ -314,9 +321,9 @@ async fn handle_delegation(
                 Err(e) => {
                     let error_message = format!("Failed to create session: {}", e);
                     fail_delegation(
-                        &delegator,
-                        &store,
-                        &config,
+                        &ctx.delegator,
+                        &ctx.store,
+                        &ctx.config,
                         &parent_session_id,
                         &delegation.public_id,
                         &error_message,
@@ -328,7 +335,7 @@ async fn handle_delegation(
         }
     };
 
-    delegator.emit_event(
+    ctx.delegator.emit_event(
         &parent_session_id,
         AgentEventKind::SessionForked {
             parent_session_id: parent_session_id.clone(),
@@ -357,14 +364,14 @@ async fn handle_delegation(
             let cancel_notif = CancelNotification::new(child_session_id.clone());
             let _ = delegate_agent.cancel(cancel_notif).await;
 
-            if let Err(e) = store
+            if let Err(e) = ctx.store
                 .update_delegation_status(&delegation_id, DelegationStatus::Cancelled)
                 .await
             {
                 warn!("Failed to update delegation status to Cancelled: {}", e);
             }
 
-            delegator.emit_event(
+            ctx.delegator.emit_event(
                 &parent_session_id,
                 AgentEventKind::DelegationCancelled {
                     delegation_id: delegation_id.clone(),
@@ -372,7 +379,7 @@ async fn handle_delegation(
             );
 
             // Clean up from active_delegations map
-            let mut active = active_delegations.lock().await;
+            let mut active = ctx.active_delegations.lock().await;
             active.remove(&delegation_id);
 
             return;
@@ -381,18 +388,18 @@ async fn handle_delegation(
 
     match prompt_result {
         Some(Ok(_)) => {
-            let verification_passed = if config.run_verification {
+            let verification_passed = if ctx.config.run_verification {
                 // Use new verification framework if verification_spec is available or legacy expected_output exists
                 match VerificationSpecBuilder::from_delegation(&delegation) {
                     Some(verification_spec) => {
                         // Create verification service using the delegator's tool registry
-                        let agent_tool_registry = delegator.tool_registry();
+                        let agent_tool_registry = ctx.delegator.tool_registry();
                         let service = VerificationService::new(agent_tool_registry.clone());
                         let verification_context = VerificationContext {
                             session_id: parent_session_id.clone(),
                             task_id: delegation.task_id.map(|id| id.to_string()),
                             delegation_id: Some(delegation.public_id.clone()),
-                            cwd: config.cwd.clone(),
+                            cwd: ctx.config.cwd.clone(),
                             tool_registry: agent_tool_registry.clone(),
                         };
 
@@ -421,9 +428,9 @@ async fn handle_delegation(
                     "Verification failed: The changes did not pass the specified verification checks."
                         .to_string();
                 fail_delegation(
-                    &delegator,
-                    &store,
-                    &config,
+                    &ctx.delegator,
+                    &ctx.store,
+                    &ctx.config,
                     &parent_session_id,
                     &delegation.public_id,
                     &error_message,
@@ -433,7 +440,7 @@ async fn handle_delegation(
             }
 
             let summary =
-                match extract_session_summary(&store, &delegate_session.session_id.to_string())
+                match extract_session_summary(&ctx.store, &delegate_session.session_id.to_string())
                     .await
                 {
                     Ok(summary) => summary,
@@ -443,14 +450,15 @@ async fn handle_delegation(
                     }
                 };
 
-            if let Err(e) = store
+            if let Err(e) = ctx
+                .store
                 .update_delegation_status(&delegation.public_id, DelegationStatus::Complete)
                 .await
             {
                 warn!("Failed to persist delegation completion: {}", e);
             }
 
-            delegator.emit_event(
+            ctx.delegator.emit_event(
                 &parent_session_id,
                 AgentEventKind::DelegationCompleted {
                     delegation_id: delegation.public_id.clone(),
@@ -458,9 +466,9 @@ async fn handle_delegation(
                 },
             );
 
-            if config.inject_results {
+            if ctx.config.inject_results {
                 inject_results(
-                    &delegator,
+                    &ctx.delegator,
                     &parent_session_id,
                     &delegation.public_id,
                     &summary,
@@ -469,15 +477,15 @@ async fn handle_delegation(
             }
 
             // Clean up from active_delegations map
-            let mut active = active_delegations.lock().await;
+            let mut active = ctx.active_delegations.lock().await;
             active.remove(&delegation_id);
         }
         Some(Err(e)) => {
             let error_message = format!("Delegation failed: {}", e);
             fail_delegation(
-                &delegator,
-                &store,
-                &config,
+                &ctx.delegator,
+                &ctx.store,
+                &ctx.config,
                 &parent_session_id,
                 &delegation_id,
                 &error_message,
@@ -485,7 +493,7 @@ async fn handle_delegation(
             .await;
 
             // Clean up from active_delegations map
-            let mut active = active_delegations.lock().await;
+            let mut active = ctx.active_delegations.lock().await;
             active.remove(&delegation_id);
         }
         None => {

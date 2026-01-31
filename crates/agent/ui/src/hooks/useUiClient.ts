@@ -36,6 +36,8 @@ export function useUiClient() {
   const [sessionAudit, setSessionAudit] = useState<AuditView | null>(null);
   const [thinkingAgentIds, setThinkingAgentIds] = useState<Set<string>>(new Set());
   const [isConversationComplete, setIsConversationComplete] = useState(false);
+  // Track thinking state per session: Map<sessionId, Set<agentId>>
+  const [thinkingBySession, setThinkingBySession] = useState<Map<string, Set<string>>>(new Map());
   const [workspaceIndexStatus, setWorkspaceIndexStatus] = useState<
     Record<string, { status: 'building' | 'ready' | 'error'; message?: string | null }>
   >({});
@@ -112,6 +114,8 @@ export function useUiClient() {
           setEventsBySession(new Map()); // Clear all event buckets for fresh session
           setSessionAudit(null); // Clear audit data
           setSessionLimits(null); // Clear session limits, will be set by session_configured event
+          setIsConversationComplete(false); // Reset conversation complete state
+          setThinkingBySession(new Map()); // Clear all session thinking state
         }
         break;
       case 'session_events': {
@@ -148,25 +152,60 @@ export function useUiClient() {
       case 'event': {
         const eventKind = msg.event?.kind?.type ?? msg.event?.kind?.type_name;
         
-        // Track LLM thinking state and conversation completion (applies to all agents)
+        // Track LLM thinking state per session
         if (eventKind === 'llm_request_start') {
+          setThinkingBySession(prev => {
+            const next = new Map(prev);
+            const sessionAgents = new Set(next.get(msg.session_id) ?? []);
+            sessionAgents.add(msg.agent_id);
+            next.set(msg.session_id, sessionAgents);
+            return next;
+          });
+          // Also update global thinking state for backward compatibility
           setThinkingAgentIds(prev => new Set(prev).add(msg.agent_id));
-          setIsConversationComplete(false);
+          // Clear conversation complete flag for the main session
+          if (msg.session_id === mainSessionId) {
+            setIsConversationComplete(false);
+          }
         } else if (eventKind === 'llm_request_end') {
           const finishReason = msg.event?.kind?.finish_reason;
           if (finishReason === 'stop' || finishReason === 'Stop') {
+            setThinkingBySession(prev => {
+              const next = new Map(prev);
+              const sessionAgents = new Set(next.get(msg.session_id) ?? []);
+              sessionAgents.delete(msg.agent_id);
+              if (sessionAgents.size === 0) {
+                next.delete(msg.session_id);
+                // Set conversation complete flag only for main session
+                if (msg.session_id === mainSessionId) {
+                  setIsConversationComplete(true);
+                  setTimeout(() => setIsConversationComplete(false), 2000);
+                }
+              } else {
+                next.set(msg.session_id, sessionAgents);
+              }
+              return next;
+            });
+            // Also update global thinking state
             setThinkingAgentIds(prev => {
               const next = new Set(prev);
               next.delete(msg.agent_id);
-              if (next.size === 0) {
-                setIsConversationComplete(true);
-                setTimeout(() => setIsConversationComplete(false), 2000);
-              }
               return next;
             });
           } else if (finishReason === 'tool_calls' || finishReason === 'ToolCalls') {
             // Tool calls requested, still thinking
           } else {
+            setThinkingBySession(prev => {
+              const next = new Map(prev);
+              const sessionAgents = new Set(next.get(msg.session_id) ?? []);
+              sessionAgents.delete(msg.agent_id);
+              if (sessionAgents.size === 0) {
+                next.delete(msg.session_id);
+              } else {
+                next.set(msg.session_id, sessionAgents);
+              }
+              return next;
+            });
             setThinkingAgentIds(prev => {
               const next = new Set(prev);
               next.delete(msg.agent_id);
@@ -174,20 +213,55 @@ export function useUiClient() {
             });
           }
         } else if (eventKind === 'prompt_received') {
-          setIsConversationComplete(false);
+          if (msg.session_id === mainSessionId) {
+            setIsConversationComplete(false);
+          }
         } else if (eventKind === 'assistant_message_stored') {
+          setThinkingBySession(prev => {
+            const next = new Map(prev);
+            const sessionAgents = new Set(next.get(msg.session_id) ?? []);
+            sessionAgents.delete(msg.agent_id);
+            if (sessionAgents.size === 0) {
+              next.delete(msg.session_id);
+            } else {
+              next.set(msg.session_id, sessionAgents);
+            }
+            return next;
+          });
           setThinkingAgentIds(prev => {
             const next = new Set(prev);
             next.delete(msg.agent_id);
             return next;
           });
         } else if (eventKind === 'error') {
+          setThinkingBySession(prev => {
+            const next = new Map(prev);
+            const sessionAgents = new Set(next.get(msg.session_id) ?? []);
+            sessionAgents.delete(msg.agent_id);
+            if (sessionAgents.size === 0) {
+              next.delete(msg.session_id);
+            } else {
+              next.set(msg.session_id, sessionAgents);
+            }
+            return next;
+          });
           setThinkingAgentIds(prev => {
             const next = new Set(prev);
             next.delete(msg.agent_id);
             return next;
           });
         } else if (eventKind === 'cancelled') {
+          setThinkingBySession(prev => {
+            const next = new Map(prev);
+            const sessionAgents = new Set(next.get(msg.session_id) ?? []);
+            sessionAgents.delete(msg.agent_id);
+            if (sessionAgents.size === 0) {
+              next.delete(msg.session_id);
+            } else {
+              next.set(msg.session_id, sessionAgents);
+            }
+            return next;
+          });
           setThinkingAgentIds(prev => {
             const next = new Set(prev);
             next.delete(msg.agent_id);
@@ -513,6 +587,7 @@ export function useUiClient() {
     sessionAudit,
     thinkingAgentId,
     thinkingAgentIds,
+    thinkingBySession,
     isConversationComplete,
     setFileIndexCallback,
     setFileIndexErrorCallback,

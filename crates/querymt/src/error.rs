@@ -36,6 +36,14 @@ pub enum LLMError {
         raw_response: String,
     },
 
+    /// Rate limit error with optional retry-after information
+    #[error("Rate limited: {message}")]
+    RateLimited {
+        message: String,
+        /// Seconds to wait before retrying (from retry-after header)
+        retry_after_secs: Option<u64>,
+    },
+
     #[error("HTTP Error: {0}")]
     HttpError(String),
 

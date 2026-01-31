@@ -173,7 +173,16 @@ impl QueryMTAgent {
             Ok(CycleOutcome::Completed) => Ok(PromptResponse::new(StopReason::EndTurn)),
             Ok(CycleOutcome::Cancelled) => Ok(PromptResponse::new(StopReason::Cancelled)),
             Ok(CycleOutcome::Stopped(stop_reason)) => Ok(PromptResponse::new(stop_reason)),
-            Err(e) => Err(Error::new(-32000, e.to_string())),
+            Err(e) => {
+                // Emit error event so UI can display the error and reset thinking state
+                self.emit_event(
+                    &session_id,
+                    AgentEventKind::Error {
+                        message: e.to_string(),
+                    },
+                );
+                Err(Error::new(-32000, e.to_string()))
+            }
         }
     }
 

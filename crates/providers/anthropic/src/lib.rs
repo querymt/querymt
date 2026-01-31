@@ -621,18 +621,26 @@ impl HTTPChatProvider for Anthropic {
             .map(|m| {
                 // Build content blocks first
                 let mut content = match &m.message_type {
-                    MessageType::Text => vec![MessageContent {
-                        message_type: Some("text"),
-                        text: Some(&m.content),
-                        image_url: None,
-                        source: None,
-                        tool_use_id: None,
-                        tool_input: None,
-                        tool_name: None,
-                        tool_result_id: None,
-                        tool_output: None,
-                        cache_control: None,
-                    }],
+                    MessageType::Text => {
+                        // Only add text content block if content is non-empty
+                        // to avoid Anthropic API error: "text content blocks must be non-empty"
+                        if !m.content.is_empty() {
+                            vec![MessageContent {
+                                message_type: Some("text"),
+                                text: Some(&m.content),
+                                image_url: None,
+                                source: None,
+                                tool_use_id: None,
+                                tool_input: None,
+                                tool_name: None,
+                                tool_result_id: None,
+                                tool_output: None,
+                                cache_control: None,
+                            }]
+                        } else {
+                            vec![]
+                        }
+                    }
                     MessageType::Pdf(raw_bytes) => {
                         vec![MessageContent {
                             message_type: Some("document"),

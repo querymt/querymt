@@ -39,6 +39,7 @@ function App() {
     loadSession,
     thinkingAgentId,
     thinkingAgentIds,
+    thinkingBySession,
     isConversationComplete,
     setFileIndexCallback,
     setFileIndexErrorCallback,
@@ -566,6 +567,8 @@ function App() {
                     onSelectSession={loadSession}
                     onNewSession={handleNewSession}
                     disabled={!connected || loading}
+                    activeSessionId={sessionId}
+                    thinkingBySession={thinkingBySession}
                   />
                 )
               ) : (

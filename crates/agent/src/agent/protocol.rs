@@ -573,6 +573,21 @@ impl SendAgent for QueryMTAgent {
         // The session-specific LLM config is stored in the database and will be used
         // when creating a SessionContext for this session.
 
+        // Emit ProviderChanged event so the UI can update its model dropdown
+        let context_limit =
+            crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
+                .and_then(|m| m.context_limit());
+
+        self.emit_event(
+            &session_id,
+            crate::events::AgentEventKind::ProviderChanged {
+                provider: llm_config.provider.clone(),
+                model: llm_config.model.clone(),
+                config_id: llm_config.id,
+                context_limit,
+            },
+        );
+
         Ok(SetSessionModelResponse::new())
     }
 
