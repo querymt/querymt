@@ -18,8 +18,11 @@ async fn create_test_provider() -> (TempDir, Arc<SessionProvider>) {
         .system("You are a helpful assistant.")
         .system("Be concise and clear.");
 
-    // Create a minimal plugin registry
-    let registry = Arc::new(PluginRegistry::from_default_path().expect("registry"));
+    // Create a minimal plugin registry with temp config file
+    let config_path = temp_dir.path().join("providers.toml");
+    std::fs::write(&config_path, "[[providers]]\nname = \"mock\"\npath = \"mock.wasm\"\n")
+        .expect("write config");
+    let registry = Arc::new(PluginRegistry::from_path(&config_path).expect("registry"));
 
     let provider = Arc::new(SessionProvider::new(
         registry,
@@ -136,7 +139,11 @@ async fn test_config_without_system_gets_none_in_params() {
         .provider("anthropic")
         .model("claude-3-5-sonnet-20241022");
 
-    let registry = Arc::new(PluginRegistry::from_default_path().expect("registry"));
+    // Create a minimal plugin registry with temp config file
+    let config_path = temp_dir.path().join("providers.toml");
+    std::fs::write(&config_path, "[[providers]]\nname = \"mock\"\npath = \"mock.wasm\"\n")
+        .expect("write config");
+    let registry = Arc::new(PluginRegistry::from_path(&config_path).expect("registry"));
     let provider = Arc::new(SessionProvider::new(
         registry,
         Arc::new(store) as Arc<dyn SessionStore>,
