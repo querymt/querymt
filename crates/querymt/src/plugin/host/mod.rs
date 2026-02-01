@@ -49,14 +49,30 @@ impl PluginRegistry {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, LLMError> {
         let config =
             PluginConfig::from_path(path).map_err(|e| LLMError::PluginError(e.to_string()))?;
+        Self::from_config(config)
+    }
 
+    /// Creates a registry from an already-parsed config.
+    ///
+    /// This uses the default cache directory (and creates it if missing).
+    pub fn from_config(config: PluginConfig) -> Result<Self, LLMError> {
         let cache_dir = dirs::cache_dir()
             .map(|mut path| {
                 path.push("querymt");
                 path
             })
             .unwrap();
-        std::fs::create_dir_all(&cache_dir)
+        Self::from_config_with_cache_path(config, cache_dir)
+    }
+
+    /// Creates a registry from an already-parsed config using a caller-supplied cache path.
+    ///
+    /// The cache directory is created if it does not exist.
+    pub fn from_config_with_cache_path(
+        config: PluginConfig,
+        cache_path: PathBuf,
+    ) -> Result<Self, LLMError> {
+        std::fs::create_dir_all(&cache_path)
             .map_err(|e| LLMError::InvalidRequest(format!("{:#}", e)))?;
 
         Ok(PluginRegistry {
@@ -64,7 +80,7 @@ impl PluginRegistry {
             factories: RwLock::new(HashMap::new()),
             oci_downloader: Arc::new(oci::OciDownloader::new(config.oci.clone())),
             config,
-            cache_path: cache_dir,
+            cache_path,
         })
     }
 
@@ -215,5 +231,56 @@ impl PluginRegistry {
 
     pub fn list(&self) -> Vec<Arc<dyn LLMProviderFactory>> {
         self.factories.read().unwrap().values().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_tmp_path(suffix: &str) -> PathBuf {
+        let pid = std::process::id();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        std::env::temp_dir().join(format!("querymt-test-{pid}-{now_ms}-{suffix}"))
+    }
+
+    #[test]
+    fn from_config_with_cache_path_creates_dir() {
+        let cache_path = unique_tmp_path("cache-dir").join("nested");
+        if cache_path.exists() {
+            fs::remove_dir_all(&cache_path).unwrap();
+        }
+
+        let cfg = PluginConfig {
+            providers: Vec::new(),
+            oci: None,
+        };
+
+        let registry = PluginRegistry::from_config_with_cache_path(cfg, cache_path.clone())
+            .expect("from_config_with_cache_path should succeed");
+
+        assert!(cache_path.is_dir(), "cache dir should be created");
+        assert_eq!(registry.cache_path, cache_path);
+        assert!(registry.config.providers.is_empty());
+    }
+
+    #[test]
+    fn from_path_parses_config_and_builds_registry() {
+        let cfg_path = unique_tmp_path("providers").with_extension("toml");
+        fs::write(&cfg_path, "providers = []\n").unwrap();
+
+        let registry = PluginRegistry::from_path(&cfg_path).expect("from_path should succeed");
+
+        assert!(registry.cache_path.ends_with("querymt"));
+        assert!(
+            registry.cache_path.is_dir(),
+            "default cache dir should exist"
+        );
+        assert!(registry.config.providers.is_empty());
     }
 }
