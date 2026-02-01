@@ -9,9 +9,26 @@ use super::messages::{ModelEntry, SessionGroup, SessionSummary, UiClientMessage,
 use super::session::{PRIMARY_AGENT_ID, ensure_sessions_for_mode, prompt_for_mode, resolve_cwd};
 use crate::index::resolve_workspace_root;
 use agent_client_protocol::CancelNotification;
+use querymt::LLMParams;
 use querymt::plugin::HTTPLLMProviderFactory;
+use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
+
+fn resolve_base_url_for_provider(state: &ServerState, provider: &str) -> Option<String> {
+    let cfg: &LLMParams = state.agent.provider.initial_config();
+    if cfg.provider.as_deref()? != provider {
+        return None;
+    }
+    if let Some(base_url) = &cfg.base_url {
+        return Some(base_url.clone());
+    }
+    cfg.custom
+        .as_ref()
+        .and_then(|m| m.get("base_url"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
 
 /// Main message dispatch handler.
 pub async fn handle_ui_message(
@@ -268,7 +285,7 @@ async fn fetch_all_models(
         let provider_name = factory.name().to_string();
 
         // Build config with API key (same as CLI)
-        let cfg = if let Some(http_factory) = factory.as_http() {
+        let mut cfg = if let Some(http_factory) = factory.as_http() {
             if let Some(api_key) = resolve_provider_api_key(&provider_name, http_factory).await {
                 serde_json::json!({"api_key": api_key})
             } else {
@@ -277,6 +294,10 @@ async fn fetch_all_models(
         } else {
             serde_json::json!({})
         };
+
+        if let Some(base_url) = resolve_base_url_for_provider(state, &provider_name) {
+            cfg["base_url"] = base_url.into();
+        }
 
         // Fetch models; on error, log and continue
         match factory.list_models(&cfg).await {
