@@ -196,6 +196,20 @@ macro_rules! impl_extism_http_plugin {
 
             let stream_id = qmt_http_stream_open_wrapper(&req)?.0;
 
+            if stream_id == 0 {
+                // Cancelled during stream open.
+                //
+                // The host returns a sentinel stream id (0) instead of trapping, so we can
+                // terminate the stream cleanly without Wasmtime backtraces.
+                qmt_yield_chunk_wrapper(&ExtismChatChunk {
+                    chunk: StreamChunk::Done {
+                        stop_reason: "cancelled".to_string(),
+                    },
+                    usage: None,
+                })?;
+                return Ok(());
+            }
+
             let mut buffer = Vec::new();
             let mut done_received = false;
 
@@ -235,24 +249,44 @@ macro_rules! impl_extism_http_plugin {
                 }
             }
 
-            // Process any remaining data in the buffer after the stream ends
-            if !buffer.is_empty() && !done_received {
-                let chunks = input.cfg.parse_chat_stream_chunk(&buffer).map_err(|e| {
-                    PdkError::msg(format!(
-                        "parse_chat_stream_chunk failed on remaining buffer: {}",
-                        e
-                    ))
-                })?;
+            // Stream ended without Done.
+            //
+            // We intentionally avoid introducing a new host API just to propagate an explicit
+            // "cancelled" signal across the WASM boundary. Instead, we rely on a convention:
+            // normal streaming completion emits a Done signal, while cancellation causes the host
+            // stream to terminate early (EOF) without Done. Maybe this can be improved in the
+            // future by introducing a specific calls to do a propet cancellation.
+            if !done_received {
+                // Best effort: try parsing any remaining bytes. If parsing fails, treat it as
+                // cancellation/truncation (common when cancellation happens mid-line).
+                if !buffer.is_empty() {
+                    if let Ok(chunks) = input.cfg.parse_chat_stream_chunk(&buffer) {
+                        for chunk in chunks {
+                            let usage_to_send = match &chunk {
+                                StreamChunk::Usage(usage) => Some(usage.clone()),
+                                _ => None,
+                            };
 
-                for chunk in chunks {
-                    // Extract usage if this is a Usage chunk
-                    let usage_to_send = match &chunk {
-                        StreamChunk::Usage(usage) => Some(usage.clone()),
-                        _ => None,
-                    };
+                            qmt_yield_chunk_wrapper(&ExtismChatChunk {
+                                chunk: chunk.clone(),
+                                usage: usage_to_send,
+                            })?;
+
+                            if matches!(chunk, StreamChunk::Done { .. }) {
+                                done_received = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // If we still didn't see Done, emit a clean cancellation termination.
+                if !done_received {
                     qmt_yield_chunk_wrapper(&ExtismChatChunk {
-                        chunk,
-                        usage: usage_to_send,
+                        chunk: StreamChunk::Done {
+                            stop_reason: "cancelled".to_string(),
+                        },
+                        usage: None,
                     })?;
                 }
             }

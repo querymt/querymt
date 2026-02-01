@@ -34,6 +34,10 @@ macro_rules! handle_http_error {
             let status = $resp.status();
             let status_code = status.as_u16();
 
+            if status_code == 499 {
+                return Err(LLMError::Cancelled);
+            }
+
             // Extract retry-after header for rate limit errors
             let retry_after_secs = if status_code == 429 {
                 $resp

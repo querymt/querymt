@@ -47,6 +47,10 @@ pub enum LLMError {
     #[error("HTTP Error: {0}")]
     HttpError(String),
 
+    /// Request was cancelled by the caller (e.g. timeout, user interrupt).
+    #[error("Cancelled")]
+    Cancelled,
+
     /// Feature or functionality not implemented by this provider.
     #[error("Not Implemented: {0}")]
     NotImplemented(String),
