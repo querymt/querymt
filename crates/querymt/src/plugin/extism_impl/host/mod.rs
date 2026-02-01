@@ -200,7 +200,7 @@ impl LLMProviderFactory for ExtismFactory {
     }
 
     fn config_schema(&self) -> Value {
-        call_plugin_json(self.plugin.clone(), "config_schema", &Value::Null)
+        self.call_json("config_schema", &Value::Null)
             .expect("config_schema() must return valid JSON")
     }
 
@@ -218,18 +218,20 @@ impl LLMProviderFactory for ExtismFactory {
     }
 
     fn list_models<'a>(&'a self, cfg: &Value) -> Fut<'a, Result<Vec<String>, LLMError>> {
+        // list_models can do host HTTP calls, so run the Extism VM call off the Tokio runtime
+        // thread to avoid deadlocks on current-thread runtimes.
         let cfg_to = cfg.clone();
+        let plugin = self.plugin.clone();
         async move {
-            let v = self
-                .call_json("list_models", &cfg_to)
-                .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
-            let arr = v.as_array().ok_or(LLMError::ProviderError(
-                "Model list is not an array".to_string(),
-            ))?;
-            Ok(arr
-                .iter()
-                .filter_map(|x| x.as_str().map(str::to_string))
-                .collect())
+            tokio::task::spawn_blocking(move || {
+                let mut plug = plugin.lock().unwrap();
+                let out: Json<Vec<String>> = plug
+                    .call_get_error_code("list_models", Json(cfg_to))
+                    .map_err(|(e, code)| decode_plugin_error(e, code))?;
+                Ok::<_, LLMError>(out.0)
+            })
+            .await
+            .map_err(|e| LLMError::PluginError(format!("Extism list_models join error: {:#}", e)))?
         }
         .boxed()
     }
@@ -304,12 +306,20 @@ impl ChatProvider for ExtismProvider {
             messages: messages.to_vec(),
             tools: tools.map(|v| v.to_vec()),
         };
-        let mut plug = self.plugin.lock().unwrap();
-        let out: Json<ExtismChatResponse> = plug
-            .call_get_error_code("chat", Json(arg))
-            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        // chat can do host HTTP calls, so run the Extism VM call off the Tokio runtime thread to
+        // avoid deadlocks on current-thread runtimes.
+        let plugin = self.plugin.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            let mut plug = plugin.lock().unwrap();
+            let out: Json<ExtismChatResponse> = plug
+                .call_get_error_code("chat", Json(arg))
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok::<_, LLMError>(out.0)
+        })
+        .await
+        .map_err(|e| LLMError::PluginError(format!("Extism chat join error: {:#}", e)))??;
 
-        Ok(Box::new(out.0) as Box<dyn ChatResponse>)
+        Ok(Box::new(out) as Box<dyn ChatResponse>)
     }
 
     #[instrument(name = "extism_provider.chat_stream_with_tools", skip_all)]
@@ -467,11 +477,18 @@ impl EmbeddingProvider for ExtismProvider {
             inputs: input,
         };
 
-        let mut plug = self.plugin.lock().unwrap();
-        let out: Json<Vec<Vec<f32>>> = plug
-            .call_get_error_code("embed", Json(arg))
-            .map_err(|(e, code)| decode_plugin_error(e, code))?;
-        Ok(out.0)
+        // embed can do host HTTP calls, so run the Extism VM call off the Tokio runtime thread to
+        // avoid deadlocks on current-thread runtimes.
+        let plugin = self.plugin.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut plug = plugin.lock().unwrap();
+            let out: Json<Vec<Vec<f32>>> = plug
+                .call_get_error_code("embed", Json(arg))
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok::<_, LLMError>(out.0)
+        })
+        .await
+        .map_err(|e| LLMError::PluginError(format!("Extism embed join error: {:#}", e)))?
     }
 }
 
@@ -484,65 +501,101 @@ impl CompletionProvider for ExtismProvider {
             req: req.clone(),
         };
 
-        let mut plug = self.plugin.lock().unwrap();
-        let out: Json<CompletionResponse> = plug
-            .call_get_error_code("complete", Json(arg))
-            .map_err(|(e, code)| decode_plugin_error(e, code))?;
-        Ok(out.0)
+        // complete can do host HTTP calls, so run the Extism VM call off the Tokio runtime thread
+        // to avoid deadlocks on current-thread runtimes.
+        let plugin = self.plugin.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut plug = plugin.lock().unwrap();
+            let out: Json<CompletionResponse> = plug
+                .call_get_error_code("complete", Json(arg))
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok::<_, LLMError>(out.0)
+        })
+        .await
+        .map_err(|e| LLMError::PluginError(format!("Extism complete join error: {:#}", e)))?
     }
 }
 
 #[async_trait]
 impl LLMProvider for ExtismProvider {
     async fn transcribe(&self, req: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
-        let mut plug = self.plugin.lock().unwrap();
+        // transcribe can do host HTTP calls, so run the Extism VM call off the Tokio runtime
+        // thread to avoid deadlocks on current-thread runtimes.
+        let cfg = self.config.clone();
+        let audio_base64 = BASE64.encode(&req.audio);
+        let filename = req.filename.clone();
+        let mime_type = req.mime_type.clone();
+        let model = req.model.clone();
+        let language = req.language.clone();
+        let plugin = self.plugin.clone();
 
-        if !plug.function_exists("transcribe") {
-            return Err(LLMError::NotImplemented(
-                "STT not supported by this plugin".into(),
-            ));
-        }
+        let out = tokio::task::spawn_blocking(move || {
+            let mut plug = plugin.lock().unwrap();
 
-        let arg = ExtismSttRequest {
-            cfg: self.config.clone(),
-            audio_base64: BASE64.encode(&req.audio),
-            filename: req.filename.clone(),
-            mime_type: req.mime_type.clone(),
-            model: req.model.clone(),
-            language: req.language.clone(),
-        };
+            if !plug.function_exists("transcribe") {
+                return Err(LLMError::NotImplemented(
+                    "STT not supported by this plugin".into(),
+                ));
+            }
 
-        let out: Json<ExtismSttResponse> = plug
-            .call_get_error_code("transcribe", Json(arg))
-            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            let arg = ExtismSttRequest {
+                cfg,
+                audio_base64,
+                filename,
+                mime_type,
+                model,
+                language,
+            };
 
-        Ok(stt::SttResponse { text: out.0.text })
+            let out: Json<ExtismSttResponse> = plug
+                .call_get_error_code("transcribe", Json(arg))
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok::<_, LLMError>(out.0)
+        })
+        .await
+        .map_err(|e| LLMError::PluginError(format!("Extism transcribe join error: {:#}", e)))??;
+
+        Ok(stt::SttResponse { text: out.text })
     }
 
     async fn speech(&self, req: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
-        let mut plug = self.plugin.lock().unwrap();
+        // speech can do host HTTP calls, so run the Extism VM call off the Tokio runtime thread
+        // to avoid deadlocks on current-thread runtimes.
+        let cfg = self.config.clone();
+        let text = req.text.clone();
+        let model = req.model.clone();
+        let voice = req.voice.clone();
+        let format = req.format.clone();
+        let speed = req.speed;
+        let plugin = self.plugin.clone();
 
-        if !plug.function_exists("speech") {
-            return Err(LLMError::NotImplemented(
-                "TTS not supported by this plugin".into(),
-            ));
-        }
+        let out = tokio::task::spawn_blocking(move || {
+            let mut plug = plugin.lock().unwrap();
 
-        let arg = ExtismTtsRequest {
-            cfg: self.config.clone(),
-            text: req.text.clone(),
-            model: req.model.clone(),
-            voice: req.voice.clone(),
-            format: req.format.clone(),
-            speed: req.speed,
-        };
+            if !plug.function_exists("speech") {
+                return Err(LLMError::NotImplemented(
+                    "TTS not supported by this plugin".into(),
+                ));
+            }
 
-        let out: Json<ExtismTtsResponse> = plug
-            .call_get_error_code("speech", Json(arg))
-            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            let arg = ExtismTtsRequest {
+                cfg,
+                text,
+                model,
+                voice,
+                format,
+                speed,
+            };
 
-        out.0
-            .into_tts_response()
+            let out: Json<ExtismTtsResponse> = plug
+                .call_get_error_code("speech", Json(arg))
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok::<_, LLMError>(out.0)
+        })
+        .await
+        .map_err(|e| LLMError::PluginError(format!("Extism speech join error: {:#}", e)))??;
+
+        out.into_tts_response()
             .map_err(|e| LLMError::PluginError(e.to_string()))
     }
 }
