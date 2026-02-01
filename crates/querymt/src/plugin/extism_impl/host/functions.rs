@@ -106,7 +106,10 @@ pub(crate) fn reqwest_http(
                 return Ok(());
             }
         }
-        (state_guard.tokio_handle.clone(), state_guard.cancel_watch_rx.clone())
+        (
+            state_guard.tokio_handle.clone(),
+            state_guard.cancel_watch_rx.clone(),
+        )
     };
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -207,6 +210,12 @@ pub(crate) fn qmt_http_stream_open(
 ) -> Result<(), extism::Error> {
     #[cfg(feature = "http-client")]
     {
+        // NOTE: streaming cancellation.
+        //
+        // If we return an `extism::Error` here during cancellation, Wasmtime will treat it like a
+        // failed host call and emit a WASM backtrace. Instead, we represent cancellation as
+        // a *sentinel stream id* (0). The WASM-side stream wrapper interprets EOF-without-Done as
+        // cancellation and emits a clean `StreamChunk::Done { stop_reason: "cancelled" }`.
         use crate::plugin::extism_impl::SerializableHttpRequest;
 
         let req_json: Vec<u8> = plugin.memory_get_val(&inputs[0])?;
@@ -219,7 +228,7 @@ pub(crate) fn qmt_http_stream_open(
         })?;
         let http_req = ser_req.req;
         let state = user_data.get()?;
-        let handle_tokio = {
+        let (handle_tokio, cancel_rx) = {
             let state_guard = state.lock().unwrap();
             if let Some(host) = http_req.uri().host() {
                 if !state_guard.allowed_hosts.is_empty()
@@ -231,8 +240,12 @@ pub(crate) fn qmt_http_stream_open(
                     )));
                 }
             }
-            state_guard.tokio_handle.clone()
+            (
+                state_guard.tokio_handle.clone(),
+                state_guard.cancel_watch_rx.clone(),
+            )
         };
+
         let stream_res = handle_tokio.block_on(async move {
             let client = reqwest::Client::new();
             let method =
@@ -248,7 +261,30 @@ pub(crate) fn qmt_http_stream_open(
             if !body.is_empty() {
                 reqwest_req = reqwest_req.body(body);
             }
-            let resp = reqwest_req.send().await.map_err(|e| format!("{}", e))?;
+
+            let wait_cancel = |mut cancel_rx: tokio::sync::watch::Receiver<bool>| async move {
+                loop {
+                    if *cancel_rx.borrow() {
+                        break;
+                    }
+                    if cancel_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            };
+
+            if *cancel_rx.borrow() {
+                return Ok(None);
+            }
+
+            let send_res = tokio::select! {
+                _ = wait_cancel(cancel_rx.clone()) => {
+                    return Ok(None);
+                }
+                res = reqwest_req.send() => res,
+            };
+
+            let resp = send_res.map_err(|e| format!("{}", e))?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp
@@ -257,14 +293,15 @@ pub(crate) fn qmt_http_stream_open(
                     .unwrap_or_else(|_| "could not read body".to_string());
                 return Err(format!("HTTP Error {}: {}", status, body));
             }
-            Ok::<_, String>(
+
+            Ok::<_, String>(Some(
                 resp.bytes_stream()
                     .map(|result| result.map(|bytes| bytes.to_vec())),
-            )
+            ))
         });
 
         match stream_res {
-            Ok(stream) => {
+            Ok(Some(stream)) => {
                 let mut state_guard = state.lock().unwrap();
                 let stream_id = state_guard.next_stream_id;
                 state_guard.next_stream_id += 1;
@@ -272,6 +309,16 @@ pub(crate) fn qmt_http_stream_open(
 
                 let resp_json = serde_json::to_vec(&stream_id)
                     .map_err(|e| extism::Error::msg(format!("{}", e)))?;
+                let handle = plugin.memory_new(resp_json)?;
+                outputs[0] = Val::I64(handle.offset as i64);
+            }
+            Ok(None) => {
+                // Cancelled: return sentinel stream_id=0.
+                //
+                // This was implemented in this way to keep the ABI stable (no extra host functions)
+                // while still allowing true cancellation: the next `qmt_http_stream_next` will return EOF immediately.
+                let resp_json =
+                    serde_json::to_vec(&0u64).map_err(|e| extism::Error::msg(format!("{}", e)))?;
                 let handle = plugin.memory_new(resp_json)?;
                 outputs[0] = Val::I64(handle.offset as i64);
             }
@@ -302,6 +349,12 @@ pub(crate) fn qmt_http_stream_next(
         let stream_id: u64 = serde_json::from_slice(&stream_id_json).map_err(|e| {
             extism::Error::msg(format!("Failed to deserialize stream_id in next: {}", e))
         })?;
+
+        if stream_id == 0 {
+            // Sentinel stream_id=0 indicates cancellation (see qmt_http_stream_open).
+            outputs[0] = Val::I64(0);
+            return Ok(());
+        }
 
         let state = user_data.get()?;
         let (handle_tokio, stream_exists, cancel_rx) = {
@@ -393,6 +446,10 @@ pub(crate) fn qmt_http_stream_close(
         let stream_id: u64 = serde_json::from_slice(&stream_id_json).map_err(|e| {
             extism::Error::msg(format!("Failed to deserialize stream_id in close: {}", e))
         })?;
+
+        if stream_id == 0 {
+            return Ok(());
+        }
 
         let state = user_data.get()?;
         let mut state_guard = state.lock().unwrap();

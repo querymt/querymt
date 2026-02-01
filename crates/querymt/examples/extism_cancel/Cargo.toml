@@ -1,5 +1,5 @@
 [package]
-name = "extism_stream_cancel"
+name = "extism_cancel"
 version = "0.1.0"
 edition = "2021"
 

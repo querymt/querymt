@@ -19,11 +19,11 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use extism::{convert::Json, Manifest, Plugin, PluginBuilder, Wasm};
 use futures::FutureExt;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::instrument;
 use url::Url;
 
@@ -284,9 +284,9 @@ pub struct ExtismProvider {
 
 impl ExtismProvider {
     fn user_data_required(&self) -> Result<extism::UserData<functions::HostState>, LLMError> {
-        self.user_data.clone().ok_or_else(|| {
-            LLMError::PluginError("No UserData found for Extism provider".into())
-        })
+        self.user_data
+            .clone()
+            .ok_or_else(|| LLMError::PluginError("No UserData found for Extism provider".into()))
     }
 
     async fn call_blocking_with_cancel<T, F>(&self, op: &'static str, f: F) -> Result<T, LLMError>
