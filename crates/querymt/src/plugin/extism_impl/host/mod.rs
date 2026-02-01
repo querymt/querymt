@@ -23,6 +23,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::instrument;
 use url::Url;
 
@@ -281,6 +282,93 @@ pub struct ExtismProvider {
     user_data: Option<extism::UserData<functions::HostState>>,
 }
 
+impl ExtismProvider {
+    fn user_data_required(&self) -> Result<extism::UserData<functions::HostState>, LLMError> {
+        self.user_data.clone().ok_or_else(|| {
+            LLMError::PluginError("No UserData found for Extism provider".into())
+        })
+    }
+
+    async fn call_blocking_with_cancel<T, F>(&self, op: &'static str, f: F) -> Result<T, LLMError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Plugin) -> Result<T, LLMError> + Send + 'static,
+    {
+        let plugin = self.plugin.clone();
+        let user_data = self.user_data_required()?;
+        let started = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        struct CancelGuard {
+            user_data: extism::UserData<functions::HostState>,
+            started: Arc<AtomicBool>,
+            cancelled: Arc<AtomicBool>,
+            armed: bool,
+        }
+
+        impl Drop for CancelGuard {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+
+                // Always mark the call as cancelled so that if the blocking task is still waiting
+                // for the plugin mutex, it can bail out once it acquires it.
+                self.cancelled.store(true, Ordering::SeqCst);
+
+                // Only send a cancellation signal to the host if this future actually acquired the
+                // plugin mutex (otherwise we might cancel an unrelated in-flight call).
+                if !self.started.load(Ordering::SeqCst) {
+                    return;
+                }
+
+                if let Ok(state) = self.user_data.get() {
+                    let mut state_guard = state.lock().unwrap();
+                    state_guard.cancel_state = functions::CancelState::CancelledByConsumerDrop;
+                    let _ = state_guard.cancel_watch_tx.send(true);
+                }
+            }
+        }
+
+        let mut guard = CancelGuard {
+            user_data: user_data.clone(),
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+            armed: true,
+        };
+
+        let user_data_for_call = user_data.clone();
+        let started_for_call = started.clone();
+        let cancelled_for_call = cancelled.clone();
+
+        let join = tokio::task::spawn_blocking(move || {
+            let mut plug = plugin.lock().unwrap();
+
+            // Reset cancellation for this call (must happen only after acquiring the plugin mutex
+            // so we don't race/cancel an unrelated in-flight call).
+            if let Ok(state) = user_data_for_call.get() {
+                let mut state_guard = state.lock().unwrap();
+                state_guard.cancel_state = functions::CancelState::NotCancelled;
+                let _ = state_guard.cancel_watch_tx.send(false);
+            }
+
+            started_for_call.store(true, Ordering::SeqCst);
+
+            if cancelled_for_call.load(Ordering::SeqCst) {
+                return Err(LLMError::Cancelled);
+            }
+
+            f(&mut plug)
+        })
+        .await;
+
+        // The plugin call finished (success or error); don't emit cancellation on drop.
+        guard.armed = false;
+
+        join.map_err(|e| LLMError::PluginError(format!("Extism {op} join error: {:#}", e)))?
+    }
+}
+
 #[async_trait]
 impl ChatProvider for ExtismProvider {
     fn supports_streaming(&self) -> bool {
@@ -307,17 +395,16 @@ impl ChatProvider for ExtismProvider {
             tools: tools.map(|v| v.to_vec()),
         };
         // chat can do host HTTP calls, so run the Extism VM call off the Tokio runtime thread to
-        // avoid deadlocks on current-thread runtimes.
-        let plugin = self.plugin.clone();
-        let out = tokio::task::spawn_blocking(move || {
-            let mut plug = plugin.lock().unwrap();
-            let out: Json<ExtismChatResponse> = plug
-                .call_get_error_code("chat", Json(arg))
-                .map_err(|(e, code)| decode_plugin_error(e, code))?;
-            Ok::<_, LLMError>(out.0)
-        })
-        .await
-        .map_err(|e| LLMError::PluginError(format!("Extism chat join error: {:#}", e)))??;
+        // avoid deadlocks on current-thread runtimes. Also wire cancellation so dropping the
+        // future can interrupt host HTTP and release the plugin mutex.
+        let out = self
+            .call_blocking_with_cancel("chat", move |plug| {
+                let out: Json<ExtismChatResponse> = plug
+                    .call_get_error_code("chat", Json(arg))
+                    .map_err(|(e, code)| decode_plugin_error(e, code))?;
+                Ok(out.0)
+            })
+            .await?;
 
         Ok(Box::new(out) as Box<dyn ChatResponse>)
     }
@@ -477,18 +564,13 @@ impl EmbeddingProvider for ExtismProvider {
             inputs: input,
         };
 
-        // embed can do host HTTP calls, so run the Extism VM call off the Tokio runtime thread to
-        // avoid deadlocks on current-thread runtimes.
-        let plugin = self.plugin.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut plug = plugin.lock().unwrap();
+        self.call_blocking_with_cancel("embed", move |plug| {
             let out: Json<Vec<Vec<f32>>> = plug
                 .call_get_error_code("embed", Json(arg))
                 .map_err(|(e, code)| decode_plugin_error(e, code))?;
-            Ok::<_, LLMError>(out.0)
+            Ok(out.0)
         })
         .await
-        .map_err(|e| LLMError::PluginError(format!("Extism embed join error: {:#}", e)))?
     }
 }
 
@@ -501,99 +583,84 @@ impl CompletionProvider for ExtismProvider {
             req: req.clone(),
         };
 
-        // complete can do host HTTP calls, so run the Extism VM call off the Tokio runtime thread
-        // to avoid deadlocks on current-thread runtimes.
-        let plugin = self.plugin.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut plug = plugin.lock().unwrap();
+        self.call_blocking_with_cancel("complete", move |plug| {
             let out: Json<CompletionResponse> = plug
                 .call_get_error_code("complete", Json(arg))
                 .map_err(|(e, code)| decode_plugin_error(e, code))?;
-            Ok::<_, LLMError>(out.0)
+            Ok(out.0)
         })
         .await
-        .map_err(|e| LLMError::PluginError(format!("Extism complete join error: {:#}", e)))?
     }
 }
 
 #[async_trait]
 impl LLMProvider for ExtismProvider {
     async fn transcribe(&self, req: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
-        // transcribe can do host HTTP calls, so run the Extism VM call off the Tokio runtime
-        // thread to avoid deadlocks on current-thread runtimes.
         let cfg = self.config.clone();
         let audio_base64 = BASE64.encode(&req.audio);
         let filename = req.filename.clone();
         let mime_type = req.mime_type.clone();
         let model = req.model.clone();
         let language = req.language.clone();
-        let plugin = self.plugin.clone();
 
-        let out = tokio::task::spawn_blocking(move || {
-            let mut plug = plugin.lock().unwrap();
+        let out = self
+            .call_blocking_with_cancel("transcribe", move |plug| {
+                if !plug.function_exists("transcribe") {
+                    return Err(LLMError::NotImplemented(
+                        "STT not supported by this plugin".into(),
+                    ));
+                }
 
-            if !plug.function_exists("transcribe") {
-                return Err(LLMError::NotImplemented(
-                    "STT not supported by this plugin".into(),
-                ));
-            }
+                let arg = ExtismSttRequest {
+                    cfg,
+                    audio_base64,
+                    filename,
+                    mime_type,
+                    model,
+                    language,
+                };
 
-            let arg = ExtismSttRequest {
-                cfg,
-                audio_base64,
-                filename,
-                mime_type,
-                model,
-                language,
-            };
-
-            let out: Json<ExtismSttResponse> = plug
-                .call_get_error_code("transcribe", Json(arg))
-                .map_err(|(e, code)| decode_plugin_error(e, code))?;
-            Ok::<_, LLMError>(out.0)
-        })
-        .await
-        .map_err(|e| LLMError::PluginError(format!("Extism transcribe join error: {:#}", e)))??;
+                let out: Json<ExtismSttResponse> = plug
+                    .call_get_error_code("transcribe", Json(arg))
+                    .map_err(|(e, code)| decode_plugin_error(e, code))?;
+                Ok(out.0)
+            })
+            .await?;
 
         Ok(stt::SttResponse { text: out.text })
     }
 
     async fn speech(&self, req: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
-        // speech can do host HTTP calls, so run the Extism VM call off the Tokio runtime thread
-        // to avoid deadlocks on current-thread runtimes.
         let cfg = self.config.clone();
         let text = req.text.clone();
         let model = req.model.clone();
         let voice = req.voice.clone();
         let format = req.format.clone();
         let speed = req.speed;
-        let plugin = self.plugin.clone();
 
-        let out = tokio::task::spawn_blocking(move || {
-            let mut plug = plugin.lock().unwrap();
+        let out = self
+            .call_blocking_with_cancel("speech", move |plug| {
+                if !plug.function_exists("speech") {
+                    return Err(LLMError::NotImplemented(
+                        "TTS not supported by this plugin".into(),
+                    ));
+                }
 
-            if !plug.function_exists("speech") {
-                return Err(LLMError::NotImplemented(
-                    "TTS not supported by this plugin".into(),
-                ));
-            }
+                let arg = ExtismTtsRequest {
+                    cfg,
+                    text,
+                    model,
+                    voice,
+                    format,
+                    speed,
+                };
 
-            let arg = ExtismTtsRequest {
-                cfg,
-                text,
-                model,
-                voice,
-                format,
-                speed,
-            };
-
-            let out: Json<ExtismTtsResponse> = plug
-                .call_get_error_code("speech", Json(arg))
-                .map_err(|(e, code)| decode_plugin_error(e, code))?;
-            Ok::<_, LLMError>(out.0)
-        })
-        .await
-        .map_err(|e| LLMError::PluginError(format!("Extism speech join error: {:#}", e)))??;
+                let out: Json<ExtismTtsResponse> = plug
+                    .call_get_error_code("speech", Json(arg))
+                    .map_err(|(e, code)| decode_plugin_error(e, code))?;
+                Ok(out.0)
+            })
+            .await?;
 
         out.into_tts_response()
             .map_err(|e| LLMError::PluginError(e.to_string()))

@@ -86,7 +86,7 @@ pub(crate) fn reqwest_http(
 
     let http_req = ser_req.req;
     let state = user_data.get()?;
-    let handle_tokio = {
+    let (handle_tokio, cancel_rx) = {
         let state_guard = state.lock().unwrap();
         if let Some(host) = http_req.uri().host() {
             if !state_guard.allowed_hosts.is_empty()
@@ -106,7 +106,7 @@ pub(crate) fn reqwest_http(
                 return Ok(());
             }
         }
-        state_guard.tokio_handle.clone()
+        (state_guard.tokio_handle.clone(), state_guard.cancel_watch_rx.clone())
     };
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -115,6 +115,12 @@ pub(crate) fn reqwest_http(
     std::thread::spawn(move || {
         let res = handle_tokio.block_on(async move {
             let http_req = http_req_clone;
+            let cancelled_response = || {
+                http::Response::builder()
+                    .status(499)
+                    .body(b"cancelled".to_vec())
+                    .map_err(|e| format!("{}", e))
+            };
             let client = reqwest::Client::new();
             let method = reqwest::Method::from_bytes(http_req.method().as_str().as_bytes())
                 .map_err(|e| format!("Invalid HTTP method: {}", e))?;
@@ -129,27 +135,54 @@ pub(crate) fn reqwest_http(
             if !body.is_empty() {
                 reqwest_req = reqwest_req.body(body);
             }
-            match reqwest_req.send().await {
-                Ok(reqwest_resp) => {
-                    let status = reqwest_resp.status();
-                    let version = reqwest_resp.version();
-                    let headers = reqwest_resp.headers().clone();
-                    let body = reqwest_resp
-                        .bytes()
-                        .await
-                        .map_err(|e| format!("{}", e))?
-                        .to_vec();
-                    let mut builder = http::Response::builder().status(status).version(version);
-                    for (name, value) in headers.iter() {
-                        builder = builder.header(name, value);
+            let wait_cancel = |mut cancel_rx: tokio::sync::watch::Receiver<bool>| async move {
+                loop {
+                    if *cancel_rx.borrow() {
+                        break;
                     }
-                    builder.body(body).map_err(|e| format!("{}", e))
+                    if cancel_rx.changed().await.is_err() {
+                        break;
+                    }
                 }
-                Err(e) => http::Response::builder()
-                    .status(500)
-                    .body(format!("{}", e).into_bytes())
-                    .map_err(|e| format!("{}", e)),
+            };
+
+            if *cancel_rx.borrow() {
+                return cancelled_response();
             }
+
+            let send_res = tokio::select! {
+                _ = wait_cancel(cancel_rx.clone()) => {
+                    return cancelled_response();
+                }
+                res = reqwest_req.send() => res,
+            };
+
+            let reqwest_resp = match send_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    return http::Response::builder()
+                        .status(500)
+                        .body(format!("{}", e).into_bytes())
+                        .map_err(|e| format!("{}", e));
+                }
+            };
+
+            let status = reqwest_resp.status();
+            let version = reqwest_resp.version();
+            let headers = reqwest_resp.headers().clone();
+
+            let body = tokio::select! {
+                _ = wait_cancel(cancel_rx.clone()) => {
+                    return cancelled_response();
+                }
+                bytes = reqwest_resp.bytes() => bytes.map_err(|e| format!("{}", e))?.to_vec(),
+            };
+
+            let mut builder = http::Response::builder().status(status).version(version);
+            for (name, value) in headers.iter() {
+                builder = builder.header(name, value);
+            }
+            builder.body(body).map_err(|e| format!("{}", e))
         });
         let _ = tx.send(res);
     });

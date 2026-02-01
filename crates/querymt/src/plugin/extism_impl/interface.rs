@@ -24,6 +24,7 @@ pub mod error_codes {
     pub const RATE_LIMITED: i32 = 4;
     pub const HTTP: i32 = 5;
     pub const NOT_IMPLEMENTED: i32 = 6;
+    pub const CANCELLED: i32 = 7;
 }
 
 /// Structured error that crosses the WASM boundary as JSON.
@@ -54,6 +55,9 @@ pub enum PluginError {
     #[error("HTTP Error: {0}")]
     Http(String),
 
+    #[error("Cancelled")]
+    Cancelled,
+
     #[error("Not Implemented: {0}")]
     NotImplemented(String),
 
@@ -76,6 +80,7 @@ impl PluginError {
                 retry_after_secs: *retry_after_secs,
             },
             LLMError::HttpError(msg) => Self::Http(msg.clone()),
+            LLMError::Cancelled => Self::Cancelled,
             LLMError::NotImplemented(msg) => Self::NotImplemented(msg.clone()),
             other => Self::Generic(other.to_string()),
         }
@@ -89,6 +94,7 @@ impl PluginError {
             Self::InvalidRequest(_) => error_codes::INVALID_REQUEST,
             Self::RateLimited { .. } => error_codes::RATE_LIMITED,
             Self::Http(_) => error_codes::HTTP,
+            Self::Cancelled => error_codes::CANCELLED,
             Self::NotImplemented(_) => error_codes::NOT_IMPLEMENTED,
             Self::Generic(_) => error_codes::GENERIC,
         }
@@ -121,6 +127,7 @@ impl PluginError {
                     | Self::Http(m)
                     | Self::NotImplemented(m)
                     | Self::Generic(m) => m,
+                    Self::Cancelled => "cancelled".to_string(),
                     Self::RateLimited { message, .. } => message,
                 })
                 .unwrap_or_else(|_| json.to_string())
@@ -148,6 +155,7 @@ impl PluginError {
                 }
             }
             error_codes::HTTP => LLMError::HttpError(msg_from_json()),
+            error_codes::CANCELLED => LLMError::Cancelled,
             error_codes::NOT_IMPLEMENTED => LLMError::NotImplemented(msg_from_json()),
             _ => LLMError::PluginError(msg_from_json()),
         }
