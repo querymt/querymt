@@ -11,7 +11,48 @@ use querymt::{
     chat::{ChatMessage, ChatResponse, MessageType},
     error::LLMError,
 };
+use serde_json::{Map, Value};
 use std::sync::Arc;
+
+fn prune_config_by_schema(cfg: &Value, schema: &Value) -> Value {
+    match (cfg, schema.get("properties")) {
+        (Value::Object(cfg_map), Some(Value::Object(props))) => {
+            // Build a new object only with keys in `properties`.
+            let mut out = Map::with_capacity(cfg_map.len());
+            for (k, v) in cfg_map {
+                if let Some(prop_schema) = props.get(k) {
+                    // If the subschema has its own nested properties, recurse.
+                    let pruned_val = if prop_schema.get("properties").is_some() {
+                        prune_config_by_schema(v, prop_schema)
+                    } else {
+                        v.clone()
+                    };
+                    out.insert(k.clone(), pruned_val);
+                }
+            }
+            Value::Object(out)
+        }
+        // Not an object or no properties defined -> return as-is.
+        _ => cfg.clone(),
+    }
+}
+
+fn pruned_top_level_keys(before: &Value, after: &Value) -> Vec<String> {
+    let Some(before_obj) = before.as_object() else {
+        return Vec::new();
+    };
+    let Some(after_obj) = after.as_object() else {
+        return Vec::new();
+    };
+
+    let mut removed: Vec<String> = before_obj
+        .keys()
+        .filter(|k| !after_obj.contains_key(*k))
+        .cloned()
+        .collect();
+    removed.sort();
+    removed
+}
 
 /// A wrapper around a `SessionStore` that resolves providers dynamically.
 pub struct SessionProvider {
@@ -410,6 +451,29 @@ pub async fn build_provider_from_config(
         }
     }
 
-    let provider = factory.from_config(&builder_config)?;
+    // Prune config by provider schema to avoid providers with
+    // `deny_unknown_fields` rejecting unrelated parameters.
+    let schema = factory.config_schema();
+    let pruned_config = prune_config_by_schema(&builder_config, &schema);
+
+    let pruned_keys = pruned_top_level_keys(&builder_config, &pruned_config);
+    if !pruned_keys.is_empty() {
+        const MAX_KEYS_TO_LOG: usize = 50;
+        let shown = pruned_keys.len().min(MAX_KEYS_TO_LOG);
+        let suffix = if pruned_keys.len() > shown {
+            format!(" (+{} more)", pruned_keys.len() - shown)
+        } else {
+            String::new()
+        };
+
+        log::warn!(
+            "Pruned unsupported config keys for provider '{}': {}{}",
+            provider_name,
+            pruned_keys[..shown].join(", "),
+            suffix
+        );
+    }
+
+    let provider = factory.from_config(&pruned_config)?;
     Ok(Arc::from(provider))
 }
