@@ -1,5 +1,6 @@
 use crate::{error::LLMError, plugin::LLMProviderFactory};
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -77,9 +78,44 @@ impl PluginRegistry {
 
     #[instrument(name = "plugin_registry.load_all_plugins", skip_all)]
     pub async fn load_all_plugins(&self) {
-        log::debug!("Loading all configured plugins...");
-        for provider_cfg in &self.config.providers {
-            match self.load_and_process_plugin(provider_cfg).await {
+        // Skip providers that are already loaded (idempotency)
+        // We need to collect loaded provider names to avoid holding the lock
+        let loaded_names: std::collections::HashSet<String> = {
+            let already_loaded = self.factories.read().unwrap();
+            already_loaded.keys().cloned().collect()
+        };
+
+        let to_load: Vec<_> = self
+            .config
+            .providers
+            .iter()
+            .filter(|cfg| !loaded_names.contains(&cfg.name))
+            .collect();
+
+        if to_load.is_empty() {
+            log::debug!(
+                "All {} configured plugins already loaded, skipping",
+                self.config.providers.len()
+            );
+            return;
+        }
+
+        log::debug!(
+            "Loading {} of {} configured plugins in parallel...",
+            to_load.len(),
+            self.config.providers.len()
+        );
+
+        let mut futures: FuturesUnordered<_> = to_load
+            .into_iter()
+            .map(|cfg| async move {
+                let result = self.load_and_process_plugin(cfg).await;
+                (cfg, result)
+            })
+            .collect();
+
+        while let Some((provider_cfg, result)) = futures.next().await {
+            match result {
                 Ok(provider) => {
                     log::info!("Adding '{}' provider to registry", provider_cfg.name);
                     self.factories
