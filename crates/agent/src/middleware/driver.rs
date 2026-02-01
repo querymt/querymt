@@ -48,10 +48,7 @@ pub struct CompositeDriver {
 
 impl CompositeDriver {
     pub fn new(drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
-        debug!(
-            "Creating CompositeDriver with {} middleware",
-            drivers.len()
-        );
+        debug!("Creating CompositeDriver with {} middleware", drivers.len());
         Self { drivers }
     }
 
