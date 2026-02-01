@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, ChevronDown, ChevronRight, Copy, Trash2 } from 'lucide-react';
 import type { EventItem } from '../types';
+import { copyToClipboard } from '../utils/clipboard';
 
 const MAX_ENTRIES = 200;
 
@@ -15,24 +16,6 @@ function buildCopyPayload(events: EventItem[]) {
       return `[${time}] ${event.content}`;
     })
     .join('\n');
-}
-
-async function copyToClipboard(value: string) {
-  if (!value) return;
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(value);
-    return;
-  }
-
-  const textarea = document.createElement('textarea');
-  textarea.value = value;
-  textarea.setAttribute('readonly', 'true');
-  textarea.style.position = 'absolute';
-  textarea.style.left = '-9999px';
-  document.body.appendChild(textarea);
-  textarea.select();
-  document.execCommand('copy');
-  document.body.removeChild(textarea);
 }
 
 interface SystemLogProps {

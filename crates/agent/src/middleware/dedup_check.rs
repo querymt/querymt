@@ -163,7 +163,8 @@ impl DedupCheckMiddleware {
         self
     }
 
-    /// Extract changed file paths from tool results
+    /// Extract changed file paths from tool results (for testing)
+    #[cfg(test)]
     fn extract_changed_paths(results: &[ToolResult]) -> DiffPaths {
         let mut combined = DiffPaths::default();
 
@@ -334,54 +335,54 @@ impl MiddlewareDriver for DedupCheckMiddleware {
             warning_injected = tracing::field::Empty
         )
     )]
-    async fn on_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
         if !self.enabled {
             tracing::Span::current().record("output_state", state.name());
             return Ok(state);
         }
 
         match state {
-            // When all tools are done and we're about to return to LLM, check for duplicates
-            ExecutionState::ProcessingToolCalls {
-                remaining_calls,
-                results,
-                context,
-            } if remaining_calls.is_empty() => {
+            // Before LLM call, check for duplicates from the previous step's tool executions
+            ExecutionState::BeforeLlmCall { ref context } => {
                 // Get session ID from context
                 let session_id = context.session_id.to_string();
 
-                // Get function index from session runtime
-                let function_index = {
+                // Get function index and changed paths from session runtime
+                let (function_index, changed_paths) = {
                     let runtimes = self.session_runtime.lock().await;
-                    runtimes
-                        .get(&session_id)
-                        .and_then(|r| r.function_index.get().cloned())
+                    let runtime = runtimes.get(&session_id);
+
+                    let function_index = runtime.and_then(|r| r.function_index.get().cloned());
+
+                    let changed_paths = runtime
+                        .and_then(|r| r.last_step_diff.lock().ok())
+                        .and_then(|mut diff| diff.take());
+
+                    (function_index, changed_paths)
                 };
 
                 let Some(function_index) = function_index else {
                     // No function index available, skip dedup check
-                    tracing::Span::current().record("output_state", "ProcessingToolCalls");
-                    return Ok(ExecutionState::ProcessingToolCalls {
-                        remaining_calls,
-                        results,
-                        context,
-                    });
+                    tracing::Span::current().record("output_state", "BeforeLlmCall");
+                    return Ok(state);
                 };
 
-                // Extract changed paths from all tool results
-                let changed_paths = Self::extract_changed_paths(&results);
+                let Some(changed_paths) = changed_paths else {
+                    // No changed paths from previous step, skip dedup check
+                    tracing::Span::current().record("files_checked", 0usize);
+                    tracing::Span::current().record("duplicates_found", 0usize);
+                    tracing::Span::current().record("warning_injected", false);
+                    tracing::Span::current().record("output_state", "BeforeLlmCall");
+                    return Ok(state);
+                };
 
                 if changed_paths.is_empty() {
                     // No file changes, nothing to check
                     tracing::Span::current().record("files_checked", 0usize);
                     tracing::Span::current().record("duplicates_found", 0usize);
                     tracing::Span::current().record("warning_injected", false);
-                    tracing::Span::current().record("output_state", "ProcessingToolCalls");
-                    return Ok(ExecutionState::ProcessingToolCalls {
-                        remaining_calls,
-                        results,
-                        context,
-                    });
+                    tracing::Span::current().record("output_state", "BeforeLlmCall");
+                    return Ok(state);
                 }
 
                 // Record the number of files being checked
@@ -422,21 +423,15 @@ impl MiddlewareDriver for DedupCheckMiddleware {
                     let new_context = Arc::new(context.inject_message(warning_message));
 
                     tracing::Span::current().record("warning_injected", true);
-                    tracing::Span::current().record("output_state", "ProcessingToolCalls");
-                    return Ok(ExecutionState::ProcessingToolCalls {
-                        remaining_calls,
-                        results,
+                    tracing::Span::current().record("output_state", "BeforeLlmCall");
+                    return Ok(ExecutionState::BeforeLlmCall {
                         context: new_context,
                     });
                 }
 
                 tracing::Span::current().record("warning_injected", false);
-                tracing::Span::current().record("output_state", "ProcessingToolCalls");
-                Ok(ExecutionState::ProcessingToolCalls {
-                    remaining_calls,
-                    results,
-                    context,
-                })
+                tracing::Span::current().record("output_state", "BeforeLlmCall");
+                Ok(state)
             }
 
             // Pass through all other states

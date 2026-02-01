@@ -1,9 +1,10 @@
 use crate::agent::core::{QueryMTAgent, SnapshotPolicy, ToolConfig, ToolPolicy};
 use crate::agent::execution::CycleOutcome;
+use crate::agent::execution_context::ExecutionContext;
 use crate::delegation::DefaultAgentRegistry;
 use crate::event_bus::EventBus;
 use crate::events::AgentEventKind;
-use crate::session::provider::SessionContext;
+use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::SessionStore;
 use crate::test_utils::{
@@ -28,8 +29,8 @@ use tokio::sync::{Mutex, oneshot, watch};
 struct TestHarness {
     agent: QueryMTAgent,
     session_id: String,
-    context: SessionContext,
-    runtime_context: RuntimeContext,
+    context: SessionHandle,
+    exec_ctx: ExecutionContext,
     provider: Arc<Mutex<MockLlmProvider>>,
     _temp_dir: TempDir,
 }
@@ -133,7 +134,7 @@ impl TestHarness {
         );
         let provider_context = Arc::new(provider_context);
 
-        let context = SessionContext::new(provider_context.clone(), session_for_context)
+        let context = SessionHandle::new(provider_context.clone(), session_for_context)
             .await
             .expect("context");
 
@@ -184,11 +185,27 @@ impl TestHarness {
             config.policy = ToolPolicy::ProviderOnly;
         }
 
+        // Create a SessionRuntime for the execution context
+        let session_runtime = Arc::new(crate::agent::core::SessionRuntime {
+            cwd: None,
+            _mcp_services: HashMap::new(),
+            mcp_tools: HashMap::new(),
+            mcp_tool_defs: Vec::new(),
+            permission_cache: StdMutex::new(HashMap::new()),
+            current_tools_hash: StdMutex::new(None),
+            function_index: Arc::new(tokio::sync::OnceCell::new()),
+            pre_step_snapshot: StdMutex::new(None),
+            current_step_id: StdMutex::new(None),
+            last_step_diff: StdMutex::new(None),
+        });
+
+        let exec_ctx = ExecutionContext::new(session_id.clone(), session_runtime, runtime_context);
+
         Self {
             agent,
             session_id,
             context,
-            runtime_context,
+            exec_ctx,
             provider,
             _temp_dir: temp_dir,
         }
@@ -196,7 +213,7 @@ impl TestHarness {
 
     async fn run(&mut self, cancel_rx: watch::Receiver<bool>) -> CycleOutcome {
         self.agent
-            .execute_cycle_state_machine(&self.context, None, &mut self.runtime_context, cancel_rx)
+            .execute_cycle_state_machine(&self.context, &mut self.exec_ctx, cancel_rx)
             .await
             .expect("state machine")
     }
@@ -391,7 +408,7 @@ async fn test_llm_error_returns_err() {
     let (_tx, rx) = watch::channel(false);
     let result = harness
         .agent
-        .execute_cycle_state_machine(&harness.context, None, &mut harness.runtime_context, rx)
+        .execute_cycle_state_machine(&harness.context, &mut harness.exec_ctx, rx)
         .await;
 
     assert!(result.is_err());

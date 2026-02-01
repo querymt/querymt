@@ -4,7 +4,8 @@
 //! state machine. Each transition method handles a specific state and returns
 //! the next state to transition to.
 
-use crate::agent::core::{QueryMTAgent, SessionRuntime};
+use crate::agent::core::QueryMTAgent;
+use crate::agent::execution_context::ExecutionContext;
 use crate::delegation::{format_delegation_completion_message, format_delegation_failure_message};
 use crate::events::{AgentEvent, AgentEventKind, ExecutionMetrics, StopType};
 use crate::middleware::{
@@ -13,7 +14,6 @@ use crate::middleware::{
 };
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::TaskStatus;
-use crate::session::runtime::RuntimeContext;
 use agent_client_protocol::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
 use anyhow::Context;
 use futures_util::StreamExt;
@@ -50,31 +50,28 @@ pub(crate) struct ProcessingToolCallsParams<'a> {
     pub remaining_calls: &'a Arc<[MiddlewareToolCall]>,
     pub results: &'a Arc<[ToolResult]>,
     pub context: &'a Arc<ConversationContext>,
-    pub runtime: Option<&'a SessionRuntime>,
-    pub runtime_context: &'a RuntimeContext,
+    pub exec_ctx: &'a mut ExecutionContext,
     pub cancel_rx: &'a watch::Receiver<bool>,
-    pub session_id: &'a str,
 }
 
 impl QueryMTAgent {
     #[instrument(
         name = "agent.state.before_turn",
-        skip(self, context, runtime, cancel_rx),
+        skip(self, context, exec_ctx, cancel_rx),
         fields(
-            session_id = %session_id,
+            session_id = %exec_ctx.session_id,
             steps = %context.stats.steps
         )
     )]
     pub(crate) async fn transition_before_llm_call(
         &self,
         context: &Arc<ConversationContext>,
-        runtime: Option<&SessionRuntime>,
+        exec_ctx: &ExecutionContext,
         cancel_rx: &watch::Receiver<bool>,
-        session_id: &str,
     ) -> Result<ExecutionState, anyhow::Error> {
         debug!(
             "BeforeLlmCall: session={}, steps={}",
-            session_id, context.stats.steps
+            exec_ctx.session_id, context.stats.steps
         );
 
         if *cancel_rx.borrow() {
@@ -83,7 +80,7 @@ impl QueryMTAgent {
 
         let provider_context = self
             .provider
-            .with_session(session_id)
+            .with_session(&exec_ctx.session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
         let provider = provider_context
@@ -91,7 +88,7 @@ impl QueryMTAgent {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to build provider: {}", e))?;
 
-        let tools = self.collect_tools(provider, runtime);
+        let tools = self.collect_tools(provider, Some(exec_ctx.runtime.as_ref()));
 
         // Serialize tools to compute hash
         let tools_json =
@@ -99,20 +96,16 @@ impl QueryMTAgent {
         let new_hash = crate::hash::RapidHash::new(&tools_json);
 
         // Check if changed (or first time)
-        let should_emit = if let Some(runtime) = runtime {
-            let mut current = runtime.current_tools_hash.lock().unwrap();
-            let changed = current.is_none_or(|h| h != new_hash);
-            if changed {
-                *current = Some(new_hash);
-            }
-            changed
-        } else {
-            true // No runtime = first time, emit
-        };
+        let mut current = exec_ctx.runtime.current_tools_hash.lock().unwrap();
+        let changed = current.is_none_or(|h| h != new_hash);
+        if changed {
+            *current = Some(new_hash);
+        }
+        let should_emit = changed;
 
         if should_emit {
             self.emit_event(
-                session_id,
+                &exec_ctx.session_id,
                 crate::events::AgentEventKind::ToolsAvailable {
                     tools: tools.clone(),
                     tools_hash: new_hash,
@@ -346,9 +339,9 @@ impl QueryMTAgent {
 
     #[instrument(
         name = "agent.state.after_llm",
-        skip(self, response, context, runtime_context, cancel_rx),
+        skip(self, response, context, exec_ctx, cancel_rx),
         fields(
-            session_id = %session_id,
+            session_id = %exec_ctx.session_id,
             has_tool_calls = %response.has_tool_calls()
         )
     )]
@@ -356,13 +349,12 @@ impl QueryMTAgent {
         &self,
         response: &Arc<LlmResponse>,
         context: &Arc<ConversationContext>,
-        runtime_context: &mut RuntimeContext,
+        exec_ctx: &mut ExecutionContext,
         cancel_rx: &watch::Receiver<bool>,
-        session_id: &str,
     ) -> Result<ExecutionState, anyhow::Error> {
         debug!(
             "AfterLlm: session={}, has_tool_calls={}",
-            session_id,
+            exec_ctx.session_id,
             response.has_tool_calls()
         );
 
@@ -380,7 +372,8 @@ impl QueryMTAgent {
             "Received response from LLM".to_string()
         };
 
-        let progress_entry = runtime_context
+        let progress_entry = exec_ctx
+            .state
             .record_progress(
                 crate::session::domain::ProgressKind::Note,
                 progress_description,
@@ -390,14 +383,14 @@ impl QueryMTAgent {
             .map_err(|e| anyhow::anyhow!("Failed to record progress: {}", e))?;
 
         self.emit_event(
-            session_id,
+            &exec_ctx.session_id,
             AgentEventKind::ProgressRecorded { progress_entry },
         );
 
         let mut parts = Vec::new();
         if !response.content.is_empty() {
             self.send_session_update(
-                session_id,
+                &exec_ctx.session_id,
                 SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
                     TextContent::new(response.content.clone()),
                 ))),
@@ -420,7 +413,7 @@ impl QueryMTAgent {
 
         let assistant_msg = AgentMessage {
             id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
+            session_id: exec_ctx.session_id.clone(),
             role: ChatRole::Assistant,
             parts,
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -429,7 +422,7 @@ impl QueryMTAgent {
 
         let provider_context = self
             .provider
-            .with_session(session_id)
+            .with_session(&exec_ctx.session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
 
@@ -439,7 +432,7 @@ impl QueryMTAgent {
             .map_err(|e| anyhow::anyhow!("Failed to store assistant message: {}", e))?;
 
         self.emit_event(
-            session_id,
+            &exec_ctx.session_id,
             AgentEventKind::AssistantMessageStored {
                 content: response.content.clone(),
                 message_id: Some(assistant_msg.id.clone()),
@@ -491,11 +484,14 @@ impl QueryMTAgent {
 
             Some(FinishReason::Stop) => {
                 // Model is done - mark active task as complete if any
-                if runtime_context.active_task.is_some() {
-                    if let Err(e) = runtime_context.update_task_status(TaskStatus::Done).await {
+                if exec_ctx.state.active_task.is_some() {
+                    if let Err(e) = exec_ctx.state.update_task_status(TaskStatus::Done).await {
                         debug!("Failed to auto-complete task on stop: {}", e);
-                    } else if let Some(task) = runtime_context.active_task.clone() {
-                        self.emit_event(session_id, AgentEventKind::TaskStatusChanged { task });
+                    } else if let Some(task) = exec_ctx.state.active_task.clone() {
+                        self.emit_event(
+                            &exec_ctx.session_id,
+                            AgentEventKind::TaskStatusChanged { task },
+                        );
                     }
                 }
                 Ok(ExecutionState::Complete)
@@ -539,28 +535,26 @@ impl QueryMTAgent {
         name = "agent.state.processing_tools",
         skip(self, params),
         fields(
-            session_id = %params.session_id,
+            session_id = %params.exec_ctx.session_id,
             remaining = %params.remaining_calls.len(),
             completed = %params.results.len()
         )
     )]
     pub(crate) async fn transition_processing_tool_calls(
         &self,
-        params: ProcessingToolCallsParams<'_>,
+        mut params: ProcessingToolCallsParams<'_>,
     ) -> Result<ExecutionState, anyhow::Error> {
         let ProcessingToolCallsParams {
             remaining_calls,
             results,
             context,
-            runtime,
-            runtime_context,
+            exec_ctx,
             cancel_rx,
-            session_id,
-        } = params;
+        } = &mut params;
 
         debug!(
             "ProcessingToolCalls: session={}, remaining={}, completed={}",
-            session_id,
+            exec_ctx.session_id,
             remaining_calls.len(),
             results.len()
         );
@@ -572,7 +566,7 @@ impl QueryMTAgent {
         if remaining_calls.is_empty() {
             // All tool calls processed, store all results and continue
             return self
-                .store_all_tool_results(results, context, runtime_context, session_id)
+                .store_all_tool_results(results, context, exec_ctx)
                 .await;
         }
 
@@ -580,12 +574,12 @@ impl QueryMTAgent {
         debug!(
             "Executing {} tool calls in parallel for session {}",
             remaining_calls.len(),
-            session_id
+            exec_ctx.session_id
         );
 
         let futures: Vec<_> = remaining_calls
             .iter()
-            .map(|call| self.execute_tool_call(call, context, runtime, runtime_context, session_id))
+            .map(|call| self.execute_tool_call(call, exec_ctx))
             .collect();
 
         // Race tool execution with cancellation for faster cancellation
@@ -598,7 +592,7 @@ impl QueryMTAgent {
         };
 
         // Collect results, propagating errors
-        let mut all_results = (*results).to_vec();
+        let mut all_results = (**results).to_vec();
         for result in tool_results {
             all_results.push(result?);
         }
@@ -606,7 +600,7 @@ impl QueryMTAgent {
         debug!(
             "Completed {} tool calls for session {}",
             all_results.len() - results.len(),
-            session_id
+            exec_ctx.session_id
         );
 
         // All tools processed — return with empty remaining_calls
@@ -620,9 +614,9 @@ impl QueryMTAgent {
 
     #[instrument(
         name = "agent.state.waiting",
-        skip(self, wait, context, runtime_context, cancel_rx, event_rx),
+        skip(self, wait, context, exec_ctx, cancel_rx, event_rx),
         fields(
-            session_id = %session_id,
+            session_id = %exec_ctx.session_id,
             reason = ?wait.reason
         )
     )]
@@ -630,14 +624,13 @@ impl QueryMTAgent {
         &self,
         wait: &WaitCondition,
         context: &Arc<ConversationContext>,
-        runtime_context: &RuntimeContext,
+        exec_ctx: &ExecutionContext,
         cancel_rx: &mut watch::Receiver<bool>,
         event_rx: &mut broadcast::Receiver<AgentEvent>,
-        session_id: &str,
     ) -> Result<ExecutionState, anyhow::Error> {
         debug!(
             "WaitingForEvent: session={}, reason={:?}",
-            session_id, wait.reason
+            exec_ctx.session_id, wait.reason
         );
 
         if *cancel_rx.borrow() {
@@ -665,13 +658,13 @@ impl QueryMTAgent {
                         }
                     };
 
-                    if event.session_id != session_id {
+                    if event.session_id != exec_ctx.session_id {
                         continue;
                     }
 
                     if let Some(message) = match_wait_event(wait, &event) {
                         let new_context = self
-                            .inject_wait_message(context, runtime_context, session_id, message)
+                            .inject_wait_message(context, &exec_ctx.session_id, message)
                             .await?;
                         return Ok(ExecutionState::BeforeLlmCall {
                             context: new_context,
@@ -685,7 +678,6 @@ impl QueryMTAgent {
     async fn inject_wait_message(
         &self,
         context: &Arc<ConversationContext>,
-        _runtime_context: &RuntimeContext,
         session_id: &str,
         content: String,
     ) -> Result<Arc<ConversationContext>, anyhow::Error> {

@@ -1,6 +1,6 @@
-import { useState } from 'react';
 import { Check } from 'lucide-react';
 import { getFileIcon, getFileIconColor } from '../utils/fileIcons';
+import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
 import type { FileMention as FileMentionType } from '../utils/fileMentionParser';
 
 interface FileMentionProps {
@@ -8,20 +8,15 @@ interface FileMentionProps {
 }
 
 export function FileMention({ mention }: FileMentionProps) {
-  const [copied, setCopied] = useState(false);
   const Icon = getFileIcon(mention.extension, mention.type === 'dir');
   const iconColor = getFileIconColor(mention.extension, mention.type === 'dir');
+  const { copiedValue, copy } = useCopyToClipboard({ resetDelay: 1500 });
+  
+  const copied = copiedValue === mention.path;
 
   const handleClick = async (e: React.MouseEvent) => {
     e.preventDefault();
-    
-    try {
-      await navigator.clipboard.writeText(mention.path);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch (err) {
-      console.error('Failed to copy path:', err);
-    }
+    await copy(mention.path, mention.path);
   };
 
   return (

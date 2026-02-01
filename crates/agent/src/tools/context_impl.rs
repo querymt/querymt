@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use crate::tools::context::{ToolContext, ToolError};
 
@@ -13,7 +12,6 @@ pub struct AgentToolContext {
     session_id: String,
     cwd: Option<PathBuf>,
     agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry>>,
-    _permission_cache: Option<Arc<Mutex<std::collections::HashMap<String, bool>>>>,
 }
 
 impl AgentToolContext {
@@ -21,19 +19,17 @@ impl AgentToolContext {
         session_id: String,
         cwd: Option<PathBuf>,
         agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry>>,
-        permission_cache: Option<Arc<Mutex<std::collections::HashMap<String, bool>>>>,
     ) -> Self {
         Self {
             session_id,
             cwd,
             agent_registry,
-            _permission_cache: permission_cache,
         }
     }
 
     /// Create a basic context for testing or simple operations
     pub fn basic(session_id: String, cwd: Option<PathBuf>) -> Self {
-        Self::new(session_id, cwd, None, None)
+        Self::new(session_id, cwd, None)
     }
 }
 

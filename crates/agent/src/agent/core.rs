@@ -102,6 +102,8 @@ pub struct SessionRuntime {
     pub pre_step_snapshot: StdMutex<Option<String>>,
     /// Step ID for the current step (for associating snapshots)
     pub current_step_id: StdMutex<Option<String>>,
+    /// Changed file paths from the last step's tool executions (for dedup check)
+    pub last_step_diff: StdMutex<Option<crate::index::DiffPaths>>,
 }
 
 /// Policy for tool usage and availability.

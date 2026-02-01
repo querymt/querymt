@@ -2,7 +2,7 @@
  * Large modal for showing full tool details - input, output, diffs
  */
 
-import { useState } from 'react';
+
 import * as Dialog from '@radix-ui/react-dialog';
 import { X, Clock, CheckCircle, XCircle, Loader, Copy, Check } from 'lucide-react';
 import { PatchDiff } from '@pierre/diffs/react';
@@ -11,6 +11,7 @@ import { generateToolSummary } from '../utils/toolSummary';
 import { HighlightedCode } from './HighlightedCode';
 import { isMarkdownFile } from '../utils/languageDetection';
 import { MessageContent } from './MessageContent';
+import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
 
 export interface ToolDetailModalProps {
   event: EventItem & { mergedResult?: EventItem };
@@ -18,8 +19,6 @@ export interface ToolDetailModalProps {
 }
 
 export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
-  const [copiedSection, setCopiedSection] = useState<string | null>(null);
-
   const toolKind = event.toolCall?.kind;
   const toolName = inferToolName(event);
   const rawInput = parseJsonMaybe(event.toolCall?.raw_input) ?? event.toolCall?.raw_input;
@@ -35,16 +34,8 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
   const isCompleted = status === 'completed';
   const isFailed = status === 'failed';
 
-  // Copy helper
-  const copyToClipboard = async (text: string, section: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedSection(section);
-      setTimeout(() => setCopiedSection(null), 2000);
-    } catch (err) {
-      console.error('Failed to copy:', err);
-    }
-  };
+  // Copy to clipboard hook
+  const { copiedValue: copiedSection, copy: copyToClipboard } = useCopyToClipboard();
 
   // Check for special tool types
   const isEdit = toolKind === 'edit' || toolKind === 'mcp_edit';

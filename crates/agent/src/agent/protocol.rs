@@ -166,6 +166,7 @@ impl SendAgent for QueryMTAgent {
             function_index,
             pre_step_snapshot: std::sync::Mutex::new(None),
             current_step_id: std::sync::Mutex::new(None),
+            last_step_diff: std::sync::Mutex::new(None),
         });
 
         {
@@ -302,6 +303,7 @@ impl SendAgent for QueryMTAgent {
             function_index: Arc::new(tokio::sync::OnceCell::new()),
             pre_step_snapshot: std::sync::Mutex::new(None),
             current_step_id: std::sync::Mutex::new(None),
+            last_step_diff: std::sync::Mutex::new(None),
         });
 
         {
@@ -490,6 +492,7 @@ impl SendAgent for QueryMTAgent {
             function_index: Arc::new(tokio::sync::OnceCell::new()),
             pre_step_snapshot: std::sync::Mutex::new(None),
             current_step_id: std::sync::Mutex::new(None),
+            last_step_diff: std::sync::Mutex::new(None),
         });
 
         {

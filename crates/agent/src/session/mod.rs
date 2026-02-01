@@ -3,7 +3,7 @@ pub use error::{SessionError, SessionResult};
 
 pub mod domain;
 pub mod provider;
-pub use provider::{SessionContext, SessionProvider};
+pub use provider::{SessionHandle, SessionProvider};
 pub mod repository;
 pub mod schema;
 pub mod sqlite_storage;

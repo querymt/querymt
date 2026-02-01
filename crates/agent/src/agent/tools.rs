@@ -1,8 +1,8 @@
 //! Tool management and permission handling
 
 use crate::agent::core::{QueryMTAgent, SessionRuntime};
+use crate::agent::execution_context::ExecutionContext;
 use crate::agent::utils::{extract_locations, tool_kind_for_tool};
-use crate::session::runtime::RuntimeContext;
 use agent_client_protocol::{
     Error, PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
     RequestPermissionRequest, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
@@ -65,9 +65,7 @@ impl QueryMTAgent {
     /// Ensures tool permission is granted before execution.
     pub(crate) async fn ensure_tool_permission(
         &self,
-        session_id: &str,
-        runtime: &SessionRuntime,
-        runtime_context: &RuntimeContext,
+        exec_ctx: &ExecutionContext,
         tool_call_id: &str,
         tool_name: &str,
         args: &serde_json::Value,
@@ -78,13 +76,13 @@ impl QueryMTAgent {
         }
 
         // Phase 5: Intent-based check
-        if let Some(task) = &runtime_context.active_task
+        if let Some(task) = &exec_ctx.state.active_task
             && task.status != crate::session::domain::TaskStatus::Active
         {
             return Ok(false);
         }
 
-        if let Ok(cache) = runtime.permission_cache.lock()
+        if let Ok(cache) = exec_ctx.runtime.permission_cache.lock()
             && let Some(cached) = cache.get(tool_name)
         {
             return Ok(*cached);
@@ -92,10 +90,11 @@ impl QueryMTAgent {
 
         let permission_id = Uuid::new_v4().to_string();
         self.emit_event(
-            session_id,
+            &exec_ctx.session_id,
             AgentEventKind::PermissionRequested {
                 permission_id: permission_id.clone(),
-                task_id: runtime_context
+                task_id: exec_ctx
+                    .state
                     .active_task
                     .as_ref()
                     .map(|task| task.public_id.clone()),
@@ -111,7 +110,7 @@ impl QueryMTAgent {
         // If neither bridge nor client is available, auto-grant permission
         if bridge.is_none() && client.is_none() {
             self.emit_event(
-                session_id,
+                &exec_ctx.session_id,
                 AgentEventKind::PermissionGranted {
                     permission_id,
                     granted: true,
@@ -133,7 +132,7 @@ impl QueryMTAgent {
             .raw_input(args.clone());
 
         let request = RequestPermissionRequest::new(
-            session_id.to_string(),
+            exec_ctx.session_id.clone(),
             ToolCallUpdate::new(
                 ToolCallId::from(tool_call_id.to_string()),
                 tool_update_fields,
@@ -181,7 +180,7 @@ impl QueryMTAgent {
             RequestPermissionOutcome::Selected(selected) => {
                 let option_id = selected.option_id.0.as_ref();
                 let allow = option_id == "allow_once" || option_id == "allow_always";
-                if let Ok(mut cache) = runtime.permission_cache.lock() {
+                if let Ok(mut cache) = exec_ctx.runtime.permission_cache.lock() {
                     if option_id == "allow_always" {
                         cache.insert(tool_name.to_string(), true);
                     } else if option_id == "reject_always" {
@@ -194,7 +193,7 @@ impl QueryMTAgent {
         };
 
         self.emit_event(
-            session_id,
+            &exec_ctx.session_id,
             AgentEventKind::PermissionGranted {
                 permission_id,
                 granted,

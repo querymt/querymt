@@ -10,7 +10,8 @@ import { PinnedUserMessage } from './PinnedUserMessage';
 import { ModelConfigPopover } from './ModelConfigPopover';
 import { getAgentShortName } from '../utils/agentNames';
 import { getAgentColor } from '../utils/agentColors';
-import { Undo2, Redo2 } from 'lucide-react';
+import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
+import { Undo2, Redo2, Copy, Check } from 'lucide-react';
 
 export interface TurnCardProps {
   turn: Turn;
@@ -137,6 +138,9 @@ export const TurnCard = memo(function TurnCard({
   // Model config popover state
   const [showConfigPopover, setShowConfigPopover] = useState(false);
 
+  // Copy to clipboard hook
+  const { copiedValue: copiedSection, copy: copyToClipboard } = useCopyToClipboard();
+
   useEffect(() => {
     if (!isLastUserMessage || !userMessageRef.current || !turn.userMessage) return;
     
@@ -176,6 +180,17 @@ export const TurnCard = memo(function TurnCard({
             <span className="text-[10px] text-gray-500">
               {new Date(turn.userMessage.timestamp).toLocaleTimeString()}
             </span>
+            <button
+              onClick={() => copyToClipboard(turn.userMessage!.content, 'user-message')}
+              className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-cyber-bg/50"
+              title="Copy message"
+            >
+              {copiedSection === 'user-message' ? (
+                <Check className="w-3.5 h-3.5 text-cyber-lime" />
+              ) : (
+                <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
+              )}
+            </button>
           </div>
           <div className="bg-cyber-surface/60 border border-cyber-magenta/20 rounded-lg px-4 py-3">
             <MessageContent content={turn.userMessage.content} />
@@ -204,6 +219,21 @@ export const TurnCard = memo(function TurnCard({
                 thinking...
               </span>
             )}
+            {/* Copy agent turn button */}
+            <button
+              onClick={() => {
+                const agentContent = turn.agentMessages.map(m => m.content).join('\n\n');
+                copyToClipboard(agentContent, 'agent-turn');
+              }}
+              className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-cyber-bg/50"
+              title="Copy agent response"
+            >
+              {copiedSection === 'agent-turn' ? (
+                <Check className="w-3.5 h-3.5 text-cyber-lime" />
+              ) : (
+                <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
+              )}
+            </button>
           </div>
           {/* Right: model label */}
           {showModelLabel && turn.modelLabel && turn.modelConfigId && requestLlmConfig ? (
@@ -246,7 +276,18 @@ export const TurnCard = memo(function TurnCard({
               {interleaved.map((item, idx) => {
                 if (item.type === 'message') {
                   return (
-                    <div key={item.event.id} className={idx > 0 ? 'pt-3 border-t border-cyber-border/30' : ''}>
+                    <div key={item.event.id} className={`${idx > 0 ? 'pt-3 border-t border-cyber-border/30' : ''} group/message relative`}>
+                      <button
+                        onClick={() => copyToClipboard(item.event.content, `message-${item.event.id}`)}
+                        className="absolute top-2 right-2 opacity-0 group-hover/message:opacity-100 transition-opacity p-1.5 rounded hover:bg-cyber-bg/50"
+                        title="Copy message"
+                      >
+                        {copiedSection === `message-${item.event.id}` ? (
+                          <Check className="w-3.5 h-3.5 text-cyber-lime" />
+                        ) : (
+                          <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
+                        )}
+                      </button>
                       <MessageContent content={item.event.content} />
                     </div>
                   );

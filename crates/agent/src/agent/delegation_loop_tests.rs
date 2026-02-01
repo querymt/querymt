@@ -3,6 +3,7 @@ use crate::agent::core::{
     ToolPolicy,
 };
 use crate::agent::execution::CycleOutcome;
+use crate::agent::execution_context::ExecutionContext;
 use crate::delegation::{AgentInfo, DefaultAgentRegistry, DelegationOrchestrator};
 use crate::event_bus::EventBus;
 use crate::events::StopType;
@@ -13,7 +14,7 @@ use crate::middleware::{
 use crate::model::{AgentMessage, MessagePart};
 use crate::send_agent::SendAgent;
 use crate::session::domain::{Delegation, DelegationStatus};
-use crate::session::provider::SessionContext;
+use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::SessionStore;
 use crate::test_utils::{
@@ -157,8 +158,8 @@ impl SendAgent for StubDelegateAgent {
 
 struct TestHarness {
     agent: Arc<QueryMTAgent>,
-    context: SessionContext,
-    runtime_context: RuntimeContext,
+    context: SessionHandle,
+    exec_ctx: ExecutionContext,
     provider: Arc<Mutex<MockLlmProvider>>,
     _temp_dir: TempDir,
 }
@@ -249,7 +250,7 @@ impl TestHarness {
         );
         let provider_context = Arc::new(provider_context);
 
-        let context = SessionContext::new(provider_context.clone(), session_for_context)
+        let context = SessionHandle::new(provider_context.clone(), session_for_context)
             .await
             .expect("context");
 
@@ -315,10 +316,27 @@ impl TestHarness {
         ));
         agent.add_observer(orchestrator);
 
+        // Create a SessionRuntime for the execution context
+        let session_runtime = Arc::new(crate::agent::core::SessionRuntime {
+            cwd: None,
+            _mcp_services: HashMap::new(),
+            mcp_tools: HashMap::new(),
+            mcp_tool_defs: Vec::new(),
+            permission_cache: StdMutex::new(HashMap::new()),
+            current_tools_hash: StdMutex::new(None),
+            function_index: Arc::new(tokio::sync::OnceCell::new()),
+            pre_step_snapshot: StdMutex::new(None),
+            current_step_id: StdMutex::new(None),
+            last_step_diff: StdMutex::new(None),
+        });
+
+        let session_id = "sess-test".to_string();
+        let exec_ctx = ExecutionContext::new(session_id, session_runtime, runtime_context);
+
         Self {
             agent,
             context,
-            runtime_context,
+            exec_ctx,
             provider,
             _temp_dir: temp_dir,
         }
@@ -327,7 +345,7 @@ impl TestHarness {
     async fn run(&mut self) -> CycleOutcome {
         let (_tx, rx) = tokio::sync::watch::channel(false);
         self.agent
-            .execute_cycle_state_machine(&self.context, None, &mut self.runtime_context, rx)
+            .execute_cycle_state_machine(&self.context, &mut self.exec_ctx, rx)
             .await
             .expect("state machine")
     }

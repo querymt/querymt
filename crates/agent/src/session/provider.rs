@@ -39,12 +39,12 @@ impl SessionProvider {
     }
 
     /// Load an existing session by ID
-    pub async fn with_session(&self, session_id: &str) -> SessionResult<SessionContext> {
+    pub async fn with_session(&self, session_id: &str) -> SessionResult<SessionHandle> {
         let session = self
             .get_session(session_id)
             .await?
             .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))?;
-        SessionContext::new(Arc::new(self.clone()), session).await
+        SessionHandle::new(Arc::new(self.clone()), session).await
     }
 
     /// Create a new session with optional cwd and parent
@@ -52,7 +52,7 @@ impl SessionProvider {
         &self,
         cwd: Option<std::path::PathBuf>,
         parent_session_id: Option<&str>,
-    ) -> SessionResult<SessionContext> {
+    ) -> SessionResult<SessionHandle> {
         let fork_origin = if parent_session_id.is_some() {
             Some(crate::session::domain::ForkOrigin::Delegation)
         } else {
@@ -75,7 +75,7 @@ impl SessionProvider {
             .set_session_llm_config(&session.public_id, llm_config.id)
             .await?;
         session.llm_config_id = Some(llm_config.id);
-        SessionContext::new(Arc::new(self.clone()), session).await
+        SessionHandle::new(Arc::new(self.clone()), session).await
     }
 
     pub fn history_store(&self) -> Arc<dyn SessionStore> {
@@ -152,12 +152,17 @@ impl Clone for SessionProvider {
     }
 }
 
-pub struct SessionContext {
+/// A handle to an active session, providing access to the session's LLM provider
+/// and message history.
+///
+/// This handle encapsulates the session state and provides methods for interacting
+/// with the LLM and managing conversation history.
+pub struct SessionHandle {
     provider: Arc<SessionProvider>,
     session: Session,
 }
 
-impl SessionContext {
+impl SessionHandle {
     pub async fn new(provider: Arc<SessionProvider>, session: Session) -> SessionResult<Self> {
         Ok(Self { provider, session })
     }

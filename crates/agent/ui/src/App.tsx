@@ -15,6 +15,7 @@ import { TurnCard } from './components/TurnCard';
 import { DelegationsView } from './components/DelegationsView';
 import { DelegationDrawer } from './components/DelegationDrawer';
 import { TodoRail } from './components/TodoRail';
+import { copyToClipboard } from './utils/clipboard';
 
 import { GlitchText } from './components/GlitchText';
 import { SessionPicker } from './components/SessionPicker';
@@ -193,20 +194,9 @@ function App() {
   const handleCopySessionId = async () => {
     if (!sessionId) return;
     const text = String(sessionId);
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const textarea = document.createElement('textarea');
-        textarea.value = text;
-        textarea.setAttribute('readonly', 'true');
-        textarea.style.position = 'absolute';
-        textarea.style.left = '-9999px';
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand('copy');
-        document.body.removeChild(textarea);
-      }
+    const success = await copyToClipboard(text);
+    
+    if (success) {
       setSessionCopied(true);
       if (copyTimeoutRef.current) {
         window.clearTimeout(copyTimeoutRef.current);
@@ -214,8 +204,6 @@ function App() {
       copyTimeoutRef.current = window.setTimeout(() => {
         setSessionCopied(false);
       }, 1500);
-    } catch (err) {
-      console.error('Failed to copy session id:', err);
     }
   };
 

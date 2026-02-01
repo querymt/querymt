@@ -7,14 +7,15 @@
 //! State transitions are implemented in the `transitions` module.
 //! Tool execution logic is in the `tool_execution` module.
 
-use crate::agent::core::{QueryMTAgent, SessionRuntime};
+use crate::agent::core::QueryMTAgent;
+use crate::agent::execution_context::ExecutionContext;
 use crate::agent::transitions::ProcessingToolCallsParams;
 use crate::agent::utils::{format_prompt_blocks, format_prompt_user_text_only};
 use crate::events::{AgentEventKind, ExecutionMetrics, StopType};
 use crate::middleware::{AgentStats, ConversationContext, ExecutionState};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::compaction::SessionCompaction;
-use crate::session::provider::SessionContext;
+use crate::session::provider::SessionHandle;
 use crate::session::pruning::{
     PruneConfig, SimpleTokenEstimator, compute_prune_candidates, extract_call_ids,
 };
@@ -159,8 +160,9 @@ impl QueryMTAgent {
 
         // 5. Execute Agent Loop using State Machine
         info!("Initializing execution cycle for session {}", session_id);
+        let mut exec_ctx = ExecutionContext::new(session_id.clone(), runtime, runtime_context);
         let result = self
-            .execute_cycle_state_machine(&context, Some(runtime.as_ref()), &mut runtime_context, rx)
+            .execute_cycle_state_machine(&context, &mut exec_ctx, rx)
             .await;
 
         // 6. Cleanup
@@ -189,7 +191,7 @@ impl QueryMTAgent {
     /// Executes a single agent cycle using state machine pattern
     #[instrument(
         name = "agent.execute_cycle",
-        skip(self, context, runtime, runtime_context, cancel_rx),
+        skip(self, context, exec_ctx, cancel_rx),
         fields(
             session_id = %context.session().public_id,
             provider = tracing::field::Empty,
@@ -198,9 +200,8 @@ impl QueryMTAgent {
     )]
     pub(crate) async fn execute_cycle_state_machine(
         &self,
-        context: &SessionContext,
-        runtime: Option<&SessionRuntime>,
-        runtime_context: &mut RuntimeContext,
+        context: &SessionHandle,
+        exec_ctx: &mut ExecutionContext,
         mut cancel_rx: watch::Receiver<bool>,
     ) -> Result<CycleOutcome, anyhow::Error> {
         debug!(
@@ -285,15 +286,11 @@ impl QueryMTAgent {
                         && let Some(ref worktree) = self.snapshot_root
                     {
                         let step_id = Uuid::new_v4().to_string();
-                        if let Some(rt) = runtime {
-                            *rt.current_step_id.lock().unwrap() = Some(step_id.clone());
-                        }
+                        *exec_ctx.runtime.current_step_id.lock().unwrap() = Some(step_id.clone());
                         match backend.track(worktree).await {
                             Ok(snapshot_id) => {
-                                if let Some(rt) = runtime {
-                                    *rt.pre_step_snapshot.lock().unwrap() =
-                                        Some(snapshot_id.clone());
-                                }
+                                *exec_ctx.runtime.pre_step_snapshot.lock().unwrap() =
+                                    Some(snapshot_id.clone());
                                 debug!(
                                     "Pre-step snapshot created: {} (step {})",
                                     snapshot_id, step_id
@@ -335,13 +332,8 @@ impl QueryMTAgent {
                                 }
                             }
 
-                            self.transition_before_llm_call(
-                                conv_context,
-                                runtime,
-                                &cancel_rx,
-                                &conv_context.session_id,
-                            )
-                            .await?
+                            self.transition_before_llm_call(conv_context, exec_ctx, &cancel_rx)
+                                .await?
                         }
                         other => other,
                     }
@@ -365,14 +357,8 @@ impl QueryMTAgent {
                             ref response,
                             ref context,
                         } => {
-                            self.transition_after_llm(
-                                response,
-                                context,
-                                runtime_context,
-                                &cancel_rx,
-                                &context.session_id,
-                            )
-                            .await?
+                            self.transition_after_llm(response, context, exec_ctx, &cancel_rx)
+                                .await?
                         }
                         other => other,
                     }
@@ -393,10 +379,8 @@ impl QueryMTAgent {
                                 remaining_calls,
                                 results,
                                 context,
-                                runtime,
-                                runtime_context,
+                                exec_ctx,
                                 cancel_rx: &cancel_rx,
-                                session_id: &context.session_id,
                             })
                             .await?
                         }
@@ -411,10 +395,9 @@ impl QueryMTAgent {
                     self.transition_waiting_for_event(
                         wait,
                         context,
-                        runtime_context,
+                        exec_ctx,
                         &mut cancel_rx,
                         &mut event_rx,
-                        &context.session_id,
                     )
                     .await?
                 }
@@ -426,10 +409,8 @@ impl QueryMTAgent {
                     if let Some(ref backend) = self.snapshot_backend
                         && let Some(ref worktree) = self.snapshot_root
                     {
-                        let pre_id =
-                            runtime.and_then(|rt| rt.pre_step_snapshot.lock().unwrap().take());
-                        let step_id =
-                            runtime.and_then(|rt| rt.current_step_id.lock().unwrap().take());
+                        let pre_id = exec_ctx.runtime.pre_step_snapshot.lock().unwrap().take();
+                        let step_id = exec_ctx.runtime.current_step_id.lock().unwrap().take();
 
                         if let (Some(pre_id), Some(step_id)) = (pre_id, step_id) {
                             match backend.track(worktree).await {
@@ -550,7 +531,7 @@ impl QueryMTAgent {
     /// Run pruning on the session history
     ///
     /// This marks old tool results as compacted based on the pruning configuration.
-    async fn run_pruning(&self, context: &SessionContext) -> Result<(), anyhow::Error> {
+    async fn run_pruning(&self, context: &SessionHandle) -> Result<(), anyhow::Error> {
         let session_id = &context.session().public_id;
         let messages = context
             .get_agent_history()
@@ -602,7 +583,7 @@ impl QueryMTAgent {
     /// then returns a new state to continue execution with filtered history.
     async fn run_ai_compaction(
         &self,
-        context: &SessionContext,
+        context: &SessionHandle,
         current_state: &ExecutionState,
     ) -> Result<ExecutionState, anyhow::Error> {
         let session_id = &context.session().public_id;

@@ -5,15 +5,14 @@
 //! - Recording side effects (artifacts, delegations)
 //! - Storing batch tool results
 
-use crate::agent::core::{QueryMTAgent, SessionRuntime, SnapshotPolicy};
+use crate::agent::core::{QueryMTAgent, SnapshotPolicy};
+use crate::agent::execution_context::ExecutionContext;
 use crate::agent::snapshots::{SnapshotState, snapshot_metadata};
 use crate::events::AgentEventKind;
 use crate::middleware::{
     ConversationContext, ExecutionState, ToolCall as MiddlewareToolCall, ToolResult, WaitCondition,
 };
 use crate::model::MessagePart;
-use crate::session::runtime::RuntimeContext;
-use crate::tools::AgentToolContext;
 use log::debug;
 use querymt::chat::ChatRole;
 use std::sync::Arc;
@@ -23,9 +22,9 @@ use uuid::Uuid;
 impl QueryMTAgent {
     #[instrument(
         name = "agent.tool_call",
-        skip(self, call, _context, runtime, runtime_context),
+        skip(self, call, exec_ctx),
         fields(
-            session_id = %session_id,
+            session_id = %exec_ctx.session_id,
             tool_name = %call.function.name,
             tool_call_id = %call.id,
             is_error = tracing::field::Empty
@@ -34,18 +33,15 @@ impl QueryMTAgent {
     pub(crate) async fn execute_tool_call(
         &self,
         call: &MiddlewareToolCall,
-        _context: &Arc<ConversationContext>,
-        runtime: Option<&SessionRuntime>,
-        runtime_context: &RuntimeContext,
-        session_id: &str,
+        exec_ctx: &ExecutionContext,
     ) -> Result<ToolResult, anyhow::Error> {
         debug!(
             "Executing tool: session={}, tool={}",
-            session_id, call.function.name
+            exec_ctx.session_id, call.function.name
         );
 
         self.emit_event(
-            session_id,
+            &exec_ctx.session_id,
             AgentEventKind::ToolCallStart {
                 tool_call_id: call.id.clone(),
                 tool_name: call.function.name.clone(),
@@ -57,7 +53,7 @@ impl QueryMTAgent {
             self.prepare_snapshot()
                 .map(|(root, policy)| {
                     self.emit_event(
-                        session_id,
+                        &exec_ctx.session_id,
                         AgentEventKind::SnapshotStart {
                             policy: policy.to_string(),
                         },
@@ -76,7 +72,8 @@ impl QueryMTAgent {
             SnapshotState::None
         };
 
-        let progress_entry = runtime_context
+        let progress_entry = exec_ctx
+            .state
             .record_progress(
                 crate::session::domain::ProgressKind::ToolCall,
                 format!("Calling tool: {}", call.function.name),
@@ -86,7 +83,7 @@ impl QueryMTAgent {
             .map_err(|e| anyhow::anyhow!("Failed to record progress: {}", e))?;
 
         self.emit_event(
-            session_id,
+            &exec_ctx.session_id,
             AgentEventKind::ProgressRecorded { progress_entry },
         );
 
@@ -95,20 +92,11 @@ impl QueryMTAgent {
 
         let provider_context = self
             .provider
-            .with_session(session_id)
+            .with_session(&exec_ctx.session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
 
-        let tool_context = AgentToolContext::new(
-            session_id.to_string(),
-            runtime.and_then(|r| r.cwd.as_ref().cloned()),
-            Some(self.agent_registry.clone()),
-            runtime.map(|r| {
-                Arc::new(std::sync::Mutex::new(
-                    r.permission_cache.lock().unwrap().clone(),
-                ))
-            }),
-        );
+        let tool_context = exec_ctx.tool_context(self.agent_registry.clone());
 
         let (raw_result_json, is_error) = if !self.is_tool_allowed(&call.function.name) {
             (
@@ -125,35 +113,18 @@ impl QueryMTAgent {
                 Ok(res) => (res, false),
                 Err(e) => (format!("Error: {}", e), true),
             }
-        } else if let Some(runtime) = runtime {
-            if let Some(tool) = runtime.mcp_tools.get(&call.function.name) {
-                use querymt::tool_decorator::CallFunctionTool;
-                match tool.call(args.clone()).await {
-                    Ok(res) => (res, false),
-                    Err(e) => (format!("Error: {}", e), true),
-                }
-            } else if !self
-                .ensure_tool_permission(
-                    session_id,
-                    runtime,
-                    runtime_context,
-                    &call.id,
-                    &call.function.name,
-                    &args,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?
-            {
-                ("Error: permission denied".to_string(), true)
-            } else {
-                match provider_context
-                    .call_tool(&call.function.name, args.clone())
-                    .await
-                {
-                    Ok(res) => (res, false),
-                    Err(e) => (format!("Error: {}", e), true),
-                }
+        } else if let Some(tool) = exec_ctx.runtime.mcp_tools.get(&call.function.name) {
+            use querymt::tool_decorator::CallFunctionTool;
+            match tool.call(args.clone()).await {
+                Ok(res) => (res, false),
+                Err(e) => (format!("Error: {}", e), true),
             }
+        } else if !self
+            .ensure_tool_permission(exec_ctx, &call.id, &call.function.name, &args)
+            .await
+            .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?
+        {
+            ("Error: permission denied".to_string(), true)
         } else {
             match provider_context
                 .call_tool(&call.function.name, args.clone())
@@ -183,7 +154,7 @@ impl QueryMTAgent {
                 let overflow = save_overflow_output(
                     &raw_result_json,
                     &config.overflow_storage,
-                    session_id,
+                    &exec_ctx.session_id,
                     &call.id,
                     None, // TODO: pass data_dir when available
                 );
@@ -204,7 +175,7 @@ impl QueryMTAgent {
         // via the EventBus path. The direct send_session_update() was removed to prevent
         // race conditions where the update could arrive before the initial ToolCall.
         self.emit_event(
-            session_id,
+            &exec_ctx.session_id,
             AgentEventKind::ToolCallEnd {
                 tool_call_id: call.id.clone(),
                 tool_name: call.function.name.clone(),
@@ -221,7 +192,7 @@ impl QueryMTAgent {
                 let post_tree = crate::index::merkle::MerkleTree::scan(root.as_path());
                 let changed_paths = post_tree.diff_paths(&pre_tree);
                 self.emit_event(
-                    session_id,
+                    &exec_ctx.session_id,
                     AgentEventKind::SnapshotEnd {
                         summary: Some(changed_paths.summary()),
                     },
@@ -233,7 +204,10 @@ impl QueryMTAgent {
             }
             SnapshotState::Metadata { root } => {
                 let (part, summary) = snapshot_metadata(root.as_path());
-                self.emit_event(session_id, AgentEventKind::SnapshotEnd { summary });
+                self.emit_event(
+                    &exec_ctx.session_id,
+                    AgentEventKind::SnapshotEnd { summary },
+                );
                 Some(part)
             }
             SnapshotState::None => None,
@@ -257,8 +231,7 @@ impl QueryMTAgent {
     pub(crate) async fn record_tool_side_effects(
         &self,
         result: &ToolResult,
-        runtime_context: &RuntimeContext,
-        session_id: &str,
+        exec_ctx: &ExecutionContext,
     ) -> Option<WaitCondition> {
         if result.is_error {
             return None;
@@ -276,7 +249,8 @@ impl QueryMTAgent {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            if let Ok(artifact) = runtime_context
+            if let Ok(artifact) = exec_ctx
+                .state
                 .record_artifact(
                     "file".to_string(),
                     None,
@@ -285,7 +259,10 @@ impl QueryMTAgent {
                 )
                 .await
             {
-                self.emit_event(session_id, AgentEventKind::ArtifactRecorded { artifact });
+                self.emit_event(
+                    &exec_ctx.session_id,
+                    AgentEventKind::ArtifactRecorded { artifact },
+                );
             }
         }
 
@@ -317,7 +294,8 @@ impl QueryMTAgent {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            if let Ok(delegation) = runtime_context
+            if let Ok(delegation) = exec_ctx
+                .state
                 .record_delegation(
                     target_agent_id.clone(),
                     objective.clone(),
@@ -328,7 +306,7 @@ impl QueryMTAgent {
                 .await
             {
                 self.emit_event(
-                    session_id,
+                    &exec_ctx.session_id,
                     AgentEventKind::DelegationRequested {
                         delegation: delegation.clone(),
                     },
@@ -342,9 +320,9 @@ impl QueryMTAgent {
 
     #[instrument(
         name = "agent.store_tool_results",
-        skip(self, results, context, runtime_context),
+        skip(self, results, context, exec_ctx),
         fields(
-            session_id = %session_id,
+            session_id = %exec_ctx.session_id,
             result_count = %results.len()
         )
     )]
@@ -352,18 +330,17 @@ impl QueryMTAgent {
         &self,
         results: &Arc<[ToolResult]>,
         context: &Arc<ConversationContext>,
-        runtime_context: &RuntimeContext,
-        session_id: &str,
+        exec_ctx: &mut ExecutionContext,
     ) -> Result<ExecutionState, anyhow::Error> {
         debug!(
             "Storing all tool results: session={}, count={}",
-            session_id,
+            exec_ctx.session_id,
             results.len()
         );
 
         let provider_context = self
             .provider
-            .with_session(session_id)
+            .with_session(&exec_ctx.session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
 
@@ -386,7 +363,7 @@ impl QueryMTAgent {
 
             let result_msg = crate::model::AgentMessage {
                 id: Uuid::new_v4().to_string(),
-                session_id: session_id.to_string(),
+                session_id: exec_ctx.session_id.clone(),
                 role: ChatRole::User,
                 parts,
                 created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -400,10 +377,7 @@ impl QueryMTAgent {
 
             messages.push(result_msg.to_chat_message());
 
-            if let Some(wait_condition) = self
-                .record_tool_side_effects(result, runtime_context, session_id)
-                .await
-            {
+            if let Some(wait_condition) = self.record_tool_side_effects(result, exec_ctx).await {
                 wait_conditions.push(wait_condition);
             }
         }
@@ -415,6 +389,33 @@ impl QueryMTAgent {
             context.provider.clone(),
             context.model.clone(),
         ));
+
+        // Aggregate changed file paths from tool results for dedup check
+        let mut combined = crate::index::DiffPaths::default();
+        for result in results.iter() {
+            if let Some(ref snapshot) = result.snapshot_part
+                && let Some(paths) = snapshot.changed_paths()
+            {
+                combined.added.extend(paths.added.iter().cloned());
+                combined.modified.extend(paths.modified.iter().cloned());
+                combined.removed.extend(paths.removed.iter().cloned());
+            }
+        }
+
+        // Deduplicate paths
+        combined.added.sort();
+        combined.added.dedup();
+        combined.modified.sort();
+        combined.modified.dedup();
+        combined.removed.sort();
+        combined.removed.dedup();
+
+        // Store for next step's dedup check
+        if !combined.is_empty()
+            && let Ok(mut diff) = exec_ctx.runtime.last_step_diff.lock()
+        {
+            *diff = Some(combined);
+        }
 
         if let Some(wait_condition) = WaitCondition::merge(wait_conditions) {
             return Ok(ExecutionState::WaitingForEvent {

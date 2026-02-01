@@ -1,8 +1,9 @@
-import { CheckCircle, Clock, Loader, XCircle } from 'lucide-react';
+import { CheckCircle, Clock, Loader, XCircle, Copy, Check } from 'lucide-react';
 import { DelegationGroupInfo, Turn, UiAgentInfo, LlmConfigDetails } from '../types';
 import { TurnCard } from './TurnCard';
 import { getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
+import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
 
 interface DelegationDetailPanelProps {
   delegation?: DelegationGroupInfo;
@@ -33,6 +34,8 @@ export function DelegationDetailPanel({
   llmConfigCache = {},
   requestLlmConfig,
 }: DelegationDetailPanelProps) {
+  const { copiedValue, copy: copyToClipboard } = useCopyToClipboard();
+
   if (!delegation || !turn) {
     return (
       <div className="flex-1 flex items-center justify-center text-gray-500">
@@ -50,7 +53,7 @@ export function DelegationDetailPanel({
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
-      <div className="px-6 py-4 border-b border-cyber-border/50 bg-cyber-surface/40">
+      <div className="group px-6 py-4 border-b border-cyber-border/50 bg-cyber-surface/40">
         <div className="flex items-center gap-2">
           <span
             className="text-xs font-semibold uppercase tracking-wide px-2 py-0.5 rounded"
@@ -76,6 +79,19 @@ export function DelegationDetailPanel({
           <span className="text-xs text-gray-400 truncate flex-1">
             {objective ?? 'Delegated task'}
           </span>
+          {objective && (
+            <button
+              onClick={() => copyToClipboard(objective, 'delegation-detail-objective')}
+              className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-cyber-bg/50"
+              title="Copy objective"
+            >
+              {copiedValue === 'delegation-detail-objective' ? (
+                <Check className="w-3.5 h-3.5 text-cyber-lime" />
+              ) : (
+                <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
+              )}
+            </button>
+          )}
           <span className="text-[10px] text-gray-500 flex items-center gap-1">
             <Clock className="w-3 h-3" />
             {durationLabel}

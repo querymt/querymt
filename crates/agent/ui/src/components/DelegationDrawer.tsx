@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
-import { X } from 'lucide-react';
+import { X, Copy, Check } from 'lucide-react';
 import { DelegationGroupInfo, EventRow, UiAgentInfo, LlmConfigDetails } from '../types';
 import { MessageContent } from './MessageContent';
 import { ToolSummary } from './ToolSummary';
 import { ModelConfigPopover } from './ModelConfigPopover';
 import { getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
+import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
 
 interface DelegationDrawerProps {
   delegation?: DelegationGroupInfo;
@@ -91,6 +92,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
     .sort((a, b) => a.timestamp - b.timestamp);
 
   const [showConfigPopover, setShowConfigPopover] = useState(false);
+  const { copiedValue, copy: copyToClipboard } = useCopyToClipboard();
 
   const handleDragStart = (event: ReactMouseEvent) => {
     if (isMobile) return;
@@ -120,7 +122,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
           )}
 
           {/* Header */}
-          <div className="px-5 py-4 border-b border-cyber-border/50 flex items-start justify-between gap-3">
+          <div className="group px-5 py-4 border-b border-cyber-border/50 flex items-start justify-between gap-3">
             <div className="flex-1">
               <div className="flex items-center gap-2 flex-wrap">
                 <span
@@ -162,9 +164,24 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                   </span>
                 ) : null}
               </div>
-              <Dialog.Title className="text-sm text-gray-300 mt-1">
-                {objective ?? 'Delegated task'}
-              </Dialog.Title>
+              <div className="flex items-center gap-2 mt-1">
+                <Dialog.Title className="text-sm text-gray-300">
+                  {objective ?? 'Delegated task'}
+                </Dialog.Title>
+                {objective && (
+                  <button
+                    onClick={() => copyToClipboard(objective, 'delegation-objective')}
+                    className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-cyber-bg/50"
+                    title="Copy objective"
+                  >
+                    {copiedValue === 'delegation-objective' ? (
+                      <Check className="w-3.5 h-3.5 text-cyber-lime" />
+                    ) : (
+                      <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
+                    )}
+                  </button>
+                )}
+              </div>
             </div>
             <Dialog.Close
               className="p-2 rounded-md hover:bg-cyber-bg/70 transition-colors text-gray-400 hover:text-gray-200"
@@ -198,7 +215,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                     ? getAgentColor(eventAgentId)
                     : agentColor;
                   return (
-                    <div key={event.id} className="rounded-md border border-cyber-border/40 bg-cyber-bg/40 px-3 py-2">
+                    <div key={event.id} className="group/message rounded-md border border-cyber-border/40 bg-cyber-bg/40 px-3 py-2">
                       <div className="flex items-center gap-2 mb-1">
                         <span
                           className="text-[10px] font-semibold uppercase tracking-wide"
@@ -209,6 +226,17 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                         <span className="text-[10px] text-gray-500">
                           {formatTimestamp(event.timestamp)}
                         </span>
+                        <button
+                          onClick={() => copyToClipboard(event.content, `delegation-message-${event.id}`)}
+                          className="opacity-0 group-hover/message:opacity-100 transition-opacity p-1 rounded hover:bg-cyber-bg/50"
+                          title="Copy message"
+                        >
+                          {copiedValue === `delegation-message-${event.id}` ? (
+                            <Check className="w-3.5 h-3.5 text-cyber-lime" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
+                          )}
+                        </button>
                       </div>
                       <MessageContent content={event.content} />
                     </div>

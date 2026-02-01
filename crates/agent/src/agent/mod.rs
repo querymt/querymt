@@ -6,6 +6,7 @@
 pub mod builder;
 pub mod core;
 pub mod execution;
+pub mod execution_context;
 pub mod mcp;
 pub mod protocol;
 pub mod snapshots;

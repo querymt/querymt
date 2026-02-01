@@ -47,23 +47,9 @@ pub struct CompositeDriver {
 }
 
 impl CompositeDriver {
-    pub fn new(mut drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
-        let original_len = drivers.len();
-
-        // Deduplicate by name, keeping first occurrence (preserves order)
-        let mut seen = std::collections::HashSet::new();
-        drivers.retain(|d| seen.insert(d.name()));
-
-        let removed = original_len - drivers.len();
-        if removed > 0 {
-            log::warn!(
-                "Removed {} duplicate middleware from pipeline — check config for redundant entries",
-                removed
-            );
-        }
-
+    pub fn new(drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
         debug!(
-            "Creating CompositeDriver with {} middleware (after dedup)",
+            "Creating CompositeDriver with {} middleware",
             drivers.len()
         );
         Self { drivers }
