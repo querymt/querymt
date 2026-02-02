@@ -2,6 +2,42 @@ use crate::{error::LLMError, HTTPLLMProvider};
 use http::{Request, Response};
 use serde_json::Value;
 
+/// Parse retry-after duration from HTTP headers.
+///
+/// Checks both `retry-after` (standard) and `x-ratelimit-reset-requests` (custom format).
+/// Supports formats:
+/// - `retry-after`: integer seconds (e.g., "60")
+/// - `x-ratelimit-reset-requests`: duration strings like "6m0s" or "1s"
+///
+/// Returns the duration in seconds if found, otherwise `None`.
+pub fn parse_retry_after(headers: &http::HeaderMap) -> Option<u64> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            // Fallback: try parsing x-ratelimit-reset-requests as duration
+            headers
+                .get("x-ratelimit-reset-requests")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| {
+                    // Parse formats like "6m0s" or "1s"
+                    if s.ends_with('s') {
+                        let num_part = s.trim_end_matches('s');
+                        if let Some(m_pos) = num_part.find('m') {
+                            // Format: "6m0s" -> extract minutes
+                            num_part[..m_pos].parse::<u64>().ok().map(|m| m * 60)
+                        } else {
+                            // Format: "1s"
+                            num_part.parse::<u64>().ok()
+                        }
+                    } else {
+                        None
+                    }
+                })
+        })
+}
+
 pub trait HTTPLLMProviderFactory: Send + Sync {
     fn name(&self) -> &str;
 
@@ -40,33 +76,7 @@ macro_rules! handle_http_error {
 
             // Extract retry-after header for rate limit errors
             let retry_after_secs = if status_code == 429 {
-                $resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .or_else(|| {
-                        // Fallback: try parsing x-ratelimit-reset-requests as duration
-                        $resp
-                            .headers()
-                            .get("x-ratelimit-reset-requests")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|s| {
-                                // Parse formats like "6m0s" or "1s"
-                                if s.ends_with('s') {
-                                    let num_part = s.trim_end_matches('s');
-                                    if let Some(m_pos) = num_part.find('m') {
-                                        // Format: "6m0s" -> extract minutes
-                                        num_part[..m_pos].parse::<u64>().ok().map(|m| m * 60)
-                                    } else {
-                                        // Format: "1s"
-                                        num_part.parse::<u64>().ok()
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                    })
+                $crate::plugin::http::parse_retry_after($resp.headers())
             } else {
                 None
             };

@@ -50,7 +50,7 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
         <Dialog.Content
           className="
             fixed z-50 top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2
-            w-[90vw] max-w-5xl h-[85vh] max-h-[900px]
+            w-[96vw] max-w-none h-[85vh] max-h-[900px]
             bg-cyber-surface border border-cyber-cyan/30 rounded-lg
             shadow-lg shadow-cyber-cyan/25
             flex flex-col overflow-hidden

@@ -165,7 +165,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
       {/* Inline preview */}
       {showPreview && previewData && (
         <div
-          className="border-t border-cyber-border/30 bg-cyber-bg/30 max-h-64 overflow-auto cursor-pointer"
+          className="border-t border-cyber-border/30 bg-cyber-bg/30 cursor-pointer"
           onClick={handleClick}
           title="Click for full details"
         >
@@ -188,7 +188,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
             </div>
           )}
           {previewData.type === 'shell' && (
-            <div className="px-3 py-2 font-mono text-[11px] max-h-32 overflow-auto">
+            <div className="px-3 py-2 font-mono text-[11px] max-h-64 overflow-auto">
               {previewData.stdout && (
                 <pre className="whitespace-pre-wrap break-words text-gray-300 leading-tight">
                   {truncateOutput(previewData.stdout, 500)}

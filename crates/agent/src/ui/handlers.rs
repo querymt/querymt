@@ -9,6 +9,7 @@ use super::messages::{ModelEntry, SessionGroup, SessionSummary, UiClientMessage,
 use super::session::{PRIMARY_AGENT_ID, ensure_sessions_for_mode, prompt_for_mode, resolve_cwd};
 use crate::index::resolve_workspace_root;
 use agent_client_protocol::CancelNotification;
+use futures_util::future;
 use querymt::LLMParams;
 use querymt::plugin::HTTPLLMProviderFactory;
 use serde_json::Value;
@@ -271,7 +272,7 @@ pub async fn handle_list_all_models(state: &ServerState, refresh: bool, tx: &mps
     }
 }
 
-/// Fetch models from all providers.
+/// Fetch models from all providers in parallel.
 async fn fetch_all_models(
     state: &ServerState,
     tx: &mpsc::Sender<String>,
@@ -279,48 +280,59 @@ async fn fetch_all_models(
     let registry = state.agent.provider.plugin_registry();
     registry.load_all_plugins().await;
 
-    let mut models: Vec<ModelEntry> = Vec::new();
+    // Build futures for all providers in parallel, skipping those without API keys
+    let futures: Vec<_> = registry
+        .list()
+        .into_iter()
+        .map(|factory| {
+            let tx = tx.clone();
+            async move {
+                let provider_name = factory.name().to_string();
 
-    for factory in registry.list() {
-        let provider_name = factory.name().to_string();
+                // Build config with API key, skip HTTP providers without keys
+                let mut cfg = if let Some(http_factory) = factory.as_http() {
+                    if let Some(api_key) =
+                        resolve_provider_api_key(&provider_name, http_factory).await
+                    {
+                        serde_json::json!({"api_key": api_key})
+                    } else {
+                        // No API key → skip this provider
+                        return Vec::new();
+                    }
+                } else {
+                    // Non-HTTP provider (e.g., ollama) — no key needed
+                    serde_json::json!({})
+                };
 
-        // Build config with API key (same as CLI)
-        let mut cfg = if let Some(http_factory) = factory.as_http() {
-            if let Some(api_key) = resolve_provider_api_key(&provider_name, http_factory).await {
-                serde_json::json!({"api_key": api_key})
-            } else {
-                serde_json::json!({})
-            }
-        } else {
-            serde_json::json!({})
-        };
+                if let Some(base_url) = resolve_base_url_for_provider(state, &provider_name) {
+                    cfg["base_url"] = base_url.into();
+                }
 
-        if let Some(base_url) = resolve_base_url_for_provider(state, &provider_name) {
-            cfg["base_url"] = base_url.into();
-        }
-
-        // Fetch models; on error, log and continue
-        match factory.list_models(&cfg).await {
-            Ok(model_list) => {
-                for model in model_list {
-                    models.push(ModelEntry {
-                        provider: provider_name.clone(),
-                        model,
-                    });
+                // Fetch models; on error, log and return empty
+                match factory.list_models(&cfg).await {
+                    Ok(model_list) => model_list
+                        .into_iter()
+                        .map(|model| ModelEntry {
+                            provider: provider_name.clone(),
+                            model,
+                        })
+                        .collect(),
+                    Err(err) => {
+                        let _ = send_error(
+                            &tx,
+                            format!("Failed to list models for {}: {}", provider_name, err),
+                        )
+                        .await;
+                        Vec::new()
+                    }
                 }
             }
-            Err(err) => {
-                // Send error to system log but continue with other providers
-                let _ = send_error(
-                    tx,
-                    format!("Failed to list models for {}: {}", provider_name, err),
-                )
-                .await;
-            }
-        }
-    }
+        })
+        .collect();
 
-    Ok(models)
+    // Execute all futures in parallel
+    let results: Vec<Vec<ModelEntry>> = future::join_all(futures).await;
+    Ok(results.into_iter().flatten().collect())
 }
 
 /// Handle session model change request.

@@ -400,8 +400,10 @@ function App() {
   }, [delegations, activeTimelineView, activeDelegationId]);
 
   return (
-    <div className="flex flex-col h-screen bg-cyber-bg text-gray-100 relative">
-      
+    <div 
+      className="flex flex-col h-screen bg-cyber-bg text-gray-100 relative"
+      style={{ ['--todo-rail-width' as any]: showTodoRail ? (todoRailCollapsed ? '2rem' : '18rem') : '0px' }}
+    >
       {/* Sidebar */}
       <Sidebar
         open={sidebarOpen}

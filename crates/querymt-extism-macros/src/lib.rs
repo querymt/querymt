@@ -29,7 +29,9 @@ pub struct HttpResponse(pub BaseHttpResponse);
 #[host_fn("extism:host/user")]
 extern "ExtismHost" {
     fn qmt_http_request(req: HttpRequest) -> HttpResponse;
-    fn qmt_http_stream_open(req: HttpRequest) -> Json<i64>;
+    fn qmt_http_stream_open(
+        req: HttpRequest,
+    ) -> Json<querymt::plugin::extism_impl::StreamOpenResult>;
     fn qmt_http_stream_next(stream_id: Json<i64>) -> Vec<u8>;
     fn qmt_http_stream_close(stream_id: Json<i64>);
     fn qmt_yield_chunk(chunk: Vec<u8>);
@@ -51,11 +53,13 @@ pub fn qmt_http_request_wrapper(
 }
 
 /// Open an HTTP stream using the host function
-pub fn qmt_http_stream_open_wrapper(req: &::http::Request<Vec<u8>>) -> Result<Json<i64>, Error> {
+pub fn qmt_http_stream_open_wrapper(
+    req: &::http::Request<Vec<u8>>,
+) -> Result<querymt::plugin::extism_impl::StreamOpenResult, Error> {
     let ser_req = BaseHttpRequest { req: req.clone() };
     let wrapped_req = HttpRequest(ser_req);
-    unsafe { qmt_http_stream_open(wrapped_req) }
-    //    Ok(x?.0)
+    let result = unsafe { qmt_http_stream_open(wrapped_req)? };
+    Ok(result.0)
 }
 
 /// Get the next chunk from an HTTP stream
@@ -194,21 +198,29 @@ macro_rules! impl_extism_http_plugin {
                 .chat_request(&input.messages, input.tools.as_deref())
                 .map_err(llm_err_to_pdk)?;
 
-            let stream_id = qmt_http_stream_open_wrapper(&req)?.0;
+            use querymt::plugin::extism_impl::StreamOpenResult;
 
-            if stream_id == 0 {
-                // Cancelled during stream open.
-                //
-                // The host returns a sentinel stream id (0) instead of trapping, so we can
-                // terminate the stream cleanly without Wasmtime backtraces.
-                qmt_yield_chunk_wrapper(&ExtismChatChunk {
-                    chunk: StreamChunk::Done {
-                        stop_reason: "cancelled".to_string(),
-                    },
-                    usage: None,
-                })?;
-                return Ok(());
-            }
+            let stream_id = match qmt_http_stream_open_wrapper(&req)? {
+                StreamOpenResult::Ok { stream_id } => stream_id,
+                StreamOpenResult::Cancelled => {
+                    // Cancelled during stream open - yield Done and return
+                    qmt_yield_chunk_wrapper(&ExtismChatChunk {
+                        chunk: StreamChunk::Done {
+                            stop_reason: "cancelled".to_string(),
+                        },
+                        usage: None,
+                    })?;
+                    return Ok(());
+                }
+                StreamOpenResult::Error {
+                    plugin_error,
+                    error_code,
+                } => {
+                    // HTTP error occurred - decode and propagate via WithReturnCode
+                    let llm_error = PluginError::decode(error_code, &plugin_error);
+                    return Err(llm_err_to_pdk(llm_error));
+                }
+            };
 
             let mut buffer = Vec::new();
             let mut done_received = false;

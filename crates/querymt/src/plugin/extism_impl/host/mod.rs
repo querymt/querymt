@@ -459,7 +459,10 @@ impl ChatProvider for ExtismProvider {
             let res: Result<(), (extism::Error, i32)> =
                 plug.call_get_error_code("chat_stream", Json(arg));
 
-            if let Err((e, _code)) = res {
+            if let Err((e, code)) = res {
+                // Decode the error using the proper error code from WithReturnCode
+                let llm_error = decode_plugin_error(e, code);
+
                 let cancel_state = user_data_clone
                     .get()
                     .ok()
@@ -468,15 +471,22 @@ impl ChatProvider for ExtismProvider {
 
                 match cancel_state {
                     functions::CancelState::NotCancelled => {
-                        log::error!("chat_stream plugin call failed: {:#}", e);
+                        log::error!("chat_stream plugin call failed: {:#}", llm_error);
+                        // Propagate error to stream consumer so it surfaces in UI
+                        if let Ok(state) = user_data_clone.get() {
+                            let state_guard = state.lock().unwrap();
+                            if let Some(tx) = &state_guard.yield_tx {
+                                let _ = tx.send(Err(llm_error));
+                            }
+                        }
                     }
                     functions::CancelState::CancelledByConsumerDrop => {
-                        log::info!("chat_stream stopped due to cancellation: {:#}", e);
+                        log::info!("chat_stream stopped due to cancellation: {:#}", llm_error);
                     }
                     functions::CancelState::YieldReceiverDropped => {
                         log::warn!(
                             "chat_stream stopped after receiver dropped (not explicit cancel): {:#}",
-                            e
+                            llm_error
                         );
                     }
                 }
@@ -538,12 +548,15 @@ impl ChatProvider for ExtismProvider {
         };
 
         let stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|bytes| {
-                let chunk_res: Result<StreamChunk, LLMError> = serde_json::from_slice::<
-                    ExtismChatChunk,
-                >(&bytes)
-                .map(|c| c.chunk)
-                .map_err(|e| LLMError::PluginError(format!("Failed to deserialize chunk: {}", e)));
+            rx.recv().await.map(|item| {
+                let chunk_res: Result<StreamChunk, LLMError> = match item {
+                    Ok(bytes) => serde_json::from_slice::<ExtismChatChunk>(&bytes)
+                        .map(|c| c.chunk)
+                        .map_err(|e| {
+                            LLMError::PluginError(format!("Failed to deserialize chunk: {}", e))
+                        }),
+                    Err(llm_err) => Err(llm_err),
+                };
                 (chunk_res, rx)
             })
         });

@@ -160,7 +160,7 @@ export const TurnCard = memo(function TurnCard({
   };
 
   return (
-    <div className="turn-card max-w-4xl mx-auto px-4 py-3 group">
+    <div className="turn-card max-w-6xl mx-auto px-2 py-3 group">
       {/* Pinned user message (appears when scrolled past) - only in chat view */}
       {isPinned && turn.userMessage && activeView === 'chat' && (
         <PinnedUserMessage

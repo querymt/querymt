@@ -25,7 +25,8 @@ pub(crate) struct HostState {
         Pin<Box<dyn Stream<Item = Result<Vec<u8>, reqwest::Error>> + Send>>,
     >,
     pub next_stream_id: u64,
-    pub yield_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    pub yield_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, crate::error::LLMError>>>,
     pub tokio_handle: tokio::runtime::Handle,
 }
 
@@ -284,48 +285,91 @@ pub(crate) fn qmt_http_stream_open(
                 res = reqwest_req.send() => res,
             };
 
-            let resp = send_res.map_err(|e| format!("{}", e))?;
+            let resp = send_res.map_err(|e| {
+                (
+                    crate::error::LLMError::ProviderError(format!("Request failed: {}", e)),
+                    0u16,
+                )
+            })?;
             if !resp.status().is_success() {
-                let status = resp.status();
+                let status_code = resp.status().as_u16();
+
+                // Extract retry-after header before consuming the response body
+                let retry_after_secs = crate::plugin::http::parse_retry_after(resp.headers());
+
                 let body = resp
                     .text()
                     .await
                     .unwrap_or_else(|_| "could not read body".to_string());
-                return Err(format!("HTTP Error {}: {}", status, body));
+
+                // Parse JSON for clean message (same logic as handle_http_error! macro)
+                let clean_message = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|json| {
+                        json.pointer("/error/message")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| format!("HTTP {}: {}", status_code, body));
+
+                // Create structured LLMError based on status code
+                use crate::error::LLMError;
+                let llm_error = match status_code {
+                    401 | 403 => LLMError::AuthError(clean_message),
+                    429 => LLMError::RateLimited {
+                        message: clean_message,
+                        retry_after_secs,
+                    },
+                    400 => LLMError::InvalidRequest(clean_message),
+                    499 => LLMError::Cancelled,
+                    500 | 529 => {
+                        LLMError::ProviderError(format!("Server error: {}", clean_message))
+                    }
+                    _ => LLMError::ProviderError(clean_message),
+                };
+
+                return Err((llm_error, status_code));
             }
 
-            Ok::<_, String>(Some(
+            Ok::<_, (crate::error::LLMError, u16)>(Some(
                 resp.bytes_stream()
                     .map(|result| result.map(|bytes| bytes.to_vec())),
             ))
         });
 
-        match stream_res {
+        use crate::plugin::extism_impl::interface::{PluginError, StreamOpenResult};
+
+        let result = match stream_res {
             Ok(Some(stream)) => {
                 let mut state_guard = state.lock().unwrap();
                 let stream_id = state_guard.next_stream_id;
                 state_guard.next_stream_id += 1;
                 state_guard.http_streams.insert(stream_id, Box::pin(stream));
-
-                let resp_json = serde_json::to_vec(&stream_id)
-                    .map_err(|e| extism::Error::msg(format!("{}", e)))?;
-                let handle = plugin.memory_new(resp_json)?;
-                outputs[0] = Val::I64(handle.offset as i64);
+                StreamOpenResult::Ok {
+                    stream_id: stream_id as i64,
+                }
             }
             Ok(None) => {
-                // Cancelled: return sentinel stream_id=0.
-                //
-                // This was implemented in this way to keep the ABI stable (no extra host functions)
-                // while still allowing true cancellation: the next `qmt_http_stream_next` will return EOF immediately.
-                let resp_json =
-                    serde_json::to_vec(&0u64).map_err(|e| extism::Error::msg(format!("{}", e)))?;
-                let handle = plugin.memory_new(resp_json)?;
-                outputs[0] = Val::I64(handle.offset as i64);
+                // Cancelled: return Cancelled variant instead of sentinel stream_id
+                StreamOpenResult::Cancelled
             }
-            Err(e) => {
-                return Err(extism::Error::msg(format!("HTTP request failed: {}", e)));
+            Err((llm_error, _status_code)) => {
+                // Encode the error as PluginError JSON so the guest can propagate it
+                // via WithReturnCode with the proper error code
+                let (plugin_error_json, error_code) = PluginError::encode(&llm_error);
+                StreamOpenResult::Error {
+                    plugin_error: plugin_error_json,
+                    error_code,
+                }
             }
-        }
+        };
+
+        // Serialize the result and return it in the output
+        let resp_json = serde_json::to_vec(&result).map_err(|e| {
+            extism::Error::msg(format!("Failed to serialize StreamOpenResult: {}", e))
+        })?;
+        let handle = plugin.memory_new(resp_json)?;
+        outputs[0] = Val::I64(handle.offset as i64);
         Ok(())
     }
     #[cfg(not(feature = "http-client"))]
@@ -475,7 +519,7 @@ pub(crate) fn qmt_yield_chunk(
 
     if let Some(tx) = &state_guard.yield_tx {
         log::debug!("Host received qmt_yield_chunk: {} bytes", chunk_json.len());
-        if let Err(_e) = tx.send(chunk_json) {
+        if let Err(_e) = tx.send(Ok(chunk_json)) {
             // Normal/expected: consumer stopped reading (stream dropped/aborted).
             if state_guard.cancel_state == CancelState::NotCancelled {
                 state_guard.cancel_state = CancelState::YieldReceiverDropped;

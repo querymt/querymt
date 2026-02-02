@@ -32,7 +32,8 @@ pub(super) async fn default_registry() -> Result<PluginRegistry> {
         .map_err(|e| anyhow!("Failed to load plugin registry: {}", e))?;
     registry.register_loader(Box::new(ExtismLoader));
     registry.register_loader(Box::new(NativeLoader));
-    registry.load_all_plugins().await;
+    // Removed eager plugin loading - plugins are now loaded on-demand for faster startup
+    // registry.load_all_plugins().await;
     Ok(registry)
 }
 

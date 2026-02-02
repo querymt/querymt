@@ -162,6 +162,37 @@ impl PluginError {
     }
 }
 
+// ============================================================================
+// HTTP streaming result type
+// ============================================================================
+
+/// Result of opening an HTTP stream, returned by qmt_http_stream_open.
+///
+/// Using a result type avoids WASM traps for recoverable HTTP errors.
+/// The host function returns `Ok(())` with this serialized in the output,
+/// allowing the guest to handle errors gracefully and propagate them via
+/// `WithReturnCode` with proper error codes.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "status")]
+pub enum StreamOpenResult {
+    /// Stream opened successfully
+    #[serde(rename = "ok")]
+    Ok { stream_id: i64 },
+
+    /// Stream open was cancelled (e.g., by user or cancellation signal)
+    #[serde(rename = "cancelled")]
+    Cancelled,
+
+    /// Stream open failed with an error (e.g., HTTP 429, auth error, etc.)
+    #[serde(rename = "error")]
+    Error {
+        /// Serialized PluginError JSON
+        plugin_error: String,
+        /// Error code from error_codes module
+        error_code: i32,
+    },
+}
+
 pub trait BinaryCodec {
     type Bytes: AsRef<[u8]>;
     type Error;
