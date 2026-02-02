@@ -5,7 +5,6 @@ import {
   UiAgentInfo,
   UiClientMessage,
   UiServerMessage,
-  SessionSummary,
   SessionGroup,
   AuditView,
   FileIndexEntry,
@@ -26,7 +25,6 @@ export function useUiClient() {
   const [activeAgentId, setActiveAgentId] = useState<string>('primary');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
-  const [sessionHistory, setSessionHistory] = useState<SessionSummary[]>([]);
   const [sessionGroups, setSessionGroups] = useState<SessionGroup[]>([]);
   const [allModels, setAllModels] = useState<ModelEntry[]>([]);
   const [sessionsByAgent, setSessionsByAgent] = useState<Record<string, string>>({});
@@ -356,9 +354,6 @@ export function useUiClient() {
       }
       case 'session_list':
         setSessionGroups(msg.groups);
-        // Flatten groups for backwards compatibility with Sidebar
-        const flatSessions = msg.groups.flatMap(g => g.sessions);
-        setSessionHistory(flatSessions);
         break;
       case 'session_loaded': {
         setSessionId(msg.session_id);
@@ -576,7 +571,6 @@ export function useUiClient() {
     activeAgentId,
     setActiveAgent: selectAgent,
     setRoutingMode: selectRoutingMode,
-    sessionHistory,
     sessionGroups,
     allModels,
     sessionsByAgent,

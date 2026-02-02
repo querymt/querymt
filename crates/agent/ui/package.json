@@ -23,11 +23,13 @@
     "react-dom": "^18.2.0",
     "react-markdown": "^10.1.0",
     "react-mentions": "^4.4.10",
+    "react-router-dom": "^7.13.0",
     "react-virtuoso": "^4.6.2",
     "remark-gfm": "^4.0.1",
     "shiki": "^1.29.2",
     "splitting": "^1.1.0",
-    "zod": "^4.3.5"
+    "zod": "^4.3.5",
+    "zustand": "^5.0.11"
   },
   "devDependencies": {
     "@types/react": "^18.2.43",

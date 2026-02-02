@@ -272,7 +272,11 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
             <kbd className="px-2 py-1 bg-cyber-bg border border-cyber-border rounded text-cyber-cyan font-mono text-[10px]">
               {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+N
             </kbd>{' '}
-            to create a session
+            to create a session, or{' '}
+            <kbd className="px-2 py-1 bg-cyber-bg border border-cyber-border rounded text-cyber-cyan font-mono text-[10px]">
+              {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+/
+            </kbd>{' '}
+            to open quick switcher
           </p>
         </div>
       </div>
