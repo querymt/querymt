@@ -9,7 +9,9 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{send_logs_to_tracing, LogOptions};
-use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, ChatRole, MessageType, Tool};
+use querymt::chat::{
+    ChatMessage, ChatProvider, ChatResponse, ChatRole, FinishReason, MessageType, Tool,
+};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
@@ -17,7 +19,6 @@ use querymt::plugin::{Fut, LLMProviderFactory};
 use querymt::{LLMProvider, Usage};
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -102,6 +103,10 @@ impl ChatResponse for LlamaCppChatResponse {
 
     fn usage(&self) -> Option<Usage> {
         Some(self.usage.clone())
+    }
+
+    fn finish_reason(&self) -> Option<FinishReason> {
+        todo!()
     }
 }
 
@@ -345,6 +350,9 @@ impl LlamaCppProvider {
                 usage: Usage {
                     input_tokens: tokens.len() as u32,
                     output_tokens: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning_tokens: 0,
                 },
             });
         }
@@ -438,6 +446,9 @@ impl LlamaCppProvider {
             usage: Usage {
                 input_tokens: tokens.len() as u32,
                 output_tokens,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning_tokens: 0,
             },
         })
     }
@@ -471,6 +482,9 @@ impl LlamaCppProvider {
             return Ok(Usage {
                 input_tokens: tokens.len() as u32,
                 output_tokens: 0,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning_tokens: 0,
             });
         }
 
@@ -545,7 +559,8 @@ impl LlamaCppProvider {
                 Err(_) => String::from_utf8_lossy(&bytes).to_string(),
             };
             if !chunk.is_empty() {
-                if tx.unbounded_send(Ok(querymt::chat::StreamChunk::Text(chunk)))
+                if tx
+                    .unbounded_send(Ok(querymt::chat::StreamChunk::Text(chunk)))
                     .is_err()
                 {
                     break;
@@ -566,6 +581,9 @@ impl LlamaCppProvider {
         Ok(Usage {
             input_tokens: tokens.len() as u32,
             output_tokens,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning_tokens: 0,
         })
     }
 }
@@ -610,8 +628,10 @@ impl ChatProvider for LlamaCppProvider {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<querymt::chat::StreamChunk, LLMError>> + Send>>, LLMError>
-    {
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<querymt::chat::StreamChunk, LLMError>> + Send>>,
+        LLMError,
+    > {
         if tools.is_some() {
             return Err(LLMError::NotImplemented(
                 "Tool calling is not supported by llama.cpp provider".into(),
@@ -694,21 +714,21 @@ impl LLMProviderFactory for LlamaCppFactory {
         "llama_cpp"
     }
 
-    fn config_schema(&self) -> Value {
+    fn config_schema(&self) -> String {
         let schema = schema_for!(LlamaCppConfig);
-        serde_json::to_value(&schema.schema).expect("LlamaCppConfig schema should always serialize")
+        serde_json::to_string(&schema.schema).expect("LlamaCppConfig schema should always serialize")
     }
 
-    fn from_config(&self, cfg: &Value) -> Result<Box<dyn LLMProvider>, LLMError> {
-        let cfg: LlamaCppConfig = serde_json::from_value(cfg.clone())?;
+    fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
+        let cfg: LlamaCppConfig = serde_json::from_str(cfg)?;
         let provider = LlamaCppProvider::new(cfg)?;
         Ok(Box::new(provider))
     }
 
-    fn list_models<'a>(&'a self, cfg: &Value) -> Fut<'a, Result<Vec<String>, LLMError>> {
-        let cfg = cfg.clone();
+    fn list_models<'a>(&'a self, cfg: &str) -> Fut<'a, Result<Vec<String>, LLMError>> {
+        let cfg = cfg.to_string();
         Box::pin(async move {
-            let cfg: LlamaCppConfig = serde_json::from_value(cfg)?;
+            let cfg: LlamaCppConfig = serde_json::from_str(&cfg)?;
             let model_name = cfg.model.clone().or_else(|| {
                 Path::new(&cfg.model_path)
                     .file_name()

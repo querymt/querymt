@@ -42,7 +42,7 @@ fn get_provider() -> Box<dyn LLMProvider> {
         paged_attn_cache_type: None,
     };
 
-    let json_cfg = serde_json::to_value(cfg).unwrap();
+    let json_cfg = serde_json::to_string(&cfg).unwrap();
     factory.from_config(&json_cfg).unwrap()
 }
 

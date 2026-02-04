@@ -22,19 +22,19 @@ impl LLMProviderFactory for NativeFactoryWrapper {
     fn name(&self) -> &str {
         self.factory_impl.name()
     }
-    fn config_schema(&self) -> serde_json::Value {
+    fn config_schema(&self) -> String {
         self.factory_impl.config_schema()
     }
     fn from_config(
         &self,
-        cfg: &serde_json::Value,
+        cfg: &str,
     ) -> Result<Box<dyn crate::LLMProvider>, LLMError> {
         self.factory_impl.from_config(cfg)
     }
 
     fn list_models<'a>(
         &'a self,
-        cfg: &serde_json::Value,
+        cfg: &str,
     ) -> crate::plugin::Fut<'a, Result<Vec<String>, LLMError>> {
         self.factory_impl.list_models(cfg)
     }

@@ -202,7 +202,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         None => serde_json::json!({}),
                     };
-                    let models = factory.list_models(&cfg).await;
+                    let cfg_str = serde_json::to_string(&cfg)?;
+                    let models = factory.list_models(&cfg_str).await;
 
                     match models {
                         Ok(models) if !models.is_empty() => {

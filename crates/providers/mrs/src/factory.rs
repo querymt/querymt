@@ -13,25 +13,29 @@ impl LLMProviderFactory for MistralRSFactory {
         "mistralrs"
     }
 
-    fn config_schema(&self) -> Value {
+    fn config_schema(&self) -> String {
         let schema = schema_for!(MistralRSConfig);
-        serde_json::to_value(&schema.schema)
+        serde_json::to_string(&schema.schema)
             .expect("OpenRouter JSON Schema should always serialize")
     }
 
     fn list_models<'a>(
         &'a self,
-        cfg: &Value,
+        cfg: &str,
     ) -> querymt::plugin::Fut<'a, Result<Vec<String>, LLMError>> {
-        let model = cfg
-            .get("model")
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
-        Box::pin(async move { Ok(model.into_iter().collect()) })
+        let cfg = cfg.to_string();
+        Box::pin(async move {
+            let cfg: Value = serde_json::from_str(&cfg)?;
+            let model = cfg
+                .get("model")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            Ok(model.into_iter().collect())
+        })
     }
 
-    fn from_config(&self, cfg: &Value) -> Result<Box<dyn querymt::LLMProvider>, LLMError> {
-        let cfg: MistralRSConfig = serde_json::from_value(cfg.clone())
+    fn from_config(&self, cfg: &str) -> Result<Box<dyn querymt::LLMProvider>, LLMError> {
+        let cfg: MistralRSConfig = serde_json::from_str(cfg)
             .map_err(|e| LLMError::PluginError(format!("mistral.rs config error: {}", e)))?;
 
         let provider = match tokio::runtime::Handle::try_current() {

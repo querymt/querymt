@@ -169,7 +169,8 @@ impl HTTPLLMProviderFactory for OpenRouterFactory {
         Some("OPENROUTER_API_KEY".into())
     }
 
-    fn list_models_request(&self, cfg: &Value) -> Result<Request<Vec<u8>>, LLMError> {
+    fn list_models_request(&self, cfg: &str) -> Result<Request<Vec<u8>>, LLMError> {
+        let cfg: Value = serde_json::from_str(cfg)?;
         let base_url = match cfg.get("base_url").and_then(Value::as_str) {
             Some(base_url_str) => Url::parse(base_url_str)?,
             None => OpenRouter::default_base_url(),
@@ -199,15 +200,15 @@ impl HTTPLLMProviderFactory for OpenRouterFactory {
         Ok(names)
     }
 
-    fn config_schema(&self) -> Value {
+    fn config_schema(&self) -> String {
         let schema = schema_for!(OpenRouter);
-        // Extract the schema object and turn it into a serde_json::Value
-        serde_json::to_value(&schema.schema)
+        // Extract the schema object and turn it into a JSON string
+        serde_json::to_string(&schema.schema)
             .expect("OpenRouter JSON Schema should always serialize")
     }
 
-    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
-        let provider: OpenRouter = serde_json::from_value(cfg.clone())
+    fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
+        let provider: OpenRouter = serde_json::from_str(cfg)
             .map_err(|e| LLMError::PluginError(format!("OpenRouter config error: {}", e)))?;
 
         // 2) Done—our OpenAI::send/chat/etc methods will lazily build the Client

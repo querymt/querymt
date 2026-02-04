@@ -106,11 +106,6 @@ fn call_plugin_str(plugin: Arc<Mutex<Plugin>>, func: &str, arg: &Value) -> anyho
     Ok(std::str::from_utf8(&output_bytes)?.to_string())
 }
 
-fn call_plugin_json(plugin: Arc<Mutex<Plugin>>, func: &str, arg: &Value) -> anyhow::Result<Value> {
-    let r = call_plugin_str(plugin, func, arg)?;
-    Ok(serde_json::from_str(&r)?)
-}
-
 impl ExtismFactory {
     #[instrument(name = "extism_factory.load", skip_all)]
     pub fn load(
@@ -189,10 +184,6 @@ impl ExtismFactory {
     fn call(&self, func: &str, arg: &Value) -> anyhow::Result<String> {
         call_plugin_str(self.plugin.clone(), func, arg)
     }
-
-    fn call_json(&self, func: &str, arg: &Value) -> anyhow::Result<Value> {
-        call_plugin_json(self.plugin.clone(), func, arg)
-    }
 }
 
 impl LLMProviderFactory for ExtismFactory {
@@ -200,34 +191,42 @@ impl LLMProviderFactory for ExtismFactory {
         &self.name
     }
 
-    fn config_schema(&self) -> Value {
-        self.call_json("config_schema", &Value::Null)
-            .expect("config_schema() must return valid JSON")
+    fn config_schema(&self) -> String {
+        self.call("config_schema", &Value::Null)
+            .expect("config_schema() must return valid JSON string")
     }
 
-    fn from_config(&self, cfg: &Value) -> Result<Box<dyn LLMProvider>, LLMError> {
+    fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
+        let cfg_value: Value = serde_json::from_str(cfg)
+            .map_err(|e| LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))?;
+        
         let _from_cfg = self
-            .call("from_config", cfg)
+            .call("from_config", &cfg_value)
             .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
 
         let provider = ExtismProvider {
             plugin: self.plugin.clone(),
-            config: cfg.clone(),
+            config: cfg_value,
             user_data: self.user_data.clone(),
         };
         Ok(Box::new(provider))
     }
 
-    fn list_models<'a>(&'a self, cfg: &Value) -> Fut<'a, Result<Vec<String>, LLMError>> {
+    fn list_models<'a>(&'a self, cfg: &str) -> Fut<'a, Result<Vec<String>, LLMError>> {
         // list_models can do host HTTP calls, so run the Extism VM call off the Tokio runtime
         // thread to avoid deadlocks on current-thread runtimes.
-        let cfg_to = cfg.clone();
+        let cfg_value: Value = match serde_json::from_str(cfg) {
+            Ok(v) => v,
+            Err(e) => return Box::pin(async move {
+                Err(LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))
+            }),
+        };
         let plugin = self.plugin.clone();
         async move {
             tokio::task::spawn_blocking(move || {
                 let mut plug = plugin.lock().unwrap();
                 let out: Json<Vec<String>> = plug
-                    .call_get_error_code("list_models", Json(cfg_to))
+                    .call_get_error_code("list_models", Json(cfg_value))
                     .map_err(|(e, code)| decode_plugin_error(e, code))?;
                 Ok::<_, LLMError>(out.0)
             })
@@ -247,17 +246,17 @@ impl HTTPLLMProviderFactory for ExtismFactory {
         (self as &dyn LLMProviderFactory).name()
     }
 
-    fn config_schema(&self) -> Value {
+    fn config_schema(&self) -> String {
         (self as &dyn LLMProviderFactory).config_schema()
     }
 
-    fn from_config(&self, _cfg: &Value) -> Result<Box<dyn crate::HTTPLLMProvider>, LLMError> {
+    fn from_config(&self, _cfg: &str) -> Result<Box<dyn crate::HTTPLLMProvider>, LLMError> {
         Err(LLMError::PluginError(
             "ExtismProvider should not be used as HTTPLLMProviderFactory".into(),
         ))
     }
 
-    fn list_models_request(&self, _cfg: &Value) -> Result<http::Request<Vec<u8>>, LLMError> {
+    fn list_models_request(&self, _cfg: &str) -> Result<http::Request<Vec<u8>>, LLMError> {
         Err(LLMError::PluginError(
             "ExtismProvider should not be used as HTTPLLMProviderFactory".into(),
         ))

@@ -2,12 +2,12 @@ use extism_pdk::*;
 use serde::{Deserialize, Serialize};
 
 pub fn decode_base64_standard(s: &str) -> Result<Vec<u8>, Error> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     BASE64.decode(s).map_err(|e| Error::msg(e.to_string()))
 }
 
 pub fn encode_base64_standard(bytes: &[u8]) -> String {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     BASE64.encode(bytes)
 }
 
@@ -94,22 +94,21 @@ macro_rules! impl_extism_http_plugin {
         name = $name:expr,
     ) => {
         use extism_pdk::{
-            Error as PdkError, FnResult, FromBytes, Json, ToBytes, WithReturnCode, plugin_fn,
+            plugin_fn, Error as PdkError, FnResult, FromBytes, Json, ToBytes, WithReturnCode,
         };
         use querymt::{
-            HTTPLLMProvider,
             chat::http::HTTPChatProvider,
-            completion::{CompletionResponse, http::HTTPCompletionProvider},
+            completion::{http::HTTPCompletionProvider, CompletionResponse},
             embedding::http::HTTPEmbeddingProvider,
             plugin::{
-                HTTPLLMProviderFactory,
                 extism_impl::{
                     BinaryCodec, ExtismChatRequest, ExtismChatResponse, ExtismCompleteRequest,
                     ExtismEmbedRequest, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
                     ExtismTtsResponse, PluginError,
                 },
+                HTTPLLMProviderFactory,
             },
-            stt, tts,
+            stt, tts, HTTPLLMProvider,
         };
         use serde_json::Value;
         use $crate::qmt_http_request_wrapper;
@@ -158,7 +157,8 @@ macro_rules! impl_extism_http_plugin {
         // list models
         #[plugin_fn]
         pub fn list_models(cfg: Json<Value>) -> FnResult<Json<Vec<String>>> {
-            let req = HTTPLLMProviderFactory::list_models_request(&$Factory, &cfg.0)
+            let cfg_str = serde_json::to_string(&cfg.0).map_err(PdkError::new)?;
+            let req = HTTPLLMProviderFactory::list_models_request(&$Factory, &cfg_str)
                 .map_err(llm_err_to_pdk)?;
             let native_resp = qmt_http_request_wrapper(&req)?;
 
