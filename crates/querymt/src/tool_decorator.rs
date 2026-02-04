@@ -82,6 +82,19 @@ impl ToolEnabledProvider {
             tool_list,
         }
     }
+
+    /// Construct with a pre-built tool list.
+    pub fn with_tool_list(
+        inner: Box<dyn LLMProvider + Send + Sync>,
+        registry: HashMap<String, Box<dyn CallFunctionTool>>,
+        tool_list: Vec<Tool>,
+    ) -> Self {
+        ToolEnabledProvider {
+            inner,
+            registry,
+            tool_list,
+        }
+    }
 }
 
 #[async_trait]

@@ -1,12 +1,12 @@
-use http::{header::CONTENT_TYPE, Method, Request, Response};
+use http::{Method, Request, Response, header::CONTENT_TYPE};
 use querymt::{
-    error::LLMError, handle_http_error, plugin::HTTPLLMProviderFactory, HTTPLLMProvider,
+    HTTPLLMProvider, error::LLMError, handle_http_error, plugin::HTTPLLMProviderFactory,
 };
 use schemars::schema_for;
 use serde_json::Value;
 use url::Url;
 
-use crate::{detect_auth_type, Anthropic};
+use crate::{Anthropic, detect_auth_type};
 
 struct AnthropicFactory;
 

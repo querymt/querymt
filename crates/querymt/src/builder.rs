@@ -337,15 +337,26 @@ impl LLMBuilder {
                 LLMError::InvalidRequest(format!("Unknown provider: {}", provider_name))
             })?;
 
+        let tool_list: Vec<Tool> = self
+            .tool_registry
+            .values()
+            .map(|t| t.descriptor())
+            .collect();
+
         let full_cfg: Value = serde_json::to_value(&self)?;
         let schema: Value = serde_json::from_str(&factory.config_schema())?;
         let pruned_cfg = prune_config_by_schema(&full_cfg, &schema);
         let pruned_cfg_str = serde_json::to_string(&pruned_cfg)?;
         let base = factory.from_config(&pruned_cfg_str)?;
+
         let provider: Box<dyn LLMProvider> = if self.tool_registry.is_empty() {
             base
         } else {
-            Box::new(ToolEnabledProvider::new(base, self.tool_registry))
+            Box::new(ToolEnabledProvider::with_tool_list(
+                base,
+                self.tool_registry,
+                tool_list,
+            ))
         };
 
         #[allow(unreachable_code)]

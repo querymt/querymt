@@ -1,14 +1,17 @@
 use async_trait::async_trait;
-use futures::channel::mpsc;
 use futures::Stream;
+use futures::channel::mpsc;
 use hf_hub::api::sync::ApiBuilder;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel, Special};
+use llama_cpp_2::model::{
+    AddBos, ChatTemplateResult, GrammarTriggerType, LlamaChatMessage, LlamaChatTemplate,
+    LlamaModel,
+};
 use llama_cpp_2::sampling::LlamaSampler;
-use llama_cpp_2::{send_logs_to_tracing, LogOptions};
+use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use querymt::chat::{
     ChatMessage, ChatProvider, ChatResponse, ChatRole, FinishReason, MessageType, Tool,
 };
@@ -17,8 +20,10 @@ use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
 use querymt::plugin::{Fut, LLMProviderFactory};
 use querymt::{LLMProvider, Usage};
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashSet;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -26,7 +31,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 const DEFAULT_MAX_TOKENS: u32 = 256;
-const DEFAULT_BATCH: u32 = 512;
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -83,6 +87,8 @@ struct LlamaCppProvider {
 #[derive(Debug)]
 struct LlamaCppChatResponse {
     text: String,
+    tool_calls: Option<Vec<querymt::ToolCall>>,
+    finish_reason: FinishReason,
     usage: Usage,
 }
 
@@ -98,7 +104,7 @@ impl ChatResponse for LlamaCppChatResponse {
     }
 
     fn tool_calls(&self) -> Option<Vec<querymt::ToolCall>> {
-        None
+        self.tool_calls.clone()
     }
 
     fn usage(&self) -> Option<Usage> {
@@ -106,7 +112,7 @@ impl ChatResponse for LlamaCppChatResponse {
     }
 
     fn finish_reason(&self) -> Option<FinishReason> {
-        todo!()
+        Some(self.finish_reason)
     }
 }
 
@@ -192,6 +198,723 @@ impl LlamaCppProvider {
             model: Arc::new(model),
             cfg,
         })
+    }
+
+    /// Utility function to escape regex special characters.
+    fn regex_escape(value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len());
+        for ch in value.chars() {
+            match ch {
+                '.' | '^' | '$' | '|' | '(' | ')' | '*' | '+' | '?' | '[' | ']' | '{' | '}'
+                | '\\' => {
+                    escaped.push('\\');
+                    escaped.push(ch);
+                }
+                _ => escaped.push(ch),
+            }
+        }
+        escaped
+    }
+
+    /// Utility function to anchor a regex pattern.
+    fn anchor_pattern(pattern: &str) -> String {
+        if pattern.is_empty() {
+            return "^$".to_string();
+        }
+        let mut anchored = String::new();
+        if !pattern.starts_with('^') {
+            anchored.push('^');
+        }
+        anchored.push_str(pattern);
+        if !pattern.ends_with('$') {
+            anchored.push('$');
+        }
+        anchored
+    }
+
+    /// Convert querymt Tool objects to OpenAI-compatible JSON string.
+    fn convert_tools_to_json(&self, tools: &[Tool]) -> Result<String, LLMError> {
+        serde_json::to_string(tools).map_err(|e| LLMError::ProviderError(e.to_string()))
+    }
+
+    /// Build LlamaChatMessage array from ChatMessage array for tool-aware conversations.
+    fn build_chat_messages_for_tools(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Vec<LlamaChatMessage>, LLMError> {
+        let mut chat_messages = Vec::new();
+
+        // Add system message if configured
+        if let Some(system) = &self.cfg.system {
+            chat_messages.push(
+                LlamaChatMessage::new("system".to_string(), system.clone())
+                    .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
+            );
+        }
+
+        for msg in messages {
+            match &msg.message_type {
+                MessageType::Text => {
+                    let role = match msg.role {
+                        ChatRole::User => "user",
+                        ChatRole::Assistant => "assistant",
+                    };
+                    chat_messages.push(
+                        LlamaChatMessage::new(role.to_string(), msg.content.clone())
+                            .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
+                    );
+                }
+                MessageType::ToolUse(tool_calls) => {
+                    // Assistant message with tool calls - serialize as JSON in content
+                    let tool_calls_json = serde_json::to_string(tool_calls).map_err(|e| {
+                        LLMError::InvalidRequest(format!("Failed to serialize tool calls: {}", e))
+                    })?;
+                    chat_messages.push(
+                        LlamaChatMessage::new("assistant".to_string(), tool_calls_json)
+                            .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
+                    );
+                }
+                MessageType::ToolResult(results) => {
+                    // Tool results - format as user message with tool results
+                    for result in results {
+                        let result_json = serde_json::to_string(result).map_err(|e| {
+                            LLMError::InvalidRequest(format!(
+                                "Failed to serialize tool result: {}",
+                                e
+                            ))
+                        })?;
+                        chat_messages.push(
+                            LlamaChatMessage::new("tool".to_string(), result_json)
+                                .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
+                        );
+                    }
+                }
+                _ => {
+                    return Err(LLMError::InvalidRequest(
+                        "Only text and tool-related messages are supported by llama.cpp provider"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
+        Ok(chat_messages)
+    }
+
+    /// Apply chat template with tools to generate prompt and grammar.
+    fn apply_template_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Tool],
+    ) -> Result<ChatTemplateResult, LLMError> {
+        let tools_json = self.convert_tools_to_json(tools)?;
+        let chat_messages = self.build_chat_messages_for_tools(messages)?;
+
+        let template = self
+            .model
+            .chat_template(self.cfg.chat_template.as_deref())
+            .or_else(|_| LlamaChatTemplate::new("chatml"))
+            .map_err(|e| LLMError::ProviderError(format!("Failed to get chat template: {}", e)))?;
+
+        self.model
+            .apply_chat_template_with_tools_oaicompat(
+                &template,
+                &chat_messages,
+                Some(tools_json.as_str()),
+                None,
+                true,
+            )
+            .map_err(|e| LLMError::ProviderError(format!("Failed to apply chat template: {}", e)))
+    }
+
+    /// Build a grammar-constrained sampler from a ChatTemplateResult.
+    ///
+    /// When a grammar is present, we use only `[grammar, greedy]` to match
+    /// the reference llama.cpp examples. Mixing temperature / top-p / top-k
+    /// with grammar sampling can corrupt the grammar state and trigger
+    /// assertion failures in llama-grammar.cpp.
+    fn build_tool_sampler(
+        &self,
+        result: &ChatTemplateResult,
+        temperature: Option<f32>,
+    ) -> LlamaSampler {
+        if let Some(ref grammar) = result.grammar {
+            let grammar_sampler = if result.grammar_lazy {
+                // Build lazy grammar sampler with triggers
+                let mut trigger_patterns = Vec::new();
+                let mut trigger_tokens = Vec::new();
+
+                for trigger in &result.grammar_triggers {
+                    match trigger.trigger_type {
+                        GrammarTriggerType::Token => {
+                            if let Some(token) = trigger.token {
+                                trigger_tokens.push(token);
+                            }
+                        }
+                        GrammarTriggerType::Word => {
+                            match self.model.str_to_token(&trigger.value, AddBos::Never) {
+                                Ok(tokens) if tokens.len() == 1 => {
+                                    trigger_tokens.push(tokens[0]);
+                                }
+                                _ => {
+                                    trigger_patterns.push(Self::regex_escape(&trigger.value));
+                                }
+                            }
+                        }
+                        GrammarTriggerType::Pattern => {
+                            trigger_patterns.push(trigger.value.clone());
+                        }
+                        GrammarTriggerType::PatternFull => {
+                            trigger_patterns.push(Self::anchor_pattern(&trigger.value));
+                        }
+                    }
+                }
+
+                LlamaSampler::grammar_lazy_patterns(
+                    &self.model,
+                    grammar,
+                    "root",
+                    &trigger_patterns,
+                    &trigger_tokens,
+                )
+                .ok()
+            } else {
+                // Build strict grammar sampler
+                LlamaSampler::grammar(&self.model, grammar, "root").ok()
+            };
+
+            if let Some(g) = grammar_sampler {
+                // Grammar + greedy only — no temp/top_p/top_k
+                return LlamaSampler::chain_simple([g, LlamaSampler::greedy()]);
+            }
+        }
+
+        // No grammar or grammar creation failed — fall back to standard sampler
+        self.build_sampler(temperature)
+    }
+
+    /// Generate text with grammar-constrained sampling for tool calls.
+    fn generate_with_tools(
+        &self,
+        result: &ChatTemplateResult,
+        max_tokens: u32,
+        temperature: Option<f32>,
+    ) -> Result<GeneratedText, LLMError> {
+        let backend = llama_backend()?;
+        let add_bos = self.cfg.add_bos.unwrap_or(true);
+        let tokens = self
+            .model
+            .str_to_token(
+                &result.prompt,
+                if add_bos {
+                    AddBos::Always
+                } else {
+                    AddBos::Never
+                },
+            )
+            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+
+        if tokens.is_empty() {
+            return Err(LLMError::InvalidRequest(
+                "Prompt tokenization resulted in an empty sequence".into(),
+            ));
+        }
+
+        if max_tokens == 0 {
+            return Ok(GeneratedText {
+                text: String::new(),
+                usage: Usage {
+                    input_tokens: tokens.len() as u32,
+                    output_tokens: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning_tokens: 0,
+                },
+            });
+        }
+
+        // Auto-size context when not explicitly configured (tool prompts are large)
+        let n_ctx_needed = tokens.len() as u32 + max_tokens;
+        let n_ctx = if let Some(configured_n_ctx) = self.cfg.n_ctx {
+            configured_n_ctx
+        } else {
+            // Only allocate what we actually need; cap at the model's training
+            // context to avoid GPU out-of-memory when n_ctx is not configured.
+            n_ctx_needed.min(self.model.n_ctx_train())
+        };
+
+        let mut ctx_params = LlamaContextParams::default();
+        let n_ctx = NonZeroU32::new(n_ctx)
+            .ok_or_else(|| LLMError::InvalidRequest("n_ctx must be greater than zero".into()))?;
+        ctx_params = ctx_params.with_n_ctx(Some(n_ctx));
+        ctx_params = ctx_params.with_n_batch(n_ctx.get());
+        if let Some(n_threads) = self.cfg.n_threads {
+            ctx_params = ctx_params.with_n_threads(n_threads);
+        }
+        if let Some(n_threads_batch) = self.cfg.n_threads_batch {
+            ctx_params = ctx_params.with_n_threads_batch(n_threads_batch);
+        }
+
+        let mut ctx = self
+            .model
+            .new_context(&*backend, ctx_params)
+            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+
+        let n_ctx_total = ctx.n_ctx() as i32;
+        let n_len_total = tokens.len() as i32 + max_tokens as i32;
+        if n_len_total > n_ctx_total {
+            return Err(LLMError::InvalidRequest(format!(
+                "Prompt + max_tokens ({n_len_total}) exceeds context window ({n_ctx_total})"
+            )));
+        }
+
+        let mut batch = LlamaBatch::new(n_ctx_total as usize, 1);
+
+        let last_index = tokens.len().saturating_sub(1) as i32;
+        for (i, token) in (0_i32..).zip(tokens.iter().copied()) {
+            let is_last = i == last_index;
+            batch
+                .add(token, i, &[0], is_last)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+        }
+
+        ctx.decode(&mut batch)
+            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+
+        // Build preserved token set for special handling
+        let mut preserved = HashSet::new();
+        for token_str in &result.preserved_tokens {
+            if let Ok(preserved_tokens) = self.model.str_to_token(token_str, AddBos::Never) {
+                if preserved_tokens.len() == 1 {
+                    preserved.insert(preserved_tokens[0]);
+                }
+            }
+        }
+
+        let mut sampler = self.build_tool_sampler(result, temperature);
+        let mut n_cur = batch.n_tokens();
+        let mut output_tokens = 0u32;
+        let mut output = String::new();
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+
+        while n_cur < n_len_total {
+            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            if self.model.is_eog_token(token) {
+                break;
+            }
+
+            let special = preserved.contains(&token);
+            let bytes = self
+                .model
+                .token_to_piece_bytes(token, 128, special, None)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+            let chunk = match self.model.token_to_piece(token, &mut decoder, special, None) {
+                Ok(piece) => piece,
+                Err(_) => String::from_utf8_lossy(&bytes).to_string(),
+            };
+            output.push_str(&chunk);
+
+            // Check additional stop sequences
+            if result
+                .additional_stops
+                .iter()
+                .any(|stop| !stop.is_empty() && output.ends_with(stop))
+            {
+                break;
+            }
+
+            batch.clear();
+            batch
+                .add(token, n_cur, &[0], true)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+            n_cur += 1;
+            output_tokens += 1;
+
+            ctx.decode(&mut batch)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+        }
+
+        // Trim matched stop sequences
+        for stop in &result.additional_stops {
+            if !stop.is_empty() && output.ends_with(stop) {
+                let new_len = output.len().saturating_sub(stop.len());
+                output.truncate(new_len);
+                break;
+            }
+        }
+
+        Ok(GeneratedText {
+            text: output,
+            usage: Usage {
+                input_tokens: tokens.len() as u32,
+                output_tokens,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning_tokens: 0,
+            },
+        })
+    }
+
+    /// Parse the generated response using the ChatTemplateResult to extract tool calls.
+    fn parse_tool_response(
+        result: &ChatTemplateResult,
+        text: &str,
+    ) -> Result<(String, Option<Vec<querymt::ToolCall>>, FinishReason), LLMError> {
+        let parsed_json = result
+            .parse_response_oaicompat(text, false)
+            .map_err(|e| LLMError::ProviderError(format!("Failed to parse response: {}", e)))?;
+
+        let parsed: Value = serde_json::from_str(&parsed_json).map_err(|e| {
+            LLMError::ProviderError(format!("Failed to deserialize parsed response: {}", e))
+        })?;
+
+        let content = parsed
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let tool_calls = parsed
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                if arr.is_empty() {
+                    None
+                } else {
+                    serde_json::from_value(Value::Array(arr.clone())).ok()
+                }
+            });
+
+        let finish_reason = if tool_calls.is_some() {
+            FinishReason::ToolCalls
+        } else {
+            FinishReason::Stop
+        };
+
+        Ok((content, tool_calls, finish_reason))
+    }
+
+    /// Generate text with streaming and grammar-constrained sampling for tool calls.
+    /// Returns (Usage, has_tool_calls) where has_tool_calls indicates if tool calls were made.
+    fn generate_streaming_with_tools(
+        &self,
+        result: &ChatTemplateResult,
+        max_tokens: u32,
+        temperature: Option<f32>,
+        tx: &mpsc::UnboundedSender<Result<querymt::chat::StreamChunk, LLMError>>,
+    ) -> Result<(Usage, bool), LLMError> {
+        let backend = llama_backend()?;
+        let add_bos = self.cfg.add_bos.unwrap_or(true);
+        let tokens = self
+            .model
+            .str_to_token(
+                &result.prompt,
+                if add_bos {
+                    AddBos::Always
+                } else {
+                    AddBos::Never
+                },
+            )
+            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+
+        if tokens.is_empty() {
+            return Err(LLMError::InvalidRequest(
+                "Prompt tokenization resulted in an empty sequence".into(),
+            ));
+        }
+
+        if max_tokens == 0 {
+            return Ok((
+                Usage {
+                    input_tokens: tokens.len() as u32,
+                    output_tokens: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning_tokens: 0,
+                },
+                false,
+            ));
+        }
+
+        // Auto-size context when not explicitly configured (tool prompts are large)
+        let n_ctx_needed = tokens.len() as u32 + max_tokens;
+        let n_ctx = if let Some(configured_n_ctx) = self.cfg.n_ctx {
+            configured_n_ctx
+        } else {
+            // Only allocate what we actually need; cap at the model's training
+            // context to avoid GPU out-of-memory when n_ctx is not configured.
+            n_ctx_needed.min(self.model.n_ctx_train())
+        };
+
+        let mut ctx_params = LlamaContextParams::default();
+        let n_ctx = NonZeroU32::new(n_ctx)
+            .ok_or_else(|| LLMError::InvalidRequest("n_ctx must be greater than zero".into()))?;
+        ctx_params = ctx_params.with_n_ctx(Some(n_ctx));
+        ctx_params = ctx_params.with_n_batch(n_ctx.get());
+        if let Some(n_threads) = self.cfg.n_threads {
+            ctx_params = ctx_params.with_n_threads(n_threads);
+        }
+        if let Some(n_threads_batch) = self.cfg.n_threads_batch {
+            ctx_params = ctx_params.with_n_threads_batch(n_threads_batch);
+        }
+
+        let mut ctx = self
+            .model
+            .new_context(&*backend, ctx_params)
+            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+
+        let n_ctx_total = ctx.n_ctx() as i32;
+        let n_len_total = tokens.len() as i32 + max_tokens as i32;
+        if n_len_total > n_ctx_total {
+            return Err(LLMError::InvalidRequest(format!(
+                "Prompt + max_tokens ({n_len_total}) exceeds context window ({n_ctx_total})"
+            )));
+        }
+
+        let mut batch = LlamaBatch::new(n_ctx_total as usize, 1);
+
+        let last_index = tokens.len().saturating_sub(1) as i32;
+        for (i, token) in (0_i32..).zip(tokens.iter().copied()) {
+            let is_last = i == last_index;
+            batch
+                .add(token, i, &[0], is_last)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+        }
+
+        ctx.decode(&mut batch)
+            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+
+        // Build preserved token set for special handling
+        let mut preserved = HashSet::new();
+        for token_str in &result.preserved_tokens {
+            if let Ok(preserved_tokens) = self.model.str_to_token(token_str, AddBos::Never) {
+                if preserved_tokens.len() == 1 {
+                    preserved.insert(preserved_tokens[0]);
+                }
+            }
+        }
+
+        // Initialize streaming parser
+        let mut stream_state = result.streaming_state_oaicompat().map_err(|e| {
+            LLMError::ProviderError(format!("Failed to init streaming state: {}", e))
+        })?;
+
+        let mut sampler = self.build_tool_sampler(result, temperature);
+        let mut n_cur = batch.n_tokens();
+        let mut output_tokens = 0u32;
+        let mut generated_text = String::new();
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+
+        // Track tool calls being assembled
+        let mut tool_calls_in_progress: std::collections::HashMap<usize, (String, String, String)> =
+            std::collections::HashMap::new();
+
+        while n_cur < n_len_total {
+            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            if self.model.is_eog_token(token) {
+                break;
+            }
+
+            let special = preserved.contains(&token);
+            let bytes = self
+                .model
+                .token_to_piece_bytes(token, 128, special, None)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+            let chunk = match self.model.token_to_piece(token, &mut decoder, special, None) {
+                Ok(piece) => piece,
+                Err(_) => String::from_utf8_lossy(&bytes).to_string(),
+            };
+            generated_text.push_str(&chunk);
+
+            // Check additional stop sequences
+            let stop_now = result
+                .additional_stops
+                .iter()
+                .any(|stop| !stop.is_empty() && generated_text.ends_with(stop));
+
+            // Update streaming parser
+            match stream_state.update(&chunk, !stop_now) {
+                Ok(deltas) => {
+                    for delta_json in deltas {
+                        // Parse each delta and emit appropriate StreamChunks
+                        if let Ok(delta) = serde_json::from_str::<Value>(&delta_json) {
+                            // Handle content delta
+                            if let Some(content_delta) =
+                                delta.get("content").and_then(|v| v.as_str())
+                            {
+                                if !content_delta.is_empty() {
+                                    if tx
+                                        .unbounded_send(Ok(querymt::chat::StreamChunk::Text(
+                                            content_delta.to_string(),
+                                        )))
+                                        .is_err()
+                                    {
+                                        return Ok((
+                                            Usage {
+                                                input_tokens: tokens.len() as u32,
+                                                output_tokens,
+                                                cache_read: 0,
+                                                cache_write: 0,
+                                                reasoning_tokens: 0,
+                                            },
+                                            !tool_calls_in_progress.is_empty(),
+                                        ));
+                                    }
+                                }
+                            }
+
+                            // Handle tool call deltas - parse tool_calls array
+                            if let Some(tool_calls_arr) =
+                                delta.get("tool_calls").and_then(|v| v.as_array())
+                            {
+                                for tc in tool_calls_arr {
+                                    let index =
+                                        tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
+                                            as usize;
+
+                                    // Check if this is a new tool call (has id and name)
+                                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                        let name = tc
+                                            .get("function")
+                                            .and_then(|f| f.get("name"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+
+                                        tool_calls_in_progress.insert(
+                                            index,
+                                            (id.to_string(), name.to_string(), String::new()),
+                                        );
+
+                                        if tx
+                                            .unbounded_send(Ok(
+                                                querymt::chat::StreamChunk::ToolUseStart {
+                                                    index,
+                                                    id: id.to_string(),
+                                                    name: name.to_string(),
+                                                },
+                                            ))
+                                            .is_err()
+                                        {
+                                            return Ok((
+                                                Usage {
+                                                    input_tokens: tokens.len() as u32,
+                                                    output_tokens,
+                                                    cache_read: 0,
+                                                    cache_write: 0,
+                                                    reasoning_tokens: 0,
+                                                },
+                                                !tool_calls_in_progress.is_empty(),
+                                            ));
+                                        }
+                                    }
+
+                                    // Always check for arguments delta
+                                    if let Some(args) = tc
+                                        .get("function")
+                                        .and_then(|f| f.get("arguments"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        if !args.is_empty() {
+                                            if let Some(entry) =
+                                                tool_calls_in_progress.get_mut(&index)
+                                            {
+                                                entry.2.push_str(args);
+                                            }
+
+                                            if tx
+                                                .unbounded_send(Ok(
+                                                    querymt::chat::StreamChunk::ToolUseInputDelta {
+                                                        index,
+                                                        partial_json: args.to_string(),
+                                                    },
+                                                ))
+                                                .is_err()
+                                            {
+                                                return Ok((
+                                                    Usage {
+                                                        input_tokens: tokens.len() as u32,
+                                                        output_tokens,
+                                                        cache_read: 0,
+                                                        cache_write: 0,
+                                                        reasoning_tokens: 0,
+                                                    },
+                                                    !tool_calls_in_progress.is_empty(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.unbounded_send(Err(LLMError::ProviderError(format!(
+                        "Streaming parse error: {}",
+                        e
+                    ))));
+                    return Err(LLMError::ProviderError(format!(
+                        "Streaming parse error: {}",
+                        e
+                    )));
+                }
+            }
+
+            if stop_now {
+                break;
+            }
+
+            batch.clear();
+            batch
+                .add(token, n_cur, &[0], true)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+            n_cur += 1;
+            output_tokens += 1;
+
+            ctx.decode(&mut batch)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+        }
+
+        // Trim matched stop sequences
+        for stop in &result.additional_stops {
+            if !stop.is_empty() && generated_text.ends_with(stop) {
+                let new_len = generated_text.len().saturating_sub(stop.len());
+                generated_text.truncate(new_len);
+                break;
+            }
+        }
+
+        // Parse final response to get complete tool calls
+        let (_, tool_calls, _) = Self::parse_tool_response(result, &generated_text)?;
+
+        // Emit ToolUseComplete for each tool call
+        let has_tool_calls = if let Some(calls) = tool_calls {
+            for (index, call) in calls.into_iter().enumerate() {
+                if tx
+                    .unbounded_send(Ok(querymt::chat::StreamChunk::ToolUseComplete {
+                        index,
+                        tool_call: call,
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            true
+        } else {
+            false
+        };
+
+        Ok((
+            Usage {
+                input_tokens: tokens.len() as u32,
+                output_tokens,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning_tokens: 0,
+            },
+            has_tool_calls,
+        ))
     }
 
     fn build_prompt_with(
@@ -363,6 +1086,8 @@ impl LlamaCppProvider {
                 LLMError::InvalidRequest("n_ctx must be greater than zero".into())
             })?;
             ctx_params = ctx_params.with_n_ctx(Some(n_ctx));
+            // Set n_batch to match n_ctx so large prompts (e.g. with tools) can be decoded
+            ctx_params = ctx_params.with_n_batch(n_ctx.get());
         }
         if let Some(n_threads) = self.cfg.n_threads {
             ctx_params = ctx_params.with_n_threads(n_threads);
@@ -384,8 +1109,8 @@ impl LlamaCppProvider {
             )));
         }
 
-        let batch_tokens = self.cfg.n_batch.unwrap_or(DEFAULT_BATCH);
-        let mut batch = LlamaBatch::new(batch_tokens as usize, 1);
+        // Allocate batch to fit all prompt tokens (n_batch was set to n_ctx above)
+        let mut batch = LlamaBatch::new(n_ctx_total as usize, 1);
 
         let last_index = tokens.len().saturating_sub(1) as i32;
         for (i, token) in (0_i32..).zip(tokens.iter().copied()) {
@@ -408,6 +1133,7 @@ impl LlamaCppProvider {
         let mut n_cur = batch.n_tokens();
         let mut output_tokens = 0u32;
         let mut output = String::new();
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
         while n_cur < n_len_total {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             if self.model.is_eog_token(token) {
@@ -422,9 +1148,9 @@ impl LlamaCppProvider {
 
             let bytes = self
                 .model
-                .token_to_bytes(token, Special::Tokenize)
+                .token_to_piece_bytes(token, 128, true, None)
                 .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-            let chunk = match self.model.token_to_str(token, Special::Tokenize) {
+            let chunk = match self.model.token_to_piece(token, &mut decoder, true, None) {
                 Ok(piece) => piece,
                 Err(_) => String::from_utf8_lossy(&bytes).to_string(),
             };
@@ -494,6 +1220,8 @@ impl LlamaCppProvider {
                 LLMError::InvalidRequest("n_ctx must be greater than zero".into())
             })?;
             ctx_params = ctx_params.with_n_ctx(Some(n_ctx));
+            // Set n_batch to match n_ctx so large prompts (e.g. with tools) can be decoded
+            ctx_params = ctx_params.with_n_batch(n_ctx.get());
         }
         if let Some(n_threads) = self.cfg.n_threads {
             ctx_params = ctx_params.with_n_threads(n_threads);
@@ -515,8 +1243,8 @@ impl LlamaCppProvider {
             )));
         }
 
-        let batch_tokens = self.cfg.n_batch.unwrap_or(DEFAULT_BATCH);
-        let mut batch = LlamaBatch::new(batch_tokens as usize, 1);
+        // Allocate batch to fit all prompt tokens (n_batch was set to n_ctx above)
+        let mut batch = LlamaBatch::new(n_ctx_total as usize, 1);
 
         let last_index = tokens.len().saturating_sub(1) as i32;
         for (i, token) in (0_i32..).zip(tokens.iter().copied()) {
@@ -538,6 +1266,7 @@ impl LlamaCppProvider {
 
         let mut n_cur = batch.n_tokens();
         let mut output_tokens = 0u32;
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
         while n_cur < n_len_total {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             if self.model.is_eog_token(token) {
@@ -552,9 +1281,9 @@ impl LlamaCppProvider {
 
             let bytes = self
                 .model
-                .token_to_bytes(token, Special::Tokenize)
+                .token_to_piece_bytes(token, 128, true, None)
                 .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-            let chunk = match self.model.token_to_str(token, Special::Tokenize) {
+            let chunk = match self.model.token_to_piece(token, &mut decoder, true, None) {
                 Ok(piece) => piece,
                 Err(_) => String::from_utf8_lossy(&bytes).to_string(),
             };
@@ -599,13 +1328,26 @@ impl ChatProvider for LlamaCppProvider {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<Box<dyn ChatResponse>, LLMError> {
-        if tools.is_some() {
-            return Err(LLMError::NotImplemented(
-                "Tool calling is not supported by llama.cpp provider".into(),
-            ));
+        let max_tokens = self.cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+
+        // If tools are provided and not empty, use tool-aware generation
+        if let Some(tools) = tools {
+            if !tools.is_empty() {
+                let template_result = self.apply_template_with_tools(messages, tools)?;
+                let generated = self.generate_with_tools(&template_result, max_tokens, None)?;
+                let (content, tool_calls, finish_reason) =
+                    Self::parse_tool_response(&template_result, &generated.text)?;
+
+                return Ok(Box::new(LlamaCppChatResponse {
+                    text: content,
+                    tool_calls,
+                    finish_reason,
+                    usage: generated.usage,
+                }));
+            }
         }
 
-        let max_tokens = self.cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        // Fall back to standard generation without tools
         let (prompt, used_chat_template) = self.build_prompt(messages)?;
         let mut generated = self.generate(&prompt, max_tokens, None)?;
         if generated.text.trim().is_empty() {
@@ -620,6 +1362,8 @@ impl ChatProvider for LlamaCppProvider {
         }
         Ok(Box::new(LlamaCppChatResponse {
             text: generated.text,
+            tool_calls: None,
+            finish_reason: FinishReason::Stop,
             usage: generated.usage,
         }))
     }
@@ -632,15 +1376,48 @@ impl ChatProvider for LlamaCppProvider {
         std::pin::Pin<Box<dyn Stream<Item = Result<querymt::chat::StreamChunk, LLMError>> + Send>>,
         LLMError,
     > {
-        if tools.is_some() {
-            return Err(LLMError::NotImplemented(
-                "Tool calling is not supported by llama.cpp provider".into(),
-            ));
+        let max_tokens = self.cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        let (tx, rx) = mpsc::unbounded();
+
+        // If tools are provided and not empty, use tool-aware streaming
+        if let Some(tools) = tools {
+            if !tools.is_empty() {
+                let template_result = self.apply_template_with_tools(messages, tools)?;
+                let cfg = self.cfg.clone();
+                let model = Arc::clone(&self.model);
+
+                thread::spawn(move || {
+                    let provider = LlamaCppProvider { model, cfg };
+
+                    match provider.generate_streaming_with_tools(
+                        &template_result,
+                        max_tokens,
+                        None,
+                        &tx,
+                    ) {
+                        Ok((usage, has_tool_calls)) => {
+                            let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
+                            let stop_reason = if has_tool_calls {
+                                "tool_use"
+                            } else {
+                                "end_turn"
+                            };
+                            let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Done {
+                                stop_reason: stop_reason.to_string(),
+                            }));
+                        }
+                        Err(err) => {
+                            let _ = tx.unbounded_send(Err(err));
+                        }
+                    }
+                });
+
+                return Ok(Box::pin(rx));
+            }
         }
 
-        let max_tokens = self.cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        // Fall back to standard streaming without tools
         let prompts = self.build_prompt_candidates(messages)?;
-        let (tx, rx) = mpsc::unbounded();
         let cfg = self.cfg.clone();
         let model = Arc::clone(&self.model);
 
@@ -716,7 +1493,8 @@ impl LLMProviderFactory for LlamaCppFactory {
 
     fn config_schema(&self) -> String {
         let schema = schema_for!(LlamaCppConfig);
-        serde_json::to_string(&schema.schema).expect("LlamaCppConfig schema should always serialize")
+        serde_json::to_string(&schema.schema)
+            .expect("LlamaCppConfig schema should always serialize")
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {

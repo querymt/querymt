@@ -199,7 +199,7 @@ impl LLMProviderFactory for ExtismFactory {
     fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
         let cfg_value: Value = serde_json::from_str(cfg)
             .map_err(|e| LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))?;
-        
+
         let _from_cfg = self
             .call("from_config", &cfg_value)
             .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
@@ -217,9 +217,14 @@ impl LLMProviderFactory for ExtismFactory {
         // thread to avoid deadlocks on current-thread runtimes.
         let cfg_value: Value = match serde_json::from_str(cfg) {
             Ok(v) => v,
-            Err(e) => return Box::pin(async move {
-                Err(LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))
-            }),
+            Err(e) => {
+                return Box::pin(async move {
+                    Err(LLMError::PluginError(format!(
+                        "Invalid JSON config: {:#}",
+                        e
+                    )))
+                })
+            }
         };
         let plugin = self.plugin.clone();
         async move {

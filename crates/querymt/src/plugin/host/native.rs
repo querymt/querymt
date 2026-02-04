@@ -25,10 +25,7 @@ impl LLMProviderFactory for NativeFactoryWrapper {
     fn config_schema(&self) -> String {
         self.factory_impl.config_schema()
     }
-    fn from_config(
-        &self,
-        cfg: &str,
-    ) -> Result<Box<dyn crate::LLMProvider>, LLMError> {
+    fn from_config(&self, cfg: &str) -> Result<Box<dyn crate::LLMProvider>, LLMError> {
         self.factory_impl.from_config(cfg)
     }
 

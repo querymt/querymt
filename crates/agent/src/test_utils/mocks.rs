@@ -276,10 +276,7 @@ impl LLMProviderFactory for TestProviderFactory {
         Ok(Box::new(self.provider.clone()))
     }
 
-    fn list_models<'a>(
-        &'a self,
-        _cfg: &str,
-    ) -> Fut<'a, Result<Vec<String>, LLMError>> {
+    fn list_models<'a>(&'a self, _cfg: &str) -> Fut<'a, Result<Vec<String>, LLMError>> {
         Box::pin(async { Ok(vec!["mock-model".to_string()]) })
     }
 }
