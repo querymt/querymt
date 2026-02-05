@@ -206,7 +206,8 @@ impl LlamaCppProvider {
             LlamaCppLogMode::Tracing => send_logs_to_tracing(LogOptions::default()),
             LlamaCppLogMode::Off => backend.void_logs(),
         }
-        let model_path = Self::resolve_model_path(&cfg.model_path, cfg.fast_download.unwrap_or(false))?;
+        let model_path =
+            Self::resolve_model_path(&cfg.model_path, cfg.fast_download.unwrap_or(false))?;
         let model_path = Path::new(&model_path);
         if !model_path.exists() {
             return Err(LLMError::InvalidRequest(format!(
