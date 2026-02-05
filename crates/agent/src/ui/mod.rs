@@ -73,6 +73,7 @@ pub(crate) struct ConnectionState {
     pub active_agent_id: String,
     pub sessions: HashMap<String, String>,
     pub subscribed_sessions: HashSet<String>,
+    pub current_workspace_root: Option<PathBuf>,
 }
 
 impl UiServer {

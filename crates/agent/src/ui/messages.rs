@@ -72,6 +72,8 @@ pub enum UiClientMessage {
     },
     NewSession {
         cwd: Option<String>,
+        #[serde(default)]
+        request_id: Option<String>,
     },
     Prompt {
         text: String,
@@ -128,6 +130,8 @@ pub enum UiServerMessage {
     SessionCreated {
         agent_id: String,
         session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     Event {
         agent_id: String,

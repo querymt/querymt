@@ -21,17 +21,20 @@ pub async fn ensure_sessions_for_mode(
     conn_id: &str,
     cwd: Option<&PathBuf>,
     tx: &mpsc::Sender<String>,
+    request_id: Option<&str>,
 ) -> Result<(), String> {
     let mode = current_mode(state, conn_id).await?;
     match mode {
         RoutingMode::Single => {
             let agent_id = current_active_agent(state, conn_id).await?;
-            ensure_session(state, conn_id, &agent_id, cwd, tx).await?;
+            ensure_session(state, conn_id, &agent_id, cwd, tx, request_id).await?;
         }
         RoutingMode::Broadcast => {
             let agent_ids = list_agent_ids(state);
-            for agent_id in agent_ids {
-                ensure_session(state, conn_id, &agent_id, cwd, tx).await?;
+            for (i, agent_id) in agent_ids.iter().enumerate() {
+                // Only pass request_id to the first agent in broadcast mode
+                let req_id = if i == 0 { request_id } else { None };
+                ensure_session(state, conn_id, agent_id, cwd, tx, req_id).await?;
             }
         }
     }
@@ -50,7 +53,7 @@ pub async fn prompt_for_mode(
     match mode {
         RoutingMode::Single => {
             let agent_id = current_active_agent(state, conn_id).await?;
-            let session_id = ensure_session(state, conn_id, &agent_id, cwd, tx).await?;
+            let session_id = ensure_session(state, conn_id, &agent_id, cwd, tx, None).await?;
             let agent = agent_for_id(state, &agent_id)
                 .ok_or_else(|| format!("Unknown agent: {}", agent_id))?;
             let session_cwd = session_cwd_for(state, &session_id).await.or(cwd.cloned());
@@ -65,7 +68,7 @@ pub async fn prompt_for_mode(
         RoutingMode::Broadcast => {
             let agent_ids = list_agent_ids(state);
             for agent_id in agent_ids {
-                let session_id = ensure_session(state, conn_id, &agent_id, cwd, tx).await?;
+                let session_id = ensure_session(state, conn_id, &agent_id, cwd, tx, None).await?;
                 let agent = agent_for_id(state, &agent_id)
                     .ok_or_else(|| format!("Unknown agent: {}", agent_id))?;
                 let session_cwd = session_cwd_for(state, &session_id).await.or(cwd.cloned());
@@ -103,6 +106,7 @@ pub async fn ensure_session(
     agent_id: &str,
     cwd: Option<&PathBuf>,
     tx: &mpsc::Sender<String>,
+    request_id: Option<&str>,
 ) -> Result<String, String> {
     let existing = {
         let connections = state.connections.lock().await;
@@ -156,6 +160,7 @@ pub async fn ensure_session(
         UiServerMessage::SessionCreated {
             agent_id: agent_id.to_string(),
             session_id: session_id.clone(),
+            request_id: request_id.map(|s| s.to_string()),
         },
     )
     .await;
@@ -179,6 +184,8 @@ pub async fn ensure_session(
         let manager = state.workspace_manager.clone();
         let session_id_clone = session_id.clone();
         let tx_clone = tx.clone();
+        let state_clone = state.clone();
+        let conn_id_clone = conn_id.to_string();
 
         let _ = super::connection::send_message(
             tx,
@@ -191,12 +198,23 @@ pub async fn ensure_session(
         .await;
 
         tokio::spawn(async move {
-            let status = match manager.get_or_create(root).await {
-                Ok(_) => UiServerMessage::WorkspaceIndexStatus {
-                    session_id: session_id_clone,
-                    status: "ready".to_string(),
-                    message: None,
-                },
+            let status = match manager.get_or_create(root.clone()).await {
+                Ok(_) => {
+                    // Subscribe to file index updates for this workspace
+                    super::connection::subscribe_to_file_index(
+                        state_clone,
+                        conn_id_clone,
+                        tx_clone.clone(),
+                        root,
+                    )
+                    .await;
+
+                    UiServerMessage::WorkspaceIndexStatus {
+                        session_id: session_id_clone,
+                        status: "ready".to_string(),
+                        message: None,
+                    }
+                }
                 Err(err) => UiServerMessage::WorkspaceIndexStatus {
                     session_id: session_id_clone,
                     status: "error".to_string(),

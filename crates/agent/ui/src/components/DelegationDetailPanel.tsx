@@ -1,9 +1,11 @@
-import { CheckCircle, Clock, Loader, XCircle, Copy, Check } from 'lucide-react';
+import { CheckCircle, Clock, Loader, XCircle, Copy, Check, Cpu, Wrench, DollarSign } from 'lucide-react';
 import { DelegationGroupInfo, Turn, UiAgentInfo, LlmConfigDetails } from '../types';
 import { TurnCard } from './TurnCard';
 import { getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
+import { calculateDelegationStats } from '../utils/statsCalculator';
+import { formatTokensAbbrev, formatCost } from '../utils/formatters';
 
 interface DelegationDetailPanelProps {
   delegation?: DelegationGroupInfo;
@@ -48,6 +50,7 @@ export function DelegationDetailPanel({
   const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
   const agentColor = agentId ? getAgentColor(agentId) : '#b026ff';
   const durationLabel = formatDuration(delegation.startTime, delegation.endTime);
+  const stats = calculateDelegationStats(delegation);
   const objective = delegation.objective ??
     (delegation.delegateEvent.toolCall?.raw_input as { objective?: string } | undefined)?.objective;
 
@@ -96,6 +99,38 @@ export function DelegationDetailPanel({
             <Clock className="w-3 h-3" />
             {durationLabel}
           </span>
+        </div>
+        {/* Delegation stats row */}
+        <div className="flex items-center gap-3 mt-2 text-[11px]">
+          {/* Context usage */}
+          <span className={`flex items-center gap-1 ${
+            (stats.contextPercent ?? 0) >= 80 ? 'text-cyber-orange' :
+            (stats.contextPercent ?? 0) >= 70 ? 'text-yellow-500' :
+            'text-gray-400'
+          }`}>
+            <Cpu className="w-3 h-3" />
+            {stats.contextPercent !== undefined
+              ? `${stats.contextPercent}% (${formatTokensAbbrev(stats.contextTokens)}/${formatTokensAbbrev(stats.contextLimit!)})`
+              : stats.contextTokens > 0
+                ? formatTokensAbbrev(stats.contextTokens)
+                : 'no ctx data'}
+          </span>
+          <span className="text-cyber-border/60">·</span>
+          <span className="flex items-center gap-1 text-gray-400">
+            <Wrench className="w-3 h-3" />
+            {stats.toolCallCount} tool call{stats.toolCallCount === 1 ? '' : 's'}
+          </span>
+          <span className="text-cyber-border/60">·</span>
+          <span className="text-gray-400">{stats.messageCount} message{stats.messageCount === 1 ? '' : 's'}</span>
+          {stats.costUsd > 0 && (
+            <>
+              <span className="text-cyber-border/60">·</span>
+              <span className="flex items-center gap-1 text-cyber-cyan">
+                <DollarSign className="w-3 h-3" />
+                {formatCost(stats.costUsd)}
+              </span>
+            </>
+          )}
         </div>
       </div>
       <div className="flex-1 overflow-y-auto">

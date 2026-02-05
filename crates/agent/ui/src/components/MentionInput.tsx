@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { MentionsInput, Mention, SuggestionDataItem, type MentionsInputStyle } from 'react-mentions';
-import { Loader } from 'lucide-react';
+import { Loader, File, Folder } from 'lucide-react';
 import { FileIndexEntry } from '../types';
 
 interface MentionInputProps {
@@ -75,25 +75,37 @@ const mentionsInputStyle: MentionsInputStyle = {
   },
   suggestions: {
     list: {
-      backgroundColor: 'rgb(20, 27, 61)',
-      border: '2px solid #00fff9',
-      borderRadius: '8px',
-      fontSize: 14,
-      maxHeight: '200px',
+      backgroundColor: '#0a0e27',  // cyber-bg (was cyber-surface)
+      border: '1px solid rgba(0, 255, 249, 0.3)',  // 1px, 30% opacity (was 2px, 100%)
+      borderRadius: '12px',  // rounded-xl (was 8px)
+      fontSize: 12,  // text-xs ~12px (was 14)
+      maxHeight: '240px',  // match ModelPicker (was 200px)
       overflow: 'auto',
-      boxShadow: '0 0 20px rgba(0, 255, 249, 0.3)',
+      boxShadow: '0 8px 30px rgba(0, 0, 0, 0.4), 0 0 20px rgba(0, 255, 249, 0.15)',  // layered shadow like ModelPicker
+      zIndex: 9999,
+      fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif",
+      padding: '4px',  // inner padding like cmdk px-1 py-1
+      minWidth: '320px',  // reasonable minimum
+      maxWidth: '480px',  // match ModelPicker width
     },
     item: {
-      padding: '8px 12px',
-      borderBottom: '1px solid rgba(0, 255, 249, 0.1)',
+      padding: '6px 8px',  // px-2 py-1.5 in Tailwind units
+      borderBottom: 'none',  // remove separators (cmdk uses gap)
+      borderRadius: '8px',  // rounded-lg like cmdk items
       cursor: 'pointer',
       display: 'flex',
       alignItems: 'center',
       gap: '8px',
-      backgroundColor: 'rgba(20, 27, 61, 0.8)',
+      backgroundColor: 'transparent',  // transparent default (was semi-transparent)
+      transition: 'all 0.15s ease',
+      margin: '1px 0',  // small gap between items
+      color: '#d1d5db',  // text-gray-300
+      fontSize: '12px',  // text-xs
       '&focused': {
-        backgroundColor: 'rgba(0, 255, 249, 0.15)',
-        boxShadow: 'inset 0 0 10px rgba(0, 255, 249, 0.2)',
+        backgroundColor: 'rgba(0, 255, 249, 0.2)',  // data-[selected=true]:bg-cyber-cyan/20
+        color: '#00fff9',  // text-cyber-cyan
+        border: '1px solid rgba(0, 255, 249, 0.4)',  // border-cyber-cyan/40
+        boxShadow: 'none',  // remove inset shadow
       },
     },
   },
@@ -379,15 +391,15 @@ export function MentionInput({
         <div style={{ 
           display: 'flex', 
           alignItems: 'center', 
+          justifyContent: 'center',
           gap: '8px',
-          opacity: 0.7,
-          fontStyle: 'italic',
+          opacity: 0.6,
+          padding: '16px 8px',
+          fontSize: '12px',
         }}>
-          <Loader className="w-4 h-4 animate-spin" style={{ color: '#00fff9' }} />
+          <Loader className="w-3.5 h-3.5 animate-spin" style={{ color: '#6b7280' }} />
           <span style={{
-            fontFamily: "'Monaco', 'Menlo', 'Ubuntu Mono', monospace",
-            fontSize: '0.9em',
-            color: '#d1d5db',
+            color: '#6b7280',
           }}>
             {suggestion.display}
           </span>
@@ -396,16 +408,22 @@ export function MentionInput({
     }
     
     const isDir = (suggestion as any).isDir;
-    const icon = isDir ? '📁' : '📄';
     
     return (
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-        <span style={{ fontSize: '1.2em' }}>{icon}</span>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%' }}>
+        {isDir ? (
+          <Folder className="w-3.5 h-3.5 flex-shrink-0" style={{ color: focused ? '#00fff9' : '#9ca3af' }} />
+        ) : (
+          <File className="w-3.5 h-3.5 flex-shrink-0" style={{ color: focused ? '#00fff9' : '#9ca3af' }} />
+        )}
         <span style={{
           fontFamily: "'Monaco', 'Menlo', 'Ubuntu Mono', monospace",
-          fontSize: '0.9em',
+          fontSize: '12px',
           color: focused ? '#00fff9' : '#d1d5db',
-          textShadow: focused ? '0 0 5px rgba(0, 255, 249, 0.4)' : 'none',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          flex: 1,
         }}>
           {suggestion.display}
         </span>

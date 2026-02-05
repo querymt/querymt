@@ -59,7 +59,7 @@ pub async fn handle_ui_message(
             drop(connections);
             send_state(state, conn_id, tx).await;
         }
-        UiClientMessage::NewSession { cwd } => {
+        UiClientMessage::NewSession { cwd, request_id } => {
             let cwd = resolve_cwd(cwd);
 
             // Clear existing sessions for this connection to start fresh
@@ -81,7 +81,7 @@ pub async fn handle_ui_message(
                 }
             }
 
-            if let Err(err) = ensure_sessions_for_mode(state, conn_id, cwd.as_ref(), tx).await {
+            if let Err(err) = ensure_sessions_for_mode(state, conn_id, cwd.as_ref(), tx, request_id.as_deref()).await {
                 let _ = send_error(tx, err).await;
             }
 
@@ -105,6 +105,8 @@ pub async fn handle_ui_message(
                 {
                     let _ = send_error(&tx, err).await;
                 }
+                // Refresh session list after prompt completes so titles are up to date
+                handle_list_sessions(&state, &tx).await;
             });
         }
         UiClientMessage::ListSessions => {
@@ -207,12 +209,15 @@ pub async fn handle_load_session(
     };
 
     // 1a. Load session to get cwd and populate session_cwds
-    if let Ok(Some(session)) = state.agent.provider.get_session(session_id).await
+    let cwd_path = if let Ok(Some(session)) = state.agent.provider.get_session(session_id).await
         && let Some(cwd) = session.cwd
     {
         let mut cwds = state.session_cwds.lock().await;
-        cwds.insert(session_id.to_string(), cwd);
-    }
+        cwds.insert(session_id.to_string(), cwd.clone());
+        Some(cwd)
+    } else {
+        None
+    };
 
     // 2. Determine agent ID (default to primary)
     let agent_id = PRIMARY_AGENT_ID.to_string();
@@ -247,6 +252,18 @@ pub async fn handle_load_session(
 
     // 6. Send updated state
     send_state(state, conn_id, tx).await;
+
+    // 7. Subscribe to file index updates if this session has a cwd
+    if let Some(cwd) = cwd_path {
+        let root = resolve_workspace_root(&cwd);
+        super::connection::subscribe_to_file_index(
+            state.clone(),
+            conn_id.to_string(),
+            tx.clone(),
+            root,
+        )
+        .await;
+    }
 }
 
 /// Handle model listing request using moka cache.

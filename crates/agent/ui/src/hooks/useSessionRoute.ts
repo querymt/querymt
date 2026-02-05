@@ -16,7 +16,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useUiClientContext } from '../context/UiClientContext';
 
 export function useSessionRoute() {
-  const { sessionId, loadSession, connected } = useUiClientContext();
+  const { sessionId, loadSession, connected, sessionCreatingRef } = useUiClientContext();
   const { sessionId: urlSessionId } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
   
@@ -31,10 +31,20 @@ export function useSessionRoute() {
     if (urlSessionId === sessionId) return; // Already loaded
     if (lastUrlSessionIdRef.current === urlSessionId) return; // Already processed this URL
     
+    // Skip loadSession during promise-based session creation to avoid race conditions.
+    // Clear the flag once everything is settled (URL and state match).
+    if (sessionCreatingRef.current) {
+      if (urlSessionId === sessionId) {
+        console.log('[useSessionRoute] Session creation complete, clearing flag');
+        sessionCreatingRef.current = false;
+      }
+      return;
+    }
+    
     console.log('[useSessionRoute] URL changed, loading session:', urlSessionId);
     lastUrlSessionIdRef.current = urlSessionId;
     loadSession(urlSessionId);
-  }, [urlSessionId, sessionId, connected, loadSession]);
+  }, [urlSessionId, sessionId, connected, loadSession, sessionCreatingRef]);
   
   // State → URL: When session changes (e.g., session_created), update URL
   useEffect(() => {
@@ -42,10 +52,14 @@ export function useSessionRoute() {
     if (sessionId === urlSessionId) return; // URL already matches
     if (lastSessionIdRef.current === sessionId) return; // Already navigated for this session
     
+    // Skip during promise-based session creation — the promise handles navigation
+    if (sessionCreatingRef.current) return;
+    
     console.log('[useSessionRoute] Session changed, navigating to:', sessionId);
     lastSessionIdRef.current = sessionId;
+    lastUrlSessionIdRef.current = sessionId; // Prevent URL→State from re-loading
     navigate(`/session/${sessionId}`, { replace: true });
-  }, [sessionId, urlSessionId, navigate]);
+  }, [sessionId, urlSessionId, navigate, sessionCreatingRef]);
   
   // Reset tracking when navigating to home
   useEffect(() => {

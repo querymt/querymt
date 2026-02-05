@@ -4,7 +4,7 @@
 //! and incremental function index updates.
 
 use arc_swap::ArcSwap;
-use glob::Pattern;
+use ignore::overrides::{Override, OverrideBuilder};
 use ignore::WalkBuilder;
 use notify::{
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -150,30 +150,44 @@ impl Default for FileIndexConfig {
         Self {
             max_files: 10_000,
             max_depth: Some(20),
-            include_hidden: false,
+            include_hidden: true, // Include dotfiles like .github, .eslintrc, etc.
             respect_gitignore: true,
             ignore_patterns: vec![
-                "node_modules/**".to_string(),
-                ".git/**".to_string(),
-                "dist/**".to_string(),
-                "build/**".to_string(),
-                "out/**".to_string(),
-                "target/**".to_string(),
-                ".next/**".to_string(),
-                ".nuxt/**".to_string(),
-                "vendor/**".to_string(),
-                "__pycache__/**".to_string(),
+                // Version control
+                ".git/".to_string(),
+                // Dependencies
+                "node_modules/".to_string(),
+                "vendor/".to_string(),
+                // Build outputs
+                "dist/".to_string(),
+                "build/".to_string(),
+                "out/".to_string(),
+                "target/".to_string(),
+                ".next/".to_string(),
+                ".nuxt/".to_string(),
+                // Python
+                "__pycache__/".to_string(),
                 "*.pyc".to_string(),
-                ".venv/**".to_string(),
-                "venv/**".to_string(),
-                "coverage/**".to_string(),
-                ".cache/**".to_string(),
-                "tmp/**".to_string(),
-                "temp/**".to_string(),
+                ".venv/".to_string(),
+                "venv/".to_string(),
+                // Caches and temp
+                ".cache/".to_string(),
+                "coverage/".to_string(),
+                "tmp/".to_string(),
+                "temp/".to_string(),
+                // Databases
                 "*.db".to_string(),
                 "*.sqlite".to_string(),
                 "*.sqlite3".to_string(),
-                "crates/agent/ui/dist/**".to_string(),
+                // IDE and editor files (exclude these dotfiles)
+                ".vscode/".to_string(),
+                ".idea/".to_string(),
+                ".DS_Store".to_string(),
+                // Environment files (sensitive)
+                ".env".to_string(),
+                ".env.*".to_string(),
+                // QueryMT agent files
+                ".opencode/".to_string(),
             ],
             debounce: Duration::from_millis(200),
             rebuild_interval: Duration::from_millis(1000),
@@ -216,7 +230,7 @@ impl FileIndexWatcher {
         let (index_tx, _) = broadcast::channel(16);
         let (changes_tx, _) = broadcast::channel(64);
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(256);
-        let ignore_patterns = compile_ignore_patterns(&config)?;
+        let overrides = compile_overrides(&root, &config)?;
 
         // Create the file watcher
         let watcher_config = Config::default().with_poll_interval(Duration::from_secs(2));
@@ -236,9 +250,9 @@ impl FileIndexWatcher {
         // Build initial index using spawn_blocking to avoid blocking the async runtime
         let root_clone = root.clone();
         let config_clone = config.clone();
-        let ignore_patterns_clone = ignore_patterns.clone();
+        let overrides_clone = overrides.clone();
         let initial_index = tokio::task::spawn_blocking(move || {
-            build_file_index(&root_clone, &config_clone, &ignore_patterns_clone)
+            build_file_index(&root_clone, &config_clone, &overrides_clone)
         })
         .await
         .map_err(|e| {
@@ -254,7 +268,7 @@ impl FileIndexWatcher {
         let changes_tx_clone = changes_tx.clone();
         let root_clone = root.clone();
         let config_clone = config.clone();
-        let ignore_patterns_clone = ignore_patterns.clone();
+        let overrides_clone = overrides.clone();
 
         let rebuild_handle = tokio::spawn(async move {
             let mut pending_events: Vec<Event> = Vec::new();
@@ -271,10 +285,10 @@ impl FileIndexWatcher {
                     _ = full_rebuild_timer.tick() => {
                         let root = root_clone.clone();
                         let config = config_clone.clone();
-                        let patterns = ignore_patterns_clone.clone();
+                        let overrides = overrides_clone.clone();
 
                         if let Ok(Ok(new_index)) = tokio::task::spawn_blocking(move || {
-                            build_file_index(&root, &config, &patterns)
+                            build_file_index(&root, &config, &overrides)
                         }).await {
                             index_clone.store(Arc::new(Some(new_index.clone())));
                             let _ = index_tx_clone.send(new_index);
@@ -291,7 +305,7 @@ impl FileIndexWatcher {
                             let change_set = process_events(
                                 &pending_events,
                                 &root_clone,
-                                &ignore_patterns_clone,
+                                &overrides_clone,
                             );
                             pending_events.clear();
 
@@ -303,7 +317,7 @@ impl FileIndexWatcher {
                                         &change_set,
                                         &root_clone,
                                         &config_clone,
-                                        &ignore_patterns_clone,
+                                        &overrides_clone,
                                     );
                                     index_clone.store(Arc::new(Some(updated.clone())));
                                     let _ = index_tx_clone.send(updated);
@@ -311,10 +325,10 @@ impl FileIndexWatcher {
                                     // No current index, do full rebuild in spawn_blocking
                                     let root = root_clone.clone();
                                     let config = config_clone.clone();
-                                    let patterns = ignore_patterns_clone.clone();
+                                    let overrides = overrides_clone.clone();
 
                                     if let Ok(Ok(new_index)) = tokio::task::spawn_blocking(move || {
-                                        build_file_index(&root, &config, &patterns)
+                                        build_file_index(&root, &config, &overrides)
                                     }).await {
                                         index_clone.store(Arc::new(Some(new_index.clone())));
                                         let _ = index_tx_clone.send(new_index);
@@ -358,12 +372,12 @@ impl FileIndexWatcher {
 
     /// Force an immediate index rebuild.
     pub async fn refresh(&self) -> Result<FileIndex, FileIndexError> {
-        let ignore_patterns = compile_ignore_patterns(&self.config)?;
+        let overrides = compile_overrides(&self.root, &self.config)?;
         let root = self.root.clone();
         let config = self.config.clone();
 
         let new_index =
-            tokio::task::spawn_blocking(move || build_file_index(&root, &config, &ignore_patterns))
+            tokio::task::spawn_blocking(move || build_file_index(&root, &config, &overrides))
                 .await
                 .map_err(|e| {
                     FileIndexError::WalkError(format!("Failed to refresh index: {}", e))
@@ -384,7 +398,7 @@ impl FileIndexWatcher {
 fn build_file_index(
     root: &Path,
     config: &FileIndexConfig,
-    ignore_patterns: &[Pattern],
+    overrides: &Override,
 ) -> Result<FileIndex, FileIndexError> {
     let mut files = Vec::new();
     let mut count = 0;
@@ -393,7 +407,8 @@ fn build_file_index(
     builder
         .git_ignore(config.respect_gitignore)
         .hidden(!config.include_hidden)
-        .follow_links(false);
+        .follow_links(false)
+        .overrides(overrides.clone());
 
     if let Some(max_depth) = config.max_depth {
         builder.max_depth(Some(max_depth));
@@ -417,10 +432,6 @@ fn build_file_index(
             Ok(p) => p.to_string_lossy().to_string(),
             Err(_) => continue,
         };
-
-        if is_ignored(&relative_path, ignore_patterns) {
-            continue;
-        }
 
         // Skip empty paths
         if relative_path.is_empty() {
@@ -463,7 +474,7 @@ fn build_file_index(
 }
 
 /// Process notify events into a FileChangeSet
-fn process_events(events: &[Event], root: &Path, ignore_patterns: &[Pattern]) -> FileChangeSet {
+fn process_events(events: &[Event], root: &Path, overrides: &Override) -> FileChangeSet {
     let mut changes = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
     let mut rename_from: Option<PathBuf> = None;
@@ -482,7 +493,7 @@ fn process_events(events: &[Event], root: &Path, ignore_patterns: &[Pattern]) ->
                 Err(_) => continue,
             };
 
-            if is_ignored(&relative, ignore_patterns) {
+            if is_ignored(&relative, is_dir, overrides) {
                 continue;
             }
 
@@ -535,18 +546,24 @@ fn process_events(events: &[Event], root: &Path, ignore_patterns: &[Pattern]) ->
     FileChangeSet { changes, timestamp }
 }
 
-fn compile_ignore_patterns(config: &FileIndexConfig) -> Result<Vec<Pattern>, FileIndexError> {
-    config
-        .ignore_patterns
-        .iter()
-        .map(|pat| Pattern::new(pat).map_err(|e| FileIndexError::InvalidConfig(e.to_string())))
-        .collect()
+fn compile_overrides(root: &Path, config: &FileIndexConfig) -> Result<Override, FileIndexError> {
+    let mut builder = OverrideBuilder::new(root);
+    
+    // Add each pattern with ! prefix (meaning "exclude" in Override semantics)
+    for pattern in &config.ignore_patterns {
+        let exclude_pattern = format!("!{}", pattern);
+        builder
+            .add(&exclude_pattern)
+            .map_err(|e| FileIndexError::InvalidConfig(format!("Invalid pattern '{}': {}", pattern, e)))?;
+    }
+    
+    builder
+        .build()
+        .map_err(|e| FileIndexError::InvalidConfig(format!("Failed to build overrides: {}", e)))
 }
 
-fn is_ignored(relative_path: &str, ignore_patterns: &[Pattern]) -> bool {
-    ignore_patterns
-        .iter()
-        .any(|pattern| pattern.matches_path(relative_path.as_ref()))
+fn is_ignored(relative_path: &str, is_dir: bool, overrides: &Override) -> bool {
+    overrides.matched(relative_path, is_dir).is_ignore()
 }
 
 fn apply_changes_to_index(
@@ -554,7 +571,7 @@ fn apply_changes_to_index(
     change_set: &FileChangeSet,
     root: &Path,
     config: &FileIndexConfig,
-    ignore_patterns: &[Pattern],
+    overrides: &Override,
 ) -> FileIndex {
     let mut entries: HashMap<String, FileIndexEntry> = current
         .files
@@ -568,7 +585,7 @@ fn apply_changes_to_index(
             Err(_) => continue,
         };
 
-        if relative_path.is_empty() || is_ignored(&relative_path, ignore_patterns) {
+        if relative_path.is_empty() || is_ignored(&relative_path, change.is_dir, overrides) {
             continue;
         }
 
@@ -653,8 +670,8 @@ mod tests {
         fs::write(temp_dir.path().join("subdir/nested.ts"), "export {}").unwrap();
 
         let config = FileIndexConfig::default();
-        let ignore_patterns = compile_ignore_patterns(&config).unwrap();
-        let index = build_file_index(temp_dir.path(), &config, &ignore_patterns).unwrap();
+        let overrides = compile_overrides(temp_dir.path(), &config).unwrap();
+        let index = build_file_index(temp_dir.path(), &config, &overrides).unwrap();
 
         assert!(index.files.len() >= 3);
         assert!(index.files.iter().any(|f| f.path == "file1.txt"));

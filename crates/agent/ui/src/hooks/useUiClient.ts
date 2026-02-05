@@ -46,6 +46,8 @@ export function useUiClient() {
   const fileIndexCallbackRef = useRef<FileIndexCallback | null>(null);
   const fileIndexErrorCallbackRef = useRef<FileIndexErrorCallback | null>(null);
   const llmConfigCallbacksRef = useRef<Map<number, (config: LlmConfigDetails) => void>>(new Map());
+  const pendingRequestsRef = useRef<Map<string, (sessionId: string) => void>>(new Map());
+  const sessionCreatingRef = useRef(false);
 
   // Derive main session events for backward compatibility
   const events = useMemo(
@@ -114,6 +116,11 @@ export function useUiClient() {
           setSessionLimits(null); // Clear session limits, will be set by session_configured event
           setIsConversationComplete(false); // Reset conversation complete state
           setThinkingBySession(new Map()); // Clear all session thinking state
+        }
+        // Resolve pending promise if there's a request_id match
+        if (msg.request_id && pendingRequestsRef.current.has(msg.request_id)) {
+          pendingRequestsRef.current.get(msg.request_id)!(msg.session_id);
+          pendingRequestsRef.current.delete(msg.request_id);
         }
         break;
       case 'session_events': {
@@ -467,13 +474,26 @@ export function useUiClient() {
     socket.send(JSON.stringify(message));
   };
 
-  const newSession = useCallback(async () => {
+  const newSession = useCallback(async (): Promise<string> => {
     const input = window.prompt('Workspace path (blank for none):', '');
     if (input === null) {
-      return;
+      throw new Error('Session creation cancelled');
     }
     const cwd = input.trim();
-    sendMessage({ type: 'new_session', cwd: cwd.length > 0 ? cwd : null });
+    const requestId = crypto.randomUUID();
+    
+    // Signal that session creation is in progress to prevent route sync interference.
+    // Cleared by useSessionRoute once URL and state are in sync.
+    sessionCreatingRef.current = true;
+    
+    return new Promise((resolve) => {
+      pendingRequestsRef.current.set(requestId, resolve);
+      sendMessage({ 
+        type: 'new_session', 
+        cwd: cwd.length > 0 ? cwd : null,
+        request_id: requestId 
+      });
+    });
   }, []);
 
   const sendPrompt = useCallback(async (promptText: string) => {
@@ -595,6 +615,7 @@ export function useUiClient() {
     sendUndo,
     sendRedo,
     undoState,
+    sessionCreatingRef,
   };
 }
 

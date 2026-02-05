@@ -1,4 +1,4 @@
-import { EventItem, AgentStats, CalculatedStats, SessionStats, SessionLimits } from '../types';
+import { EventItem, AgentStats, CalculatedStats, SessionStats, SessionLimits, DelegationGroupInfo } from '../types';
 
 // Track agent working state during reconstruction
 interface AgentTimingState {
@@ -212,4 +212,68 @@ export function calculateStats(events: EventItem[], sessionLimits?: SessionLimit
   };
   
   return { session, perAgent };
+}
+
+/** Stats computed from a delegation group's events */
+export interface DelegationStats {
+  contextTokens: number;
+  contextLimit: number | undefined;
+  contextPercent: number | undefined;
+  toolCallCount: number;
+  messageCount: number;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  steps: number;
+  turns: number;
+}
+
+export function calculateDelegationStats(group: DelegationGroupInfo): DelegationStats {
+  let contextTokens = 0;
+  let contextLimit: number | undefined;
+  let costUsd = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let steps = 0;
+  let turns = 0;
+
+  const toolCallCount = group.events.filter(e => e.type === 'tool_call').length;
+  const messageCount = group.events.filter(e => e.type === 'agent' && e.isMessage).length;
+
+  for (const event of group.events) {
+    if (event.contextTokens !== undefined) {
+      contextTokens = event.contextTokens; // latest value wins
+    }
+    if (event.contextLimit !== undefined) {
+      contextLimit = event.contextLimit;
+    }
+    if (event.costUsd !== undefined) {
+      costUsd += event.costUsd;
+    }
+    if (event.usage) {
+      inputTokens += event.usage.input_tokens;
+      outputTokens += event.usage.output_tokens;
+    }
+    if (event.metrics) {
+      steps = event.metrics.steps;
+      turns = event.metrics.turns;
+    }
+  }
+
+  const contextPercent = contextLimit && contextLimit > 0
+    ? Math.min(100, Math.round((contextTokens / contextLimit) * 100))
+    : undefined;
+
+  return {
+    contextTokens,
+    contextLimit,
+    contextPercent,
+    toolCallCount,
+    messageCount,
+    costUsd,
+    inputTokens,
+    outputTokens,
+    steps,
+    turns,
+  };
 }

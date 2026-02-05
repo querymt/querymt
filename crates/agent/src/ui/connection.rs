@@ -27,6 +27,7 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
                 active_agent_id: PRIMARY_AGENT_ID.to_string(),
                 sessions: HashMap::new(),
                 subscribed_sessions: HashSet::new(),
+                current_workspace_root: None,
             },
         );
     }
@@ -208,4 +209,98 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
             }
         });
     }
+}
+
+/// Subscribe to file index updates for a workspace and forward them to the WebSocket client.
+/// 
+/// This spawns a long-lived task that listens to file index broadcasts from the FileIndexWatcher
+/// and sends FileIndex messages to the client whenever files are created/modified/deleted.
+pub async fn subscribe_to_file_index(
+    state: ServerState,
+    conn_id: String,
+    tx: mpsc::Sender<String>,
+    workspace_root: std::path::PathBuf,
+) {
+    // Get the workspace and subscribe to its file index updates
+    let workspace = match state.workspace_manager.get_or_create(workspace_root.clone()).await {
+        Ok(workspace) => workspace,
+        Err(err) => {
+            log::error!("Failed to get workspace for file index subscription: {}", err);
+            return;
+        }
+    };
+
+    let mut index_rx = workspace.file_watcher().subscribe_index();
+    
+    // Update connection state to track which workspace we're subscribed to
+    {
+        let mut connections = state.connections.lock().await;
+        if let Some(conn) = connections.get_mut(&conn_id) {
+            conn.current_workspace_root = Some(workspace_root.clone());
+        }
+    }
+
+    log::info!(
+        "Subscribed connection {} to file index updates for workspace {:?}",
+        conn_id,
+        workspace_root
+    );
+
+    // Spawn a task to forward file index updates to the client
+    tokio::spawn(async move {
+        while let Ok(index) = index_rx.recv().await {
+            // Get the current session's cwd to filter the index appropriately
+            let (_session_id, cwd) = {
+                let connections = state.connections.lock().await;
+                let conn = match connections.get(&conn_id) {
+                    Some(conn) => conn,
+                    None => {
+                        // Connection closed, stop forwarding
+                        log::debug!("Connection {} closed, stopping file index forwarding", conn_id);
+                        break;
+                    }
+                };
+                
+                let session_id = conn.sessions.get(&conn.active_agent_id).cloned();
+                
+                let session_id = match session_id {
+                    Some(id) => id,
+                    None => continue, // No active session, skip this update
+                };
+                
+                let cwds = state.session_cwds.lock().await;
+                let cwd = match cwds.get(&session_id).cloned() {
+                    Some(cwd) => cwd,
+                    None => continue, // No cwd for this session, skip
+                };
+                
+                (session_id, cwd)
+            };
+
+            // Filter the index to the session's cwd
+            let relative_cwd = match cwd.strip_prefix(&workspace_root) {
+                Ok(relative) => relative,
+                Err(_) => continue, // cwd outside workspace root, skip
+            };
+
+            let files = super::mentions::filter_index_for_cwd(&index, relative_cwd);
+
+            // Send the filtered index to the client
+            if send_message(
+                &tx,
+                UiServerMessage::FileIndex {
+                    files,
+                    generated_at: index.generated_at,
+                },
+            )
+            .await
+            .is_err()
+            {
+                log::debug!("Failed to send file index to connection {}, stopping forwarding", conn_id);
+                break;
+            }
+
+            log::debug!("Pushed file index update to connection {}", conn_id);
+        }
+    });
 }

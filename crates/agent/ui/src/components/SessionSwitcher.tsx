@@ -18,7 +18,7 @@ interface SessionSwitcherProps {
   groups: SessionGroup[];
   activeSessionId: string | null;
   thinkingBySession: Map<string, Set<string>>;
-  onNewSession: () => void;
+  onNewSession: () => Promise<void>;
   connected: boolean;
 }
 
@@ -127,9 +127,9 @@ export function SessionSwitcher({
   };
   
   // Handle new session
-  const handleNewSession = () => {
-    onNewSession();
+  const handleNewSession = async () => {
     onOpenChange(false);
+    await onNewSession();
   };
   
   if (!open) return null;

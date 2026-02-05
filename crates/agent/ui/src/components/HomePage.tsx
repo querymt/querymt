@@ -27,7 +27,11 @@ export function HomePage() {
   const handleNewSession = async () => {
     setLoading(true);
     try {
-      await newSession();
+      const newSessionId = await newSession();
+      navigate(`/session/${newSessionId}`, { replace: true });
+    } catch (err) {
+      // User cancelled or error occurred
+      console.log('Session creation cancelled or failed:', err);
     } finally {
       setLoading(false);
     }

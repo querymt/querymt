@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { Outlet, Link, useLocation } from 'react-router-dom';
+import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
 import { Home, Copy, Check } from 'lucide-react';
 import { useUiClientContext } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
@@ -62,6 +62,7 @@ export function AppShell() {
   } = useUiStore();
   
   const location = useLocation();
+  const navigate = useNavigate();
   const isHomePage = location.pathname === '/';
   const copyTimeoutRef = useRef<number | null>(null);
   
@@ -90,7 +91,7 @@ export function AppShell() {
       if ((e.metaKey || e.ctrlKey) && e.key === 'n') {
         e.preventDefault();
         if (connected && !loading) {
-          newSession();
+          handleNewSession();
         }
       }
     };
@@ -161,6 +162,17 @@ export function AppShell() {
     copyTimeoutRef.current = window.setTimeout(() => {
       setSessionCopied(false);
     }, 2000);
+  };
+  
+  // Handle new session creation with navigation
+  const handleNewSession = async () => {
+    try {
+      const newSessionId = await newSession();
+      navigate(`/session/${newSessionId}`, { replace: true });
+    } catch (err) {
+      // User cancelled or error occurred
+      console.log('Session creation cancelled or failed:', err);
+    }
   };
   
   // Clean up timeout on unmount
@@ -299,7 +311,7 @@ export function AppShell() {
         groups={sessionGroups}
         activeSessionId={sessionId}
         thinkingBySession={thinkingBySession}
-        onNewSession={newSession}
+        onNewSession={handleNewSession}
         connected={connected}
       />
       

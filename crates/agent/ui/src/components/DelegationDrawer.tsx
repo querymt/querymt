@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
-import { X, Copy, Check } from 'lucide-react';
+import { X, Copy, Check, Cpu, Wrench, DollarSign } from 'lucide-react';
 import { DelegationGroupInfo, EventRow, UiAgentInfo, LlmConfigDetails } from '../types';
 import { MessageContent } from './MessageContent';
 import { ToolSummary } from './ToolSummary';
@@ -9,6 +9,8 @@ import { ModelConfigPopover } from './ModelConfigPopover';
 import { getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
+import { calculateDelegationStats } from '../utils/statsCalculator';
+import { formatTokensAbbrev, formatCost } from '../utils/formatters';
 
 interface DelegationDrawerProps {
   delegation?: DelegationGroupInfo;
@@ -77,6 +79,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
   const agentId = delegation.targetAgentId ?? delegation.agentId;
   const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
   const agentColor = agentId ? getAgentColor(agentId) : '#b026ff';
+  const stats = calculateDelegationStats(delegation);
   const objective = delegation.objective ??
     (delegation.delegateEvent.toolCall?.raw_input as { objective?: string } | undefined)?.objective;
 
@@ -180,6 +183,35 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                       <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
                     )}
                   </button>
+                )}
+              </div>
+              {/* Delegation stats */}
+              <div className="flex items-center gap-3 mt-1.5 text-[10px]">
+                <span className={`flex items-center gap-1 ${
+                  (stats.contextPercent ?? 0) >= 80 ? 'text-cyber-orange' :
+                  (stats.contextPercent ?? 0) >= 70 ? 'text-yellow-500' :
+                  'text-gray-400'
+                }`}>
+                  <Cpu className="w-3 h-3" />
+                  {stats.contextPercent !== undefined
+                    ? `${stats.contextPercent}% (${formatTokensAbbrev(stats.contextTokens)}/${formatTokensAbbrev(stats.contextLimit!)})`
+                    : stats.contextTokens > 0
+                      ? formatTokensAbbrev(stats.contextTokens)
+                      : '—'}
+                </span>
+                <span className="text-cyber-border/60">·</span>
+                <span className="flex items-center gap-1 text-gray-400">
+                  <Wrench className="w-3 h-3" />
+                  {stats.toolCallCount} call{stats.toolCallCount === 1 ? '' : 's'}
+                </span>
+                {stats.costUsd > 0 && (
+                  <>
+                    <span className="text-cyber-border/60">·</span>
+                    <span className="flex items-center gap-1 text-cyber-cyan">
+                      <DollarSign className="w-3 h-3" />
+                      {formatCost(stats.costUsd)}
+                    </span>
+                  </>
                 )}
               </div>
             </div>

@@ -307,6 +307,7 @@ export type UiServerMessage =
       type: 'session_created';
       agent_id: string;
       session_id: string;
+      request_id?: string;
     }
   | {
       type: 'event';
@@ -355,7 +356,7 @@ export type UiClientMessage =
   | { type: 'init' }
   | { type: 'set_active_agent'; agent_id: string }
   | { type: 'set_routing_mode'; mode: RoutingMode }
-  | { type: 'new_session'; cwd?: string | null }
+  | { type: 'new_session'; cwd?: string | null; request_id?: string }
   | { type: 'prompt'; text: string }
   | { type: 'list_sessions' }
   | { type: 'load_session'; session_id: string }

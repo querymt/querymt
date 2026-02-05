@@ -1,7 +1,9 @@
-import { CheckCircle, ChevronRight, Clock, Loader, XCircle } from 'lucide-react';
+import { CheckCircle, ChevronRight, Clock, Loader, XCircle, Cpu, Wrench } from 'lucide-react';
 import { DelegationGroupInfo, UiAgentInfo } from '../types';
 import { getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
+import { calculateDelegationStats } from '../utils/statsCalculator';
+import { formatTokensAbbrev, formatCost } from '../utils/formatters';
 
 interface DelegationSummaryCardProps {
   group: DelegationGroupInfo;
@@ -26,8 +28,7 @@ export function DelegationSummaryCard({ group, agents, onOpen }: DelegationSumma
   const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
   const agentColor = agentId ? getAgentColor(agentId) : '#b026ff';
   const durationLabel = formatDuration(group.startTime, group.endTime);
-  const messageCount = group.events.filter((event) => event.type === 'agent' && event.isMessage).length;
-  const toolCallCount = group.events.filter((event) => event.type === 'tool_call').length;
+  const stats = calculateDelegationStats(group);
   const objective = group.objective ??
     (group.delegateEvent.toolCall?.raw_input as { objective?: string } | undefined)?.objective;
 
@@ -69,8 +70,27 @@ export function DelegationSummaryCard({ group, agents, onOpen }: DelegationSumma
         <ChevronRight className="w-3.5 h-3.5 text-gray-500" />
       </div>
       <div className="mt-1 text-[11px] text-gray-500 flex items-center gap-3">
-        <span>{messageCount} message{messageCount === 1 ? '' : 's'}</span>
-        <span>{toolCallCount} tool{toolCallCount === 1 ? '' : 's'}</span>
+        {/* Context usage */}
+        <span className={`flex items-center gap-1 ${
+          (stats.contextPercent ?? 0) >= 80 ? 'text-cyber-orange' :
+          (stats.contextPercent ?? 0) >= 70 ? 'text-yellow-500' :
+          'text-gray-500'
+        }`}>
+          <Cpu className="w-3 h-3" />
+          {stats.contextPercent !== undefined
+            ? `${stats.contextPercent}%`
+            : stats.contextTokens > 0
+              ? formatTokensAbbrev(stats.contextTokens)
+              : '—'}
+        </span>
+        <span className="flex items-center gap-1">
+          <Wrench className="w-3 h-3" />
+          {stats.toolCallCount} tool{stats.toolCallCount === 1 ? '' : 's'}
+        </span>
+        <span>{stats.messageCount} msg{stats.messageCount === 1 ? '' : 's'}</span>
+        {stats.costUsd > 0 && (
+          <span className="text-cyber-cyan">{formatCost(stats.costUsd)}</span>
+        )}
       </div>
     </button>
   );
