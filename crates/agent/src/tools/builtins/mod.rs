@@ -7,6 +7,7 @@ pub mod edit;
 pub mod glob;
 pub mod helpers;
 pub mod ls;
+pub mod mdq;
 pub mod multiedit;
 pub mod patch_utils;
 pub mod patch_validator;
@@ -26,6 +27,7 @@ pub use delete_file::DeleteFileTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use ls::ListTool;
+pub use mdq::MdqTool;
 pub use multiedit::MultiEditTool;
 pub use question::QuestionTool;
 pub use read_file::ReadFileTool;
@@ -52,6 +54,7 @@ pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(EditTool::new()),
         Arc::new(GlobTool::new()),
         Arc::new(ListTool::new()),
+        Arc::new(MdqTool::new()),
         Arc::new(MultiEditTool::new()),
         Arc::new(QuestionTool::new()),
         Arc::new(ReadFileTool::new()),
