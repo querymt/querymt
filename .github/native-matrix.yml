@@ -35,6 +35,7 @@ providers:
     cuda:
       disabled: false
       toolkit_version: "12.8"
+      platforms: ["linux"]
       strategy: "split"
       variants:
         x86_64:
@@ -65,3 +66,30 @@ providers:
       darwin:
         - "accelerate"
         - "metal"
+
+  llama-cpp:
+    env:
+      linux:
+        "cuda":
+          CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+    cuda:
+      disabled: false
+      toolkit_version: "12.8"
+      platforms: ["linux", "windows"]
+      strategy: "combined"
+      # No cuda_env_var - let llama.cpp's CMake use its own architecture defaults
+      # This builds for a wide range of GPUs (sm_50-120) and avoids env var serialization issues
+      variants:
+        x86_64:
+          - features: ["cuda"]
+        aarch64:
+          - features: ["cuda"]
+    feature_sets:
+      linux:
+        - ""
+        - "vulkan"
+      darwin:
+        - "metal"
+      windows:
+        - ""
+        - "vulkan"

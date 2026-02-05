@@ -11,14 +11,14 @@ verification = false
 snapshot_policy = "diff"
 
 [planner]
-#provider = "anthropic"
-#model = "claude-opus-4-5"
-provider = "codex"
-model = "gpt-5.2-codex"
+provider = "anthropic"
+model = "claude-opus-4-5"
+#provider = "codex"
+#model = "gpt-5.2-codex"
 tools = ["delegate", "create_task", "todowrite", "todoread", "search_text", "glob", "ls", "read_file", "shell"]
 system = [
-#  "You are Claude Code, Anthropic's official CLI for Claude.",
-  { file = "../prompts/anthropic_opencode.txt" }
+  "You are Claude Code, Anthropic's official CLI for Claude.",
+#  { file = "../prompts/anthropic_opencode.txt" }
 ]
 
 # Middleware for planner

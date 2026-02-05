@@ -141,7 +141,8 @@ jobs:
             strategy = cuda_config.get('strategy', 'split')
             
             if strategy == 'combined':
-              sm_list = [str(v['sm']) for v in variants]
+              # Collect SM values if present (some providers omit them to use CMake defaults)
+              sm_list = [str(v['sm']) for v in variants if 'sm' in v]
               # For combined, we need to merge all features from all variants
               all_features = set()
               for v in variants:
@@ -152,7 +153,7 @@ jobs:
               return [{
                 'feature_string': feature_string,
                 'feature_tag': sanitize_feature_tag(feature_name),
-                'compute_cap': ";".join(sm_list),
+                'compute_cap': ";".join(sm_list) if sm_list else "",
                 'cuda_version': cuda_version
               }]
             else:
@@ -248,9 +249,9 @@ jobs:
                 
                 # Add CUDA variants
                 include_cuda = False
-                # Disable Windows CUDA builds until upstream support lands.
-                # TODO: retest after https://github.com/EricLBuehler/mistral.rs/pull/1801 merged
-                if osname in ['linux']:
+                # Check if CUDA is enabled for this OS (configurable per provider)
+                cuda_platforms = cuda_config.get('platforms', ['linux'])
+                if osname in cuda_platforms:
                   # If target features are not explicitly restricted, or if they include "cuda"
                   if target_features is None:
                     include_cuda = True
@@ -264,12 +265,20 @@ jobs:
                 if include_cuda:
                   cuda_features = generate_cuda_features(cuda_config, arch_key)
                   for cuda_feat in cuda_features:
+                    # Skip arm64 Windows CUDA (no NVIDIA support)
+                    if osname == 'windows' and arch_key == 'aarch64':
+                      continue
+                    
                     runner = get_runner_for_build(target_info, osname, is_cuda=True)
                     env_vars = env_by_feature.get(cuda_feat['feature_string']) or {}
-                    env_vars.update({
-                      "CUDA_COMPUTE_CAP": cuda_feat['compute_cap'],
-                      "CUDA_VERSION": cuda_feat['cuda_version']
-                    })
+                    
+                    # Only set compute capability env var if cuda_env_var is explicitly configured
+                    # This allows providers to opt out and use their own architecture detection
+                    cuda_env_name = cuda_config.get('cuda_env_var')
+                    if cuda_env_name and cuda_feat.get('compute_cap'):
+                      env_vars[cuda_env_name] = cuda_feat['compute_cap']
+                    
+                    env_vars["CUDA_VERSION"] = cuda_feat['cuda_version']
                     entries.append({
                       "crate": provider,
                       "os": osname,
@@ -334,6 +343,23 @@ jobs:
           key: native-${{ matrix.target }}-${{ matrix.feature_tag }}
           cache-targets: "false"
 
+      - name: Install build dependencies (Linux - llama-cpp)
+        if: matrix.crate == 'llama-cpp' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+
+      - name: Install build dependencies (macOS - llama-cpp)
+        if: matrix.crate == 'llama-cpp' && runner.os == 'macOS'
+        run: |
+          brew install libomp
+
+      - name: Set LIBCLANG_PATH (Windows - llama-cpp)
+        if: matrix.crate == 'llama-cpp' && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\lib" >> $env:GITHUB_ENV
+
       - name: Set up CUDA toolkit
         if: matrix.crate != 'noop' && matrix.needs_cuda == 'true'
         uses: mjun0812/setup-cuda@v1
@@ -390,7 +416,8 @@ jobs:
         if: matrix.crate != 'noop'
         shell: bash
         run: |
-          LIB_BASE="qmt_${{ matrix.crate }}"
+          # Convert hyphens to underscores (Rust cdylib naming convention)
+          LIB_BASE="qmt_$(echo '${{ matrix.crate }}' | tr '-' '_')"
           case "${{ matrix.os }}" in
             linux) LIB_FILE="lib${LIB_BASE}.so" ;;
             darwin) LIB_FILE="lib${LIB_BASE}.dylib" ;;
