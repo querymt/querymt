@@ -209,27 +209,49 @@ pub struct Tool {
 /// across all compilation units (host binary and cdylib plugins).
 ///
 /// This catches serde_json feature mismatches where `preserve_order` changes
-/// `serde_json::Value` from 32 bytes (BTreeMap) to 72 bytes (IndexMap), which
-/// propagates through FunctionTool.parameters and causes ABI incompatibility.
+/// `serde_json::Value` from 32 bytes (BTreeMap) to 72 bytes (IndexMap on 64-bit,
+/// 48 bytes on 32-bit), which propagates through FunctionTool.parameters and causes
+/// ABI incompatibility.
 ///
 /// See: commit d893ffaee7637b6a673e72002772b77ead019382 (LLMProviderFactory fix)
 /// and this fix that pins serde_json features at the workspace level.
 const _: () = {
-    const EXPECTED_TOOL_SIZE: usize = 144;
-    const EXPECTED_FUNCTION_TOOL_SIZE: usize = 120;
+    // Calculate expected sizes from actual component sizes, accounting for alignment.
+    // This handles different pointer widths (64-bit native vs 32-bit WASM).
+    const STRING_SIZE: usize = std::mem::size_of::<String>();
+    const VALUE_SIZE: usize = std::mem::size_of::<Value>();
+    const VALUE_ALIGN: usize = std::mem::align_of::<Value>();
 
-    // With preserve_order enabled (IndexMap):
-    // - serde_json::Value = 72 bytes
-    // - FunctionTool = 24 (name) + 24 (description) + 72 (parameters) = 120 bytes
-    // - Tool = 24 (tool_type) + 120 (function) = 144 bytes
+    // Helper to round up to next multiple of alignment
+    const fn align_up(size: usize, align: usize) -> usize {
+        (size + align - 1) & !(align - 1)
+    }
+
+    // FunctionTool = name (String) + description (String) + parameters (Value)
+    // No padding needed: String fields are adjacent, then Value at end
+    const EXPECTED_FUNCTION_TOOL_SIZE: usize = STRING_SIZE + STRING_SIZE + VALUE_SIZE;
+
+    // Tool = tool_type (String) + function (FunctionTool)
+    // Need to align String to FunctionTool's alignment (which matches Value's alignment)
+    const EXPECTED_TOOL_SIZE: usize =
+        align_up(STRING_SIZE, VALUE_ALIGN) + EXPECTED_FUNCTION_TOOL_SIZE;
+
+    // Verify preserve_order is enabled by checking Value uses IndexMap (larger than BTreeMap).
+    // With preserve_order: Value = 72 bytes on 64-bit, 48 bytes on 32-bit
+    // Without preserve_order: Value = 32 bytes on 64-bit (BTreeMap is smaller)
+    const MIN_VALUE_SIZE_FOR_PRESERVE_ORDER: usize = std::mem::size_of::<usize>() * 6;
+    assert!(
+        VALUE_SIZE >= MIN_VALUE_SIZE_FOR_PRESERVE_ORDER,
+        "serde_json::Value too small - preserve_order feature may be disabled!"
+    );
 
     assert!(
         std::mem::size_of::<Tool>() == EXPECTED_TOOL_SIZE,
-        "Tool size mismatch! Check serde_json features (preserve_order)."
+        "Tool size mismatch! Unexpected struct layout change."
     );
     assert!(
         std::mem::size_of::<FunctionTool>() == EXPECTED_FUNCTION_TOOL_SIZE,
-        "FunctionTool size mismatch! Check serde_json features (preserve_order)."
+        "FunctionTool size mismatch! Unexpected struct layout change."
     );
 };
 
