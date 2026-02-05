@@ -4,8 +4,8 @@
 //! and incremental function index updates.
 
 use arc_swap::ArcSwap;
-use ignore::overrides::{Override, OverrideBuilder};
 use ignore::WalkBuilder;
+use ignore::overrides::{Override, OverrideBuilder};
 use notify::{
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{CreateKind, ModifyKind, RemoveKind, RenameMode},
@@ -548,15 +548,15 @@ fn process_events(events: &[Event], root: &Path, overrides: &Override) -> FileCh
 
 fn compile_overrides(root: &Path, config: &FileIndexConfig) -> Result<Override, FileIndexError> {
     let mut builder = OverrideBuilder::new(root);
-    
+
     // Add each pattern with ! prefix (meaning "exclude" in Override semantics)
     for pattern in &config.ignore_patterns {
         let exclude_pattern = format!("!{}", pattern);
-        builder
-            .add(&exclude_pattern)
-            .map_err(|e| FileIndexError::InvalidConfig(format!("Invalid pattern '{}': {}", pattern, e)))?;
+        builder.add(&exclude_pattern).map_err(|e| {
+            FileIndexError::InvalidConfig(format!("Invalid pattern '{}': {}", pattern, e))
+        })?;
     }
-    
+
     builder
         .build()
         .map_err(|e| FileIndexError::InvalidConfig(format!("Failed to build overrides: {}", e)))

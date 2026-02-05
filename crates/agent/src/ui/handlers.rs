@@ -81,7 +81,10 @@ pub async fn handle_ui_message(
                 }
             }
 
-            if let Err(err) = ensure_sessions_for_mode(state, conn_id, cwd.as_ref(), tx, request_id.as_deref()).await {
+            if let Err(err) =
+                ensure_sessions_for_mode(state, conn_id, cwd.as_ref(), tx, request_id.as_deref())
+                    .await
+            {
                 let _ = send_error(tx, err).await;
             }
 

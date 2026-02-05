@@ -212,7 +212,7 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
 }
 
 /// Subscribe to file index updates for a workspace and forward them to the WebSocket client.
-/// 
+///
 /// This spawns a long-lived task that listens to file index broadcasts from the FileIndexWatcher
 /// and sends FileIndex messages to the client whenever files are created/modified/deleted.
 pub async fn subscribe_to_file_index(
@@ -222,16 +222,23 @@ pub async fn subscribe_to_file_index(
     workspace_root: std::path::PathBuf,
 ) {
     // Get the workspace and subscribe to its file index updates
-    let workspace = match state.workspace_manager.get_or_create(workspace_root.clone()).await {
+    let workspace = match state
+        .workspace_manager
+        .get_or_create(workspace_root.clone())
+        .await
+    {
         Ok(workspace) => workspace,
         Err(err) => {
-            log::error!("Failed to get workspace for file index subscription: {}", err);
+            log::error!(
+                "Failed to get workspace for file index subscription: {}",
+                err
+            );
             return;
         }
     };
 
     let mut index_rx = workspace.file_watcher().subscribe_index();
-    
+
     // Update connection state to track which workspace we're subscribed to
     {
         let mut connections = state.connections.lock().await;
@@ -256,24 +263,27 @@ pub async fn subscribe_to_file_index(
                     Some(conn) => conn,
                     None => {
                         // Connection closed, stop forwarding
-                        log::debug!("Connection {} closed, stopping file index forwarding", conn_id);
+                        log::debug!(
+                            "Connection {} closed, stopping file index forwarding",
+                            conn_id
+                        );
                         break;
                     }
                 };
-                
+
                 let session_id = conn.sessions.get(&conn.active_agent_id).cloned();
-                
+
                 let session_id = match session_id {
                     Some(id) => id,
                     None => continue, // No active session, skip this update
                 };
-                
+
                 let cwds = state.session_cwds.lock().await;
                 let cwd = match cwds.get(&session_id).cloned() {
                     Some(cwd) => cwd,
                     None => continue, // No cwd for this session, skip
                 };
-                
+
                 (session_id, cwd)
             };
 
@@ -296,7 +306,10 @@ pub async fn subscribe_to_file_index(
             .await
             .is_err()
             {
-                log::debug!("Failed to send file index to connection {}, stopping forwarding", conn_id);
+                log::debug!(
+                    "Failed to send file index to connection {}, stopping forwarding",
+                    conn_id
+                );
                 break;
             }
 
