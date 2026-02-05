@@ -7,8 +7,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{
-    AddBos, ChatTemplateResult, GrammarTriggerType, LlamaChatMessage, LlamaChatTemplate,
-    LlamaModel,
+    AddBos, ChatTemplateResult, GrammarTriggerType, LlamaChatMessage, LlamaChatTemplate, LlamaModel,
 };
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
@@ -508,7 +507,10 @@ impl LlamaCppProvider {
                 .model
                 .token_to_piece_bytes(token, 128, special, None)
                 .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-            let chunk = match self.model.token_to_piece(token, &mut decoder, special, None) {
+            let chunk = match self
+                .model
+                .token_to_piece(token, &mut decoder, special, None)
+            {
                 Ok(piece) => piece,
                 Err(_) => String::from_utf8_lossy(&bytes).to_string(),
             };
@@ -720,7 +722,10 @@ impl LlamaCppProvider {
                 .model
                 .token_to_piece_bytes(token, 128, special, None)
                 .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-            let chunk = match self.model.token_to_piece(token, &mut decoder, special, None) {
+            let chunk = match self
+                .model
+                .token_to_piece(token, &mut decoder, special, None)
+            {
                 Ok(piece) => piece,
                 Err(_) => String::from_utf8_lossy(&bytes).to_string(),
             };
