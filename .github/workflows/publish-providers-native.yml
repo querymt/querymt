@@ -117,10 +117,17 @@ jobs:
               "windows": "windows-latest",
             }[osname]
 
-          def get_runner_for_build(target_info, osname, is_cuda):
-            """Get appropriate runner based on target and whether it's a CUDA build"""
-            if is_cuda and 'runner_cuda' in target_info:
-              return target_info['runner_cuda']
+          def needs_native_runner(is_cuda, features=""):
+            """Check if a build needs native target-arch libraries"""
+            if is_cuda:
+              return True
+            native_features = {'vulkan', 'cuda'}
+            return bool(features and native_features & set(features.split()))
+
+          def get_runner_for_build(target_info, osname, is_cuda, features=""):
+            """Get appropriate runner based on target and build requirements"""
+            if needs_native_runner(is_cuda, features) and 'runner_native' in target_info:
+              return target_info['runner_native']
             if 'runner' in target_info:
               return target_info['runner']
             return runner_for(osname)
@@ -219,7 +226,7 @@ jobs:
                   if feature_set:
                     features = feature_set
                     feature_tag = sanitize_feature_tag(features)
-                    runner = get_runner_for_build(target_info, osname, is_cuda=False)
+                    runner = get_runner_for_build(target_info, osname, is_cuda=False, features=features)
                     entries.append({
                       "crate": provider,
                       "os": osname,
@@ -269,7 +276,7 @@ jobs:
                     if osname == 'windows' and arch_key == 'aarch64':
                       continue
                     
-                    runner = get_runner_for_build(target_info, osname, is_cuda=True)
+                    runner = get_runner_for_build(target_info, osname, is_cuda=True, features=cuda_feat['feature_string'])
                     env_vars = env_by_feature.get(cuda_feat['feature_string']) or {}
                     
                     # Only set compute capability env var if cuda_env_var is explicitly configured
@@ -360,11 +367,43 @@ jobs:
         run: |
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\lib" >> $env:GITHUB_ENV
 
+      - name: Install Vulkan SDK (Linux)
+        if: matrix.crate != 'noop' && runner.os == 'Linux' && contains(matrix.features, 'vulkan')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev glslc
+
+      - name: Install Vulkan SDK (Windows)
+        if: matrix.crate != 'noop' && runner.os == 'Windows' && contains(matrix.features, 'vulkan')
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
       - name: Set up CUDA toolkit
         if: matrix.crate != 'noop' && matrix.needs_cuda == 'true'
         uses: mjun0812/setup-cuda@v1
         with:
           version: "${{ matrix.env.CUDA_VERSION || '12.8' }}"
+
+      - name: Set CUDA_PATH_vX_Y for MSBuild (Windows)
+        if: matrix.os == 'windows' && matrix.needs_cuda == 'true'
+        shell: powershell
+        run: |
+          $cudaPath = $env:CUDA_PATH
+          if (-not $cudaPath) {
+            $cudaPath = (Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*" -Directory |
+                         Sort-Object Name -Descending | Select-Object -First 1).FullName
+          }
+          if (-not $cudaPath) {
+            Write-Error "CUDA_PATH not found"
+            exit 1
+          }
+          $versionDir = Split-Path $cudaPath -Leaf
+          $versionNum = $versionDir -replace '^v', '' -replace '\.', '_'
+          $envVarName = "CUDA_PATH_v$versionNum"
+          Write-Host "Setting $envVarName = $cudaPath"
+          echo "$envVarName=$cudaPath" >> $env:GITHUB_ENV
 
       - name: Install cuDNN (Linux)
         if: matrix.os == 'linux' && matrix.needs_cuda == 'true'
