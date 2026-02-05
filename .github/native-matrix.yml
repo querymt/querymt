@@ -37,6 +37,7 @@ providers:
       toolkit_version: "12.8"
       platforms: ["linux"]
       strategy: "split"
+      cuda_env_var: "CUDA_COMPUTE_CAP"
       variants:
         x86_64:
           - sm: 80

@@ -438,6 +438,10 @@ jobs:
             # Remove Git's link.exe to prevent it from shadowing MSVC's linker.
             # This is a known issue when using bash on Windows GHA runners.
             rm -f /usr/bin/link.exe
+
+            # Use a short target dir to avoid Windows MAX_PATH issues with
+            # deeply nested CMake ExternalProject builds (e.g. vulkan-shaders-gen)
+            export CARGO_TARGET_DIR='C:\b'
           fi
 
           FEATURES="${{ matrix.features }}"
@@ -463,8 +467,13 @@ jobs:
             windows) LIB_FILE="${LIB_BASE}.dll" ;;
           esac
 
+          TARGET_DIR="target"
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            TARGET_DIR="C:/b"
+          fi
+
           mkdir -p dist
-          tar -czf dist/plugin.tar.gz -C "target/${{ matrix.target }}/release" "$LIB_FILE"
+          tar -czf dist/plugin.tar.gz -C "${TARGET_DIR}/${{ matrix.target }}/release" "$LIB_FILE"
           echo "PLUGIN_TAR=dist/plugin.tar.gz" >> $GITHUB_ENV
 
       - name: Cleanup build artifacts (non-Windows)
@@ -479,7 +488,7 @@ jobs:
         shell: powershell
         run: |
           # Free runner disk before cache post-job runs.
-          Remove-Item -Recurse -Force target
+          Remove-Item -Recurse -Force C:\b
 
       - name: Install Oras CLI
         if: matrix.crate != 'noop'
