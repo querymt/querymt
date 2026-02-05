@@ -91,7 +91,7 @@ Text matching: unquoted = case-insensitive; quoted = case-sensitive; `^...$` anc
             .map_err(|e| ToolError::ProviderError(format!("selection failed: {e}")))?;
 
         let found_any = !found_nodes.is_empty();
-        let md_json = serde_json::to_value(&mdq::output::SerializableMd::new(
+        let md_json = serde_json::to_value(mdq::output::SerializableMd::new(
             &found_nodes,
             &ctx,
             mdq::output::InlineElemOptions::default(),
@@ -143,7 +143,7 @@ mod tests {
         let result = tool.call(args, &context).await.unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(parsed["found_any"].as_bool().unwrap(), true);
+        assert!(parsed["found_any"].as_bool().unwrap());
         assert_eq!(parsed["matched_count"].as_u64().unwrap(), 2);
         assert!(parsed["md"].get("items").is_some());
     }
