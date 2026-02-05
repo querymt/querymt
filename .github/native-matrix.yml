@@ -98,4 +98,7 @@ providers:
         - "metal"
       windows:
         - ""
-        - "vulkan"
+        # TODO: Re-enable Vulkan on Windows after fixing llama-cpp-sys-2's CMake ExternalProject
+        # install step. Currently fails with "cmake_install.cmake: Not a file" on MSBuild.
+        # See: https://github.com/ggml-org/llama.cpp/issues/[TODO]
+        # - "vulkan"
