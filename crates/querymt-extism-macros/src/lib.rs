@@ -158,7 +158,8 @@ macro_rules! impl_extism_http_plugin {
         // list models
         #[plugin_fn]
         pub fn list_models(cfg: Json<Value>) -> FnResult<Json<Vec<String>>> {
-            let req = HTTPLLMProviderFactory::list_models_request(&$Factory, &cfg.0)
+            let cfg_str = serde_json::to_string(&cfg.0).map_err(PdkError::new)?;
+            let req = HTTPLLMProviderFactory::list_models_request(&$Factory, &cfg_str)
                 .map_err(llm_err_to_pdk)?;
             let native_resp = qmt_http_request_wrapper(&req)?;
 

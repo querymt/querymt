@@ -309,7 +309,8 @@ async fn fetch_all_models(
                 }
 
                 // Fetch models; on error, log and return empty
-                match factory.list_models(&cfg).await {
+                let cfg_str = serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".to_string());
+                match factory.list_models(&cfg_str).await {
                     Ok(model_list) => model_list
                         .into_iter()
                         .map(|model| ModelEntry {

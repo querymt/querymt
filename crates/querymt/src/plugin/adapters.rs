@@ -5,7 +5,6 @@ use crate::{
 };
 use futures::future::FutureExt;
 use http::{Request, Response};
-use serde_json::Value;
 use std::{ops::Deref, sync::Arc};
 
 pub struct HTTPFactoryAdapter {
@@ -27,11 +26,11 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
         Some(self.inner.deref())
     }
 
-    fn config_schema(&self) -> Value {
+    fn config_schema(&self) -> String {
         self.inner.config_schema()
     }
 
-    fn from_config(&self, cfg: &Value) -> Result<Box<dyn LLMProvider>, LLMError> {
+    fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
         let sync_provider = self
             .inner
             .from_config(cfg)
@@ -42,10 +41,10 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
         Ok(Box::new(adapter))
     }
 
-    fn list_models<'a>(&'a self, cfg: &Value) -> Fut<'a, Result<Vec<String>, LLMError>> {
+    fn list_models<'a>(&'a self, cfg: &str) -> Fut<'a, Result<Vec<String>, LLMError>> {
         // clone the Arc so we can move it into the async block
         let inner = Arc::clone(&self.inner);
-        let cloned_cfg = cfg.clone();
+        let cloned_cfg = cfg.to_string();
 
         async move {
             let req: Request<Vec<u8>> = inner.list_models_request(&cloned_cfg)?;

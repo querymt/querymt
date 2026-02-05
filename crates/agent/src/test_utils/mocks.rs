@@ -268,18 +268,15 @@ impl LLMProviderFactory for TestProviderFactory {
         "mock"
     }
 
-    fn config_schema(&self) -> serde_json::Value {
-        serde_json::json!({})
+    fn config_schema(&self) -> String {
+        "{}".to_string()
     }
 
-    fn from_config(&self, _cfg: &serde_json::Value) -> Result<Box<dyn LLMProvider>, LLMError> {
+    fn from_config(&self, _cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
         Ok(Box::new(self.provider.clone()))
     }
 
-    fn list_models<'a>(
-        &'a self,
-        _cfg: &serde_json::Value,
-    ) -> Fut<'a, Result<Vec<String>, LLMError>> {
+    fn list_models<'a>(&'a self, _cfg: &str) -> Fut<'a, Result<Vec<String>, LLMError>> {
         Box::pin(async { Ok(vec!["mock-model".to_string()]) })
     }
 }

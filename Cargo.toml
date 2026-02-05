@@ -15,7 +15,7 @@ license = "MIT"
 [workspace.dependencies]
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order", "raw_value"] }
 serde-value = "0.7"
 either = { version = "1.15.0", features = ["serde"] }
 http = "1.0"
@@ -30,3 +30,4 @@ http-serde-ext = "1.0"
 regex = "1"
 heck = "0.5"
 dirs = "6"
+hf-hub = { version = "0.4", default-features = false, features = [ "rustls-tls", "tokio", "ureq"] }

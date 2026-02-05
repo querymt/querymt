@@ -176,7 +176,7 @@ impl HTTPLLMProviderFactory for AlibabaFactory {
         Some("ALIBABA_API_KEY".into())
     }
 
-    fn list_models_request(&self, _cfg: &Value) -> Result<Request<Vec<u8>>, LLMError> {
+    fn list_models_request(&self, _cfg: &str) -> Result<Request<Vec<u8>>, LLMError> {
         Ok(Request::builder()
             .method(Method::GET)
             .uri(Alibaba::default_base_url().as_str().to_string())
@@ -230,15 +230,15 @@ impl HTTPLLMProviderFactory for AlibabaFactory {
         .collect())
     }
 
-    fn config_schema(&self) -> Value {
+    fn config_schema(&self) -> String {
         let schema = schema_for!(Alibaba);
-        // Extract the schema object and turn it into a serde_json::Value
-        serde_json::to_value(&schema.schema)
+        // Extract the schema object and turn it into a JSON string
+        serde_json::to_string(&schema.schema)
             .expect("OpenRouter JSON Schema should always serialize")
     }
 
-    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
-        let provider: Alibaba = serde_json::from_value(cfg.clone())?;
+    fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
+        let provider: Alibaba = serde_json::from_str(cfg)?;
 
         Ok(Box::new(provider))
     }

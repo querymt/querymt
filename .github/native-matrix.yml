@@ -7,7 +7,7 @@ defaults:
       - target: aarch64-unknown-linux-gnu
         arch: arm64
         runner: ubuntu-latest
-        runner_cuda: ubuntu-24.04-arm
+        runner_native: ubuntu-24.04-arm
     darwin:
       - target: x86_64-apple-darwin
         arch: amd64
@@ -35,7 +35,9 @@ providers:
     cuda:
       disabled: false
       toolkit_version: "12.8"
+      platforms: ["linux"]
       strategy: "split"
+      cuda_env_var: "CUDA_COMPUTE_CAP"
       variants:
         x86_64:
           - sm: 80
@@ -65,3 +67,38 @@ providers:
       darwin:
         - "accelerate"
         - "metal"
+
+  llama-cpp:
+    env:
+      linux:
+        "cuda":
+          CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+    cuda:
+      disabled: false
+      toolkit_version: "12.8"
+      platforms: ["linux", "windows"]
+      strategy: "combined"
+      # No cuda_env_var - let llama.cpp's CMake use its own architecture defaults
+      # This builds for a wide range of GPUs (sm_50-120) and avoids env var serialization issues
+      variants:
+        x86_64:
+          - features: ["cuda"]
+        aarch64:
+          - features: ["cuda"]
+    targets:
+      windows:
+        - target: x86_64-pc-windows-msvc
+          arch: amd64
+          runner: windows-latest
+    feature_sets:
+      linux:
+        - ""
+        - "vulkan"
+      darwin:
+        - "metal"
+      windows:
+        - ""
+        # TODO: Re-enable Vulkan on Windows after fixing llama-cpp-sys-2's CMake ExternalProject
+        # install step. Currently fails with "cmake_install.cmake: Not a file" on MSBuild.
+        # See: https://github.com/ggml-org/llama.cpp/issues/[TODO]
+        # - "vulkan"

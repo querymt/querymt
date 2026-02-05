@@ -205,6 +205,34 @@ pub struct Tool {
     pub function: FunctionTool,
 }
 
+/// Compile-time ABI guard: ensures Tool and FunctionTool struct sizes are consistent
+/// across all compilation units (host binary and cdylib plugins).
+///
+/// This catches serde_json feature mismatches where `preserve_order` changes
+/// `serde_json::Value` from 32 bytes (BTreeMap) to 72 bytes (IndexMap), which
+/// propagates through FunctionTool.parameters and causes ABI incompatibility.
+///
+/// See: commit d893ffaee7637b6a673e72002772b77ead019382 (LLMProviderFactory fix)
+/// and this fix that pins serde_json features at the workspace level.
+const _: () = {
+    const EXPECTED_TOOL_SIZE: usize = 144;
+    const EXPECTED_FUNCTION_TOOL_SIZE: usize = 120;
+
+    // With preserve_order enabled (IndexMap):
+    // - serde_json::Value = 72 bytes
+    // - FunctionTool = 24 (name) + 24 (description) + 72 (parameters) = 120 bytes
+    // - Tool = 24 (tool_type) + 120 (function) = 144 bytes
+
+    assert!(
+        std::mem::size_of::<Tool>() == EXPECTED_TOOL_SIZE,
+        "Tool size mismatch! Check serde_json features (preserve_order)."
+    );
+    assert!(
+        std::mem::size_of::<FunctionTool>() == EXPECTED_FUNCTION_TOOL_SIZE,
+        "FunctionTool size mismatch! Check serde_json features (preserve_order)."
+    );
+};
+
 /// Tool choice determines how the LLM uses available tools.
 /// The behavior is standardized across different LLM providers.
 #[derive(Debug, Clone, Default)]

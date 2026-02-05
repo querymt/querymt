@@ -1,6 +1,5 @@
 use crate::{error::LLMError, LLMProvider};
 use futures::future::BoxFuture;
-use serde_json::Value;
 use std::path::PathBuf;
 
 #[cfg(feature = "http-client")]
@@ -39,12 +38,12 @@ pub fn default_providers_path() -> PathBuf {
 
 pub trait LLMProviderFactory: Send + Sync {
     fn name(&self) -> &str;
-    fn config_schema(&self) -> Value;
+    fn config_schema(&self) -> String;
     // FIXME: refactor
     #[allow(clippy::wrong_self_convention)]
-    fn from_config(&self, cfg: &Value) -> Result<Box<dyn LLMProvider>, LLMError>;
+    fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError>;
 
-    fn list_models<'a>(&'a self, cfg: &Value) -> Fut<'a, Result<Vec<String>, LLMError>>;
+    fn list_models<'a>(&'a self, cfg: &str) -> Fut<'a, Result<Vec<String>, LLMError>>;
 
     fn as_http(&self) -> Option<&dyn http::HTTPLLMProviderFactory> {
         None

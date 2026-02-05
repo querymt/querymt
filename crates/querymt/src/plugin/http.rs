@@ -1,6 +1,5 @@
 use crate::{error::LLMError, HTTPLLMProvider};
 use http::{Request, Response};
-use serde_json::Value;
 
 /// Parse retry-after duration from HTTP headers.
 ///
@@ -46,10 +45,10 @@ pub trait HTTPLLMProviderFactory: Send + Sync {
     }
 
     /// Schema for plugin config
-    fn config_schema(&self) -> Value;
+    fn config_schema(&self) -> String;
 
     /// Build the HTTP request that lists models.
-    fn list_models_request(&self, cfg: &Value) -> Result<Request<Vec<u8>>, LLMError>;
+    fn list_models_request(&self, cfg: &str) -> Result<Request<Vec<u8>>, LLMError>;
 
     /// Turn the raw HTTP response into a Vec<String>.
     fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError>;
@@ -57,7 +56,7 @@ pub trait HTTPLLMProviderFactory: Send + Sync {
     /// Given a chosen model name, build a sync `HttpLLMProvider`
     // FIXME: refactor to follow rust standards
     #[allow(clippy::wrong_self_convention)]
-    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError>;
+    fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError>;
 }
 
 #[allow(improper_ctypes_definitions)]

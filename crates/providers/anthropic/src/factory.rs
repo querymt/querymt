@@ -19,7 +19,8 @@ impl HTTPLLMProviderFactory for AnthropicFactory {
         Some("ANTHROPIC_API_KEY".into())
     }
 
-    fn list_models_request(&self, cfg: &Value) -> Result<Request<Vec<u8>>, LLMError> {
+    fn list_models_request(&self, cfg: &str) -> Result<Request<Vec<u8>>, LLMError> {
+        let cfg: Value = serde_json::from_str(cfg)?;
         let base_url = match cfg.get("base_url").and_then(Value::as_str) {
             Some(base_url_str) => Url::parse(base_url_str)?,
             None => Anthropic::default_base_url(),
@@ -73,13 +74,14 @@ impl HTTPLLMProviderFactory for AnthropicFactory {
         Ok(names)
     }
 
-    fn config_schema(&self) -> Value {
+    fn config_schema(&self) -> String {
         let schema = schema_for!(Anthropic);
-        serde_json::to_value(&schema.schema).expect("Anthropic JSON Schema should always serialize")
+        serde_json::to_string(&schema.schema)
+            .expect("Anthropic JSON Schema should always serialize")
     }
 
-    fn from_config(&self, cfg: &Value) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
-        let provider: Anthropic = serde_json::from_value(cfg.clone())?;
+    fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
+        let provider: Anthropic = serde_json::from_str(cfg)?;
         Ok(Box::new(provider))
     }
 }

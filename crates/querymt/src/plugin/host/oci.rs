@@ -19,10 +19,11 @@ use sigstore::trust::sigstore::SigstoreTrustRoot;
 use sigstore::trust::{ManualTrustRoot, TrustRoot};
 use std::env::consts::{ARCH, OS};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::NamedTempFile;
+use tokio::io::AsyncWriteExt;
 use tracing::instrument;
 
 use super::{PluginType, ProviderPlugin};
@@ -266,16 +267,25 @@ async fn extract_file_and_content(
     image_manifest: &OciImageManifest,
     plugin_type: PluginType,
     filename: Option<&str>,
-) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
+) -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
     match plugin_type {
         PluginType::Wasm => {
             // Find the wasm layer and extract it.
             for layer in &image_manifest.layers {
                 if layer.media_type == "application/vnd.wasm.v1.layer+wasm" {
-                    let mut wasm_bytes = Vec::new();
-                    client.pull_blob(reference, layer, &mut wasm_bytes).await?;
+                    // Create a temporary file to stream the download
+                    let temp_file = NamedTempFile::new()?;
+                    let temp_path = temp_file.path().to_path_buf();
+
+                    // Convert to tokio file for async writes
+                    let mut tokio_file = tokio::fs::File::from_std(temp_file.into_file());
+
+                    // Stream the blob directly to disk
+                    client.pull_blob(reference, layer, &mut tokio_file).await?;
+                    tokio_file.flush().await?;
+
                     let filename = filename.unwrap_or("plugin.wasm").to_string();
-                    return Ok((filename, wasm_bytes));
+                    return Ok((filename, temp_path));
                 }
             }
             Err("Wasm plugin type was determined, but no Wasm layer was found.".into())
@@ -284,28 +294,75 @@ async fn extract_file_and_content(
             // Find the native tarball layer and extract the file from it.
             for layer in &image_manifest.layers {
                 if layer.media_type == "application/vnd.oci.image.layer.v1.tar+gzip" {
-                    let mut buf = Vec::new();
-                    client.pull_blob(reference, layer, &mut buf).await?;
-                    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&buf[..]));
+                    // Create a temporary file to stream the download
+                    let temp_file = NamedTempFile::new()?;
+                    let temp_path = temp_file.path().to_path_buf();
 
-                    for entry_result in archive.entries()? {
-                        let mut entry = entry_result?;
-                        if entry.header().entry_type().is_file() {
-                            let path = entry.path()?.to_string_lossy().to_string();
-                            let current_filename = Path::new(&path)
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy();
+                    // Convert to tokio file for async writes
+                    let mut tokio_file = tokio::fs::File::from_std(temp_file.into_file());
 
-                            let matches = filename.is_none_or(|target| current_filename == target);
+                    // Stream the blob directly to disk
+                    client.pull_blob(reference, layer, &mut tokio_file).await?;
+                    tokio_file.flush().await?;
 
-                            if matches {
-                                let mut content = Vec::new();
-                                entry.read_to_end(&mut content)?;
-                                return Ok((current_filename.to_string(), content));
+                    // Move decompression and tar extraction to a blocking thread
+                    let target_filename = filename.map(|s| s.to_string());
+                    let temp_path_clone = temp_path.clone();
+                    let (extracted_filename, extracted_path) = tokio::task::spawn_blocking(
+                        move || -> Result<(String, PathBuf), anyhow::Error> {
+                            // Open the temp file synchronously
+                            let file = std::fs::File::open(&temp_path_clone)
+                                .map_err(|e| anyhow!("Failed to open temp file: {}", e))?;
+                            let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+
+                            for entry_result in archive
+                                .entries()
+                                .map_err(|e| anyhow!("Failed to read tar entries: {}", e))?
+                            {
+                                let mut entry = entry_result
+                                    .map_err(|e| anyhow!("Failed to read tar entry: {}", e))?;
+                                if entry.header().entry_type().is_file() {
+                                    let path = entry
+                                        .path()
+                                        .map_err(|e| anyhow!("Failed to get entry path: {}", e))?
+                                        .to_string_lossy()
+                                        .to_string();
+                                    let current_filename = Path::new(&path)
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy();
+
+                                    let matches = target_filename.is_none()
+                                        || target_filename
+                                            .as_ref()
+                                            .map(|t| current_filename == t.as_str())
+                                            .unwrap_or(false);
+
+                                    if matches {
+                                        // Extract to a new temp file
+                                        let output_temp = NamedTempFile::new().map_err(|e| {
+                                            anyhow!("Failed to create output temp file: {}", e)
+                                        })?;
+                                        let output_path = output_temp.path().to_path_buf();
+                                        let mut output_file = output_temp.into_file();
+                                        std::io::copy(&mut entry, &mut output_file).map_err(
+                                            |e| anyhow!("Failed to extract file from tar: {}", e),
+                                        )?;
+
+                                        return Ok((current_filename.to_string(), output_path));
+                                    }
+                                }
                             }
-                        }
-                    }
+                            Err(anyhow!("No matching file found in tar archive."))
+                        },
+                    )
+                    .await
+                    .map_err(|e| anyhow!("Blocking task panicked: {}", e))??;
+
+                    // Clean up the compressed temp file
+                    let _ = std::fs::remove_file(&temp_path);
+
+                    return Ok((extracted_filename, extracted_path));
                 }
             }
             Err("Native plugin type was determined, but no .tar.gzip layer was found.".into())
@@ -543,7 +600,7 @@ impl OciDownloader {
                     }
                 }
 
-                let (filename, content) = extract_file_and_content(
+                let (filename, temp_path) = extract_file_and_content(
                     &client,
                     &reference,
                     &image_manifest,
@@ -554,7 +611,12 @@ impl OciDownloader {
 
                 let blob_path = get_blob_path(cache_path, &live_digest, &filename);
                 fs::create_dir_all(blob_path.parent().unwrap())?;
-                fs::write(&blob_path, &content)?;
+
+                // Move the temp file to the final blob cache location
+                // Use copy + remove for cross-device compatibility
+                fs::copy(&temp_path, &blob_path)?;
+                let _ = fs::remove_file(&temp_path);
+
                 log::debug!("Populated OCI blob cache at: {}", blob_path.display());
 
                 let new_metadata = CacheMetadata {

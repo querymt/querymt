@@ -22,7 +22,9 @@ mod utils;
 use chat::{chat_pipe, interactive_loop};
 use cli_args::{AuthCommands, CliArgs, Commands, SecretsCommands, ToolConfig, ToolPolicyState};
 use embed::embed_pipe;
-use provider::{get_api_key, get_provider_info, get_provider_registry, split_provider};
+use provider::{
+    apply_provider_config, get_api_key, get_provider_info, get_provider_registry, split_provider,
+};
 use secret_store::SecretStore;
 use tracing::setup_logging;
 use utils::{ToolLoadingStats, find_config_in_home, get_provider_api_key, parse_tool_names};
@@ -200,7 +202,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         None => serde_json::json!({}),
                     };
-                    let models = factory.list_models(&cfg).await;
+                    let cfg_str = serde_json::to_string(&cfg)?;
+                    let models = factory.list_models(&cfg_str).await;
 
                     match models {
                         Ok(models) if !models.is_empty() => {
@@ -249,6 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (prov_name, opt_model) =
                     resolve_provider_and_model(&args, sc_provider.as_ref(), sc_model.as_ref())?;
                 let mut builder = LLMBuilder::new().provider(prov_name.clone());
+                builder = apply_provider_config(builder, &registry, &prov_name)?;
                 if let Some(m) = opt_model {
                     builder = builder.model(m);
                 }
@@ -322,6 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build provider + LLMBuilder
     let (prov_name, opt_model) = resolve_provider_and_model(&args, None, None)?;
     let mut builder = LLMBuilder::new().provider(prov_name.clone());
+    builder = apply_provider_config(builder, &registry, &prov_name)?;
     if let Some(m) = opt_model.or(args.model.clone()) {
         builder = builder.model(m);
     }
@@ -348,6 +353,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     for (k, v) in &args.options {
         builder = builder.parameter(k.clone(), v.clone());
+    }
+
+    // Validate provider-specific requirements
+    if prov_name == "llama_cpp" {
+        let has_model_path = args.options.iter().any(|(k, _)| k == "model_path");
+        if !has_model_path {
+            eprintln!(
+                "{} The llama_cpp provider requires 'model_path' to be specified.",
+                "Error:".bright_red()
+            );
+            eprintln!("\n{}", "Usage examples:".bright_cyan());
+            eprintln!("  {}", "Local file:".bright_yellow());
+            eprintln!("    qmt -p llama_cpp -o model_path=\"/path/to/model.gguf\"");
+            eprintln!("\n  {}", "HuggingFace model:".bright_yellow());
+            eprintln!(
+                "    qmt -p llama_cpp -o model_path=\"hf:Qwen/Qwen3-VL-8B-Instruct-GGUF:Qwen3VL-8B-Instruct-Q4_K_M.gguf\""
+            );
+            eprintln!(
+                "\n{}",
+                "Or configure in ~/.qmt/providers.toml:".bright_cyan()
+            );
+            eprintln!("    [[providers]]");
+            eprintln!("    name = \"llama_cpp\"");
+            eprintln!("    path = \"target/debug/libqmt_llama_cpp.dylib\"");
+            eprintln!("    [providers.config]");
+            eprintln!("    model_path = \"/path/to/model.gguf\"");
+            return Err("Missing required parameter 'model_path' for llama_cpp provider".into());
+        }
     }
 
     // MCP tools injection

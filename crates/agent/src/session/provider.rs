@@ -453,7 +453,7 @@ pub async fn build_provider_from_config(
 
     // Prune config by provider schema to avoid providers with
     // `deny_unknown_fields` rejecting unrelated parameters.
-    let schema = factory.config_schema();
+    let schema: Value = serde_json::from_str(&factory.config_schema())?;
     let pruned_config = prune_config_by_schema(&builder_config, &schema);
 
     let pruned_keys = pruned_top_level_keys(&builder_config, &pruned_config);
@@ -474,6 +474,7 @@ pub async fn build_provider_from_config(
         );
     }
 
-    let provider = factory.from_config(&pruned_config)?;
+    let pruned_config_str = serde_json::to_string(&pruned_config)?;
+    let provider = factory.from_config(&pruned_config_str)?;
     Ok(Arc::from(provider))
 }
