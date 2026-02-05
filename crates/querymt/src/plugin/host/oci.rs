@@ -267,7 +267,7 @@ async fn extract_file_and_content(
     image_manifest: &OciImageManifest,
     plugin_type: PluginType,
     filename: Option<&str>,
-) -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
+) -> Result<(String, NamedTempFile), Box<dyn std::error::Error>> {
     match plugin_type {
         PluginType::Wasm => {
             // Find the wasm layer and extract it.
@@ -275,17 +275,17 @@ async fn extract_file_and_content(
                 if layer.media_type == "application/vnd.wasm.v1.layer+wasm" {
                     // Create a temporary file to stream the download
                     let temp_file = NamedTempFile::new()?;
-                    let temp_path = temp_file.path().to_path_buf();
 
-                    // Convert to tokio file for async writes
-                    let mut tokio_file = tokio::fs::File::from_std(temp_file.into_file());
+                    // Reopen to get a file handle while keeping temp_file alive
+                    let std_file = temp_file.reopen()?;
+                    let mut tokio_file = tokio::fs::File::from_std(std_file);
 
                     // Stream the blob directly to disk
                     client.pull_blob(reference, layer, &mut tokio_file).await?;
                     tokio_file.flush().await?;
 
                     let filename = filename.unwrap_or("plugin.wasm").to_string();
-                    return Ok((filename, temp_path));
+                    return Ok((filename, temp_file));
                 }
             }
             Err("Wasm plugin type was determined, but no Wasm layer was found.".into())
@@ -298,8 +298,9 @@ async fn extract_file_and_content(
                     let temp_file = NamedTempFile::new()?;
                     let temp_path = temp_file.path().to_path_buf();
 
-                    // Convert to tokio file for async writes
-                    let mut tokio_file = tokio::fs::File::from_std(temp_file.into_file());
+                    // Reopen to get a file handle while keeping temp_file alive
+                    let std_file = temp_file.reopen()?;
+                    let mut tokio_file = tokio::fs::File::from_std(std_file);
 
                     // Stream the blob directly to disk
                     client.pull_blob(reference, layer, &mut tokio_file).await?;
@@ -308,8 +309,8 @@ async fn extract_file_and_content(
                     // Move decompression and tar extraction to a blocking thread
                     let target_filename = filename.map(|s| s.to_string());
                     let temp_path_clone = temp_path.clone();
-                    let (extracted_filename, extracted_path) = tokio::task::spawn_blocking(
-                        move || -> Result<(String, PathBuf), anyhow::Error> {
+                    let (extracted_filename, extracted_temp_file) = tokio::task::spawn_blocking(
+                        move || -> Result<(String, NamedTempFile), anyhow::Error> {
                             // Open the temp file synchronously
                             let file = std::fs::File::open(&temp_path_clone)
                                 .map_err(|e| anyhow!("Failed to open temp file: {}", e))?;
@@ -343,13 +344,16 @@ async fn extract_file_and_content(
                                         let output_temp = NamedTempFile::new().map_err(|e| {
                                             anyhow!("Failed to create output temp file: {}", e)
                                         })?;
-                                        let output_path = output_temp.path().to_path_buf();
-                                        let mut output_file = output_temp.into_file();
+                                        // Reopen to get a writable file handle
+                                        let mut output_file =
+                                            output_temp.reopen().map_err(|e| {
+                                                anyhow!("Failed to reopen output temp file: {}", e)
+                                            })?;
                                         std::io::copy(&mut entry, &mut output_file).map_err(
                                             |e| anyhow!("Failed to extract file from tar: {}", e),
                                         )?;
 
-                                        return Ok((current_filename.to_string(), output_path));
+                                        return Ok((current_filename.to_string(), output_temp));
                                     }
                                 }
                             }
@@ -359,10 +363,10 @@ async fn extract_file_and_content(
                     .await
                     .map_err(|e| anyhow!("Blocking task panicked: {}", e))??;
 
-                    // Clean up the compressed temp file
-                    let _ = std::fs::remove_file(&temp_path);
+                    // Clean up the compressed temp file (the tarball)
+                    drop(temp_file);
 
-                    return Ok((extracted_filename, extracted_path));
+                    return Ok((extracted_filename, extracted_temp_file));
                 }
             }
             Err("Native plugin type was determined, but no .tar.gzip layer was found.".into())
@@ -600,7 +604,7 @@ impl OciDownloader {
                     }
                 }
 
-                let (filename, temp_path) = extract_file_and_content(
+                let (filename, temp_file) = extract_file_and_content(
                     &client,
                     &reference,
                     &image_manifest,
@@ -612,10 +616,8 @@ impl OciDownloader {
                 let blob_path = get_blob_path(cache_path, &live_digest, &filename);
                 fs::create_dir_all(blob_path.parent().unwrap())?;
 
-                // Move the temp file to the final blob cache location
-                // Use copy + remove for cross-device compatibility
-                fs::copy(&temp_path, &blob_path)?;
-                let _ = fs::remove_file(&temp_path);
+                // Atomically move the temp file to the final blob cache location
+                temp_file.persist(&blob_path)?;
 
                 log::debug!("Populated OCI blob cache at: {}", blob_path.display());
 
