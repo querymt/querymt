@@ -382,6 +382,37 @@ fn get_blob_path(cache_root: &Path, digest: &str, filename: &str) -> PathBuf {
         .join(filename)
 }
 
+/// Persist a temporary file to a target path, with fallback to copy for cross-device scenarios.
+///
+/// On some systems (particularly Linux), /tmp may be on a different filesystem than the target
+/// directory. In this case, `NamedTempFile::persist()` will fail with EXDEV (error 18).
+/// This function handles that case by falling back to a copy operation.
+fn persist_with_fallback(
+    temp_file: NamedTempFile,
+    target: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match temp_file.persist(target) {
+        Ok(_) => Ok(()),
+        Err(persist_error) => {
+            // Check if this is a cross-device link error (EXDEV = 18 on Unix systems)
+            let is_cross_device = persist_error.error.raw_os_error() == Some(18);
+
+            if is_cross_device {
+                log::debug!("Cross-device persist failed, falling back to copy");
+                // Get the temp file back from the error
+                let temp_file = persist_error.file;
+                // Copy to the target location
+                fs::copy(temp_file.path(), target)?;
+                // temp_file drops here, cleaning up the temporary file
+                Ok(())
+            } else {
+                // Some other error occurred, propagate it
+                Err(persist_error.into())
+            }
+        }
+    }
+}
+
 fn load_from_cache(
     meta: &CacheMetadata,
     blob_path: &Path,
@@ -616,8 +647,9 @@ impl OciDownloader {
                 let blob_path = get_blob_path(cache_path, &live_digest, &filename);
                 fs::create_dir_all(blob_path.parent().unwrap())?;
 
-                // Atomically move the temp file to the final blob cache location
-                temp_file.persist(&blob_path)?;
+                // Move the temp file to the final blob cache location
+                // Uses atomic rename when possible, falls back to copy for cross-device scenarios
+                persist_with_fallback(temp_file, &blob_path)?;
 
                 log::debug!("Populated OCI blob cache at: {}", blob_path.display());
 
@@ -692,4 +724,236 @@ impl OciDownloader {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_normalize_os_macos() {
+        assert_eq!(normalize_os("macos"), "darwin");
+    }
+
+    #[test]
+    fn test_normalize_os_passthrough() {
+        assert_eq!(normalize_os("linux"), "linux");
+        assert_eq!(normalize_os("windows"), "windows");
+    }
+
+    #[test]
+    fn test_normalize_arch_aarch64() {
+        assert_eq!(normalize_arch("aarch64"), "arm64");
+    }
+
+    #[test]
+    fn test_normalize_arch_x86_64() {
+        assert_eq!(normalize_arch("x86_64"), "amd64");
+    }
+
+    #[test]
+    fn test_normalize_arch_passthrough() {
+        assert_eq!(normalize_arch("riscv64"), "riscv64");
+    }
+
+    #[test]
+    fn test_get_blob_path() {
+        let cache_root = Path::new("/cache");
+        let digest = "sha256:abc123def456";
+        let filename = "plugin.wasm";
+
+        let result = get_blob_path(cache_root, digest, filename);
+
+        assert_eq!(
+            result,
+            PathBuf::from("/cache/blobs/sha256_abc123def456/plugin.wasm")
+        );
+    }
+
+    #[test]
+    fn test_get_blob_path_sanitizes_colon() {
+        let cache_root = Path::new("/tmp");
+        let digest = "sha256:xyz";
+        let filename = "file";
+
+        let result = get_blob_path(cache_root, digest, filename);
+
+        // Verify colon is replaced with underscore
+        assert!(result.to_string_lossy().contains("sha256_xyz"));
+        assert!(!result.to_string_lossy().contains("sha256:xyz"));
+    }
+
+    #[test]
+    fn test_load_from_cache_wasm() {
+        let meta = CacheMetadata {
+            manifest_digest: "sha256:abc".to_string(),
+            filename: "plugin.wasm".to_string(),
+            plugin_type_str: "extism".to_string(),
+            retrieved_at_unix: 1234567890,
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let blob_path = temp_dir.path().join("plugin.wasm");
+        fs::write(&blob_path, b"dummy").unwrap();
+
+        let result = load_from_cache(&meta, &blob_path).unwrap();
+
+        assert!(matches!(result.plugin_type, PluginType::Wasm));
+        assert_eq!(result.file_path, blob_path);
+    }
+
+    #[test]
+    fn test_load_from_cache_native() {
+        let meta = CacheMetadata {
+            manifest_digest: "sha256:def".to_string(),
+            filename: "plugin.so".to_string(),
+            plugin_type_str: "native".to_string(),
+            retrieved_at_unix: 1234567890,
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let blob_path = temp_dir.path().join("plugin.so");
+        fs::write(&blob_path, b"dummy").unwrap();
+
+        let result = load_from_cache(&meta, &blob_path).unwrap();
+
+        assert!(matches!(result.plugin_type, PluginType::Native));
+        assert_eq!(result.file_path, blob_path);
+    }
+
+    #[test]
+    fn test_load_from_cache_invalid_type() {
+        let meta = CacheMetadata {
+            manifest_digest: "sha256:ghi".to_string(),
+            filename: "plugin".to_string(),
+            plugin_type_str: "invalid".to_string(),
+            retrieved_at_unix: 1234567890,
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let blob_path = temp_dir.path().join("plugin");
+
+        let result = load_from_cache(&meta, &blob_path);
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid plugin type"));
+    }
+
+    #[test]
+    fn test_cache_metadata_serialization() {
+        let meta = CacheMetadata {
+            manifest_digest: "sha256:test123".to_string(),
+            filename: "test.wasm".to_string(),
+            plugin_type_str: "extism".to_string(),
+            retrieved_at_unix: 1234567890,
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&meta).unwrap();
+
+        // Deserialize back
+        let deserialized: CacheMetadata = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.manifest_digest, meta.manifest_digest);
+        assert_eq!(deserialized.filename, meta.filename);
+        assert_eq!(deserialized.plugin_type_str, meta.plugin_type_str);
+        assert_eq!(deserialized.retrieved_at_unix, meta.retrieved_at_unix);
+    }
+
+    /// Test that NamedTempFile survives when using reopen() and can be persisted.
+    /// This is the core fix for the bug where into_file() was deleting the temp file.
+    #[test]
+    fn test_named_temp_file_survives_for_persist() {
+        let temp_file = NamedTempFile::new().unwrap();
+
+        // Write using reopen (like our fix does)
+        let mut file = temp_file.reopen().unwrap();
+        file.write_all(b"test content").unwrap();
+        drop(file); // Close the handle
+
+        // File should still exist
+        assert!(temp_file.path().exists());
+
+        // Persist to final location
+        let final_dir = tempfile::tempdir().unwrap();
+        let final_path = final_dir.path().join("final_file");
+        temp_file.persist(&final_path).unwrap();
+
+        // Final file should exist with correct content
+        assert!(final_path.exists());
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "test content");
+    }
+
+    /// Test that persist_with_fallback works in the normal case (same filesystem).
+    #[test]
+    fn test_persist_with_fallback_same_filesystem() {
+        let temp_file = NamedTempFile::new().unwrap();
+
+        let mut file = temp_file.reopen().unwrap();
+        file.write_all(b"same filesystem content").unwrap();
+        drop(file);
+
+        let final_dir = tempfile::tempdir().unwrap();
+        let final_path = final_dir.path().join("final_file");
+
+        persist_with_fallback(temp_file, &final_path).unwrap();
+
+        assert!(final_path.exists());
+        assert_eq!(
+            fs::read_to_string(&final_path).unwrap(),
+            "same filesystem content"
+        );
+    }
+
+    /// Test that NamedTempFile can be returned from a spawn_blocking closure.
+    /// This verifies that NamedTempFile is Send, which is required for the native plugin
+    /// extraction that happens in a blocking task.
+    #[tokio::test]
+    async fn test_blocking_task_returns_temp_file() {
+        let temp_file = tokio::task::spawn_blocking(|| {
+            let temp = NamedTempFile::new().unwrap();
+            let mut file = temp.reopen().unwrap();
+            std::io::Write::write_all(&mut file, b"from blocking").unwrap();
+            temp // Return the NamedTempFile
+        })
+        .await
+        .unwrap();
+
+        // File should still exist after returning from blocking task
+        assert!(temp_file.path().exists());
+        assert_eq!(fs::read(temp_file.path()).unwrap(), b"from blocking");
+
+        // Verify we can persist it
+        let final_dir = tempfile::tempdir().unwrap();
+        let final_path = final_dir.path().join("final");
+        persist_with_fallback(temp_file, &final_path).unwrap();
+        assert_eq!(fs::read(&final_path).unwrap(), b"from blocking");
+    }
+
+    /// Test that the old buggy pattern (into_file) would fail.
+    /// This test documents the bug we fixed.
+    #[test]
+    fn test_into_file_pattern_loses_temp_file() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let temp_path = temp_file.path().to_path_buf();
+
+        // This is the OLD buggy pattern - into_file() consumes the guard
+        let mut file = temp_file.into_file();
+        file.write_all(b"lost content").unwrap();
+        drop(file);
+
+        // The temp file is now DELETED because the NamedTempFile guard was consumed
+        assert!(
+            !temp_path.exists(),
+            "Bug: temp file should be deleted after into_file()"
+        );
+    }
+
+    // Note: Tests for determine_plugin_type are omitted because constructing
+    // OciImageManifest requires complex internal structures from oci-client crate.
+    // These are tested implicitly by the integration tests (qmt update command).
 }
