@@ -292,7 +292,11 @@ fn default_provider_options(provider: &str, model: &str) -> HashMap<String, Valu
                     .insert("reasoningEffort".into(), json!("medium"));
             }
         }
-        if id.contains("gpt-5.") && !id.contains("codex") && provider != "azure" {
+        if id.contains("gpt-5.")
+            && !id.contains("codex")
+            && provider != "azure"
+            && provider != "codex"
+        {
             let eb = opts.entry("extra_body".into()).or_insert_with(|| json!({}));
             eb.as_object_mut()
                 .unwrap()
@@ -564,6 +568,15 @@ mod tests {
         // OpenAI provider should have reasoningEffort (not reasoning object)
         assert_eq!(extra["reasoningEffort"], json!("medium"));
         assert_eq!(extra["store"], json!(false));
+    }
+
+    #[test]
+    fn test_gpt5_dot_codex_provider_no_verbosity() {
+        let d = ModelDefaults::for_model("codex", "gpt-5.2");
+        let extra = d.provider_options.get("extra_body").unwrap();
+        assert!(extra.get("verbosity").is_none());
+        // Codex provider should have reasoning effort in reasoning object
+        assert_eq!(extra["reasoning"], json!({"effort": "medium"}));
     }
 
     #[test]
