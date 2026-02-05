@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use futures::Stream;
 use futures::channel::mpsc;
-use hf_hub::api::sync::ApiBuilder;
+use hf_hub::api::sync::ApiBuilder as SyncApiBuilder;
+use hf_hub::api::tokio::ApiBuilder as AsyncApiBuilder;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -68,6 +69,11 @@ pub struct LlamaCppConfig {
     pub add_bos: Option<bool>,
     /// Logging destination for llama.cpp output.
     pub log: Option<LlamaCppLogMode>,
+    /// Enable high-throughput HuggingFace Hub downloads. Uses multiple parallel
+    /// connections to saturate high-bandwidth connections (>500MB/s). This will
+    /// heavily utilize CPU cores during download. Only recommended for cloud
+    /// instances with high CPU and bandwidth.
+    pub fast_download: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
@@ -136,7 +142,7 @@ fn llama_backend() -> Result<std::sync::MutexGuard<'static, LlamaBackend>, LLMEr
 }
 
 impl LlamaCppProvider {
-    fn resolve_model_path(raw: &str) -> Result<PathBuf, LLMError> {
+    fn resolve_model_path(raw: &str, fast: bool) -> Result<PathBuf, LLMError> {
         let Some(rest) = raw.strip_prefix("hf:") else {
             return Ok(PathBuf::from(raw));
         };
@@ -148,7 +154,31 @@ impl LlamaCppProvider {
                 "hf: model_path must be formatted as hf:<repo>:<file>".into(),
             ));
         }
-        let api = ApiBuilder::new()
+
+        // High-throughput async download when explicitly enabled and a tokio runtime is available
+        if fast {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let repo = repo.to_string();
+                let file = file.to_string();
+                let path = tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let api = AsyncApiBuilder::new()
+                            .with_progress(true)
+                            .high()
+                            .build()
+                            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+                        api.model(repo)
+                            .get(&file)
+                            .await
+                            .map_err(|e| LLMError::ProviderError(e.to_string()))
+                    })
+                })?;
+                return Ok(path);
+            }
+        }
+
+        // Standard sync download (default, or fallback when no tokio runtime available)
+        let api = SyncApiBuilder::new()
             .with_progress(true)
             .build()
             .map_err(|e| LLMError::ProviderError(e.to_string()))?;
@@ -176,7 +206,7 @@ impl LlamaCppProvider {
             LlamaCppLogMode::Tracing => send_logs_to_tracing(LogOptions::default()),
             LlamaCppLogMode::Off => backend.void_logs(),
         }
-        let model_path = Self::resolve_model_path(&cfg.model_path)?;
+        let model_path = Self::resolve_model_path(&cfg.model_path, cfg.fast_download.unwrap_or(false))?;
         let model_path = Path::new(&model_path);
         if !model_path.exists() {
             return Err(LLMError::InvalidRequest(format!(
