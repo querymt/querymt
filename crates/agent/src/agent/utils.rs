@@ -108,6 +108,7 @@ pub fn truncate_to_bytes(input: &str, max_bytes: usize) -> String {
 pub fn tool_kind_for_tool(name: &str) -> ToolKind {
     match name {
         "search_text" => ToolKind::Search,
+        "mdq" => ToolKind::Search,
         "write_file" | "apply_patch" => ToolKind::Edit,
         "delete_file" => ToolKind::Delete,
         "shell" => ToolKind::Execute,

@@ -166,6 +166,7 @@ impl QueryMTAgent {
         tool_registry.add(Arc::new(crate::tools::builtins::SearchTextTool::new()));
         tool_registry.add(Arc::new(crate::tools::builtins::GlobTool::new()));
         tool_registry.add(Arc::new(crate::tools::builtins::ListTool::new()));
+        tool_registry.add(Arc::new(crate::tools::builtins::MdqTool::new()));
 
         // Execution and external
         tool_registry.add(Arc::new(crate::tools::builtins::ShellTool::new()));

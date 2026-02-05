@@ -65,6 +65,9 @@ infer = "0.16"
 rayon = "1.11"
 indexmap = { version = "2", features = ["serde"] }
 
+# Markdown Query cli tool for agent `mdq` tool
+mdq = "0.9.0"
+
 # Snapshot backend support
 gix = { version = "0.78", default-features = false, features = ["basic", "worktree-mutation", "attributes"] }
 dirs.workspace = true
