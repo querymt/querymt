@@ -13,6 +13,7 @@ use querymt::{
 };
 use serde_json::{Map, Value};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 fn prune_config_by_schema(cfg: &Value, schema: &Value) -> Value {
     match (cfg, schema.get("properties")) {
@@ -54,11 +55,29 @@ fn pruned_top_level_keys(before: &Value, after: &Value) -> Vec<String> {
     removed
 }
 
+/// Type alias for the provider cache: (config_id, provider) pair
+type ProviderCache = Arc<RwLock<Option<(i64, Arc<dyn LLMProvider>)>>>;
+
 /// A wrapper around a `SessionStore` that resolves providers dynamically.
+///
+/// # Provider Caching
+///
+/// TODO: This implementation uses a simple single-entry cache to avoid reloading
+/// heavy models (e.g., llama_cpp GGUF models) on every agent step. For production
+/// multi-model scenarios, consider:
+/// - Option B: Model pool at LlamaCppFactory level with LRU eviction
+/// - Option C: Persistent SessionHandle with lazy provider initialization
+///
+/// The cache is keyed on LLMConfig.id (content-addressed in DB). When a session's
+/// config changes mid-session (e.g., user switches models via dashboard), the old
+/// cached provider is dropped (freeing VRAM) before the new one is loaded.
 pub struct SessionProvider {
     plugin_registry: Arc<PluginRegistry>,
     history_store: Arc<dyn SessionStore>,
     initial_config: LLMParams,
+    /// Cache for the most recently used provider, keyed by LLMConfig.id
+    /// Uses a single-entry cache to ensure safe VRAM management for GPU models
+    cached_provider: ProviderCache,
 }
 
 impl SessionProvider {
@@ -71,6 +90,7 @@ impl SessionProvider {
             plugin_registry,
             history_store: store,
             initial_config,
+            cached_provider: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -143,14 +163,47 @@ impl SessionProvider {
                 SessionError::InvalidOperation("Session has no LLM config".to_string())
             })?;
 
-        build_provider_from_config(
+        // Check cache first - fast path for same config
+        {
+            let cache = self.cached_provider.read().await;
+            if let Some((cached_config_id, cached_provider)) = cache.as_ref()
+                && *cached_config_id == config.id
+            {
+                log::trace!(
+                    "Provider cache hit for config_id={} ({}:{})",
+                    config.id,
+                    config.provider,
+                    config.model
+                );
+                return Ok(Arc::clone(cached_provider));
+            }
+        }
+
+        // Cache miss or config changed - build new provider
+        log::debug!(
+            "Provider cache miss for config_id={} ({}:{}), building new provider",
+            config.id,
+            config.provider,
+            config.model
+        );
+
+        let provider = build_provider_from_config(
             &self.plugin_registry,
             &config.provider,
             &config.model,
             config.params.as_ref(),
             None,
         )
-        .await
+        .await?;
+
+        // Update cache - this will drop the old provider if config changed
+        // For GPU models (llama_cpp), this frees VRAM before loading the new model
+        {
+            let mut cache = self.cached_provider.write().await;
+            *cache = Some((config.id, Arc::clone(&provider)));
+        }
+
+        Ok(provider)
     }
 
     /// Get pricing information for a session's model
@@ -189,6 +242,7 @@ impl Clone for SessionProvider {
             plugin_registry: self.plugin_registry.clone(),
             history_store: Arc::clone(&self.history_store),
             initial_config: self.initial_config.clone(),
+            cached_provider: Arc::clone(&self.cached_provider),
         }
     }
 }
