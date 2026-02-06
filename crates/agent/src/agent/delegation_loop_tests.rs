@@ -328,7 +328,7 @@ impl TestHarness {
             function_index: Arc::new(tokio::sync::OnceCell::new()),
             pre_step_snapshot: StdMutex::new(None),
             current_step_id: StdMutex::new(None),
-            last_step_diff: StdMutex::new(None),
+            turn_diffs: StdMutex::new(Default::default()),
         });
 
         let session_id = "sess-test".to_string();

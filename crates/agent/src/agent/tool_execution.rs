@@ -440,11 +440,20 @@ impl QueryMTAgent {
         combined.removed.sort();
         combined.removed.dedup();
 
-        // Store for next step's dedup check
+        // Accumulate for end-of-turn dedup check
         if !combined.is_empty()
-            && let Ok(mut diff) = exec_ctx.runtime.last_step_diff.lock()
+            && let Ok(mut diffs) = exec_ctx.runtime.turn_diffs.lock()
         {
-            *diff = Some(combined);
+            diffs.added.extend(combined.added);
+            diffs.modified.extend(combined.modified);
+            diffs.removed.extend(combined.removed);
+            // Deduplicate
+            diffs.added.sort();
+            diffs.added.dedup();
+            diffs.modified.sort();
+            diffs.modified.dedup();
+            diffs.removed.sort();
+            diffs.removed.dedup();
         }
 
         if let Some(wait_condition) = WaitCondition::merge(wait_conditions) {

@@ -35,13 +35,14 @@ use crate::event_bus::EventBus;
 use crate::events::AgentEventKind;
 use crate::index::{DiffPaths, FunctionIndex, IndexedFunctionEntry, SimilarFunctionMatch};
 use crate::middleware::factory::MiddlewareFactory;
-use crate::middleware::{ExecutionState, MiddlewareDriver, Result, ToolResult};
+use crate::middleware::{ConversationContext, ExecutionState, MiddlewareDriver, Result, ToolResult};
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::instrument;
@@ -113,6 +114,10 @@ pub struct DedupCheckMiddleware {
     pending_results: Arc<Mutex<Vec<ToolResult>>>,
     /// Optional event bus for emitting duplicate detection events
     event_bus: Option<Arc<EventBus>>,
+    /// Guard to prevent multiple reviews in the same turn
+    already_reviewed_this_turn: AtomicBool,
+    /// Last context seen, used for building BeforeLlmCall state in on_turn_end
+    last_context: Arc<Mutex<Option<Arc<ConversationContext>>>>,
 }
 
 impl DedupCheckMiddleware {
@@ -132,6 +137,8 @@ impl DedupCheckMiddleware {
             session_runtime,
             pending_results: Arc::new(Mutex::new(Vec::new())),
             event_bus: None,
+            already_reviewed_this_turn: AtomicBool::new(false),
+            last_context: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -254,30 +261,29 @@ impl DedupCheckMiddleware {
         warnings
     }
 
-    /// Format warnings into a human-readable message for LLM injection
-    fn format_warning_message(warnings: &[DuplicateWarning]) -> String {
+    /// Format warnings into a human-readable review message for LLM injection
+    fn format_review_message(warnings: &[DuplicateWarning]) -> String {
         if warnings.is_empty() {
             return String::new();
         }
 
         let mut message = String::from(
-            "\n🚨 DUPLICATE CODE DETECTED — ACTION REQUIRED\n\n\
-             You just wrote code that already exists in the codebase. \
-             You MUST use the existing function(s) instead of duplicating them.\n\n",
+            "\n📋 POST-TURN CODE REVIEW: Potential code duplication found.\n\n\
+             The following functions you wrote appear similar to existing code in the codebase.\n\n",
         );
 
         for warning in warnings {
             let new_func = &warning.new_function;
             message.push_str(&format!(
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
-                 ❌ DUPLICATE: `{}` in {}:{}-{}\n\n",
+                 📝 Function: `{}` in {}:{}-{}\n\n",
                 new_func.function_name,
                 new_func.file_path.display(),
                 new_func.start_line,
                 new_func.end_line
             ));
 
-            message.push_str("✅ USE INSTEAD:\n\n");
+            message.push_str("Similar to:\n\n");
 
             for m in &warning.matches {
                 message.push_str(&format!(
@@ -308,15 +314,36 @@ impl DedupCheckMiddleware {
 
         message.push_str(
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
-             REQUIRED ACTIONS:\n\
-             1. REMOVE the duplicate function(s) you just wrote\n\
-             2. Import and call the existing function(s) shown above instead\n\
-             3. If the existing function is ALMOST but not exactly what you need, \
-                extend it with a parameter or create a thin wrapper — do NOT copy the logic\n\n\
-             Do NOT proceed without addressing this duplication.\n",
+             REVIEW NOTES:\n\
+             - If you intentionally moved/extracted this function as part of a refactor, \
+               make sure the original is removed from the source file.\n\
+             - If this is unintentional duplication, consider using the existing function instead.\n\
+             - If the functions serve different purposes despite similar structure, no action needed.\n",
         );
 
         message
+    }
+
+    /// Filter out functions that were moved (appear in both removed and added/modified paths)
+    fn filter_moved_functions(
+        &self,
+        warnings: Vec<DuplicateWarning>,
+        changed_paths: &DiffPaths,
+    ) -> Vec<DuplicateWarning> {
+        warnings.into_iter().filter(|warning| {
+            // Keep warning only if the matched function is NOT in a file that was
+            // removed/modified during this turn (which would indicate a move)
+            warning.matches.iter().any(|m| {
+                // If the similar match's file was also changed in this turn,
+                // the function may have been moved/removed — not a real duplicate
+                !changed_paths.removed.contains(&m.file_path)
+            })
+        }).map(|mut warning| {
+            // Also filter individual matches
+            warning.matches.retain(|m| !changed_paths.removed.contains(&m.file_path));
+            warning
+        }).filter(|w| !w.matches.is_empty())
+        .collect()
     }
 
     /// Update the function index with newly changed files
@@ -355,126 +382,149 @@ impl DedupCheckMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for DedupCheckMiddleware {
+    /// Capture the latest context for use in on_turn_end
+    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+        // Capture the latest context for use in on_turn_end
+        if let Some(ctx) = state.context() {
+            *self.last_context.lock().await = Some(ctx.clone());
+        }
+        Ok(state)
+    }
+
     #[instrument(
-        name = "middleware.dedup_check",
+        name = "middleware.dedup_check.turn_end",
         skip(self, state),
         fields(
             input_state = %state.name(),
             output_state = tracing::field::Empty,
             files_checked = tracing::field::Empty,
             duplicates_found = tracing::field::Empty,
-            warning_injected = tracing::field::Empty
+            review_injected = tracing::field::Empty
         )
     )]
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_end(&self, state: ExecutionState) -> Result<ExecutionState> {
         if !self.enabled {
             tracing::Span::current().record("output_state", state.name());
             return Ok(state);
         }
 
-        match state {
-            // Before LLM call, check for duplicates from the previous step's tool executions
-            ExecutionState::BeforeLlmCall { ref context } => {
-                // Get session ID from context
-                let session_id = context.session_id.to_string();
-
-                // Get function index and changed paths from session runtime
-                let (function_index, changed_paths) = {
-                    let runtimes = self.session_runtime.lock().await;
-                    let runtime = runtimes.get(&session_id);
-
-                    let function_index = runtime.and_then(|r| r.function_index.get().cloned());
-
-                    let changed_paths = runtime
-                        .and_then(|r| r.last_step_diff.lock().ok())
-                        .and_then(|mut diff| diff.take());
-
-                    (function_index, changed_paths)
-                };
-
-                let Some(function_index) = function_index else {
-                    // No function index available, skip dedup check
-                    tracing::Span::current().record("output_state", "BeforeLlmCall");
-                    return Ok(state);
-                };
-
-                let Some(changed_paths) = changed_paths else {
-                    // No changed paths from previous step, skip dedup check
-                    tracing::Span::current().record("files_checked", 0usize);
-                    tracing::Span::current().record("duplicates_found", 0usize);
-                    tracing::Span::current().record("warning_injected", false);
-                    tracing::Span::current().record("output_state", "BeforeLlmCall");
-                    return Ok(state);
-                };
-
-                if changed_paths.is_empty() {
-                    // No file changes, nothing to check
-                    tracing::Span::current().record("files_checked", 0usize);
-                    tracing::Span::current().record("duplicates_found", 0usize);
-                    tracing::Span::current().record("warning_injected", false);
-                    tracing::Span::current().record("output_state", "BeforeLlmCall");
-                    return Ok(state);
-                }
-
-                // Record the number of files being checked
-                let files_checked = changed_paths.added.len() + changed_paths.modified.len();
-                tracing::Span::current().record("files_checked", files_checked);
-
-                // Check for duplicates
-                let warnings = self
-                    .check_for_duplicates(&function_index, &changed_paths)
-                    .await;
-
-                // Record duplicates found
-                tracing::Span::current().record("duplicates_found", warnings.len());
-
-                // Update the index with new/modified functions
-                self.update_index(&function_index, &changed_paths).await;
-
-                // If duplicates found, inject warning message and emit event
-                if !warnings.is_empty() {
-                    let warning_message = Self::format_warning_message(&warnings);
-
-                    log::info!(
-                        "DedupCheckMiddleware: Found {} duplicate code warnings",
-                        warnings.len()
-                    );
-
-                    // Emit event if event bus is available
-                    if let Some(ref event_bus) = self.event_bus {
-                        event_bus.publish(
-                            &session_id,
-                            AgentEventKind::DuplicateCodeDetected {
-                                warnings: warnings.clone(),
-                            },
-                        );
-                    }
-
-                    // Inject the warning into the context
-                    let new_context = Arc::new(context.inject_message(warning_message));
-
-                    tracing::Span::current().record("warning_injected", true);
-                    tracing::Span::current().record("output_state", "BeforeLlmCall");
-                    return Ok(ExecutionState::BeforeLlmCall {
-                        context: new_context,
-                    });
-                }
-
-                tracing::Span::current().record("warning_injected", false);
-                tracing::Span::current().record("output_state", "BeforeLlmCall");
-                Ok(state)
-            }
-
-            // Pass through all other states
-            _ => {
-                tracing::Span::current().record("output_state", state.name());
-                Ok(state)
-            }
+        // Only run on Complete state
+        if !matches!(state, ExecutionState::Complete) {
+            tracing::Span::current().record("output_state", state.name());
+            return Ok(state);
         }
+
+        // Guard: only review once per turn
+        if self.already_reviewed_this_turn.swap(true, Ordering::SeqCst) {
+            tracing::Span::current().record("output_state", "Complete");
+            return Ok(state);
+        }
+
+        // Get the last context for building BeforeLlmCall state
+        let last_context = self.last_context.lock().await.clone();
+        let Some(context) = last_context else {
+            tracing::Span::current().record("output_state", "Complete");
+            return Ok(state);
+        };
+
+        // Find an active session with turn_diffs
+        let (function_index, turn_diffs) = {
+            let runtimes = self.session_runtime.lock().await;
+            
+            // Try to find the session matching our context
+            let session_id = &context.session_id;
+            let runtime = runtimes.get(session_id.as_ref());
+
+            let function_index = runtime.and_then(|r| r.function_index.get().cloned());
+
+            // Get and clear turn_diffs
+            let turn_diffs = runtime.and_then(|r| {
+                r.turn_diffs.lock().ok().map(|mut diffs| {
+                    let accumulated = diffs.clone();
+                    *diffs = DiffPaths::default();
+                    accumulated
+                })
+            });
+
+            (function_index, turn_diffs)
+        };
+
+        let Some(function_index) = function_index else {
+            tracing::Span::current().record("output_state", "Complete");
+            return Ok(state);
+        };
+
+        let Some(turn_diffs) = turn_diffs else {
+            tracing::Span::current().record("files_checked", 0usize);
+            tracing::Span::current().record("duplicates_found", 0usize);
+            tracing::Span::current().record("review_injected", false);
+            tracing::Span::current().record("output_state", "Complete");
+            return Ok(state);
+        };
+
+        if turn_diffs.is_empty() {
+            tracing::Span::current().record("files_checked", 0usize);
+            tracing::Span::current().record("duplicates_found", 0usize);
+            tracing::Span::current().record("review_injected", false);
+            tracing::Span::current().record("output_state", "Complete");
+            return Ok(state);
+        }
+
+        // Record the number of files being checked
+        let files_checked = turn_diffs.added.len() + turn_diffs.modified.len();
+        tracing::Span::current().record("files_checked", files_checked);
+
+        // Check for duplicates
+        let mut warnings = self
+            .check_for_duplicates(&function_index, &turn_diffs)
+            .await;
+
+        // Filter out moved functions
+        warnings = self.filter_moved_functions(warnings, &turn_diffs);
+
+        // Record duplicates found
+        tracing::Span::current().record("duplicates_found", warnings.len());
+
+        // Update the index with new/modified functions
+        self.update_index(&function_index, &turn_diffs).await;
+
+        // If duplicates found after filtering, inject review message
+        if !warnings.is_empty() {
+            let review_message = Self::format_review_message(&warnings);
+
+            log::info!(
+                "DedupCheckMiddleware: Found {} duplicate code warnings in turn review",
+                warnings.len()
+            );
+
+            // Emit event if event bus is available
+            if let Some(ref event_bus) = self.event_bus {
+                event_bus.publish(
+                    context.session_id.as_ref(),
+                    AgentEventKind::DuplicateCodeDetected {
+                        warnings: warnings.clone(),
+                    },
+                );
+            }
+
+            // Inject the review into a new context
+            let new_context = Arc::new(context.inject_message(review_message));
+
+            tracing::Span::current().record("review_injected", true);
+            tracing::Span::current().record("output_state", "BeforeLlmCall");
+            return Ok(ExecutionState::BeforeLlmCall {
+                context: new_context,
+            });
+        }
+
+        tracing::Span::current().record("review_injected", false);
+        tracing::Span::current().record("output_state", "Complete");
+        Ok(state)
     }
 
     fn reset(&self) {
-        // Clear accumulated results at the start of a new cycle
+        // Reset review guard and clear accumulated results
+        self.already_reviewed_this_turn.store(false, Ordering::SeqCst);
         if let Ok(mut pending) = self.pending_results.try_lock() {
             pending.clear();
         }
@@ -550,13 +600,13 @@ mod tests {
     }
 
     #[test]
-    fn test_format_warning_message_empty() {
-        let message = DedupCheckMiddleware::format_warning_message(&[]);
+    fn test_format_review_message_empty() {
+        let message = DedupCheckMiddleware::format_review_message(&[]);
         assert!(message.is_empty());
     }
 
     #[test]
-    fn test_format_warning_message() {
+    fn test_format_review_message() {
         let warnings = vec![DuplicateWarning {
             new_function: FunctionLocation {
                 file_path: PathBuf::from("src/utils.ts"),
@@ -574,13 +624,13 @@ mod tests {
             }],
         }];
 
-        let message = DedupCheckMiddleware::format_warning_message(&warnings);
+        let message = DedupCheckMiddleware::format_review_message(&warnings);
 
-        assert!(message.contains("DUPLICATE CODE DETECTED"));
+        assert!(message.contains("POST-TURN CODE REVIEW"));
         assert!(message.contains("calculateTotal"));
         assert!(message.contains("computeSum"));
         assert!(message.contains("85%"));
-        assert!(message.contains("REMOVE the duplicate"));
+        assert!(message.contains("REVIEW NOTES"));
         assert!(message.contains("function computeSum")); // Verify source code is included
     }
 

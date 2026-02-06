@@ -28,6 +28,13 @@ pub trait MiddlewareDriver: Send + Sync {
         Ok(state)
     }
 
+    /// Runs once when the turn is about to complete (state is Complete).
+    /// Middleware can transform Complete → BeforeLlmCall to request corrections
+    /// (e.g., post-turn code review for duplicate detection).
+    async fn on_turn_end(&self, state: ExecutionState) -> Result<ExecutionState> {
+        Ok(state)
+    }
+
     /// Reset internal state (called at start of execute_cycle)
     fn reset(&self);
 
@@ -75,6 +82,10 @@ impl CompositeDriver {
     pub async fn run_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
         self.run_phase(state, MiddlewarePhase::ProcessingToolCalls)
             .await
+    }
+
+    pub async fn run_turn_end(&self, state: ExecutionState) -> Result<ExecutionState> {
+        self.run_phase(state, MiddlewarePhase::TurnEnd).await
     }
 
     pub fn reset(&self) {
@@ -168,11 +179,14 @@ impl CompositeDriver {
                         .instrument(span)
                         .await?
                 }
+                MiddlewarePhase::TurnEnd => {
+                    driver.on_turn_end(current).instrument(span).await?
+                }
             };
 
             let new_state_name = current.name();
             trace!(
-                "  Driver {} transitioned: {} → {}",
+                "  Driver {} transitioned: {} -> {}",
                 driver_name, current_state_name, new_state_name
             );
 
@@ -211,6 +225,7 @@ enum MiddlewarePhase {
     StepStart,
     AfterLlm,
     ProcessingToolCalls,
+    TurnEnd,
 }
 
 impl MiddlewarePhase {
@@ -220,6 +235,7 @@ impl MiddlewarePhase {
             MiddlewarePhase::StepStart => "step_start",
             MiddlewarePhase::AfterLlm => "after_llm",
             MiddlewarePhase::ProcessingToolCalls => "processing_tool_calls",
+            MiddlewarePhase::TurnEnd => "turn_end",
         }
     }
 }

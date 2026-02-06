@@ -403,75 +403,97 @@ impl QueryMTAgent {
                 }
 
                 ExecutionState::Complete => {
-                    debug!("State machine reached Complete state");
+                    // Run turn-end middleware BEFORE exiting (e.g., dedup review)
+                    let turn_end_state = driver
+                        .run_turn_end(ExecutionState::Complete)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                    
+                    match turn_end_state {
+                        ExecutionState::BeforeLlmCall { .. } => {
+                            // Middleware wants another step (e.g., dedup review)
+                            // Continue the loop with the new state
+                            turn_end_state
+                        }
+                        ExecutionState::Complete => {
+                            // Truly done — proceed with existing snapshot/cleanup
+                            debug!("State machine reached Complete state");
 
-                    // Take post-step snapshot and record changes for undo/redo
-                    if let Some(ref backend) = self.snapshot_backend
-                        && let Some(ref worktree) = self.snapshot_root
-                    {
-                        let pre_id = exec_ctx.runtime.pre_step_snapshot.lock().unwrap().take();
-                        let step_id = exec_ctx.runtime.current_step_id.lock().unwrap().take();
+                            // Take post-step snapshot and record changes for undo/redo
+                            if let Some(ref backend) = self.snapshot_backend
+                                && let Some(ref worktree) = self.snapshot_root
+                            {
+                                let pre_id = exec_ctx.runtime.pre_step_snapshot.lock().unwrap().take();
+                                let step_id = exec_ctx.runtime.current_step_id.lock().unwrap().take();
 
-                        if let (Some(pre_id), Some(step_id)) = (pre_id, step_id) {
-                            match backend.track(worktree).await {
-                                Ok(post_id) => {
-                                    if pre_id != post_id {
-                                        let changed = backend
-                                            .diff(worktree, &pre_id, &post_id)
-                                            .await
-                                            .unwrap_or_default();
-                                        if !changed.is_empty() {
-                                            let patch_part = MessagePart::StepSnapshotPatch {
-                                                step_id: step_id.clone(),
-                                                snapshot_id: post_id.clone(),
-                                                changed_paths: changed
-                                                    .iter()
-                                                    .map(|p| p.to_string_lossy().to_string())
-                                                    .collect(),
-                                            };
+                                if let (Some(pre_id), Some(step_id)) = (pre_id, step_id) {
+                                    match backend.track(worktree).await {
+                                        Ok(post_id) => {
+                                            if pre_id != post_id {
+                                                let changed = backend
+                                                    .diff(worktree, &pre_id, &post_id)
+                                                    .await
+                                                    .unwrap_or_default();
+                                                if !changed.is_empty() {
+                                                    let patch_part = MessagePart::StepSnapshotPatch {
+                                                        step_id: step_id.clone(),
+                                                        snapshot_id: post_id.clone(),
+                                                        changed_paths: changed
+                                                            .iter()
+                                                            .map(|p| p.to_string_lossy().to_string())
+                                                            .collect(),
+                                                    };
 
-                                            // Store patch as a system message
-                                            let snapshot_msg = AgentMessage {
-                                                id: Uuid::new_v4().to_string(),
-                                                session_id: context.session().public_id.clone(),
-                                                role: ChatRole::Assistant,
-                                                parts: vec![patch_part],
-                                                created_at: time::OffsetDateTime::now_utc()
-                                                    .unix_timestamp(),
-                                                parent_message_id: None,
-                                            };
-                                            if let Err(e) = context.add_message(snapshot_msg).await
-                                            {
-                                                warn!("Failed to store snapshot patch: {}", e);
-                                            } else {
-                                                debug!(
-                                                    "Post-step snapshot patch stored: {} changed files (step {})",
-                                                    changed.len(),
-                                                    step_id
-                                                );
+                                                    // Store patch as a system message
+                                                    let snapshot_msg = AgentMessage {
+                                                        id: Uuid::new_v4().to_string(),
+                                                        session_id: context.session().public_id.clone(),
+                                                        role: ChatRole::Assistant,
+                                                        parts: vec![patch_part],
+                                                        created_at: time::OffsetDateTime::now_utc()
+                                                            .unix_timestamp(),
+                                                        parent_message_id: None,
+                                                    };
+                                                    if let Err(e) = context.add_message(snapshot_msg).await
+                                                    {
+                                                        warn!("Failed to store snapshot patch: {}", e);
+                                                    } else {
+                                                        debug!(
+                                                            "Post-step snapshot patch stored: {} changed files (step {})",
+                                                            changed.len(),
+                                                            step_id
+                                                        );
+                                                    }
+                                                }
                                             }
+                                        }
+                                        Err(e) => {
+                                            warn!("Post-step snapshot failed: {}", e);
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    warn!("Post-step snapshot failed: {}", e);
-                                }
+
+                                // Run GC if snapshot backend is configured
+                                let _ = backend.gc(worktree, &self.snapshot_gc_config).await;
                             }
+
+                            // Run pruning if enabled
+                            if self.pruning_config.enabled
+                                && let Err(e) = self.run_pruning(context).await
+                            {
+                                warn!("Pruning failed: {}", e);
+                                // Don't fail the whole operation, just log the warning
+                            }
+
+                            return Ok(CycleOutcome::Completed);
                         }
-
-                        // Run GC if snapshot backend is configured
-                        let _ = backend.gc(worktree, &self.snapshot_gc_config).await;
+                        ExecutionState::Stopped { ref message, stop_type } => {
+                            // Middleware stopped execution
+                            info!("Turn-end middleware stopped: {} ({:?})", message, stop_type);
+                            turn_end_state  // Will be handled in the next loop iteration
+                        }
+                        other => other, // Cancelled, etc.
                     }
-
-                    // Run pruning if enabled
-                    if self.pruning_config.enabled
-                        && let Err(e) = self.run_pruning(context).await
-                    {
-                        warn!("Pruning failed: {}", e);
-                        // Don't fail the whole operation, just log the warning
-                    }
-
-                    return Ok(CycleOutcome::Completed);
                 }
 
                 ExecutionState::Stopped {

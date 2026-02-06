@@ -161,7 +161,7 @@ impl SendAgent for QueryMTAgent {
             .map_err(|e| Error::new(-32000, e.to_string()))?;
         }
 
-        let function_index = Arc::new(tokio::sync::OnceCell::new());
+        let function_index = Arc::new(tokio::sync::OnceCell::<Arc<tokio::sync::RwLock<crate::index::FunctionIndex>>>::new());
 
         let runtime = Arc::new(crate::agent::core::SessionRuntime {
             cwd: cwd.clone(),
@@ -173,7 +173,7 @@ impl SendAgent for QueryMTAgent {
             function_index,
             pre_step_snapshot: std::sync::Mutex::new(None),
             current_step_id: std::sync::Mutex::new(None),
-            last_step_diff: std::sync::Mutex::new(None),
+            turn_diffs: std::sync::Mutex::new(Default::default()),
         });
 
         {
@@ -316,7 +316,7 @@ impl SendAgent for QueryMTAgent {
             function_index: Arc::new(tokio::sync::OnceCell::new()),
             pre_step_snapshot: std::sync::Mutex::new(None),
             current_step_id: std::sync::Mutex::new(None),
-            last_step_diff: std::sync::Mutex::new(None),
+            turn_diffs: std::sync::Mutex::new(Default::default()),
         });
 
         {
@@ -511,7 +511,7 @@ impl SendAgent for QueryMTAgent {
             function_index: Arc::new(tokio::sync::OnceCell::new()),
             pre_step_snapshot: std::sync::Mutex::new(None),
             current_step_id: std::sync::Mutex::new(None),
-            last_step_diff: std::sync::Mutex::new(None),
+            turn_diffs: std::sync::Mutex::new(Default::default()),
         });
 
         {
