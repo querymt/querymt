@@ -48,7 +48,8 @@ pub struct LlamaCppConfig {
     /// Top-k sampling.
     pub top_k: Option<u32>,
     /// System prompt to prepend to chat requests.
-    pub system: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system: Vec<String>,
     /// Override model context length.
     pub n_ctx: Option<u32>,
     /// Batch size for llama.cpp decoding.
@@ -275,9 +276,10 @@ impl LlamaCppProvider {
         let mut chat_messages = Vec::new();
 
         // Add system message if configured
-        if let Some(system) = &self.cfg.system {
+        if !self.cfg.system.is_empty() {
+            let system = self.cfg.system.join("\n\n");
             chat_messages.push(
-                LlamaChatMessage::new("system".to_string(), system.clone())
+                LlamaChatMessage::new("system".to_string(), system)
                     .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
             );
         }
@@ -972,9 +974,10 @@ impl LlamaCppProvider {
         }
 
         let mut chat_messages = Vec::with_capacity(messages.len() + 1);
-        if let Some(system) = &self.cfg.system {
+        if !self.cfg.system.is_empty() {
+            let system = self.cfg.system.join("\n\n");
             chat_messages.push(
-                LlamaChatMessage::new("system".to_string(), system.clone())
+                LlamaChatMessage::new("system".to_string(), system)
                     .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
             );
         }
@@ -1037,8 +1040,8 @@ impl LlamaCppProvider {
         }
 
         let mut prompt = String::new();
-        if let Some(system) = &self.cfg.system {
-            prompt.push_str(system);
+        if !self.cfg.system.is_empty() {
+            prompt.push_str(&self.cfg.system.join("\n\n"));
             prompt.push_str("\n\n");
         }
         for (idx, msg) in messages.iter().enumerate() {

@@ -65,3 +65,19 @@ export function formatDurationCompact(ms: number): string {
   }
   return `${seconds}s`;
 }
+
+/**
+ * Format duration from start/end timestamps (e.g., "2h 34m 56s")
+ * If endTime is not provided, uses current time
+ */
+export function formatDurationFromTimestamps(startTime: number, endTime?: number): string {
+  const durationMs = (endTime ?? Date.now()) - startTime;
+  return formatDuration(Math.max(0, durationMs));
+}
+
+/**
+ * Format timestamp as locale time string
+ */
+export function formatTimestamp(ts: number): string {
+  return new Date(ts).toLocaleTimeString();
+}

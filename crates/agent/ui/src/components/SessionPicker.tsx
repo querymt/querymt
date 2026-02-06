@@ -3,6 +3,7 @@ import * as Collapsible from '@radix-ui/react-collapsible';
 import { SessionGroup, SessionSummary } from '../types';
 import { GlitchText } from './GlitchText';
 import { ChevronDown, ChevronRight, Search, Plus, Clock, GitBranch } from 'lucide-react';
+import { useThinkingSessionIds } from '../hooks/useThinkingSessionIds';
 
 interface SessionPickerProps {
   groups: SessionGroup[];
@@ -11,9 +12,10 @@ interface SessionPickerProps {
   disabled?: boolean;
   activeSessionId?: string | null;
   thinkingBySession?: Map<string, Set<string>>;
+  sessionParentMap?: Map<string, string>;
 }
 
-export function SessionPicker({ groups, onSelectSession, onNewSession, disabled, activeSessionId, thinkingBySession }: SessionPickerProps) {
+export function SessionPicker({ groups, onSelectSession, onNewSession, disabled, activeSessionId, thinkingBySession, sessionParentMap }: SessionPickerProps) {
   const [filterText, setFilterText] = useState('');
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set(groups.map((_, i) => `group-${i}`)));
   
@@ -72,6 +74,8 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
       .filter(group => group.sessions.length > 0);
   }, [groups, filterText]);
   
+  const thinkingSessionIds = useThinkingSessionIds(thinkingBySession, groups, sessionParentMap);
+  
   const toggleGroup = (groupIndex: number) => {
     const groupId = `group-${groupIndex}`;
     setExpandedGroups(prev => {
@@ -109,7 +113,7 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
     const isDelegation = session.fork_origin === 'delegation';
     const indentClass = depth > 0 ? `ml-${depth * 6}` : '';
     const isActive = activeSessionId === session.session_id;
-    const isThinking = thinkingBySession?.get(session.session_id)?.size ?? 0 > 0;
+    const isThinking = thinkingSessionIds.has(session.session_id);
     
     return (
       <div key={session.session_id}>

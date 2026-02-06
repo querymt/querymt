@@ -48,11 +48,13 @@ impl ExecutionContext {
     pub fn tool_context(
         &self,
         agent_registry: Arc<dyn crate::delegation::AgentRegistry>,
+        elicitation_tx: Option<tokio::sync::mpsc::Sender<crate::tools::ElicitationRequest>>,
     ) -> AgentToolContext {
         AgentToolContext::new(
             self.session_id.clone(),
             self.cwd().map(|p| p.to_path_buf()),
             Some(agent_registry),
+            elicitation_tx,
         )
     }
 }

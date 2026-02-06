@@ -37,6 +37,15 @@ export interface FileIndexEntry {
   is_dir: boolean;
 }
 
+// Elicitation tool types (unified MCP protocol)
+export interface ElicitationData {
+  elicitationId: string;
+  sessionId: string;
+  message: string;
+  requestedSchema: any;  // JSON Schema object
+  source: string;  // "builtin:question" or "mcp:server_name"
+}
+
 // Custom UI-specific types
 export interface EventItem {
   id: string;
@@ -86,6 +95,8 @@ export interface EventItem {
   stopType?: StopType;
   stopReason?: string;
   stopMetrics?: ExecutionMetrics;
+  // Elicitation tool fields
+  elicitationData?: ElicitationData;
 }
 
 export type RoutingMode = 'single' | 'broadcast';
@@ -368,4 +379,5 @@ export type UiClientMessage =
   | { type: 'undo'; message_id: string }
   | { type: 'redo' }
   | { type: 'subscribe_session'; session_id: string; agent_id?: string }
-  | { type: 'unsubscribe_session'; session_id: string };
+  | { type: 'unsubscribe_session'; session_id: string }
+  | { type: 'elicitation_response'; elicitation_id: string; action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> };

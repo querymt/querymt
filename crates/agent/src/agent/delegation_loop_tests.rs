@@ -302,6 +302,7 @@ impl TestHarness {
             compaction: crate::session::compaction::SessionCompaction::new(),
             snapshot_backend: None,
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
+            pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
         });
 
         if let Ok(mut config) = agent.tool_config.lock() {

@@ -16,14 +16,12 @@ pub use stdio::serve_stdio;
 
 // Existing manual JSON-RPC implementation (for dashboard compatibility)
 use crate::acp::shared::{
-    PermissionMap, RpcRequest, SessionOwnerMap, collect_event_sources, handle_rpc_message,
-    is_event_owned, translate_event_to_notification,
+    PendingElicitationMap, PermissionMap, RpcRequest, SessionOwnerMap, collect_event_sources,
+    handle_rpc_message, is_event_owned, translate_event_to_notification,
 };
 use crate::agent::QueryMTAgent;
 use crate::event_bus::EventBus;
-use agent_client_protocol::{
-    Error, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-};
+use agent_client_protocol::{Error, RequestPermissionRequest, RequestPermissionResponse};
 use axum::{
     Router,
     extract::{
@@ -43,6 +41,7 @@ use uuid::Uuid;
 pub struct AcpServer {
     agent: Arc<QueryMTAgent>,
     pending_permissions: PermissionMap,
+    pending_elicitations: PendingElicitationMap,
     event_sources: Vec<Arc<EventBus>>,
     session_owners: SessionOwnerMap,
 }
@@ -51,6 +50,7 @@ pub struct AcpServer {
 struct ServerState {
     agent: Arc<QueryMTAgent>,
     pending_permissions: PermissionMap,
+    pending_elicitations: PendingElicitationMap,
     event_sources: Vec<Arc<EventBus>>,
     session_owners: SessionOwnerMap,
 }
@@ -59,16 +59,19 @@ impl AcpServer {
     pub fn new(agent: Arc<QueryMTAgent>) -> Self {
         let event_sources = collect_event_sources(&agent);
         let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations = agent.pending_elicitations();
         let session_owners = Arc::new(Mutex::new(HashMap::new()));
 
         let client = WebClientBridge {
             pending_permissions: pending_permissions.clone(),
+            pending_elicitations: pending_elicitations.clone(),
         };
         agent.set_client(Arc::new(client));
 
         Self {
             agent,
             pending_permissions,
+            pending_elicitations,
             event_sources,
             session_owners,
         }
@@ -78,6 +81,7 @@ impl AcpServer {
         let state = ServerState {
             agent: self.agent,
             pending_permissions: self.pending_permissions,
+            pending_elicitations: self.pending_elicitations,
             event_sources: self.event_sources,
             session_owners: self.session_owners,
         };
@@ -91,6 +95,7 @@ impl AcpServer {
         let state = ServerState {
             agent: self.agent,
             pending_permissions: self.pending_permissions,
+            pending_elicitations: self.pending_elicitations,
             event_sources: self.event_sources,
             session_owners: self.session_owners,
         };
@@ -126,6 +131,7 @@ impl AcpServer {
                         state.agent.as_ref(),
                         &state.session_owners,
                         &state.pending_permissions,
+                        &state.pending_elicitations,
                         &conn_id,
                         request,
                     )
@@ -148,7 +154,9 @@ impl AcpServer {
 }
 
 struct WebClientBridge {
-    pending_permissions: Arc<Mutex<HashMap<String, oneshot::Sender<RequestPermissionOutcome>>>>,
+    pending_permissions: PermissionMap,
+    #[allow(dead_code)]
+    pending_elicitations: PendingElicitationMap,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -212,6 +220,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: ServerState) {
                             state.agent.as_ref(),
                             &state.session_owners,
                             &state.pending_permissions,
+                            &state.pending_elicitations,
                             &conn_id,
                             request,
                         )

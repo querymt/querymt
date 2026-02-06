@@ -83,6 +83,7 @@ pub struct SimilarMatch {
     pub start_line: u32,
     pub end_line: u32,
     pub similarity: f64,
+    pub body_text: String,
 }
 
 impl From<&SimilarFunctionMatch> for SimilarMatch {
@@ -93,6 +94,7 @@ impl From<&SimilarFunctionMatch> for SimilarMatch {
             start_line: m.function.start_line,
             end_line: m.function.end_line,
             similarity: m.similarity,
+            body_text: m.function.body_text.clone(),
         }
     }
 }
@@ -258,32 +260,61 @@ impl DedupCheckMiddleware {
             return String::new();
         }
 
-        let mut message = String::from("\n⚠️ Similar code detected:\n\n");
+        let mut message = String::from(
+            "\n🚨 DUPLICATE CODE DETECTED — ACTION REQUIRED\n\n\
+             You just wrote code that already exists in the codebase. \
+             You MUST use the existing function(s) instead of duplicating them.\n\n",
+        );
 
         for warning in warnings {
             let new_func = &warning.new_function;
             message.push_str(&format!(
-                "Function `{}` in {}:{}-{} is similar to:\n",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+                 ❌ DUPLICATE: `{}` in {}:{}-{}\n\n",
                 new_func.function_name,
                 new_func.file_path.display(),
                 new_func.start_line,
                 new_func.end_line
             ));
 
+            message.push_str("✅ USE INSTEAD:\n\n");
+
             for m in &warning.matches {
                 message.push_str(&format!(
-                    "  • `{}` in {}:{}-{} ({:.0}% similar)\n",
+                    "  `{}` in {} (lines {}-{}, {:.0}% similar)\n",
                     m.function_name,
                     m.file_path.display(),
                     m.start_line,
                     m.end_line,
                     m.similarity * 100.0
                 ));
+
+                // Show the existing function's source code (truncated if too long)
+                let code_preview = if m.body_text.lines().count() > 30 {
+                    let preview: String =
+                        m.body_text.lines().take(25).collect::<Vec<_>>().join("\n");
+                    format!(
+                        "{}...\n  // ... truncated ({} total lines)",
+                        preview,
+                        m.body_text.lines().count()
+                    )
+                } else {
+                    m.body_text.clone()
+                };
+
+                message.push_str(&format!("  ```\n{}\n  ```\n\n", code_preview));
             }
-            message.push('\n');
         }
 
-        message.push_str("Consider using existing functions or extracting shared logic.\n");
+        message.push_str(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+             REQUIRED ACTIONS:\n\
+             1. REMOVE the duplicate function(s) you just wrote\n\
+             2. Import and call the existing function(s) shown above instead\n\
+             3. If the existing function is ALMOST but not exactly what you need, \
+                extend it with a parameter or create a thin wrapper — do NOT copy the logic\n\n\
+             Do NOT proceed without addressing this duplication.\n",
+        );
 
         message
     }
@@ -539,15 +570,18 @@ mod tests {
                 start_line: 5,
                 end_line: 15,
                 similarity: 0.85,
+                body_text: "function computeSum(items: number[]): number {\n  return items.reduce((a, b) => a + b, 0);\n}".to_string(),
             }],
         }];
 
         let message = DedupCheckMiddleware::format_warning_message(&warnings);
 
-        assert!(message.contains("Similar code detected"));
+        assert!(message.contains("DUPLICATE CODE DETECTED"));
         assert!(message.contains("calculateTotal"));
         assert!(message.contains("computeSum"));
         assert!(message.contains("85%"));
+        assert!(message.contains("REMOVE the duplicate"));
+        assert!(message.contains("function computeSum")); // Verify source code is included
     }
 
     #[test]

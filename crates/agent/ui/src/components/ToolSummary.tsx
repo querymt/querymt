@@ -35,15 +35,16 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
   const normalized = (toolKind || toolName || '').toLowerCase().replace(/^mcp_/, '');
   const isEdit = normalized === 'edit';
   const isPatch = normalized === 'apply_patch';
+  const isWrite = normalized === 'write' || normalized === 'write_file';
   const isShell = normalized === 'shell' || normalized === 'bash';
-  const hasInlinePreview = isEdit || isPatch || isShell;
-  const [showPreview, setShowPreview] = useState(isEdit || isPatch); // Auto-expand diffs
+  const hasInlinePreview = isEdit || isPatch || isWrite || isShell;
+  const [showPreview, setShowPreview] = useState(isEdit || isPatch || isWrite); // Auto-expand diffs
 
   // Build preview data
   const previewData = useMemo(() => {
     if (!hasInlinePreview) return null;
 
-    if ((isEdit || isPatch) && rawInput && typeof rawInput === 'object') {
+    if ((isEdit || isPatch || isWrite) && rawInput && typeof rawInput === 'object') {
       return buildDiffPreview(toolKind, rawInput as Record<string, unknown>);
     }
 
@@ -52,7 +53,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
     }
 
     return null;
-  }, [hasInlinePreview, isEdit, isPatch, isShell, toolKind, rawInput, hasMergedResult, event.mergedResult]);
+  }, [hasInlinePreview, isEdit, isPatch, isWrite, isShell, toolKind, rawInput, hasMergedResult, event.mergedResult]);
 
   const handleClick = () => {
     if (isDelegate && onDelegateClick) {
@@ -235,6 +236,25 @@ function buildDiffPreview(toolKind: string | undefined, input: Record<string, un
         `+++ b/${normalizedPath}`,
         `@@ -1,${oldLines} +1,${newLines} @@`,
         oldBlock,
+        newBlock,
+      ].join('\n');
+      return { type: 'diff', patch };
+    }
+  }
+  
+  if (normalized === 'write' || normalized === 'write_file') {
+    const filePath = (input.filePath || input.file_path || input.path || 'file') as string;
+    const content = input.content;
+    if (typeof content === 'string') {
+      const normalizedPath = filePath.replace(/^\/+/, '') || 'file';
+      const newLines = content.split('\n').length;
+      const newBlock = content.split('\n').map(line => `+${line}`).join('\n');
+      const patch = [
+        `diff --git a/${normalizedPath} b/${normalizedPath}`,
+        `new file mode 100644`,
+        `--- /dev/null`,
+        `+++ b/${normalizedPath}`,
+        `@@ -0,0 +1,${newLines} @@`,
         newBlock,
       ].join('\n');
       return { type: 'diff', patch };

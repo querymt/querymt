@@ -61,6 +61,10 @@ pub struct QueryMTAgent {
     pub(crate) snapshot_backend: Option<Arc<dyn crate::snapshot::SnapshotBackend>>,
     /// GC configuration for snapshot cleanup
     pub(crate) snapshot_gc_config: crate::snapshot::GcConfig,
+
+    // Question handling for interactive tools
+    /// Pending elicitation requests from tools and MCP servers (elicitation_id -> response sender)
+    pub(crate) pending_elicitations: crate::elicitation::PendingElicitationMap,
 }
 
 /// Configuration for when and how delegation context is injected into conversations.
@@ -90,7 +94,10 @@ pub struct ClientState {
 /// Runtime state for an active session.
 pub struct SessionRuntime {
     pub cwd: Option<std::path::PathBuf>,
-    pub _mcp_services: HashMap<String, rmcp::service::RunningService<rmcp::RoleClient, ()>>,
+    pub _mcp_services: HashMap<
+        String,
+        rmcp::service::RunningService<rmcp::RoleClient, crate::elicitation::ElicitationHandler>,
+    >,
     pub mcp_tools: HashMap<String, Arc<querymt::mcp::adapter::McpToolAdapter>>,
     pub mcp_tool_defs: Vec<querymt::chat::Tool>,
     pub permission_cache: StdMutex<HashMap<String, bool>>,
@@ -216,6 +223,8 @@ impl QueryMTAgent {
             // Snapshot system - disabled by default
             snapshot_backend: None,
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
+            // Elicitation handling - empty by default
+            pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -340,6 +349,11 @@ impl QueryMTAgent {
     pub fn tool_registry(&self) -> Arc<crate::tools::ToolRegistry> {
         let registry = self.tool_registry.lock().unwrap();
         Arc::new(registry.clone())
+    }
+
+    /// Access the pending elicitations map for resolving tool and MCP server elicitation requests.
+    pub fn pending_elicitations(&self) -> crate::elicitation::PendingElicitationMap {
+        self.pending_elicitations.clone()
     }
 
     /// Sets the client for protocol communication.

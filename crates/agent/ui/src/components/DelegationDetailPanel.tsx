@@ -1,11 +1,11 @@
-import { CheckCircle, Clock, Loader, XCircle, Copy, Check, Cpu, Wrench, DollarSign } from 'lucide-react';
+import { CheckCircle, Clock, XCircle, Copy, Check, Cpu, Wrench, DollarSign } from 'lucide-react';
 import { DelegationGroupInfo, Turn, UiAgentInfo, LlmConfigDetails } from '../types';
 import { TurnCard } from './TurnCard';
 import { getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
 import { calculateDelegationStats } from '../utils/statsCalculator';
-import { formatTokensAbbrev, formatCost } from '../utils/formatters';
+import { formatTokensAbbrev, formatCost, formatDurationFromTimestamps } from '../utils/formatters';
 
 interface DelegationDetailPanelProps {
   delegation?: DelegationGroupInfo;
@@ -14,18 +14,6 @@ interface DelegationDetailPanelProps {
   onToolClick: (event: Turn['toolCalls'][number]) => void;
   llmConfigCache?: Record<number, LlmConfigDetails>;
   requestLlmConfig?: (configId: number, callback: (config: LlmConfigDetails) => void) => void;
-}
-
-function formatDuration(startTime: number, endTime?: number): string {
-  const durationMs = (endTime ?? Date.now()) - startTime;
-  const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
-  const seconds = totalSeconds % 60;
-  const minutes = Math.floor(totalSeconds / 60) % 60;
-  const hours = Math.floor(totalSeconds / 3600);
-
-  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
-  if (minutes > 0) return `${minutes}m ${seconds}s`;
-  return `${seconds}s`;
 }
 
 export function DelegationDetailPanel({
@@ -49,7 +37,7 @@ export function DelegationDetailPanel({
   const agentId = delegation.targetAgentId ?? delegation.agentId;
   const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
   const agentColor = agentId ? getAgentColor(agentId) : '#b026ff';
-  const durationLabel = formatDuration(delegation.startTime, delegation.endTime);
+  const durationLabel = formatDurationFromTimestamps(delegation.startTime, delegation.endTime);
   const stats = calculateDelegationStats(delegation);
   const objective = delegation.objective ??
     (delegation.delegateEvent.toolCall?.raw_input as { objective?: string } | undefined)?.objective;
@@ -69,9 +57,6 @@ export function DelegationDetailPanel({
             {agentName}
           </span>
           <span className="flex-shrink-0">
-            {delegation.status === 'in_progress' && (
-              <Loader className="w-3.5 h-3.5 text-cyber-purple animate-spin" />
-            )}
             {delegation.status === 'completed' && (
               <CheckCircle className="w-3.5 h-3.5 text-cyber-lime" />
             )}

@@ -95,21 +95,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(Commands::Auth { command }) = &args.command {
         match command {
             AuthCommands::Login { provider, mode } => {
-                let oauth_provider = match auth::get_oauth_provider(provider, Some(mode)) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("{} {}", "Error:".bright_red(), e);
-                        return Ok(());
-                    }
-                };
+                let oauth_provider =
+                    match querymt_utils::oauth::get_oauth_provider(provider, Some(mode)) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("{} {}", "Error:".bright_red(), e);
+                            return Ok(());
+                        }
+                    };
 
                 let mut store = SecretStore::new()?;
-                auth::authenticate(oauth_provider.as_ref(), &mut store).await?;
+                let console_ui = auth::ConsoleOAuthUI;
+                querymt_utils::oauth::authenticate(
+                    oauth_provider.as_ref(),
+                    &mut store,
+                    &console_ui,
+                )
+                .await?;
                 return Ok(());
             }
             AuthCommands::Logout { provider } => {
                 // Verify the provider supports OAuth
-                if auth::get_oauth_provider(provider, None).is_err() {
+                if querymt_utils::oauth::get_oauth_provider(provider, None).is_err() {
                     eprintln!(
                         "{} Provider '{}' does not support OAuth",
                         "Error:".bright_red(),
@@ -132,7 +139,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_refresh,
             } => {
                 let mut store = SecretStore::new()?;
-                auth::show_auth_status(&mut store, provider.as_deref(), !no_refresh).await?;
+                let console_ui = auth::ConsoleOAuthUI;
+                querymt_utils::oauth::show_auth_status(
+                    &mut store,
+                    provider.as_deref(),
+                    !no_refresh,
+                    &console_ui,
+                )
+                .await?;
                 return Ok(());
             }
         }

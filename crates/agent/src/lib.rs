@@ -10,6 +10,7 @@ pub mod auth;
 pub mod acp;
 pub mod agent;
 pub mod delegation;
+pub mod elicitation;
 pub mod event_bus;
 pub mod events;
 pub mod export;

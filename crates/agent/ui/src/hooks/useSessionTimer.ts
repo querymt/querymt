@@ -59,6 +59,9 @@ export function useSessionTimer(
       return; // Don't start interval if session is not active
     }
     
+    // Immediately refresh current time so the timer doesn't jump
+    setCurrentTime(Date.now());
+    
     const interval = setInterval(() => {
       setCurrentTime(Date.now());
     }, 1000);

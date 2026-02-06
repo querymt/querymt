@@ -153,6 +153,13 @@ pub async fn handle_ui_message(
         UiClientMessage::UnsubscribeSession { session_id } => {
             handle_unsubscribe_session(state, conn_id, &session_id).await;
         }
+        UiClientMessage::ElicitationResponse {
+            elicitation_id,
+            action,
+            content,
+        } => {
+            handle_elicitation_response(state, &elicitation_id, &action, content.as_ref()).await;
+        }
     }
 }
 
@@ -653,5 +660,35 @@ pub async fn handle_unsubscribe_session(state: &ServerState, conn_id: &str, sess
     let mut connections = state.connections.lock().await;
     if let Some(conn) = connections.get_mut(conn_id) {
         conn.subscribed_sessions.remove(session_id);
+    }
+}
+
+/// Handle elicitation response from UI client.
+pub async fn handle_elicitation_response(
+    state: &ServerState,
+    elicitation_id: &str,
+    action: &str,
+    content: Option<&serde_json::Value>,
+) {
+    // Parse action string to enum
+    let action_enum = match action {
+        "accept" => crate::elicitation::ElicitationAction::Accept,
+        "decline" => crate::elicitation::ElicitationAction::Decline,
+        "cancel" => crate::elicitation::ElicitationAction::Cancel,
+        _ => {
+            log::warn!("Invalid elicitation action: {}", action);
+            return;
+        }
+    };
+
+    let response = crate::elicitation::ElicitationResponse {
+        action: action_enum,
+        content: content.cloned(),
+    };
+
+    let pending_map = state.agent.pending_elicitations();
+    let mut pending = pending_map.lock().await;
+    if let Some(tx) = pending.remove(elicitation_id) {
+        let _ = tx.send(response);
     }
 }

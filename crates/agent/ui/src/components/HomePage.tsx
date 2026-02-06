@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { Plus, Loader } from 'lucide-react';
+import { useSessionManager } from '../hooks/useSessionManager';
 import { useUiClientContext } from '../context/UiClientContext';
 import { SessionPicker } from './SessionPicker';
 import { GlitchText } from './GlitchText';
@@ -12,25 +12,23 @@ import { GlitchText } from './GlitchText';
  * - SessionPicker (if sessions exist)
  */
 export function HomePage() {
+  const { selectSession, createSession } = useSessionManager();
+  
   const { 
     connected, 
-    newSession, 
     sessionGroups, 
     sessionId,
-    thinkingBySession 
+    thinkingBySession,
+    sessionParentMap
   } = useUiClientContext();
-  
-  const navigate = useNavigate();
   
   const [loading, setLoading] = useState(false);
 
   const handleNewSession = async () => {
     setLoading(true);
     try {
-      const newSessionId = await newSession();
-      navigate(`/session/${newSessionId}`, { replace: true });
+      await createSession();
     } catch (err) {
-      // User cancelled or error occurred
       console.log('Session creation cancelled or failed:', err);
     } finally {
       setLoading(false);
@@ -40,7 +38,7 @@ export function HomePage() {
   // Handle session selection - navigate to the session route
   // The useSessionRoute hook in ChatView will then load the session from URL
   const handleSelectSession = (sessionId: string) => {
-    navigate(`/session/${sessionId}`);
+    selectSession(sessionId);
   };
 
   // If sessions exist, show the session picker
@@ -54,6 +52,7 @@ export function HomePage() {
           disabled={!connected || loading}
           activeSessionId={sessionId}
           thinkingBySession={thinkingBySession}
+          sessionParentMap={sessionParentMap}
         />
       </div>
     );

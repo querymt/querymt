@@ -12,11 +12,12 @@ homepage = "https://query.mt"
 
 [features]
 default = []
-dbus-secret-service = ["keyring/sync-secret-service"]
+dbus-secret-service = ["querymt-utils/dbus-secret-service"]
 
 [dependencies]
 anyhow = "1.0"
 querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
+querymt-utils = { path = "../querymt-utils", features = ["secret-store", "oauth"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 rustyline = "17"
@@ -30,20 +31,10 @@ log.workspace = true
 dirs = "6.0"
 toml = "0.9"
 futures = "0.3"
-anthropic-auth = { version = "0.1", default-features = false, features = ["browser", "async", "rustls-tls"] }
-openai-auth = { version = "1.0", features = ["browser", "async", "callback-server"] }
 async-trait = "0.1"
-keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native", "crypto-rust"] }
-url = "2"
+open = "5"
 
 tracing.workspace = true
-tracing-log = "0.2"
-tracing-opentelemetry = "0.32"
-tracing-subscriber = "0.3"
-opentelemetry = "0.31"
-opentelemetry_sdk = "0.31"
-opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
-opentelemetry-semantic-conventions = "0.31"
 
 [[bin]]
 name = "qmt"

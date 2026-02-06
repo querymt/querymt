@@ -8,6 +8,7 @@ import { MessageContent } from './MessageContent';
 import { ActivitySection } from './ActivitySection';
 import { PinnedUserMessage } from './PinnedUserMessage';
 import { ModelConfigPopover } from './ModelConfigPopover';
+import { ElicitationCard } from './ElicitationCard';
 import { getAgentShortName } from '../utils/agentNames';
 import { getAgentColor } from '../utils/agentColors';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
@@ -302,6 +303,10 @@ export const TurnCard = memo(function TurnCard({
                         onToolClick={onToolClick}
                         onDelegateClick={onDelegateClick}
                       />
+                      {/* Render elicitation cards for any tool calls with elicitation data */}
+                      {item.events.map((event) => event.elicitationData && (
+                        <ElicitationCard key={`elicitation-${event.id}`} data={event.elicitationData} />
+                      ))}
                     </div>
                   );
                 }

@@ -7,10 +7,22 @@ import { EventRow } from '../types';
  * Separate from UiClientContext which handles WebSocket/server state
  */
 
+interface SessionViewState {
+  activeDelegationId: string | null;
+  activeTimelineView: 'chat' | 'delegations';
+  delegationsPanelCollapsed: boolean;
+  delegationDrawerOpen: boolean;
+  chatScrollIndex: number;
+  isAtBottom: boolean;
+}
+
 interface UiState {
   // UI visibility toggles
   todoRailCollapsed: boolean;
   setTodoRailCollapsed: (collapsed: boolean) => void;
+  
+  delegationsPanelCollapsed: boolean;
+  setDelegationsPanelCollapsed: (collapsed: boolean) => void;
   
   // Session/navigation state
   sessionCopied: boolean;
@@ -34,6 +46,9 @@ interface UiState {
   isAtBottom: boolean;
   setIsAtBottom: (atBottom: boolean) => void;
   
+  chatScrollIndex: number;
+  setChatScrollIndex: (index: number) => void;
+  
   // Form state
   prompt: string;
   setPrompt: (prompt: string) => void;
@@ -49,6 +64,14 @@ interface UiState {
   statsDrawerOpen: boolean;
   setStatsDrawerOpen: (open: boolean) => void;
   
+  // Delegation drawer state
+  delegationDrawerOpen: boolean;
+  setDelegationDrawerOpen: (open: boolean) => void;
+  
+  // Per-session view state cache
+  sessionViewCache: Map<string, SessionViewState>;
+  saveAndSwitchSession: (fromSessionId: string | null, toSessionId: string | null) => void;
+  
   // Utility actions
   resetChatView: () => void; // Reset view state when switching sessions
   
@@ -59,16 +82,20 @@ interface UiState {
 export const useUiStore = create<UiState>((set) => ({
   // Initial state
   todoRailCollapsed: false,
+  delegationsPanelCollapsed: false,
   sessionCopied: false,
   activeTimelineView: 'chat',
   activeDelegationId: null,
   selectedToolEvent: null,
   modelPickerOpen: false,
   isAtBottom: true,
+  chatScrollIndex: 0,
   prompt: '',
   loading: false,
   sessionSwitcherOpen: false,
   statsDrawerOpen: false,
+  delegationDrawerOpen: false,
+  sessionViewCache: new Map(),
   
   // Actions
   setTodoRailCollapsed: (collapsed) => {
@@ -77,16 +104,51 @@ export const useUiStore = create<UiState>((set) => ({
     localStorage.setItem('todoRailCollapsed', collapsed.toString());
   },
   
+  setDelegationsPanelCollapsed: (collapsed) => set({ delegationsPanelCollapsed: collapsed }),
+  
   setSessionCopied: (copied) => set({ sessionCopied: copied }),
   setActiveTimelineView: (view) => set({ activeTimelineView: view }),
   setActiveDelegationId: (id) => set({ activeDelegationId: id }),
   setSelectedToolEvent: (event) => set({ selectedToolEvent: event }),
   setModelPickerOpen: (open) => set({ modelPickerOpen: open }),
   setIsAtBottom: (atBottom) => set({ isAtBottom: atBottom }),
+  setChatScrollIndex: (index) => set({ chatScrollIndex: index }),
   setPrompt: (prompt) => set({ prompt }),
   setLoading: (loading) => set({ loading }),
   setSessionSwitcherOpen: (open) => set({ sessionSwitcherOpen: open }),
   setStatsDrawerOpen: (open) => set({ statsDrawerOpen: open }),
+  setDelegationDrawerOpen: (open) => set({ delegationDrawerOpen: open }),
+  
+  // Save and restore per-session view state when switching sessions
+  saveAndSwitchSession: (fromSessionId, toSessionId) => set((state) => {
+    const cache = new Map(state.sessionViewCache);
+    
+    // Save current state for the session we're leaving
+    if (fromSessionId) {
+      cache.set(fromSessionId, {
+        activeDelegationId: state.activeDelegationId,
+        activeTimelineView: state.activeTimelineView,
+        delegationsPanelCollapsed: state.delegationsPanelCollapsed,
+        delegationDrawerOpen: state.delegationDrawerOpen,
+        chatScrollIndex: state.chatScrollIndex,
+        isAtBottom: state.isAtBottom,
+      });
+    }
+    
+    // Restore state for the session we're switching to (or defaults)
+    const restored = toSessionId ? cache.get(toSessionId) : undefined;
+    
+    return {
+      sessionViewCache: cache,
+      activeDelegationId: restored?.activeDelegationId ?? null,
+      activeTimelineView: restored?.activeTimelineView ?? 'chat',
+      delegationsPanelCollapsed: restored?.delegationsPanelCollapsed ?? false,
+      delegationDrawerOpen: restored?.delegationDrawerOpen ?? false,
+      chatScrollIndex: restored?.chatScrollIndex ?? 0,
+      isAtBottom: restored?.isAtBottom ?? true,
+      selectedToolEvent: null, // Always clear this on switch
+    };
+  }),
   
   // Reset chat view state when switching sessions
   resetChatView: () => set({
@@ -94,6 +156,9 @@ export const useUiStore = create<UiState>((set) => ({
     activeTimelineView: 'chat',
     selectedToolEvent: null,
     isAtBottom: true,
+    chatScrollIndex: 0,
+    delegationsPanelCollapsed: false,
+    delegationDrawerOpen: false,
   }),
   
   // Load persisted state from localStorage

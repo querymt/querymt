@@ -12,14 +12,15 @@ default = []
 # The build script will automatically run npm install and npm run build
 dashboard = []
 # Enables OAuth token support for authentication (reads tokens from system keyring)
-oauth = ["anthropic-auth", "openai-auth", "keyring"]
+oauth = ["querymt-utils/oauth"]
 
 # Enable DBus Secret Service backend for keyring on Linux.
 # This mirrors the CLI's `dbus-secret-service` feature, but is wired through the agent crate.
-dbus-secret-service = ["oauth", "keyring/sync-secret-service"]
+dbus-secret-service = ["oauth", "querymt-utils/dbus-secret-service"]
 
 [dependencies]
 querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
+querymt-utils = { path = "../querymt-utils" }
 agent-client-protocol = { version = "0.9", features = ["unstable"] }
 agent-client-protocol-schema = { version = "0.10", features = ["unstable"]}
 async-trait.workspace = true
@@ -72,10 +73,7 @@ mdq = "0.9.0"
 gix = { version = "0.78", default-features = false, features = ["basic", "worktree-mutation", "attributes"] }
 dirs.workspace = true
 
-# OAuth support (optional, feature-gated)
-anthropic-auth = { version = "0.1", default-features = false, features = ["async", "rustls-tls"], optional = true }
-openai-auth = { version = "1.0", features = ["async"], optional = true }
-keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native", "crypto-rust"], optional = true }
+# OAuth support (optional, feature-gated) - now provided by querymt-utils
 
 # Code similarity detection (local fork with tree-sitter 0.25)
 similarity-core = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }

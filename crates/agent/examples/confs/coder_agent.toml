@@ -12,10 +12,10 @@ snapshot_policy = "diff"
 
 [planner]
 provider = "anthropic"
-model = "claude-opus-4-5"
+model = "claude-opus-4-6"
 #provider = "codex"
 #model = "gpt-5.2-codex"
-tools = ["delegate", "create_task", "todowrite", "todoread", "search_text", "glob", "ls", "read_file", "shell"]
+tools = ["delegate", "create_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "read_file", "shell"]
 system = [
   "You are Claude Code, Anthropic's official CLI for Claude.",
 #  { file = "../prompts/anthropic_opencode.txt" }
@@ -86,12 +86,21 @@ model = "claude-3-5-haiku-20241022"
 
 [[delegates]]
 id = "coder"
+#provider = "llama_cpp"
+#model = "qwen3-coder-30b"
 provider = "anthropic"
-model = "claude-sonnet-4-5"
+model = "claude-sonnet-4-5-20250929"
 description = "Specialized in implementation and code writing"
 capabilities = ["rust", "python"]
-tools = ["edit", "todowrite", "todoread", "code_surgeon", "glob", "search_text", "ls", "shell", "read_file", "write_file"]
-system = ["You are Claude Code, Anthropic's official CLI for Claude."]
+tools = ["question", "edit", "todowrite", "todoread", "code_surgeon", "glob", "search_text", "ls", "shell", "read_file", "write_file"]
+system = [
+  "You are Claude Code, Anthropic's official CLI for Claude.",
+#  { file = "../prompts/anthropic_opencode.txt" }
+]
+
+#[delegates.parameters]
+#model_path = "hf:unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf"
+#n_ctx = 32768
 
 # Middleware for coder delegate
 # Apply same limits as planner
@@ -110,4 +119,4 @@ fallback_max_tokens = 32000
 [[delegates.middleware]]
 type = "dedup_check"
 threshold = 0.85
-min_lines = 5
+min_lines = 10

@@ -1,0 +1,439 @@
+import { describe, it, expect, beforeEach } from 'vitest';
+import { useUiStore } from './uiStore';
+import { EventRow } from '../types';
+
+describe('UiStore', () => {
+  beforeEach(() => {
+    // Reset the Zustand store to initial state between tests
+    useUiStore.setState({
+      todoRailCollapsed: false,
+      delegationsPanelCollapsed: false,
+      sessionCopied: false,
+      activeTimelineView: 'chat',
+      activeDelegationId: null,
+      selectedToolEvent: null,
+      modelPickerOpen: false,
+      isAtBottom: true,
+      chatScrollIndex: 0,
+      prompt: '',
+      loading: false,
+      sessionSwitcherOpen: false,
+      statsDrawerOpen: false,
+      delegationDrawerOpen: false,
+      sessionViewCache: new Map(),
+    });
+  });
+
+  describe('saveAndSwitchSession', () => {
+    it('should save current view state for the old session', () => {
+      const store = useUiStore.getState();
+      
+      // Set some state
+      store.setActiveTimelineView('delegations');
+      store.setDelegationsPanelCollapsed(true);
+      store.setActiveDelegationId('del-123');
+      store.setChatScrollIndex(50);
+      store.setIsAtBottom(false);
+      store.setDelegationDrawerOpen(true);
+      
+      // Switch away from session-A to session-B
+      store.saveAndSwitchSession('session-A', 'session-B');
+      
+      // Verify state was saved for session-A
+      const cached = useUiStore.getState().sessionViewCache.get('session-A');
+      expect(cached).toBeDefined();
+      expect(cached!.activeTimelineView).toBe('delegations');
+      expect(cached!.delegationsPanelCollapsed).toBe(true);
+      expect(cached!.activeDelegationId).toBe('del-123');
+      expect(cached!.chatScrollIndex).toBe(50);
+      expect(cached!.isAtBottom).toBe(false);
+      expect(cached!.delegationDrawerOpen).toBe(true);
+    });
+    
+    it('should restore cached state for the target session', () => {
+      const store = useUiStore.getState();
+      
+      // Pre-populate cache for session-B
+      store.setActiveTimelineView('delegations');
+      store.setActiveDelegationId('del-456');
+      store.setDelegationsPanelCollapsed(true);
+      store.setChatScrollIndex(100);
+      store.setIsAtBottom(false);
+      store.setDelegationDrawerOpen(true);
+      store.saveAndSwitchSession('session-B', 'session-C'); // saves session-B state
+      
+      // Now switch to session-A (which should have defaults)
+      store.saveAndSwitchSession('session-C', 'session-A');
+      expect(useUiStore.getState().activeTimelineView).toBe('chat');
+      expect(useUiStore.getState().activeDelegationId).toBeNull();
+      expect(useUiStore.getState().delegationsPanelCollapsed).toBe(false);
+      expect(useUiStore.getState().chatScrollIndex).toBe(0);
+      expect(useUiStore.getState().isAtBottom).toBe(true);
+      expect(useUiStore.getState().delegationDrawerOpen).toBe(false);
+      
+      // Switch back to session-B — should restore
+      store.saveAndSwitchSession('session-A', 'session-B');
+      expect(useUiStore.getState().activeTimelineView).toBe('delegations');
+      expect(useUiStore.getState().activeDelegationId).toBe('del-456');
+      expect(useUiStore.getState().delegationsPanelCollapsed).toBe(true);
+      expect(useUiStore.getState().chatScrollIndex).toBe(100);
+      expect(useUiStore.getState().isAtBottom).toBe(false);
+      expect(useUiStore.getState().delegationDrawerOpen).toBe(true);
+    });
+    
+    it('should default to chat view when switching to unknown session', () => {
+      const store = useUiStore.getState();
+      
+      store.setActiveTimelineView('delegations');
+      store.setActiveDelegationId('del-999');
+      store.setDelegationsPanelCollapsed(true);
+      store.setDelegationDrawerOpen(true);
+      store.setChatScrollIndex(75);
+      store.setIsAtBottom(false);
+      
+      store.saveAndSwitchSession('session-X', 'new-session');
+      
+      expect(useUiStore.getState().activeTimelineView).toBe('chat');
+      expect(useUiStore.getState().activeDelegationId).toBeNull();
+      expect(useUiStore.getState().delegationsPanelCollapsed).toBe(false);
+      expect(useUiStore.getState().delegationDrawerOpen).toBe(false);
+      expect(useUiStore.getState().chatScrollIndex).toBe(0);
+      expect(useUiStore.getState().isAtBottom).toBe(true);
+    });
+    
+    it('should handle null fromSessionId (first mount)', () => {
+      const store = useUiStore.getState();
+      
+      // Set some state that should be reset
+      store.setActiveTimelineView('delegations');
+      store.setActiveDelegationId('del-first');
+      
+      store.saveAndSwitchSession(null, 'session-A');
+      
+      // Should not crash, should apply defaults
+      expect(useUiStore.getState().activeTimelineView).toBe('chat');
+      expect(useUiStore.getState().activeDelegationId).toBeNull();
+      expect(useUiStore.getState().delegationsPanelCollapsed).toBe(false);
+      expect(useUiStore.getState().delegationDrawerOpen).toBe(false);
+      expect(useUiStore.getState().chatScrollIndex).toBe(0);
+      expect(useUiStore.getState().isAtBottom).toBe(true);
+      
+      // Verify cache is empty (no fromSession to save)
+      expect(useUiStore.getState().sessionViewCache.size).toBe(0);
+    });
+    
+    it('should handle null toSessionId (navigating home)', () => {
+      const store = useUiStore.getState();
+      
+      store.setActiveTimelineView('delegations');
+      store.setActiveDelegationId('del-home');
+      store.setDelegationsPanelCollapsed(true);
+      store.setDelegationDrawerOpen(true);
+      store.setChatScrollIndex(200);
+      store.setIsAtBottom(false);
+      
+      store.saveAndSwitchSession('session-A', null);
+      
+      // Should save session-A state and apply defaults
+      expect(useUiStore.getState().activeTimelineView).toBe('chat');
+      expect(useUiStore.getState().activeDelegationId).toBeNull();
+      expect(useUiStore.getState().delegationsPanelCollapsed).toBe(false);
+      expect(useUiStore.getState().delegationDrawerOpen).toBe(false);
+      expect(useUiStore.getState().chatScrollIndex).toBe(0);
+      expect(useUiStore.getState().isAtBottom).toBe(true);
+      
+      const cached = useUiStore.getState().sessionViewCache.get('session-A');
+      expect(cached?.activeTimelineView).toBe('delegations');
+      expect(cached?.activeDelegationId).toBe('del-home');
+      expect(cached?.delegationsPanelCollapsed).toBe(true);
+      expect(cached?.delegationDrawerOpen).toBe(true);
+      expect(cached?.chatScrollIndex).toBe(200);
+      expect(cached?.isAtBottom).toBe(false);
+    });
+    
+    it('should always clear selectedToolEvent on switch', () => {
+      const store = useUiStore.getState();
+      
+      const mockToolEvent = { id: 'tool-1' } as EventRow;
+      store.setSelectedToolEvent(mockToolEvent);
+      expect(useUiStore.getState().selectedToolEvent).not.toBeNull();
+      expect(useUiStore.getState().selectedToolEvent?.id).toBe('tool-1');
+      
+      store.saveAndSwitchSession('session-A', 'session-B');
+      expect(useUiStore.getState().selectedToolEvent).toBeNull();
+    });
+    
+    it('should preserve cache entries when switching between sessions', () => {
+      const store = useUiStore.getState();
+      
+      // Set state for session-A
+      store.setActiveTimelineView('delegations');
+      store.setActiveDelegationId('del-A');
+      store.saveAndSwitchSession('session-A', 'session-B');
+      
+      // Set state for session-B
+      store.setActiveTimelineView('delegations');
+      store.setActiveDelegationId('del-B');
+      store.setDelegationsPanelCollapsed(true);
+      store.saveAndSwitchSession('session-B', 'session-C');
+      
+      // Set state for session-C
+      store.setActiveTimelineView('chat');
+      store.saveAndSwitchSession('session-C', 'session-A');
+      
+      // Verify all three sessions are in cache
+      const cache = useUiStore.getState().sessionViewCache;
+      expect(cache.size).toBe(3);
+      expect(cache.get('session-A')?.activeDelegationId).toBe('del-A');
+      expect(cache.get('session-B')?.activeDelegationId).toBe('del-B');
+      expect(cache.get('session-B')?.delegationsPanelCollapsed).toBe(true);
+      expect(cache.get('session-C')?.activeTimelineView).toBe('chat');
+    });
+  });
+
+  describe('resetChatView', () => {
+    it('should reset all view state to defaults', () => {
+      const store = useUiStore.getState();
+      
+      // Set all states to non-default values
+      store.setActiveTimelineView('delegations');
+      store.setActiveDelegationId('del-123');
+      store.setDelegationsPanelCollapsed(true);
+      store.setDelegationDrawerOpen(true);
+      store.setIsAtBottom(false);
+      store.setChatScrollIndex(50);
+      store.setSelectedToolEvent({ id: 'tool-1' } as EventRow);
+      
+      // Reset
+      store.resetChatView();
+      
+      // Verify all states are back to defaults
+      const state = useUiStore.getState();
+      expect(state.activeTimelineView).toBe('chat');
+      expect(state.activeDelegationId).toBeNull();
+      expect(state.delegationsPanelCollapsed).toBe(false);
+      expect(state.delegationDrawerOpen).toBe(false);
+      expect(state.isAtBottom).toBe(true);
+      expect(state.chatScrollIndex).toBe(0);
+      expect(state.selectedToolEvent).toBeNull();
+    });
+    
+    it('should not affect other store state', () => {
+      const store = useUiStore.getState();
+      
+      // Set some states that should NOT be affected
+      store.setTodoRailCollapsed(true);
+      store.setPrompt('test prompt');
+      store.setLoading(true);
+      store.setModelPickerOpen(true);
+      store.setSessionSwitcherOpen(true);
+      store.setStatsDrawerOpen(true);
+      
+      // Reset chat view
+      store.resetChatView();
+      
+      // Verify unrelated state is preserved
+      const state = useUiStore.getState();
+      expect(state.todoRailCollapsed).toBe(true);
+      expect(state.prompt).toBe('test prompt');
+      expect(state.loading).toBe(true);
+      expect(state.modelPickerOpen).toBe(true);
+      expect(state.sessionSwitcherOpen).toBe(true);
+      expect(state.statsDrawerOpen).toBe(true);
+    });
+  });
+
+  describe('individual setters', () => {
+    it('should set todoRailCollapsed', () => {
+      const store = useUiStore.getState();
+      expect(store.todoRailCollapsed).toBe(false);
+      
+      store.setTodoRailCollapsed(true);
+      expect(useUiStore.getState().todoRailCollapsed).toBe(true);
+      
+      store.setTodoRailCollapsed(false);
+      expect(useUiStore.getState().todoRailCollapsed).toBe(false);
+    });
+    
+    it('should set delegationsPanelCollapsed', () => {
+      const store = useUiStore.getState();
+      expect(store.delegationsPanelCollapsed).toBe(false);
+      
+      store.setDelegationsPanelCollapsed(true);
+      expect(useUiStore.getState().delegationsPanelCollapsed).toBe(true);
+    });
+    
+    it('should set sessionCopied', () => {
+      const store = useUiStore.getState();
+      expect(store.sessionCopied).toBe(false);
+      
+      store.setSessionCopied(true);
+      expect(useUiStore.getState().sessionCopied).toBe(true);
+    });
+    
+    it('should set activeTimelineView', () => {
+      const store = useUiStore.getState();
+      expect(store.activeTimelineView).toBe('chat');
+      
+      store.setActiveTimelineView('delegations');
+      expect(useUiStore.getState().activeTimelineView).toBe('delegations');
+      
+      store.setActiveTimelineView('chat');
+      expect(useUiStore.getState().activeTimelineView).toBe('chat');
+    });
+    
+    it('should set activeDelegationId', () => {
+      const store = useUiStore.getState();
+      expect(store.activeDelegationId).toBeNull();
+      
+      store.setActiveDelegationId('del-456');
+      expect(useUiStore.getState().activeDelegationId).toBe('del-456');
+      
+      store.setActiveDelegationId(null);
+      expect(useUiStore.getState().activeDelegationId).toBeNull();
+    });
+    
+    it('should set selectedToolEvent', () => {
+      const store = useUiStore.getState();
+      expect(store.selectedToolEvent).toBeNull();
+      
+      const mockEvent = { id: 'tool-123', type: 'tool_use' } as unknown as EventRow;
+      store.setSelectedToolEvent(mockEvent);
+      expect(useUiStore.getState().selectedToolEvent).toBe(mockEvent);
+      
+      store.setSelectedToolEvent(null);
+      expect(useUiStore.getState().selectedToolEvent).toBeNull();
+    });
+    
+    it('should set modelPickerOpen', () => {
+      const store = useUiStore.getState();
+      expect(store.modelPickerOpen).toBe(false);
+      
+      store.setModelPickerOpen(true);
+      expect(useUiStore.getState().modelPickerOpen).toBe(true);
+    });
+    
+    it('should set isAtBottom', () => {
+      const store = useUiStore.getState();
+      expect(store.isAtBottom).toBe(true);
+      
+      store.setIsAtBottom(false);
+      expect(useUiStore.getState().isAtBottom).toBe(false);
+    });
+    
+    it('should set chatScrollIndex', () => {
+      const store = useUiStore.getState();
+      expect(store.chatScrollIndex).toBe(0);
+      
+      store.setChatScrollIndex(42);
+      expect(useUiStore.getState().chatScrollIndex).toBe(42);
+    });
+    
+    it('should set prompt', () => {
+      const store = useUiStore.getState();
+      expect(store.prompt).toBe('');
+      
+      store.setPrompt('Hello, world!');
+      expect(useUiStore.getState().prompt).toBe('Hello, world!');
+    });
+    
+    it('should set loading', () => {
+      const store = useUiStore.getState();
+      expect(store.loading).toBe(false);
+      
+      store.setLoading(true);
+      expect(useUiStore.getState().loading).toBe(true);
+    });
+    
+    it('should set sessionSwitcherOpen', () => {
+      const store = useUiStore.getState();
+      expect(store.sessionSwitcherOpen).toBe(false);
+      
+      store.setSessionSwitcherOpen(true);
+      expect(useUiStore.getState().sessionSwitcherOpen).toBe(true);
+    });
+    
+    it('should set statsDrawerOpen', () => {
+      const store = useUiStore.getState();
+      expect(store.statsDrawerOpen).toBe(false);
+      
+      store.setStatsDrawerOpen(true);
+      expect(useUiStore.getState().statsDrawerOpen).toBe(true);
+    });
+    
+    it('should set delegationDrawerOpen', () => {
+      const store = useUiStore.getState();
+      expect(store.delegationDrawerOpen).toBe(false);
+      
+      store.setDelegationDrawerOpen(true);
+      expect(useUiStore.getState().delegationDrawerOpen).toBe(true);
+    });
+  });
+
+  describe('initial state', () => {
+    it('should have correct initial values', () => {
+      const state = useUiStore.getState();
+      
+      expect(state.todoRailCollapsed).toBe(false);
+      expect(state.delegationsPanelCollapsed).toBe(false);
+      expect(state.sessionCopied).toBe(false);
+      expect(state.activeTimelineView).toBe('chat');
+      expect(state.activeDelegationId).toBeNull();
+      expect(state.selectedToolEvent).toBeNull();
+      expect(state.modelPickerOpen).toBe(false);
+      expect(state.isAtBottom).toBe(true);
+      expect(state.chatScrollIndex).toBe(0);
+      expect(state.prompt).toBe('');
+      expect(state.loading).toBe(false);
+      expect(state.sessionSwitcherOpen).toBe(false);
+      expect(state.statsDrawerOpen).toBe(false);
+      expect(state.delegationDrawerOpen).toBe(false);
+      expect(state.sessionViewCache).toBeInstanceOf(Map);
+      expect(state.sessionViewCache.size).toBe(0);
+    });
+  });
+
+  describe('complex session switching scenarios', () => {
+    it('should handle rapid session switches', () => {
+      const store = useUiStore.getState();
+      
+      // Simulate rapid switching between multiple sessions
+      store.setActiveDelegationId('del-1');
+      store.saveAndSwitchSession('session-1', 'session-2');
+      
+      store.setActiveDelegationId('del-2');
+      store.saveAndSwitchSession('session-2', 'session-3');
+      
+      store.setActiveDelegationId('del-3');
+      store.saveAndSwitchSession('session-3', 'session-1');
+      
+      // Should restore session-1 state
+      expect(useUiStore.getState().activeDelegationId).toBe('del-1');
+      
+      // Switch back to session-3
+      store.saveAndSwitchSession('session-1', 'session-3');
+      expect(useUiStore.getState().activeDelegationId).toBe('del-3');
+    });
+    
+    it('should update existing cache entry when switching from same session twice', () => {
+      const store = useUiStore.getState();
+      
+      // First switch from session-A
+      store.setActiveDelegationId('del-first');
+      store.saveAndSwitchSession('session-A', 'session-B');
+      
+      // Go back to session-A and modify state
+      store.saveAndSwitchSession('session-B', 'session-A');
+      store.setActiveDelegationId('del-updated');
+      store.setDelegationsPanelCollapsed(true);
+      
+      // Switch away again
+      store.saveAndSwitchSession('session-A', 'session-C');
+      
+      // Verify cache was updated with new state
+      const cached = useUiStore.getState().sessionViewCache.get('session-A');
+      expect(cached?.activeDelegationId).toBe('del-updated');
+      expect(cached?.delegationsPanelCollapsed).toBe(true);
+    });
+  });
+});

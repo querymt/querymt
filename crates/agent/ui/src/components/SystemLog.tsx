@@ -2,12 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, ChevronDown, ChevronRight, Copy, Trash2 } from 'lucide-react';
 import type { EventItem } from '../types';
 import { copyToClipboard } from '../utils/clipboard';
+import { formatTimestamp } from '../utils/formatters';
 
 const MAX_ENTRIES = 200;
-
-function formatTimestamp(timestamp: number) {
-  return new Date(timestamp).toLocaleTimeString();
-}
 
 function buildCopyPayload(events: EventItem[]) {
   return events

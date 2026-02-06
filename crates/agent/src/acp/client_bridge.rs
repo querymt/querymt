@@ -68,6 +68,17 @@ pub enum ClientBridgeMessage {
         request: RequestPermissionRequest,
         response_tx: oneshot::Sender<Result<RequestPermissionResponse, Error>>,
     },
+
+    /// Request-response elicitation request.
+    ///
+    /// The bridge task will handle elicitation and return the response.
+    Elicit {
+        elicitation_id: String,
+        message: String,
+        requested_schema: serde_json::Value,
+        source: String,
+        response_tx: oneshot::Sender<crate::elicitation::ElicitationResponse>,
+    },
 }
 
 /// Send-side handle for the client bridge.
@@ -144,5 +155,39 @@ impl ClientBridgeSender {
         response_rx
             .await
             .map_err(|_| Error::new(-32000, "Permission response channel dropped"))?
+    }
+
+    /// Request elicitation from the user and wait for response.
+    ///
+    /// This method blocks until the user responds to the elicitation request.
+    /// The response flows back through a oneshot channel embedded in the message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The bridge channel is closed
+    /// - The client disconnects before responding
+    pub async fn elicit(
+        &self,
+        elicitation_id: String,
+        message: String,
+        requested_schema: serde_json::Value,
+        source: String,
+    ) -> Result<crate::elicitation::ElicitationResponse, String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(ClientBridgeMessage::Elicit {
+                elicitation_id,
+                message,
+                requested_schema,
+                source,
+                response_tx,
+            })
+            .await
+            .map_err(|_| "Client bridge closed".to_string())?;
+
+        response_rx
+            .await
+            .map_err(|_| "Elicitation response channel dropped".to_string())
     }
 }

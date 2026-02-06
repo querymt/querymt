@@ -36,6 +36,8 @@ export function useUiClient() {
   const [isConversationComplete, setIsConversationComplete] = useState(false);
   // Track thinking state per session: Map<sessionId, Set<agentId>>
   const [thinkingBySession, setThinkingBySession] = useState<Map<string, Set<string>>>(new Map());
+  // Track parent-child session relationships from session_forked events
+  const [sessionParentMap, setSessionParentMap] = useState<Map<string, string>>(new Map());
   const [workspaceIndexStatus, setWorkspaceIndexStatus] = useState<
     Record<string, { status: 'building' | 'ready' | 'error'; message?: string | null }>
   >({});
@@ -283,10 +285,17 @@ export function useUiClient() {
 
         // Auto-subscribe to delegation child sessions
         if (eventKind === 'session_forked' && msg.event?.kind?.origin === 'delegation') {
+          const childSessionId = msg.event.kind.child_session_id;
           sendMessage({
             type: 'subscribe_session',
-            session_id: msg.event.kind.child_session_id,
+            session_id: childSessionId,
             agent_id: msg.event.kind.target_agent_id,
+          });
+          // Track parent-child relationship for thinking state propagation
+          setSessionParentMap(prev => {
+            const next = new Map(prev);
+            next.set(childSessionId, msg.session_id);
+            return next;
           });
         }
 
@@ -400,10 +409,17 @@ export function useUiClient() {
             (event.kind as any)?.type === 'session_forked' &&
             (event.kind as any)?.origin === 'delegation'
           ) {
+            const childSessionId = (event.kind as any)?.child_session_id;
             sendMessage({
               type: 'subscribe_session',
-              session_id: (event.kind as any)?.child_session_id,
+              session_id: childSessionId,
               agent_id: (event.kind as any)?.target_agent_id,
+            });
+            // Track parent-child relationship
+            setSessionParentMap(prev => {
+              const next = new Map(prev);
+              next.set(childSessionId, msg.session_id);
+              return next;
             });
           }
         }
@@ -577,6 +593,14 @@ export function useUiClient() {
     sendMessage({ type: 'redo' });
   }, []);
 
+  const sendElicitationResponse = useCallback((
+    elicitationId: string,
+    action: 'accept' | 'decline' | 'cancel',
+    content?: Record<string, unknown>
+  ) => {
+    sendMessage({ type: 'elicitation_response', elicitation_id: elicitationId, action, content });
+  }, []);
+
   return {
     events,
     eventsBySession,
@@ -602,6 +626,7 @@ export function useUiClient() {
     thinkingAgentId,
     thinkingAgentIds,
     thinkingBySession,
+    sessionParentMap,
     isConversationComplete,
     setFileIndexCallback,
     setFileIndexErrorCallback,
@@ -616,6 +641,7 @@ export function useUiClient() {
     sendRedo,
     undoState,
     sessionCreatingRef,
+    sendElicitationResponse,
   };
 }
 
@@ -763,6 +789,24 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       model: event.kind?.model,
       contextLimit: event.kind?.context_limit,
       configId: event.kind?.config_id,
+    };
+  }
+
+  if (kind === 'elicitation_requested') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'tool_call',  // Render it as a tool interaction
+      content: event.kind?.message ?? 'Elicitation',
+      timestamp,
+      elicitationData: {
+        elicitationId: event.kind?.elicitation_id,
+        sessionId: event.kind?.session_id,
+        message: event.kind?.message,
+        requestedSchema: event.kind?.requested_schema,
+        source: event.kind?.source ?? 'unknown',
+      },
     };
   }
 

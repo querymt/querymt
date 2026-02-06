@@ -214,6 +214,13 @@ pub enum AgentEventKind {
         permission_id: String,
         granted: bool,
     },
+    ElicitationRequested {
+        elicitation_id: String,
+        session_id: String,
+        message: String,
+        requested_schema: serde_json::Value,
+        source: String,
+    },
     SessionForked {
         parent_session_id: String,
         child_session_id: String,

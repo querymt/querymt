@@ -3,7 +3,7 @@ import { DelegationGroupInfo, UiAgentInfo } from '../types';
 import { getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
 import { calculateDelegationStats } from '../utils/statsCalculator';
-import { formatTokensAbbrev, formatCost } from '../utils/formatters';
+import { formatTokensAbbrev, formatCost, formatDurationFromTimestamps } from '../utils/formatters';
 
 interface DelegationSummaryCardProps {
   group: DelegationGroupInfo;
@@ -11,23 +11,13 @@ interface DelegationSummaryCardProps {
   onOpen: (delegationId: string) => void;
 }
 
-function formatDuration(startTime: number, endTime?: number): string {
-  const durationMs = (endTime ?? Date.now()) - startTime;
-  const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
-  const seconds = totalSeconds % 60;
-  const minutes = Math.floor(totalSeconds / 60) % 60;
-  const hours = Math.floor(totalSeconds / 3600);
 
-  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
-  if (minutes > 0) return `${minutes}m ${seconds}s`;
-  return `${seconds}s`;
-}
 
 export function DelegationSummaryCard({ group, agents, onOpen }: DelegationSummaryCardProps) {
   const agentId = group.targetAgentId ?? group.agentId;
   const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
   const agentColor = agentId ? getAgentColor(agentId) : '#b026ff';
-  const durationLabel = formatDuration(group.startTime, group.endTime);
+  const durationLabel = formatDurationFromTimestamps(group.startTime, group.endTime);
   const stats = calculateDelegationStats(group);
   const objective = group.objective ??
     (group.delegateEvent.toolCall?.raw_input as { objective?: string } | undefined)?.objective;

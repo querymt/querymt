@@ -1,17 +1,30 @@
 //! Agent-specific implementation of ToolContext
 
 use async_trait::async_trait;
+use serde_json::json;
 use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
 
+use crate::elicitation::{ElicitationAction, ElicitationResponse};
 use crate::tools::context::{ToolContext, ToolError};
+
+/// A request to elicit information from the user, sent from tool context to the agent
+pub struct ElicitationRequest {
+    pub elicitation_id: String,
+    pub message: String,
+    pub requested_schema: serde_json::Value,
+    pub source: String,
+    pub response_tx: oneshot::Sender<ElicitationResponse>,
+}
 
 /// Implementation of ToolContext that provides access to agent services
 pub struct AgentToolContext {
     session_id: String,
     cwd: Option<PathBuf>,
     agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry>>,
+    elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
 }
 
 impl AgentToolContext {
@@ -19,17 +32,19 @@ impl AgentToolContext {
         session_id: String,
         cwd: Option<PathBuf>,
         agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry>>,
+        elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
     ) -> Self {
         Self {
             session_id,
             cwd,
             agent_registry,
+            elicitation_tx,
         }
     }
 
     /// Create a basic context for testing or simple operations
     pub fn basic(session_id: String, cwd: Option<PathBuf>) -> Self {
-        Self::new(session_id, cwd, None)
+        Self::new(session_id, cwd, None, None)
     }
 }
 
@@ -54,6 +69,119 @@ impl ToolContext for AgentToolContext {
         _metadata: Option<serde_json::Value>,
     ) -> Result<String, ToolError> {
         Ok(format!("progress_{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn ask_question(
+        &self,
+        question_id: &str,
+        question: &str,
+        header: &str,
+        options: &[(String, String)],
+        multiple: bool,
+    ) -> Result<Vec<String>, ToolError> {
+        if let Some(tx) = &self.elicitation_tx {
+            // Build MCP elicitation schema from question options
+            let mut properties = serde_json::Map::new();
+
+            if multiple {
+                // Multi-select: use array type with items.anyOf
+                let any_of: Vec<serde_json::Value> = options
+                    .iter()
+                    .map(|(label, desc)| {
+                        json!({
+                            "const": label,
+                            "title": desc
+                        })
+                    })
+                    .collect();
+                properties.insert(
+                    "selection".to_string(),
+                    json!({
+                        "type": "array",
+                        "title": header,
+                        "description": question,
+                        "items": { "anyOf": any_of }
+                    }),
+                );
+            } else {
+                // Single select: use string type with oneOf
+                let one_of: Vec<serde_json::Value> = options
+                    .iter()
+                    .map(|(label, desc)| {
+                        json!({
+                            "const": label,
+                            "title": desc
+                        })
+                    })
+                    .collect();
+                properties.insert(
+                    "selection".to_string(),
+                    json!({
+                        "type": "string",
+                        "title": header,
+                        "description": question,
+                        "oneOf": one_of
+                    }),
+                );
+            }
+
+            let schema = json!({
+                "type": "object",
+                "properties": properties,
+                "required": ["selection"]
+            });
+
+            // Send through elicitation channel
+            let (response_tx, response_rx) = oneshot::channel();
+            let request = ElicitationRequest {
+                elicitation_id: question_id.to_string(),
+                message: question.to_string(),
+                requested_schema: schema,
+                source: "builtin:question".to_string(),
+                response_tx,
+            };
+
+            tx.send(request)
+                .await
+                .map_err(|_| ToolError::Other(anyhow::anyhow!("Elicitation channel closed")))?;
+
+            let response = response_rx.await.map_err(|_| {
+                ToolError::Other(anyhow::anyhow!("Elicitation response channel dropped"))
+            })?;
+
+            // Extract answers from the MCP response
+            match response.action {
+                ElicitationAction::Accept => {
+                    if let Some(content) = response.content {
+                        // Extract "selection" from content
+                        match content.get("selection") {
+                            Some(serde_json::Value::Array(arr)) => Ok(arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()),
+                            Some(serde_json::Value::String(s)) => Ok(vec![s.clone()]),
+                            _ => Err(ToolError::ProviderError(
+                                "Invalid elicitation response format".into(),
+                            )),
+                        }
+                    } else {
+                        Err(ToolError::ProviderError(
+                            "No content in accepted elicitation response".into(),
+                        ))
+                    }
+                }
+                ElicitationAction::Decline => {
+                    Err(ToolError::ProviderError("User declined question".into()))
+                }
+                ElicitationAction::Cancel => {
+                    Err(ToolError::ProviderError("User cancelled question".into()))
+                }
+            }
+        } else {
+            // Fall back to default stdin/stdout implementation
+            <dyn ToolContext>::ask_question(self, question_id, question, header, options, multiple)
+                .await
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

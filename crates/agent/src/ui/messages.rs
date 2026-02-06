@@ -114,6 +114,12 @@ pub enum UiClientMessage {
     UnsubscribeSession {
         session_id: String,
     },
+    /// Respond to an elicitation request
+    ElicitationResponse {
+        elicitation_id: String,
+        action: String,
+        content: Option<serde_json::Value>,
+    },
 }
 
 /// Messages from server to UI client.

@@ -8,5 +8,5 @@ pub use builtins::{
     ShellTool, WebFetchTool, WriteFileTool,
 };
 pub use context::{CapabilityRequirement, Tool, ToolContext, ToolError};
-pub use context_impl::AgentToolContext;
+pub use context_impl::{AgentToolContext, ElicitationRequest};
 pub use registry::ToolRegistry;

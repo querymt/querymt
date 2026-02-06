@@ -10,6 +10,7 @@ import { ChevronDown, ChevronRight, Clock, CheckCircle, XCircle, Loader } from '
 import { UiAgentInfo, EventRow } from '../types';
 import { getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
+import { formatDuration } from '../utils/formatters';
 
 export interface DelegationGroup {
   id: string;
@@ -200,11 +201,4 @@ export function DelegationConnector({ startY, endY, startX, color, isActive }: D
   );
 }
 
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const seconds = Math.floor(ms / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  return `${minutes}m ${remainingSeconds}s`;
-}
+

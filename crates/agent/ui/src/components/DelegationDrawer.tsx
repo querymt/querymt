@@ -10,7 +10,7 @@ import { getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
 import { calculateDelegationStats } from '../utils/statsCalculator';
-import { formatTokensAbbrev, formatCost } from '../utils/formatters';
+import { formatTokensAbbrev, formatCost, formatTimestamp } from '../utils/formatters';
 
 interface DelegationDrawerProps {
   delegation?: DelegationGroupInfo;
@@ -21,9 +21,7 @@ interface DelegationDrawerProps {
   requestLlmConfig?: (configId: number, callback: (config: LlmConfigDetails) => void) => void;
 }
 
-function formatTimestamp(ts: number) {
-  return new Date(ts).toLocaleTimeString();
-}
+
 
 export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llmConfigCache = {}, requestLlmConfig }: DelegationDrawerProps) {
   const [drawerWidth, setDrawerWidth] = useState(() => {

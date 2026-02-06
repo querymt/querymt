@@ -26,6 +26,9 @@ pub type SessionOwnerMap = Arc<Mutex<HashMap<String, String>>>;
 /// Type alias for pending permission requests (tool_call_id -> response sender)
 pub type PermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<RequestPermissionOutcome>>>>;
 
+/// Type alias for pending elicitation requests (elicitation_id -> response sender)
+pub type PendingElicitationMap = crate::elicitation::PendingElicitationMap;
+
 /// JSON-RPC 2.0 request structure
 #[derive(Deserialize)]
 pub struct RpcRequest {
@@ -49,6 +52,28 @@ pub struct RpcResponse {
 ///
 /// Returns `None` if the event should not be sent to the client.
 pub fn translate_event_to_notification(event: &AgentEvent) -> Option<serde_json::Value> {
+    // Handle ElicitationRequested specially - it's a custom notification, not a session/update
+    if let AgentEventKind::ElicitationRequested {
+        elicitation_id,
+        session_id,
+        message,
+        requested_schema,
+        source,
+    } = &event.kind
+    {
+        return Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "elicitation/requested",
+            "params": {
+                "elicitationId": elicitation_id,
+                "sessionId": session_id,
+                "message": message,
+                "requestedSchema": requested_schema,
+                "source": source,
+            }
+        }));
+    }
+
     let session_id = event.session_id.clone();
     let update = translate_event_to_update(event)?;
 
@@ -208,6 +233,7 @@ pub async fn handle_rpc_message<S: SendAgent>(
     agent: &S,
     session_owners: &SessionOwnerMap,
     pending_permissions: &PermissionMap,
+    pending_elicitations: &PendingElicitationMap,
     conn_id: &str,
     req: RpcRequest,
 ) -> RpcResponse {
@@ -313,6 +339,52 @@ pub async fn handle_rpc_message<S: SendAgent>(
                             -32000,
                             "No pending permission for this tool_call_id",
                         ))
+                    }
+                }
+                Err(e) => {
+                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                }
+            }
+        }
+
+        "elicitation_result" => {
+            #[derive(Deserialize)]
+            struct ElicitationResultParams {
+                elicitation_id: String,
+                action: String,
+                content: Option<serde_json::Value>,
+            }
+            match serde_json::from_value::<ElicitationResultParams>(req.params) {
+                Ok(params) => {
+                    // Parse action string to enum
+                    let action_result = match params.action.as_str() {
+                        "accept" => Ok(crate::elicitation::ElicitationAction::Accept),
+                        "decline" => Ok(crate::elicitation::ElicitationAction::Decline),
+                        "cancel" => Ok(crate::elicitation::ElicitationAction::Cancel),
+                        _ => Err(Error::invalid_params().data(serde_json::json!({
+                            "error": format!("Invalid action: {}", params.action)
+                        }))),
+                    };
+
+                    match action_result {
+                        Ok(action) => {
+                            let response = crate::elicitation::ElicitationResponse {
+                                action,
+                                content: params.content,
+                            };
+
+                            let mut pending = pending_elicitations.lock().await;
+                            if let Some(tx) = pending.remove(&params.elicitation_id) {
+                                let _ = tx.send(response);
+                                Ok(serde_json::Value::Null)
+                            } else {
+                                Err(Error::new(
+                                    -32000,
+                                    "No pending elicitation for this elicitation_id",
+                                ))
+                            }
+                        }
+                        Err(e) => Err(e),
                     }
                 }
                 Err(e) => {

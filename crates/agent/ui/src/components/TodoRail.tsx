@@ -1,4 +1,3 @@
-import { useMemo } from 'react';
 import { CheckCircle, Circle, XCircle, ChevronRight, ChevronLeft } from 'lucide-react';
 import { TodoItem } from '../types';
 import { TodoStats } from '../hooks/useTodoState';
@@ -12,25 +11,6 @@ interface TodoRailProps {
 }
 
 export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyChangedIds }: TodoRailProps) {
-  // Sort todos: in_progress first, then pending, then completed, then cancelled
-  const sortedTodos = useMemo(() => {
-    const statusOrder = {
-      in_progress: 0,
-      pending: 1,
-      completed: 2,
-      cancelled: 3,
-    };
-    
-    return [...todos].sort((a, b) => {
-      const statusDiff = statusOrder[a.status] - statusOrder[b.status];
-      if (statusDiff !== 0) return statusDiff;
-      
-      // Within same status, sort by priority
-      const priorityOrder = { high: 0, medium: 1, low: 2 };
-      return priorityOrder[a.priority] - priorityOrder[b.priority];
-    });
-  }, [todos]);
-  
   if (collapsed) {
     return (
       <div className="w-8 border-l border-cyber-border/50 bg-cyber-bg/60 backdrop-blur-sm flex flex-col items-center py-4 relative">
@@ -132,7 +112,7 @@ export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyCh
       
       {/* Todo list */}
       <div className="flex-1 overflow-y-auto px-2 py-3 space-y-1.5">
-        {sortedTodos.map((todo) => (
+        {todos.map((todo) => (
           <TodoItemRow
             key={todo.id}
             todo={todo}

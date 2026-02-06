@@ -23,8 +23,8 @@
 
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::acp::shared::{
-    PermissionMap, RpcRequest, SessionOwnerMap, collect_event_sources, handle_rpc_message,
-    is_event_owned, translate_event_to_notification,
+    PendingElicitationMap, PermissionMap, RpcRequest, SessionOwnerMap, collect_event_sources,
+    handle_rpc_message, is_event_owned, translate_event_to_notification,
 };
 use crate::acp::shutdown;
 use crate::agent::QueryMTAgent;
@@ -49,6 +49,7 @@ use uuid::Uuid;
 struct WsServerState {
     agent: Arc<QueryMTAgent>,
     pending_permissions: PermissionMap,
+    pending_elicitations: PendingElicitationMap,
     event_sources: Vec<Arc<EventBus>>,
     session_owners: SessionOwnerMap,
 }
@@ -99,11 +100,13 @@ pub async fn serve_websocket(agent: Arc<QueryMTAgent>, addr: &str) -> anyhow::Re
 
     let event_sources = collect_event_sources(&agent);
     let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
+    let pending_elicitations = agent.pending_elicitations();
     let session_owners = Arc::new(Mutex::new(HashMap::new()));
 
     let state = WsServerState {
         agent,
         pending_permissions,
+        pending_elicitations,
         event_sources,
         session_owners,
     };
@@ -167,6 +170,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
                             state.agent.as_ref(),
                             &state.session_owners,
                             &state.pending_permissions,
+                            &state.pending_elicitations,
                             &conn_id,
                             request,
                         )

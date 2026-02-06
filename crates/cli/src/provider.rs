@@ -50,11 +50,13 @@ pub async fn get_api_key(
     }
 
     // 2. Check for OAuth tokens (prefer OAuth over API keys)
-    if let Ok(oauth_provider) = crate::auth::get_oauth_provider(provider, None)
+    if let Ok(oauth_provider) = querymt_utils::oauth::get_oauth_provider(provider, None)
         && let Ok(mut store) = SecretStore::new()
     {
         // Try to get a valid OAuth token (will refresh if needed)
-        if let Ok(token) = crate::auth::get_valid_token(oauth_provider.as_ref(), &mut store).await {
+        if let Ok(token) =
+            querymt_utils::oauth::get_valid_token(oauth_provider.as_ref(), &mut store).await
+        {
             log::debug!("Using OAuth token for {}", provider);
             return Some(token);
         }

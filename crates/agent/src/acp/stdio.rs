@@ -56,10 +56,10 @@ use tracing::{info_span, instrument};
 ///
 /// - **Notification**: Fire-and-forget, just call `connection.session_notification()`
 /// - **RequestPermission**: Request-response, send result back via oneshot channel
-#[instrument(name = "acp.bridge_task", skip(rx, connection))]
+#[instrument(name = "acp.bridge_task", skip(rx, _connection))]
 async fn run_bridge_task(
     mut rx: mpsc::Receiver<ClientBridgeMessage>,
-    connection: Rc<AgentSideConnection>,
+    _connection: Rc<AgentSideConnection>,
 ) {
     log::info!("Client bridge task started");
 
@@ -68,7 +68,7 @@ async fn run_bridge_task(
             ClientBridgeMessage::Notification(notif) => {
                 let _span = info_span!("acp.notification").entered();
                 log::debug!("Bridge: forwarding session notification");
-                if let Err(e) = connection.session_notification(notif).await {
+                if let Err(e) = _connection.session_notification(notif).await {
                     log::error!("Bridge: session_notification failed: {:?}", e);
                 }
             }
@@ -78,11 +78,26 @@ async fn run_bridge_task(
             } => {
                 let _span = info_span!("acp.permission_request").entered();
                 log::debug!("Bridge: forwarding permission request");
-                let result = connection.request_permission(request).await;
+                let result = _connection.request_permission(request).await;
 
                 if response_tx.send(result).is_err() {
                     log::error!("Bridge: failed to send permission response (receiver dropped)");
                 }
+            }
+            ClientBridgeMessage::Elicit {
+                elicitation_id: _,
+                message: _,
+                requested_schema: _,
+                source: _,
+                response_tx,
+            } => {
+                // Elicitations are not supported over stdio transport yet
+                // They should be handled through events and elicitation_result RPC
+                log::warn!("Elicit not implemented for stdio transport");
+                let _ = response_tx.send(crate::elicitation::ElicitationResponse {
+                    action: crate::elicitation::ElicitationAction::Decline,
+                    content: None,
+                });
             }
         }
     }

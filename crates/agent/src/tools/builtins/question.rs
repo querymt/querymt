@@ -4,14 +4,14 @@ use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool as ChatTool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::io::{self, Write};
 
 use crate::tools::{Tool, ToolContext, ToolError};
 
+/// A single option in a question
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct QuestionOption {
-    label: String,
-    description: String,
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,64 +35,6 @@ pub struct QuestionTool;
 impl QuestionTool {
     pub fn new() -> Self {
         Self
-    }
-
-    fn ask_question_interactive(question: &QuestionInfo) -> Result<Vec<String>, String> {
-        println!("\n{}", "=".repeat(60));
-        println!("{}", question.header);
-        println!("{}", "=".repeat(60));
-        println!("{}\n", question.question);
-
-        for (idx, option) in question.options.iter().enumerate() {
-            println!("{}. {} - {}", idx + 1, option.label, option.description);
-        }
-
-        if question.multiple {
-            println!(
-                "\nEnter your choices (comma-separated numbers, or 'other' for custom input): "
-            );
-        } else {
-            println!("\nEnter your choice (number, or 'other' for custom input): ");
-        }
-
-        print!("> ");
-        io::stdout().flush().map_err(|e| e.to_string())?;
-
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| e.to_string())?;
-        let input = input.trim();
-
-        if input.to_lowercase() == "other" {
-            println!("Enter your custom response: ");
-            print!("> ");
-            io::stdout().flush().map_err(|e| e.to_string())?;
-
-            let mut custom = String::new();
-            io::stdin()
-                .read_line(&mut custom)
-                .map_err(|e| e.to_string())?;
-            return Ok(vec![custom.trim().to_string()]);
-        }
-
-        let selections: Vec<usize> = input
-            .split(',')
-            .filter_map(|s| s.trim().parse::<usize>().ok())
-            .collect();
-
-        let mut answers = Vec::new();
-        for sel in selections {
-            if sel > 0 && sel <= question.options.len() {
-                answers.push(question.options[sel - 1].label.clone());
-            }
-        }
-
-        if answers.is_empty() {
-            Err("No valid selections made".to_string())
-        } else {
-            Ok(answers)
-        }
     }
 }
 
@@ -167,7 +109,7 @@ impl Tool for QuestionTool {
         }
     }
 
-    async fn call(&self, args: Value, _context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
         let questions_val = args
             .get("questions")
             .and_then(Value::as_array)
@@ -181,14 +123,27 @@ impl Tool for QuestionTool {
 
         let mut all_answers = Vec::new();
 
-        for question in questions {
-            let answers = tokio::task::spawn_blocking({
-                let q = question.clone();
-                move || Self::ask_question_interactive(&q)
-            })
-            .await
-            .map_err(|e| ToolError::ProviderError(format!("Question task failed: {}", e)))?
-            .map_err(|e| ToolError::ProviderError(format!("Failed to get answer: {}", e)))?;
+        for (idx, question) in questions.into_iter().enumerate() {
+            // Create a unique question ID for this question
+            let question_id = format!("question_{}_{}", uuid::Uuid::new_v4(), idx);
+
+            // Convert QuestionOption to (label, description) pairs
+            let options: Vec<(String, String)> = question
+                .options
+                .iter()
+                .map(|opt| (opt.label.clone(), opt.description.clone()))
+                .collect();
+
+            // Use context.ask_question() which works across all transports
+            let answers = context
+                .ask_question(
+                    &question_id,
+                    &question.question,
+                    &question.header,
+                    &options,
+                    question.multiple,
+                )
+                .await?;
 
             all_answers.push(QuestionAnswer {
                 question: question.question.clone(),

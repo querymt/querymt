@@ -224,38 +224,45 @@ function JsonView({ data }: { data: unknown }) {
 function DiffView({ toolKind, rawInput }: { toolKind?: string; rawInput: unknown }) {
   const input = rawInput as Record<string, unknown>;
   
-  // Handle write tool - show syntax highlighted content
+  // Handle write tool - show as diff with empty left side
   if (toolKind === 'write' || toolKind === 'mcp_write' || toolKind === 'write_file') {
     const filePath = input.filePath || input.file_path || input.path;
     const content = input.content;
     
     if (typeof filePath === 'string' && typeof content === 'string') {
-      // Check if markdown - render it
-      if (isMarkdownFile(filePath)) {
-        return (
-          <div>
-            <div className="text-[11px] text-gray-400 mb-2 font-mono">
-              Writing to: <span className="text-cyber-cyan">{filePath}</span>
-            </div>
-            <div className="prose prose-invert prose-sm max-w-none p-4 bg-cyber-bg/30 rounded border border-cyber-border/30">
-              <MessageContent content={content} />
-            </div>
-          </div>
-        );
-      }
+      const normalizedPath = (filePath as string).replace(/^\/+/, '') || 'file';
+      const newLines = content.split('\n').length;
+      const newBlock = content.split('\n').map((line: string) => `+${line}`).join('\n');
+      const patch = [
+        `diff --git a/${normalizedPath} b/${normalizedPath}`,
+        `new file mode 100644`,
+        `--- /dev/null`,
+        `+++ b/${normalizedPath}`,
+        `@@ -0,0 +1,${newLines} @@`,
+        newBlock,
+      ].join('\n');
       
-      // Otherwise show with syntax highlighting
       return (
         <div>
           <div className="text-[11px] text-gray-400 mb-2 font-mono">
-            Writing to: <span className="text-cyber-cyan">{filePath}</span>
+            Writing to: <span className="text-cyber-cyan">{filePath as string}</span>
           </div>
-          <HighlightedCode
-            code={content}
-            filePath={filePath}
-            lineNumbers={true}
-            maxHeight="24rem"
-          />
+          <div className="event-diff-container m-0 border-0">
+            <PatchDiff
+              patch={patch}
+              options={{
+                theme: 'pierre-dark',
+                themeType: 'dark',
+                diffStyle: 'split',
+                diffIndicators: 'bars',
+                lineDiffType: 'word-alt',
+                overflow: 'wrap',
+                disableLineNumbers: false,
+                useCSSClasses: true,
+                disableBackground: true,
+              }}
+            />
+          </div>
         </div>
       );
     }

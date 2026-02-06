@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useCallback } from 'react';
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
 import { Home, Copy, Check } from 'lucide-react';
 import { useUiClientContext } from '../context/UiClientContext';
@@ -49,6 +49,8 @@ export function AppShell() {
     thinkingBySession,
   } = useUiClientContext();
   
+  const navigate = useNavigate();
+  
   const {
     loading,
     sessionSwitcherOpen,
@@ -62,7 +64,6 @@ export function AppShell() {
   } = useUiStore();
   
   const location = useLocation();
-  const navigate = useNavigate();
   const isHomePage = location.pathname === '/';
   const copyTimeoutRef = useRef<number | null>(null);
   
@@ -170,10 +171,14 @@ export function AppShell() {
       const newSessionId = await newSession();
       navigate(`/session/${newSessionId}`, { replace: true });
     } catch (err) {
-      // User cancelled or error occurred
       console.log('Session creation cancelled or failed:', err);
     }
   };
+  
+  // Handle session selection
+  const handleSelectSession = useCallback((sessionId: string) => {
+    navigate(`/session/${sessionId}`);
+  }, [navigate]);
   
   // Clean up timeout on unmount
   useEffect(() => {
@@ -312,6 +317,7 @@ export function AppShell() {
         activeSessionId={sessionId}
         thinkingBySession={thinkingBySession}
         onNewSession={handleNewSession}
+        onSelectSession={handleSelectSession}
         connected={connected}
       />
       

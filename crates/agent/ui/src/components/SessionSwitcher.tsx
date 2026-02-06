@@ -1,6 +1,5 @@
 import { useMemo, useRef, useEffect, useState } from 'react';
 import { Command } from 'cmdk';
-import { useNavigate } from 'react-router-dom';
 import Fuse from 'fuse.js';
 import { Plus, GitBranch, Clock } from 'lucide-react';
 import { SessionGroup, SessionSummary } from '../types';
@@ -19,6 +18,7 @@ interface SessionSwitcherProps {
   activeSessionId: string | null;
   thinkingBySession: Map<string, Set<string>>;
   onNewSession: () => Promise<void>;
+  onSelectSession: (sessionId: string) => void;
   connected: boolean;
 }
 
@@ -35,9 +35,9 @@ export function SessionSwitcher({
   activeSessionId,
   thinkingBySession,
   onNewSession,
+  onSelectSession,
   connected,
 }: SessionSwitcherProps) {
-  const navigate = useNavigate();
   const inputRef = useRef<HTMLInputElement>(null);
   const [search, setSearch] = useState('');
   
@@ -122,7 +122,9 @@ export function SessionSwitcher({
   
   // Handle session selection
   const handleSelectSession = (sessionId: string) => {
-    navigate(`/session/${sessionId}`);
+    if (sessionId !== activeSessionId) {
+      onSelectSession(sessionId);
+    }
     onOpenChange(false);
   };
   

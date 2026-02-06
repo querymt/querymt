@@ -127,8 +127,6 @@ impl SendAgent for QueryMTAgent {
             Some(req.cwd.clone())
         };
 
-        let (mcp_services, mcp_tools, mcp_tool_defs) = build_mcp_state(&req.mcp_servers).await?;
-
         // Extract parent_session_id from meta if provided
         let parent_session_id = req
             .meta
@@ -142,6 +140,15 @@ impl SendAgent for QueryMTAgent {
             .await
             .map_err(|e| Error::new(-32000, e.to_string()))?;
         let session_id = session_context.session().public_id.clone();
+
+        // Build MCP state with session context
+        let (mcp_services, mcp_tools, mcp_tool_defs) = build_mcp_state(
+            &req.mcp_servers,
+            self.pending_elicitations(),
+            self.event_bus.clone(),
+            session_id.clone(),
+        )
+        .await?;
 
         // Phase 3: Initialize fork if parent_session_id was provided
         if parent_session_id.is_some() {
@@ -290,7 +297,13 @@ impl SendAgent for QueryMTAgent {
         };
 
         // Build MCP state
-        let (mcp_services, mcp_tools, mcp_tool_defs) = build_mcp_state(&req.mcp_servers).await?;
+        let (mcp_services, mcp_tools, mcp_tool_defs) = build_mcp_state(
+            &req.mcp_servers,
+            self.pending_elicitations(),
+            self.event_bus.clone(),
+            session_id.clone(),
+        )
+        .await?;
 
         // Create SessionRuntime (no function index for load_session - would need to rebuild)
         let runtime = Arc::new(crate::agent::core::SessionRuntime {
@@ -479,7 +492,13 @@ impl SendAgent for QueryMTAgent {
         };
 
         // Build MCP state
-        let (mcp_services, mcp_tools, mcp_tool_defs) = build_mcp_state(&req.mcp_servers).await?;
+        let (mcp_services, mcp_tools, mcp_tool_defs) = build_mcp_state(
+            &req.mcp_servers,
+            self.pending_elicitations(),
+            self.event_bus.clone(),
+            session_id.clone(),
+        )
+        .await?;
 
         // Create SessionRuntime (no function index for resume_session)
         let runtime = Arc::new(crate::agent::core::SessionRuntime {
@@ -617,9 +636,12 @@ impl SendAgent for QueryMTAgent {
 /// - Tool definitions (for LLM)
 async fn build_mcp_state(
     servers: &[McpServer],
+    pending_elicitations: crate::elicitation::PendingElicitationMap,
+    event_bus: Arc<crate::event_bus::EventBus>,
+    session_id: String,
 ) -> Result<
     (
-        HashMap<String, RunningService<RoleClient, ()>>,
+        HashMap<String, RunningService<RoleClient, crate::elicitation::ElicitationHandler>>,
         HashMap<String, Arc<querymt::mcp::adapter::McpToolAdapter>>,
         Vec<querymt::chat::Tool>,
     ),
@@ -630,8 +652,16 @@ async fn build_mcp_state(
     let mut tool_defs = Vec::new();
 
     for server in servers {
-        let (server_name, running): (String, RunningService<RoleClient, ()>) =
-            start_mcp_server(server).await?;
+        let (server_name, running): (
+            String,
+            RunningService<RoleClient, crate::elicitation::ElicitationHandler>,
+        ) = start_mcp_server(
+            server,
+            pending_elicitations.clone(),
+            event_bus.clone(),
+            session_id.clone(),
+        )
+        .await?;
         let peer = running.peer().clone();
         let tool_list = peer
             .list_all_tools()
@@ -662,7 +692,16 @@ async fn build_mcp_state(
 /// Starts an MCP server based on its configuration
 async fn start_mcp_server(
     server: &McpServer,
-) -> Result<(String, RunningService<RoleClient, ()>), Error> {
+    pending_elicitations: crate::elicitation::PendingElicitationMap,
+    event_bus: Arc<crate::event_bus::EventBus>,
+    session_id: String,
+) -> Result<
+    (
+        String,
+        RunningService<RoleClient, crate::elicitation::ElicitationHandler>,
+    ),
+    Error,
+> {
     match server {
         McpServer::Stdio(stdio) => {
             let McpServerStdio {
@@ -680,8 +719,14 @@ async fn start_mcp_server(
                 .stdin(std::process::Stdio::piped());
             let transport =
                 TokioChildProcess::new(cmd).map_err(|e| Error::new(-32000, e.to_string()))?;
-            let running: RunningService<RoleClient, ()> =
-                serve_client((), transport).await.map_err(|e| {
+            let handler = crate::elicitation::ElicitationHandler::new(
+                pending_elicitations.clone(),
+                event_bus.clone(),
+                name.clone(),
+                session_id.clone(),
+            );
+            let running: RunningService<RoleClient, crate::elicitation::ElicitationHandler> =
+                serve_client(handler, transport).await.map_err(|e| {
                     Error::new(-32000, format!("failed to start MCP stdio server: {}", e))
                 })?;
             Ok((name, running))
@@ -698,7 +743,13 @@ async fn start_mcp_server(
                 client,
                 StreamableHttpClientTransportConfig::with_uri(url),
             );
-            let running = serve_client((), transport).await.map_err(|e| {
+            let handler = crate::elicitation::ElicitationHandler::new(
+                pending_elicitations.clone(),
+                event_bus.clone(),
+                name.clone(),
+                session_id.clone(),
+            );
+            let running = serve_client(handler, transport).await.map_err(|e| {
                 Error::new(-32000, format!("failed to start MCP http server: {}", e))
             })?;
             Ok((name, running))
@@ -720,7 +771,13 @@ async fn start_mcp_server(
             )
             .await
             .map_err(|e| Error::new(-32000, e.to_string()))?;
-            let running = serve_client((), transport).await.map_err(|e| {
+            let handler = crate::elicitation::ElicitationHandler::new(
+                pending_elicitations,
+                event_bus,
+                name.clone(),
+                session_id,
+            );
+            let running = serve_client(handler, transport).await.map_err(|e| {
                 Error::new(-32000, format!("failed to start MCP sse server: {}", e))
             })?;
             Ok((name, running))

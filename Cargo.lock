@@ -238,14 +238,13 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "url",
- "webbrowser",
 ]
 
 [[package]]
 name = "anyhow"
-version = "1.0.100"
+version = "1.0.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
+checksum = "5f0e0fee31ef5ed1ba1316088939cea399010ed7731dba877ed44aeb407a75ea"
 dependencies = [
  "backtrace",
 ]
@@ -1840,9 +1839,9 @@ dependencies = [
 
 [[package]]
 name = "cudaforge"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d51d58ebf0bdc2e4d42e3f420acd9cd698f7bd6f47cd0733a40dde7c3c8ba811"
+checksum = "3d318737bfa734ed050353ca00f1e4889f7d237bdecc345f9566483b4d2cdbcd"
 dependencies = [
  "anyhow",
  "fs2",
@@ -2735,7 +2734,7 @@ dependencies = [
  "toml 0.9.11+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
- "ureq 3.1.4",
+ "ureq 3.2.0",
  "url",
  "uuid 1.20.0",
  "wasi-common",
@@ -5183,6 +5182,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "is-docker"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "928bae27f42bc99b60d9ac7334e3a21d10ad8f1835a4e12ec3ec0464765ed1b3"
+dependencies = [
+ "once_cell",
+]
+
+[[package]]
 name = "is-terminal"
 version = "0.4.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5191,6 +5199,16 @@ dependencies = [
  "hermit-abi",
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "is-wsl"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
+dependencies = [
+ "is-docker",
+ "once_cell",
 ]
 
 [[package]]
@@ -5254,9 +5272,9 @@ dependencies = [
 
 [[package]]
 name = "jiff"
-version = "0.2.18"
+version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e67e8da4c49d6d9909fe03361f9b620f58898859f5c7aded68351e85e71ecf50"
+checksum = "d89a5b5e10d5a9ad6e5d1f4bd58225f655d6fe9767575a5e8ac5a6fe64e04495"
 dependencies = [
  "jiff-static",
  "jiff-tzdb-platform",
@@ -5269,9 +5287,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-static"
-version = "0.2.18"
+version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0c84ee7f197eca9a86c6fd6cb771e55eb991632f15f2bc3ca6ec838929e6e78"
+checksum = "ff7a39c8862fc1369215ccf0a8f12dd4598c7f6484704359f0351bd617034dbf"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6097,7 +6115,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#dd5a0f9f4f8ee99b5551e31ffd58bdd7f2725803"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#4f50f6eca892e0e791ff099b2b0d92a630047e23"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -6123,7 +6141,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#dd5a0f9f4f8ee99b5551e31ffd58bdd7f2725803"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#4f50f6eca892e0e791ff099b2b0d92a630047e23"
 dependencies = [
  "anyhow",
  "apodize",
@@ -6134,7 +6152,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#dd5a0f9f4f8ee99b5551e31ffd58bdd7f2725803"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#4f50f6eca892e0e791ff099b2b0d92a630047e23"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -6232,7 +6250,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#dd5a0f9f4f8ee99b5551e31ffd58bdd7f2725803"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#4f50f6eca892e0e791ff099b2b0d92a630047e23"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -6243,7 +6261,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#dd5a0f9f4f8ee99b5551e31ffd58bdd7f2725803"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#4f50f6eca892e0e791ff099b2b0d92a630047e23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6263,7 +6281,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#dd5a0f9f4f8ee99b5551e31ffd58bdd7f2725803"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#4f50f6eca892e0e791ff099b2b0d92a630047e23"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -6279,7 +6297,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#dd5a0f9f4f8ee99b5551e31ffd58bdd7f2725803"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#4f50f6eca892e0e791ff099b2b0d92a630047e23"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -6308,7 +6326,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.7.0"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#dd5a0f9f4f8ee99b5551e31ffd58bdd7f2725803"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git#4f50f6eca892e0e791ff099b2b0d92a630047e23"
 dependencies = [
  "candle-core",
  "image",
@@ -6902,6 +6920,17 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "open"
+version = "5.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43bb73a7fa3799b198970490a51174027ba0d4ec504b03cd08caf513d40024bc"
+dependencies = [
+ "is-wsl",
+ "libc",
+ "pathdiff",
+]
 
 [[package]]
 name = "openai-auth"
@@ -8099,7 +8128,6 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-schema",
- "anthropic-auth",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -8117,7 +8145,6 @@ dependencies = [
  "ignore",
  "indexmap 2.13.0",
  "infer",
- "keyring",
  "log",
  "mdq",
  "mime_guess",
@@ -8125,10 +8152,10 @@ dependencies = [
  "moka",
  "notify",
  "once_cell",
- "openai-auth",
  "patchkit",
  "pathdiff",
  "querymt",
+ "querymt-utils",
  "rapidhash",
  "rayon",
  "regex",
@@ -8422,7 +8449,6 @@ dependencies = [
 name = "querymt-cli"
 version = "0.2.0"
 dependencies = [
- "anthropic-auth",
  "anyhow",
  "async-trait",
  "clap",
@@ -8430,14 +8456,10 @@ dependencies = [
  "colored",
  "dirs",
  "futures",
- "keyring",
  "log",
- "openai-auth",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry-semantic-conventions",
- "opentelemetry_sdk",
+ "open",
  "querymt",
+ "querymt-utils",
  "rustyline",
  "rustyline-derive",
  "serde",
@@ -8446,10 +8468,6 @@ dependencies = [
  "tokio",
  "toml 0.9.11+spec-1.1.0",
  "tracing",
- "tracing-log",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "url",
 ]
 
 [[package]]
@@ -8463,6 +8481,29 @@ dependencies = [
  "querymt",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "querymt-utils"
+version = "0.0.0"
+dependencies = [
+ "anthropic-auth",
+ "anyhow",
+ "async-trait",
+ "keyring",
+ "log",
+ "openai-auth",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-log",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -8658,9 +8699,9 @@ dependencies = [
 
 [[package]]
 name = "rapidhash"
-version = "4.2.1"
+version = "4.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d8b5b858a440a0bc02625b62dd95131b9201aa9f69f411195dd4a7cfb1de3d7"
+checksum = "71ec30b38a417407efe7676bad0ca6b78f995f810185ece9af3bd5dc561185a9"
 dependencies = [
  "rustversion",
 ]
@@ -10890,9 +10931,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.46"
+version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9da98b7d9b7dad93488a84b8248efc35352b0b2657397d4167e7ad67e5d535e5"
+checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
  "itoa",
@@ -10911,9 +10952,9 @@ checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
 
 [[package]]
 name = "time-macros"
-version = "0.2.26"
+version = "0.2.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78cc610bac2dcee56805c99642447d4c5dbde4d01f752ffea0199aee1f601dc4"
+checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
@@ -11882,9 +11923,9 @@ dependencies = [
 
 [[package]]
 name = "ureq"
-version = "3.1.4"
+version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d39cb1dbab692d82a977c0392ffac19e188bd9186a9f32806f0aaa859d75585a"
+checksum = "fdc97a28575b85cfedf2a7e7d3cc64b3e11bd8ac766666318003abbacc7a21fc"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -13432,18 +13473,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.38"
+version = "0.8.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57cf3aa6855b23711ee9852dfc97dfaa51c45feaba5b645d0c777414d494a961"
+checksum = "db6d35d663eadb6c932438e763b262fe1a70987f9ae936e60158176d710cae4a"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.38"
+version = "0.8.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a616990af1a287837c4fe6596ad77ef57948f787e46ce28e166facc0cc1cb75"
+checksum = "4122cd3169e94605190e77839c9a40d40ed048d305bfdc146e7df40ab0f3e517"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -13526,9 +13567,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "7.3.0"
+version = "7.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "268bf6f9ceb991e07155234071501490bb41fd1e39c6a588106dad10ae2a5804"
+checksum = "cc12baa6db2b15a140161ce53d72209dacea594230798c24774139b54ecaa980"
 dependencies = [
  "crc32fast",
  "indexmap 2.13.0",

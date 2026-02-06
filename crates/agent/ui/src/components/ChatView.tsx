@@ -15,7 +15,7 @@ import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { Activity, Send, Loader, Plus, ChevronDown, Square } from 'lucide-react';
 import { useUiClientContext } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
-import { useSessionRoute } from '../hooks/useSessionRoute';
+import { useSessionManager } from '../hooks/useSessionManager';
 import { useFileMention } from '../hooks/useFileMention';
 import { useTodoState } from '../hooks/useTodoState';
 import { EventItem, EventRow, DelegationGroupInfo, Turn } from '../types';
@@ -37,14 +37,12 @@ export function ChatView() {
     mainSessionId,
     sessionId,
     connected,
-    newSession,
     sendPrompt,
     cancelSession,
     agents,
     sessionGroups,
-    loadSession,
-    thinkingAgentId,
     thinkingBySession,
+    sessionParentMap,
     isConversationComplete,
     setFileIndexCallback,
     setFileIndexErrorCallback,
@@ -56,9 +54,6 @@ export function ChatView() {
     sendRedo,
     undoState,
   } = useUiClientContext();
-  
-  // URL ↔ Session sync (Phase 6)
-  useSessionRoute();
   
   // UI state from Zustand store
   const {
@@ -76,7 +71,20 @@ export function ChatView() {
     setActiveDelegationId,
     selectedToolEvent,
     setSelectedToolEvent,
+    delegationDrawerOpen,
+    setDelegationDrawerOpen,
   } = useUiStore();
+  
+  // Session-scoped thinking state (replaces global thinkingAgentId)
+  const sessionThinkingAgentId = useMemo(() => {
+    if (!sessionId || !thinkingBySession) return null;
+    const agentSet = thinkingBySession.get(sessionId);
+    if (!agentSet || agentSet.size === 0) return null;
+    return Array.from(agentSet).pop()!;
+  }, [sessionId, thinkingBySession]);
+  
+  // Session-scoped conversation complete state (only for main session)
+  const sessionConversationComplete = sessionId === mainSessionId ? isConversationComplete : false;
   
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const activeIndexStatus = sessionId ? workspaceIndexStatus[sessionId]?.status : undefined;
@@ -99,10 +107,11 @@ export function ChatView() {
     return () => setFileIndexErrorCallback(null);
   }, [setFileIndexErrorCallback, fileMention.handleFileIndexError]);
 
-  useEffect(() => {
-    setActiveDelegationId(null);
-    setActiveTimelineView('chat');
-  }, [sessionId]);
+  // useSessionManager for session navigation
+  const { selectSession, createSession } = useSessionManager();
+
+  // useSessionManager for session navigation
+  
 
   // Keyboard shortcuts (Cmd+N, double Esc, etc. moved to AppShell)
 
@@ -124,12 +133,15 @@ export function ChatView() {
 
   const handleNewSession = async () => {
     try {
-      await newSession();
+      await createSession();
     } catch (err) {
       console.error('Failed to create session:', err);
-      throw err;
     }
   };
+
+  const handleSelectSession = useCallback((sessionId: string) => {
+    selectSession(sessionId);
+  }, [selectSession]);
 
 
 
@@ -139,7 +151,7 @@ export function ChatView() {
     delegations,
     hasMultipleModels: sessionHasMultipleModels,
   } = useMemo(() => {
-    const result = buildTurns(events, thinkingAgentId);
+    const result = buildTurns(events, sessionThinkingAgentId);
     
     // Enrich delegations with child session events from eventsBySession
     for (const delegation of result.delegations) {
@@ -166,7 +178,7 @@ export function ChatView() {
     }
     
     return result;
-  }, [events, eventsBySession, mainSessionId, thinkingAgentId]);
+  }, [events, eventsBySession, mainSessionId, sessionThinkingAgentId]);
   const systemEvents = useMemo(
     () => events.filter((event: EventItem) => event.type === 'system'),
     [events]
@@ -243,16 +255,9 @@ export function ChatView() {
 
   // Handle delegation click - open drawer
   const handleDelegateClick = useCallback((delegationId: string) => {
-    console.log('[handleDelegateClick] Setting delegation ID:', delegationId);
-    console.log('[handleDelegateClick] Current state:', {
-      activeTimelineView,
-      hasTurns,
-      sessionId,
-      delegationsCount: delegations.length,
-      eventsCount: events.length
-    });
     setActiveDelegationId(delegationId);
-  }, [activeTimelineView, hasTurns, sessionId, delegations.length, events.length]);
+    setDelegationDrawerOpen(true);
+  }, [setActiveDelegationId, setDelegationDrawerOpen]);
 
   const activeDelegation = useMemo(
     () => delegations.find((delegation) => delegation.id === activeDelegationId),
@@ -298,16 +303,16 @@ export function ChatView() {
   }, [showTodoRail, todoRailCollapsed, setTodoRailCollapsed]);
 
   useEffect(() => {
-    if (activeDelegationId && !activeDelegation) {
+    if (events.length > 0 && activeDelegationId && !activeDelegation) {
       setActiveDelegationId(null);
     }
-  }, [activeDelegation, activeDelegationId]);
+  }, [activeDelegation, activeDelegationId, events.length]);
 
   useEffect(() => {
-    if (activeTimelineView === 'delegations' && delegations.length === 0) {
+    if (events.length > 0 && activeTimelineView === 'delegations' && delegations.length === 0) {
       setActiveTimelineView('chat');
     }
-  }, [activeTimelineView, delegations.length]);
+  }, [activeTimelineView, delegations.length, events.length]);
 
   // Fallback to first when selected delegation disappears (due to updates/changes)
   useEffect(() => {
@@ -333,7 +338,7 @@ export function ChatView() {
               type="button"
               onClick={() => {
                 setActiveTimelineView('chat');
-                setActiveDelegationId(null);
+                setDelegationDrawerOpen(false);
               }}
               className={`text-xs uppercase tracking-wider px-3 py-1.5 rounded-full border transition-colors ${
                 activeTimelineView === 'chat'
@@ -426,11 +431,12 @@ export function ChatView() {
                   // Sessions exist - show session picker
                   <SessionPicker
                     groups={sessionGroups}
-                    onSelectSession={loadSession}
+                    onSelectSession={handleSelectSession}
                     onNewSession={handleNewSession}
                     disabled={!connected || loading}
                     activeSessionId={sessionId}
                     thinkingBySession={thinkingBySession}
+                    sessionParentMap={sessionParentMap}
                   />
                 )
               ) : (
@@ -512,9 +518,9 @@ export function ChatView() {
       </div>
 
       {/* Thinking/Completion Indicator */}
-      {thinkingAgentId !== null && <ThinkingIndicator agentId={thinkingAgentId} agents={agents} />}
-      {thinkingAgentId === null && isConversationComplete && (
-        <ThinkingIndicator agentId={thinkingAgentId} agents={agents} isComplete={true} />
+      {sessionThinkingAgentId !== null && <ThinkingIndicator agentId={sessionThinkingAgentId} agents={agents} />}
+      {sessionThinkingAgentId === null && sessionConversationComplete && (
+        <ThinkingIndicator agentId={sessionThinkingAgentId} agents={agents} isComplete={true} />
       )}
 
       {visibleSystemEvents.length > 0 && (
@@ -538,7 +544,7 @@ export function ChatView() {
             isLoadingFiles={fileMention.isLoading}
             showIndexBuilding={activeIndexStatus === 'building'}
           />
-          {thinkingAgentId !== null ? (
+          {sessionThinkingAgentId !== null ? (
             <button
               onClick={cancelSession}
               className="
@@ -588,14 +594,13 @@ export function ChatView() {
         />
       )}
 
-      {activeTimelineView === 'chat' && activeDelegation && (
+      {activeTimelineView === 'chat' && delegationDrawerOpen && activeDelegation && (
         <DelegationDrawer
           delegation={activeDelegation}
           agents={agents}
           onClose={() => {
-          console.log('[DelegationDrawer] Closing drawer');
-          setActiveDelegationId(null);
-        }}
+            setDelegationDrawerOpen(false);
+          }}
           onToolClick={handleToolClick}
           llmConfigCache={llmConfigCache}
           requestLlmConfig={requestLlmConfig}
@@ -653,7 +658,7 @@ function hasMultipleModels(timeline: ModelTimelineEntry[]): boolean {
 }
 
 // Build turns from event rows
-function buildTurns(events: EventItem[], thinkingAgentId: string | null): {
+function buildTurns(events: EventItem[], sessionThinkingAgentId: string | null): {
   turns: Turn[];
   allEventRows: EventRow[];
   hasMultipleModels: boolean;
@@ -755,7 +760,7 @@ function buildTurns(events: EventItem[], thinkingAgentId: string | null): {
 
   // Close final turn
   if (currentTurn) {
-    currentTurn.isActive = thinkingAgentId !== null;
+    currentTurn.isActive = sessionThinkingAgentId !== null;
     turns.push(currentTurn);
   }
 

@@ -96,7 +96,37 @@ impl QueryMTAgent {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
 
-        let tool_context = exec_ctx.tool_context(self.agent_registry.clone());
+        // Set up elicitation channel for this tool call
+        let (elicitation_tx, mut elicitation_rx) =
+            tokio::sync::mpsc::channel::<crate::tools::ElicitationRequest>(1);
+
+        // Spawn task to handle elicitation requests from the tool
+        let event_bus = self.event_bus.clone();
+        let session_id_clone = exec_ctx.session_id.clone();
+        let pending_elicitations = self.pending_elicitations.clone();
+        tokio::spawn(async move {
+            while let Some(request) = elicitation_rx.recv().await {
+                let elicitation_id = request.elicitation_id.clone();
+                // Store the oneshot sender in the pending map
+                {
+                    let mut pending = pending_elicitations.lock().await;
+                    pending.insert(elicitation_id.clone(), request.response_tx);
+                }
+                // Emit event so clients learn about the elicitation request
+                event_bus.publish(
+                    &session_id_clone,
+                    crate::events::AgentEventKind::ElicitationRequested {
+                        elicitation_id,
+                        session_id: session_id_clone.clone(),
+                        message: request.message,
+                        requested_schema: request.requested_schema,
+                        source: request.source,
+                    },
+                );
+            }
+        });
+
+        let tool_context = exec_ctx.tool_context(self.agent_registry.clone(), Some(elicitation_tx));
 
         let (raw_result_json, is_error) = if !self.is_tool_allowed(&call.function.name) {
             (

@@ -1,0 +1,35 @@
+[package]
+name = "querymt-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared utilities for querymt workspace"
+
+[features]
+default = []
+secret-store = ["dep:keyring", "dep:anthropic-auth", "dep:serde_json"]
+oauth = ["secret-store", "dep:openai-auth", "dep:async-trait", "dep:anyhow", "dep:url", "dep:tokio"]
+dbus-secret-service = ["keyring/sync-secret-service"]
+
+[dependencies]
+tracing.workspace = true
+log.workspace = true
+tracing-log = "0.2"
+tracing-opentelemetry = "0.32"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = "0.31"
+opentelemetry_sdk = "0.31"
+opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
+opentelemetry-semantic-conventions = "0.31"
+
+# Secret store dependencies (optional, behind secret-store feature)
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native", "crypto-rust"], optional = true }
+anthropic-auth = { version = "0.1", default-features = false, features = ["async", "rustls-tls"], optional = true }
+serde_json = { workspace = true, optional = true }
+
+# OAuth dependencies (optional, behind oauth feature)
+openai-auth = { version = "1.0", features = ["async", "callback-server"], optional = true }
+async-trait = { workspace = true, optional = true }
+anyhow = { version = "1.0", optional = true }
+url = { workspace = true, optional = true }
+tokio = { version = "1.0", features = ["time"], optional = true }
