@@ -1,0 +1,30 @@
+[package]
+name = "querymt-service"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+description = "Service for querymt providers."
+authors = [
+    "Ivan Zatevakhin"
+]
+repository = "https://github.com/querymt/querymt"
+homepage = "https://query.mt"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.7", features = ["macros"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+querymt = { path = "../querymt", default-features = false, features = ["http-client", "extism_host", "native", "tracing", "mcp"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+toml = "0.9"
+tower-http = { version = "0.5", features = ["cors"] }
+tracing = { version = "0.1", features = ["attributes"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.18", features = ["v4"] }
+
+[[bin]]
+name = "qmt-service"
+path = "src/main.rs"

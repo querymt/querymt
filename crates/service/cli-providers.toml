@@ -1,0 +1,14 @@
+[[providers]]
+name = "proxy"
+path = "target/wasm32-wasip1/debug/qmt_proxy.wasm"
+config = {
+  allowed_hosts = ["localhost"],
+  base_url = "http://localhost:9999",
+  model = "unsloth/Qwen3-VL-4B-Instruct-GGUF:Qwen3-VL-4B-Instruct-Q5_K_M.gguf",
+  stream = true,
+  extra_body = {
+    target_provider = "llama_cpp",
+    model_path = "hf:unsloth/Qwen3-VL-4B-Instruct-GGUF:Qwen3-VL-4B-Instruct-Q5_K_M.gguf",
+  }
+}
+

@@ -1,0 +1,7 @@
+[[providers]]
+name = "llama_cpp"
+path = "oci://ghcr.io/querymt/llama-cpp:linux-amd64-cuda12.8"
+
+# [[providers]]
+# name = "llama_cpp"
+# path = "oci://ghcr.io/querymt/llama-cpp:linux-amd64-vulkan"
