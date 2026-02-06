@@ -83,4 +83,26 @@ jobs:
           flags: agent
           verbose: true
           fail_ci_if_error: false
+
+  # Job 4: Run UI tests
+  ui-test:
+    name: UI Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install dependencies
+        working-directory: crates/agent/ui
+        run: npm ci
+      
+      - name: Run UI Tests
+        working-directory: crates/agent/ui
+        run: npm test
      
