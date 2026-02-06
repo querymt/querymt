@@ -8552,6 +8552,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "qmt-proxy"
+version = "0.2.0"
+dependencies = [
+ "extism-pdk",
+ "http",
+ "querymt",
+ "querymt-extism-macros",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "qmt-xai"
 version = "0.1.0"
 dependencies = [
@@ -8655,6 +8669,25 @@ dependencies = [
  "querymt",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "querymt-service"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "clap",
+ "futures",
+ "querymt",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.9.11+spec-1.1.0",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid 1.20.0",
 ]
 
 [[package]]

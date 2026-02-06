@@ -1,0 +1,26 @@
+[quorum]
+cwd = "."
+delegation = true
+verification = false
+snapshot_policy = "diff"
+
+[planner]
+provider = "codex"
+model = "gpt-5.2"
+tools = ["delegate", "create_task"]
+system = [{file = "../prompts/planner.md"}]
+
+
+[[delegates]]
+id = "coder"
+provider = "proxy"
+model = "llama_cpp:unsloth/Qwen3-VL-8B-Instruct-GGUF:Qwen3-VL-8B-Instruct-Q5_K_M.gguf"
+description = "Specialized in implementation and code writing"
+capabilities = ["rust", "python"]
+tools = ["edit", "glob", "ls", "shell", "read_file", "write_file"]
+system = [{file = "../prompts/coder.md"}]
+
+[delegates.parameters]
+base_url = "http://localhost:9999"
+extra_body = { target_provider = "llama_cpp", model_path = "hf:unsloth/Qwen3-VL-8B-Instruct-GGUF:Qwen3-VL-8B-Instruct-Q5_K_M.gguf" }
+
