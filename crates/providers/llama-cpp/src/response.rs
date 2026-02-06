@@ -1,5 +1,5 @@
-use querymt::chat::{ChatResponse, FinishReason};
 use querymt::Usage;
+use querymt::chat::{ChatResponse, FinishReason};
 use std::fmt;
 
 /// Response from a llama.cpp chat completion.

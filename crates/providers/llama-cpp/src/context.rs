@@ -1,9 +1,9 @@
 use crate::config::{
-    FlashAttentionPolicy, LlamaCppConfig, LLAMA_FLASH_ATTN_TYPE_AUTO,
-    LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED,
+    FlashAttentionPolicy, LLAMA_FLASH_ATTN_TYPE_AUTO, LLAMA_FLASH_ATTN_TYPE_DISABLED,
+    LLAMA_FLASH_ATTN_TYPE_ENABLED, LlamaCppConfig,
 };
 use crate::memory::{
-    kv_cache_bytes_per_element, parse_kv_cache_type, query_gpu_memory, MemoryEstimate,
+    MemoryEstimate, kv_cache_bytes_per_element, parse_kv_cache_type, query_gpu_memory,
 };
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::model::LlamaModel;

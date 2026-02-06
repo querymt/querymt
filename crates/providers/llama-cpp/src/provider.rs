@@ -2,25 +2,28 @@ use crate::backend::{install_abort_callback, llama_backend};
 use crate::config::{DEFAULT_MAX_TOKENS, LlamaCppConfig, LlamaCppLogMode};
 use crate::context::estimate_context_memory;
 use crate::generation::{
-    build_prompt, build_prompt_candidates, build_raw_prompt, build_prompt_with, generate,
+    build_prompt, build_prompt_candidates, build_prompt_with, build_raw_prompt, generate,
     generate_streaming,
 };
 use crate::memory::MemoryEstimate;
 use crate::response::LlamaCppChatResponse;
-use crate::tools::{apply_template_with_tools, generate_streaming_with_tools, generate_with_tools, parse_tool_response};
+use crate::tools::{
+    apply_template_with_tools, generate_streaming_with_tools, generate_with_tools,
+    parse_tool_response,
+};
 use async_trait::async_trait;
-use futures::channel::mpsc;
 use futures::Stream;
+use futures::channel::mpsc;
 use hf_hub::api::sync::ApiBuilder as SyncApiBuilder;
 use hf_hub::api::tokio::ApiBuilder as AsyncApiBuilder;
-use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
-use llama_cpp_2::{send_logs_to_tracing, LogOptions};
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::{LogOptions, send_logs_to_tracing};
+use querymt::LLMProvider;
 use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, FinishReason, Tool};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
-use querymt::LLMProvider;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -170,8 +173,15 @@ impl ChatProvider for LlamaCppProvider {
         // If tools are provided and not empty, use tool-aware generation
         if let Some(tools) = tools {
             if !tools.is_empty() {
-                let template_result = apply_template_with_tools(&self.model, &self.cfg, messages, tools)?;
-                let generated = generate_with_tools(&self.model, &self.cfg, &template_result, max_tokens, None)?;
+                let template_result =
+                    apply_template_with_tools(&self.model, &self.cfg, messages, tools)?;
+                let generated = generate_with_tools(
+                    &self.model,
+                    &self.cfg,
+                    &template_result,
+                    max_tokens,
+                    None,
+                )?;
                 let (content, thinking, tool_calls, finish_reason) =
                     parse_tool_response(&template_result, &generated.text)?;
 
@@ -190,7 +200,8 @@ impl ChatProvider for LlamaCppProvider {
         let mut generated = generate(&self.model, &self.cfg, &prompt, max_tokens, None)?;
         if generated.text.trim().is_empty() {
             if used_chat_template && self.cfg.use_chat_template.is_none() {
-                let (fallback_prompt, _) = build_prompt_with(&self.model, &self.cfg, messages, false)?;
+                let (fallback_prompt, _) =
+                    build_prompt_with(&self.model, &self.cfg, messages, false)?;
                 generated = generate(&self.model, &self.cfg, &fallback_prompt, max_tokens, None)?;
             }
         }
@@ -222,7 +233,8 @@ impl ChatProvider for LlamaCppProvider {
         // If tools are provided and not empty, use tool-aware streaming
         if let Some(tools) = tools {
             if !tools.is_empty() {
-                let template_result = apply_template_with_tools(&self.model, &self.cfg, messages, tools)?;
+                let template_result =
+                    apply_template_with_tools(&self.model, &self.cfg, messages, tools)?;
                 let cfg = self.cfg.clone();
                 let model = Arc::clone(&self.model);
 
@@ -305,7 +317,13 @@ impl CompletionProvider for LlamaCppProvider {
             .max_tokens
             .or(self.cfg.max_tokens)
             .unwrap_or(DEFAULT_MAX_TOKENS);
-        let generated = generate(&self.model, &self.cfg, &req.prompt, max_tokens, req.temperature)?;
+        let generated = generate(
+            &self.model,
+            &self.cfg,
+            &req.prompt,
+            max_tokens,
+            req.temperature,
+        )?;
         Ok(CompletionResponse {
             text: generated.text,
         })

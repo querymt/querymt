@@ -10,9 +10,9 @@ mod tools;
 pub use config::LlamaCppConfig;
 use provider::LlamaCppProvider;
 
+use querymt::LLMProvider;
 use querymt::error::LLMError;
 use querymt::plugin::{Fut, LLMProviderFactory};
-use querymt::LLMProvider;
 use schemars::schema_for;
 use std::path::Path;
 
