@@ -207,6 +207,10 @@ impl QueryMTAgent {
                         anyhow::anyhow!("LLM streaming request with tools failed: {}", e)
                     })? {
                         StreamChunk::Text(delta) => text.push_str(&delta),
+                        StreamChunk::Thinking(_) => {
+                            // Thinking/reasoning content is not included in the main text.
+                            // The agent does not currently persist or display thinking content.
+                        }
                         StreamChunk::ToolUseComplete { tool_call, .. } => {
                             if tool_call_ids.insert(tool_call.id.clone()) {
                                 tool_calls.push(tool_call);

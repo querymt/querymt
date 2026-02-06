@@ -126,18 +126,21 @@ fn test_conversation_context_counts_user_messages() {
             role: ChatRole::User,
             content: "one".to_string(),
             message_type: MessageType::Text,
+            thinking: None,
             cache: None,
         },
         ChatMessage {
             role: ChatRole::Assistant,
             content: "two".to_string(),
             message_type: MessageType::Text,
+            thinking: None,
             cache: None,
         },
         ChatMessage {
             role: ChatRole::User,
             content: "three".to_string(),
             message_type: MessageType::Text,
+            thinking: None,
             cache: None,
         },
     ];

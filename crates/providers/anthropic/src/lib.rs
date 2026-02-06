@@ -919,7 +919,7 @@ impl HTTPChatProvider for Anthropic {
                             if let Some(text) = delta.text {
                                 chunks.push(querymt::chat::StreamChunk::Text(text));
                             } else if let Some(thinking) = delta.thinking {
-                                chunks.push(querymt::chat::StreamChunk::Text(thinking));
+                                chunks.push(querymt::chat::StreamChunk::Thinking(thinking));
                             } else if let Some(partial_json) = delta.partial_json {
                                 chunks.push(querymt::chat::StreamChunk::ToolUseInputDelta {
                                     index,

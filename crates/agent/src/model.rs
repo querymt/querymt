@@ -179,6 +179,7 @@ impl AgentMessage {
             role: self.role.clone(),
             message_type,
             content,
+            thinking: None,
             cache: None,
         }
     }

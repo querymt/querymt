@@ -219,6 +219,7 @@ impl<'a> MultiPromptChain<'a> {
                         role: ChatRole::User,
                         message_type: MessageType::Text,
                         content: prompt_text,
+                        thinking: None,
                         cache: None,
                     }];
 
@@ -236,6 +237,7 @@ impl<'a> MultiPromptChain<'a> {
                         step_messages.push(ChatMessage {
                             role: ChatRole::Assistant,
                             content: response_text.clone().unwrap_or_default(),
+                            thinking: response.thinking(),
                             cache: None,
                             message_type: if let Some(ref tcs) = tool_calls {
                                 if tcs.is_empty() {
@@ -286,6 +288,7 @@ impl<'a> MultiPromptChain<'a> {
                                 role: ChatRole::User,
                                 content: String::new(),
                                 message_type: MessageType::ToolResult(tool_results),
+                                thinking: None,
                                 cache: None,
                             });
 

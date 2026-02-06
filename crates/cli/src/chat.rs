@@ -99,9 +99,10 @@ pub async fn handle_any_response(
 
     loop {
         let is_stream = matches!(current, StreamOrResponse::Stream(_));
-        let (text, tool_calls, _usage) = match current {
+        let (text, thinking, tool_calls, _usage) = match current {
             StreamOrResponse::Stream(mut stream) => {
                 let mut full_text = String::new();
+                let mut thinking_text = String::new();
                 let mut tool_calls_map: HashMap<usize, (String, String, String)> = HashMap::new();
 
                 if let Some(mut sp) = spinner.take() {
@@ -126,6 +127,12 @@ pub async fn handle_any_response(
                                     print!("{}", t);
                                     io::stdout().flush().ok();
                                     full_text.push_str(&t);
+                                }
+                                StreamChunk::Thinking(t) => {
+                                    log::trace!("Received thinking chunk: {} bytes", t.len());
+                                    print!("{}", t.dimmed());
+                                    io::stdout().flush().ok();
+                                    thinking_text.push_str(&t);
                                 }
                                 StreamChunk::ToolUseStart { index, id, name } => {
                                     log::debug!("Received tool use start: {} (idx {})", name, index);
@@ -192,7 +199,18 @@ pub async fn handle_any_response(
                     )
                 };
 
-                (Some(full_text), tool_calls, None)
+                // If streaming didn't emit separate Thinking chunks (e.g. the
+                // provider doesn't support it), fall back to extracting <think>
+                // blocks from the accumulated text so that future turns have
+                // clean content and proper reasoning_content separation.
+                let (thinking, clean_text) = if thinking_text.is_empty() {
+                    let (extracted, clean) = querymt::chat::extract_thinking(&full_text);
+                    (extracted, clean)
+                } else {
+                    (Some(thinking_text), full_text)
+                };
+
+                (Some(clean_text), thinking, tool_calls, None)
             }
             StreamOrResponse::Response(resp) => {
                 if let Some(mut sp) = spinner.take() {
@@ -207,17 +225,23 @@ pub async fn handle_any_response(
                         usage.output_tokens
                     );
                 }
-                (resp.text(), resp.tool_calls(), resp.usage())
+                (
+                    resp.text(),
+                    resp.thinking(),
+                    resp.tool_calls(),
+                    resp.usage(),
+                )
             }
         };
 
         if let Some(ref tcalls) = tool_calls {
-            messages.push(
-                ChatMessage::assistant()
-                    .tool_use(tcalls.clone())
-                    .content(text.clone().unwrap_or_default())
-                    .build(),
-            );
+            let mut msg_builder = ChatMessage::assistant()
+                .tool_use(tcalls.clone())
+                .content(text.clone().unwrap_or_default());
+            if let Some(ref t) = thinking {
+                msg_builder = msg_builder.thinking(t.clone());
+            }
+            messages.push(msg_builder.build());
 
             let tool_futures = tcalls.clone().into_iter().map(|call| async {
                 let tool_name = call.function.name.clone();
@@ -383,11 +407,11 @@ pub async fn handle_any_response(
                     println!("{}", text.as_deref().unwrap_or_default());
                 }
             }
-            messages.push(
-                ChatMessage::assistant()
-                    .content(text.unwrap_or_default())
-                    .build(),
-            );
+            let mut msg_builder = ChatMessage::assistant().content(text.unwrap_or_default());
+            if let Some(t) = thinking {
+                msg_builder = msg_builder.thinking(t);
+            }
+            messages.push(msg_builder.build());
             break;
         }
     }

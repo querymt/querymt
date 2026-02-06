@@ -102,6 +102,7 @@ impl DelegationSummarizer {
             role: ChatRole::User,
             message_type: querymt::chat::MessageType::Text,
             content: input,
+            thinking: None,
             cache: None,
         }];
 

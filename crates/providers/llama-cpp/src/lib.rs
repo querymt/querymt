@@ -10,6 +10,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{
     AddBos, ChatTemplateResult, GrammarTriggerType, LlamaChatMessage, LlamaChatTemplate, LlamaModel,
 };
+use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use querymt::chat::{
@@ -75,6 +76,11 @@ pub struct LlamaCppConfig {
     /// heavily utilize CPU cores during download. Only recommended for cloud
     /// instances with high CPU and bandwidth.
     pub fast_download: Option<bool>,
+    /// Enable thinking/reasoning output from the model.
+    /// When true, the template is rendered with thinking support and
+    /// `<think>` blocks are parsed into separate reasoning_content.
+    /// Defaults to true.
+    pub enable_thinking: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
@@ -93,6 +99,7 @@ struct LlamaCppProvider {
 #[derive(Debug)]
 struct LlamaCppChatResponse {
     text: String,
+    thinking: Option<String>,
     tool_calls: Option<Vec<querymt::ToolCall>>,
     finish_reason: FinishReason,
     usage: Usage,
@@ -107,6 +114,10 @@ impl fmt::Display for LlamaCppChatResponse {
 impl ChatResponse for LlamaCppChatResponse {
     fn text(&self) -> Option<String> {
         Some(self.text.clone())
+    }
+
+    fn thinking(&self) -> Option<String> {
+        self.thinking.clone()
     }
 
     fn tool_calls(&self) -> Option<Vec<querymt::ToolCall>> {
@@ -268,20 +279,17 @@ impl LlamaCppProvider {
         serde_json::to_string(tools).map_err(|e| LLMError::ProviderError(e.to_string()))
     }
 
-    /// Build LlamaChatMessage array from ChatMessage array for tool-aware conversations.
-    fn build_chat_messages_for_tools(
-        &self,
-        messages: &[ChatMessage],
-    ) -> Result<Vec<LlamaChatMessage>, LLMError> {
-        let mut chat_messages = Vec::new();
+    /// Build OpenAI-compatible JSON messages from ChatMessage array for tool-aware conversations.
+    fn build_messages_json_for_tools(&self, messages: &[ChatMessage]) -> Result<String, LLMError> {
+        let mut json_messages = Vec::new();
 
         // Add system message if configured
         if !self.cfg.system.is_empty() {
             let system = self.cfg.system.join("\n\n");
-            chat_messages.push(
-                LlamaChatMessage::new("system".to_string(), system)
-                    .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
-            );
+            json_messages.push(serde_json::json!({
+                "role": "system",
+                "content": system
+            }));
         }
 
         for msg in messages {
@@ -291,34 +299,85 @@ impl LlamaCppProvider {
                         ChatRole::User => "user",
                         ChatRole::Assistant => "assistant",
                     };
-                    chat_messages.push(
-                        LlamaChatMessage::new(role.to_string(), msg.content.clone())
-                            .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
-                    );
+
+                    // For assistant messages, separate <think> blocks from content
+                    // into reasoning_content for the template engine.
+                    // If thinking was already extracted (msg.thinking is Some), use it.
+                    // Otherwise, extract from content as a fallback for messages
+                    // stored before thinking extraction was available.
+                    let (thinking, content) = if msg.thinking.is_some() {
+                        (msg.thinking.clone(), msg.content.clone())
+                    } else if matches!(msg.role, ChatRole::Assistant) {
+                        let (t, c) = querymt::chat::extract_thinking(&msg.content);
+                        (t, c)
+                    } else {
+                        (None, msg.content.clone())
+                    };
+
+                    let mut json_msg = serde_json::json!({
+                        "role": role,
+                        "content": content
+                    });
+                    if let Some(ref t) = thinking {
+                        if !t.is_empty() {
+                            json_msg["reasoning_content"] = serde_json::json!(t);
+                        }
+                    }
+                    json_messages.push(json_msg);
                 }
                 MessageType::ToolUse(tool_calls) => {
-                    // Assistant message with tool calls - serialize as JSON in content
-                    let tool_calls_json = serde_json::to_string(tool_calls).map_err(|e| {
-                        LLMError::InvalidRequest(format!("Failed to serialize tool calls: {}", e))
-                    })?;
-                    chat_messages.push(
-                        LlamaChatMessage::new("assistant".to_string(), tool_calls_json)
-                            .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
-                    );
+                    // Assistant message with tool calls in OpenAI format
+                    let tool_calls_array: Vec<Value> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            serde_json::json!({
+                                "id": tc.id,
+                                "type": tc.call_type,
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments
+                                }
+                            })
+                        })
+                        .collect();
+
+                    // Separate <think> blocks from content (fallback extraction)
+                    let (thinking, clean_content) = if msg.thinking.is_some() {
+                        (msg.thinking.clone(), msg.content.clone())
+                    } else {
+                        let (t, c) = querymt::chat::extract_thinking(&msg.content);
+                        (t, c)
+                    };
+
+                    let content = if clean_content.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(clean_content)
+                    };
+
+                    let mut json_msg = serde_json::json!({
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": tool_calls_array
+                    });
+                    if let Some(ref t) = thinking {
+                        if !t.is_empty() {
+                            json_msg["reasoning_content"] = serde_json::json!(t);
+                        }
+                    }
+                    json_messages.push(json_msg);
                 }
                 MessageType::ToolResult(results) => {
-                    // Tool results - format as user message with tool results
+                    // Tool results - each result is a separate message with tool role
+                    // Note: function.arguments contains the result content,
+                    // function.name contains the tool name, and id is the tool_call_id
                     for result in results {
-                        let result_json = serde_json::to_string(result).map_err(|e| {
-                            LLMError::InvalidRequest(format!(
-                                "Failed to serialize tool result: {}",
-                                e
-                            ))
-                        })?;
-                        chat_messages.push(
-                            LlamaChatMessage::new("tool".to_string(), result_json)
-                                .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
-                        );
+                        json_messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": result.id,
+                            "name": result.function.name,
+                            "content": result.function.arguments
+                        }));
                     }
                 }
                 _ => {
@@ -330,7 +389,9 @@ impl LlamaCppProvider {
             }
         }
 
-        Ok(chat_messages)
+        serde_json::to_string(&json_messages).map_err(|e| {
+            LLMError::ProviderError(format!("Failed to serialize messages JSON: {}", e))
+        })
     }
 
     /// Apply chat template with tools to generate prompt and grammar.
@@ -340,7 +401,15 @@ impl LlamaCppProvider {
         tools: &[Tool],
     ) -> Result<ChatTemplateResult, LLMError> {
         let tools_json = self.convert_tools_to_json(tools)?;
-        let chat_messages = self.build_chat_messages_for_tools(messages)?;
+        let messages_json = self.build_messages_json_for_tools(messages)?;
+
+        log::debug!(
+            "Applying chat template with {} messages and {} tools",
+            messages.len(),
+            tools.len()
+        );
+        log::debug!("Messages JSON: {}", messages_json);
+        log::debug!("Tools JSON: {}", tools_json);
 
         let template = self
             .model
@@ -348,15 +417,43 @@ impl LlamaCppProvider {
             .or_else(|_| LlamaChatTemplate::new("chatml"))
             .map_err(|e| LLMError::ProviderError(format!("Failed to get chat template: {}", e)))?;
 
-        self.model
-            .apply_chat_template_with_tools_oaicompat(
-                &template,
-                &chat_messages,
-                Some(tools_json.as_str()),
-                None,
-                true,
-            )
-            .map_err(|e| LLMError::ProviderError(format!("Failed to apply chat template: {}", e)))
+        let params = OpenAIChatTemplateParams {
+            messages_json: &messages_json,
+            tools_json: Some(&tools_json),
+            tool_choice: None,
+            json_schema: None,
+            grammar: None,
+            reasoning_format: None,
+            chat_template_kwargs: None,
+            add_generation_prompt: true,
+            use_jinja: true,
+            parallel_tool_calls: false,
+            enable_thinking: self.cfg.enable_thinking.unwrap_or(true),
+            // BOS is handled by the tokenizer in generate_with_tools(),
+            // not by the template engine, to avoid double-BOS.
+            // See self.cfg.add_bos.
+            add_bos: false,
+            add_eos: false,
+            parse_tool_calls: true,
+        };
+
+        let result = self
+            .model
+            .apply_chat_template_oaicompat(&template, &params)
+            .map_err(|e| {
+                LLMError::ProviderError(format!("Failed to apply chat template: {}", e))
+            })?;
+
+        log::debug!(
+            "Template applied: prompt_len={}, has_grammar={}, triggers={}, stops={}, parse_tool_calls={}",
+            result.prompt.len(),
+            result.grammar.is_some(),
+            result.grammar_triggers.len(),
+            result.additional_stops.len(),
+            result.parse_tool_calls
+        );
+
+        Ok(result)
     }
 
     /// Build a grammar-constrained sampler from a ChatTemplateResult.
@@ -452,6 +549,13 @@ impl LlamaCppProvider {
             ));
         }
 
+        log::debug!(
+            "Generating with tools: input_tokens={}, max_tokens={}, add_bos={}",
+            tokens.len(),
+            max_tokens,
+            add_bos
+        );
+
         if max_tokens == 0 {
             return Ok(GeneratedText {
                 text: String::new(),
@@ -474,6 +578,14 @@ impl LlamaCppProvider {
             // context to avoid GPU out-of-memory when n_ctx is not configured.
             n_ctx_needed.min(self.model.n_ctx_train())
         };
+
+        log::debug!(
+            "Context sizing: needed={}, configured={:?}, model_train={}, using={}",
+            n_ctx_needed,
+            self.cfg.n_ctx,
+            self.model.n_ctx_train(),
+            n_ctx
+        );
 
         let mut ctx_params = LlamaContextParams::default();
         let n_ctx = NonZeroU32::new(n_ctx)
@@ -591,23 +703,56 @@ impl LlamaCppProvider {
     }
 
     /// Parse the generated response using the ChatTemplateResult to extract tool calls.
+    ///
+    /// Returns (content, thinking, tool_calls, finish_reason).
     fn parse_tool_response(
         result: &ChatTemplateResult,
         text: &str,
-    ) -> Result<(String, Option<Vec<querymt::ToolCall>>, FinishReason), LLMError> {
-        let parsed_json = result
-            .parse_response_oaicompat(text, false)
-            .map_err(|e| LLMError::ProviderError(format!("Failed to parse response: {}", e)))?;
+    ) -> Result<
+        (
+            String,
+            Option<String>,
+            Option<Vec<querymt::ToolCall>>,
+            FinishReason,
+        ),
+        LLMError,
+    > {
+        log::debug!("Parsing tool response: text_len={}", text.len());
+        log::debug!("Raw generated text: {}", text);
+
+        let parsed_json = result.parse_response_oaicompat(text, false).map_err(|e| {
+            log::debug!(
+                "Failed to parse response with parse_response_oaicompat: {}",
+                e
+            );
+            LLMError::ProviderError(format!("Failed to parse response: {}", e))
+        })?;
+
+        log::debug!("Parsed JSON: {}", parsed_json);
 
         let parsed: Value = serde_json::from_str(&parsed_json).map_err(|e| {
             LLMError::ProviderError(format!("Failed to deserialize parsed response: {}", e))
         })?;
 
-        let content = parsed
+        let raw_content = parsed
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
+        // The C++ parser may have already extracted reasoning_content.
+        // If so, use it directly. Otherwise, use extract_thinking as fallback.
+        let reasoning_content = parsed
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+
+        let (thinking, content) = if reasoning_content.is_some() {
+            (reasoning_content, raw_content)
+        } else {
+            querymt::chat::extract_thinking(&raw_content)
+        };
 
         let tool_calls = parsed
             .get("tool_calls")
@@ -626,7 +771,18 @@ impl LlamaCppProvider {
             FinishReason::Stop
         };
 
-        Ok((content, tool_calls, finish_reason))
+        log::debug!(
+            "Parsed response: content_len={}, thinking={}, tool_calls={}, finish_reason={:?}",
+            content.len(),
+            thinking.as_ref().map(|t| t.len()).unwrap_or(0),
+            tool_calls
+                .as_ref()
+                .map(|tc: &Vec<querymt::ToolCall>| tc.len())
+                .unwrap_or(0),
+            finish_reason
+        );
+
+        Ok((content, thinking, tool_calls, finish_reason))
     }
 
     /// Generate text with streaming and grammar-constrained sampling for tool calls.
@@ -657,6 +813,12 @@ impl LlamaCppProvider {
                 "Prompt tokenization resulted in an empty sequence".into(),
             ));
         }
+
+        log::debug!(
+            "Streaming generation with tools: input_tokens={}, max_tokens={}",
+            tokens.len(),
+            max_tokens
+        );
 
         if max_tokens == 0 {
             return Ok((
@@ -801,6 +963,31 @@ impl LlamaCppProvider {
                                 }
                             }
 
+                            // Handle reasoning_content delta (thinking)
+                            if let Some(reasoning_delta) =
+                                delta.get("reasoning_content").and_then(|v| v.as_str())
+                            {
+                                if !reasoning_delta.is_empty() {
+                                    if tx
+                                        .unbounded_send(Ok(querymt::chat::StreamChunk::Thinking(
+                                            reasoning_delta.to_string(),
+                                        )))
+                                        .is_err()
+                                    {
+                                        return Ok((
+                                            Usage {
+                                                input_tokens: tokens.len() as u32,
+                                                output_tokens,
+                                                cache_read: 0,
+                                                cache_write: 0,
+                                                reasoning_tokens: 0,
+                                            },
+                                            !tool_calls_in_progress.is_empty(),
+                                        ));
+                                    }
+                                }
+                            }
+
                             // Handle tool call deltas - parse tool_calls array
                             if let Some(tool_calls_arr) =
                                 delta.get("tool_calls").and_then(|v| v.as_array())
@@ -923,7 +1110,7 @@ impl LlamaCppProvider {
         }
 
         // Parse final response to get complete tool calls
-        let (_, tool_calls, _) = Self::parse_tool_response(result, &generated_text)?;
+        let (_, _, tool_calls, _) = Self::parse_tool_response(result, &generated_text)?;
 
         // Emit ToolUseComplete for each tool call
         let has_tool_calls = if let Some(calls) = tool_calls {
@@ -1374,11 +1561,12 @@ impl ChatProvider for LlamaCppProvider {
             if !tools.is_empty() {
                 let template_result = self.apply_template_with_tools(messages, tools)?;
                 let generated = self.generate_with_tools(&template_result, max_tokens, None)?;
-                let (content, tool_calls, finish_reason) =
+                let (content, thinking, tool_calls, finish_reason) =
                     Self::parse_tool_response(&template_result, &generated.text)?;
 
                 return Ok(Box::new(LlamaCppChatResponse {
                     text: content,
+                    thinking,
                     tool_calls,
                     finish_reason,
                     usage: generated.usage,
@@ -1399,8 +1587,10 @@ impl ChatProvider for LlamaCppProvider {
             let raw_prompt = self.build_raw_prompt(messages)?;
             generated = self.generate(&raw_prompt, max_tokens, None)?;
         }
+        let (thinking, clean_text) = querymt::chat::extract_thinking(&generated.text);
         Ok(Box::new(LlamaCppChatResponse {
-            text: generated.text,
+            text: clean_text,
+            thinking,
             tool_calls: None,
             finish_reason: FinishReason::Stop,
             usage: generated.usage,
@@ -1560,4 +1750,25 @@ impl LLMProviderFactory for LlamaCppFactory {
 #[unsafe(no_mangle)]
 pub extern "C" fn plugin_factory() -> *mut dyn LLMProviderFactory {
     Box::into_raw(Box::new(LlamaCppFactory)) as *mut _
+}
+
+/// Initialize logging from the host process.
+///
+/// This function is called by the host after loading the plugin via dlopen.
+/// It sets up a logger that forwards all `log` crate calls from this plugin
+/// back to the host's logger, enabling `RUST_LOG` filtering to work for the plugin.
+///
+/// # Safety
+///
+/// This function is unsafe because:
+/// - The `callback` function pointer must remain valid for the lifetime of the plugin
+/// - This should only be called once per plugin load (the host ensures this)
+/// - The callback must be thread-safe
+#[cfg(feature = "native")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn plugin_init_logging(
+    callback: querymt::plugin::LogCallbackFn,
+    max_level: usize,
+) {
+    querymt::plugin::plugin_log::init_from_host(callback, max_level);
 }

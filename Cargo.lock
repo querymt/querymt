@@ -8271,6 +8271,7 @@ dependencies = [
  "futures",
  "hf-hub",
  "llama-cpp-2",
+ "log",
  "querymt",
  "schemars 0.8.22",
  "serde",

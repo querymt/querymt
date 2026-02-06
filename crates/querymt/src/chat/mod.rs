@@ -15,6 +15,85 @@ use std::pin::Pin;
 
 pub mod http;
 
+/// Extract `<think>...</think>` blocks from text, returning (thinking, clean_content).
+///
+/// This handles the common pattern where local models (Qwen3, DeepSeek, QwQ)
+/// output `<think>...</think>` inline in their response text.
+///
+/// Returns `(thinking_content, clean_content)` where:
+/// - `thinking_content` is `Some(reasoning)` if `<think>` blocks were found, `None` otherwise
+/// - `clean_content` is the text with all `<think>...</think>` blocks removed and trimmed
+///
+/// # Examples
+///
+/// ```
+/// use querymt::chat::extract_thinking;
+///
+/// let (thinking, content) = extract_thinking("<think>reasoning here</think>\n\nHello!");
+/// assert_eq!(thinking, Some("reasoning here".to_string()));
+/// assert_eq!(content, "Hello!");
+///
+/// let (thinking, content) = extract_thinking("No thinking here");
+/// assert_eq!(thinking, None);
+/// assert_eq!(content, "No thinking here");
+/// ```
+pub fn extract_thinking(text: &str) -> (Option<String>, String) {
+    const OPEN_TAG: &str = "<think>";
+    const CLOSE_TAG: &str = "</think>";
+
+    let mut thinking_parts = Vec::new();
+    let mut clean_parts = Vec::new();
+    let mut remaining = text;
+
+    loop {
+        match remaining.find(OPEN_TAG) {
+            Some(open_pos) => {
+                // Add text before the <think> tag to clean parts
+                let before = &remaining[..open_pos];
+                if !before.is_empty() {
+                    clean_parts.push(before);
+                }
+
+                let after_open = &remaining[open_pos + OPEN_TAG.len()..];
+                match after_open.find(CLOSE_TAG) {
+                    Some(close_pos) => {
+                        // Found a complete <think>...</think> block
+                        let thinking_content = &after_open[..close_pos];
+                        let trimmed = thinking_content.trim();
+                        if !trimmed.is_empty() {
+                            thinking_parts.push(trimmed.to_string());
+                        }
+                        remaining = &after_open[close_pos + CLOSE_TAG.len()..];
+                    }
+                    None => {
+                        // Unclosed <think> tag — treat the rest as thinking content
+                        let thinking_content = after_open.trim();
+                        if !thinking_content.is_empty() {
+                            thinking_parts.push(thinking_content.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+            None => {
+                // No more <think> tags
+                if !remaining.is_empty() {
+                    clean_parts.push(remaining);
+                }
+                break;
+            }
+        }
+    }
+
+    if thinking_parts.is_empty() {
+        (None, text.to_string())
+    } else {
+        let thinking = thinking_parts.join("\n\n");
+        let clean = clean_parts.join("").trim().to_string();
+        (Some(thinking), clean)
+    }
+}
+
 /// Role of a participant in a chat conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatRole {
@@ -102,6 +181,12 @@ pub struct ChatMessage {
     pub message_type: MessageType,
     /// The text content of the message
     pub content: String,
+    /// Optional thinking/reasoning content from the model.
+    /// Kept separate from `content` so providers can serialize it in their
+    /// expected format (e.g., `reasoning_content` for llama.cpp templates,
+    /// `thinking` content blocks for Anthropic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     /// Optional cache hint. Providers that support caching (e.g., Anthropic)
     /// will translate this into provider-specific cache breakpoint markers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -465,6 +550,7 @@ pub trait ChatResponse: std::fmt::Debug + std::fmt::Display + Send {
 impl From<&dyn ChatResponse> for ChatMessage {
     fn from(response: &dyn ChatResponse) -> Self {
         let content = response.text().unwrap_or_default();
+        let thinking = response.thinking();
         let tool_calls = response.tool_calls();
         let message_type = if let Some(calls) = tool_calls.clone() {
             MessageType::ToolUse(calls)
@@ -475,6 +561,7 @@ impl From<&dyn ChatResponse> for ChatMessage {
             role: ChatRole::Assistant,
             message_type,
             content,
+            thinking,
             cache: None,
         }
     }
@@ -502,6 +589,11 @@ pub enum FinishReason {
 pub enum StreamChunk {
     /// Text content delta
     Text(String),
+
+    /// Thinking/reasoning content delta from the model.
+    /// This is emitted separately from `Text` so consumers can display or
+    /// store reasoning content differently (e.g., dimmed text, separate field).
+    Thinking(String),
 
     /// Tool use block started (contains tool id and name)
     ToolUseStart {
@@ -655,6 +747,7 @@ pub struct ChatMessageBuilder {
     role: ChatRole,
     message_type: MessageType,
     content: String,
+    thinking: Option<String>,
     cache: Option<CacheHint>,
 }
 
@@ -665,6 +758,7 @@ impl ChatMessageBuilder {
             role,
             message_type: MessageType::default(),
             content: String::new(),
+            thinking: None,
             cache: None,
         }
     }
@@ -672,6 +766,14 @@ impl ChatMessageBuilder {
     /// Set the message content
     pub fn content<S: Into<String>>(mut self, content: S) -> Self {
         self.content = content.into();
+        self
+    }
+
+    /// Set the thinking/reasoning content.
+    /// Empty strings are treated as None.
+    pub fn thinking<S: Into<String>>(mut self, thinking: S) -> Self {
+        let t = thinking.into();
+        self.thinking = if t.is_empty() { None } else { Some(t) };
         self
     }
 
@@ -717,6 +819,7 @@ impl ChatMessageBuilder {
             role: self.role,
             message_type: self.message_type,
             content: self.content,
+            thinking: self.thinking,
             cache: self.cache,
         }
     }

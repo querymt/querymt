@@ -128,6 +128,7 @@ impl SessionCompaction {
             role: ChatRole::User,
             message_type: querymt::chat::MessageType::Text,
             content: COMPACTION_PROMPT.to_string(),
+            thinking: None,
             cache: None,
         });
 

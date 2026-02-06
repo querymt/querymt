@@ -139,6 +139,7 @@ impl ConversationContext {
             role: ChatRole::User,
             message_type: querymt::chat::MessageType::Text,
             content,
+            thinking: None,
             cache: None,
         };
 

@@ -31,6 +31,7 @@ pub fn test_context_with_user_messages(
             role: ChatRole::User,
             message_type: querymt::chat::MessageType::Text,
             content: format!("User message {}", i),
+            thinking: None,
             cache: None,
         })
         .collect();
