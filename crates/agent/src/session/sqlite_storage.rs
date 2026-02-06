@@ -68,11 +68,22 @@ pub struct SqliteStorage {
 
 impl SqliteStorage {
     pub async fn connect(path: PathBuf) -> SessionResult<Self> {
+        Self::connect_with_options(path, true).await
+    }
+
+    /// Connect to the database with control over migration behavior.
+    ///
+    /// When `migrate` is `false`, the database is opened as-is without running
+    /// migrations.  This is useful for read-only tooling (e.g. session replay,
+    /// export) that must not alter the existing data.
+    pub async fn connect_with_options(path: PathBuf, migrate: bool) -> SessionResult<Self> {
         let db_path = path.clone();
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection, rusqlite::Error> {
             let mut conn = Connection::open(&db_path)?;
             conn.execute("PRAGMA foreign_keys = ON;", [])?;
-            apply_migrations(&mut conn)?;
+            if migrate {
+                apply_migrations(&mut conn)?;
+            }
             Ok(conn)
         })
         .await
