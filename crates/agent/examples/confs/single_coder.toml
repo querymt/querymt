@@ -1,0 +1,135 @@
+# Single Coder Agent Configuration
+#
+# A single AI agent that operates in three switchable modes:
+#   - Build mode (default): Full read/write access, implements code changes
+#   - Plan mode: Read-only, explores and plans before implementation
+#   - Review mode: Read-only, reviews code quality and provides feedback
+#
+# Switch modes at runtime with Ctrl+M (or Cmd+M on macOS).
+# The mode indicator in the UI header shows the current mode.
+
+[agent]
+db = "/tmp/agent.db"
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+#provider = "llama_cpp"
+#model = "qwen3-coder-30b"
+tools = [
+  # File operations
+  "edit", "read_file", "write_file",
+  # Search & navigation
+  "glob", "search_text", "ls",
+  # Execution
+  "shell",
+  # Task management
+  "create_task", "todowrite", "todoread",
+  # User interaction
+  "question",
+  # Code intelligence
+  "code_surgeon",
+]
+system = [
+  "You are Claude Code, Anthropic's official CLI for Claude.",
+#  { file = "../prompts/anthropic_opencode.txt" }
+]
+
+[agent.snapshot]
+backend = "git"
+
+# Compaction: tool output truncation (Layer 1)
+[agent.tool_output]
+max_lines = 2000
+max_bytes = 51200
+
+# Compaction: pruning after every turn (Layer 2)
+[agent.pruning]
+protect_tokens = 40000
+
+# Compaction: AI summary on context overflow (Layer 3)
+[agent.compaction]
+auto = true
+
+#[agent.parameters]
+#model_path = "hf:unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf"
+#n_ctx = 32768
+
+# =============================================================================
+# Middleware Stack
+# =============================================================================
+
+# Mode-aware middleware: injects reminders when in Plan or Review mode.
+# In Build mode (default), no reminder is injected — full read/write access.
+# Switch modes at runtime with Ctrl+M / Cmd+M.
+[[middleware]]
+type = "agent_mode"
+default = "build"
+reminder = """<system-reminder>
+# Plan Mode
+
+You are in **plan mode**. You may only observe, analyze, and plan.
+
+## What You CAN Do
+- Read files, search code, list directories
+- Analyze architecture and patterns
+- Create todo lists and task breakdowns
+- Ask the user clarifying questions
+- Run read-only shell commands (git log, grep, find, etc.)
+
+## What You MUST NOT Do
+- Do NOT edit, create, or delete files
+- Do NOT run mutating shell commands (no sed, tee, echo >, rm, cargo build, etc.)
+- Do NOT write code — only plan what code should be written
+
+## Your Goal
+Produce a clear, actionable implementation plan. Break work into small, concrete
+steps. Identify risks and tradeoffs. When the user is ready to implement, they
+will switch to Build mode.
+
+Ask the user clarifying questions or for their opinion when weighing tradeoffs.
+</system-reminder>"""
+review_reminder = """<system-reminder>
+# Review Mode
+
+You are in **review mode**. You are a code reviewer providing constructive feedback.
+
+## What You CAN Do
+- Read files and search code to understand context
+- Analyze code quality, correctness, and style
+- Identify bugs, performance issues, and security concerns
+- Suggest improvements and alternative approaches
+- Check adherence to best practices and project conventions
+- Run read-only commands (tests with --dry-run, linting, etc.)
+
+## What You MUST NOT Do
+- Do NOT edit, create, or delete files
+- Do NOT run mutating shell commands
+- Do NOT implement fixes — only describe what should be fixed
+
+## Your Goal
+Provide thorough, constructive code review feedback. Be specific about issues
+and suggest concrete fixes. Prioritize findings by severity. Focus on:
+1. Correctness — bugs, logic errors, edge cases
+2. Security — vulnerabilities, unsafe patterns
+3. Performance — bottlenecks, unnecessary allocations
+4. Maintainability — readability, naming, documentation
+5. Architecture — design patterns, coupling, cohesion
+</system-reminder>"""
+
+# Execution limits
+[[middleware]]
+type = "limits"
+max_steps = 200
+max_turns = 50
+
+# Context management with auto-compaction
+[[middleware]]
+type = "context"
+warn_at_percent = 80
+auto_compact = true
+fallback_max_tokens = 128000
+
+# Detect when code is similar to existing code
+[[middleware]]
+type = "dedup_check"
+threshold = 0.85
+min_lines = 10

@@ -41,7 +41,7 @@ pub use limits::{
 };
 pub use presets::MiddlewarePresets;
 pub use specialized::{
-    DuplicateToolCallMiddleware, PlanModeMiddleware, TaskAutoCompletionMiddleware,
+    AgentModeMiddleware, DuplicateToolCallMiddleware, TaskAutoCompletionMiddleware,
 };
 
 #[cfg(test)]

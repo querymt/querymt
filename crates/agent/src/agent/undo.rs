@@ -37,19 +37,33 @@ impl QueryMTAgent {
             .snapshot_backend
             .as_ref()
             .ok_or_else(|| anyhow!("No snapshot backend configured"))?;
-        let worktree = self
-            .snapshot_root
-            .as_ref()
-            .ok_or_else(|| anyhow!("No worktree configured"))?;
+
+        // Get worktree from session runtime
+        let worktree = {
+            let runtime_map = self.session_runtime.lock().await;
+            let runtime = runtime_map
+                .get(session_id)
+                .ok_or_else(|| anyhow!("Session runtime not found for session: {}", session_id))?;
+            runtime
+                .cwd
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "No working directory configured for session: {}",
+                        session_id
+                    )
+                })?
+                .to_path_buf()
+        };
 
         // 1. Snapshot current state for redo
-        let pre_revert_snapshot = backend.track(worktree).await?;
+        let pre_revert_snapshot = backend.track(&worktree).await?;
         info!(
             "Undo: created pre-revert snapshot {} for session {}",
             pre_revert_snapshot, session_id
         );
 
-        // 2. Get message history
+        // 2. Get message history from parent session
         let history = self
             .provider
             .history_store()
@@ -63,75 +77,167 @@ impl QueryMTAgent {
             .position(|m| m.id == message_id)
             .ok_or_else(|| anyhow!("Message not found: {}", message_id))?;
 
-        // 4. Collect all StepSnapshotPatch/StepSnapshotStart pairs after the target message
+        // 4. Get child sessions (for delegation scenarios)
+        let child_sessions = self
+            .provider
+            .history_store()
+            .list_child_sessions(session_id)
+            .await
+            .unwrap_or_default();
+
+        debug!(
+            "Undo: found {} child sessions for session {}",
+            child_sessions.len(),
+            session_id
+        );
+
+        // 5. Collect all TurnSnapshotPatch/TurnSnapshotStart pairs from parent AND child sessions
         let mut all_reverted_files = Vec::new();
 
-        // Walk messages after the target, collecting patches to undo
-        let messages_after = &history[target_idx + 1..];
+        // Collect sessions to scan: parent + all children
+        let mut sessions_to_scan = vec![session_id.to_string()];
+        sessions_to_scan.extend(child_sessions);
 
-        // Build a map of step_id -> pre-snapshot_id from StepSnapshotStart parts
+        // Build a global map of turn_id -> pre-snapshot_id from TurnSnapshotStart parts
         let mut pre_snapshots: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut all_patches: Vec<(String, String, Vec<String>)> = Vec::new();
 
-        for msg in messages_after {
-            for part in &msg.parts {
-                if let MessagePart::StepSnapshotStart {
-                    step_id,
-                    snapshot_id,
-                } = part
+        // Scan all sessions (parent + children) for snapshot parts
+        for scan_session_id in &sessions_to_scan {
+            let session_history = if scan_session_id == session_id {
+                // Already have parent history
+                &history[target_idx + 1..]
+            } else {
+                // Get child session history (all messages, not just after target)
+                match self
+                    .provider
+                    .history_store()
+                    .get_history(scan_session_id)
+                    .await
                 {
-                    pre_snapshots.insert(step_id.clone(), snapshot_id.clone());
+                    Ok(child_history) => {
+                        debug!(
+                            "Undo: scanning {} messages from child session {}",
+                            child_history.len(),
+                            scan_session_id
+                        );
+                        // Collect TurnSnapshotStart from child
+                        for msg in &child_history {
+                            for part in &msg.parts {
+                                if let MessagePart::TurnSnapshotStart {
+                                    turn_id,
+                                    snapshot_id,
+                                } = part
+                                {
+                                    pre_snapshots.insert(turn_id.clone(), snapshot_id.clone());
+                                }
+                            }
+                        }
+                        // Collect TurnSnapshotPatch from child
+                        for msg in &child_history {
+                            for part in &msg.parts {
+                                if let MessagePart::TurnSnapshotPatch {
+                                    turn_id,
+                                    snapshot_id: _,
+                                    changed_paths,
+                                } = part
+                                    && let Some(pre_snapshot) = pre_snapshots.get(turn_id)
+                                {
+                                    all_patches.push((
+                                        turn_id.clone(),
+                                        pre_snapshot.clone(),
+                                        changed_paths.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Undo: failed to get history for child session {}: {}",
+                            scan_session_id, e
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            // For parent session, scan messages after target
+            for msg in session_history {
+                for part in &msg.parts {
+                    if let MessagePart::TurnSnapshotStart {
+                        turn_id,
+                        snapshot_id,
+                    } = part
+                    {
+                        pre_snapshots.insert(turn_id.clone(), snapshot_id.clone());
+                    }
+                }
+            }
+
+            for msg in session_history {
+                for part in &msg.parts {
+                    if let MessagePart::TurnSnapshotPatch {
+                        turn_id,
+                        snapshot_id: _,
+                        changed_paths,
+                    } = part
+                        && let Some(pre_snapshot) = pre_snapshots.get(turn_id)
+                    {
+                        all_patches.push((
+                            turn_id.clone(),
+                            pre_snapshot.clone(),
+                            changed_paths.clone(),
+                        ));
+                    }
                 }
             }
         }
 
-        // Process patches in reverse order (undo most recent first)
-        let mut patches_to_undo: Vec<(String, String, Vec<String>)> = Vec::new();
-        for msg in messages_after {
-            for part in &msg.parts {
-                if let MessagePart::StepSnapshotPatch {
-                    step_id,
-                    snapshot_id: _,
-                    changed_paths,
-                } = part
-                    && let Some(pre_snapshot) = pre_snapshots.get(step_id)
-                {
-                    patches_to_undo.push((
-                        step_id.clone(),
-                        pre_snapshot.clone(),
-                        changed_paths.clone(),
-                    ));
-                }
-            }
-        }
+        let patches_to_undo = all_patches;
 
         // Undo patches in reverse order
-        for (step_id, pre_snapshot, changed_paths) in patches_to_undo.iter().rev() {
+        for (turn_id, pre_snapshot, changed_paths) in patches_to_undo.iter().rev() {
             let paths: Vec<PathBuf> = changed_paths.iter().map(PathBuf::from).collect();
-            match backend.restore_paths(worktree, pre_snapshot, &paths).await {
+            match backend.restore_paths(&worktree, pre_snapshot, &paths).await {
                 Ok(()) => {
                     debug!(
-                        "Undo: restored {} files from step {} snapshot {}",
+                        "Undo: restored {} files from turn {} snapshot {}",
                         paths.len(),
-                        step_id,
+                        turn_id,
                         pre_snapshot
                     );
                     all_reverted_files.extend(changed_paths.iter().cloned());
                 }
                 Err(e) => {
-                    warn!("Undo: failed to restore files from step {}: {}", step_id, e);
+                    warn!("Undo: failed to restore files from turn {}: {}", turn_id, e);
                 }
             }
         }
 
-        // If no patches found, try a full restore to the snapshot at the target message
+        // If no patches found, try a restore to the snapshot at the target message
         if patches_to_undo.is_empty() {
-            // Look for a StepSnapshotPatch in the target message itself
+            // Look for a TurnSnapshotPatch in the target message itself
             // to get the snapshot state at that point
             for part in &history[target_idx].parts {
-                if let MessagePart::StepSnapshotPatch { snapshot_id, .. } = part {
-                    debug!("Undo: full restore to snapshot {}", snapshot_id);
-                    backend.restore(worktree, snapshot_id).await?;
+                if let MessagePart::TurnSnapshotPatch { snapshot_id, .. } = part {
+                    debug!("Undo: fallback restore to snapshot {}", snapshot_id);
+
+                    // Compute diff to determine what needs to change
+                    let current_snapshot = backend.track(&worktree).await?;
+                    let changed = backend
+                        .diff(&worktree, &current_snapshot, snapshot_id)
+                        .await?;
+
+                    if !changed.is_empty() {
+                        backend
+                            .restore_paths(&worktree, snapshot_id, &changed)
+                            .await?;
+                        all_reverted_files
+                            .extend(changed.iter().map(|p| p.to_string_lossy().to_string()));
+                    }
                     break;
                 }
             }
@@ -170,10 +276,24 @@ impl QueryMTAgent {
             .snapshot_backend
             .as_ref()
             .ok_or_else(|| anyhow!("No snapshot backend configured"))?;
-        let worktree = self
-            .snapshot_root
-            .as_ref()
-            .ok_or_else(|| anyhow!("No worktree configured"))?;
+
+        // Get worktree from session runtime
+        let worktree = {
+            let runtime_map = self.session_runtime.lock().await;
+            let runtime = runtime_map
+                .get(session_id)
+                .ok_or_else(|| anyhow!("Session runtime not found for session: {}", session_id))?;
+            runtime
+                .cwd
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "No working directory configured for session: {}",
+                        session_id
+                    )
+                })?
+                .to_path_buf()
+        };
 
         let revert_state = self
             .provider
@@ -188,8 +308,21 @@ impl QueryMTAgent {
             revert_state.snapshot_id, session_id
         );
 
-        // Restore full state from pre-undo snapshot
-        backend.restore(worktree, &revert_state.snapshot_id).await?;
+        // Take current snapshot and compute diff to target state
+        let current_snapshot = backend.track(&worktree).await?;
+        let changed = backend
+            .diff(&worktree, &current_snapshot, &revert_state.snapshot_id)
+            .await?;
+
+        // Use restore_paths to correctly handle both file restoration and deletion
+        if !changed.is_empty() {
+            debug!("Redo: restoring {} changed files", changed.len());
+            backend
+                .restore_paths(&worktree, &revert_state.snapshot_id, &changed)
+                .await?;
+        } else {
+            debug!("Redo: no file changes needed");
+        }
 
         // Clear revert state
         self.provider

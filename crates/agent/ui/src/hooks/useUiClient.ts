@@ -9,6 +9,7 @@ import {
   AuditView,
   FileIndexEntry,
   ModelEntry,
+  RecentModelEntry,
   LlmConfigDetails,
   SessionLimits,
 } from '../types';
@@ -25,8 +26,12 @@ export function useUiClient() {
   const [activeAgentId, setActiveAgentId] = useState<string>('primary');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  const [agentMode, setAgentModeState] = useState<string>('build');
+  // @ts-expect-error - setAvailableModes reserved for future backend integration
+  const [availableModes, setAvailableModes] = useState<string[]>(['build', 'plan']);
   const [sessionGroups, setSessionGroups] = useState<SessionGroup[]>([]);
   const [allModels, setAllModels] = useState<ModelEntry[]>([]);
+  const [recentModelsByWorkspace, setRecentModelsByWorkspace] = useState<Record<string, RecentModelEntry[]>>({});
   const [sessionsByAgent, setSessionsByAgent] = useState<Record<string, string>>({});
   const [agentModels, setAgentModels] = useState<
     Record<string, { provider?: string; model?: string; contextLimit?: number }>
@@ -57,6 +62,11 @@ export function useUiClient() {
     [eventsBySession, mainSessionId]
   );
 
+  // Use a ref to always access the latest handleServerMessage from the socket callback.
+  // Without this, the onmessage handler captures a stale closure from the initial render,
+  // causing all state reads (mainSessionId, activeAgentId, etc.) to be permanently stale.
+  const handleServerMessageRef = useRef<(msg: UiServerMessage) => void>(() => {});
+
   useEffect(() => {
     let mounted = true;
     // Dynamically construct WebSocket URL from current page location
@@ -69,6 +79,7 @@ export function useUiClient() {
       setConnected(true);
       sendMessage({ type: 'init' });
       sendMessage({ type: 'list_all_models', refresh: false });
+      sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
     };
 
     socket.onclose = () => {
@@ -85,7 +96,7 @@ export function useUiClient() {
       if (!mounted) return;
       try {
         const msg = JSON.parse(event.data) as UiServerMessage;
-        handleServerMessage(msg);
+        handleServerMessageRef.current(msg);
       } catch (err) {
         console.error('Failed to parse UI message:', err);
       }
@@ -108,6 +119,9 @@ export function useUiClient() {
         setActiveAgentId(msg.active_agent_id);
         setSessionId(msg.active_session_id ?? null);
         setSessionsByAgent(msg.sessions_by_agent ?? {});
+        if (msg.agent_mode) {
+          setAgentModeState(msg.agent_mode);
+        }
         break;
       case 'session_created':
         if (msg.agent_id === activeAgentId) {
@@ -118,6 +132,11 @@ export function useUiClient() {
           setSessionLimits(null); // Clear session limits, will be set by session_configured event
           setIsConversationComplete(false); // Reset conversation complete state
           setThinkingBySession(new Map()); // Clear all session thinking state
+          setUndoState(null); // Clear undo state from previous session
+          // NOTE: We intentionally do NOT clear agentModels here.
+          // The model badge should continue to show the last known model
+          // until we receive a provider_changed event for the new session.
+          // This provides better UX than showing an empty badge.
         }
         // Resolve pending promise if there's a request_id match
         if (msg.request_id && pendingRequestsRef.current.has(msg.request_id)) {
@@ -375,6 +394,7 @@ export function useUiClient() {
         setSessionId(msg.session_id);
         setMainSessionId(msg.session_id);
         setSessionAudit(msg.audit);
+        setUndoState(null); // Clear undo state from previous session
         
         // Populate eventsBySession from the audit events (for old session history)
         const translated = msg.audit.events.map((e: any) => {
@@ -389,18 +409,21 @@ export function useUiClient() {
         eventsMap.set(msg.session_id, translated);
         setEventsBySession(eventsMap);
         
-        // Update agentModels from the last provider event in the loaded session
+        // Update agentModels from the last provider event in the loaded session.
+        // Clear first so stale model info from a previous session doesn't persist.
         const lastProvider = [...translated].reverse()
           .find(e => e.provider || e.model);
         if (lastProvider) {
-          setAgentModels(prev => ({
-            ...prev,
+          setAgentModels({
             [msg.agent_id]: {
               provider: lastProvider.provider,
               model: lastProvider.model,
               contextLimit: lastProvider.contextLimit,
             },
-          }));
+          });
+        } else {
+          // No provider info in loaded session - clear stale model badge
+          setAgentModels({});
         }
         
         // Subscribe to child delegation sessions
@@ -439,6 +462,15 @@ export function useUiClient() {
       case 'all_models_list':
         setAllModels(msg.models);
         break;
+      case 'recent_models': {
+        // Convert null keys to empty string for consistent lookup
+        const normalized: Record<string, RecentModelEntry[]> = {};
+        for (const [key, value] of Object.entries(msg.by_workspace)) {
+          normalized[key === 'null' ? '' : key] = value;
+        }
+        setRecentModelsByWorkspace(normalized);
+        break;
+      }
       case 'llm_config': {
         const config: LlmConfigDetails = {
           configId: msg.config_id,
@@ -477,10 +509,17 @@ export function useUiClient() {
         }
         break;
       }
+      case 'agent_mode':
+        setAgentModeState(msg.mode);
+        break;
       default:
         break;
     }
   };
+
+  // Keep the ref always pointing to the latest version of handleServerMessage
+  // so the WebSocket onmessage handler never uses a stale closure.
+  handleServerMessageRef.current = handleServerMessage;
 
   const sendMessage = (message: UiClientMessage) => {
     const socket = socketRef.current;
@@ -536,6 +575,14 @@ export function useUiClient() {
 
   const setSessionModel = useCallback((sessionId: string, modelId: string) => {
     sendMessage({ type: 'set_session_model', session_id: sessionId, model_id: modelId });
+    // Refresh recent models after a short delay
+    setTimeout(() => {
+      sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
+    }, 500);
+  }, []);
+
+  const fetchRecentModels = useCallback(() => {
+    sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
   }, []);
 
   // Register a callback for file index updates
@@ -601,6 +648,17 @@ export function useUiClient() {
     sendMessage({ type: 'elicitation_response', elicitation_id: elicitationId, action, content });
   }, []);
 
+  const setAgentMode = useCallback((mode: string) => {
+    setAgentModeState(mode);  // Optimistic update
+    sendMessage({ type: 'set_agent_mode', mode });
+  }, []);
+
+  const cycleAgentMode = useCallback(() => {
+    const currentIndex = availableModes.indexOf(agentMode);
+    const nextMode = availableModes[(currentIndex + 1) % availableModes.length];
+    setAgentMode(nextMode);
+  }, [agentMode, setAgentMode, availableModes]);
+
   return {
     events,
     eventsBySession,
@@ -617,10 +675,12 @@ export function useUiClient() {
     setRoutingMode: selectRoutingMode,
     sessionGroups,
     allModels,
+    recentModelsByWorkspace,
     sessionsByAgent,
     agentModels,
     loadSession,
     refreshAllModels,
+    fetchRecentModels,
     setSessionModel,
     sessionAudit,
     thinkingAgentId,
@@ -642,6 +702,10 @@ export function useUiClient() {
     undoState,
     sessionCreatingRef,
     sendElicitationResponse,
+    agentMode,
+    availableModes,
+    setAgentMode,
+    cycleAgentMode,
   };
 }
 

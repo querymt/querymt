@@ -19,11 +19,14 @@ pub enum SnapshotState {
 
 impl QueryMTAgent {
     /// Prepares a snapshot configuration if enabled.
-    pub(crate) fn prepare_snapshot(&self) -> Option<(std::path::PathBuf, SnapshotPolicy)> {
+    pub(crate) fn prepare_snapshot(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Option<(std::path::PathBuf, SnapshotPolicy)> {
         if self.snapshot_policy == SnapshotPolicy::None {
             return None;
         }
-        let root = self.snapshot_root.clone()?;
+        let root = cwd?.to_path_buf();
         Some((root, self.snapshot_policy))
     }
 

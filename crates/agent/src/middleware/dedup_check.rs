@@ -35,15 +35,17 @@ use crate::event_bus::EventBus;
 use crate::events::AgentEventKind;
 use crate::index::{DiffPaths, FunctionIndex, IndexedFunctionEntry, SimilarFunctionMatch};
 use crate::middleware::factory::MiddlewareFactory;
-use crate::middleware::{ConversationContext, ExecutionState, MiddlewareDriver, Result, ToolResult};
+use crate::middleware::{
+    ConversationContext, ExecutionState, MiddlewareDriver, Result, ToolResult,
+};
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, RwLock};
 use tracing::instrument;
 
@@ -330,20 +332,26 @@ impl DedupCheckMiddleware {
         warnings: Vec<DuplicateWarning>,
         changed_paths: &DiffPaths,
     ) -> Vec<DuplicateWarning> {
-        warnings.into_iter().filter(|warning| {
-            // Keep warning only if the matched function is NOT in a file that was
-            // removed/modified during this turn (which would indicate a move)
-            warning.matches.iter().any(|m| {
-                // If the similar match's file was also changed in this turn,
-                // the function may have been moved/removed — not a real duplicate
-                !changed_paths.removed.contains(&m.file_path)
+        warnings
+            .into_iter()
+            .filter(|warning| {
+                // Keep warning only if the matched function is NOT in a file that was
+                // removed/modified during this turn (which would indicate a move)
+                warning.matches.iter().any(|m| {
+                    // If the similar match's file was also changed in this turn,
+                    // the function may have been moved/removed — not a real duplicate
+                    !changed_paths.removed.contains(&m.file_path)
+                })
             })
-        }).map(|mut warning| {
-            // Also filter individual matches
-            warning.matches.retain(|m| !changed_paths.removed.contains(&m.file_path));
-            warning
-        }).filter(|w| !w.matches.is_empty())
-        .collect()
+            .map(|mut warning| {
+                // Also filter individual matches
+                warning
+                    .matches
+                    .retain(|m| !changed_paths.removed.contains(&m.file_path));
+                warning
+            })
+            .filter(|w| !w.matches.is_empty())
+            .collect()
     }
 
     /// Update the function index with newly changed files
@@ -430,7 +438,7 @@ impl MiddlewareDriver for DedupCheckMiddleware {
         // Find an active session with turn_diffs
         let (function_index, turn_diffs) = {
             let runtimes = self.session_runtime.lock().await;
-            
+
             // Try to find the session matching our context
             let session_id = &context.session_id;
             let runtime = runtimes.get(session_id.as_ref());
@@ -524,7 +532,8 @@ impl MiddlewareDriver for DedupCheckMiddleware {
 
     fn reset(&self) {
         // Reset review guard and clear accumulated results
-        self.already_reviewed_this_turn.store(false, Ordering::SeqCst);
+        self.already_reviewed_this_turn
+            .store(false, Ordering::SeqCst);
         if let Ok(mut pending) = self.pending_results.try_lock() {
             pending.clear();
         }

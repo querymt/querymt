@@ -247,6 +247,11 @@ pub enum AgentEventKind {
         /// List of duplicate code warnings
         warnings: Vec<crate::middleware::dedup_check::DuplicateWarning>,
     },
+    /// Emitted when the agent's operating mode changes at runtime
+    ModeChanged {
+        mode: String,
+        previous_mode: String,
+    },
 }
 
 #[async_trait]

@@ -1,15 +1,15 @@
 //! Builder pattern methods for QueryMTAgent configuration
 
 use crate::agent::core::{
-    ClientState, DelegationContextConfig, DelegationContextTiming, QueryMTAgent, SnapshotPolicy,
-    ToolConfig, ToolPolicy,
+    AgentMode, ClientState, DelegationContextConfig, DelegationContextTiming, QueryMTAgent,
+    SnapshotPolicy, ToolConfig, ToolPolicy,
 };
 use crate::config::{CompactionConfig, PruningConfig, ToolOutputConfig};
 use crate::delegation::AgentRegistry;
 use crate::event_bus::EventBus;
 use crate::middleware::{
-    ContextConfig, ContextMiddleware, DelegationConfig, DelegationMiddleware, LimitsConfig,
-    LimitsMiddleware, PlanModeMiddleware,
+    AgentModeMiddleware, ContextConfig, ContextMiddleware, DelegationConfig, DelegationMiddleware,
+    LimitsConfig, LimitsMiddleware,
 };
 use crate::tools::ToolRegistry;
 use agent_client_protocol::AuthMethod;
@@ -58,8 +58,8 @@ pub trait AgentBuilderExt {
         middlewares: Vec<Arc<dyn crate::middleware::MiddlewareDriver>>,
     ) -> Self;
 
-    /// Adds plan mode middleware with a custom reminder.
-    fn with_plan_mode_middleware<T: Into<String>>(self, reminder: T) -> Self;
+    /// Adds agent mode middleware with a custom plan-mode reminder.
+    fn with_agent_mode_middleware<T: Into<String>>(self, reminder: T) -> Self;
 
     /// Adds an event observer to the agent.
     fn with_event_observer<O: crate::events::EventObserver + 'static>(self, observer: O) -> Self;
@@ -71,9 +71,6 @@ pub trait AgentBuilderExt {
     fn with_auth_methods<I>(self, methods: I) -> Self
     where
         I: IntoIterator<Item = AuthMethod>;
-
-    /// Sets the snapshot root directory.
-    fn with_snapshot_root(self, path: std::path::PathBuf) -> Self;
 
     /// Sets the snapshot policy.
     fn with_snapshot_policy(self, policy: SnapshotPolicy) -> Self;
@@ -110,8 +107,8 @@ pub trait AgentBuilderExt {
         I: IntoIterator<Item = S>,
         S: Into<String>;
 
-    /// Sets the plan mode enabled flag.
-    fn with_plan_mode_enabled(self, enabled: bool) -> Self;
+    /// Sets the initial agent mode.
+    fn with_agent_mode(self, mode: AgentMode) -> Self;
 
     /// Sets the event observers.
     fn with_event_observers(self, observers: Vec<Arc<dyn crate::events::EventObserver>>) -> Self;
@@ -257,8 +254,8 @@ impl AgentBuilderExt for QueryMTAgent {
         self
     }
 
-    fn with_plan_mode_middleware<T: Into<String>>(self, reminder: T) -> Self {
-        let middleware = PlanModeMiddleware::new(self.plan_mode_enabled.clone(), reminder.into());
+    fn with_agent_mode_middleware<T: Into<String>>(self, reminder: T) -> Self {
+        let middleware = AgentModeMiddleware::new(self.agent_mode.clone(), reminder.into());
         self.middleware_drivers
             .lock()
             .unwrap()
@@ -281,11 +278,6 @@ impl AgentBuilderExt for QueryMTAgent {
         I: IntoIterator<Item = AuthMethod>,
     {
         *self.auth_methods.lock().unwrap() = methods.into_iter().collect();
-        self
-    }
-
-    fn with_snapshot_root(mut self, path: std::path::PathBuf) -> Self {
-        self.snapshot_root = Some(path);
         self
     }
 
@@ -353,9 +345,9 @@ impl AgentBuilderExt for QueryMTAgent {
         self
     }
 
-    fn with_plan_mode_enabled(self, enabled: bool) -> Self {
-        self.plan_mode_enabled
-            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    fn with_agent_mode(self, mode: AgentMode) -> Self {
+        self.agent_mode
+            .store(mode as u8, std::sync::atomic::Ordering::SeqCst);
         self
     }
 

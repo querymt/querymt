@@ -254,7 +254,7 @@ pub fn filter_to_effective_history(messages: Vec<AgentMessage>) -> Vec<AgentMess
             m.parts.iter().any(|p| {
                 !matches!(
                     p,
-                    MessagePart::StepSnapshotStart { .. } | MessagePart::StepSnapshotPatch { .. }
+                    MessagePart::TurnSnapshotStart { .. } | MessagePart::TurnSnapshotPatch { .. }
                 )
             })
         })

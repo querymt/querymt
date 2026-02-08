@@ -108,6 +108,7 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
     };
 
     let agents = build_agent_list(state);
+    let agent_mode = state.agent.get_agent_mode().as_str().to_string();
     let _ = send_message(
         tx,
         UiServerMessage::State {
@@ -116,6 +117,7 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
             active_session_id,
             agents,
             sessions_by_agent,
+            agent_mode,
         },
     )
     .await;

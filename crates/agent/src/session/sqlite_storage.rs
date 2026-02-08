@@ -7,9 +7,10 @@ use crate::session::domain::{
 };
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::projection::{
-    AuditView, DefaultRedactor, EventStore, FilterExpr, PredicateOp, RedactedArtifact,
-    RedactedProgress, RedactedTask, RedactedView, RedactionPolicy, Redactor, SessionGroup,
-    SessionListFilter, SessionListItem, SessionListView, SummaryView, ViewStore,
+    AuditView, DefaultRedactor, EventStore, FilterExpr, PredicateOp, RecentModelEntry,
+    RecentModelsView, RedactedArtifact, RedactedProgress, RedactedTask, RedactedView,
+    RedactionPolicy, Redactor, SessionGroup, SessionListFilter, SessionListItem, SessionListView,
+    SummaryView, ViewStore,
 };
 use crate::session::repo_artifact::SqliteArtifactRepository;
 use crate::session::repo_decision::SqliteDecisionRepository;
@@ -1425,6 +1426,82 @@ impl ViewStore for SqliteStorage {
         let trajectory = builder.build();
 
         Ok(trajectory)
+    }
+
+    async fn get_recent_models_view(
+        &self,
+        limit_per_workspace: usize,
+    ) -> SessionResult<RecentModelsView> {
+        use std::collections::HashMap;
+
+        let conn_arc = self.conn.clone();
+
+        let results = tokio::task::spawn_blocking(
+            move || -> Result<Vec<(Option<String>, String, String, i64, u32)>, rusqlite::Error> {
+                let conn = conn_arc.lock().unwrap();
+
+                // Query all ProviderChanged events with workspace info
+                let mut stmt = conn.prepare(
+                    r#"
+                SELECT 
+                    s.cwd,
+                    json_extract(e.kind, '$.provider') as provider,
+                    json_extract(e.kind, '$.model') as model,
+                    MAX(e.timestamp) as last_used_ts,
+                    COUNT(*) as use_count
+                FROM events e
+                JOIN sessions s ON s.public_id = e.session_id
+                WHERE json_extract(e.kind, '$.type') = 'provider_changed'
+                  AND provider IS NOT NULL
+                  AND model IS NOT NULL
+                GROUP BY s.cwd, provider, model
+                ORDER BY last_used_ts DESC
+                "#,
+                )?;
+
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, u32>(4)?,
+                    ))
+                })?;
+
+                let mut results = Vec::new();
+                for row in rows {
+                    results.push(row?);
+                }
+                Ok(results)
+            },
+        )
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)?;
+
+        // Group by workspace and limit per workspace
+        let mut by_workspace: HashMap<Option<String>, Vec<RecentModelEntry>> = HashMap::new();
+
+        for (cwd, provider, model, last_used_ts, use_count) in results {
+            let entry = RecentModelEntry {
+                provider,
+                model,
+                last_used: OffsetDateTime::from_unix_timestamp(last_used_ts / 1000)
+                    .unwrap_or_else(|_| OffsetDateTime::now_utc()),
+                use_count,
+            };
+
+            let workspace_entries = by_workspace.entry(cwd).or_default();
+            if workspace_entries.len() < limit_per_workspace {
+                workspace_entries.push(entry);
+            }
+        }
+
+        Ok(RecentModelsView {
+            by_workspace,
+            generated_at: OffsetDateTime::now_utc(),
+        })
     }
 }
 

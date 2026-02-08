@@ -2,7 +2,8 @@ import { useCallback, useMemo, useState, useRef } from 'react';
 import { Command } from 'cmdk';
 import * as Popover from '@radix-ui/react-popover';
 import { RefreshCw, Search, X, ChevronRight, ChevronDown } from 'lucide-react';
-import type { ModelEntry, RoutingMode, UiAgentInfo } from '../types';
+import type { ModelEntry, RecentModelEntry, RoutingMode, UiAgentInfo } from '../types';
+import { useUiStore } from '../store/uiStore';
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -20,6 +21,9 @@ interface ModelPickerPopoverProps {
   allModels: ModelEntry[];
   currentProvider?: string;
   currentModel?: string;
+  currentWorkspace: string | null;
+  recentModelsByWorkspace: Record<string, RecentModelEntry[]>;
+  agentMode: string;
   onRefresh: () => void;
   onSetSessionModel: (sessionId: string, modelId: string) => void;
 }
@@ -69,6 +73,9 @@ export function ModelPickerPopover({
   allModels,
   currentProvider,
   currentModel,
+  currentWorkspace,
+  recentModelsByWorkspace,
+  agentMode,
   onRefresh,
   onSetSessionModel,
 }: ModelPickerPopoverProps) {
@@ -76,6 +83,7 @@ export function ModelPickerPopover({
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedValue, setSelectedValue] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
+  const { setModeModelPreference } = useUiStore();
 
   const targetAgents = useMemo(
     () => agents.filter((agent) => sessionsByAgent[agent.id]),
@@ -92,6 +100,19 @@ export function ModelPickerPopover({
     }
     return m;
   }, [allModels]);
+  
+  // Get recent models for current workspace from backend data
+  const recentModels = useMemo(() => {
+    const key = currentWorkspace ?? '';  // Empty string for null workspace
+    const recent = recentModelsByWorkspace[key] || [];
+    
+    // Filter to only show models that are currently available and limit to 5
+    return recent
+      .filter(entry => 
+        allModels.some(m => m.provider === entry.provider && m.model === entry.model)
+      )
+      .slice(0, 5);
+  }, [currentWorkspace, recentModelsByWorkspace, allModels]);
 
   const hasTargetSession =
     target === TARGET_ALL
@@ -129,9 +150,15 @@ export function ModelPickerPopover({
 
       if (sessionIds.size === 0) return;
       sessionIds.forEach((id) => onSetSessionModel(id, modelId));
+      
+      // Save the model preference for the current agent mode
+      setModeModelPreference(agentMode, entry.provider, entry.model);
+      
+      // Backend will automatically record model usage and refresh recent models
+      
       onOpenChange(false);
     },
-    [modelMap, target, sessionsByAgent, sessionId, onSetSessionModel, onOpenChange],
+    [modelMap, target, sessionsByAgent, sessionId, onSetSessionModel, onOpenChange, agentMode, setModeModelPreference],
   );
 
   const handleSwitchClick = useCallback(() => {
@@ -152,7 +179,9 @@ export function ModelPickerPopover({
         <button
           type="button"
           className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-cyber-border bg-cyber-bg/60 text-xs text-gray-300 hover:border-cyber-cyan/60 hover:text-cyber-cyan transition-colors max-w-[280px]"
-          title={currentProvider && currentModel ? `${currentProvider} / ${currentModel}` : 'No model selected'}
+          title={currentProvider && currentModel 
+            ? `${currentProvider} / ${currentModel} (${navigator.platform.includes('Mac') ? '⌘⇧M' : 'Ctrl+Shift+M'} to open)` 
+            : `Select model (${navigator.platform.includes('Mac') ? '⌘⇧M' : 'Ctrl+Shift+M'})`}
         >
           <span className="truncate">{triggerLabel}</span>
           <ChevronDown
@@ -249,6 +278,46 @@ export function ModelPickerPopover({
                     No models match your search
                   </Command.Empty>
 
+                  {/* Recent Models Section */}
+                  {recentModels.length > 0 && (
+                    <Command.Group
+                      heading="Recent"
+                      className="mb-2 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-cyber-cyan [&_[cmdk-group-heading]]:bg-cyber-bg/95"
+                    >
+                      {recentModels.map((entry) => {
+                        const itemValue = `${entry.provider}/${entry.model}`;
+                        const isCurrent =
+                          currentProvider === entry.provider && currentModel === entry.model;
+
+                        return (
+                          <Command.Item
+                            key={`recent-${itemValue}`}
+                            value={itemValue}
+                            keywords={[entry.provider, entry.model]}
+                            onSelect={(val) => switchModel(val)}
+                            className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-gray-300 data-[selected=true]:bg-cyber-cyan/20 data-[selected=true]:text-cyber-cyan data-[selected=true]:border data-[selected=true]:border-cyber-cyan/40 hover:bg-cyber-surface/60 cursor-pointer"
+                          >
+                            <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-cyber-cyan transition-opacity" />
+                            <span className="flex-1 truncate">
+                              {entry.provider} / {entry.model}
+                            </span>
+                            {isCurrent && (
+                              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-cyber-purple/20 text-cyber-purple border border-cyber-purple/30">
+                                current
+                              </span>
+                            )}
+                          </Command.Item>
+                        );
+                      })}
+                    </Command.Group>
+                  )}
+
+                  {/* Separator if we have recent models */}
+                  {recentModels.length > 0 && (
+                    <div className="h-px bg-cyber-border/40 my-2" />
+                  )}
+
+                  {/* Provider-grouped models */}
                   {grouped.map((group) => (
                     <Command.Group
                       key={group.provider}

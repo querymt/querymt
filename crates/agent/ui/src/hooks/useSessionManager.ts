@@ -50,8 +50,18 @@ export function useSessionManager(): SessionManager {
   useEffect(() => {
     if (!connected) return; // Wait for WebSocket
     if (!urlSessionId) return; // On home page, nothing to load
+    
+    // If session creation just completed and URL now matches server state, clear the flag
+    if (sessionCreatingRef.current && urlSessionId === serverSessionId) {
+      sessionCreatingRef.current = false;
+      return; // Already loaded by creation flow
+    }
+    
     if (urlSessionId === serverSessionId) return; // Already loaded
-    if (sessionCreatingRef.current) return; // Skip during creation
+    
+    // During creation the server sets sessionId via session_created before we navigate,
+    // so skip the loadSession call to avoid re-loading what was just created.
+    if (sessionCreatingRef.current) return;
     
     console.log('[useSessionManager] URL changed, loading session:', urlSessionId);
     loadSession(urlSessionId);

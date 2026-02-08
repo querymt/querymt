@@ -145,6 +145,16 @@ pub trait ViewStore: Send + Sync {
         session_id: &str,
         options: &crate::export::AtifExportOptions,
     ) -> SessionResult<crate::export::ATIF>;
+
+    /// Get recent models from full event history, grouped by workspace
+    /// Returns all models ever used, sorted by last_used descending
+    ///
+    /// # Arguments
+    /// * `limit_per_workspace` - Maximum number of recent models to return per workspace
+    async fn get_recent_models_view(
+        &self,
+        limit_per_workspace: usize,
+    ) -> SessionResult<RecentModelsView>;
 }
 
 /// Helper trait for redacting sensitive content
@@ -285,6 +295,25 @@ pub struct SessionGroup {
 pub struct SessionListView {
     pub groups: Vec<SessionGroup>,
     pub total_count: usize,
+    #[serde(with = "time::serde::rfc3339")]
+    pub generated_at: OffsetDateTime,
+}
+
+/// Recent model usage entry from event history
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentModelEntry {
+    pub provider: String,
+    pub model: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub last_used: OffsetDateTime,
+    pub use_count: u32,
+}
+
+/// Recent models view grouped by workspace
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentModelsView {
+    /// Models grouped by workspace (cwd path string, or None for no-workspace sessions)
+    pub by_workspace: std::collections::HashMap<Option<String>, Vec<RecentModelEntry>>,
     #[serde(with = "time::serde::rfc3339")]
     pub generated_at: OffsetDateTime,
 }

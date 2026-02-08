@@ -49,14 +49,14 @@ pub enum MessagePart {
         summary: String,
         original_token_count: usize,
     },
-    /// Step snapshot start: worktree state before LLM call
-    StepSnapshotStart {
-        step_id: String,
+    /// Turn snapshot start: worktree state before turn (user prompt)
+    TurnSnapshotStart {
+        turn_id: String,
         snapshot_id: String,
     },
-    /// Step snapshot patch: worktree state after tool calls, with changed files
-    StepSnapshotPatch {
-        step_id: String,
+    /// Turn snapshot patch: worktree state after turn completes, with changed files
+    TurnSnapshotPatch {
+        turn_id: String,
         snapshot_id: String,
         changed_paths: Vec<String>,
     },
@@ -74,8 +74,8 @@ impl MessagePart {
             MessagePart::Patch { .. } => "patch",
             MessagePart::Snapshot { .. } => "snapshot",
             MessagePart::Compaction { .. } => "compaction",
-            MessagePart::StepSnapshotStart { .. } => "step_snapshot_start",
-            MessagePart::StepSnapshotPatch { .. } => "step_snapshot_patch",
+            MessagePart::TurnSnapshotStart { .. } => "turn_snapshot_start",
+            MessagePart::TurnSnapshotPatch { .. } => "turn_snapshot_patch",
         }
     }
 

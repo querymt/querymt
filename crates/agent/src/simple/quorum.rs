@@ -161,20 +161,16 @@ impl QuorumBuilder {
             let snapshot_backend_config = delegate.snapshot.clone();
             let registry = registry.clone();
             let snapshot_policy_for_delegate = self.snapshot_policy;
-            let cwd_for_delegate = cwd.clone();
+            let _cwd_for_delegate = cwd.clone();
             builder = builder.add_delegate_agent(agent_info, move |store, event_bus| {
                 let mut agent = QueryMTAgent::new(registry.clone(), store, llm_config.clone())
                     .with_event_bus(event_bus)
                     .with_tool_policy(ToolPolicy::BuiltInOnly)
                     .with_snapshot_policy(snapshot_policy_for_delegate);
 
-                // Set snapshot root and backend if snapshot policy is enabled and cwd is available
-                if snapshot_policy_for_delegate != SnapshotPolicy::None
-                    && let Some(ref root) = cwd_for_delegate
-                {
-                    agent = agent
-                        .with_snapshot_root(root.clone())
-                        .with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+                // Set snapshot backend if snapshot policy is enabled
+                if snapshot_policy_for_delegate != SnapshotPolicy::None {
+                    agent = agent.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
                 }
 
                 if !tools.is_empty() {
@@ -219,7 +215,7 @@ impl QuorumBuilder {
         let planner_snapshot = planner_config.snapshot.clone();
         let registry_for_planner = registry.clone();
         let snapshot_policy_for_planner = self.snapshot_policy;
-        let cwd_for_planner = cwd.clone();
+        let _cwd_for_planner = cwd.clone();
         builder = builder.with_planner(move |store, event_bus, agent_registry| {
             let mut agent =
                 QueryMTAgent::new(registry_for_planner.clone(), store, planner_llm.clone())
@@ -228,12 +224,9 @@ impl QuorumBuilder {
                     .with_snapshot_policy(snapshot_policy_for_planner);
 
             // Set snapshot root and backend if snapshot policy is enabled and cwd is available
-            if snapshot_policy_for_planner != SnapshotPolicy::None
-                && let Some(ref root) = cwd_for_planner
-            {
-                agent = agent
-                    .with_snapshot_root(root.clone())
-                    .with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+            // Set snapshot backend if snapshot policy is enabled
+            if snapshot_policy_for_planner != SnapshotPolicy::None {
+                agent = agent.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
             }
 
             if !planner_tools.is_empty() {

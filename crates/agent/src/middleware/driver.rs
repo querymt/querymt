@@ -179,9 +179,7 @@ impl CompositeDriver {
                         .instrument(span)
                         .await?
                 }
-                MiddlewarePhase::TurnEnd => {
-                    driver.on_turn_end(current).instrument(span).await?
-                }
+                MiddlewarePhase::TurnEnd => driver.on_turn_end(current).instrument(span).await?,
             };
 
             let new_state_name = current.name();

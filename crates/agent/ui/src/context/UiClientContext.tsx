@@ -43,6 +43,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
  * - session subscription: subscribeSession, unsubscribeSession
  * - undo/redo: sendUndo, sendRedo, undoState
  * - elicitation: sendElicitationResponse
+ * - agentMode, availableModes, setAgentMode, cycleAgentMode
  */
 export function useUiClientContext(): UiClientContextValue {
   const context = useContext(UiClientContext);

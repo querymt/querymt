@@ -274,7 +274,6 @@ impl TestHarness {
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
             session_runtime: Arc::new(Mutex::new(HashMap::new())),
             max_steps: None,
-            snapshot_root: None,
             snapshot_policy: SnapshotPolicy::None,
             assume_mutating: false,
             mutating_tools: HashSet::new(),
@@ -282,7 +281,7 @@ impl TestHarness {
             tool_config: Arc::new(StdMutex::new(ToolConfig::default())),
             tool_registry: Arc::new(StdMutex::new(ToolRegistry::new())),
             middleware_drivers: Arc::new(std::sync::Mutex::new(Vec::new())),
-            plan_mode_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            agent_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             event_bus: Arc::new(EventBus::new()),
             client_state: Arc::new(StdMutex::new(None)),
             auth_methods: Arc::new(StdMutex::new(Vec::new())),
@@ -326,8 +325,7 @@ impl TestHarness {
             permission_cache: StdMutex::new(HashMap::new()),
             current_tools_hash: StdMutex::new(None),
             function_index: Arc::new(tokio::sync::OnceCell::new()),
-            pre_step_snapshot: StdMutex::new(None),
-            current_step_id: StdMutex::new(None),
+            turn_snapshot: StdMutex::new(None),
             turn_diffs: StdMutex::new(Default::default()),
         });
 

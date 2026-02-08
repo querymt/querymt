@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useMemo } from 'react';
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
 import { Home, Copy, Check } from 'lucide-react';
 import { useUiClientContext } from '../context/UiClientContext';
@@ -10,6 +10,7 @@ import { HeaderStatsBar } from './HeaderStatsBar';
 import { SessionSwitcher } from './SessionSwitcher';
 import { StatsDrawer } from './StatsDrawer';
 import { copyToClipboard } from '../utils/clipboard';
+import { getModeColors, getModeDisplayName } from '../utils/modeColors';
 
 /**
  * AppShell - Main layout wrapper for all routes
@@ -43,10 +44,13 @@ export function AppShell() {
     activeAgentId,
     sessionsByAgent,
     allModels,
+    recentModelsByWorkspace,
     refreshAllModels,
     setSessionModel,
     sessionGroups,
     thinkingBySession,
+    agentMode,
+    cycleAgentMode,
   } = useUiClientContext();
   
   const navigate = useNavigate();
@@ -79,9 +83,35 @@ export function AppShell() {
     useUiStore.getState().loadPersistedState();
   }, []);
   
+  // Extract current workspace from active session
+  const currentWorkspace = useMemo(() => {
+    if (!sessionId) return null;
+    // Find workspace from sessionGroups
+    for (const group of sessionGroups) {
+      if (group.sessions.some(s => s.session_id === sessionId)) {
+        return group.cwd || null;
+      }
+    }
+    return null;
+  }, [sessionId, sessionGroups]);
+  
   // Global keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Ctrl+E / Cmd+E - Cycle agent mode
+      if ((e.metaKey || e.ctrlKey) && e.key === 'e') {
+        e.preventDefault();
+        cycleAgentMode();
+        return;
+      }
+      
+      // Cmd+Shift+M / Ctrl+Shift+M - Toggle model picker
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'm') {
+        e.preventDefault();
+        setModelPickerOpen(!modelPickerOpen);
+        return;
+      }
+      
       // Cmd+/ or Ctrl+/ - Toggle session switcher (open/close)
       if ((e.metaKey || e.ctrlKey) && e.key === '/') {
         e.preventDefault();
@@ -99,7 +129,7 @@ export function AppShell() {
     
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [connected, loading, newSession, sessionSwitcherOpen, setSessionSwitcherOpen]);
+  }, [connected, loading, newSession, sessionSwitcherOpen, setSessionSwitcherOpen, cycleAgentMode, modelPickerOpen, setModelPickerOpen]);
   
   // ESC handling: close modals first, then double-escape to cancel session
   // Reads state directly from Zustand store for guaranteed latest values
@@ -148,6 +178,41 @@ export function AppShell() {
     window.addEventListener('keydown', handleKeyDown, { capture: true });
     return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
   }, [thinkingAgentId, cancelSession, setSessionSwitcherOpen, setModelPickerOpen, setStatsDrawerOpen]);
+  
+  // Set CSS custom properties for mode theming
+  useEffect(() => {
+    const colors = getModeColors(agentMode);
+    const root = document.documentElement;
+    
+    root.style.setProperty('--mode-rgb', colors.rgb);
+    root.style.setProperty('--mode-color', colors.hex);
+    
+    return () => {
+      root.style.removeProperty('--mode-rgb');
+      root.style.removeProperty('--mode-color');
+    };
+  }, [agentMode]);
+  
+  // Auto-switch model when agent mode changes (if preference exists)
+  useEffect(() => {
+    const { modeModelPreferences } = useUiStore.getState();
+    const preference = modeModelPreferences[agentMode];
+    
+    // Only auto-switch if:
+    // 1. We have a stored preference for this mode
+    // 2. We have an active session
+    // 3. The current model is different from the preference
+    if (
+      preference &&
+      sessionId &&
+      (agentModels[activeAgentId]?.provider !== preference.provider ||
+       agentModels[activeAgentId]?.model !== preference.model)
+    ) {
+      const modelId = `${preference.provider}/${preference.model}`;
+      console.log(`[AppShell] Auto-switching to ${modelId} for mode "${agentMode}"`);
+      setSessionModel(sessionId, modelId);
+    }
+  }, [agentMode, sessionId, activeAgentId, agentModels, setSessionModel]);
   
   // Handle session ID copy
   const handleCopySessionId = () => {
@@ -210,17 +275,18 @@ export function AppShell() {
             <GlitchText text="QueryMT" variant="3" hoverOnly />
           </h1>
           
-          {/* Session chip (when active) - moved to left section */}
+          {/* Session chip (when active) - now includes mode */}
           {sessionId && (
             <div className="flex items-center gap-2">
-              {/* Session chip - click to open session switcher */}
-              <button
-                type="button"
-                onClick={() => setSessionSwitcherOpen(true)}
-                title={`Click to switch sessions (${navigator.platform.includes('Mac') ? 'Cmd' : 'Ctrl'}+/)`}
-                className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-cyber-border bg-cyber-bg hover:border-cyber-cyan/60 hover:bg-cyber-surface/50 transition-colors group"
-              >
-                <span className="flex items-center gap-1.5">
+              {/* Combined session chip with mode */}
+              <div className="flex items-center rounded-lg border border-cyber-border bg-cyber-bg overflow-hidden">
+                {/* Session ID part - click to open session switcher */}
+                <button
+                  type="button"
+                  onClick={() => setSessionSwitcherOpen(true)}
+                  title={`Click to switch sessions (${navigator.platform.includes('Mac') ? 'Cmd' : 'Ctrl'}+/)`}
+                  className="flex items-center gap-1.5 px-3 py-1.5 hover:bg-cyber-surface/50 transition-colors group"
+                >
                   <span
                     className={`w-2 h-2 rounded-full ${
                       isSessionActive
@@ -240,8 +306,20 @@ export function AppShell() {
                   <span className="text-xs font-mono text-gray-400 group-hover:text-cyber-cyan transition-colors">
                     {String(sessionId).substring(0, 12)}...
                   </span>
-                </span>
-              </button>
+                  <span className="text-gray-600">·</span>
+                </button>
+                
+                {/* Mode part - click to cycle mode */}
+                <button
+                  type="button"
+                  onClick={cycleAgentMode}
+                  title={`Mode: ${agentMode} (${navigator.platform.includes('Mac') ? '⌘E' : 'Ctrl+E'} to cycle)`}
+                  className="px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-cyber-surface/50"
+                  style={{ color: 'var(--mode-color)' }}
+                >
+                  {getModeDisplayName(agentMode)}
+                </button>
+              </div>
               
               {/* Copy button */}
               <button
@@ -287,6 +365,9 @@ export function AppShell() {
             allModels={allModels}
             currentProvider={agentModels[activeAgentId]?.provider}
             currentModel={agentModels[activeAgentId]?.model}
+            currentWorkspace={currentWorkspace}
+            recentModelsByWorkspace={recentModelsByWorkspace}
+            agentMode={agentMode}
             onRefresh={refreshAllModels}
             onSetSessionModel={setSessionModel}
           />
@@ -300,6 +381,12 @@ export function AppShell() {
           />
         </div>
       </header>
+      
+      {/* Mode accent line */}
+      <div 
+        className="h-0.5 w-full transition-colors duration-200"
+        style={{ backgroundColor: `rgba(var(--mode-rgb), 0.6)` }}
+      />
       
       {/* Route content */}
       <div className="flex-1 min-h-0 flex flex-col overflow-hidden">

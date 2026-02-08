@@ -9,7 +9,8 @@ use crate::session::runtime::RuntimeContext;
 use crate::session::store::SessionStore;
 use crate::test_utils::{
     MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, StopOnBeforeLlmCall,
-    TestPluginLoader, TestProviderFactory, mock_llm_config, mock_querymt_tool_call, mock_session,
+    TestProviderFactory, mock_llm_config, mock_plugin_registry, mock_querymt_tool_call,
+    mock_session,
 };
 use crate::tools::ToolRegistry;
 use agent_client_protocol::StopReason;
@@ -17,7 +18,6 @@ use mockall::Sequence;
 use querymt::LLMParams;
 use querymt::chat::{FunctionTool, Tool};
 use querymt::error::LLMError;
-use querymt::plugin::host::PluginRegistry;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -57,21 +57,9 @@ impl TestHarness {
         let factory = Arc::new(TestProviderFactory {
             provider: shared_provider,
         });
-        let temp_dir = TempDir::new().expect("temp dir");
-        let wasm_path = temp_dir.path().join("mock.wasm");
-        std::fs::write(&wasm_path, "").expect("write wasm");
-        let config_path = temp_dir.path().join("providers.toml");
-        std::fs::write(
-            &config_path,
-            format!(
-                "[[providers]]\nname = \"mock\"\npath = \"{}\"\n",
-                wasm_path.display()
-            ),
-        )
-        .expect("write config");
 
-        let mut registry = PluginRegistry::from_path(&config_path).expect("registry");
-        registry.register_loader(Box::new(TestPluginLoader { factory }));
+        // Use shared helper to create mock plugin registry
+        let (registry, temp_dir) = mock_plugin_registry(factory).expect("mock registry");
         let registry = Arc::new(registry);
 
         let mut store = MockSessionStore::new();
@@ -151,7 +139,6 @@ impl TestHarness {
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
             session_runtime: Arc::new(Mutex::new(HashMap::new())),
             max_steps: None,
-            snapshot_root: None,
             snapshot_policy: SnapshotPolicy::None,
             assume_mutating: false,
             mutating_tools: HashSet::new(),
@@ -159,7 +146,7 @@ impl TestHarness {
             tool_config: Arc::new(StdMutex::new(ToolConfig::default())),
             tool_registry: Arc::new(StdMutex::new(ToolRegistry::new())),
             middleware_drivers: Arc::new(std::sync::Mutex::new(Vec::new())),
-            plan_mode_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            agent_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             event_bus: Arc::new(EventBus::new()),
             client_state: Arc::new(StdMutex::new(None)),
             auth_methods: Arc::new(StdMutex::new(Vec::new())),
@@ -195,8 +182,7 @@ impl TestHarness {
             permission_cache: StdMutex::new(HashMap::new()),
             current_tools_hash: StdMutex::new(None),
             function_index: Arc::new(tokio::sync::OnceCell::new()),
-            pre_step_snapshot: StdMutex::new(None),
-            current_step_id: StdMutex::new(None),
+            turn_snapshot: StdMutex::new(None),
             turn_diffs: StdMutex::new(Default::default()),
         });
 

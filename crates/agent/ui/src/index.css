@@ -6,6 +6,12 @@
 @tailwind utilities;
 
 @layer base {
+  :root {
+    /* Default mode colors (build/lime) - updated dynamically by AppShell */
+    --mode-rgb: 57, 255, 20;
+    --mode-color: #39ff14;
+  }
+
   body {
     @apply bg-cyber-bg text-gray-100;
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
@@ -71,6 +77,23 @@
     );
     background-size: 100% 4px;
     pointer-events: none;
+  }
+  
+  /* Mode-aware utilities */
+  .border-mode {
+    border-color: rgba(var(--mode-rgb), 0.3);
+  }
+  
+  .border-mode-strong {
+    border-color: rgba(var(--mode-rgb), 0.6);
+  }
+  
+  .shadow-mode {
+    box-shadow: 0 0 10px rgba(var(--mode-rgb), 0.3);
+  }
+  
+  .bg-mode-subtle {
+    background-color: rgba(var(--mode-rgb), 0.05);
   }
 }
 

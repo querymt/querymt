@@ -234,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             m.parts.iter().any(|p| {
                 !matches!(
                     p,
-                    MessagePart::StepSnapshotStart { .. } | MessagePart::StepSnapshotPatch { .. }
+                    MessagePart::TurnSnapshotStart { .. } | MessagePart::TurnSnapshotPatch { .. }
                 )
             })
         })

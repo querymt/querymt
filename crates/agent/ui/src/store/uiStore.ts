@@ -24,6 +24,10 @@ interface UiState {
   delegationsPanelCollapsed: boolean;
   setDelegationsPanelCollapsed: (collapsed: boolean) => void;
   
+  // Agent mode -> model preferences (persisted to localStorage)
+  modeModelPreferences: Record<string, { provider: string; model: string }>;
+  setModeModelPreference: (mode: string, provider: string, model: string) => void;
+  
   // Session/navigation state
   sessionCopied: boolean;
   setSessionCopied: (copied: boolean) => void;
@@ -96,6 +100,7 @@ export const useUiStore = create<UiState>((set) => ({
   statsDrawerOpen: false,
   delegationDrawerOpen: false,
   sessionViewCache: new Map(),
+  modeModelPreferences: {},
   
   // Actions
   setTodoRailCollapsed: (collapsed) => {
@@ -105,6 +110,14 @@ export const useUiStore = create<UiState>((set) => ({
   },
   
   setDelegationsPanelCollapsed: (collapsed) => set({ delegationsPanelCollapsed: collapsed }),
+  
+  setModeModelPreference: (mode, provider, model) => {
+    set((state) => {
+      const updated = { ...state.modeModelPreferences, [mode]: { provider, model } };
+      localStorage.setItem('modeModelPreferences', JSON.stringify(updated));
+      return { modeModelPreferences: updated };
+    });
+  },
   
   setSessionCopied: (copied) => set({ sessionCopied: copied }),
   setActiveTimelineView: (view) => set({ activeTimelineView: view }),
@@ -164,6 +177,8 @@ export const useUiStore = create<UiState>((set) => ({
   // Load persisted state from localStorage
   loadPersistedState: () => {
     const todoRailCollapsed = localStorage.getItem('todoRailCollapsed') === 'true';
-    set({ todoRailCollapsed });
+    const modeModelPreferencesRaw = localStorage.getItem('modeModelPreferences');
+    const modeModelPreferences = modeModelPreferencesRaw ? JSON.parse(modeModelPreferencesRaw) : {};
+    set({ todoRailCollapsed, modeModelPreferences });
   },
 }));

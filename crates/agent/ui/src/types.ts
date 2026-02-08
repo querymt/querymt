@@ -313,6 +313,7 @@ export type UiServerMessage =
       active_session_id?: string | null;
       agents: UiAgentInfo[];
       sessions_by_agent: Record<string, string>;
+      agent_mode: string;
     }
   | {
       type: 'session_created';
@@ -345,14 +346,23 @@ export type UiServerMessage =
       message?: string | null;
     }
   | { type: 'all_models_list'; models: ModelEntry[] }
+  | { type: 'recent_models'; by_workspace: Record<string, RecentModelEntry[]> }
   | { type: 'file_index'; files: FileIndexEntry[]; generated_at: number }
   | { type: 'llm_config'; config_id: number; provider: string; model: string; params?: Record<string, unknown> | null }
   | { type: 'undo_result'; success: boolean; message?: string | null; reverted_files: string[] }
-  | { type: 'redo_result'; success: boolean; message?: string | null };
+  | { type: 'redo_result'; success: boolean; message?: string | null }
+  | { type: 'agent_mode'; mode: string };
 
 export interface ModelEntry {
   provider: string;
   model: string;
+}
+
+export interface RecentModelEntry {
+  provider: string;
+  model: string;
+  last_used: string;  // ISO 8601 timestamp
+  use_count: number;
 }
 
 // Cached LLM config details for model config popover
@@ -373,6 +383,7 @@ export type UiClientMessage =
   | { type: 'load_session'; session_id: string }
   | { type: 'list_all_models'; refresh?: boolean }
   | { type: 'set_session_model'; session_id: string; model_id: string }
+  | { type: 'get_recent_models'; limit_per_workspace?: number }
   | { type: 'get_file_index' }
   | { type: 'get_llm_config'; config_id: number }
   | { type: 'cancel_session' }
@@ -380,4 +391,6 @@ export type UiClientMessage =
   | { type: 'redo' }
   | { type: 'subscribe_session'; session_id: string; agent_id?: string }
   | { type: 'unsubscribe_session'; session_id: string }
-  | { type: 'elicitation_response'; elicitation_id: string; action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> };
+  | { type: 'elicitation_response'; elicitation_id: string; action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> }
+  | { type: 'set_agent_mode'; mode: string }
+  | { type: 'get_agent_mode' };

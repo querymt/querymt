@@ -4,6 +4,9 @@ import { EventRow } from '../types';
 
 describe('UiStore', () => {
   beforeEach(() => {
+    // Clear localStorage before each test
+    localStorage.clear();
+    
     // Reset the Zustand store to initial state between tests
     useUiStore.setState({
       todoRailCollapsed: false,
@@ -21,6 +24,7 @@ describe('UiStore', () => {
       statsDrawerOpen: false,
       delegationDrawerOpen: false,
       sessionViewCache: new Map(),
+      modeModelPreferences: {},
     });
   });
 
@@ -434,6 +438,228 @@ describe('UiStore', () => {
       const cached = useUiStore.getState().sessionViewCache.get('session-A');
       expect(cached?.activeDelegationId).toBe('del-updated');
       expect(cached?.delegationsPanelCollapsed).toBe(true);
+    });
+  });
+
+  describe('modeModelPreferences', () => {
+    describe('setModeModelPreference', () => {
+      it('should save model preference for a mode', () => {
+        const store = useUiStore.getState();
+        
+        store.setModeModelPreference('build', 'anthropic', 'claude-3-5-sonnet-20241022');
+        
+        const state = useUiStore.getState();
+        expect(state.modeModelPreferences['build']).toEqual({
+          provider: 'anthropic',
+          model: 'claude-3-5-sonnet-20241022',
+        });
+      });
+      
+      it('should persist preference to localStorage', () => {
+        const store = useUiStore.getState();
+        
+        store.setModeModelPreference('build', 'anthropic', 'claude-3-5-sonnet-20241022');
+        
+        const stored = localStorage.getItem('modeModelPreferences');
+        expect(stored).not.toBeNull();
+        const parsed = JSON.parse(stored!);
+        expect(parsed['build']).toEqual({
+          provider: 'anthropic',
+          model: 'claude-3-5-sonnet-20241022',
+        });
+      });
+      
+      it('should save preferences for multiple modes', () => {
+        const store = useUiStore.getState();
+        
+        store.setModeModelPreference('build', 'anthropic', 'claude-3-5-sonnet-20241022');
+        store.setModeModelPreference('plan', 'openai', 'gpt-4-turbo');
+        
+        const state = useUiStore.getState();
+        expect(state.modeModelPreferences['build']).toEqual({
+          provider: 'anthropic',
+          model: 'claude-3-5-sonnet-20241022',
+        });
+        expect(state.modeModelPreferences['plan']).toEqual({
+          provider: 'openai',
+          model: 'gpt-4-turbo',
+        });
+      });
+      
+      it('should update existing mode preference', () => {
+        const store = useUiStore.getState();
+        
+        store.setModeModelPreference('build', 'anthropic', 'claude-3-5-sonnet-20241022');
+        store.setModeModelPreference('build', 'openai', 'gpt-4-turbo');
+        
+        const state = useUiStore.getState();
+        expect(state.modeModelPreferences['build']).toEqual({
+          provider: 'openai',
+          model: 'gpt-4-turbo',
+        });
+        
+        // Verify localStorage was updated
+        const stored = localStorage.getItem('modeModelPreferences');
+        const parsed = JSON.parse(stored!);
+        expect(parsed['build']).toEqual({
+          provider: 'openai',
+          model: 'gpt-4-turbo',
+        });
+      });
+      
+      it('should preserve other mode preferences when updating one', () => {
+        const store = useUiStore.getState();
+        
+        store.setModeModelPreference('build', 'anthropic', 'claude-3-5-sonnet-20241022');
+        store.setModeModelPreference('plan', 'openai', 'gpt-4-turbo');
+        store.setModeModelPreference('build', 'anthropic', 'claude-3-opus-20240229');
+        
+        const state = useUiStore.getState();
+        expect(state.modeModelPreferences['build']).toEqual({
+          provider: 'anthropic',
+          model: 'claude-3-opus-20240229',
+        });
+        expect(state.modeModelPreferences['plan']).toEqual({
+          provider: 'openai',
+          model: 'gpt-4-turbo',
+        });
+      });
+    });
+    
+    describe('loadPersistedState', () => {
+      it('should load modeModelPreferences from localStorage', () => {
+        // Set up localStorage with preferences
+        const preferences = {
+          build: { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' },
+          plan: { provider: 'openai', model: 'gpt-4-turbo' },
+        };
+        localStorage.setItem('modeModelPreferences', JSON.stringify(preferences));
+        
+        const store = useUiStore.getState();
+        store.loadPersistedState();
+        
+        const state = useUiStore.getState();
+        expect(state.modeModelPreferences).toEqual(preferences);
+      });
+      
+      it('should handle missing modeModelPreferences in localStorage', () => {
+        // Don't set anything in localStorage
+        const store = useUiStore.getState();
+        store.loadPersistedState();
+        
+        const state = useUiStore.getState();
+        expect(state.modeModelPreferences).toEqual({});
+      });
+      
+      it('should handle invalid JSON in localStorage', () => {
+        localStorage.setItem('modeModelPreferences', 'invalid-json');
+        
+        const store = useUiStore.getState();
+        
+        // Should not crash, should default to empty object
+        expect(() => store.loadPersistedState()).toThrow();
+      });
+      
+      it('should load both todoRailCollapsed and modeModelPreferences', () => {
+        localStorage.setItem('todoRailCollapsed', 'true');
+        localStorage.setItem('modeModelPreferences', JSON.stringify({
+          build: { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' },
+        }));
+        
+        const store = useUiStore.getState();
+        store.loadPersistedState();
+        
+        const state = useUiStore.getState();
+        expect(state.todoRailCollapsed).toBe(true);
+        expect(state.modeModelPreferences).toEqual({
+          build: { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' },
+        });
+      });
+    });
+    
+    describe('initial state', () => {
+      it('should have empty modeModelPreferences by default', () => {
+        const state = useUiStore.getState();
+        expect(state.modeModelPreferences).toEqual({});
+        expect(Object.keys(state.modeModelPreferences).length).toBe(0);
+      });
+    });
+    
+    describe('integration scenarios', () => {
+      it('should persist preferences across store resets', () => {
+        const store = useUiStore.getState();
+        
+        // Set a preference
+        store.setModeModelPreference('build', 'anthropic', 'claude-3-5-sonnet-20241022');
+        
+        // Simulate app reload by resetting state and loading from localStorage
+        useUiStore.setState({ modeModelPreferences: {} });
+        store.loadPersistedState();
+        
+        const state = useUiStore.getState();
+        expect(state.modeModelPreferences['build']).toEqual({
+          provider: 'anthropic',
+          model: 'claude-3-5-sonnet-20241022',
+        });
+      });
+      
+      it('should handle switching modes with different preferences', () => {
+        const store = useUiStore.getState();
+        
+        // User is in "build" mode and selects a model
+        store.setModeModelPreference('build', 'anthropic', 'claude-3-5-sonnet-20241022');
+        
+        // User switches to "plan" mode and selects a different model
+        store.setModeModelPreference('plan', 'openai', 'gpt-4-turbo');
+        
+        // Simulate cycling back to "build" mode
+        // (In real app, AppShell would read modeModelPreferences['build'])
+        const buildPreference = useUiStore.getState().modeModelPreferences['build'];
+        expect(buildPreference).toEqual({
+          provider: 'anthropic',
+          model: 'claude-3-5-sonnet-20241022',
+        });
+      });
+      
+      it('should handle mode with no preference', () => {
+        const store = useUiStore.getState();
+        
+        // Set preference for "build" only
+        store.setModeModelPreference('build', 'anthropic', 'claude-3-5-sonnet-20241022');
+        
+        // Try to get preference for "plan" (doesn't exist)
+        const planPreference = useUiStore.getState().modeModelPreferences['plan'];
+        expect(planPreference).toBeUndefined();
+      });
+      
+      it('should support multiple mode switches and updates', () => {
+        const store = useUiStore.getState();
+        
+        // Build mode - first selection
+        store.setModeModelPreference('build', 'anthropic', 'claude-3-5-sonnet-20241022');
+        
+        // Plan mode - first selection
+        store.setModeModelPreference('plan', 'openai', 'gpt-4-turbo');
+        
+        // Build mode - change model
+        store.setModeModelPreference('build', 'anthropic', 'claude-3-opus-20240229');
+        
+        // Verify final state
+        const state = useUiStore.getState();
+        expect(state.modeModelPreferences['build']).toEqual({
+          provider: 'anthropic',
+          model: 'claude-3-opus-20240229',
+        });
+        expect(state.modeModelPreferences['plan']).toEqual({
+          provider: 'openai',
+          model: 'gpt-4-turbo',
+        });
+        
+        // Verify localStorage matches
+        const stored = localStorage.getItem('modeModelPreferences');
+        const parsed = JSON.parse(stored!);
+        expect(parsed).toEqual(state.modeModelPreferences);
+      });
     });
   });
 });

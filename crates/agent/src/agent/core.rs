@@ -17,9 +17,77 @@ use agent_client_protocol::{
 };
 use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, OnceCell, broadcast, watch};
+
+/// Runtime operating mode for the agent.
+/// Modes control what the agent is allowed to do and what system reminders are injected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum AgentMode {
+    /// Full read/write mode - all tools available, no restrictions
+    Build = 0,
+    /// Planning mode - read-only, agent observes and plans without making changes
+    Plan = 1,
+    /// Review mode - read-only, agent reviews code and provides feedback
+    Review = 2,
+}
+
+impl AgentMode {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => AgentMode::Plan,
+            2 => AgentMode::Review,
+            _ => AgentMode::Build,
+        }
+    }
+
+    /// Cycle to next mode: Build -> Plan -> Review -> Build
+    pub fn next(self) -> Self {
+        match self {
+            AgentMode::Build => AgentMode::Plan,
+            AgentMode::Plan => AgentMode::Review,
+            AgentMode::Review => AgentMode::Build,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AgentMode::Build => "build",
+            AgentMode::Plan => "plan",
+            AgentMode::Review => "review",
+        }
+    }
+
+    /// Whether this mode is read-only (agent should not make file changes)
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, AgentMode::Plan | AgentMode::Review)
+    }
+}
+
+impl std::fmt::Display for AgentMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for AgentMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "build" => Ok(AgentMode::Build),
+            "plan" => Ok(AgentMode::Plan),
+            "review" => Ok(AgentMode::Review),
+            _ => Err(format!(
+                "unknown agent mode: '{}'. Valid modes: build, plan, review",
+                s
+            )),
+        }
+    }
+}
 
 /// Main agent implementation that coordinates LLM interactions, tool execution,
 /// session management, and protocol compliance.
@@ -28,7 +96,6 @@ pub struct QueryMTAgent {
     pub(crate) active_sessions: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     pub(crate) session_runtime: Arc<Mutex<HashMap<String, Arc<SessionRuntime>>>>,
     pub(crate) max_steps: Option<usize>,
-    pub(crate) snapshot_root: Option<std::path::PathBuf>,
     pub(crate) snapshot_policy: SnapshotPolicy,
     pub(crate) assume_mutating: bool,
     pub(crate) mutating_tools: HashSet<String>,
@@ -36,7 +103,7 @@ pub struct QueryMTAgent {
     pub(crate) tool_config: Arc<StdMutex<ToolConfig>>,
     pub(crate) tool_registry: Arc<StdMutex<ToolRegistry>>,
     pub(crate) middleware_drivers: Arc<std::sync::Mutex<Vec<Arc<dyn MiddlewareDriver>>>>,
-    pub(crate) plan_mode_enabled: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) agent_mode: Arc<std::sync::atomic::AtomicU8>,
     pub(crate) event_bus: Arc<EventBus>,
     pub(crate) client_state: Arc<StdMutex<Option<ClientState>>>,
     pub(crate) auth_methods: Arc<StdMutex<Vec<AuthMethod>>>,
@@ -105,10 +172,8 @@ pub struct SessionRuntime {
     pub current_tools_hash: StdMutex<Option<crate::hash::RapidHash>>,
     /// Function index for duplicate code detection (built asynchronously on session start)
     pub function_index: Arc<OnceCell<Arc<tokio::sync::RwLock<crate::index::FunctionIndex>>>>,
-    /// Snapshot ID taken at the start of the current step (for diffing at step end)
-    pub pre_step_snapshot: StdMutex<Option<String>>,
-    /// Step ID for the current step (for associating snapshots)
-    pub current_step_id: StdMutex<Option<String>>,
+    /// Turn snapshot: (turn_id, snapshot_id) taken at the start of the turn for undo/redo
+    pub turn_snapshot: StdMutex<Option<(String, String)>>,
     /// Accumulated changed file paths across the entire turn (for end-of-turn dedup check)
     pub turn_diffs: StdMutex<crate::index::DiffPaths>,
 }
@@ -193,7 +258,6 @@ impl QueryMTAgent {
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
             session_runtime: Arc::new(Mutex::new(HashMap::new())),
             max_steps: None,
-            snapshot_root: None,
             snapshot_policy: SnapshotPolicy::None,
             assume_mutating: true,
             mutating_tools: HashSet::new(),
@@ -201,7 +265,7 @@ impl QueryMTAgent {
             tool_config: Arc::new(StdMutex::new(ToolConfig::default())),
             tool_registry: Arc::new(StdMutex::new(tool_registry)),
             middleware_drivers: Arc::new(std::sync::Mutex::new(Vec::new())),
-            plan_mode_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            agent_mode: Arc::new(std::sync::atomic::AtomicU8::new(AgentMode::Build as u8)),
             event_bus: Arc::new(EventBus::new()),
             client_state: Arc::new(StdMutex::new(None)),
             auth_methods: Arc::new(StdMutex::new(Vec::new())),
@@ -306,15 +370,20 @@ impl QueryMTAgent {
             )
     }
 
-    /// Sets the plan mode flag.
-    pub fn set_plan_mode(&self, enabled: bool) {
-        self.plan_mode_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    /// Sets the agent operating mode.
+    pub fn set_agent_mode(&self, mode: AgentMode) {
+        self.agent_mode
+            .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Gets the plan mode flag.
-    pub fn plan_mode_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        self.plan_mode_enabled.clone()
+    /// Gets the current agent mode.
+    pub fn get_agent_mode(&self) -> AgentMode {
+        AgentMode::from_u8(self.agent_mode.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Gets the agent mode atomic for sharing with middleware.
+    pub fn agent_mode_flag(&self) -> Arc<std::sync::atomic::AtomicU8> {
+        self.agent_mode.clone()
     }
 
     /// Subscribes to agent events.

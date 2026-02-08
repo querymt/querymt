@@ -158,14 +158,122 @@ impl QueryMTAgent {
             },
         );
 
+        // 4a. Take pre-turn snapshot for undo/redo support
+        if let Some(ref backend) = self.snapshot_backend
+            && let Some(worktree) = runtime.cwd.as_ref()
+        {
+            let turn_id = Uuid::new_v4().to_string();
+            match backend.track(worktree).await {
+                Ok(snapshot_id) => {
+                    *runtime.turn_snapshot.lock().unwrap() =
+                        Some((turn_id.clone(), snapshot_id.clone()));
+                    debug!(
+                        "Pre-turn snapshot created: {} (turn {})",
+                        snapshot_id, turn_id
+                    );
+
+                    // Persist TurnSnapshotStart message
+                    let start_part = MessagePart::TurnSnapshotStart {
+                        turn_id: turn_id.clone(),
+                        snapshot_id: snapshot_id.clone(),
+                    };
+
+                    let snapshot_msg = AgentMessage {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.clone(),
+                        role: ChatRole::Assistant,
+                        parts: vec![start_part],
+                        created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                        parent_message_id: None,
+                    };
+
+                    if let Err(e) = context.add_message(snapshot_msg).await {
+                        warn!("Failed to store turn snapshot start: {}", e);
+                    } else {
+                        debug!("Pre-turn snapshot start stored (turn {})", turn_id);
+                    }
+                }
+                Err(e) => {
+                    warn!("Pre-turn snapshot failed: {}", e);
+                }
+            }
+        }
+
         // 5. Execute Agent Loop using State Machine
         info!("Initializing execution cycle for session {}", session_id);
-        let mut exec_ctx = ExecutionContext::new(session_id.clone(), runtime, runtime_context);
+        let mut exec_ctx =
+            ExecutionContext::new(session_id.clone(), runtime.clone(), runtime_context);
         let result = self
             .execute_cycle_state_machine(&context, &mut exec_ctx, rx)
             .await;
 
-        // 6. Cleanup
+        // 6. Take post-turn snapshot and record changes for undo/redo
+        if let Some(ref backend) = self.snapshot_backend
+            && let Some(worktree) = runtime.cwd.as_ref()
+        {
+            let turn_snapshot_data = runtime.turn_snapshot.lock().unwrap().take();
+
+            if let Some((turn_id, pre_snapshot_id)) = turn_snapshot_data {
+                match backend.track(worktree).await {
+                    Ok(post_snapshot_id) => {
+                        if pre_snapshot_id != post_snapshot_id {
+                            match backend
+                                .diff(worktree, &pre_snapshot_id, &post_snapshot_id)
+                                .await
+                            {
+                                Ok(changed) if !changed.is_empty() => {
+                                    let patch_part = MessagePart::TurnSnapshotPatch {
+                                        turn_id: turn_id.clone(),
+                                        snapshot_id: post_snapshot_id.clone(),
+                                        changed_paths: changed
+                                            .iter()
+                                            .map(|p| p.to_string_lossy().to_string())
+                                            .collect(),
+                                    };
+
+                                    // Store patch as a message
+                                    let snapshot_msg = AgentMessage {
+                                        id: Uuid::new_v4().to_string(),
+                                        session_id: session_id.clone(),
+                                        role: ChatRole::Assistant,
+                                        parts: vec![patch_part],
+                                        created_at: time::OffsetDateTime::now_utc()
+                                            .unix_timestamp(),
+                                        parent_message_id: None,
+                                    };
+
+                                    if let Err(e) = context.add_message(snapshot_msg).await {
+                                        warn!("Failed to store turn snapshot patch: {}", e);
+                                    } else {
+                                        debug!(
+                                            "Post-turn snapshot patch stored: {} changed files (turn {})",
+                                            changed.len(),
+                                            turn_id
+                                        );
+                                    }
+                                }
+                                Ok(_) => {
+                                    debug!("No file changes detected in turn {}", turn_id);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to diff turn snapshots: {}", e);
+                                }
+                            }
+                        } else {
+                            debug!("Turn snapshot unchanged (turn {})", turn_id);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Post-turn snapshot failed: {}", e);
+                    }
+                }
+
+                // Run GC if snapshot backend is configured
+                let _ = backend.gc(worktree, &self.snapshot_gc_config).await;
+            }
+        }
+
+        // 7. Cleanup
         {
             let mut active = self.active_sessions.lock().await;
             active.remove(&session_id);
@@ -278,60 +386,10 @@ impl QueryMTAgent {
                         .await
                         .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
 
-                    // Take pre-step snapshot for undo/redo support
-                    // Store step_id and snapshot_id temporarily for persistence
-                    let mut snapshot_data: Option<(String, String)> = None;
-
-                    if let Some(ref backend) = self.snapshot_backend
-                        && let Some(ref worktree) = self.snapshot_root
-                    {
-                        let step_id = Uuid::new_v4().to_string();
-                        *exec_ctx.runtime.current_step_id.lock().unwrap() = Some(step_id.clone());
-                        match backend.track(worktree).await {
-                            Ok(snapshot_id) => {
-                                *exec_ctx.runtime.pre_step_snapshot.lock().unwrap() =
-                                    Some(snapshot_id.clone());
-                                debug!(
-                                    "Pre-step snapshot created: {} (step {})",
-                                    snapshot_id, step_id
-                                );
-                                // Store for persistence below
-                                snapshot_data = Some((step_id, snapshot_id));
-                            }
-                            Err(e) => {
-                                warn!("Pre-step snapshot failed: {}", e);
-                            }
-                        }
-                    }
-
                     match state {
                         ExecutionState::BeforeLlmCall {
                             context: ref conv_context,
                         } => {
-                            // Persist StepSnapshotStart message part if we took a snapshot
-                            // Note: `context` here refers to the outer SessionContext parameter
-                            if let Some((step_id, snapshot_id)) = snapshot_data {
-                                let start_part = MessagePart::StepSnapshotStart {
-                                    step_id: step_id.clone(),
-                                    snapshot_id: snapshot_id.clone(),
-                                };
-
-                                let snapshot_msg = AgentMessage {
-                                    id: Uuid::new_v4().to_string(),
-                                    session_id: context.session().public_id.clone(),
-                                    role: ChatRole::Assistant,
-                                    parts: vec![start_part],
-                                    created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
-                                    parent_message_id: None,
-                                };
-
-                                if let Err(e) = context.add_message(snapshot_msg).await {
-                                    warn!("Failed to store snapshot start: {}", e);
-                                } else {
-                                    debug!("Pre-step snapshot start stored (step {})", step_id);
-                                }
-                            }
-
                             self.transition_before_llm_call(conv_context, exec_ctx, &cancel_rx)
                                 .await?
                         }
@@ -408,7 +466,7 @@ impl QueryMTAgent {
                         .run_turn_end(ExecutionState::Complete)
                         .await
                         .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
-                    
+
                     match turn_end_state {
                         ExecutionState::BeforeLlmCall { .. } => {
                             // Middleware wants another step (e.g., dedup review)
@@ -416,66 +474,8 @@ impl QueryMTAgent {
                             turn_end_state
                         }
                         ExecutionState::Complete => {
-                            // Truly done — proceed with existing snapshot/cleanup
+                            // Truly done
                             debug!("State machine reached Complete state");
-
-                            // Take post-step snapshot and record changes for undo/redo
-                            if let Some(ref backend) = self.snapshot_backend
-                                && let Some(ref worktree) = self.snapshot_root
-                            {
-                                let pre_id = exec_ctx.runtime.pre_step_snapshot.lock().unwrap().take();
-                                let step_id = exec_ctx.runtime.current_step_id.lock().unwrap().take();
-
-                                if let (Some(pre_id), Some(step_id)) = (pre_id, step_id) {
-                                    match backend.track(worktree).await {
-                                        Ok(post_id) => {
-                                            if pre_id != post_id {
-                                                let changed = backend
-                                                    .diff(worktree, &pre_id, &post_id)
-                                                    .await
-                                                    .unwrap_or_default();
-                                                if !changed.is_empty() {
-                                                    let patch_part = MessagePart::StepSnapshotPatch {
-                                                        step_id: step_id.clone(),
-                                                        snapshot_id: post_id.clone(),
-                                                        changed_paths: changed
-                                                            .iter()
-                                                            .map(|p| p.to_string_lossy().to_string())
-                                                            .collect(),
-                                                    };
-
-                                                    // Store patch as a system message
-                                                    let snapshot_msg = AgentMessage {
-                                                        id: Uuid::new_v4().to_string(),
-                                                        session_id: context.session().public_id.clone(),
-                                                        role: ChatRole::Assistant,
-                                                        parts: vec![patch_part],
-                                                        created_at: time::OffsetDateTime::now_utc()
-                                                            .unix_timestamp(),
-                                                        parent_message_id: None,
-                                                    };
-                                                    if let Err(e) = context.add_message(snapshot_msg).await
-                                                    {
-                                                        warn!("Failed to store snapshot patch: {}", e);
-                                                    } else {
-                                                        debug!(
-                                                            "Post-step snapshot patch stored: {} changed files (step {})",
-                                                            changed.len(),
-                                                            step_id
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!("Post-step snapshot failed: {}", e);
-                                        }
-                                    }
-                                }
-
-                                // Run GC if snapshot backend is configured
-                                let _ = backend.gc(worktree, &self.snapshot_gc_config).await;
-                            }
 
                             // Run pruning if enabled
                             if self.pruning_config.enabled
@@ -487,10 +487,13 @@ impl QueryMTAgent {
 
                             return Ok(CycleOutcome::Completed);
                         }
-                        ExecutionState::Stopped { ref message, stop_type } => {
+                        ExecutionState::Stopped {
+                            ref message,
+                            stop_type,
+                        } => {
                             // Middleware stopped execution
                             info!("Turn-end middleware stopped: {} ({:?})", message, stop_type);
-                            turn_end_state  // Will be handled in the next loop iteration
+                            turn_end_state // Will be handled in the next loop iteration
                         }
                         other => other, // Cancelled, etc.
                     }

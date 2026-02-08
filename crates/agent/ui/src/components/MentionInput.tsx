@@ -24,31 +24,35 @@ const mentionsInputStyle: MentionsInputStyle = {
     width: '100%',
     maxHeight: '180px',
     overflow: 'hidden',
+    borderRadius: '8px',
+    border: '2px solid transparent',
+    transition: 'all 0.2s',
+    boxSizing: 'border-box',
   },
   '&singleLine': {
     display: 'flex',
     highlighter: {
       padding: '12px 40px 12px 16px',
-      border: '2px solid rgb(59, 68, 129)',
-      borderRadius: '8px',
+      // Match react-mentions' default border to prevent 1px offset
+      border: '1px solid transparent',
       minHeight: '48px',
     },
     input: {
       padding: '12px 40px 12px 16px',
-      border: '2px solid rgb(59, 68, 129)',
-      borderRadius: '8px',
-      backgroundColor: 'rgb(20, 27, 61)',
+      border: 'none',
+      borderRadius: '0',
+      backgroundColor: 'transparent',
       color: 'white',
       minHeight: '48px',
       outline: 'none',
-      transition: 'all 0.2s',
     },
   },
   '&multiLine': {
     display: 'block',
     highlighter: {
       padding: '12px 40px 12px 16px',
-      border: 'none',
+      // Match react-mentions' default border to prevent 1px offset
+      border: '1px solid transparent',
       minHeight: '48px',
       whiteSpace: 'pre-wrap',
       wordBreak: 'break-word',
@@ -59,13 +63,12 @@ const mentionsInputStyle: MentionsInputStyle = {
     },
     input: {
       padding: '12px 40px 12px 16px',
-      border: '2px solid rgb(59, 68, 129)',
-      borderRadius: '8px',
-      backgroundColor: 'rgb(20, 27, 61)',
+      border: 'none',
+      borderRadius: '0',
+      backgroundColor: 'transparent',
       color: 'white',
       minHeight: '48px',
       outline: 'none',
-      transition: 'all 0.2s',
       resize: 'none',
       boxSizing: 'border-box',
       width: '100%',
@@ -111,16 +114,34 @@ const mentionsInputStyle: MentionsInputStyle = {
   },
 };
 
-// Style for the mention badge
+// Style for the mention badge in the highlighter overlay.
+// 
+// CRITICAL: This style is applied to <strong> tags in the highlighter layer, which sits
+// BEHIND the input textarea. The highlighter has `color: transparent` by default, so
+// normally you only see background colors and decorations.
+// 
+// The input textarea (which shows white text on top) must render identical text metrics
+// to the highlighter. Any property that changes text width/height (padding, border, 
+// fontSize, fontFamily, fontWeight) will cause the two layers to drift apart, creating
+// unreadable double text.
+//
+// DO NOT set:
+// - color (makes highlighter text visible = double rendering with input text)
+// - fontWeight (changes text width vs input layer)
+// - padding (changes inline element width)
+// - border (changes inline element width - use boxShadow instead)
+// - fontSize (changes text size vs input)
+// - fontFamily (changes text width vs input)
+//
+// ONLY use properties that don't affect layout:
+// - backgroundColor (highlights behind the text)
+// - borderRadius (rounds the background)
+// - boxShadow (creates visual border without affecting layout)
 const mentionStyle = {
   backgroundColor: 'rgba(0, 255, 249, 0.15)',
-  border: '1px solid rgba(0, 255, 249, 0.4)',
   borderRadius: '4px',
-  padding: '1px 6px',
-  color: '#00fff9',
-  fontFamily: "'Monaco', 'Menlo', 'Ubuntu Mono', monospace",
-  fontSize: '0.9em',
-  fontWeight: 500,
+  // Use inset box-shadow for a visual border without affecting text layout
+  boxShadow: 'inset 0 0 0 1px rgba(0, 255, 249, 0.4)',
 };
 
 export function MentionInput({
@@ -444,13 +465,10 @@ export function MentionInput({
         inputRef={inputRef}
         style={{
           ...mentionsInputStyle,
-          '&multiLine': {
-            ...mentionsInputStyle['&multiLine'],
-            input: {
-              ...mentionsInputStyle['&multiLine']!.input,
-              borderColor: isFocused ? '#00fff9' : 'rgb(59, 68, 129)',
-              boxShadow: isFocused ? '0 0 20px rgba(0, 255, 249, 0.3)' : 'none',
-            },
+          control: {
+            ...mentionsInputStyle.control,
+            borderColor: isFocused ? 'rgba(var(--mode-rgb), 0.8)' : 'rgba(var(--mode-rgb), 0.2)',
+            boxShadow: isFocused ? '0 0 20px rgba(var(--mode-rgb), 0.3)' : 'none',
           },
         }}
         suggestionsPortalHost={document.body}

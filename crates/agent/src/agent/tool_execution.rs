@@ -50,7 +50,7 @@ impl QueryMTAgent {
         );
 
         let snapshot = if self.should_snapshot_tool(&call.function.name) {
-            self.prepare_snapshot()
+            self.prepare_snapshot(exec_ctx.cwd())
                 .map(|(root, policy)| {
                     self.emit_event(
                         &exec_ctx.session_id,

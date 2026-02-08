@@ -19,6 +19,9 @@ mod session;
 
 pub use messages::{RoutingMode, UiAgentInfo};
 
+#[cfg(test)]
+mod undo_handler_tests;
+
 use crate::agent::QueryMTAgent;
 use crate::event_bus::EventBus;
 use crate::index::WorkspaceIndexManager;

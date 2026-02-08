@@ -32,3 +32,7 @@ pub use core::QueryMTAgent as Agent;
 mod delegation_loop_tests;
 #[cfg(test)]
 mod execution_tests;
+#[cfg(test)]
+mod undo_integration_tests;
+#[cfg(test)]
+mod undo_tests;

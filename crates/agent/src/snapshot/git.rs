@@ -28,7 +28,7 @@ impl GitSnapshotBackend {
     }
 
     #[cfg(test)]
-    fn with_snapshot_base(base: PathBuf) -> Self {
+    pub(crate) fn with_snapshot_base(base: PathBuf) -> Self {
         Self {
             snapshot_base_override: Some(base),
         }
@@ -681,5 +681,383 @@ mod tests {
         let result = backend.gc(tmpdir.path(), &config).await.unwrap();
         assert_eq!(result.remaining_count, 3);
         assert_eq!(result.removed_count, 2);
+    }
+
+    // ==================== Test Suite 1.1: Track Idempotency & Determinism ====================
+
+    #[tokio::test]
+    async fn test_track_idempotent_no_change() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+        fs::write(tmpdir.path().join("test.txt"), "hello").unwrap();
+
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot1 = backend.track(tmpdir.path()).await.unwrap();
+
+        // Note: Due to git timestamps, snapshot IDs will differ even with same content.
+        // Instead, verify that both snapshots succeed and detect no differences.
+        let snapshot2 = backend.track(tmpdir.path()).await.unwrap();
+
+        // The snapshots will have different commit hashes due to timestamps,
+        // but diff should show no changes
+        let diff = backend
+            .diff(tmpdir.path(), &snapshot1, &snapshot2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            diff.len(),
+            0,
+            "No modifications should result in empty diff"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_track_changes_after_modify() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+        let file_path = tmpdir.path().join("test.txt");
+
+        fs::write(&file_path, "initial").unwrap();
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot1 = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(&file_path, "modified").unwrap();
+        let snapshot2 = backend.track(tmpdir.path()).await.unwrap();
+
+        assert_ne!(
+            snapshot1, snapshot2,
+            "Track after modifications should return different snapshot ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_track_empty_directory() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot_id = backend.track(tmpdir.path()).await.unwrap();
+
+        assert!(
+            !snapshot_id.is_empty(),
+            "Track empty directory should return valid snapshot ID"
+        );
+    }
+
+    // ==================== Test Suite 1.2: Diff Detection ====================
+
+    #[tokio::test]
+    async fn test_diff_new_file_added() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        fs::write(tmpdir.path().join("a.txt"), "aaa").unwrap();
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot1 = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(tmpdir.path().join("b.txt"), "bbb").unwrap();
+        let snapshot2 = backend.track(tmpdir.path()).await.unwrap();
+
+        let diff = backend
+            .diff(tmpdir.path(), &snapshot1, &snapshot2)
+            .await
+            .unwrap();
+
+        assert_eq!(diff.len(), 1, "Should detect one new file");
+        assert!(
+            diff.contains(&PathBuf::from("b.txt")),
+            "Diff should contain b.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_diff_file_deleted() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        fs::write(tmpdir.path().join("a.txt"), "aaa").unwrap();
+        fs::write(tmpdir.path().join("b.txt"), "bbb").unwrap();
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot1 = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::remove_file(tmpdir.path().join("b.txt")).unwrap();
+        let snapshot2 = backend.track(tmpdir.path()).await.unwrap();
+
+        let diff = backend
+            .diff(tmpdir.path(), &snapshot1, &snapshot2)
+            .await
+            .unwrap();
+
+        assert_eq!(diff.len(), 1, "Should detect one deleted file");
+        assert!(
+            diff.contains(&PathBuf::from("b.txt")),
+            "Diff should contain b.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_diff_no_changes_empty() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        fs::write(tmpdir.path().join("test.txt"), "hello").unwrap();
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot1 = backend.track(tmpdir.path()).await.unwrap();
+        let snapshot2 = backend.track(tmpdir.path()).await.unwrap();
+
+        let diff = backend
+            .diff(tmpdir.path(), &snapshot1, &snapshot2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            diff.len(),
+            0,
+            "No modifications should result in empty diff"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_diff_nested_directory() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        let nested_dir = tmpdir.path().join("src/foo");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let nested_file = nested_dir.join("bar.rs");
+        fs::write(&nested_file, "initial").unwrap();
+
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot1 = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(&nested_file, "modified").unwrap();
+        let snapshot2 = backend.track(tmpdir.path()).await.unwrap();
+
+        let diff = backend
+            .diff(tmpdir.path(), &snapshot1, &snapshot2)
+            .await
+            .unwrap();
+
+        // Git's diff returns tree entries - may include directories
+        // Verify the file is in the diff (it may report src, src/foo, and src/foo/bar.rs)
+        assert!(
+            diff.contains(&PathBuf::from("src/foo/bar.rs")),
+            "Diff should return the modified file path"
+        );
+    }
+
+    // ==================== Test Suite 1.3: Selective Restore (restore_paths) ====================
+
+    #[tokio::test]
+    async fn test_restore_paths_deletes_new_file() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        fs::write(tmpdir.path().join("a.txt"), "aaa").unwrap();
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(tmpdir.path().join("b.txt"), "bbb").unwrap();
+        assert!(tmpdir.path().join("b.txt").exists(), "b.txt should exist");
+
+        backend
+            .restore_paths(tmpdir.path(), &snapshot, &[PathBuf::from("b.txt")])
+            .await
+            .unwrap();
+
+        assert!(
+            !tmpdir.path().join("b.txt").exists(),
+            "b.txt should be removed after restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_paths_selective() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        fs::write(tmpdir.path().join("a.txt"), "aaa").unwrap();
+        fs::write(tmpdir.path().join("b.txt"), "bbb").unwrap();
+        fs::write(tmpdir.path().join("c.txt"), "ccc").unwrap();
+
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(tmpdir.path().join("a.txt"), "AAA").unwrap();
+        fs::write(tmpdir.path().join("b.txt"), "BBB").unwrap();
+        fs::write(tmpdir.path().join("c.txt"), "CCC").unwrap();
+
+        backend
+            .restore_paths(
+                tmpdir.path(),
+                &snapshot,
+                &[PathBuf::from("a.txt"), PathBuf::from("b.txt")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(tmpdir.path().join("a.txt")).unwrap(),
+            "aaa",
+            "a.txt should be restored"
+        );
+        assert_eq!(
+            fs::read_to_string(tmpdir.path().join("b.txt")).unwrap(),
+            "bbb",
+            "b.txt should be restored"
+        );
+        assert_eq!(
+            fs::read_to_string(tmpdir.path().join("c.txt")).unwrap(),
+            "CCC",
+            "c.txt should remain untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_paths_nested() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        let nested_dir = tmpdir.path().join("src/deep/nested");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let nested_file = nested_dir.join("file.rs");
+        fs::write(&nested_file, "original").unwrap();
+
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(&nested_file, "modified").unwrap();
+
+        backend
+            .restore_paths(
+                tmpdir.path(),
+                &snapshot,
+                &[PathBuf::from("src/deep/nested/file.rs")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&nested_file).unwrap(),
+            "original",
+            "Nested file should be restored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_paths_empty_list() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        fs::write(tmpdir.path().join("test.txt"), "hello").unwrap();
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(tmpdir.path().join("test.txt"), "modified").unwrap();
+
+        backend
+            .restore_paths(tmpdir.path(), &snapshot, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(tmpdir.path().join("test.txt")).unwrap(),
+            "modified",
+            "File should remain modified after empty restore"
+        );
+    }
+
+    // ==================== Test Suite 1.4: Full Restore & Edge Cases ====================
+
+    #[tokio::test]
+    async fn test_restore_full_does_not_remove_new_files() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        fs::write(tmpdir.path().join("a.txt"), "aaa").unwrap();
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(tmpdir.path().join("b.txt"), "bbb").unwrap();
+
+        backend.restore(tmpdir.path(), &snapshot).await.unwrap();
+
+        assert!(
+            tmpdir.path().join("a.txt").exists(),
+            "a.txt should still exist"
+        );
+        assert_eq!(
+            fs::read_to_string(tmpdir.path().join("a.txt")).unwrap(),
+            "aaa",
+            "a.txt should be restored"
+        );
+
+        // Bug #5: This documents the current limitation - b.txt is NOT removed
+        assert!(
+            tmpdir.path().join("b.txt").exists(),
+            "BUG: b.txt still exists after full restore (documents Bug #5)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multi_snapshot_chain_restore() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+
+        let file_path = tmpdir.path().join("test.txt");
+
+        // Create 5 snapshots with progressive changes
+        fs::write(&file_path, "v1").unwrap();
+        let _snapshot1 = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(&file_path, "v2").unwrap();
+        let snapshot2 = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(&file_path, "v3").unwrap();
+        let _snapshot3 = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(&file_path, "v4").unwrap();
+        let _snapshot4 = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(&file_path, "v5").unwrap();
+        let _snapshot5 = backend.track(tmpdir.path()).await.unwrap();
+
+        // Restore to snapshot #2
+        backend.restore(tmpdir.path(), &snapshot2).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            "v2",
+            "Should restore to snapshot #2 state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_binary_file() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        let binary_data: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let file_path = tmpdir.path().join("test.bin");
+        fs::write(&file_path, &binary_data).unwrap();
+
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot = backend.track(tmpdir.path()).await.unwrap();
+
+        let modified_data: Vec<u8> = vec![0xFF, 0xFF, 0xFF, 0xFF];
+        fs::write(&file_path, &modified_data).unwrap();
+
+        backend
+            .restore_paths(tmpdir.path(), &snapshot, &[PathBuf::from("test.bin")])
+            .await
+            .unwrap();
+
+        let restored_data = fs::read(&file_path).unwrap();
+        assert_eq!(
+            restored_data, binary_data,
+            "Binary content should roundtrip correctly"
+        );
     }
 }

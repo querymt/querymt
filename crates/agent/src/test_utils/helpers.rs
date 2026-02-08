@@ -1,10 +1,24 @@
 //! Helper functions for creating test fixtures
 
+use crate::agent::builder::AgentBuilderExt;
+use crate::agent::core::{QueryMTAgent, SnapshotPolicy};
 use crate::middleware::{AgentStats, ConversationContext, ToolCall, ToolFunction};
+use crate::model::{AgentMessage, MessagePart};
+use crate::session::backend::StorageBackend;
+use crate::session::domain::ForkOrigin;
+use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::{LLMConfig, Session};
+use crate::snapshot::backend::SnapshotBackend;
+use crate::snapshot::git::GitSnapshotBackend;
+use crate::test_utils::mocks::{TestPluginLoader, TestProviderFactory};
+use anyhow::Result;
+use querymt::LLMParams;
 use querymt::chat::{ChatMessage, ChatRole};
+use querymt::plugin::host::PluginRegistry;
 use std::sync::Arc;
+use tempfile::TempDir;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 /// Creates a test conversation context with the given session ID and step count
 pub fn test_context(session_id: &str, steps: usize) -> Arc<ConversationContext> {
@@ -101,5 +115,233 @@ pub fn mock_llm_config() -> LLMConfig {
         params: None,
         created_at: Some(OffsetDateTime::now_utc()),
         updated_at: Some(OffsetDateTime::now_utc()),
+    }
+}
+
+/// Creates an empty plugin registry for tests that don't need LLM calls.
+/// Useful for undo/snapshot tests, middleware tests, etc.
+///
+/// # Returns
+/// A tuple of (PluginRegistry, TempDir) - the TempDir must be kept alive
+/// for the duration of the test.
+pub fn empty_plugin_registry() -> Result<(PluginRegistry, TempDir)> {
+    let temp_dir = TempDir::new()?;
+    let config_path = temp_dir.path().join("providers.toml");
+    std::fs::write(&config_path, "providers = []\n")?;
+    let registry = PluginRegistry::from_path(&config_path)?;
+    Ok((registry, temp_dir))
+}
+
+/// Creates a plugin registry with a mock provider for LLM interaction tests.
+///
+/// # Returns
+/// A tuple of (PluginRegistry, TempDir) - the TempDir must be kept alive
+/// for the duration of the test.
+pub fn mock_plugin_registry(
+    factory: Arc<TestProviderFactory>,
+) -> Result<(PluginRegistry, TempDir)> {
+    let temp_dir = TempDir::new()?;
+    let wasm_path = temp_dir.path().join("mock.wasm");
+    std::fs::write(&wasm_path, "")?;
+    let config_path = temp_dir.path().join("providers.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[[providers]]\nname = \"mock\"\npath = \"{}\"\n",
+            wasm_path.display()
+        ),
+    )?;
+
+    let mut registry = PluginRegistry::from_path(&config_path)?;
+    registry.register_loader(Box::new(TestPluginLoader { factory }));
+    Ok((registry, temp_dir))
+}
+
+/// Test fixture for undo/snapshot integration tests.
+/// Provides a complete agent setup with snapshot support.
+pub struct UndoTestFixture {
+    pub worktree: TempDir,
+    pub snapshot_base: TempDir,
+    pub config_dir: TempDir,
+    pub storage: Arc<SqliteStorage>,
+    pub agent: QueryMTAgent,
+    pub backend: GitSnapshotBackend,
+}
+
+impl UndoTestFixture {
+    /// Creates a new test fixture with snapshot support enabled.
+    pub async fn new() -> Result<Self> {
+        let worktree = TempDir::new()?;
+        let snapshot_base = TempDir::new()?;
+
+        let (registry, config_dir) = empty_plugin_registry()?;
+        let registry = Arc::new(registry);
+
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
+        let llm = LLMParams::new().provider("mock").model("mock");
+
+        let snapshot_base_path = snapshot_base.path().to_path_buf();
+        let backend = GitSnapshotBackend::with_snapshot_base(snapshot_base_path.clone());
+        let backend_arc = Arc::new(backend);
+
+        let agent = QueryMTAgent::new(registry, storage.session_store(), llm)
+            .with_snapshot_policy(SnapshotPolicy::Diff)
+            .with_snapshot_backend(backend_arc.clone());
+
+        agent.add_observer(storage.event_observer());
+
+        Ok(Self {
+            worktree,
+            snapshot_base,
+            config_dir,
+            storage,
+            agent,
+            backend: GitSnapshotBackend::with_snapshot_base(snapshot_base_path),
+        })
+    }
+
+    /// Create a session and return its public ID
+    pub async fn create_session(&self) -> Result<String> {
+        let session = self
+            .storage
+            .session_store()
+            .create_session(None, Some(self.worktree.path().to_path_buf()), None, None)
+            .await?;
+
+        // Create SessionRuntime for undo/redo to work
+        self.create_session_runtime(&session.public_id).await;
+
+        Ok(session.public_id)
+    }
+
+    /// Create a child session (for delegation tests)
+    pub async fn create_child_session(&self, parent_id: &str) -> Result<String> {
+        let session = self
+            .storage
+            .session_store()
+            .create_session(
+                None,
+                Some(self.worktree.path().to_path_buf()),
+                Some(parent_id.to_string()),
+                Some(ForkOrigin::Delegation),
+            )
+            .await?;
+
+        // Create SessionRuntime for undo/redo to work
+        self.create_session_runtime(&session.public_id).await;
+
+        Ok(session.public_id)
+    }
+
+    /// Helper to create a SessionRuntime entry for a session (needed for undo/redo)
+    async fn create_session_runtime(&self, session_id: &str) {
+        let runtime = Arc::new(crate::agent::core::SessionRuntime {
+            cwd: Some(self.worktree.path().to_path_buf()),
+            _mcp_services: std::collections::HashMap::new(),
+            mcp_tools: std::collections::HashMap::new(),
+            mcp_tool_defs: vec![],
+            permission_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            current_tools_hash: std::sync::Mutex::new(None),
+            function_index: Arc::new(tokio::sync::OnceCell::new()),
+            turn_snapshot: std::sync::Mutex::new(None),
+            turn_diffs: std::sync::Mutex::new(Default::default()),
+        });
+
+        let mut runtimes = self.agent.session_runtime.lock().await;
+        runtimes.insert(session_id.to_string(), runtime);
+    }
+
+    /// Simulate a user message and return its ID
+    pub async fn add_user_message(&self, session_id: &str, content: &str) -> Result<String> {
+        let msg_id = Uuid::new_v4().to_string();
+        let msg = AgentMessage {
+            id: msg_id.clone(),
+            session_id: session_id.to_string(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::Text {
+                content: content.to_string(),
+            }],
+            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            parent_message_id: None,
+        };
+        self.storage
+            .session_store()
+            .add_message(session_id, msg)
+            .await?;
+        Ok(msg_id)
+    }
+
+    /// Take a snapshot and record TurnSnapshotStart
+    pub async fn take_pre_snapshot(&self, session_id: &str) -> Result<(String, String)> {
+        let snapshot_id = self.backend.track(self.worktree.path()).await?;
+        let turn_id = Uuid::new_v4().to_string();
+
+        let msg = AgentMessage {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::TurnSnapshotStart {
+                turn_id: turn_id.clone(),
+                snapshot_id: snapshot_id.clone(),
+            }],
+            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            parent_message_id: None,
+        };
+        self.storage
+            .session_store()
+            .add_message(session_id, msg)
+            .await?;
+
+        Ok((turn_id, snapshot_id))
+    }
+
+    /// Take post-snapshot and record TurnSnapshotPatch
+    pub async fn take_post_snapshot(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        pre_snapshot: &str,
+    ) -> Result<Vec<String>> {
+        let post_snapshot = self.backend.track(self.worktree.path()).await?;
+        let pre_snapshot_string = pre_snapshot.to_string();
+        let changed_paths = self
+            .backend
+            .diff(self.worktree.path(), &pre_snapshot_string, &post_snapshot)
+            .await?;
+
+        let changed_strs: Vec<String> = changed_paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        let msg = AgentMessage {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::TurnSnapshotPatch {
+                turn_id: turn_id.to_string(),
+                snapshot_id: post_snapshot,
+                changed_paths: changed_strs.clone(),
+            }],
+            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            parent_message_id: None,
+        };
+        self.storage
+            .session_store()
+            .add_message(session_id, msg)
+            .await?;
+
+        Ok(changed_strs)
+    }
+
+    /// Convenience: write a file to the worktree
+    pub fn write_file(&self, name: &str, content: &str) -> Result<()> {
+        std::fs::write(self.worktree.path().join(name), content)?;
+        Ok(())
+    }
+
+    /// Convenience: read a file from the worktree
+    pub fn read_file(&self, name: &str) -> Result<String> {
+        Ok(std::fs::read_to_string(self.worktree.path().join(name))?)
     }
 }

@@ -34,6 +34,15 @@ pub struct ModelEntry {
     pub model: String,
 }
 
+/// Recent model usage entry from event history.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentModelEntry {
+    pub provider: String,
+    pub model: String,
+    pub last_used: String, // ISO 8601 timestamp
+    pub use_count: u32,
+}
+
 /// Summary of a session for listing.
 #[derive(Serialize)]
 pub struct SessionSummary {
@@ -90,6 +99,11 @@ pub enum UiClientMessage {
         session_id: String,
         model_id: String,
     },
+    /// Get recent models from event history
+    GetRecentModels {
+        #[serde(default)]
+        limit_per_workspace: Option<u32>,
+    },
     /// Request file index for @ mentions
     GetFileIndex,
     /// Request LLM config details by config_id
@@ -120,6 +134,12 @@ pub enum UiClientMessage {
         action: String,
         content: Option<serde_json::Value>,
     },
+    /// Set the agent's operating mode (build/plan/review)
+    SetAgentMode {
+        mode: String,
+    },
+    /// Get the current agent mode
+    GetAgentMode,
 }
 
 /// Messages from server to UI client.
@@ -132,6 +152,7 @@ pub enum UiServerMessage {
         active_session_id: Option<String>,
         agents: Vec<UiAgentInfo>,
         sessions_by_agent: HashMap<String, String>,
+        agent_mode: String,
     },
     SessionCreated {
         agent_id: String,
@@ -168,6 +189,10 @@ pub enum UiServerMessage {
     AllModelsList {
         models: Vec<ModelEntry>,
     },
+    /// Recent models from event history, grouped by workspace
+    RecentModels {
+        by_workspace: HashMap<Option<String>, Vec<RecentModelEntry>>,
+    },
     /// File index for autocomplete
     FileIndex {
         files: Vec<FileIndexEntry>,
@@ -191,6 +216,10 @@ pub enum UiServerMessage {
         success: bool,
         message: Option<String>,
     },
+    /// Current agent mode notification
+    AgentMode {
+        mode: String,
+    },
 }
 
 impl UiServerMessage {
@@ -205,11 +234,13 @@ impl UiServerMessage {
             Self::SessionLoaded { .. } => "session_loaded",
             Self::WorkspaceIndexStatus { .. } => "workspace_index_status",
             Self::AllModelsList { .. } => "all_models_list",
+            Self::RecentModels { .. } => "recent_models",
             Self::FileIndex { .. } => "file_index",
             Self::LlmConfig { .. } => "llm_config",
             Self::SessionEvents { .. } => "session_events",
             Self::UndoResult { .. } => "undo_result",
             Self::RedoResult { .. } => "redo_result",
+            Self::AgentMode { .. } => "agent_mode",
         }
     }
 }

@@ -7,6 +7,7 @@ use super::connection::{send_error, send_message, send_state};
 use super::mentions::filter_index_for_cwd;
 use super::messages::{ModelEntry, SessionGroup, SessionSummary, UiClientMessage, UiServerMessage};
 use super::session::{PRIMARY_AGENT_ID, ensure_sessions_for_mode, prompt_for_mode, resolve_cwd};
+use crate::agent::core::AgentMode;
 use crate::index::resolve_workspace_root;
 use agent_client_protocol::CancelNotification;
 use futures_util::future;
@@ -121,6 +122,12 @@ pub async fn handle_ui_message(
         UiClientMessage::ListAllModels { refresh } => {
             handle_list_all_models(state, refresh, tx).await;
         }
+        UiClientMessage::GetRecentModels {
+            limit_per_workspace,
+        } => {
+            let limit = limit_per_workspace.unwrap_or(10) as usize;
+            handle_get_recent_models(state, limit, tx).await;
+        }
         UiClientMessage::SetSessionModel {
             session_id,
             model_id,
@@ -159,6 +166,12 @@ pub async fn handle_ui_message(
             content,
         } => {
             handle_elicitation_response(state, &elicitation_id, &action, content.as_ref()).await;
+        }
+        UiClientMessage::SetAgentMode { mode } => {
+            handle_set_agent_mode(state, &mode, tx).await;
+        }
+        UiClientMessage::GetAgentMode => {
+            handle_get_agent_mode(state, tx).await;
         }
     }
 }
@@ -295,6 +308,47 @@ pub async fn handle_list_all_models(state: &ServerState, refresh: bool, tx: &mps
         }
         Err(e) => {
             let _ = send_error(tx, format!("Failed to fetch models: {}", e)).await;
+        }
+    }
+}
+
+/// Handle request for recent models from event history.
+pub async fn handle_get_recent_models(
+    state: &ServerState,
+    limit_per_workspace: usize,
+    tx: &mpsc::Sender<String>,
+) {
+    match state
+        .view_store
+        .get_recent_models_view(limit_per_workspace)
+        .await
+    {
+        Ok(view) => {
+            // Convert OffsetDateTime to RFC3339 strings for JSON serialization
+            let by_workspace: std::collections::HashMap<
+                Option<String>,
+                Vec<super::messages::RecentModelEntry>,
+            > = view
+                .by_workspace
+                .into_iter()
+                .map(|(workspace, entries)| {
+                    let converted_entries = entries
+                        .into_iter()
+                        .map(|entry| super::messages::RecentModelEntry {
+                            provider: entry.provider,
+                            model: entry.model,
+                            last_used: entry.last_used.format(&Rfc3339).unwrap_or_default(),
+                            use_count: entry.use_count,
+                        })
+                        .collect();
+                    (workspace, converted_entries)
+                })
+                .collect();
+
+            let _ = send_message(tx, UiServerMessage::RecentModels { by_workspace }).await;
+        }
+        Err(e) => {
+            let _ = send_error(tx, format!("Failed to get recent models: {}", e)).await;
         }
     }
 }
@@ -691,4 +745,40 @@ pub async fn handle_elicitation_response(
     if let Some(tx) = pending.remove(elicitation_id) {
         let _ = tx.send(response);
     }
+}
+
+/// Handle agent mode change request.
+pub async fn handle_set_agent_mode(state: &ServerState, mode: &str, tx: &mpsc::Sender<String>) {
+    match mode.parse::<AgentMode>() {
+        Ok(new_mode) => {
+            let previous_mode = state.agent.get_agent_mode();
+            state.agent.set_agent_mode(new_mode);
+
+            log::info!("Agent mode changed: {} -> {}", previous_mode, new_mode);
+
+            // Send mode confirmation back
+            let _ = send_message(
+                tx,
+                UiServerMessage::AgentMode {
+                    mode: new_mode.as_str().to_string(),
+                },
+            )
+            .await;
+        }
+        Err(e) => {
+            let _ = send_error(tx, e).await;
+        }
+    }
+}
+
+/// Handle get agent mode request.
+pub async fn handle_get_agent_mode(state: &ServerState, tx: &mpsc::Sender<String>) {
+    let mode = state.agent.get_agent_mode();
+    let _ = send_message(
+        tx,
+        UiServerMessage::AgentMode {
+            mode: mode.as_str().to_string(),
+        },
+    )
+    .await;
 }
