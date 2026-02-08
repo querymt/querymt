@@ -377,3 +377,116 @@ impl ChatResponse for MockChatResponse {
         None
     }
 }
+
+// ============================================================================
+// MockCompactionProvider - for testing SessionCompaction
+// ============================================================================
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Mock ChatProvider for testing compaction - queues predetermined responses
+#[derive(Clone)]
+pub struct MockCompactionProvider {
+    responses: Arc<Mutex<VecDeque<Result<String, LLMError>>>>,
+    received_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    call_count: Arc<AtomicUsize>,
+}
+
+impl MockCompactionProvider {
+    /// Create a new mock provider with a queue of responses
+    pub fn new(responses: Vec<Result<String, LLMError>>) -> Self {
+        Self {
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+            received_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Create with a single successful response
+    pub fn with_summary(summary: &str) -> Self {
+        Self::new(vec![Ok(summary.to_string())])
+    }
+
+    /// Create with a single error response
+    pub fn with_error(error: LLMError) -> Self {
+        Self::new(vec![Err(error)])
+    }
+
+    /// Get all messages that were sent to this provider (async version)
+    pub async fn get_received_messages_async(&self) -> Vec<Vec<ChatMessage>> {
+        self.received_messages.lock().await.clone()
+    }
+
+    /// Get the number of times chat() was called
+    pub fn call_count(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+
+    /// Reset call count and messages (for reusing provider in multiple tests)
+    pub async fn reset(&self) {
+        self.call_count.store(0, Ordering::SeqCst);
+        self.received_messages.lock().await.clear();
+    }
+}
+
+#[async_trait]
+impl querymt::chat::ChatProvider for MockCompactionProvider {
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.received_messages.lock().await.push(messages.to_vec());
+
+        let mut responses = self.responses.lock().await;
+        match responses.pop_front() {
+            Some(Ok(text)) => Ok(Box::new(MockChatResponse::text_only(&text))),
+            Some(Err(e)) => Err(e),
+            None => Err(LLMError::GenericError(
+                "No more mock responses available".to_string(),
+            )),
+        }
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        _tools: Option<&[Tool]>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        // For compaction testing, we don't use tools
+        self.chat(messages).await
+    }
+}
+
+#[async_trait]
+impl querymt::completion::CompletionProvider for MockCompactionProvider {
+    async fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
+        Err(LLMError::NotImplemented(
+            "MockCompactionProvider does not support completions".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl querymt::embedding::EmbeddingProvider for MockCompactionProvider {
+    async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+        Err(LLMError::NotImplemented(
+            "MockCompactionProvider does not support embeddings".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl LLMProvider for MockCompactionProvider {
+    fn tools(&self) -> Option<&[Tool]> {
+        None
+    }
+
+    async fn call_tool(&self, _name: &str, _args: serde_json::Value) -> Result<String, LLMError> {
+        Err(LLMError::NotImplemented(
+            "MockCompactionProvider does not support tools".to_string(),
+        ))
+    }
+}

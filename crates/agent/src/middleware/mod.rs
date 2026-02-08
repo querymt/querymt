@@ -27,9 +27,7 @@ pub use state::{
 pub use crate::model_info::{CapabilityError, ModelInfoSource};
 
 // Re-export middleware implementations (will be converted to new system)
-pub use context::{
-    AutoCompactMiddleware, ContextConfig, ContextMiddleware, ContextWarningMiddleware,
-};
+pub use context::{ContextConfig, ContextMiddleware};
 pub use dedup_check::{
     DedupCheckFactory, DedupCheckMiddleware, DuplicateWarning, FunctionLocation, SimilarMatch,
 };

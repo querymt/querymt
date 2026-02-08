@@ -285,32 +285,160 @@ pub fn get_last_compaction(messages: &[AgentMessage]) -> Option<&MessagePart> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::mocks::MockCompactionProvider;
+    use querymt::error::LLMError;
 
-    fn make_text_message(id: &str, session_id: &str, role: ChatRole, text: &str) -> AgentMessage {
-        AgentMessage {
-            id: id.to_string(),
-            session_id: session_id.to_string(),
-            role,
-            parts: vec![MessagePart::Text {
-                content: text.to_string(),
-            }],
-            created_at: 0,
-            parent_message_id: None,
+    // ========================================================================
+    // Test Fixtures
+    // ========================================================================
+
+    /// Fixture for building test messages
+    struct MessageFixture;
+
+    impl MessageFixture {
+        fn text_message(id: &str, session_id: &str, role: ChatRole, text: &str) -> AgentMessage {
+            AgentMessage {
+                id: id.to_string(),
+                session_id: session_id.to_string(),
+                role,
+                parts: vec![MessagePart::Text {
+                    content: text.to_string(),
+                }],
+                created_at: 0,
+                parent_message_id: None,
+            }
+        }
+
+        fn assistant_message(id: &str, session_id: &str, text: &str) -> AgentMessage {
+            Self::text_message(id, session_id, ChatRole::Assistant, text)
+        }
+
+        fn user_message(id: &str, session_id: &str, text: &str) -> AgentMessage {
+            Self::text_message(id, session_id, ChatRole::User, text)
+        }
+
+        fn tool_result_message(
+            id: &str,
+            session_id: &str,
+            call_id: &str,
+            content: &str,
+        ) -> AgentMessage {
+            AgentMessage {
+                id: id.to_string(),
+                session_id: session_id.to_string(),
+                role: ChatRole::Assistant,
+                parts: vec![MessagePart::ToolResult {
+                    call_id: call_id.to_string(),
+                    content: content.to_string(),
+                    is_error: false,
+                    tool_name: Some("test_tool".to_string()),
+                    tool_arguments: None,
+                    compacted_at: None,
+                }],
+                created_at: 0,
+                parent_message_id: None,
+            }
+        }
+
+        fn compaction_message(id: &str, session_id: &str, summary: &str) -> AgentMessage {
+            AgentMessage {
+                id: id.to_string(),
+                session_id: session_id.to_string(),
+                role: ChatRole::Assistant,
+                parts: vec![MessagePart::Compaction {
+                    summary: summary.to_string(),
+                    original_token_count: 1000,
+                }],
+                created_at: 0,
+                parent_message_id: None,
+            }
+        }
+
+        fn reasoning_message(id: &str, session_id: &str, reasoning: &str) -> AgentMessage {
+            AgentMessage {
+                id: id.to_string(),
+                session_id: session_id.to_string(),
+                role: ChatRole::Assistant,
+                parts: vec![MessagePart::Reasoning {
+                    content: reasoning.to_string(),
+                    time_ms: Some(100),
+                }],
+                created_at: 0,
+                parent_message_id: None,
+            }
+        }
+
+        /// Create a simple conversation with user/assistant exchanges
+        fn simple_conversation(session_id: &str) -> Vec<AgentMessage> {
+            vec![
+                Self::user_message("1", session_id, "Hello"),
+                Self::assistant_message("2", session_id, "Hi there"),
+                Self::user_message("3", session_id, "How are you?"),
+                Self::assistant_message("4", session_id, "I'm doing great!"),
+            ]
+        }
+
+        /// Create a conversation with tool usage
+        fn conversation_with_tools(session_id: &str) -> Vec<AgentMessage> {
+            vec![
+                Self::user_message("1", session_id, "List the files"),
+                Self::tool_result_message("2", session_id, "call1", "file1.txt\nfile2.txt"),
+                Self::user_message("3", session_id, "Read file1.txt"),
+                Self::tool_result_message("4", session_id, "call2", "File contents here"),
+            ]
+        }
+
+        /// Create a long conversation (for token counting tests)
+        fn long_conversation(session_id: &str) -> Vec<AgentMessage> {
+            let long_text = "a".repeat(1000);
+            vec![
+                Self::user_message("1", session_id, &long_text),
+                Self::tool_result_message("2", session_id, "call1", &long_text),
+                Self::user_message("3", session_id, &long_text),
+                Self::tool_result_message("4", session_id, "call2", &long_text),
+            ]
         }
     }
 
-    fn make_compaction_message(id: &str, session_id: &str, summary: &str) -> AgentMessage {
-        AgentMessage {
-            id: id.to_string(),
-            session_id: session_id.to_string(),
-            role: ChatRole::Assistant,
-            parts: vec![MessagePart::Compaction {
-                summary: summary.to_string(),
-                original_token_count: 1000,
-            }],
-            created_at: 0,
-            parent_message_id: None,
+    /// Fixture for SessionCompaction service
+    struct CompactionFixture {
+        service: SessionCompaction,
+    }
+
+    impl CompactionFixture {
+        fn new() -> Self {
+            Self {
+                service: SessionCompaction::new(),
+            }
         }
+
+        async fn process_with_summary(
+            &self,
+            messages: &[AgentMessage],
+            summary_response: &str,
+        ) -> Result<CompactionResult> {
+            let mock = MockCompactionProvider::with_summary(summary_response);
+            self.service
+                .process(
+                    messages,
+                    Arc::new(mock),
+                    "test-model",
+                    &RetryConfig::default(),
+                )
+                .await
+        }
+    }
+
+    // ========================================================================
+    // Helper Functions (backwards compatibility)
+    // ========================================================================
+
+    fn make_text_message(id: &str, session_id: &str, role: ChatRole, text: &str) -> AgentMessage {
+        MessageFixture::text_message(id, session_id, role, text)
+    }
+
+    fn make_compaction_message(id: &str, session_id: &str, summary: &str) -> AgentMessage {
+        MessageFixture::compaction_message(id, session_id, summary)
     }
 
     #[test]
@@ -418,5 +546,307 @@ mod tests {
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.initial_backoff_ms, 1000);
         assert!((config.backoff_multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    // ========================================================================
+    // New Unit Tests Using Fixtures
+    // ========================================================================
+
+    #[test]
+    fn test_message_fixture_creates_text_messages() {
+        let msg = MessageFixture::user_message("1", "sess1", "test");
+        assert_eq!(msg.id, "1");
+        assert_eq!(msg.session_id, "sess1");
+        assert_eq!(msg.role, ChatRole::User);
+        assert_eq!(msg.parts.len(), 1);
+    }
+
+    #[test]
+    fn test_message_fixture_simple_conversation() {
+        let conv = MessageFixture::simple_conversation("s1");
+        assert_eq!(conv.len(), 4);
+        assert_eq!(conv[0].role, ChatRole::User);
+        assert_eq!(conv[1].role, ChatRole::Assistant);
+    }
+
+    #[test]
+    fn test_estimate_messages_tokens_text_parts() {
+        let fixture = CompactionFixture::new();
+        let messages = MessageFixture::simple_conversation("s1");
+
+        let tokens = fixture.service.estimate_messages_tokens(&messages);
+        assert!(tokens > 0, "Should count tokens for text messages");
+    }
+
+    #[test]
+    fn test_estimate_messages_tokens_tool_results() {
+        let fixture = CompactionFixture::new();
+        let messages = MessageFixture::conversation_with_tools("s1");
+
+        let tokens = fixture.service.estimate_messages_tokens(&messages);
+        assert!(tokens > 0, "Should count tokens for tool results");
+    }
+
+    #[test]
+    fn test_estimate_messages_tokens_mixed_parts() {
+        let fixture = CompactionFixture::new();
+        let messages = vec![
+            MessageFixture::user_message("1", "s1", "User request"),
+            MessageFixture::reasoning_message("2", "s1", "Let me think about this"),
+            MessageFixture::tool_result_message("3", "s1", "c1", "Tool output"),
+            MessageFixture::assistant_message("4", "s1", "Final response"),
+        ];
+
+        let tokens = fixture.service.estimate_messages_tokens(&messages);
+        assert!(tokens > 0, "Should count tokens for all part types");
+    }
+
+    #[test]
+    fn test_estimate_messages_tokens_empty() {
+        let fixture = CompactionFixture::new();
+        let messages: Vec<AgentMessage> = vec![];
+
+        let tokens = fixture.service.estimate_messages_tokens(&messages);
+        assert_eq!(tokens, 0, "Empty messages should have 0 tokens");
+    }
+
+    #[test]
+    fn test_estimate_messages_tokens_long_conversation() {
+        let fixture = CompactionFixture::new();
+        let messages = MessageFixture::long_conversation("s1");
+
+        let tokens = fixture.service.estimate_messages_tokens(&messages);
+        assert!(
+            tokens > 500,
+            "Long conversation should have significant token count"
+        );
+    }
+
+    #[test]
+    fn test_build_compaction_messages_appends_prompt() {
+        let fixture = CompactionFixture::new();
+        let messages = MessageFixture::simple_conversation("s1");
+
+        let chat_messages = fixture.service.build_compaction_messages(&messages);
+
+        // Should have all original messages + compaction prompt
+        assert_eq!(
+            chat_messages.len(),
+            messages.len() + 1,
+            "Should append compaction prompt"
+        );
+
+        // Last message should be the compaction prompt
+        assert_eq!(chat_messages.last().unwrap().role, ChatRole::User);
+        assert!(
+            chat_messages
+                .last()
+                .unwrap()
+                .content
+                .contains("conversation")
+        );
+    }
+
+    #[test]
+    fn test_build_compaction_messages_preserves_roles() {
+        let fixture = CompactionFixture::new();
+        let messages = MessageFixture::simple_conversation("s1");
+
+        let chat_messages = fixture.service.build_compaction_messages(&messages);
+
+        // Check that roles are preserved (excluding the appended prompt)
+        assert_eq!(chat_messages[0].role, ChatRole::User);
+        assert_eq!(chat_messages[1].role, ChatRole::Assistant);
+        assert_eq!(chat_messages[2].role, ChatRole::User);
+        assert_eq!(chat_messages[3].role, ChatRole::Assistant);
+    }
+
+    #[tokio::test]
+    async fn test_process_success_simple() {
+        let fixture = CompactionFixture::new();
+        let messages = MessageFixture::simple_conversation("s1");
+
+        let result = fixture
+            .process_with_summary(&messages, "This is a summary")
+            .await
+            .expect("process should succeed");
+
+        assert_eq!(result.summary, "This is a summary");
+        assert!(result.original_token_count > 0);
+        assert!(result.summary_token_count > 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_success_with_tools() {
+        let fixture = CompactionFixture::new();
+        let messages = MessageFixture::conversation_with_tools("s1");
+
+        let result = fixture
+            .process_with_summary(&messages, "Tool execution summary")
+            .await
+            .expect("process should succeed");
+
+        assert!(!result.summary.is_empty());
+        assert!(result.original_token_count > 0);
+        assert!(result.summary_token_count > 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_returns_correct_token_counts() {
+        let fixture = CompactionFixture::new();
+        let messages = MessageFixture::long_conversation("s1");
+
+        let original_tokens = fixture.service.estimate_messages_tokens(&messages);
+        let result = fixture
+            .process_with_summary(&messages, "short")
+            .await
+            .expect("process should succeed");
+
+        assert_eq!(result.original_token_count, original_tokens);
+        // Summary "short" should have fewer tokens than original
+        assert!(result.summary_token_count <= original_tokens);
+    }
+
+    #[tokio::test]
+    async fn test_process_with_empty_messages() {
+        let fixture = CompactionFixture::new();
+        let messages: Vec<AgentMessage> = vec![];
+
+        let result = fixture
+            .process_with_summary(&messages, "empty summary")
+            .await
+            .expect("process should succeed with empty messages");
+
+        assert_eq!(result.original_token_count, 0);
+        assert!(!result.summary.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_retries_on_llm_error() {
+        let service = SessionCompaction::new();
+        let messages = MessageFixture::simple_conversation("s1");
+
+        // Create a mock that fails twice then succeeds
+        let mock = MockCompactionProvider::new(vec![
+            Err(LLMError::GenericError("timeout".to_string())),
+            Err(LLMError::GenericError("timeout".to_string())),
+            Ok("recovered summary".to_string()),
+        ]);
+        let mock_arc = Arc::new(mock);
+
+        let result = service
+            .process(
+                &messages,
+                mock_arc.clone(),
+                "model",
+                &RetryConfig::default(),
+            )
+            .await
+            .expect("should succeed after retries");
+
+        assert_eq!(result.summary, "recovered summary");
+        assert_eq!(mock_arc.call_count(), 3, "Should have retried twice");
+    }
+
+    #[tokio::test]
+    async fn test_process_fails_after_max_retries() {
+        let service = SessionCompaction::new();
+        let messages = MessageFixture::simple_conversation("s1");
+
+        // Create a mock that always fails
+        let mock = MockCompactionProvider::new(vec![
+            Err(LLMError::GenericError("error1".to_string())),
+            Err(LLMError::GenericError("error2".to_string())),
+            Err(LLMError::GenericError("error3".to_string())),
+            Err(LLMError::GenericError("error4".to_string())),
+        ]);
+        let mock_arc = Arc::new(mock);
+
+        let result = service
+            .process(
+                &messages,
+                mock_arc.clone(),
+                "model",
+                &RetryConfig::default(),
+            )
+            .await;
+
+        assert!(result.is_err(), "should fail after max retries");
+        // Default retry config has max_retries=3, so 4 calls (initial + 3 retries)
+        assert_eq!(mock_arc.call_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_process_with_custom_retry_config() {
+        let service = SessionCompaction::new();
+        let messages = MessageFixture::simple_conversation("s1");
+
+        let custom_config = RetryConfig {
+            max_retries: 1,
+            initial_backoff_ms: 10,
+            backoff_multiplier: 1.0,
+        };
+
+        let mock = MockCompactionProvider::new(vec![
+            Err(LLMError::GenericError("error1".to_string())),
+            Err(LLMError::GenericError("error2".to_string())),
+        ]);
+        let mock_arc = Arc::new(mock);
+
+        let result = service
+            .process(&messages, mock_arc.clone(), "model", &custom_config)
+            .await;
+
+        assert!(result.is_err());
+        // With max_retries=1, should have 2 calls (initial + 1 retry)
+        assert_eq!(mock_arc.call_count(), 2);
+    }
+
+    #[test]
+    fn test_create_compaction_message_structure() {
+        let msg = SessionCompaction::create_compaction_message("session1", "Test summary", 5000);
+
+        assert_eq!(msg.session_id, "session1");
+        assert_eq!(msg.role, ChatRole::Assistant);
+        assert_eq!(msg.parts.len(), 1);
+        assert!(!msg.id.is_empty());
+        assert!(msg.created_at > 0);
+    }
+
+    #[test]
+    fn test_create_compaction_message_with_different_summaries() {
+        let msg1 = SessionCompaction::create_compaction_message("s1", "Summary 1", 1000);
+        let msg2 = SessionCompaction::create_compaction_message("s1", "Summary 2", 2000);
+
+        assert_ne!(
+            msg1.id, msg2.id,
+            "Different messages should have different IDs"
+        );
+
+        if let MessagePart::Compaction {
+            summary: s1,
+            original_token_count: t1,
+        } = &msg1.parts[0]
+            && let MessagePart::Compaction {
+                summary: s2,
+                original_token_count: t2,
+            } = &msg2.parts[0]
+        {
+            assert_ne!(s1, s2);
+            assert_ne!(t1, t2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_message_order_preserved() {
+        let fixture = CompactionFixture::new();
+        let messages = MessageFixture::simple_conversation("s1");
+
+        let chat_messages = fixture.service.build_compaction_messages(&messages);
+
+        // Verify first message is the user message from conversation
+        if let MessagePart::Text { content } = &messages[0].parts[0] {
+            assert!(chat_messages[0].content.contains(content));
+        }
     }
 }
