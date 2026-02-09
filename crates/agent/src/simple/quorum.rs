@@ -182,11 +182,15 @@ impl QuorumBuilder {
                 agent = agent
                     .with_tool_output_config(tool_output_config)
                     .with_pruning_config(pruning_config)
-                    .with_compaction_config(compaction_config)
+                    .with_compaction_config(compaction_config.clone())
                     .with_rate_limit_config(rate_limit_config);
 
                 // Apply middleware from config (after compaction_config is set)
-                apply_middleware_from_config(&mut agent, &middleware_entries);
+                apply_middleware_from_config(
+                    &mut agent,
+                    &middleware_entries,
+                    compaction_config.auto,
+                );
 
                 // Handle snapshot backend from config (can override the policy-based one above)
                 match snapshot_backend_config.backend.as_str() {
@@ -242,11 +246,11 @@ impl QuorumBuilder {
             agent = agent
                 .with_tool_output_config(planner_tool_output)
                 .with_pruning_config(planner_pruning)
-                .with_compaction_config(planner_compaction)
+                .with_compaction_config(planner_compaction.clone())
                 .with_rate_limit_config(planner_rate_limit);
 
             // Apply middleware from config (after compaction_config is set)
-            apply_middleware_from_config(&mut agent, &planner_middleware);
+            apply_middleware_from_config(&mut agent, &planner_middleware, planner_compaction.auto);
 
             // Handle snapshot backend from config (can override the policy-based one above)
             match planner_snapshot.backend.as_str() {
@@ -690,7 +694,11 @@ fn parse_snapshot_policy(policy: Option<String>) -> Result<SnapshotPolicy> {
 }
 
 /// Helper to apply middleware from config entries to an agent
-fn apply_middleware_from_config(agent: &mut QueryMTAgent, entries: &[MiddlewareEntry]) {
+fn apply_middleware_from_config(
+    agent: &mut QueryMTAgent,
+    entries: &[MiddlewareEntry],
+    auto_compact: bool,
+) {
     for entry in entries {
         match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, agent) {
             Ok(middleware) => {
@@ -707,6 +715,19 @@ fn apply_middleware_from_config(agent: &mut QueryMTAgent, entries: &[MiddlewareE
                     );
                 }
             }
+        }
+    }
+
+    // Auto-add ContextMiddleware if compaction.auto is true and user didn't provide one
+    if auto_compact {
+        let mut drivers = agent.middleware_drivers.lock().unwrap();
+        let already_has = drivers.iter().any(|d| d.name() == "ContextMiddleware");
+        if !already_has {
+            log::info!("Auto-enabling ContextMiddleware for compaction");
+            let context_middleware = crate::middleware::ContextMiddleware::new(
+                crate::middleware::ContextConfig::default().auto_compact(true),
+            );
+            drivers.push(Arc::new(context_middleware));
         }
     }
 }

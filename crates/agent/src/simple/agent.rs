@@ -255,6 +255,19 @@ impl AgentBuilder {
             }
         }
 
+        // Auto-add ContextMiddleware if compaction.auto is true and user didn't provide one
+        if agent.compaction_config.auto {
+            let mut drivers = agent.middleware_drivers.lock().unwrap();
+            let already_has = drivers.iter().any(|d| d.name() == "ContextMiddleware");
+            if !already_has {
+                log::info!("Auto-enabling ContextMiddleware for compaction");
+                let context_middleware = crate::middleware::ContextMiddleware::new(
+                    crate::middleware::ContextConfig::default().auto_compact(true),
+                );
+                drivers.push(Arc::new(context_middleware));
+            }
+        }
+
         let view_store = backend
             .view_store()
             .expect("SqliteStorage always provides ViewStore");
