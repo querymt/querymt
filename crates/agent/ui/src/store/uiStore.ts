@@ -172,14 +172,12 @@ export const useUiStore = create<UiState>((set) => ({
   
   // Reset chat view state when switching sessions
   resetChatView: () => set({
-    activeTimelineView: 'chat',
     activeDelegationId: null,
+    activeTimelineView: 'chat',
+    selectedToolEvent: null,
     isAtBottom: true,
     chatScrollIndex: 0,
-    selectedToolEvent: null,
-    modelPickerOpen: false,
-    sessionSwitcherOpen: false,
-    statsDrawerOpen: false,
+    delegationsPanelCollapsed: false,
     delegationDrawerOpen: false,
   }),
   
