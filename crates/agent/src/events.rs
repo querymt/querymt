@@ -252,6 +252,24 @@ pub enum AgentEventKind {
         mode: String,
         previous_mode: String,
     },
+    /// LLM request was rate limited, execution is paused and waiting
+    RateLimited {
+        /// Human-readable message from the provider
+        message: String,
+        /// Seconds until retry will be attempted
+        wait_secs: u64,
+        /// When the wait started (Unix timestamp in seconds)
+        started_at: i64,
+        /// Current retry attempt (1-indexed)
+        attempt: usize,
+        /// Maximum retry attempts configured
+        max_attempts: usize,
+    },
+    /// Rate limit wait completed, resuming execution
+    RateLimitResume {
+        /// Which attempt is now being made
+        attempt: usize,
+    },
 }
 
 #[async_trait]

@@ -123,6 +123,10 @@ pub struct QueryMTAgent {
     /// Session compaction service for AI summaries
     pub(crate) compaction: SessionCompaction,
 
+    // Rate limiting
+    /// Rate limit retry configuration
+    pub(crate) rate_limit_config: crate::config::RateLimitConfig,
+
     // Snapshot system for undo/redo
     /// Snapshot backend implementation (e.g., git-based)
     pub(crate) snapshot_backend: Option<Arc<dyn crate::snapshot::SnapshotBackend>>,
@@ -284,6 +288,8 @@ impl QueryMTAgent {
             pruning_config: PruningConfig::default(),
             compaction_config: CompactionConfig::default(),
             compaction: SessionCompaction::new(),
+            // Rate limiting - default config
+            rate_limit_config: crate::config::RateLimitConfig::default(),
             // Snapshot system - disabled by default
             snapshot_backend: None,
             snapshot_gc_config: crate::snapshot::GcConfig::default(),

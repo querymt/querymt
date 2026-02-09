@@ -159,6 +159,7 @@ impl QuorumBuilder {
             let pruning_config = delegate.pruning.clone();
             let compaction_config = delegate.compaction.clone();
             let snapshot_backend_config = delegate.snapshot.clone();
+            let rate_limit_config = delegate.rate_limit.clone();
             let registry = registry.clone();
             let snapshot_policy_for_delegate = self.snapshot_policy;
             let _cwd_for_delegate = cwd.clone();
@@ -184,7 +185,8 @@ impl QuorumBuilder {
                 agent = agent
                     .with_tool_output_config(tool_output_config)
                     .with_pruning_config(pruning_config)
-                    .with_compaction_config(compaction_config);
+                    .with_compaction_config(compaction_config)
+                    .with_rate_limit_config(rate_limit_config);
 
                 // Handle snapshot backend from config (can override the policy-based one above)
                 match snapshot_backend_config.backend.as_str() {
@@ -213,6 +215,7 @@ impl QuorumBuilder {
         let planner_pruning = planner_config.pruning.clone();
         let planner_compaction = planner_config.compaction.clone();
         let planner_snapshot = planner_config.snapshot.clone();
+        let planner_rate_limit = planner_config.rate_limit.clone();
         let registry_for_planner = registry.clone();
         let snapshot_policy_for_planner = self.snapshot_policy;
         let _cwd_for_planner = cwd.clone();
@@ -242,7 +245,8 @@ impl QuorumBuilder {
             agent = agent
                 .with_tool_output_config(planner_tool_output)
                 .with_pruning_config(planner_pruning)
-                .with_compaction_config(planner_compaction);
+                .with_compaction_config(planner_compaction)
+                .with_rate_limit_config(planner_rate_limit);
 
             // Handle snapshot backend from config (can override the policy-based one above)
             match planner_snapshot.backend.as_str() {
@@ -480,11 +484,12 @@ impl Quorum {
         // Copy middleware config for planner
         planner_config.middleware = config.planner.middleware;
 
-        // Copy compaction/pruning/tool_output/snapshot configs for planner
+        // Copy compaction/pruning/tool_output/snapshot/rate_limit configs for planner
         planner_config.tool_output = config.planner.tool_output;
         planner_config.pruning = config.planner.pruning;
         planner_config.compaction = config.planner.compaction;
         planner_config.snapshot = config.planner.snapshot;
+        planner_config.rate_limit = config.planner.rate_limit;
 
         builder.planner_config = Some(planner_config);
 
@@ -531,11 +536,12 @@ impl Quorum {
             // Copy middleware config for this delegate
             delegate_config.middleware = delegate.middleware;
 
-            // Copy compaction/pruning/tool_output/snapshot configs for this delegate
+            // Copy compaction/pruning/tool_output/snapshot/rate_limit configs for this delegate
             delegate_config.tool_output = delegate.tool_output;
             delegate_config.pruning = delegate.pruning;
             delegate_config.compaction = delegate.compaction;
             delegate_config.snapshot = delegate.snapshot;
+            delegate_config.rate_limit = delegate.rate_limit;
 
             builder.delegates.push(delegate_config);
         }

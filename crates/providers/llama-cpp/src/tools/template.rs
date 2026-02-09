@@ -1,9 +1,9 @@
 use crate::config::LlamaCppConfig;
+use crate::messages;
 use llama_cpp_2::model::{ChatTemplateResult, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
-use querymt::chat::{ChatMessage, ChatRole, MessageType, Tool};
+use querymt::chat::{ChatMessage, Tool};
 use querymt::error::LLMError;
-use serde_json::Value;
 use std::sync::Arc;
 
 /// Utility function to escape regex special characters.
@@ -43,120 +43,13 @@ pub(crate) fn convert_tools_to_json(tools: &[Tool]) -> Result<String, LLMError> 
 }
 
 /// Build OpenAI-compatible JSON messages from ChatMessage array for tool-aware conversations.
+/// This now delegates to the unified messages module.
 pub(crate) fn build_messages_json_for_tools(
     cfg: &LlamaCppConfig,
     messages: &[ChatMessage],
 ) -> Result<String, LLMError> {
-    let mut json_messages = Vec::new();
-
-    // Add system message if configured
-    if !cfg.system.is_empty() {
-        let system = cfg.system.join("\n\n");
-        json_messages.push(serde_json::json!({
-            "role": "system",
-            "content": system
-        }));
-    }
-
-    for msg in messages {
-        match &msg.message_type {
-            MessageType::Text => {
-                let role = match msg.role {
-                    ChatRole::User => "user",
-                    ChatRole::Assistant => "assistant",
-                };
-
-                // For assistant messages, separate <think> blocks from content
-                // into reasoning_content for the template engine.
-                // If thinking was already extracted (msg.thinking is Some), use it.
-                // Otherwise, extract from content as a fallback for messages
-                // stored before thinking extraction was available.
-                let (thinking, content) = if msg.thinking.is_some() {
-                    (msg.thinking.clone(), msg.content.clone())
-                } else if matches!(msg.role, ChatRole::Assistant) {
-                    let (t, c) = querymt::chat::extract_thinking(&msg.content);
-                    (t, c)
-                } else {
-                    (None, msg.content.clone())
-                };
-
-                let mut json_msg = serde_json::json!({
-                    "role": role,
-                    "content": content
-                });
-                if let Some(ref t) = thinking {
-                    if !t.is_empty() {
-                        json_msg["reasoning_content"] = serde_json::json!(t);
-                    }
-                }
-                json_messages.push(json_msg);
-            }
-            MessageType::ToolUse(tool_calls) => {
-                // Assistant message with tool calls in OpenAI format
-                let tool_calls_array: Vec<Value> = tool_calls
-                    .iter()
-                    .map(|tc| {
-                        serde_json::json!({
-                            "id": tc.id,
-                            "type": tc.call_type,
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            }
-                        })
-                    })
-                    .collect();
-
-                // Separate <think> blocks from content (fallback extraction)
-                let (thinking, clean_content) = if msg.thinking.is_some() {
-                    (msg.thinking.clone(), msg.content.clone())
-                } else {
-                    let (t, c) = querymt::chat::extract_thinking(&msg.content);
-                    (t, c)
-                };
-
-                let content = if clean_content.is_empty() {
-                    Value::Null
-                } else {
-                    Value::String(clean_content)
-                };
-
-                let mut json_msg = serde_json::json!({
-                    "role": "assistant",
-                    "content": content,
-                    "tool_calls": tool_calls_array
-                });
-                if let Some(ref t) = thinking {
-                    if !t.is_empty() {
-                        json_msg["reasoning_content"] = serde_json::json!(t);
-                    }
-                }
-                json_messages.push(json_msg);
-            }
-            MessageType::ToolResult(results) => {
-                // Tool results - each result is a separate message with tool role
-                // Note: function.arguments contains the result content,
-                // function.name contains the tool name, and id is the tool_call_id
-                for result in results {
-                    json_messages.push(serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": result.id,
-                        "name": result.function.name,
-                        "content": result.function.arguments
-                    }));
-                }
-            }
-            _ => {
-                return Err(LLMError::InvalidRequest(
-                    "Only text and tool-related messages are supported by llama.cpp provider"
-                        .into(),
-                ));
-            }
-        }
-    }
-
-    serde_json::to_string(&json_messages)
-        .map_err(|e| LLMError::ProviderError(format!("Failed to serialize messages JSON: {}", e)))
+    // Use the unified message conversion function
+    messages::messages_to_json(cfg, messages)
 }
 
 /// Apply chat template with tools to generate prompt and grammar.

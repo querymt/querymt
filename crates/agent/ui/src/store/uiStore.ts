@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { EventRow } from '../types';
+import { EventRow, RateLimitState } from '../types';
 
 /**
  * UI State Store
@@ -76,6 +76,12 @@ interface UiState {
   sessionViewCache: Map<string, SessionViewState>;
   saveAndSwitchSession: (fromSessionId: string | null, toSessionId: string | null) => void;
   
+  // Rate limit state per session
+  rateLimitBySession: Map<string, RateLimitState>;
+  setRateLimitState: (sessionId: string, state: RateLimitState | null) => void;
+  updateRemainingTime: (sessionId: string) => void;
+  clearRateLimitState: (sessionId: string) => void;
+  
   // Utility actions
   resetChatView: () => void; // Reset view state when switching sessions
   
@@ -101,6 +107,7 @@ export const useUiStore = create<UiState>((set) => ({
   delegationDrawerOpen: false,
   sessionViewCache: new Map(),
   modeModelPreferences: {},
+  rateLimitBySession: new Map(),
   
   // Actions
   setTodoRailCollapsed: (collapsed) => {
@@ -165,13 +172,56 @@ export const useUiStore = create<UiState>((set) => ({
   
   // Reset chat view state when switching sessions
   resetChatView: () => set({
-    activeDelegationId: null,
     activeTimelineView: 'chat',
-    selectedToolEvent: null,
+    activeDelegationId: null,
     isAtBottom: true,
     chatScrollIndex: 0,
-    delegationsPanelCollapsed: false,
+    selectedToolEvent: null,
+    modelPickerOpen: false,
+    sessionSwitcherOpen: false,
+    statsDrawerOpen: false,
     delegationDrawerOpen: false,
+  }),
+  
+  // Rate limit actions
+  setRateLimitState: (sessionId, state) => set((prev) => {
+    const updated = new Map(prev.rateLimitBySession);
+    if (state === null) {
+      updated.delete(sessionId);
+    } else {
+      updated.set(sessionId, state);
+    }
+    return { rateLimitBySession: updated };
+  }),
+  
+  updateRemainingTime: (sessionId) => set((prev) => {
+    const current = prev.rateLimitBySession.get(sessionId);
+    if (!current) return prev;
+    
+    const now = Date.now() / 1000;
+    const elapsed = now - current.startedAt;
+    const remaining = Math.max(0, current.waitSecs - elapsed);
+    
+    if (remaining <= 0) {
+      // Time's up - clear the state
+      const updated = new Map(prev.rateLimitBySession);
+      updated.delete(sessionId);
+      return { rateLimitBySession: updated };
+    }
+    
+    // Update remaining time
+    const updated = new Map(prev.rateLimitBySession);
+    updated.set(sessionId, {
+      ...current,
+      remainingSecs: Math.ceil(remaining),
+    });
+    return { rateLimitBySession: updated };
+  }),
+  
+  clearRateLimitState: (sessionId) => set((prev) => {
+    const updated = new Map(prev.rateLimitBySession);
+    updated.delete(sessionId);
+    return { rateLimitBySession: updated };
   }),
   
   // Load persisted state from localStorage

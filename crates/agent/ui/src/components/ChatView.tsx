@@ -29,7 +29,8 @@ import { SessionPicker } from './SessionPicker';
 import { ThinkingIndicator } from './ThinkingIndicator';
 import { SystemLog } from './SystemLog';
 import { GlitchText } from './GlitchText';
-import { buildTurns, buildDelegationTurn, buildEventRowsWithDelegations } from '../logic/chatViewLogic';
+import { buildTurns, buildDelegationTurn, buildEventRowsWithDelegations, isRateLimitEvent, processRateLimitEvent } from '../logic/chatViewLogic';
+import { RateLimitIndicator } from './RateLimitIndicator';
 
 export function ChatView() {
   const {
@@ -74,7 +75,13 @@ export function ChatView() {
     setSelectedToolEvent,
     delegationDrawerOpen,
     setDelegationDrawerOpen,
+    rateLimitBySession,
+    setRateLimitState,
+    clearRateLimitState,
   } = useUiStore();
+  
+  // Get rate limit state for current session
+  const rateLimitState = sessionId ? rateLimitBySession.get(sessionId) : undefined;
   
   // Session-scoped thinking state (replaces global thinkingAgentId)
   const sessionThinkingAgentId = useMemo(() => {
@@ -111,8 +118,25 @@ export function ChatView() {
   // useSessionManager for session navigation
   const { selectSession, createSession } = useSessionManager();
 
-  // useSessionManager for session navigation
-  
+  // Process rate limit events
+  useEffect(() => {
+    if (!sessionId) return;
+    
+    const sessionEvents = events;
+    const latestEvent = sessionEvents[sessionEvents.length - 1];
+    if (latestEvent && isRateLimitEvent(latestEvent)) {
+      processRateLimitEvent(latestEvent, sessionId, setRateLimitState);
+    }
+  }, [events, sessionId, setRateLimitState]);
+
+  // Clear rate limit state when switching sessions
+  useEffect(() => {
+    return () => {
+      if (sessionId) {
+        clearRateLimitState(sessionId);
+      }
+    };
+  }, [sessionId, clearRateLimitState]);
 
   // Keyboard shortcuts (Cmd+N, double Esc, etc. moved to AppShell)
 
@@ -143,6 +167,14 @@ export function ChatView() {
   const handleSelectSession = useCallback((sessionId: string) => {
     selectSession(sessionId);
   }, [selectSession]);
+
+  // Handle cancel during rate limit wait
+  const handleCancelRateLimit = useCallback(() => {
+    if (sessionId) {
+      cancelSession();
+      // State will be cleared when cancel event is received
+    }
+  }, [sessionId, cancelSession]);
 
 
 
@@ -531,6 +563,22 @@ export function ChatView() {
         />
       )}
 
+      {/* Rate Limit Indicator */}
+      {rateLimitState?.isRateLimited && sessionId && (
+        <div className="px-6 py-2">
+          <RateLimitIndicator
+            sessionId={sessionId}
+            message={rateLimitState.message}
+            waitSecs={rateLimitState.waitSecs}
+            startedAt={rateLimitState.startedAt}
+            attempt={rateLimitState.attempt}
+            maxAttempts={rateLimitState.maxAttempts}
+            remainingSecs={rateLimitState.remainingSecs}
+            onCancel={handleCancelRateLimit}
+          />
+        </div>
+      )}
+
       {/* Input Area */}
       <div className="px-6 py-4 bg-cyber-surface border-t border-cyber-border shadow-[0_-4px_20px_rgba(0,255,249,0.05)]">
         <div 
@@ -544,8 +592,14 @@ export function ChatView() {
             value={prompt}
             onChange={setPrompt}
             onSubmit={handleSendPrompt}
-            placeholder={!sessionId ? "Create a session to start chatting..." : "Enter your prompt... (use @ to mention files)"}
-            disabled={loading || !connected || !sessionId}
+            placeholder={
+              !sessionId 
+                ? "Create a session to start chatting..." 
+                : rateLimitState?.isRateLimited
+                  ? "Waiting for rate limit..."
+                  : "Enter your prompt... (use @ to mention files)"
+            }
+            disabled={loading || !connected || !sessionId || rateLimitState?.isRateLimited}
             files={fileMention.allFiles}
             onRequestFiles={fileMention.requestIndex}
             isLoadingFiles={fileMention.isLoading}
@@ -568,7 +622,7 @@ export function ChatView() {
           ) : (
             <button
               onClick={handleSendPrompt}
-              disabled={loading || !connected || !sessionId || !prompt.trim()}
+              disabled={loading || !connected || !sessionId || !prompt.trim() || rateLimitState?.isRateLimited}
               className="
                 px-6 py-3 rounded-lg font-medium transition-all duration-200
                 bg-cyber-cyan/10 border-2 border-cyber-cyan text-cyber-cyan

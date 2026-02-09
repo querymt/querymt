@@ -210,6 +210,63 @@ impl Default for CompactionConfig {
 // ============================================================================
 
 // ============================================================================
+// Rate Limit Configuration
+// ============================================================================
+
+/// Default maximum retry attempts for rate limiting
+pub const DEFAULT_RATE_LIMIT_MAX_RETRIES: usize = 3;
+
+/// Default wait time in seconds if no retry-after header
+pub const DEFAULT_RATE_LIMIT_WAIT_SECS: u64 = 60;
+
+/// Default backoff multiplier for rate limiting
+pub const DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER: f64 = 2.0;
+
+fn default_rate_limit_max_retries() -> usize {
+    DEFAULT_RATE_LIMIT_MAX_RETRIES
+}
+
+fn default_rate_limit_wait_secs() -> u64 {
+    DEFAULT_RATE_LIMIT_WAIT_SECS
+}
+
+fn default_rate_limit_backoff_multiplier() -> f64 {
+    DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER
+}
+
+/// Configuration for rate limit retry behavior
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Maximum number of retry attempts (default: 3)
+    #[serde(default = "default_rate_limit_max_retries")]
+    pub max_retries: usize,
+
+    /// Default wait time in seconds if no retry-after header (default: 60)
+    #[serde(default = "default_rate_limit_wait_secs")]
+    pub default_wait_secs: u64,
+
+    /// Backoff multiplier when no retry-after header (default: 2.0)
+    /// Wait time increases exponentially: default_wait_secs * multiplier^(attempt-1)
+    #[serde(default = "default_rate_limit_backoff_multiplier")]
+    pub backoff_multiplier: f64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: DEFAULT_RATE_LIMIT_MAX_RETRIES,
+            default_wait_secs: DEFAULT_RATE_LIMIT_WAIT_SECS,
+            backoff_multiplier: DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER,
+        }
+    }
+}
+
+// ============================================================================
+// End Rate Limit Configuration
+// ============================================================================
+
+// ============================================================================
 // Delegation Summary Configuration
 // ============================================================================
 
@@ -465,6 +522,9 @@ pub struct AgentSettings {
     /// Snapshot backend for undo/redo support
     #[serde(default)]
     pub snapshot: SnapshotBackendConfig,
+    /// Rate limit retry configuration
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 /// Multi-agent quorum configuration
@@ -526,6 +586,8 @@ pub struct PlannerConfig {
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub snapshot: SnapshotBackendConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 /// Delegate agent configuration
@@ -557,6 +619,8 @@ pub struct DelegateConfig {
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub snapshot: SnapshotBackendConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 /// MCP server configuration

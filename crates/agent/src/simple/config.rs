@@ -2,7 +2,8 @@
 
 use super::utils::infer_required_capabilities;
 use crate::config::{
-    CompactionConfig, MiddlewareEntry, PruningConfig, SnapshotBackendConfig, ToolOutputConfig,
+    CompactionConfig, MiddlewareEntry, PruningConfig, RateLimitConfig, SnapshotBackendConfig,
+    ToolOutputConfig,
 };
 use crate::tools::CapabilityRequirement;
 use querymt::LLMParams;
@@ -22,6 +23,7 @@ pub(super) struct AgentConfig {
     pub pruning: PruningConfig,
     pub compaction: CompactionConfig,
     pub snapshot: SnapshotBackendConfig,
+    pub rate_limit: RateLimitConfig,
 }
 
 impl AgentConfig {
@@ -38,6 +40,7 @@ impl AgentConfig {
             pruning: PruningConfig::default(),
             compaction: CompactionConfig::default(),
             snapshot: SnapshotBackendConfig::default(),
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }

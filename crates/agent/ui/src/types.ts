@@ -97,6 +97,23 @@ export interface EventItem {
   stopMetrics?: ExecutionMetrics;
   // Elicitation tool fields
   elicitationData?: ElicitationData;
+  // Rate limit fields
+  rateLimitMessage?: string;
+  rateLimitWaitSecs?: number;
+  rateLimitStartedAt?: number;  // Unix timestamp in seconds
+  rateLimitAttempt?: number;
+  rateLimitMaxAttempts?: number;
+  rateLimitResume?: boolean;  // true for rate_limit_resume event
+}
+
+export interface RateLimitState {
+  isRateLimited: boolean;
+  message: string;
+  waitSecs: number;
+  startedAt: number;  // Unix timestamp in seconds
+  attempt: number;
+  maxAttempts: number;
+  remainingSecs: number;  // Updated by timer in UI
 }
 
 export type RoutingMode = 'single' | 'broadcast';

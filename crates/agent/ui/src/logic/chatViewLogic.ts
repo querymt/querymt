@@ -5,7 +5,7 @@
  * These functions are pure, side-effect free, and fully testable.
  */
 
-import { EventItem, EventRow, DelegationGroupInfo, Turn } from '../types';
+import { EventItem, EventRow, DelegationGroupInfo, Turn, RateLimitState } from '../types';
 
 // Model timeline entry
 export interface ModelTimelineEntry {
@@ -488,4 +488,46 @@ export function inferToolName(event: EventItem): string | undefined {
     if (match?.[1]) return match[1];
   }
   return undefined;
+}
+
+/**
+ * Rate Limit Event Processing
+ */
+
+/**
+ * Check if an event item represents a rate limit event
+ */
+export function isRateLimitEvent(event: EventItem): boolean {
+  return !!(event.rateLimitMessage || event.rateLimitResume);
+}
+
+/**
+ * Process rate limit events and update UI state
+ */
+export function processRateLimitEvent(
+  event: EventItem,
+  sessionId: string,
+  setRateLimitState: (sessionId: string, state: RateLimitState | null) => void
+): void {
+  // Handle RateLimited event
+  if (event.rateLimitMessage && event.rateLimitWaitSecs && event.rateLimitStartedAt) {
+    const now = Date.now() / 1000;
+    const elapsed = now - event.rateLimitStartedAt;
+    const remaining = Math.max(0, event.rateLimitWaitSecs - elapsed);
+    
+    setRateLimitState(sessionId, {
+      isRateLimited: true,
+      message: event.rateLimitMessage,
+      waitSecs: event.rateLimitWaitSecs,
+      startedAt: event.rateLimitStartedAt,
+      attempt: event.rateLimitAttempt || 1,
+      maxAttempts: event.rateLimitMaxAttempts || 3,
+      remainingSecs: Math.ceil(remaining),
+    });
+  }
+  
+  // Handle RateLimitResume event
+  if (event.rateLimitResume) {
+    setRateLimitState(sessionId, null);
+  }
 }

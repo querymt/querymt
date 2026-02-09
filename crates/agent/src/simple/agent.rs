@@ -10,8 +10,8 @@ use crate::acp::websocket::serve_websocket;
 use crate::agent::builder::AgentBuilderExt;
 use crate::agent::core::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
 use crate::config::{
-    CompactionConfig, MiddlewareEntry, PruningConfig, SingleAgentConfig, SnapshotBackendConfig,
-    ToolOutputConfig,
+    CompactionConfig, MiddlewareEntry, PruningConfig, RateLimitConfig, SingleAgentConfig,
+    SnapshotBackendConfig, ToolOutputConfig,
 };
 use crate::events::AgentEvent;
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
@@ -45,6 +45,7 @@ pub struct AgentBuilder {
     pruning_config: Option<PruningConfig>,
     compaction_config: Option<CompactionConfig>,
     snapshot_backend_config: Option<SnapshotBackendConfig>,
+    rate_limit_config: Option<RateLimitConfig>,
 }
 
 impl Default for AgentBuilder {
@@ -67,6 +68,7 @@ impl AgentBuilder {
             pruning_config: None,
             compaction_config: None,
             snapshot_backend_config: None,
+            rate_limit_config: None,
         }
     }
 
@@ -117,6 +119,12 @@ impl AgentBuilder {
 
     pub fn snapshot_policy(mut self, policy: SnapshotPolicy) -> Self {
         self.snapshot_policy = policy;
+        self
+    }
+
+    /// Configure rate limit retry behavior
+    pub fn rate_limit_config(mut self, config: RateLimitConfig) -> Self {
+        self.rate_limit_config = Some(config);
         self
     }
 
@@ -200,6 +208,9 @@ impl AgentBuilder {
         }
         if let Some(config) = self.compaction_config {
             agent = agent.with_compaction_config(config);
+        }
+        if let Some(config) = self.rate_limit_config {
+            agent = agent.with_rate_limit_config(config);
         }
 
         // Handle snapshot backend from config
@@ -489,6 +500,7 @@ impl Agent {
         builder.pruning_config = Some(config.agent.pruning);
         builder.compaction_config = Some(config.agent.compaction);
         builder.snapshot_backend_config = Some(config.agent.snapshot);
+        builder.rate_limit_config = Some(config.agent.rate_limit);
 
         builder.build().await
     }

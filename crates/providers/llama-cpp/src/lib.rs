@@ -3,6 +3,7 @@ mod config;
 mod context;
 mod generation;
 mod memory;
+mod messages;
 mod provider;
 mod response;
 mod tools;

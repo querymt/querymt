@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { v7 as uuidv7 } from 'uuid';
 import {
   EventItem,
   RoutingMode,
@@ -535,7 +536,7 @@ export function useUiClient() {
       throw new Error('Session creation cancelled');
     }
     const cwd = input.trim();
-    const requestId = crypto.randomUUID();
+    const requestId = uuidv7();
     
     // Signal that session creation is in progress to prevent route sync interference.
     // Cleared by useSessionRoute once URL and state are in sync.

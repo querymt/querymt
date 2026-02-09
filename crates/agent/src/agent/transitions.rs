@@ -15,7 +15,7 @@ use crate::middleware::{
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::TaskStatus;
 use agent_client_protocol::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use log::{debug, info};
@@ -23,6 +23,7 @@ use querymt::chat::{CacheHint, ChatMessage, ChatRole, FinishReason, StreamChunk}
 use querymt::plugin::extism_impl::ExtismChatResponse;
 use querymt::{ToolCall, Usage};
 use std::sync::Arc;
+use time;
 use tokio::sync::{broadcast, watch};
 use tracing::instrument;
 use uuid::Uuid;
@@ -166,16 +167,25 @@ impl QueryMTAgent {
         let messages_with_cache = apply_cache_breakpoints(&context.messages);
 
         let response = if tools.is_empty() {
+            // Path A: No tools - RETRY ENABLED
             // Race the LLM request with cancellation for faster cancellation
-            let mut cancel_rx_clone = cancel_rx.clone();
-            tokio::select! {
-                result = provider_context.submit_request(&messages_with_cache) => {
-                    result.map_err(|e| anyhow::anyhow!("LLM request failed: {}", e))?
+            let cancel_rx_clone = cancel_rx.clone();
+            self.call_llm_with_retry(session_id, cancel_rx, || {
+                let provider_context = &provider_context;
+                let messages_with_cache = &messages_with_cache;
+                let mut cancel_rx_clone = cancel_rx_clone.clone();
+                async move {
+                    tokio::select! {
+                        result = provider_context.submit_request(messages_with_cache) => {
+                            result.map_err(|e| anyhow::anyhow!("LLM request failed: {}", e))
+                        }
+                        _ = cancel_rx_clone.changed() => {
+                            Err(anyhow!("Cancelled"))
+                        }
+                    }
                 }
-                _ = cancel_rx_clone.changed() => {
-                    return Ok(ExecutionState::Cancelled);
-                }
-            }
+            })
+            .await?
         } else {
             let provider = provider_context
                 .provider()
@@ -185,7 +195,9 @@ impl QueryMTAgent {
             // NOTE(codex): Codex backend is streaming-only.
             // Backend sends `{"detail":"Stream must be set to true"}`
             // Keep this special-case for now narrow to avoid changing behavior for other providers.
+            // TODO: Remove this hack once codex streaming is replaced
             if context.provider.as_ref() == "codex" {
+                // Path B: Codex streaming hack - NO RETRY (temporary)
                 let mut stream = provider
                     .chat_stream_with_tools(&messages_with_cache, Some(tools))
                     .await
@@ -240,16 +252,25 @@ impl QueryMTAgent {
                     finish_reason,
                 })
             } else {
+                // Path C: With tools, non-codex - RETRY ENABLED
                 // Race the LLM request with cancellation for faster cancellation
-                let mut cancel_rx_clone = cancel_rx.clone();
-                tokio::select! {
-                    result = provider.chat_with_tools(&messages_with_cache, Some(tools)) => {
-                        result.map_err(|e| anyhow::anyhow!("LLM request with tools failed: {}", e))?
+                let cancel_rx_clone = cancel_rx.clone();
+                self.call_llm_with_retry(session_id, cancel_rx, || {
+                    let provider = &provider;
+                    let messages_with_cache = &messages_with_cache;
+                    let tools = tools.as_ref();
+                    let mut cancel_rx_clone = cancel_rx_clone.clone();
+                    async move {
+                        tokio::select! {
+                            result = provider.chat_with_tools(messages_with_cache, Some(tools)) => {
+                                result.map_err(|e| anyhow::anyhow!("LLM request with tools failed: {}", e))
+                            }
+                            _ = cancel_rx_clone.changed() => {
+                                Err(anyhow!("Cancelled"))
+                            }
+                        }
                     }
-                    _ = cancel_rx_clone.changed() => {
-                        return Ok(ExecutionState::Cancelled);
-                    }
-                }
+                }).await?
             }
         };
 
@@ -716,6 +737,156 @@ impl QueryMTAgent {
 
         Ok(Arc::new(context.inject_message(content)))
     }
+
+    /// Helper to execute LLM call with retry logic for rate limiting.
+    /// Excludes the codex streaming hack which will be removed later.
+    async fn call_llm_with_retry<F, Fut>(
+        &self,
+        session_id: &str,
+        cancel_rx: &watch::Receiver<bool>,
+        mut call_fn: F,
+    ) -> Result<Box<dyn querymt::chat::ChatResponse>, anyhow::Error>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<
+                Output = Result<Box<dyn querymt::chat::ChatResponse>, anyhow::Error>,
+            >,
+    {
+        let max_retries = self.rate_limit_config.max_retries;
+        let mut attempt = 0;
+
+        loop {
+            attempt += 1;
+
+            // Check for cancellation before each attempt
+            if *cancel_rx.borrow() {
+                return Err(anyhow!("Cancelled"));
+            }
+
+            // Attempt the LLM call
+            match call_fn().await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    // Check if this is a rate limit error
+                    if let Some((message, retry_after)) = extract_rate_limit_info(&e) {
+                        // This is a rate limit error
+                        if attempt >= max_retries {
+                            // Exceeded max retries - fail permanently
+                            return Err(anyhow!(
+                                "Rate limit exceeded after {} attempts: {}",
+                                max_retries,
+                                message
+                            ));
+                        }
+
+                        // Calculate wait time (exponential backoff or retry-after header)
+                        let wait_secs = self.calculate_rate_limit_wait(retry_after, attempt);
+                        let started_at = time::OffsetDateTime::now_utc().unix_timestamp();
+
+                        info!(
+                            "Session {} rate limited, attempt {}/{}, waiting {}s",
+                            session_id, attempt, max_retries, wait_secs
+                        );
+
+                        // Emit RateLimited event
+                        self.emit_event(
+                            session_id,
+                            AgentEventKind::RateLimited {
+                                message: message.clone(),
+                                wait_secs,
+                                started_at,
+                                attempt,
+                                max_attempts: max_retries,
+                            },
+                        );
+
+                        // Wait with cancellation support
+                        let cancelled = self.wait_with_cancellation(wait_secs, cancel_rx).await;
+                        if cancelled {
+                            debug!(
+                                "Rate limit wait cancelled for session {} during attempt {}",
+                                session_id, attempt
+                            );
+                            return Err(anyhow!("Cancelled during rate limit wait"));
+                        }
+
+                        info!(
+                            "Session {} resuming after rate limit wait, attempt {}",
+                            session_id,
+                            attempt + 1
+                        );
+
+                        // Emit RateLimitResume event
+                        self.emit_event(
+                            session_id,
+                            AgentEventKind::RateLimitResume {
+                                attempt: attempt + 1,
+                            },
+                        );
+
+                        // Continue loop to retry
+                        continue;
+                    } else {
+                        // Not a rate limit error - propagate immediately
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Calculate wait time based on retry-after header or exponential backoff.
+    fn calculate_rate_limit_wait(&self, retry_after: Option<u64>, attempt: usize) -> u64 {
+        match retry_after {
+            Some(secs) => secs,
+            None => {
+                // Exponential backoff: default_wait_secs * backoff_multiplier^(attempt-1)
+                let base = self.rate_limit_config.default_wait_secs as f64;
+                let multiplier = self.rate_limit_config.backoff_multiplier;
+                (base * multiplier.powi((attempt - 1) as i32)) as u64
+            }
+        }
+    }
+
+    /// Wait for specified seconds with cancellation support.
+    /// Returns true if cancelled, false if wait completed.
+    async fn wait_with_cancellation(
+        &self,
+        wait_secs: u64,
+        cancel_rx: &watch::Receiver<bool>,
+    ) -> bool {
+        let mut cancel_rx = cancel_rx.clone();
+
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(wait_secs)) => {
+                false // Wait completed
+            }
+            _ = cancel_rx.changed() => {
+                *cancel_rx.borrow() // Return true if actually cancelled
+            }
+        }
+    }
+}
+
+/// Extract rate limit information from an error if it's rate-related.
+/// Returns (message, retry_after_secs) if the error indicates rate limiting.
+fn extract_rate_limit_info(error: &anyhow::Error) -> Option<(String, Option<u64>)> {
+    // Check error chain for LLMError::RateLimited
+    let error_string = error.to_string();
+
+    // Check for rate limit indicators in the error message
+    if error_string.to_lowercase().contains("rate limit")
+        || error_string.contains("429")
+        || error_string.to_lowercase().contains("too many requests")
+    {
+        // Try to extract retry-after value from common patterns
+        // Pattern 1: "retry after X seconds"
+        // Pattern 2: "retry_after: X"
+        // For now, return None and let the backoff logic handle it
+        return Some((error_string, None));
+    }
+
+    None
 }
 
 fn match_wait_event(wait: &WaitCondition, event: &AgentEvent) -> Option<String> {

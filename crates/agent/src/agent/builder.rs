@@ -148,6 +148,9 @@ pub trait AgentBuilderExt {
 
     /// Sets the snapshot GC configuration.
     fn with_snapshot_gc_config(self, config: crate::snapshot::GcConfig) -> Self;
+
+    /// Sets the rate limit retry configuration.
+    fn with_rate_limit_config(self, config: crate::config::RateLimitConfig) -> Self;
 }
 
 impl AgentBuilderExt for QueryMTAgent {
@@ -423,6 +426,11 @@ impl AgentBuilderExt for QueryMTAgent {
 
     fn with_snapshot_gc_config(mut self, config: crate::snapshot::GcConfig) -> Self {
         self.snapshot_gc_config = config;
+        self
+    }
+
+    fn with_rate_limit_config(mut self, config: crate::config::RateLimitConfig) -> Self {
+        self.rate_limit_config = config;
         self
     }
 }

@@ -4,6 +4,7 @@ use crate::agent::core::{
 };
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
+use crate::config::RateLimitConfig;
 use crate::delegation::{AgentInfo, DefaultAgentRegistry, DelegationOrchestrator};
 use crate::event_bus::EventBus;
 use crate::events::StopType;
@@ -302,6 +303,7 @@ impl TestHarness {
             snapshot_backend: None,
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
             pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit_config: RateLimitConfig::default(),
         });
 
         if let Ok(mut config) = agent.tool_config.lock() {

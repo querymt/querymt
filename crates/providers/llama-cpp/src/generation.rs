@@ -1,6 +1,7 @@
 use crate::backend::llama_backend;
 use crate::config::LlamaCppConfig;
 use crate::context::{apply_context_params, estimate_context_memory, resolve_n_batch};
+use crate::messages;
 use crate::response::GeneratedText;
 use crate::tools::sampler::{build_fallback_sampler, build_standard_sampler};
 use futures::channel::mpsc;
@@ -8,7 +9,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use querymt::Usage;
-use querymt::chat::{ChatMessage, ChatRole, MessageType};
+use querymt::chat::ChatMessage;
 use querymt::error::LLMError;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -20,35 +21,27 @@ pub(crate) fn build_prompt_with(
     messages: &[ChatMessage],
     use_chat_template: bool,
 ) -> Result<(String, bool), LLMError> {
-    for msg in messages {
-        if !matches!(msg.message_type, MessageType::Text) {
-            return Err(LLMError::InvalidRequest(
-                "Only text chat messages are supported by llama.cpp provider".into(),
-            ));
-        }
-    }
-
     if !use_chat_template {
-        let prompt = build_raw_prompt(cfg, messages)?;
+        let prompt = messages::messages_to_text(cfg, messages)?;
         return Ok((prompt, false));
     }
 
-    let mut chat_messages = Vec::with_capacity(messages.len() + 1);
-    if !cfg.system.is_empty() {
-        let system = cfg.system.join("\n\n");
-        chat_messages.push(
-            LlamaChatMessage::new("system".to_string(), system)
-                .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
-        );
-    }
+    // Try to use the JSON-based chat template approach for better consistency
+    // with tool-aware conversations
+    let messages_json = messages::messages_to_json(cfg, messages)?;
+    let json_messages: Vec<serde_json::Value> = serde_json::from_str(&messages_json)
+        .map_err(|e| LLMError::ProviderError(format!("Failed to parse messages JSON: {}", e)))?;
 
-    for msg in messages {
-        let role = match msg.role {
-            ChatRole::User => "user",
-            ChatRole::Assistant => "assistant",
-        };
+    // Convert JSON messages to LlamaChatMessage format
+    let mut chat_messages = Vec::new();
+    for json_msg in json_messages {
+        let role = json_msg["role"]
+            .as_str()
+            .ok_or_else(|| LLMError::ProviderError("Missing role in message".into()))?
+            .to_string();
+        let content = json_msg["content"].as_str().unwrap_or("").to_string();
         chat_messages.push(
-            LlamaChatMessage::new(role.to_string(), msg.content.clone())
+            LlamaChatMessage::new(role, content)
                 .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
         );
     }
@@ -59,7 +52,8 @@ pub(crate) fn build_prompt_with(
         }
     }
 
-    let prompt = build_raw_prompt(cfg, messages)?;
+    // Fall back to simple text concatenation
+    let prompt = messages::messages_to_text(cfg, messages)?;
     Ok((prompt, false))
 }
 
@@ -102,26 +96,8 @@ pub(crate) fn build_raw_prompt(
     cfg: &LlamaCppConfig,
     messages: &[ChatMessage],
 ) -> Result<String, LLMError> {
-    for msg in messages {
-        if !matches!(msg.message_type, MessageType::Text) {
-            return Err(LLMError::InvalidRequest(
-                "Only text chat messages are supported by llama.cpp provider".into(),
-            ));
-        }
-    }
-
-    let mut prompt = String::new();
-    if !cfg.system.is_empty() {
-        prompt.push_str(&cfg.system.join("\n\n"));
-        prompt.push_str("\n\n");
-    }
-    for (idx, msg) in messages.iter().enumerate() {
-        prompt.push_str(&msg.content);
-        if idx + 1 < messages.len() {
-            prompt.push_str("\n\n");
-        }
-    }
-    Ok(prompt)
+    // Use the unified messages_to_text function
+    messages::messages_to_text(cfg, messages)
 }
 
 /// Generate text from a prompt.
