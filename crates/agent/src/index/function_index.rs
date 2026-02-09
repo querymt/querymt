@@ -10,6 +10,7 @@ use similarity_core::{
     generic_tree_sitter_parser::GenericTreeSitterParser, language_parser::LanguageParser,
     parser::parse_and_convert_to_tree,
 };
+use similarity_py::python_parser::PythonParser;
 use similarity_rs::rust_parser::RustParser;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -139,6 +140,7 @@ impl FunctionIndex {
         let mut cpp_files: Vec<(PathBuf, String)> = Vec::new();
         let mut csharp_files: Vec<(PathBuf, String)> = Vec::new();
         let mut ruby_files: Vec<(PathBuf, String)> = Vec::new();
+        let mut python_files: Vec<(PathBuf, String)> = Vec::new();
 
         for (path, content, lang) in file_contents {
             match lang {
@@ -150,6 +152,7 @@ impl FunctionIndex {
                 "cpp" => cpp_files.push((path, content)),
                 "csharp" => csharp_files.push((path, content)),
                 "ruby" => ruby_files.push((path, content)),
+                "python" => python_files.push((path, content)),
                 _ => {}
             }
         }
@@ -318,6 +321,27 @@ impl FunctionIndex {
             }
         }
 
+        // Index Python files in parallel
+        if !python_files.is_empty() {
+            let python_results: Vec<_> = python_files
+                .par_iter()
+                .filter_map(|(path, source)| {
+                    let mut parser = PythonParser::new().ok()?;
+                    let entries =
+                        index_with_parser(&mut parser, path, source, "python", &config).ok()?;
+                    if entries.is_empty() {
+                        None
+                    } else {
+                        Some((path.clone(), entries))
+                    }
+                })
+                .collect();
+
+            for (path, entries) in python_results {
+                functions.insert(path, entries);
+            }
+        }
+
         let total_functions: usize = functions.values().map(|v| v.len()).sum();
         log::info!(
             "FunctionIndex: Indexed {} functions from {} files",
@@ -411,6 +435,14 @@ impl FunctionIndex {
                     Vec::new()
                 }
             }
+            "python" => {
+                if let Ok(mut parser) = PythonParser::new() {
+                    index_with_parser(&mut parser, file_path, source, language, &self.config)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            }
             lang => {
                 if let Ok(mut parser) = GenericTreeSitterParser::from_language_name(lang) {
                     index_with_parser(&mut parser, file_path, source, language, &self.config)
@@ -452,6 +484,14 @@ impl FunctionIndex {
             }
             "rust" => {
                 if let Ok(mut parser) = RustParser::new() {
+                    index_with_parser(&mut parser, file_path, source, language, &self.config)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            }
+            "python" => {
+                if let Ok(mut parser) = PythonParser::new() {
                     index_with_parser(&mut parser, file_path, source, language, &self.config)
                         .unwrap_or_default()
                 } else {
@@ -615,6 +655,7 @@ fn get_language_category(ext: &str) -> Option<&'static str> {
         "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "c++" => Some("cpp"),
         "cs" => Some("csharp"),
         "rb" => Some("ruby"),
+        "py" => Some("python"),
         _ => None,
     }
 }
@@ -650,6 +691,7 @@ fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> {
         "c", "h", "cpp", "hpp", "cc", "cxx", // C/C++
         "cs",  // C#
         "rb",  // Ruby
+        "py",  // Python
     ];
 
     let mut files = Vec::new();
@@ -799,5 +841,130 @@ function another(y: number) {
 
         // Should have more functions now
         assert!(index.function_count() >= initial_count);
+    }
+
+    #[tokio::test]
+    async fn test_build_index_with_python() {
+        let temp_dir = TempDir::new().unwrap();
+
+        fs::write(
+            temp_dir.path().join("test.py"),
+            r#"
+def hello(name):
+    """Say hello to someone."""
+    greeting = f"Hello, {name}!"
+    print(greeting)
+    return greeting
+
+def add(a, b):
+    """Add two numbers."""
+    result = a + b
+    print(f"Result: {result}")
+    return result
+
+class Calculator:
+    """A simple calculator class."""
+    
+    def __init__(self):
+        self.result = 0
+    
+    def multiply(self, x, y):
+        """Multiply two numbers."""
+        self.result = x * y
+        return self.result
+    
+    async def async_divide(self, x, y):
+        """Async division."""
+        if y == 0:
+            raise ValueError("Cannot divide by zero")
+        self.result = x / y
+        return self.result
+"#,
+        )
+        .unwrap();
+
+        let config = FunctionIndexConfig::default().with_min_lines(3);
+        let index = FunctionIndex::build(temp_dir.path(), config).await.unwrap();
+
+        // Should have indexed the Python file
+        assert_eq!(index.file_count(), 1);
+
+        // Should have 4 functions: hello (5 lines), add (5 lines), multiply (4 lines), async_divide (6 lines)
+        // Note: __init__ (2 lines) is filtered out by min_lines=3
+        assert_eq!(index.function_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_python_update_file() {
+        let temp_dir = TempDir::new().unwrap();
+
+        fs::write(
+            temp_dir.path().join("test.py"),
+            r#"
+def original():
+    print("original")
+    return True
+"#,
+        )
+        .unwrap();
+
+        let config = FunctionIndexConfig::default().with_min_lines(3);
+        let mut index = FunctionIndex::build(temp_dir.path(), config).await.unwrap();
+
+        assert_eq!(index.function_count(), 1);
+
+        // Update the file with new content
+        let new_content = r#"
+def updated(x):
+    result = x * 3
+    print(result)
+    return result
+
+def another(y):
+    value = y + 1
+    print(value)
+    return value
+"#;
+
+        index.update_file(&temp_dir.path().join("test.py"), new_content);
+
+        // Should have 2 functions now
+        assert_eq!(index.function_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_python_mixed_with_other_languages() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Add Python file
+        fs::write(
+            temp_dir.path().join("script.py"),
+            r#"
+def python_func():
+    print("Python")
+    return 42
+"#,
+        )
+        .unwrap();
+
+        // Add TypeScript file
+        fs::write(
+            temp_dir.path().join("code.ts"),
+            r#"
+function tsFunc() {
+    console.log("TypeScript");
+    return 42;
+}
+"#,
+        )
+        .unwrap();
+
+        let config = FunctionIndexConfig::default().with_min_lines(3);
+        let index = FunctionIndex::build(temp_dir.path(), config).await.unwrap();
+
+        // Should have indexed both files
+        assert_eq!(index.file_count(), 2);
+        // Should have 2 functions total
+        assert_eq!(index.function_count(), 2);
     }
 }

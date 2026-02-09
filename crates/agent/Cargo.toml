@@ -78,6 +78,7 @@ dirs.workspace = true
 # Code similarity detection (local fork with tree-sitter 0.25)
 similarity-core = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
 similarity-rs = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
+similarity-py = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
 
 [lib]
 name = "querymt_agent"
