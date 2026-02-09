@@ -18,21 +18,38 @@
 
 use querymt_agent::prelude::*;
 
+/// Setup logging for stdio mode - writes to stderr only to avoid corrupting stdout JSON-RPC
+fn setup_stdio_logging() {
+    use tracing_log::LogTracer;
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{EnvFilter, Registry, fmt};
+
+    // Initialize log->tracing bridge so log:: macros from providers work
+    LogTracer::init().expect("Failed to set LogTracer");
+
+    // Create fmt layer that writes to STDERR only (stdout is reserved for JSON-RPC)
+    let fmt_layer = fmt::layer().with_writer(std::io::stderr).with_target(true);
+
+    let filter = EnvFilter::from_default_env();
+
+    let subscriber = Registry::default().with(filter).with(fmt_layer);
+
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    // Parse CLI args
+    // Parse CLI args first to determine mode
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let is_stdio = args.contains(&"--stdio".to_string());
 
-    // Only enable env_logger when running the dashboard.
-    // In stdio mode, stdout must be reserved for ACP JSON-RPC traffic.
-    // TODO: Clap?
-    let is_dashboard = args.iter().any(|a| a.starts_with("--dashboard"));
-    if is_dashboard {
-        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-            .target(env_logger::Target::Stdout)
-            .try_init();
+    // Setup logging based on mode:
+    // - Stdio mode: logs to stderr (stdout reserved for JSON-RPC)
+    // - Dashboard mode: full telemetry with stdout
+    if is_stdio {
+        setup_stdio_logging();
+    } else {
+        querymt_utils::telemetry::setup_telemetry("querymt-coder-agent", env!("CARGO_PKG_VERSION"));
     }
 
     // Default config path

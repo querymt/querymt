@@ -88,3 +88,5 @@ path = "src/lib.rs"
 mockall = "0.14"
 env_logger = "0.10"
 tempfile = "3.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
