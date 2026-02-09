@@ -181,7 +181,7 @@ impl SessionCompaction {
     }
 
     /// Estimate token count for a list of messages
-    fn estimate_messages_tokens(&self, messages: &[AgentMessage]) -> usize {
+    pub(crate) fn estimate_messages_tokens(&self, messages: &[AgentMessage]) -> usize {
         messages
             .iter()
             .map(|m| {

@@ -550,16 +550,18 @@ fn process_events(events: &[Event], root: &Path, overrides: &Override) -> FileCh
 fn compile_overrides(root: &Path, config: &FileIndexConfig) -> Result<Override, FileIndexError> {
     let mut builder = OverrideBuilder::new(root);
 
-    // Override patterns work as a whitelist system:
-    // 1. First add a base whitelist pattern to match everything
-    // 2. Then add negation patterns to exclude specific paths
-    // Without the base whitelist, negation patterns have no effect
-    builder.add("**/*").map_err(|e| {
-        FileIndexError::InvalidConfig(format!("Failed to add base whitelist pattern: {}", e))
-    })?;
-
-    // Add each ignore pattern with ! prefix (meaning "exclude" in Override semantics)
-    // Ensure patterns use glob syntax for recursive matching
+    // Add each pattern with ! prefix (meaning "exclude/ignore" in Override semantics)
+    //
+    // IMPORTANT: We only add ignore patterns (with ! prefix) here. Without any whitelist
+    // patterns, unmatched files return Match::None which allows .gitignore to handle them.
+    //
+    // If we added a whitelist pattern like "**/*", it would OVERRIDE .gitignore rules
+    // because Override patterns have higher priority than .gitignore! This was the bug
+    // that caused node_modules to be indexed despite being in .gitignore.
+    //
+    // With only ignore patterns:
+    // - Files matching !pattern -> Match::Ignore (definitely excluded)
+    // - Files not matching any pattern -> Match::None (let .gitignore decide)
     for pattern in &config.ignore_patterns {
         // Normalize pattern to use glob recursion
         let normalized_pattern = normalize_ignore_pattern(pattern);
@@ -1082,5 +1084,116 @@ mod tests {
                 if should_be_ignored { "" } else { "NOT " }
             );
         }
+    }
+
+    /// Test that .gitignore is respected when using Overrides
+    /// This is a regression test for the bug where **/* whitelist was overriding .gitignore
+    #[tokio::test]
+    async fn test_gitignore_respected_with_overrides() {
+        use std::process::Command;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        println!("\n=== Testing .gitignore Respect with Overrides ===\n");
+
+        // Initialize as git repo so .gitignore is recognized by WalkBuilder
+        Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .ok();
+
+        // Create .gitignore that ignores node_modules
+        fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        println!("Created .gitignore with: node_modules/");
+
+        // Create node_modules with a file (should be ignored via .gitignore)
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), "// code").unwrap();
+        println!("Created node_modules/pkg/index.js");
+
+        // Create src with a file (should be included)
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        println!("Created src/main.rs");
+
+        let config = FileIndexConfig::default();
+        let overrides = compile_overrides(root, &config).unwrap();
+        let index = build_file_index(root, &config, &overrides).unwrap();
+
+        println!("\nIndexed files:");
+        for file in &index.files {
+            println!("  {}", file.path);
+        }
+
+        // .gitignore should be respected - no node_modules files
+        let node_modules_files: Vec<_> = index
+            .files
+            .iter()
+            .filter(|f| f.path.contains("node_modules"))
+            .collect();
+
+        assert!(
+            node_modules_files.is_empty(),
+            "node_modules should be ignored via .gitignore, but found: {:?}",
+            node_modules_files
+        );
+
+        // src/main.rs should be present
+        assert!(
+            index.files.iter().any(|f| f.path == "src/main.rs"),
+            "src/main.rs should be indexed"
+        );
+
+        println!("\n✓ .gitignore correctly respected with Override patterns");
+    }
+
+    /// Test that the fix works on the actual UI directory with real node_modules
+    #[tokio::test]
+    #[ignore] // Only run manually since it depends on external directory structure
+    async fn test_ui_directory_node_modules_ignored() {
+        use std::path::PathBuf;
+
+        let ui_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui");
+
+        if !ui_path.exists() {
+            println!("UI directory doesn't exist, skipping test");
+            return;
+        }
+
+        println!("\n=== Testing Real UI Directory ===");
+        println!("Path: {:?}", ui_path);
+
+        let config = FileIndexConfig::default();
+        let overrides = compile_overrides(&ui_path, &config).unwrap();
+        let index = build_file_index(&ui_path, &config, &overrides).unwrap();
+
+        println!("\nTotal files indexed: {}", index.files.len());
+
+        let node_modules_files: Vec<_> = index
+            .files
+            .iter()
+            .filter(|f| f.path.contains("node_modules"))
+            .collect();
+
+        println!(
+            "Files containing 'node_modules': {}",
+            node_modules_files.len()
+        );
+
+        if !node_modules_files.is_empty() {
+            println!("\nFirst 10 node_modules files:");
+            for file in node_modules_files.iter().take(10) {
+                println!("  {}", file.path);
+            }
+        }
+
+        assert!(
+            node_modules_files.is_empty(),
+            "node_modules should be ignored via .gitignore in UI directory"
+        );
+
+        println!("\n✓ UI directory correctly ignores node_modules");
     }
 }

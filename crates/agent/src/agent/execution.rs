@@ -720,12 +720,28 @@ impl QueryMTAgent {
             .map(|m| m.to_chat_message())
             .collect();
 
-        // Create new conversation context with filtered history
+        // Estimate new context token count from filtered messages
+        let new_context_tokens = self.compaction.estimate_messages_tokens(&filtered_messages);
+
+        debug!(
+            "Post-compaction context tokens updated: {} -> {} (filtered {} messages)",
+            current_state
+                .context()
+                .map(|c| c.stats.context_tokens)
+                .unwrap_or(0),
+            new_context_tokens,
+            filtered_messages.len()
+        );
+
+        // Create new conversation context with filtered history and updated token count
         let new_context = if let Some(ctx) = current_state.context() {
+            let mut new_stats = AgentStats::clone(&ctx.stats);
+            new_stats.context_tokens = new_context_tokens;
+
             Arc::new(ConversationContext::new(
                 ctx.session_id.clone(),
                 Arc::from(chat_messages.into_boxed_slice()),
-                ctx.stats.clone(),
+                Arc::new(new_stats),
                 ctx.provider.clone(),
                 ctx.model.clone(),
             ))
