@@ -158,11 +158,33 @@ impl WorkspaceIndex {
 }
 
 /// Update function index based on file changes
+///
+/// # Thread Safety
+///
+/// This function processes files **sequentially** to avoid tree-sitter thread-safety
+/// issues. While slower than parallel processing, incremental updates typically involve
+/// only 1-2 files at a time, so the performance impact is negligible.
+///
+/// **Critical:** The `index.update_file()` calls must remain sequential. Do NOT use
+/// parallel iterators or spawn multiple update tasks, as this will cause segfaults
+/// in the tree-sitter C bindings.
 async fn update_function_index(
     function_index: &Arc<RwLock<FunctionIndex>>,
     change_set: &FileChangeSet,
     _root: &Path,
 ) {
+    // Count changes for logging
+    let remove_count = change_set.files_to_remove().count();
+    let reindex_count = change_set.files_to_reindex().count();
+
+    if remove_count > 0 || reindex_count > 0 {
+        log::debug!(
+            "FunctionIndex: Processing {} removals and {} updates sequentially (thread-safe)",
+            remove_count,
+            reindex_count
+        );
+    }
+
     let mut index = function_index.write().await;
 
     // Remove deleted files
@@ -171,7 +193,7 @@ async fn update_function_index(
         log::debug!("FunctionIndex: Removed {:?}", path);
     }
 
-    // Reindex created/modified files
+    // Reindex created/modified files (sequential - do NOT parallelize!)
     for path in change_set.files_to_reindex() {
         if let Ok(content) = std::fs::read_to_string(path) {
             index.update_file(path, &content);

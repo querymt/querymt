@@ -116,6 +116,7 @@ pub fn is_source_file(path: &Path) -> bool {
         "c", "h", "cpp", "hpp", "cc", "cxx", // C/C++
         "cs",  // C#
         "rb",  // Ruby
+        "py",  // Python
     ];
 
     path.extension()

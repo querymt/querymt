@@ -108,6 +108,25 @@ impl FunctionIndex {
     }
 
     /// Synchronous build implementation
+    ///
+    /// # Parallelism and Thread Safety
+    ///
+    /// This method uses rayon's `par_iter()` for fast initial indexing of large codebases.
+    /// Each thread creates its own parser instance within the closure scope, which is safe because:
+    /// - Each parser is created fresh for each file and lives only within the closure
+    /// - Parsers don't escape their thread or outlive the parsing operation
+    /// - Tree-sitter `Node` objects are consumed and converted to owned data before collection
+    /// - No parser state is shared between threads
+    ///
+    /// # IMPORTANT: Incremental Updates Must Be Sequential
+    ///
+    /// While parallel processing is safe for the initial build, **incremental updates via
+    /// `update_file()` MUST use sequential processing**. This is because:
+    /// - Tree-sitter parsers contain internal C state with raw pointers
+    /// - The `Node` type holds references to tree data that are not thread-safe
+    /// - Concurrent parser usage can cause segfaults in `Node::kind()` and similar methods
+    ///
+    /// See: https://github.com/tree-sitter/tree-sitter/issues/1369
     fn build_sync(root: &Path, config: FunctionIndexConfig) -> Result<Self, String> {
         let mut functions: HashMap<PathBuf, Vec<IndexedFunctionEntry>> = HashMap::new();
 
@@ -410,6 +429,11 @@ impl FunctionIndex {
     }
 
     /// Find functions similar to newly written/modified code
+    ///
+    /// # Thread Safety
+    ///
+    /// Like `update_file()`, this method is **NOT thread-safe** due to tree-sitter
+    /// parser usage. It should only be called from a single thread at a time.
     pub fn find_similar_to_code(
         &self,
         file_path: &Path,
@@ -466,6 +490,26 @@ impl FunctionIndex {
     }
 
     /// Update the index for a specific file
+    ///
+    /// # Thread Safety Warning
+    ///
+    /// This method is **NOT thread-safe** and must only be called from a single thread
+    /// at a time. The tree-sitter parsers used internally contain C state with raw
+    /// pointers that can cause segfaults if accessed concurrently.
+    ///
+    /// **Critical:** Do NOT use parallel iterators (e.g., rayon's `par_iter()`) or
+    /// spawn multiple threads calling this method simultaneously. This will cause
+    /// segmentation faults in `tree_sitter::Node::kind()` and related methods.
+    ///
+    /// # Usage
+    ///
+    /// This method is designed for incremental updates when files change:
+    /// - Called from `workspace::update_function_index()` with a write lock
+    /// - Processes one file at a time sequentially
+    /// - Typically used for 1-2 file updates at a time (fast enough without parallelism)
+    ///
+    /// For bulk indexing of many files, use `build()` which safely uses parallelism
+    /// with thread-local parser instances.
     pub fn update_file(&mut self, file_path: &Path, source: &str) {
         let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
@@ -966,5 +1010,70 @@ function tsFunc() {
         assert_eq!(index.file_count(), 2);
         // Should have 2 functions total
         assert_eq!(index.function_count(), 2);
+    }
+
+    /// This test documents the thread-safety contract for FunctionIndex
+    #[test]
+    fn test_thread_safety_documentation() {
+        // FunctionIndex is Send + Sync, which means it CAN be shared across threads
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FunctionIndex>();
+
+        // HOWEVER: The methods that use tree-sitter parsers are NOT thread-safe
+        // and must only be called from a single thread at a time:
+        //
+        // - update_file() - NOT thread-safe (uses parsers)
+        // - find_similar_to_code() - NOT thread-safe (uses parsers)
+        // - build_sync() - Uses par_iter() which creates thread-local parsers (SAFE)
+        //
+        // This test serves as documentation. If you're seeing segfaults:
+        // 1. Check that update_file() is not called from multiple threads concurrently
+        // 2. Ensure no rayon par_iter() is used in update paths
+        // 3. Verify parsers are created fresh within each thread's scope
+        //
+        // See the documentation on build_sync() and update_file() for details.
+    }
+
+    /// Test that sequential updates work correctly (thread-safe pattern)
+    #[tokio::test]
+    async fn test_sequential_updates_are_safe() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create initial file
+        fs::write(
+            temp_dir.path().join("test.rs"),
+            r#"
+fn foo() {
+    println!("original");
+    let x = 42;
+    return x;
+}
+"#,
+        )
+        .unwrap();
+
+        let config = FunctionIndexConfig::default().with_min_lines(3);
+        let mut index = FunctionIndex::build(temp_dir.path(), config).await.unwrap();
+
+        assert_eq!(index.function_count(), 1);
+
+        // Simulate multiple sequential updates (like from file watcher)
+        // This is the SAFE pattern - one at a time
+        for i in 1..=5 {
+            let content = format!(
+                r#"
+fn foo() {{
+    println!("update {}");
+    let x = 42;
+    return x;
+}}
+"#,
+                i
+            );
+            index.update_file(&temp_dir.path().join("test.rs"), &content);
+            assert_eq!(index.function_count(), 1);
+        }
+
+        // All updates completed successfully without segfaults
     }
 }
