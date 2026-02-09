@@ -740,9 +740,12 @@ fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> {
 
     let mut files = Vec::new();
 
+    // TODO: Consider consolidating with file_index.rs's Override pattern for consistency
+    // Currently using .standard_filters() which respects .gitignore and common ignore patterns
     for entry in WalkBuilder::new(root)
         .git_ignore(true)
         .hidden(true)
+        .standard_filters(true)
         .build()
         .filter_map(|e| e.ok())
     {
@@ -1075,5 +1078,78 @@ fn foo() {{
         }
 
         // All updates completed successfully without segfaults
+    }
+
+    #[tokio::test]
+    async fn test_ignores_target_directory() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize a git repo (needed for .gitignore to be recognized by WalkBuilder)
+        // Using gix (gitoxide) which is already in the project dependencies
+        gix::init(temp_dir.path()).expect("Failed to initialize git repo");
+
+        // Create a .gitignore file
+        fs::write(temp_dir.path().join(".gitignore"), "/target\n").unwrap();
+
+        // Create source files in the root
+        fs::write(
+            temp_dir.path().join("main.rs"),
+            r#"
+fn main() {
+    println!("Hello, world!");
+    let x = 42;
+}
+"#,
+        )
+        .unwrap();
+
+        // Create a target directory with Rust files (build artifacts)
+        fs::create_dir_all(temp_dir.path().join("target/debug")).unwrap();
+        fs::write(
+            temp_dir.path().join("target/debug/build.rs"),
+            r#"
+fn build_artifact() {
+    println!("This should be ignored");
+    let y = 99;
+}
+"#,
+        )
+        .unwrap();
+
+        fs::create_dir_all(temp_dir.path().join("target/debug/deps")).unwrap();
+        fs::write(
+            temp_dir.path().join("target/debug/deps/lib.rs"),
+            r#"
+fn dependency() {
+    println!("This should also be ignored");
+    let z = 100;
+}
+"#,
+        )
+        .unwrap();
+
+        let config = FunctionIndexConfig::default().with_min_lines(3);
+        let index = FunctionIndex::build(temp_dir.path(), config).await.unwrap();
+
+        // Verify that no files from target/ directory are indexed
+        let indexed_files: Vec<_> = index
+            .functions
+            .keys()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            indexed_files.iter().all(|f| !f.contains("target")),
+            "No files from target/ directory should be indexed. Found: {:?}",
+            indexed_files
+        );
+
+        // Should have indexed only main.rs, not anything in target/
+        assert_eq!(index.file_count(), 1, "Should only index 1 file (main.rs)");
+        assert_eq!(
+            index.function_count(),
+            1,
+            "Should only have 1 function (main)"
+        );
     }
 }

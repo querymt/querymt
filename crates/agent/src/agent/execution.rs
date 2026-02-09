@@ -490,6 +490,7 @@ impl QueryMTAgent {
                         ExecutionState::Stopped {
                             ref message,
                             stop_type,
+                            ..
                         } => {
                             // Middleware stopped execution
                             info!("Turn-end middleware stopped: {} ({:?})", message, stop_type);
@@ -502,6 +503,7 @@ impl QueryMTAgent {
                 ExecutionState::Stopped {
                     ref message,
                     stop_type,
+                    ..
                 } => {
                     info!("State machine stopped: {} ({:?})", message, stop_type);
 

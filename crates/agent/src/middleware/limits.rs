@@ -175,6 +175,7 @@ impl MiddlewareDriver for LimitsMiddleware {
                     return Ok(ExecutionState::Stopped {
                         message: format!("Max steps ({}) reached", max_steps).into(),
                         stop_type: StopType::StepLimit,
+                        context: Some(context.clone()),
                     });
                 }
 
@@ -188,6 +189,7 @@ impl MiddlewareDriver for LimitsMiddleware {
                     return Ok(ExecutionState::Stopped {
                         message: format!("Turn limit ({}) reached", max_turns).into(),
                         stop_type: StopType::TurnLimit,
+                        context: Some(context.clone()),
                     });
                 }
 
@@ -206,6 +208,7 @@ impl MiddlewareDriver for LimitsMiddleware {
                         )
                         .into(),
                         stop_type: StopType::PriceLimit,
+                        context: Some(context.clone()),
                     });
                 }
 
@@ -270,6 +273,7 @@ impl MiddlewareDriver for MaxStepsMiddleware {
                     Ok(ExecutionState::Stopped {
                         message: format!("Max steps ({}) reached", self.max_steps).into(),
                         stop_type: StopType::StepLimit,
+                        context: Some(context.clone()),
                     })
                 } else {
                     trace!("MaxStepsMiddleware: allowing execution to continue");
@@ -342,6 +346,7 @@ impl MiddlewareDriver for TurnLimitMiddleware {
                     Ok(ExecutionState::Stopped {
                         message: format!("Turn limit ({}) reached", self.max_turns).into(),
                         stop_type: StopType::TurnLimit,
+                        context: Some(context.clone()),
                     })
                 } else {
                     trace!("TurnLimitMiddleware: allowing execution to continue");
@@ -430,6 +435,7 @@ impl MiddlewareDriver for PriceLimitMiddleware {
                         )
                         .into(),
                         stop_type: StopType::PriceLimit,
+                        context: Some(context.clone()),
                     })
                 } else {
                     trace!(

@@ -27,6 +27,7 @@ tools = [
   "question",
   # Code intelligence
   "code_surgeon",
+  "web_fetch",
 ]
 system = [
   "You are Claude Code, Anthropic's official CLI for Claude.",
@@ -122,10 +123,10 @@ max_steps = 200
 max_turns = 50
 
 # Context management with auto-compaction
+# Note: auto_compact is controlled by [agent.compaction].auto
 [[middleware]]
 type = "context"
 warn_at_percent = 80
-auto_compact = true
 fallback_max_tokens = 128000
 
 # Detect when code is similar to existing code

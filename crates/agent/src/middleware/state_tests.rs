@@ -57,6 +57,7 @@ fn test_execution_state_name_all_variants() {
             ExecutionState::Stopped {
                 message: "done".into(),
                 stop_type: StopType::Other,
+                context: None,
             },
             "Stopped",
         ),
@@ -110,6 +111,7 @@ fn test_execution_state_context_accessors() {
         ExecutionState::Stopped {
             message: "done".into(),
             stop_type: StopType::Other,
+            context: None,
         },
         ExecutionState::Cancelled,
     ];

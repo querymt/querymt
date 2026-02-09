@@ -193,6 +193,7 @@ impl MiddlewareDriver for DelegationGuardMiddleware {
                                         return Ok(ExecutionState::Stopped {
                                             message: "Delegation blocked by guard".into(),
                                             stop_type: StopType::DelegationBlocked,
+                                            context: Some(context.clone()),
                                         });
                                     }
                                 }

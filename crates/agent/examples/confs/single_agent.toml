@@ -38,10 +38,10 @@ system = "You are a helpful coding assistant."
 # reminder = "You are in plan mode. Only observe, analyze, and plan. Do not make changes."
 
 # Uncomment to enable context management with auto-compaction
+# Note: auto_compact is controlled by [agent.compaction].auto
 # [[middleware]]
 # type = "context"
 # warn_at_percent = 80
-# auto_compact = true
 # fallback_max_tokens = 64000
 
 # Uncomment to enable duplicate code detection

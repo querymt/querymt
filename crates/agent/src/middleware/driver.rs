@@ -257,6 +257,7 @@ mod tests {
                 Ok(ExecutionState::Stopped {
                     message: "test stop".into(),
                     stop_type: StopType::Other,
+                    context: None,
                 })
             } else {
                 Ok(state)

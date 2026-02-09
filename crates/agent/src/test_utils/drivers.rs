@@ -133,6 +133,7 @@ impl StopDriver {
         ExecutionState::Stopped {
             message: self.message.into(),
             stop_type: self.stop_type,
+            context: None,
         }
     }
 }
@@ -176,6 +177,7 @@ impl MiddlewareDriver for AlwaysStopDriver {
         Ok(ExecutionState::Stopped {
             message: "stopped by middleware".into(),
             stop_type: self.stop_type,
+            context: None,
         })
     }
 
@@ -394,6 +396,7 @@ impl MiddlewareDriver for StopOnBeforeLlmCall {
             ExecutionState::BeforeLlmCall { .. } => Ok(ExecutionState::Stopped {
                 message: "stopped".into(),
                 stop_type: StopType::Other,
+                context: None,
             }),
             other => Ok(other),
         }

@@ -397,19 +397,23 @@ impl AgentBuilderExt for QueryMTAgent {
     }
 
     fn with_compaction_config(mut self, config: CompactionConfig) -> Self {
+        // Set compaction config FIRST so middleware factories can read it
+        self.compaction_config = config.clone();
+
         // If auto compaction is enabled, auto-enable ContextMiddleware
         if config.auto {
             let mut drivers = self.middleware_drivers.lock().unwrap();
             let already_has = drivers.iter().any(|d| d.name() == "ContextMiddleware");
             if !already_has {
                 log::info!("Auto-enabling ContextMiddleware for compaction");
-                let context_middleware = ContextMiddleware::new(ContextConfig::default());
+                // auto_compact will be derived from compaction_config.auto
+                let context_middleware =
+                    ContextMiddleware::new(ContextConfig::default().auto_compact(true));
                 drivers.push(Arc::new(context_middleware));
             } else {
                 log::debug!("ContextMiddleware already present, skipping auto-add");
             }
         }
-        self.compaction_config = config;
         self
     }
 

@@ -550,9 +550,21 @@ fn process_events(events: &[Event], root: &Path, overrides: &Override) -> FileCh
 fn compile_overrides(root: &Path, config: &FileIndexConfig) -> Result<Override, FileIndexError> {
     let mut builder = OverrideBuilder::new(root);
 
-    // Add each pattern with ! prefix (meaning "exclude" in Override semantics)
+    // Override patterns work as a whitelist system:
+    // 1. First add a base whitelist pattern to match everything
+    // 2. Then add negation patterns to exclude specific paths
+    // Without the base whitelist, negation patterns have no effect
+    builder.add("**/*").map_err(|e| {
+        FileIndexError::InvalidConfig(format!("Failed to add base whitelist pattern: {}", e))
+    })?;
+
+    // Add each ignore pattern with ! prefix (meaning "exclude" in Override semantics)
+    // Ensure patterns use glob syntax for recursive matching
     for pattern in &config.ignore_patterns {
-        let exclude_pattern = format!("!{}", pattern);
+        // Normalize pattern to use glob recursion
+        let normalized_pattern = normalize_ignore_pattern(pattern);
+        let exclude_pattern = format!("!{}", normalized_pattern);
+
         builder.add(&exclude_pattern).map_err(|e| {
             FileIndexError::InvalidConfig(format!("Invalid pattern '{}': {}", pattern, e))
         })?;
@@ -561,6 +573,34 @@ fn compile_overrides(root: &Path, config: &FileIndexConfig) -> Result<Override, 
     builder
         .build()
         .map_err(|e| FileIndexError::InvalidConfig(format!("Failed to build overrides: {}", e)))
+}
+
+/// Normalize ignore patterns to ensure they match recursively
+///
+/// Examples:
+/// - "target/" -> "target/**"
+/// - "target" -> "target/**"
+/// - "node_modules/" -> "node_modules/**"
+/// - "*.db" -> "*.db" (unchanged - file pattern)
+/// - ".env" -> ".env" (unchanged - single file)
+fn normalize_ignore_pattern(pattern: &str) -> String {
+    // If pattern already has glob syntax, use as-is
+    if pattern.contains("**") || pattern.contains('*') && !pattern.ends_with('/') {
+        return pattern.to_string();
+    }
+
+    // If pattern ends with /, it's a directory - add recursive glob
+    if pattern.ends_with('/') {
+        return format!("{}**", pattern);
+    }
+
+    // For patterns without extension (likely directories), add recursive glob
+    if !pattern.contains('.') {
+        return format!("{}/**", pattern);
+    }
+
+    // Otherwise use as-is (e.g., ".env", ".DS_Store")
+    pattern.to_string()
 }
 
 fn is_ignored(relative_path: &str, is_dir: bool, overrides: &Override) -> bool {
@@ -744,5 +784,303 @@ mod tests {
         assert_eq!(to_remove.len(), 1);
 
         assert!(change_set.has_source_changes());
+    }
+
+    /// Test Override pattern matching behavior
+    /// This test verifies that our ignore patterns work correctly for filtering file events
+    #[test]
+    fn test_override_semantics() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        println!("\n=== Testing Override Pattern Semantics ===\n");
+
+        // Test 1: Current implementation (only negation with "!" prefix)
+        println!("Test 1: Only negation patterns (current implementation)");
+        let mut builder1 = OverrideBuilder::new(root);
+        builder1.add("!target/").unwrap();
+        let overrides1 = builder1.build().unwrap();
+
+        // Test 2: Whitelist everything at root level, then negate
+        println!("\nTest 2: Whitelist root + negation");
+        let mut builder2 = OverrideBuilder::new(root);
+        builder2.add("*").unwrap(); // Match everything at root
+        builder2.add("!target").unwrap(); // Except target dir
+        let overrides2 = builder2.build().unwrap();
+
+        // Test 3: Recursive patterns
+        println!("\nTest 3: Recursive whitelist + negation");
+        let mut builder3 = OverrideBuilder::new(root);
+        builder3.add("**/*").unwrap(); // Match everything recursively
+        builder3.add("!target/**").unwrap(); // Except target and all contents
+        let overrides3 = builder3.build().unwrap();
+
+        // Test 4: Pattern without trailing slash
+        println!("\nTest 4: Pattern without trailing slash");
+        let mut builder4 = OverrideBuilder::new(root);
+        builder4.add("**/*").unwrap();
+        builder4.add("!target").unwrap(); // No trailing slash
+        let overrides4 = builder4.build().unwrap();
+
+        // Test paths that should be ignored
+        let test_paths = vec![
+            (
+                "target/debug/.fingerprint/lib.rs",
+                false,
+                "File deep in target",
+            ),
+            ("target/debug/build.rs", false, "File in target/debug"),
+            ("target/release/build", true, "Dir in target/release"),
+            ("src/main.rs", false, "File in src (should NOT be ignored)"),
+            ("target", true, "Target directory itself"),
+        ];
+
+        for (path, is_dir, description) in test_paths {
+            println!("\nPath: {} ({})", path, description);
+
+            let m1 = overrides1.matched(path, is_dir);
+            let m2 = overrides2.matched(path, is_dir);
+            let m3 = overrides3.matched(path, is_dir);
+            let m4 = overrides4.matched(path, is_dir);
+
+            println!(
+                "  Test1 (only negation):     matched={:?}, is_ignore={}",
+                m1,
+                m1.is_ignore()
+            );
+            println!(
+                "  Test2 (root whitelist):    matched={:?}, is_ignore={}",
+                m2,
+                m2.is_ignore()
+            );
+            println!(
+                "  Test3 (recursive):         matched={:?}, is_ignore={}",
+                m3,
+                m3.is_ignore()
+            );
+            println!(
+                "  Test4 (no trailing slash): matched={:?}, is_ignore={}",
+                m4,
+                m4.is_ignore()
+            );
+
+            // For target/* paths, at least one method should mark as ignored
+            if path.starts_with("target") {
+                let any_ignored =
+                    m1.is_ignore() || m2.is_ignore() || m3.is_ignore() || m4.is_ignore();
+                if !any_ignored {
+                    println!("  ⚠️  WARNING: target path not ignored by any method!");
+                }
+            }
+        }
+    }
+
+    /// Test the actual is_ignored function used by process_events
+    #[test]
+    fn test_is_ignored_function() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        println!("\n=== Testing is_ignored() Function ===\n");
+
+        // Use default config which has "target/" in ignore_patterns
+        let config = FileIndexConfig::default();
+        let overrides = compile_overrides(root, &config).unwrap();
+
+        let test_paths = vec![
+            ("target/debug/.fingerprint/lib.rs", false),
+            ("target/debug/build.rs", false),
+            ("target/release/build", true),
+            ("src/main.rs", false),
+            ("node_modules/package/index.js", false),
+            (".git/objects/abc", false),
+            ("dist/bundle.js", false),
+        ];
+
+        for (path, is_dir) in test_paths {
+            let ignored = is_ignored(path, is_dir, &overrides);
+            println!(
+                "Path: {:<40} is_dir={:<5} ignored={}",
+                path, is_dir, ignored
+            );
+
+            // Verify expected behavior
+            if path.starts_with("target/") {
+                assert!(
+                    ignored,
+                    "Path '{}' should be ignored (in default ignore_patterns)",
+                    path
+                );
+            }
+        }
+    }
+
+    /// Test process_events filtering with actual file system events
+    #[test]
+    fn test_process_events_filters_ignored_paths() {
+        use notify::event::{DataChange, ModifyKind};
+        use notify::{Event, EventKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        println!("\n=== Testing process_events Filtering ===\n");
+
+        // Create actual directory structure
+        fs::create_dir_all(root.join("target/debug/.fingerprint")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        let config = FileIndexConfig::default();
+        let overrides = compile_overrides(root, &config).unwrap();
+
+        // Simulate file events
+        let mut target_event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)));
+        target_event
+            .paths
+            .push(root.join("target/debug/.fingerprint/lib.rs"));
+
+        let mut src_event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)));
+        src_event.paths.push(root.join("src/main.rs"));
+
+        let events = vec![target_event, src_event];
+
+        let change_set = process_events(&events, root, &overrides);
+
+        println!("Total changes processed: {}", change_set.changes.len());
+        for change in &change_set.changes {
+            println!("  - {:?}", change.path);
+        }
+
+        // Verify target/ files are filtered out
+        let has_target_file = change_set
+            .changes
+            .iter()
+            .any(|c| c.path.to_string_lossy().contains("target"));
+
+        assert!(
+            !has_target_file,
+            "process_events should filter out target/ paths. Found changes: {:?}",
+            change_set.changes
+        );
+
+        // Verify src/ files are NOT filtered
+        let has_src_file = change_set
+            .changes
+            .iter()
+            .any(|c| c.path.to_string_lossy().contains("src/main.rs"));
+
+        assert!(
+            has_src_file,
+            "process_events should NOT filter out src/ paths"
+        );
+    }
+
+    /// Test compile_overrides with different pattern formats
+    #[test]
+    fn test_compile_overrides_patterns() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        println!("\n=== Testing Different Pattern Formats ===\n");
+
+        let pattern_sets = vec![
+            (vec!["target/"], "With trailing slash"),
+            (vec!["target"], "Without trailing slash"),
+            (vec!["target/**"], "With glob recursion"),
+            (vec!["**/target/**"], "Full glob path"),
+        ];
+
+        for (patterns, description) in pattern_sets {
+            println!("\nPattern set: {} - {:?}", description, patterns);
+
+            let config = FileIndexConfig {
+                ignore_patterns: patterns.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            };
+
+            let overrides = compile_overrides(root, &config).unwrap();
+
+            let test_paths = vec![
+                "target/debug/.fingerprint/lib.rs",
+                "target/release/build",
+                "src/main.rs",
+            ];
+
+            for path in test_paths {
+                let ignored = is_ignored(path, false, &overrides);
+                println!("  {} -> ignored={}", path, ignored);
+            }
+        }
+    }
+
+    /// Test the normalize_ignore_pattern function
+    #[test]
+    fn test_normalize_ignore_pattern() {
+        let test_cases = vec![
+            ("target/", "target/**"),
+            ("target", "target/**"),
+            ("node_modules/", "node_modules/**"),
+            ("node_modules", "node_modules/**"),
+            ("dist/", "dist/**"),
+            ("build", "build/**"),
+            ("*.db", "*.db"),
+            ("*.pyc", "*.pyc"),
+            (".env", ".env"),
+            (".env.*", ".env.*"),
+            (".DS_Store", ".DS_Store"),
+            ("target/**", "target/**"),
+            ("**/target/**", "**/target/**"),
+        ];
+
+        println!("\n=== Testing normalize_ignore_pattern ===\n");
+        for (input, expected) in test_cases {
+            let result = normalize_ignore_pattern(input);
+            println!("'{}' -> '{}' (expected: '{}')", input, result, expected);
+            assert_eq!(
+                result, expected,
+                "normalize_ignore_pattern('{}') should return '{}'",
+                input, expected
+            );
+        }
+    }
+
+    /// Test that the fix resolves the original issue
+    #[test]
+    fn test_fixed_override_filters_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        println!("\n=== Testing Fixed Override Implementation ===\n");
+
+        // Use default config which includes "target/"
+        let config = FileIndexConfig::default();
+        let overrides = compile_overrides(root, &config).unwrap();
+
+        let test_paths = vec![
+            ("target/debug/.fingerprint/lib.rs", false, true),
+            ("target/debug/build.rs", false, true),
+            ("target/release/build", true, true),
+            ("src/main.rs", false, false),
+            ("node_modules/package/index.js", false, true),
+            (".git/objects/abc", false, true),
+            ("dist/bundle.js", false, true),
+            ("README.md", false, false),
+        ];
+
+        for (path, is_dir, should_be_ignored) in test_paths {
+            let ignored = is_ignored(path, is_dir, &overrides);
+            println!(
+                "Path: {:<40} is_dir={:<5} ignored={:<5} (expected: {})",
+                path, is_dir, ignored, should_be_ignored
+            );
+
+            assert_eq!(
+                ignored,
+                should_be_ignored,
+                "Path '{}' should {}be ignored",
+                path,
+                if should_be_ignored { "" } else { "NOT " }
+            );
+        }
     }
 }

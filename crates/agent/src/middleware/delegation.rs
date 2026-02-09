@@ -272,6 +272,7 @@ impl MiddlewareDriver for DelegationMiddleware {
                                     return Ok(ExecutionState::Stopped {
                                         message: warning.into(),
                                         stop_type: StopType::DelegationBlocked,
+                                        context: Some(context.clone()),
                                     });
                                 }
                             }

@@ -310,6 +310,7 @@ pub enum ExecutionState {
     Stopped {
         message: Arc<str>,
         stop_type: StopType,
+        context: Option<Arc<ConversationContext>>,
     },
 
     /// Execution cancelled by user
@@ -339,6 +340,7 @@ impl ExecutionState {
             ExecutionState::AfterLlm { context, .. } => Some(context),
             ExecutionState::ProcessingToolCalls { context, .. } => Some(context),
             ExecutionState::WaitingForEvent { context, .. } => Some(context),
+            ExecutionState::Stopped { context, .. } => context.as_ref(),
             _ => None,
         }
     }

@@ -188,6 +188,7 @@ impl MiddlewareDriver for ContextMiddleware {
                         )
                         .into(),
                         stop_type: StopType::ContextThreshold,
+                        context: Some(context.clone()),
                     });
                 }
 
@@ -232,7 +233,6 @@ pub struct ContextFactory;
 struct ContextFactoryConfig {
     enabled: bool,
     warn_at_percent: u32,
-    auto_compact: bool,
     fallback_max_tokens: usize,
 }
 
@@ -241,7 +241,6 @@ impl Default for ContextFactoryConfig {
         Self {
             enabled: true,
             warn_at_percent: 80,
-            auto_compact: true,
             fallback_max_tokens: 32_000,
         }
     }
@@ -255,7 +254,7 @@ impl MiddlewareFactory for ContextFactory {
     fn create(
         &self,
         config: &serde_json::Value,
-        _agent: &crate::agent::core::QueryMTAgent,
+        agent: &crate::agent::core::QueryMTAgent,
     ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
         let cfg: ContextFactoryConfig = serde_json::from_value(config.clone())?;
 
@@ -263,9 +262,12 @@ impl MiddlewareFactory for ContextFactory {
             return Err(anyhow::anyhow!("Middleware disabled"));
         }
 
+        // Read auto_compact from agent's compaction_config
+        let auto_compact = agent.compaction_config.auto;
+
         let context_config = ContextConfig {
             warn_at_percent: cfg.warn_at_percent,
-            auto_compact: cfg.auto_compact,
+            auto_compact,
             context_source: ModelInfoSource::FromSession,
             fallback_max_tokens: cfg.fallback_max_tokens,
         };

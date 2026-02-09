@@ -66,9 +66,12 @@ impl MerkleTree {
         // Collect paths first to sort them (deterministic order)
         let mut paths = Vec::new();
 
+        // TODO: Consider consolidating with file_index.rs's Override pattern for consistency
+        // Currently using .standard_filters() which respects .gitignore and common ignore patterns
         for result in WalkBuilder::new(root)
             .hidden(false)
             .git_ignore(true)
+            .standard_filters(true)
             .build()
         {
             match result {

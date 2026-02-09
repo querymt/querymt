@@ -26,7 +26,6 @@ system = [
 [[planner.middleware]]
 type = "context"
 warn_at_percent = 80
-auto_compact = true
 fallback_max_tokens = 32000
 
 [[planner.middleware]]
@@ -114,7 +113,6 @@ max_turns = 30
 [[delegates.middleware]]
 type = "context"
 warn_at_percent = 70
-auto_compact = true
 fallback_max_tokens = 110000
 
 # Detect when code is similar to existing code

@@ -527,6 +527,7 @@ impl QueryMTAgent {
                 Ok(ExecutionState::Stopped {
                     message: "Model hit token limit".into(),
                     stop_type: StopType::ModelTokenLimit,
+                    context: Some(new_context),
                 })
             }
 
@@ -535,6 +536,7 @@ impl QueryMTAgent {
                 Ok(ExecutionState::Stopped {
                     message: "Response blocked by content filter".into(),
                     stop_type: StopType::ContentFilter,
+                    context: Some(new_context),
                 })
             }
 
@@ -679,6 +681,7 @@ impl QueryMTAgent {
                             return Ok(ExecutionState::Stopped {
                                 message: "Event stream closed while waiting".into(),
                                 stop_type: StopType::Other,
+                                context: Some(context.clone()),
                             });
                         }
                     };

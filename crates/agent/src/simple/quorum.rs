@@ -178,15 +178,15 @@ impl QuorumBuilder {
                     agent = agent.with_allowed_tools(tools.clone());
                 }
 
-                // Apply middleware from config
-                apply_middleware_from_config(&mut agent, &middleware_entries);
-
-                // Thread through config fields
+                // Set compaction config BEFORE applying middleware so factory can read it
                 agent = agent
                     .with_tool_output_config(tool_output_config)
                     .with_pruning_config(pruning_config)
                     .with_compaction_config(compaction_config)
                     .with_rate_limit_config(rate_limit_config);
+
+                // Apply middleware from config (after compaction_config is set)
+                apply_middleware_from_config(&mut agent, &middleware_entries);
 
                 // Handle snapshot backend from config (can override the policy-based one above)
                 match snapshot_backend_config.backend.as_str() {
@@ -238,15 +238,15 @@ impl QuorumBuilder {
                     .with_allowed_tools(planner_tools.clone());
             }
 
-            // Apply middleware from config
-            apply_middleware_from_config(&mut agent, &planner_middleware);
-
-            // Thread through config fields
+            // Set compaction config BEFORE applying middleware so factory can read it
             agent = agent
                 .with_tool_output_config(planner_tool_output)
                 .with_pruning_config(planner_pruning)
                 .with_compaction_config(planner_compaction)
                 .with_rate_limit_config(planner_rate_limit);
+
+            // Apply middleware from config (after compaction_config is set)
+            apply_middleware_from_config(&mut agent, &planner_middleware);
 
             // Handle snapshot backend from config (can override the policy-based one above)
             match planner_snapshot.backend.as_str() {

@@ -12,9 +12,12 @@ impl CodeSearch {
             RegexMatcher::new(pattern).map_err(|e| Box::new(e) as Box<dyn Error + Send>)?;
         let mut matches = vec![];
 
+        // TODO: Consider consolidating with file_index.rs's Override pattern for consistency
+        // Currently using .standard_filters() which respects .gitignore and common ignore patterns
         for result in WalkBuilder::new(root)
             .hidden(false)
             .git_ignore(true)
+            .standard_filters(true)
             .build()
         {
             let entry = match result {
