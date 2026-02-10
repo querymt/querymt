@@ -86,7 +86,7 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 mockall = "0.14"
-env_logger = "0.10"
+env_logger = "0.11"
 tempfile = "3.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
