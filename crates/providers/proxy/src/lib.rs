@@ -1,12 +1,12 @@
 use http::{Request, Response};
 use querymt::{
-    chat::{http::HTTPChatProvider, ChatMessage, ChatResponse, FinishReason, StreamChunk, Tool},
-    completion::{http::HTTPCompletionProvider, CompletionRequest, CompletionResponse},
+    HTTPLLMProvider, ToolCall,
+    chat::{ChatMessage, ChatResponse, FinishReason, StreamChunk, Tool, http::HTTPChatProvider},
+    completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
     handle_http_error,
     plugin::HTTPLLMProviderFactory,
-    HTTPLLMProvider, ToolCall,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -303,11 +303,16 @@ impl ProxyConfig {
                     "target_provider must be a string".to_string(),
                 ));
             }
+            if let Value::String(provider_id) = target {
+                ensure_allowed_provider(provider_id)?;
+            }
         } else if !self.model.contains(':') {
             return Err(LLMError::InvalidRequest(
                 "Proxy model must include provider prefix or set target_provider in extra_body"
                     .to_string(),
             ));
+        } else if let Some((provider_id, _)) = self.model.split_once(':') {
+            ensure_allowed_provider(provider_id)?;
         }
 
         Ok(ProxyChatRequest {
@@ -323,6 +328,15 @@ impl ProxyConfig {
             tools: None,
             extra_body: self.extra_body.clone(),
         })
+    }
+}
+
+fn ensure_allowed_provider(provider_id: &str) -> Result<(), LLMError> {
+    match provider_id {
+        "llama_cpp" | "mrs" => Ok(()),
+        _ => Err(LLMError::InvalidRequest(
+            "Only llama_cpp and mrs providers are supported".to_string(),
+        )),
     }
 }
 

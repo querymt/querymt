@@ -1,30 +1,37 @@
 use anyhow::Result;
 use axum::{
-    Json,
-    Router,
+    Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::post,
 };
 use clap::Parser;
+use futures::StreamExt;
+use futures::stream as futures_stream;
 use querymt::{
+    FunctionCall, LLMProvider, ToolCall,
     chat::{ChatMessage, ChatRole, MessageType, StreamChunk, Tool},
     error::LLMError,
     plugin::{
         default_providers_path,
         extism_impl::host::ExtismLoader,
-        host::{PluginRegistry, ProviderConfig},
         host::native::NativeLoader,
+        host::{PluginRegistry, ProviderConfig},
     },
-    FunctionCall, ToolCall,
-    LLMProvider,
 };
-use futures::{StreamExt};
-use futures::stream as futures_stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -130,7 +137,10 @@ struct ToolUseState {
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("querymt_service=info,tower_http=info"));
-    tracing_subscriber::registry().with(fmt::layer()).with(filter).init();
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(filter)
+        .init();
 
     let args = Args::parse();
     let providers_path = args.providers.unwrap_or_else(default_providers_path);
@@ -198,7 +208,9 @@ async fn handle_chat(
 
     if !req.steps.is_empty() {
         info!(steps = req.steps.len(), "processing chain request");
-        return handle_chain_request(state, req).await.map(IntoResponse::into_response);
+        return handle_chain_request(state, req)
+            .await
+            .map(IntoResponse::into_response);
     }
 
     let target_provider = take_target_provider(&mut options)?;
@@ -251,13 +263,7 @@ async fn handle_chat(
 
                 match item {
                     Ok(chunk) => {
-                        events.extend(render_stream_chunk(
-                            &id,
-                            created,
-                            &model,
-                            chunk,
-                            state,
-                        ));
+                        events.extend(render_stream_chunk(&id, created, &model, chunk, state));
                         if state.finished {
                             events.push(Event::default().data("[DONE]"));
                         }
@@ -301,13 +307,10 @@ async fn handle_chat(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             })?
     } else {
-        provider
-            .chat(&messages)
-            .await
-            .map_err(|e| {
-                error!(provider = %provider_id, error = %e, "chat request failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            })?
+        provider.chat(&messages).await.map_err(|e| {
+            error!(provider = %provider_id, error = %e, "chat request failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?
     };
 
     let tool_calls = response.tool_calls();
@@ -377,7 +380,8 @@ async fn handle_chain_request(
     };
 
     if req.model.is_some() {
-        let (provider_id, model_name) = resolve_provider_and_model(&req, target_provider.as_deref())?;
+        let (provider_id, model_name) =
+            resolve_provider_and_model(&req, target_provider.as_deref())?;
         provider_ids.push(provider_id.clone());
         info!(provider = %provider_id, model = %model_name, "processing chain initial step");
 
@@ -422,6 +426,7 @@ async fn handle_chain_request(
     }
 
     for step in req.steps.into_iter() {
+        ensure_allowed_provider(&step.provider_id)?;
         provider_ids.push(step.provider_id.clone());
         let prompt = replace_template(&step.template, &memory);
         info!(provider = %step.provider_id, step = %step.id, "processing chain step");
@@ -496,6 +501,7 @@ fn resolve_provider_and_model(
         .ok_or((StatusCode::BAD_REQUEST, "Model is required".to_string()))?;
 
     if let Some(target) = target_provider {
+        ensure_allowed_provider(target)?;
         let model_name = model
             .split_once(':')
             .map(|(_, name)| name)
@@ -505,7 +511,18 @@ fn resolve_provider_and_model(
         let (provider_id, model_name) = model
             .split_once(':')
             .ok_or((StatusCode::BAD_REQUEST, "Invalid model format".to_string()))?;
+        ensure_allowed_provider(provider_id)?;
         Ok((provider_id.to_string(), model_name.to_string()))
+    }
+}
+
+fn ensure_allowed_provider(provider_id: &str) -> Result<(), (StatusCode, String)> {
+    match provider_id {
+        "llama_cpp" | "mrs" => Ok(()),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "Only llama_cpp and mrs providers are supported".to_string(),
+        )),
     }
 }
 
@@ -578,8 +595,8 @@ async fn build_provider(
     let schema: Value = serde_json::from_str(&factory.config_schema())
         .map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
     let pruned_cfg = prune_config_by_schema(&cfg, &schema);
-    let pruned_cfg_str = serde_json::to_string(&pruned_cfg)
-        .map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
+    let pruned_cfg_str =
+        serde_json::to_string(&pruned_cfg).map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
     factory.from_config(&pruned_cfg_str)
 }
 
@@ -587,8 +604,8 @@ fn base_provider_config(provider_cfg: &ProviderConfig) -> Result<Value, LLMError
     let mut map = Map::new();
     if let Some(cfg) = &provider_cfg.config {
         for (key, value) in cfg {
-            let json_value = serde_json::to_value(value)
-                .map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
+            let json_value =
+                serde_json::to_value(value).map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
             map.insert(key.clone(), json_value);
         }
     }
@@ -616,9 +633,7 @@ fn merge_extra_options(cfg: &mut Value, options: &HashMap<String, Value>) {
     }
 }
 
-fn map_request_messages(
-    messages: Vec<Message>,
-) -> Result<Vec<ChatMessage>, (StatusCode, String)> {
+fn map_request_messages(messages: Vec<Message>) -> Result<Vec<ChatMessage>, (StatusCode, String)> {
     let mut out = Vec::with_capacity(messages.len());
 
     for msg in messages {
@@ -718,39 +733,43 @@ fn render_stream_chunk(
             if text.is_empty() {
                 return events;
             }
-            events.push(Event::default().data(
-                json!({
-                    "id": stream_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": text},
-                        "finish_reason": null
-                    }]
-                })
-                .to_string(),
-            ));
+            events.push(
+                Event::default().data(
+                    json!({
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": text},
+                            "finish_reason": null
+                        }]
+                    })
+                    .to_string(),
+                ),
+            );
         }
         StreamChunk::Thinking(text) => {
             if text.is_empty() {
                 return events;
             }
-            events.push(Event::default().data(
-                json!({
-                    "id": stream_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"reasoning_content": text},
-                        "finish_reason": null
-                    }]
-                })
-                .to_string(),
-            ));
+            events.push(
+                Event::default().data(
+                    json!({
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"reasoning_content": text},
+                            "finish_reason": null
+                        }]
+                    })
+                    .to_string(),
+                ),
+            );
         }
         StreamChunk::ToolUseStart { index, id, name } => {
             state.saw_tool_calls = true;
@@ -759,29 +778,34 @@ fn render_stream_chunk(
             entry.name = name.clone();
             entry.started = true;
 
-            events.push(Event::default().data(
-                json!({
-                    "id": stream_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "tool_calls": [{
-                                "index": index,
-                                "id": id,
-                                "type": "function",
-                                "function": {"name": name}
-                            }]
-                        },
-                        "finish_reason": null
-                    }]
-                })
-                .to_string(),
-            ));
+            events.push(
+                Event::default().data(
+                    json!({
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": index,
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {"name": name}
+                                }]
+                            },
+                            "finish_reason": null
+                        }]
+                    })
+                    .to_string(),
+                ),
+            );
         }
-        StreamChunk::ToolUseInputDelta { index, partial_json } => {
+        StreamChunk::ToolUseInputDelta {
+            index,
+            partial_json,
+        } => {
             let entry = state.tool_states.entry(index).or_default();
             entry.arguments_buffer.push_str(&partial_json);
             events.push(Event::default().data(
@@ -825,20 +849,22 @@ fn render_stream_chunk(
                 }
             };
 
-            events.push(Event::default().data(
-                json!({
-                    "id": stream_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": finish_reason
-                    }]
-                })
-                .to_string(),
-            ));
+            events.push(
+                Event::default().data(
+                    json!({
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": finish_reason
+                        }]
+                    })
+                    .to_string(),
+                ),
+            );
             state.finished = true;
         }
     }
