@@ -1,18 +1,7 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { useStopwatch } from 'react-timer-hook';
 import { EventItem } from '../types';
-
-interface AgentWorkingState {
-  isWorking: boolean;
-  accumulatedMs: number;
-  workStartedAt?: number;
-  activeDelegationIds: Set<string>;
-}
-
-interface GlobalTimerState {
-  hasStarted: boolean;
-  accumulatedMs: number;
-  lastActiveAt?: number;
-}
+import { useUiStore } from '../store/uiStore';
 
 interface SessionTimerResult {
   globalElapsedMs: number;
@@ -21,206 +10,258 @@ interface SessionTimerResult {
 }
 
 /**
- * Live timer hook that tracks:
- * - Global session elapsed time (wall-clock from first prompt, paused when waiting for user)
- * - Per-agent active time (accumulated work time, excluding pauses for delegation and user wait)
+ * Simple stopwatch class for tracking per-agent elapsed time.
+ * Uses timestamps to calculate elapsed time with millisecond precision.
+ */
+class AgentStopwatch {
+  private running = false;
+  private accumulated = 0;
+  private startedAt?: number;
+
+  start(): void {
+    if (!this.running) {
+      this.running = true;
+      this.startedAt = Date.now();
+    }
+  }
+
+  pause(): void {
+    if (this.running && this.startedAt !== undefined) {
+      this.accumulated += Date.now() - this.startedAt;
+      this.running = false;
+      this.startedAt = undefined;
+    }
+  }
+
+  getElapsedMs(): number {
+    if (this.running && this.startedAt !== undefined) {
+      return this.accumulated + (Date.now() - this.startedAt);
+    }
+    return this.accumulated;
+  }
+
+  isRunning(): boolean {
+    return this.running;
+  }
+
+  // For save/restore functionality
+  getAccumulated(): number {
+    // Capture current state including running time
+    if (this.running && this.startedAt !== undefined) {
+      return this.accumulated + (Date.now() - this.startedAt);
+    }
+    return this.accumulated;
+  }
+
+  setAccumulated(value: number): void {
+    this.accumulated = value;
+    this.running = false;
+    this.startedAt = undefined;
+  }
+
+  reset(): void {
+    this.accumulated = 0;
+    this.running = false;
+    this.startedAt = undefined;
+  }
+}
+
+/**
+ * Live timer hook that tracks per-session elapsed time.
  * 
- * Global timer:
- * - Starts from first prompt_received
- * - Pauses when ALL agents are waiting for user (conversation complete)
- * - Resumes when any agent starts working
+ * This hook provides:
+ * - Global session elapsed time (total wall-clock time while agents are thinking)
+ * - Per-agent active time (time each agent spends actively thinking)
+ * - Session active state (whether any agent is currently thinking)
  * 
- * Per-agent timers:
- * - Start when agent receives prompt
- * - Pause when:
- *   - Delegating to another agent (delegation_requested)
- *   - Waiting for user (llm_request_end with finish_reason 'stop')
- * - Resume when:
- *   - Delegation completes (delegation_completed)
- *   - Next prompt received
- * - Keep running when:
- *   - llm_request_end with finish_reason 'tool_calls' (about to execute tools)
+ * Key behaviors:
+ * - Timer state is stored per-session in Zustand store
+ * - When switching sessions, timer state is saved and restored
+ * - Global timer starts when first agent begins thinking (thinkingAgentIds becomes non-empty)
+ * - Global timer pauses when all agents stop thinking (thinkingAgentIds becomes empty)
+ * - Per-agent timers start when agent enters thinkingAgentIds
+ * - Per-agent timers pause when agent leaves thinkingAgentIds
+ * - Null sessionId (home page) shows 0:00
+ * 
+ * Implementation notes:
+ * - Uses useStopwatch from react-timer-hook for smooth global timer
+ * - Uses custom AgentStopwatch class in refs for per-agent tracking
+ * - Re-renders every second while active to update displayed times
+ * - Saves/restores timer state via Zustand when session changes
+ * 
+ * @param events - Event history (currently unused, for future historical replay)
+ * @param thinkingAgentIds - Set of agent IDs currently thinking/processing
+ * @param sessionId - Current session ID (null when on home page)
+ * @returns Session timer state with elapsed times and active status
  */
 export function useSessionTimer(
-  events: EventItem[],
+  _events: EventItem[],
   thinkingAgentIds: Set<string>,
-  isConversationComplete: boolean
+  sessionId: string | null
 ): SessionTimerResult {
-  const [currentTime, setCurrentTime] = useState(Date.now());
+  const { saveSessionTimer, getSessionTimer } = useUiStore();
   
-  // Determine if session should be considered active
-  // This is computed early so we can use it to conditionally run the timer
-  const shouldTimerRun = thinkingAgentIds.size > 0 && !isConversationComplete;
+  // Track previous session ID for save/restore
+  const prevSessionIdRef = useRef<string | null>(null);
   
-  // Update current time every second ONLY when session is active
-  // This is the key optimization - no interval when idle
+  // Global stopwatch using react-timer-hook
+  // We'll use reset() with offset to restore saved time
+  const { totalSeconds, start, pause, reset, isRunning } = useStopwatch({ autoStart: false });
+  
+  // Store latest totalSeconds in ref for save operations
+  const totalSecondsRef = useRef(totalSeconds);
+  totalSecondsRef.current = totalSeconds;
+  
+  // Per-agent stopwatches stored in ref (persists across renders)
+  const agentStopwatches = useRef(new Map<string, AgentStopwatch>());
+  
+  // Tick state to force re-render every second while active
+  // This ensures agentElapsedMs Map reflects current elapsed time
+  const [, setTick] = useState(0);
+  
+  // Track restored time to handle reset() async behavior
+  // useStopwatch doesn't update totalSeconds immediately after reset()
+  const [restoredTimeMs, setRestoredTimeMs] = useState<number | null>(null);
+  
+  // Determine if session is active (any agents thinking)
+  const isSessionActive = thinkingAgentIds.size > 0;
+  
+  // Session switching: save previous session state and restore new session state
   useEffect(() => {
-    if (!shouldTimerRun) {
-      return; // Don't start interval if session is not active
+    const prevSessionId = prevSessionIdRef.current;
+    
+    // Only process when sessionId actually changes
+    if (prevSessionId === sessionId) return;
+    
+    // Save timer state when leaving a session
+    if (prevSessionId) {
+      const globalAccumulatedMs = totalSecondsRef.current * 1000;
+      const agentAccumulatedMs: Record<string, number> = {};
+      
+      for (const [agentId, stopwatch] of agentStopwatches.current) {
+        agentAccumulatedMs[agentId] = stopwatch.getAccumulated();
+      }
+      
+      saveSessionTimer(prevSessionId, {
+        globalAccumulatedMs,
+        agentAccumulatedMs,
+      });
+      
+      console.log(`[useSessionTimer] Saved timer state for session ${prevSessionId}:`, {
+        globalAccumulatedMs,
+        agentCount: Object.keys(agentAccumulatedMs).length,
+      });
     }
     
-    // Immediately refresh current time so the timer doesn't jump
-    setCurrentTime(Date.now());
+    // Restore or reset timer state when entering a session
+    if (sessionId) {
+      const savedState = getSessionTimer(sessionId);
+      
+      if (savedState) {
+        // Restore from saved state
+        const offsetTimestamp = new Date();
+        offsetTimestamp.setSeconds(offsetTimestamp.getSeconds() + savedState.globalAccumulatedMs / 1000);
+        reset(offsetTimestamp, false); // Set offset, don't auto-start
+        setRestoredTimeMs(savedState.globalAccumulatedMs);
+        
+        // Restore agent stopwatches
+        const newAgentStopwatches = new Map<string, AgentStopwatch>();
+        for (const [agentId, accumulated] of Object.entries(savedState.agentAccumulatedMs)) {
+          const stopwatch = new AgentStopwatch();
+          stopwatch.setAccumulated(accumulated as number);
+          newAgentStopwatches.set(agentId, stopwatch);
+        }
+        agentStopwatches.current = newAgentStopwatches;
+        
+        console.log(`[useSessionTimer] Restored timer state for session ${sessionId}:`, {
+          globalAccumulatedMs: savedState.globalAccumulatedMs,
+          agentCount: Object.keys(savedState.agentAccumulatedMs).length,
+        });
+      } else {
+        // Fresh session - reset to 0
+        reset(undefined, false);
+        setRestoredTimeMs(0);
+        agentStopwatches.current.clear();
+        
+        console.log(`[useSessionTimer] Fresh timer for session ${sessionId}`);
+      }
+    } else {
+      // Navigated to home page - reset timer
+      reset(undefined, false);
+      setRestoredTimeMs(0);
+      agentStopwatches.current.clear();
+      
+      console.log(`[useSessionTimer] Reset timer (navigated to home)`);
+    }
+    
+    prevSessionIdRef.current = sessionId;
+  }, [sessionId, reset, saveSessionTimer, getSessionTimer]);
+  
+  // Control global stopwatch based on session active state
+  useEffect(() => {
+    if (isSessionActive && !isRunning) {
+      // Session became active - start or resume global timer
+      start();
+    } else if (!isSessionActive && isRunning) {
+      // Session became inactive - pause global timer
+      pause();
+    }
+  }, [isSessionActive, isRunning, start, pause]);
+  
+  // Control per-agent stopwatches based on thinkingAgentIds membership
+  useEffect(() => {
+    // Start stopwatches for agents that are thinking
+    for (const agentId of thinkingAgentIds) {
+      if (!agentStopwatches.current.has(agentId)) {
+        // First time seeing this agent - create stopwatch
+        agentStopwatches.current.set(agentId, new AgentStopwatch());
+      }
+      const stopwatch = agentStopwatches.current.get(agentId)!;
+      if (!stopwatch.isRunning()) {
+        stopwatch.start();
+      }
+    }
+    
+    // Pause stopwatches for agents that stopped thinking
+    for (const [agentId, stopwatch] of agentStopwatches.current) {
+      if (!thinkingAgentIds.has(agentId) && stopwatch.isRunning()) {
+        stopwatch.pause();
+      }
+    }
+  }, [thinkingAgentIds]);
+  
+  // Update tick every second while session is active
+  // This triggers re-render to update displayed elapsed times
+  useEffect(() => {
+    if (!isSessionActive) return;
     
     const interval = setInterval(() => {
-      setCurrentTime(Date.now());
+      setTick(t => t + 1);
     }, 1000);
     
     return () => clearInterval(interval);
-  }, [shouldTimerRun]);
+  }, [isSessionActive]);
   
-  // Calculate timing state from events
-  const { agentStates, globalState } = useMemo(() => {
-    const agentStates = new Map<string, AgentWorkingState>();
-    const globalState: GlobalTimerState = {
-      hasStarted: false,
-      accumulatedMs: 0,
-    };
-    let lastEventTimestamp = 0;
-    
-    // Process events to reconstruct timing state
-    for (const event of events) {
-      const timestamp = event.timestamp;
-      lastEventTimestamp = Math.max(lastEventTimestamp, timestamp);
-      
-      // Handle system error events - stop all agents
-      if (event.type === 'system') {
-        const content = event.content?.toLowerCase() || '';
-        if (content.includes('error') || content.includes('failed')) {
-          // System error - stop all working agents
-          for (const state of agentStates.values()) {
-            if (state.isWorking && state.workStartedAt !== undefined) {
-              const elapsed = timestamp - state.workStartedAt;
-              state.accumulatedMs += elapsed;
-              state.isWorking = false;
-              state.workStartedAt = undefined;
-            }
-          }
-        }
-        continue;
-      }
-      
-      const agentId = event.agentId || 'unknown';
-      
-      if (!agentStates.has(agentId)) {
-        agentStates.set(agentId, {
-          isWorking: false,
-          accumulatedMs: 0,
-          activeDelegationIds: new Set(),
-        });
-      }
-      
-      const state = agentStates.get(agentId)!;
-      
-      // Detect event types
-      const eventContent = event.content?.toLowerCase() || '';
-      const isPromptReceived = event.type === 'user';
-      const isLlmRequestEnd = eventContent.includes('llm_request_end');
-      const isDelegationRequested = eventContent.includes('delegation_requested');
-      const isDelegationCompleted = eventContent.includes('delegation_completed');
-      const isErrorEvent = eventContent.includes('error') || eventContent.includes('failed');
-      const finishReason = event.finishReason?.toLowerCase();
-      
-      // GLOBAL TIMER: Start from first prompt_received
-      if (isPromptReceived) {
-        if (!globalState.hasStarted) {
-          globalState.hasStarted = true;
-          globalState.lastActiveAt = timestamp;
-        } else if (globalState.lastActiveAt === undefined) {
-          // Resume after pause - re-anchor the live timer
-          globalState.lastActiveAt = timestamp;
-        }
-      }
-      
-      // PER-AGENT: Start working when prompt received
-      if (isPromptReceived) {
-        if (!state.isWorking && state.activeDelegationIds.size === 0) {
-          state.isWorking = true;
-          state.workStartedAt = timestamp;
-        }
-      }
-      
-      // PER-AGENT: Pause when delegation requested
-      if (isDelegationRequested && event.delegationId) {
-        state.activeDelegationIds.add(event.delegationId);
-        if (state.isWorking && state.workStartedAt !== undefined) {
-          // Accumulate time up to this point and pause
-          const elapsed = timestamp - state.workStartedAt;
-          state.accumulatedMs += elapsed;
-          state.isWorking = false;
-          state.workStartedAt = undefined;
-        }
-      }
-      
-      // PER-AGENT: Resume when delegation completed
-      if (isDelegationCompleted && event.delegationId) {
-        state.activeDelegationIds.delete(event.delegationId);
-        // If no more active delegations and not already working, resume
-        if (state.activeDelegationIds.size === 0 && !state.isWorking) {
-          state.isWorking = true;
-          state.workStartedAt = timestamp;
-        }
-      }
-      
-      // PER-AGENT: Only pause on llm_request_end with finish_reason 'stop'
-      if (isLlmRequestEnd && state.isWorking && state.activeDelegationIds.size === 0) {
-        if (finishReason === 'stop') {
-          // Conversation turn complete, waiting for user - pause
-          if (state.workStartedAt !== undefined) {
-            const elapsed = timestamp - state.workStartedAt;
-            state.accumulatedMs += elapsed;
-          }
-          state.isWorking = false;
-          state.workStartedAt = undefined;
-        }
-        // If finishReason === 'tool_calls' or 'toolcalls', keep timer running
-        // The agent will execute tools next
-      }
-      
-      // PER-AGENT: Stop on error events - the agent has stopped processing
-      if (isErrorEvent && state.isWorking) {
-        if (state.workStartedAt !== undefined) {
-          const elapsed = timestamp - state.workStartedAt;
-          state.accumulatedMs += elapsed;
-        }
-        state.isWorking = false;
-        state.workStartedAt = undefined;
-      }
-    }
-    
-    // GLOBAL TIMER: Pause when all agents stopped working
-    const anyAgentWorking = Array.from(agentStates.values()).some(s => s.isWorking);
-    if (!anyAgentWorking && globalState.lastActiveAt !== undefined) {
-      // All agents have stopped - accumulate time and pause
-      const elapsed = lastEventTimestamp - globalState.lastActiveAt;
-      globalState.accumulatedMs += elapsed;
-      globalState.lastActiveAt = undefined;
-    }
-    
-    return { agentStates, globalState };
-  }, [events]);
-  
-  // Calculate live elapsed times
-  // GLOBAL TIMER: Add live delta only if session is active
-  // Use thinkingAgentIds as the sole source of truth for active state
-  // This ensures loaded historical sessions are never shown as active
-  const isSessionActive = thinkingAgentIds.size > 0 && !isConversationComplete;
-  
-  let globalElapsedMs = globalState.accumulatedMs;
-  if (globalState.lastActiveAt !== undefined && isSessionActive) {
-    globalElapsedMs += (currentTime - globalState.lastActiveAt);
-  }
-  
-  // PER-AGENT TIMERS: Add live delta for agents currently working
+  // Build agentElapsedMs map from current stopwatch states
   const agentElapsedMs = new Map<string, number>();
-  for (const [agentId, state] of agentStates.entries()) {
-    let elapsed = state.accumulatedMs;
-    // If agent is currently working, add live delta
-    if (state.isWorking && state.workStartedAt !== undefined) {
-      elapsed += (currentTime - state.workStartedAt);
-    }
-    agentElapsedMs.set(agentId, elapsed);
+  for (const [agentId, stopwatch] of agentStopwatches.current) {
+    agentElapsedMs.set(agentId, stopwatch.getElapsedMs());
   }
+  
+  // Convert totalSeconds to milliseconds for global elapsed time
+  // Use restoredTimeMs if available (handles reset() async behavior)
+  // Clear restoredTimeMs once totalSeconds catches up
+  const currentTimeMs = totalSeconds * 1000;
+  const globalElapsedMs = restoredTimeMs !== null && Math.abs(currentTimeMs - restoredTimeMs) > 100
+    ? restoredTimeMs
+    : currentTimeMs;
+  
+  // Clear restoredTimeMs once useStopwatch has caught up
+  useEffect(() => {
+    if (restoredTimeMs !== null && Math.abs(currentTimeMs - restoredTimeMs) <= 100) {
+      setRestoredTimeMs(null);
+    }
+  }, [currentTimeMs, restoredTimeMs]);
   
   return {
     globalElapsedMs,

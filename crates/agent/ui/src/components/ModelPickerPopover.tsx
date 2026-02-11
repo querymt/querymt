@@ -35,6 +35,10 @@ const TARGET_ALL = 'all';
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
+const RECENT_PREFIX = 'recent:';
+const normalizeValue = (value: string) => 
+  value.startsWith(RECENT_PREFIX) ? value.slice(RECENT_PREFIX.length) : value;
+
 interface GroupedModels {
   provider: string;
   models: string[];
@@ -83,7 +87,7 @@ export function ModelPickerPopover({
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedValue, setSelectedValue] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
-  const { setModeModelPreference } = useUiStore();
+  const { setModeModelPreference, focusMainInput } = useUiStore();
 
   const targetAgents = useMemo(
     () => agents.filter((agent) => sessionsByAgent[agent.id]),
@@ -121,7 +125,7 @@ export function ModelPickerPopover({
         ? Boolean(sessionId)
         : Boolean(sessionsByAgent[target]);
 
-  const selectedEntry = modelMap.get(selectedValue);
+  const selectedEntry = modelMap.get(normalizeValue(selectedValue));
   const canSwitch = connected && selectedEntry !== undefined && hasTargetSession;
 
   /* ---- actions ---- */
@@ -134,7 +138,7 @@ export function ModelPickerPopover({
 
   const switchModel = useCallback(
     (value: string) => {
-      const entry = modelMap.get(value);
+      const entry = modelMap.get(normalizeValue(value));
       if (!entry) return;
 
       const modelId = `${entry.provider}/${entry.model}`;
@@ -157,6 +161,8 @@ export function ModelPickerPopover({
       // Backend will automatically record model usage and refresh recent models
       
       onOpenChange(false);
+      
+      // Focus is handled by onCloseAutoFocus in Popover.Content
     },
     [modelMap, target, sessionsByAgent, sessionId, onSetSessionModel, onOpenChange, agentMode, setModeModelPreference],
   );
@@ -198,6 +204,10 @@ export function ModelPickerPopover({
           onOpenAutoFocus={(e) => {
             e.preventDefault();
             inputRef.current?.focus();
+          }}
+          onCloseAutoFocus={(e) => {
+            e.preventDefault();
+            focusMainInput();
           }}
         >
           {/* Header */}
@@ -249,8 +259,9 @@ export function ModelPickerPopover({
             onValueChange={setSelectedValue}
             className="flex flex-col flex-1 min-h-0"
             filter={(value, search) => {
-              // value is "provider/model", search is the user query
-              if (value.toLowerCase().includes(search.toLowerCase())) return 1;
+              // value is "provider/model" or "recent:provider/model", search is the user query
+              const normalized = normalizeValue(value);
+              if (normalized.toLowerCase().includes(search.toLowerCase())) return 1;
               return 0;
             }}
           >
@@ -292,7 +303,7 @@ export function ModelPickerPopover({
                         return (
                           <Command.Item
                             key={`recent-${itemValue}`}
-                            value={itemValue}
+                            value={`${RECENT_PREFIX}${itemValue}`}
                             keywords={[entry.provider, entry.model]}
                             onSelect={(val) => switchModel(val)}
                             className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-gray-300 data-[selected=true]:bg-cyber-cyan/20 data-[selected=true]:text-cyber-cyan data-[selected=true]:border data-[selected=true]:border-cyber-cyan/40 hover:bg-cyber-surface/60 cursor-pointer"

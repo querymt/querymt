@@ -112,6 +112,10 @@ pub struct QueryMTAgent {
     pub(crate) agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     pub(crate) delegation_context_config: DelegationContextConfig,
     pub(crate) workspace_index_manager: Arc<WorkspaceIndexManager>,
+    /// Maximum time to wait for session execution permit (seconds).
+    /// If a session is busy and doesn't become available within this time,
+    /// the prompt will fail with a timeout error. Default: 300 (5 minutes)
+    pub(crate) execution_timeout_secs: u64,
 
     // Compaction system (3-layer)
     /// Tool output truncation configuration (Layer 1)
@@ -180,6 +184,16 @@ pub struct SessionRuntime {
     pub turn_snapshot: StdMutex<Option<(String, String)>>,
     /// Accumulated changed file paths across the entire turn (for end-of-turn dedup check)
     pub turn_diffs: StdMutex<crate::index::DiffPaths>,
+    /// Execution permit ensuring only one prompt runs at a time for this session.
+    /// Uses a semaphore with capacity 1 to guarantee FIFO ordering of concurrent prompts.
+    /// This prevents race conditions where user messages are inserted between
+    /// tool_use and tool_result blocks, which violates LLM API requirements.
+    ///
+    /// When a prompt is cancelled via `cancel_session()`, the execution permit is held
+    /// until the cancelled operation fully cleans up (removes from active_sessions,
+    /// emits final events, etc.). This ensures the next queued prompt doesn't race
+    /// with cancellation cleanup.
+    pub execution_permit: Arc<tokio::sync::Semaphore>,
 }
 
 /// Policy for tool usage and availability.
@@ -229,33 +243,8 @@ impl QueryMTAgent {
             Arc::new(SessionProvider::new(plugin_registry, store, initial_config));
         let mut tool_registry = ToolRegistry::new();
 
-        // Register built-in tools
-        // File operations
-        tool_registry.add(Arc::new(crate::tools::builtins::ReadFileTool::new()));
-        tool_registry.add(Arc::new(crate::tools::builtins::WriteFileTool::new()));
-        tool_registry.add(Arc::new(crate::tools::builtins::DeleteFileTool::new()));
-        tool_registry.add(Arc::new(crate::tools::builtins::EditTool::new()));
-        tool_registry.add(Arc::new(crate::tools::builtins::MultiEditTool::new()));
-        tool_registry.add(Arc::new(crate::tools::builtins::ApplyPatchTool::new()));
-
-        // Search and navigation
-        tool_registry.add(Arc::new(crate::tools::builtins::SearchTextTool::new()));
-        tool_registry.add(Arc::new(crate::tools::builtins::GlobTool::new()));
-        tool_registry.add(Arc::new(crate::tools::builtins::ListTool::new()));
-        tool_registry.add(Arc::new(crate::tools::builtins::MdqTool::new()));
-
-        // Execution and external
-        tool_registry.add(Arc::new(crate::tools::builtins::ShellTool::new()));
-        tool_registry.add(Arc::new(crate::tools::builtins::WebFetchTool::new()));
-
-        // Task management
-        tool_registry.add(Arc::new(crate::tools::builtins::CreateTaskTool::new()));
-        tool_registry.add(Arc::new(crate::tools::builtins::DelegateTool::new()));
-        tool_registry.add(Arc::new(crate::tools::builtins::TodoWriteTool::new()));
-        tool_registry.add(Arc::new(crate::tools::builtins::TodoReadTool::new()));
-
-        // User interaction
-        tool_registry.add(Arc::new(crate::tools::builtins::QuestionTool::new()));
+        // Register all built-in tools from the canonical source
+        tool_registry.extend(crate::tools::builtins::all_builtin_tools());
 
         Self {
             provider: session_provider,
@@ -283,6 +272,7 @@ impl QueryMTAgent {
             workspace_index_manager: Arc::new(WorkspaceIndexManager::new(
                 WorkspaceIndexManagerConfig::default(),
             )),
+            execution_timeout_secs: 300, // 5 minutes default
             // Compaction system (3-layer) - all defaults
             tool_output_config: ToolOutputConfig::default(),
             pruning_config: PruningConfig::default(),
@@ -626,5 +616,57 @@ impl QueryMTAgent {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         log::info!("QueryMTAgent: Shutdown complete");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_all_builtin_tools_registered() {
+        // Verify that all tools from all_builtin_tools() are registered
+        let all_tools = crate::tools::builtins::all_builtin_tools();
+
+        // Create a minimal agent to test tool registration
+        use crate::session::backend::StorageBackend;
+        use crate::session::sqlite_storage::SqliteStorage;
+        use crate::test_utils::empty_plugin_registry;
+
+        let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let llm_config = querymt::LLMParams::new()
+            .provider("test")
+            .model("test-model");
+
+        let agent = QueryMTAgent::new(
+            Arc::new(plugin_registry),
+            storage.session_store(),
+            llm_config,
+        );
+        let registry = agent.tool_registry.lock().unwrap();
+
+        // Check that all tools are present
+        let registered_names = registry.names();
+        for tool in &all_tools {
+            assert!(
+                registered_names.contains(&tool.name().to_string()),
+                "Tool '{}' from all_builtin_tools() should be registered",
+                tool.name()
+            );
+        }
+
+        // Specifically verify semantic_edit is registered
+        assert!(
+            registry.find("semantic_edit").is_some(),
+            "semantic_edit tool should be registered"
+        );
+
+        // Verify count matches
+        assert_eq!(
+            registered_names.len(),
+            all_tools.len(),
+            "Number of registered tools should match all_builtin_tools()"
+        );
     }
 }

@@ -105,10 +105,9 @@ pub async fn handle_ui_message(
             let tx = tx.clone();
             tokio::spawn(async move {
                 let cwd = resolve_cwd(None);
-                if let Err(err) = prompt_for_mode(&state, &conn_id, &text, cwd.as_ref(), &tx).await
-                {
-                    let _ = send_error(&tx, err).await;
-                }
+                // Agent errors are already emitted via AgentEventKind::Error and sent through
+                // the event stream, so we don't need to call send_error() here to avoid duplicates.
+                let _ = prompt_for_mode(&state, &conn_id, &text, cwd.as_ref(), &tx).await;
                 // Refresh session list after prompt completes so titles are up to date
                 handle_list_sessions(&state, &tx).await;
             });

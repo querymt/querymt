@@ -3,6 +3,7 @@ import { Command } from 'cmdk';
 import Fuse from 'fuse.js';
 import { Plus, GitBranch, Clock } from 'lucide-react';
 import { SessionGroup, SessionSummary } from '../types';
+import { useUiStore } from '../store/uiStore';
 
 /**
  * SessionSwitcher - Cmd+K modal for quickly switching sessions
@@ -40,6 +41,7 @@ export function SessionSwitcher({
 }: SessionSwitcherProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [search, setSearch] = useState('');
+  const { focusMainInput } = useUiStore();
   
   // Flatten all sessions from all groups into a single searchable list
   const flatSessions = useMemo(() => {
@@ -126,12 +128,16 @@ export function SessionSwitcher({
       onSelectSession(sessionId);
     }
     onOpenChange(false);
+    // Return focus to the main input after closing
+    focusMainInput();
   };
   
   // Handle new session
   const handleNewSession = async () => {
     onOpenChange(false);
     await onNewSession();
+    // Return focus to the main input after creating new session
+    focusMainInput();
   };
   
   if (!open) return null;

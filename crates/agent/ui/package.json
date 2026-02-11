@@ -26,6 +26,7 @@
     "react-markdown": "^10.1.0",
     "react-mentions": "^4.4.10",
     "react-router-dom": "^7.13.0",
+    "react-timer-hook": "^4.0.5",
     "react-virtuoso": "^4.6.2",
     "remark-gfm": "^4.0.1",
     "shiki": "^1.29.2",

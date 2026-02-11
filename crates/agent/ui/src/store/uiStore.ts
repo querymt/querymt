@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import type { RefObject } from 'react';
 import { EventRow, RateLimitState } from '../types';
 
 /**
@@ -16,7 +17,17 @@ interface SessionViewState {
   isAtBottom: boolean;
 }
 
-interface UiState {
+interface SessionTimerState {
+  globalAccumulatedMs: number;
+  agentAccumulatedMs: Record<string, number>;
+}
+
+export interface UiState {
+  // Focus management
+  mainInputRef: RefObject<HTMLTextAreaElement> | null;
+  setMainInputRef: (ref: RefObject<HTMLTextAreaElement> | null) => void;
+  focusMainInput: () => void;
+  
   // UI visibility toggles
   todoRailCollapsed: boolean;
   setTodoRailCollapsed: (collapsed: boolean) => void;
@@ -82,6 +93,12 @@ interface UiState {
   updateRemainingTime: (sessionId: string) => void;
   clearRateLimitState: (sessionId: string) => void;
   
+  // Per-session timer state cache
+  sessionTimerCache: Map<string, SessionTimerState>;
+  saveSessionTimer: (sessionId: string, state: SessionTimerState) => void;
+  getSessionTimer: (sessionId: string) => SessionTimerState | undefined;
+  clearSessionTimer: (sessionId: string) => void;
+  
   // Utility actions
   resetChatView: () => void; // Reset view state when switching sessions
   
@@ -89,8 +106,9 @@ interface UiState {
   loadPersistedState: () => void;
 }
 
-export const useUiStore = create<UiState>((set) => ({
+export const useUiStore = create<UiState>((set, get) => ({
   // Initial state
+  mainInputRef: null,
   todoRailCollapsed: false,
   delegationsPanelCollapsed: false,
   sessionCopied: false,
@@ -108,8 +126,19 @@ export const useUiStore = create<UiState>((set) => ({
   sessionViewCache: new Map(),
   modeModelPreferences: {},
   rateLimitBySession: new Map(),
+  sessionTimerCache: new Map(),
   
   // Actions
+  setMainInputRef: (ref) => set({ mainInputRef: ref }),
+  
+  focusMainInput: () => {
+    const { mainInputRef } = get();
+    // Small delay ensures focus happens after modal close animations complete
+    setTimeout(() => {
+      mainInputRef?.current?.focus();
+    }, 0);
+  },
+  
   setTodoRailCollapsed: (collapsed) => {
     set({ todoRailCollapsed: collapsed });
     // Persist to localStorage
@@ -220,6 +249,23 @@ export const useUiStore = create<UiState>((set) => ({
     const updated = new Map(prev.rateLimitBySession);
     updated.delete(sessionId);
     return { rateLimitBySession: updated };
+  }),
+  
+  // Timer state actions
+  saveSessionTimer: (sessionId, state) => set((prev) => {
+    const updated = new Map(prev.sessionTimerCache);
+    updated.set(sessionId, state);
+    return { sessionTimerCache: updated };
+  }),
+  
+  getSessionTimer: (sessionId: string): SessionTimerState | undefined => {
+    return useUiStore.getState().sessionTimerCache.get(sessionId);
+  },
+  
+  clearSessionTimer: (sessionId) => set((prev) => {
+    const updated = new Map(prev.sessionTimerCache);
+    updated.delete(sessionId);
+    return { sessionTimerCache: updated };
   }),
   
   // Load persisted state from localStorage

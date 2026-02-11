@@ -1,434 +1,614 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { renderHook } from '@testing-library/react';
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { renderHook, act } from '@testing-library/react';
 import { useSessionTimer } from './useSessionTimer';
 import { EventItem } from '../types';
-import { resetFixtureCounter, makeUserEvent, makeAgentEvent, makeSystemEvent } from '../test/fixtures';
+import { resetFixtureCounter } from '../test/fixtures';
+import { useUiStore } from '../store/uiStore';
 
 describe('useSessionTimer', () => {
   beforeEach(() => {
     resetFixtureCounter();
+    vi.useFakeTimers();
+    // Clear the session timer cache before each test
+    useUiStore.getState().sessionTimerCache.clear();
   });
 
-  it('returns zero elapsed time with empty events', () => {
-    const { result } = renderHook(() => 
-      useSessionTimer([], new Set(), true)
-    );
-    
-    expect(result.current.globalElapsedMs).toBe(0);
-    expect(result.current.agentElapsedMs.size).toBe(0);
-    expect(result.current.isSessionActive).toBe(false);
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
-  it('returns isSessionActive=true when agents are thinking and conversation not complete', () => {
-    const { result } = renderHook(() => 
-      useSessionTimer([], new Set(['agent-1']), false)
-    );
-    
-    expect(result.current.isSessionActive).toBe(true);
+  describe('initial state', () => {
+    it('returns zero elapsed time with no thinking agents', () => {
+      const { result } = renderHook(() => 
+        useSessionTimer([], new Set(), 'session-1')
+      );
+      
+      expect(result.current.globalElapsedMs).toBe(0);
+      expect(result.current.agentElapsedMs.size).toBe(0);
+      expect(result.current.isSessionActive).toBe(false);
+    });
+
+    it('returns isSessionActive=true when agents are thinking', () => {
+      const { result } = renderHook(() => 
+        useSessionTimer([], new Set(['agent-1']), 'session-1')
+      );
+      
+      expect(result.current.isSessionActive).toBe(true);
+    });
+
+    it('returns isSessionActive=false when no thinking agents', () => {
+      const { result } = renderHook(() => 
+        useSessionTimer([], new Set(), 'session-1')
+      );
+      
+      expect(result.current.isSessionActive).toBe(false);
+    });
+
+    it('handles null sessionId (home page)', () => {
+      const { result } = renderHook(() => 
+        useSessionTimer([], new Set(), null)
+      );
+      
+      expect(result.current.globalElapsedMs).toBe(0);
+      expect(result.current.agentElapsedMs.size).toBe(0);
+      expect(result.current.isSessionActive).toBe(false);
+    });
   });
 
-  it('returns isSessionActive=false when conversation is complete', () => {
-    const { result } = renderHook(() => 
-      useSessionTimer([], new Set(['agent-1']), true)
-    );
-    
-    expect(result.current.isSessionActive).toBe(false);
+  describe('global timer', () => {
+    it('starts global timer when agent begins thinking', async () => {
+      const { result, rerender } = renderHook(
+        ({ thinking }) => useSessionTimer([], thinking, 'session-1'),
+        { initialProps: { thinking: new Set<string>() } }
+      );
+
+      expect(result.current.globalElapsedMs).toBe(0);
+
+      // Agent starts thinking
+      act(() => {
+        rerender({ thinking: new Set(['agent-1']) });
+      });
+
+      // Advance time by 3 seconds
+      await act(async () => {
+        vi.advanceTimersByTime(3000);
+      });
+
+      // Global timer should have advanced (approximately 3000ms)
+      // Note: react-timer-hook uses seconds, so we check >= 2000ms to account for timing
+      expect(result.current.globalElapsedMs).toBeGreaterThanOrEqual(2000);
+      expect(result.current.globalElapsedMs).toBeLessThanOrEqual(4000);
+    });
+
+    it('pauses global timer when all agents stop thinking', async () => {
+      const { result, rerender } = renderHook(
+        ({ thinking }) => useSessionTimer([], thinking, 'session-1'),
+        { initialProps: { thinking: new Set(['agent-1']) } }
+      );
+
+      // Advance time while active
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      const elapsedWhileActive = result.current.globalElapsedMs;
+      expect(elapsedWhileActive).toBeGreaterThan(0);
+
+      // Stop all agents
+      act(() => {
+        rerender({ thinking: new Set() });
+      });
+
+      // Advance more time while inactive
+      await act(async () => {
+        vi.advanceTimersByTime(3000);
+      });
+
+      // Timer should not have advanced significantly
+      expect(result.current.globalElapsedMs).toBe(elapsedWhileActive);
+    });
+
+    it('resumes global timer when agents start thinking again', async () => {
+      const { result, rerender } = renderHook(
+        ({ thinking }) => useSessionTimer([], thinking, 'session-1'),
+        { initialProps: { thinking: new Set(['agent-1']) } }
+      );
+
+      // First active period
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      const firstElapsed = result.current.globalElapsedMs;
+
+      // Pause
+      act(() => {
+        rerender({ thinking: new Set() });
+      });
+
+      // Wait while paused
+      await act(async () => {
+        vi.advanceTimersByTime(5000);
+      });
+
+      // Resume
+      act(() => {
+        rerender({ thinking: new Set(['agent-1']) });
+      });
+
+      // Advance time during second active period
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      // Timer should have accumulated both active periods
+      expect(result.current.globalElapsedMs).toBeGreaterThan(firstElapsed);
+    });
+
+    it('continues global timer when different agents are thinking', async () => {
+      const { result, rerender } = renderHook(
+        ({ thinking }) => useSessionTimer([], thinking, 'session-1'),
+        { initialProps: { thinking: new Set(['agent-1']) } }
+      );
+
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      // Switch to different agent (global timer should keep running)
+      act(() => {
+        rerender({ thinking: new Set(['agent-2']) });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      // Global timer should show accumulated time from both periods
+      expect(result.current.globalElapsedMs).toBeGreaterThanOrEqual(2000);
+    });
   });
 
-  it('returns isSessionActive=false when no thinking agents', () => {
-    const { result } = renderHook(() => 
-      useSessionTimer([], new Set(), false)
-    );
-    
-    expect(result.current.isSessionActive).toBe(false);
+  describe('per-agent timers', () => {
+    it('tracks elapsed time for a single agent', async () => {
+      const { result } = renderHook(() => 
+        useSessionTimer([], new Set(['agent-1']), 'session-1')
+      );
+
+      await act(async () => {
+        vi.advanceTimersByTime(3000);
+      });
+
+      const agentTime = result.current.agentElapsedMs.get('agent-1');
+      expect(agentTime).toBeGreaterThanOrEqual(2000);
+      expect(agentTime).toBeLessThanOrEqual(4000);
+    });
+
+    it('tracks multiple agents independently', async () => {
+      const { result, rerender } = renderHook(
+        ({ thinking }) => useSessionTimer([], thinking, 'session-1'),
+        { initialProps: { thinking: new Set(['agent-1']) } }
+      );
+
+      // Agent 1 runs for 2 seconds
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      // Add agent 2 (agent 1 continues)
+      act(() => {
+        rerender({ thinking: new Set(['agent-1', 'agent-2']) });
+      });
+
+      // Both run for 1 second
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      const agent1Time = result.current.agentElapsedMs.get('agent-1');
+      const agent2Time = result.current.agentElapsedMs.get('agent-2');
+
+      // Agent 1 should have ~3 seconds total
+      expect(agent1Time).toBeGreaterThanOrEqual(2000);
+      expect(agent1Time).toBeLessThanOrEqual(4000);
+
+      // Agent 2 should have ~1 second
+      expect(agent2Time).toBeGreaterThanOrEqual(500);
+      expect(agent2Time).toBeLessThanOrEqual(2000);
+    });
+
+    it('pauses agent timer when agent stops thinking', async () => {
+      const { result, rerender } = renderHook(
+        ({ thinking }) => useSessionTimer([], thinking, 'session-1'),
+        { initialProps: { thinking: new Set(['agent-1']) } }
+      );
+
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      const timeBeforePause = result.current.agentElapsedMs.get('agent-1')!;
+      expect(timeBeforePause).toBeGreaterThan(0);
+
+      // Stop agent
+      act(() => {
+        rerender({ thinking: new Set() });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(3000);
+      });
+
+      // Agent time should not have changed
+      const timeAfterPause = result.current.agentElapsedMs.get('agent-1')!;
+      expect(timeAfterPause).toBe(timeBeforePause);
+    });
+
+    it('resumes agent timer when agent starts thinking again', async () => {
+      const { result, rerender } = renderHook(
+        ({ thinking }) => useSessionTimer([], thinking, 'session-1'),
+        { initialProps: { thinking: new Set(['agent-1']) } }
+      );
+
+      // First period
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      const firstPeriod = result.current.agentElapsedMs.get('agent-1')!;
+
+      // Pause
+      act(() => {
+        rerender({ thinking: new Set() });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(5000);
+      });
+
+      // Resume
+      act(() => {
+        rerender({ thinking: new Set(['agent-1']) });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      // Should have accumulated both periods
+      const totalTime = result.current.agentElapsedMs.get('agent-1')!;
+      expect(totalTime).toBeGreaterThan(firstPeriod);
+    });
+
+    it('handles agents starting at different times', async () => {
+      const { result, rerender } = renderHook(
+        ({ thinking }) => useSessionTimer([], thinking, 'session-1'),
+        { initialProps: { thinking: new Set<string>() } }
+      );
+
+      // Start agent 1
+      act(() => {
+        rerender({ thinking: new Set(['agent-1']) });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      // Start agent 2 (agent 1 continues)
+      act(() => {
+        rerender({ thinking: new Set(['agent-1', 'agent-2']) });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      const agent1Time = result.current.agentElapsedMs.get('agent-1')!;
+      const agent2Time = result.current.agentElapsedMs.get('agent-2')!;
+
+      // Agent 1 should have more time than agent 2
+      expect(agent1Time).toBeGreaterThan(agent2Time);
+    });
   });
 
-  it('calculates global elapsed time from first user event to stop', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000 }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 5000, 
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    expect(result.current.globalElapsedMs).toBe(4000);
+  describe('edge cases', () => {
+    it('handles empty thinkingAgentIds set', () => {
+      const { result } = renderHook(() => 
+        useSessionTimer([], new Set(), 'session-1')
+      );
+      
+      expect(result.current.globalElapsedMs).toBe(0);
+      expect(result.current.agentElapsedMs.size).toBe(0);
+      expect(result.current.isSessionActive).toBe(false);
+    });
+
+    it('handles rapid agent changes', async () => {
+      const { result, rerender } = renderHook(
+        ({ thinking }) => useSessionTimer([], thinking, 'session-1'),
+        { initialProps: { thinking: new Set(['agent-1']) } }
+      );
+
+      // Rapid changes
+      act(() => {
+        rerender({ thinking: new Set(['agent-2']) });
+      });
+
+      act(() => {
+        rerender({ thinking: new Set(['agent-1', 'agent-2']) });
+      });
+
+      act(() => {
+        rerender({ thinking: new Set(['agent-1']) });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      // Should not crash and should have some elapsed time
+      expect(result.current.globalElapsedMs).toBeGreaterThanOrEqual(0);
+      expect(result.current.agentElapsedMs.get('agent-1')).toBeGreaterThanOrEqual(0);
+    });
+
+    it('maintains timer state across re-renders with same thinkingAgentIds', async () => {
+      const agentSet = new Set(['agent-1']);
+      const { result, rerender } = renderHook(
+        ({ thinking }) => useSessionTimer([], thinking, 'session-1'),
+        { initialProps: { thinking: agentSet } }
+      );
+
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      const timeBefore = result.current.globalElapsedMs;
+
+      // Re-render with same set
+      rerender({ thinking: agentSet });
+
+      // Time should not have reset
+      expect(result.current.globalElapsedMs).toBeGreaterThanOrEqual(timeBefore);
+    });
+
+    it('ignores events parameter (backward compatibility)', async () => {
+      const events: EventItem[] = [
+        { id: '1', timestamp: 1000, type: 'user', content: 'test', agentId: 'agent-1' } as EventItem,
+      ];
+
+      const { result } = renderHook(() => 
+        useSessionTimer(events, new Set(['agent-1']), 'session-1')
+      );
+
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      // Should work normally, ignoring events
+      expect(result.current.globalElapsedMs).toBeGreaterThanOrEqual(0);
+      expect(result.current.isSessionActive).toBe(true);
+    });
   });
 
-  it('tracks per-agent timer from user event to stop', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 3000,
-        agentId: 'agent-1',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    expect(result.current.agentElapsedMs.get('agent-1')).toBe(2000);
+  describe('tick interval behavior', () => {
+    it('updates agentElapsedMs map every second while active', async () => {
+      const { result } = renderHook(() => 
+        useSessionTimer([], new Set(['agent-1']), 'session-1')
+      );
+
+      const initialTime = result.current.agentElapsedMs.get('agent-1') || 0;
+
+      // Advance by 1 second and trigger interval
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      const timeAfter1s = result.current.agentElapsedMs.get('agent-1') || 0;
+      expect(timeAfter1s).toBeGreaterThan(initialTime);
+
+      // Advance another second
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      const timeAfter2s = result.current.agentElapsedMs.get('agent-1') || 0;
+      expect(timeAfter2s).toBeGreaterThan(timeAfter1s);
+    });
+
+    it('does not run tick interval when inactive', async () => {
+      const { result } = renderHook(() => 
+        useSessionTimer([], new Set(), 'session-1')
+      );
+
+      await act(async () => {
+        vi.advanceTimersByTime(5000);
+      });
+
+      // Should remain at 0, no intervals running
+      expect(result.current.globalElapsedMs).toBe(0);
+    });
   });
 
-  it('pauses agent timer on delegation_requested', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeAgentEvent('delegation_requested', { 
-        timestamp: 3000,
-        agentId: 'agent-1',
-        delegationId: 'del-1',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    // Agent worked for 2000ms then paused
-    expect(result.current.agentElapsedMs.get('agent-1')).toBe(2000);
-  });
+  describe('per-session timer state', () => {
+    it('resets timer when switching to a new session', async () => {
+      const { result, rerender } = renderHook(
+        ({ sessionId, thinking }) => useSessionTimer([], thinking, sessionId),
+        { initialProps: { sessionId: 'session-1', thinking: new Set(['agent-1']) } }
+      );
 
-  it('resumes agent timer on delegation_completed', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeAgentEvent('delegation_requested', { 
-        timestamp: 3000,
-        agentId: 'agent-1',
-        delegationId: 'del-1',
-        isMessage: false,
-      }),
-      makeAgentEvent('delegation_completed', { 
-        timestamp: 8000,
-        agentId: 'agent-1',
-        delegationId: 'del-1',
-        isMessage: false,
-      }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 10000,
-        agentId: 'agent-1',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    // 2000ms before delegation + 2000ms after resumption = 4000ms
-    expect(result.current.agentElapsedMs.get('agent-1')).toBe(4000);
-  });
+      // Let timer run for session-1
+      await act(async () => {
+        vi.advanceTimersByTime(3000);
+      });
 
-  it('keeps agent timer running on llm_request_end with tool_calls finish reason', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 3000,
-        agentId: 'agent-1',
-        finishReason: 'tool_calls',
-        isMessage: false,
-      }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 6000,
-        agentId: 'agent-1',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    // Timer ran continuously from 1000 to 6000 = 5000ms
-    expect(result.current.agentElapsedMs.get('agent-1')).toBe(5000);
-  });
+      const session1Time = result.current.globalElapsedMs;
+      expect(session1Time).toBeGreaterThanOrEqual(2000);
 
-  it('stops agent timer on llm_request_end with stop finish reason', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 4000,
-        agentId: 'agent-1',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-      // Later events should not affect timer
-      makeAgentEvent('some event', { 
-        timestamp: 8000,
-        agentId: 'agent-1',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    expect(result.current.agentElapsedMs.get('agent-1')).toBe(3000);
-  });
+      // Switch to session-2
+      act(() => {
+        rerender({ sessionId: 'session-2', thinking: new Set<string>() });
+      });
 
-  it('stops all agents on system error event', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-2' }),
-      makeSystemEvent('System error occurred', { timestamp: 3000 }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    expect(result.current.agentElapsedMs.get('agent-1')).toBe(2000);
-    expect(result.current.agentElapsedMs.get('agent-2')).toBe(2000);
-  });
+      // Timer should be reset to 0 for new session
+      expect(result.current.globalElapsedMs).toBe(0);
+      expect(result.current.agentElapsedMs.size).toBe(0);
+    });
 
-  it('stops agent on error content in agent event', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeAgentEvent('Error: failed to execute', { 
-        timestamp: 3000,
-        agentId: 'agent-1',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    expect(result.current.agentElapsedMs.get('agent-1')).toBe(2000);
-  });
+    it('restores timer state when switching back to a previous session', async () => {
+      const { result, rerender } = renderHook(
+        ({ sessionId, thinking }) => useSessionTimer([], thinking, sessionId),
+        { initialProps: { sessionId: 'session-1', thinking: new Set(['agent-1']) } }
+      );
 
-  it('tracks multiple agents independently', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeUserEvent('hello', { timestamp: 2000, agentId: 'agent-2' }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 5000,
-        agentId: 'agent-1',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 7000,
-        agentId: 'agent-2',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    expect(result.current.agentElapsedMs.get('agent-1')).toBe(4000);
-    expect(result.current.agentElapsedMs.get('agent-2')).toBe(5000);
-  });
+      // Let timer run for session-1
+      await act(async () => {
+        vi.advanceTimersByTime(3000);
+      });
 
-  it('handles multiple delegation cycles for same agent', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeAgentEvent('delegation_requested', { 
-        timestamp: 2000,
-        agentId: 'agent-1',
-        delegationId: 'del-1',
-        isMessage: false,
-      }),
-      makeAgentEvent('delegation_completed', { 
-        timestamp: 5000,
-        agentId: 'agent-1',
-        delegationId: 'del-1',
-        isMessage: false,
-      }),
-      makeAgentEvent('delegation_requested', { 
-        timestamp: 7000,
-        agentId: 'agent-1',
-        delegationId: 'del-2',
-        isMessage: false,
-      }),
-      makeAgentEvent('delegation_completed', { 
-        timestamp: 10000,
-        agentId: 'agent-1',
-        delegationId: 'del-2',
-        isMessage: false,
-      }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 12000,
-        agentId: 'agent-1',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    // (2000-1000) + (7000-5000) + (12000-10000) = 1000 + 2000 + 2000 = 5000ms
-    expect(result.current.agentElapsedMs.get('agent-1')).toBe(5000);
-  });
+      const session1Time = result.current.globalElapsedMs;
+      expect(session1Time).toBeGreaterThanOrEqual(2000);
 
-  it('pauses global timer when all agents stop working', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 3000,
-        agentId: 'agent-1',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-      // After all agents stop, global timer pauses at last event timestamp (3000)
-      // Later events don't add to global timer since no agent is working
-      makeAgentEvent('some event', { 
-        timestamp: 10000,
-        agentId: 'agent-1',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    // Global timer stops at the last event (10000) since that's the last timestamp processed
-    // But it only accumulated from 1000-3000 while the agent was working
-    // The logic pauses at lastEventTimestamp which is 10000
-    expect(result.current.globalElapsedMs).toBe(9000);
-  });
+      // Switch to session-2
+      act(() => {
+        rerender({ sessionId: 'session-2', thinking: new Set(['agent-2']) });
+      });
 
-  it('handles agent resuming after stop on new user prompt', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 3000,
-        agentId: 'agent-1',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-      makeUserEvent('another question', { timestamp: 10000, agentId: 'agent-1' }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 13000,
-        agentId: 'agent-1',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    // (3000-1000) + (13000-10000) = 2000 + 3000 = 5000ms
-    expect(result.current.agentElapsedMs.get('agent-1')).toBe(5000);
-  });
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
 
-  it('handles nested delegations correctly', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeAgentEvent('delegation_requested', { 
-        timestamp: 2000,
-        agentId: 'agent-1',
-        delegationId: 'del-1',
-        isMessage: false,
-      }),
-      makeAgentEvent('delegation_requested', { 
-        timestamp: 3000,
-        agentId: 'agent-1',
-        delegationId: 'del-2',
-        isMessage: false,
-      }),
-      makeAgentEvent('delegation_completed', { 
-        timestamp: 8000,
-        agentId: 'agent-1',
-        delegationId: 'del-2',
-        isMessage: false,
-      }),
-      // Agent should still be paused because del-1 is still active
-      makeAgentEvent('delegation_completed', { 
-        timestamp: 10000,
-        agentId: 'agent-1',
-        delegationId: 'del-1',
-        isMessage: false,
-      }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 12000,
-        agentId: 'agent-1',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    // (2000-1000) + (12000-10000) = 1000 + 2000 = 3000ms
-    expect(result.current.agentElapsedMs.get('agent-1')).toBe(3000);
-  });
+      // Switch back to session-1
+      act(() => {
+        rerender({ sessionId: 'session-1', thinking: new Set<string>() });
+      });
 
-  it('handles events with no agentId gracefully', () => {
-    const events: EventItem[] = [
-      { 
-        ...makeUserEvent('hello', { timestamp: 1000 }), 
-        agentId: undefined 
-      } as EventItem,
-      { 
-        ...makeAgentEvent('llm_request_end', { 
-          timestamp: 3000,
-          finishReason: 'stop',
-          isMessage: false,
-        }),
-        agentId: undefined
-      } as EventItem,
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    // Should track under 'unknown' agent (since agentId is undefined, code uses 'unknown')
-    expect(result.current.agentElapsedMs.has('unknown')).toBe(true);
-  });
+      // Should restore session-1's timer (approximately, accounting for save/restore)
+      expect(result.current.globalElapsedMs).toBeGreaterThanOrEqual(session1Time - 100);
+      expect(result.current.globalElapsedMs).toBeLessThanOrEqual(session1Time + 100);
+    });
 
-  it('calculates correct global timer across multiple agent starts and stops', () => {
-    const events: EventItem[] = [
-      makeUserEvent('hello', { timestamp: 1000, agentId: 'agent-1' }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 3000,
-        agentId: 'agent-1',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-      makeUserEvent('question 2', { timestamp: 5000, agentId: 'agent-1' }),
-      makeAgentEvent('llm_request_end', { 
-        timestamp: 9000,
-        agentId: 'agent-1',
-        finishReason: 'stop',
-        isMessage: false,
-      }),
-    ];
-    
-    const { result } = renderHook(() => 
-      useSessionTimer(events, new Set(), true)
-    );
-    
-    // Global timer runs from start (1000) to last event (9000)
-    // It pauses when all agents stop at timestamp 3000, accumulating (3000-1000)
-    // Then resumes at 5000 when new prompt arrives
-    // Pauses again at 9000, accumulating (9000-5000)
-    // Total: 2000 + 4000 = 6000, but the pause logic uses lastEventTimestamp
-    // which would be 9000, so accumulated = (3000-1000) + (9000-5000) but the
-    // final pause uses lastEventTimestamp=9000, so it's actually 9000-1000 = 8000
-    expect(result.current.globalElapsedMs).toBe(8000);
+    it('preserves per-agent times across session switches', async () => {
+      const { result, rerender } = renderHook(
+        ({ sessionId, thinking }) => useSessionTimer([], thinking, sessionId),
+        { initialProps: { sessionId: 'session-1', thinking: new Set(['agent-1']) } }
+      );
+
+      // Let agent-1 run in session-1
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      const agent1Time = result.current.agentElapsedMs.get('agent-1')!;
+      expect(agent1Time).toBeGreaterThan(0);
+
+      // Switch to session-2
+      act(() => {
+        rerender({ sessionId: 'session-2', thinking: new Set(['agent-2']) });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      // Switch back to session-1
+      act(() => {
+        rerender({ sessionId: 'session-1', thinking: new Set<string>() });
+      });
+
+      // Should restore agent-1's time
+      const restoredAgent1Time = result.current.agentElapsedMs.get('agent-1');
+      expect(restoredAgent1Time).toBeDefined();
+      expect(restoredAgent1Time!).toBeGreaterThanOrEqual(agent1Time - 100);
+      expect(restoredAgent1Time!).toBeLessThanOrEqual(agent1Time + 100);
+
+      // Should not have agent-2 from session-2
+      expect(result.current.agentElapsedMs.has('agent-2')).toBe(false);
+    });
+
+    it('handles switching to null sessionId (home page)', async () => {
+      const { result, rerender } = renderHook(
+        ({ sessionId, thinking }) => useSessionTimer([], thinking, sessionId),
+        { initialProps: { sessionId: 'session-1', thinking: new Set(['agent-1']) } }
+      );
+
+      // Let timer run for session-1
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      const session1Time = result.current.globalElapsedMs;
+      expect(session1Time).toBeGreaterThan(0);
+
+      // Navigate to home (null sessionId)
+      act(() => {
+        rerender({ sessionId: null, thinking: new Set<string>() });
+      });
+
+      // Timer should reset
+      expect(result.current.globalElapsedMs).toBe(0);
+
+      // Navigate back to session-1
+      act(() => {
+        rerender({ sessionId: 'session-1', thinking: new Set<string>() });
+      });
+
+      // Should restore session-1's time
+      expect(result.current.globalElapsedMs).toBeGreaterThanOrEqual(session1Time - 100);
+    });
+
+    it('saves timer state for multiple sessions independently', async () => {
+      const { result, rerender } = renderHook(
+        ({ sessionId, thinking }) => useSessionTimer([], thinking, sessionId),
+        { initialProps: { sessionId: 'session-1', thinking: new Set(['agent-1']) } }
+      );
+
+      // Run session-1 for 3 seconds
+      await act(async () => {
+        vi.advanceTimersByTime(3000);
+      });
+      const session1Time = result.current.globalElapsedMs;
+
+      // Switch to session-2, run for 2 seconds
+      act(() => {
+        rerender({ sessionId: 'session-2', thinking: new Set(['agent-2']) });
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+      const session2Time = result.current.globalElapsedMs;
+
+      // Switch to session-3, run for 1 second
+      act(() => {
+        rerender({ sessionId: 'session-3', thinking: new Set(['agent-3']) });
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+      const session3Time = result.current.globalElapsedMs;
+
+      // Verify each session has independent times
+      expect(session1Time).toBeGreaterThan(session2Time);
+      expect(session2Time).toBeGreaterThan(session3Time);
+
+      // Switch back to session-1
+      act(() => {
+        rerender({ sessionId: 'session-1', thinking: new Set<string>() });
+      });
+      expect(result.current.globalElapsedMs).toBeGreaterThanOrEqual(session1Time - 100);
+
+      // Switch to session-2
+      act(() => {
+        rerender({ sessionId: 'session-2', thinking: new Set<string>() });
+      });
+      expect(result.current.globalElapsedMs).toBeGreaterThanOrEqual(session2Time - 100);
+      expect(result.current.globalElapsedMs).toBeLessThan(session1Time);
+
+      // Switch to session-3
+      act(() => {
+        rerender({ sessionId: 'session-3', thinking: new Set<string>() });
+      });
+      expect(result.current.globalElapsedMs).toBeGreaterThanOrEqual(session3Time - 100);
+      expect(result.current.globalElapsedMs).toBeLessThan(session2Time);
+    });
   });
 });

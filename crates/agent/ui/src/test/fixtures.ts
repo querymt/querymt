@@ -237,3 +237,17 @@ export function makeProviderChangedEvent(
     ...overrides,
   });
 }
+
+/**
+ * Create an llm_request_end event
+ */
+export function makeLlmRequestEndEvent(
+  finishReason: 'stop' | 'tool_calls' | string,
+  overrides: Partial<EventItem> = {}
+): EventItem {
+  return makeAgentEvent('llm_request_end', {
+    finishReason,
+    isMessage: false,
+    ...overrides,
+  });
+}

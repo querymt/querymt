@@ -70,12 +70,13 @@ export function AppShell() {
   const location = useLocation();
   const isHomePage = location.pathname === '/';
   const copyTimeoutRef = useRef<number | null>(null);
+  const prevAgentModeRef = useRef(agentMode);
   
-  // Live timer hook
+  // Live timer hook (per-session)
   const { globalElapsedMs, agentElapsedMs, isSessionActive } = useSessionTimer(
     events,
     thinkingAgentIds,
-    isConversationComplete
+    sessionId
   );
   
   // Load persisted UI state on mount
@@ -195,6 +196,13 @@ export function AppShell() {
   
   // Auto-switch model when agent mode changes (if preference exists)
   useEffect(() => {
+    // Only auto-switch when agentMode actually changes, not when agentModels updates
+    // This prevents infinite loop when user manually switches model via ModelPickerPopover
+    if (prevAgentModeRef.current === agentMode) {
+      return;
+    }
+    prevAgentModeRef.current = agentMode;
+    
     const { modeModelPreferences } = useUiStore.getState();
     const preference = modeModelPreferences[agentMode];
     

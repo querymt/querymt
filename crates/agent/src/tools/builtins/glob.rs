@@ -122,6 +122,13 @@ impl Tool for GlobTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn truncation_hint(&self) -> Option<&'static str> {
+        Some(
+            "TIP: Many matches found and truncated. Refine your glob pattern \
+             or use more specific path filters to narrow results.",
+        )
+    }
+
     async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
         // Extract pattern (required)
         let pattern = args

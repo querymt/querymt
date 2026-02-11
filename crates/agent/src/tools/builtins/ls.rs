@@ -176,6 +176,13 @@ impl Tool for ListTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn truncation_hint(&self) -> Option<&'static str> {
+        Some(
+            "TIP: The file list was truncated. Use search_text or more specific \
+             glob patterns to narrow your search.",
+        )
+    }
+
     async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
         let root = if let Some(path_str) = args.get("path").and_then(Value::as_str) {
             context.resolve_path(path_str)?

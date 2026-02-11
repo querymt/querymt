@@ -164,6 +164,14 @@ export function useUiClient() {
           const lastProvider = [...translated].reverse()
             .find(e => e.provider || e.model);
           if (lastProvider) {
+            console.log('[useUiClient] 🔴 session_events: Setting agentModels from replay', {
+              session_id: msg.session_id,
+              agent_id: msg.agent_id,
+              provider: lastProvider.provider,
+              model: lastProvider.model,
+              mainSessionId,
+              eventCount: translated.length
+            });
             setAgentModels(prev => ({
               ...prev,
               [msg.agent_id]: {
@@ -339,6 +347,14 @@ export function useUiClient() {
         // Provider/limits updates - only for main session
         if (msg.session_id === mainSessionId) {
           if (eventKind === 'provider_changed') {
+            console.log('[useUiClient] 🟢 provider_changed event: Setting agentModels', {
+              session_id: msg.session_id,
+              agent_id: msg.agent_id,
+              provider: msg.event?.kind?.provider,
+              model: msg.event?.kind?.model,
+              mainSessionId,
+              seq: msg.event?.seq
+            });
             setAgentModels((prev) => ({
               ...prev,
               [msg.agent_id]: {
@@ -415,6 +431,13 @@ export function useUiClient() {
         const lastProvider = [...translated].reverse()
           .find(e => e.provider || e.model);
         if (lastProvider) {
+          console.log('[useUiClient] 🔵 session_loaded: Setting agentModels from loaded session', {
+            session_id: msg.session_id,
+            agent_id: msg.agent_id,
+            provider: lastProvider.provider,
+            model: lastProvider.model,
+            eventCount: translated.length
+          });
           setAgentModels({
             [msg.agent_id]: {
               provider: lastProvider.provider,
@@ -423,6 +446,7 @@ export function useUiClient() {
             },
           });
         } else {
+          console.log('[useUiClient] 🔵 session_loaded: Clearing agentModels (no provider info)');
           // No provider info in loaded session - clear stale model badge
           setAgentModels({});
         }

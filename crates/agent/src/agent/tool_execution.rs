@@ -188,10 +188,20 @@ impl QueryMTAgent {
                     &call.id,
                     None, // TODO: pass data_dir when available
                 );
+
+                // Get tool-specific truncation hint (if available)
+                let tool_hint = self
+                    .tool_registry
+                    .lock()
+                    .ok()
+                    .and_then(|r| r.find(&call.function.name))
+                    .and_then(|t| t.truncation_hint());
+
                 let suffix = format_truncation_message_with_overflow(
                     &truncation,
                     TruncationDirection::Head,
                     Some(&overflow),
+                    tool_hint,
                 );
                 format!("{}{}", truncation.content, suffix)
             } else {

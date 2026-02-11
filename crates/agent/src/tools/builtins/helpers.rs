@@ -226,6 +226,7 @@ pub fn format_truncation_message_with_overflow(
     result: &TruncationResult,
     direction: TruncationDirection,
     overflow_result: Option<&OverflowSaveResult>,
+    tool_hint: Option<&str>,
 ) -> String {
     if !result.was_truncated {
         return String::new();
@@ -246,14 +247,17 @@ pub fn format_truncation_message_with_overflow(
         _ => String::new(),
     };
 
+    let hint_str = tool_hint.map(|h| format!("\n\n{}", h)).unwrap_or_default();
+
     format!(
-        "\n\n[Output truncated: showing {} {} lines / {} bytes of {} lines / {} bytes total.{}]",
+        "\n\n[Output truncated: showing {} {} lines / {} bytes of {} lines / {} bytes total.{}]{}",
         dir_str,
         result.content.lines().count(),
         result.content.len(),
         result.original_line_count,
         result.original_byte_count,
-        overflow_info
+        overflow_info,
+        hint_str
     )
 }
 

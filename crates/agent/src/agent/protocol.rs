@@ -171,6 +171,7 @@ impl SendAgent for QueryMTAgent {
             function_index: Arc::new(tokio::sync::OnceCell::new()),
             turn_snapshot: std::sync::Mutex::new(None),
             turn_diffs: std::sync::Mutex::new(Default::default()),
+            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
         {
@@ -313,6 +314,7 @@ impl SendAgent for QueryMTAgent {
             function_index: Arc::new(tokio::sync::OnceCell::new()),
             turn_snapshot: std::sync::Mutex::new(None),
             turn_diffs: std::sync::Mutex::new(Default::default()),
+            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
         {
@@ -507,6 +509,7 @@ impl SendAgent for QueryMTAgent {
             function_index: Arc::new(tokio::sync::OnceCell::new()),
             turn_snapshot: std::sync::Mutex::new(None),
             turn_diffs: std::sync::Mutex::new(Default::default()),
+            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
         {

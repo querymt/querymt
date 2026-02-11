@@ -60,6 +60,13 @@ impl ToolTrait for ShellTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn truncation_hint(&self) -> Option<&'static str> {
+        Some(
+            "TIP: Pipe command output through grep/head/tail to filter results, \
+             or use search_text on the overflow file to find specific content.",
+        )
+    }
+
     async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
         let command = args
             .get("command")

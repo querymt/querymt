@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, forwardRef, useImperativeHandle } from 'react';
 import { MentionsInput, Mention, SuggestionDataItem, type MentionsInputStyle } from 'react-mentions';
 import { Loader, File, Folder } from 'lucide-react';
 import { FileIndexEntry } from '../types';
@@ -144,22 +144,26 @@ const mentionStyle = {
   boxShadow: 'inset 0 0 0 1px rgba(0, 255, 249, 0.4)',
 };
 
-export function MentionInput({
-  value,
-  onChange,
-  onSubmit,
-  placeholder = '',
-  disabled = false,
-  files,
-  onRequestFiles,
-  isLoadingFiles = false,
-  showIndexBuilding = false,
-}: MentionInputProps) {
+export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
+  function MentionInput({
+    value,
+    onChange,
+    onSubmit,
+    placeholder = '',
+    disabled = false,
+    files,
+    onRequestFiles,
+    isLoadingFiles = false,
+    showIndexBuilding = false,
+  }, ref) {
   const [isFocused, setIsFocused] = useState(false);
   const callbackRef = useRef<((data: SuggestionDataItem[]) => void) | null>(null);
   const searchRef = useRef<string>('');
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const maxInputHeight = 180;
+  
+  // Expose the textarea element via ref
+  useImperativeHandle(ref, () => inputRef.current!, []);
   
   // Advanced fuzzy matching with scoring and ranking
   const fuzzyMatchWithScore = useCallback((search: string, filePath: string): { match: boolean; score: number } => {
@@ -522,4 +526,4 @@ export function MentionInput({
       )}
     </div>
   );
-}
+});

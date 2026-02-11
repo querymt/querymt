@@ -1,5 +1,4 @@
 pub mod apply_patch;
-pub mod code_surgeon;
 pub mod create_task;
 pub mod delegate;
 pub mod delete_file;
@@ -14,13 +13,13 @@ pub mod patch_validator;
 pub mod question;
 pub mod read_file;
 pub mod search_text;
+pub mod semantic_edit;
 pub mod shell;
 pub mod todo;
 pub mod web_fetch;
 pub mod write_file;
 
 pub use apply_patch::ApplyPatchTool;
-pub use code_surgeon::CodeSurgeonTool;
 pub use create_task::CreateTaskTool;
 pub use delegate::DelegateTool;
 pub use delete_file::DeleteFileTool;
@@ -32,6 +31,7 @@ pub use multiedit::MultiEditTool;
 pub use question::QuestionTool;
 pub use read_file::ReadFileTool;
 pub use search_text::SearchTextTool;
+pub use semantic_edit::SemanticEditTool;
 pub use shell::ShellTool;
 pub use todo::{TodoReadTool, TodoWriteTool};
 pub use web_fetch::WebFetchTool;
@@ -47,7 +47,7 @@ use std::sync::Arc;
 pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ApplyPatchTool::new()),
-        Arc::new(CodeSurgeonTool::new()),
+        Arc::new(SemanticEditTool::new()),
         Arc::new(CreateTaskTool::new()),
         Arc::new(DelegateTool::new()),
         Arc::new(DeleteFileTool::new()),

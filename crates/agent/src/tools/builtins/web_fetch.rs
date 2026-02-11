@@ -68,6 +68,13 @@ impl ToolTrait for WebFetchTool {
         &[]
     }
 
+    fn truncation_hint(&self) -> Option<&'static str> {
+        Some(
+            "TIP: The response was truncated. If overflow storage is enabled, \
+             use search_text or read_file on the saved overflow file to find specific content.",
+        )
+    }
+
     async fn call(&self, args: Value, _context: &dyn ToolContext) -> Result<String, ToolError> {
         let url = args
             .get("url")

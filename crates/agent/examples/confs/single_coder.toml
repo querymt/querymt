@@ -26,7 +26,7 @@ tools = [
   # User interaction
   "question",
   # Code intelligence
-  "code_surgeon",
+  "semantic_edit",
   "web_fetch",
 ]
 system = [

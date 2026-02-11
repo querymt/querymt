@@ -78,6 +78,7 @@ export function ChatView() {
     rateLimitBySession,
     setRateLimitState,
     clearRateLimitState,
+    setMainInputRef,
   } = useUiStore();
   
   // Get rate limit state for current session
@@ -95,11 +96,18 @@ export function ChatView() {
   const sessionConversationComplete = sessionId === mainSessionId ? isConversationComplete : false;
   
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+  const mentionInputRef = useRef<HTMLTextAreaElement>(null);
   const activeIndexStatus = sessionId ? workspaceIndexStatus[sessionId]?.status : undefined;
 
   
   // File mention hook
   const fileMention = useFileMention(requestFileIndex);
+  
+  // Register main input ref for focus management
+  useEffect(() => {
+    setMainInputRef(mentionInputRef);
+    return () => setMainInputRef(null);
+  }, [setMainInputRef]);
   
   // Register file index callback
   useEffect(() => {
@@ -371,7 +379,7 @@ export function ChatView() {
       {/* Event Timeline with Todo Rail */}
       <div className="flex-1 overflow-hidden flex flex-row relative">
         <div className="flex-1 overflow-hidden flex flex-col min-w-0 relative">
-        {sessionId && (hasTurns || hasDelegations) && (
+        {sessionId && hasDelegations && (
           <div className="px-6 py-2 border-b border-cyber-border/60 bg-cyber-surface/40 flex items-center gap-2">
             <button
               type="button"
@@ -595,6 +603,7 @@ export function ChatView() {
         >
           <div className="flex gap-3 relative items-end flex-1">
           <MentionInput
+            ref={mentionInputRef}
             value={prompt}
             onChange={setPrompt}
             onSubmit={handleSendPrompt}

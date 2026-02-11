@@ -161,8 +161,6 @@ export interface AgentStats {
   toolBreakdown: Record<string, number>;
   // Cost tracking
   costUsd: number;
-  // Time tracking
-  activeTimeMs: number;  // Accumulated active work time
   // Context tracking - current context size from last LLM request
   currentContextTokens: number;  // Current context size (input + output) from backend
   maxContextTokens?: number;  // Model's context limit from provider_changed event
@@ -176,8 +174,6 @@ export interface SessionStats {
   totalCostUsd: number;
   totalMessages: number;
   totalToolCalls: number;
-  // Time tracking
-  totalElapsedMs: number;      // Total wall-clock time from first to last event
   startTimestamp?: number;     // First event timestamp (for live timer calculation)
   // Execution metrics from backend
   totalSteps: number;  // LLM calls

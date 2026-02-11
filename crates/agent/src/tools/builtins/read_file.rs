@@ -31,7 +31,7 @@ impl ToolTrait for ReadFileTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Read contents of a file under the workspace. Supports reading the full file or a specific line range."
+                description: "Read contents of a file under the workspace. Returns content with line numbers in format '00001| content'. Supports reading the full file or a specific line range."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -64,6 +64,13 @@ impl ToolTrait for ReadFileTool {
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[CapabilityRequirement::Filesystem]
+    }
+
+    fn truncation_hint(&self) -> Option<&'static str> {
+        Some(
+            "TIP: Use search_text to find specific content, or use read_file with \
+             start_line/line_count parameters to view specific sections.",
+        )
     }
 
     async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
@@ -159,23 +166,35 @@ impl ToolTrait for ReadFileTool {
             }
         };
 
-        // Extract selected lines
-        let selected_content = if total_lines == 0 {
-            String::new()
+        // Build plain text output with OpenCode-style line numbering
+        let mut output = String::from("<file>\n");
+
+        // Add line-numbered content (format: 00001| content)
+        if total_lines == 0 {
+            // Empty file - no content lines
         } else {
-            lines[start_idx..end_idx].join("\n")
-        };
+            for (idx, line_content) in lines.iter().enumerate().take(end_idx).skip(start_idx) {
+                let line_number = idx + 1; // 1-indexed
+                output.push_str(&format!("{:05}| {}\n", line_number, line_content));
+            }
+        }
 
-        let result = json!({
-            "path": target.display().to_string(),
-            "content": selected_content,
-            "start_line": actual_start,
-            "end_line": actual_end,
-            "total_lines": total_lines
-        });
+        // Add metadata footer
+        match (actual_start, actual_end) {
+            (Some(_start), Some(end)) if end < total_lines => {
+                output.push_str(&format!(
+                    "\n(File has more lines. Use 'offset' parameter to read beyond line {})\n",
+                    end
+                ));
+            }
+            _ => {
+                output.push_str(&format!("\n(End of file - total {} lines)\n", total_lines));
+            }
+        }
 
-        serde_json::to_string(&result)
-            .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
+        output.push_str("</file>");
+
+        Ok(output)
     }
 }
 
@@ -214,15 +233,20 @@ mod tests {
         });
 
         let result = tool.call(args, &context).await.unwrap();
-        let parsed: Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(
-            parsed["content"].as_str().unwrap(),
-            "line 1\nline 2\nline 3\nline 4\nline 5"
-        );
-        assert_eq!(parsed["start_line"], Value::Null);
-        assert_eq!(parsed["end_line"], Value::Null);
-        assert_eq!(parsed["total_lines"], 5);
+        // Verify format
+        assert!(result.starts_with("<file>\n"));
+        assert!(result.ends_with("</file>"));
+
+        // Verify line numbering
+        assert!(result.contains("00001| line 1"));
+        assert!(result.contains("00002| line 2"));
+        assert!(result.contains("00003| line 3"));
+        assert!(result.contains("00004| line 4"));
+        assert!(result.contains("00005| line 5"));
+
+        // Verify metadata
+        assert!(result.contains("(End of file - total 5 lines)"));
     }
 
     #[tokio::test]
@@ -244,15 +268,20 @@ mod tests {
         });
 
         let result = tool.call(args, &context).await.unwrap();
-        let parsed: Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(
-            parsed["content"].as_str().unwrap(),
-            "line 3\nline 4\nline 5"
-        );
-        assert_eq!(parsed["start_line"], 3);
-        assert_eq!(parsed["end_line"], 5);
-        assert_eq!(parsed["total_lines"], 5);
+        // Verify format
+        assert!(result.starts_with("<file>\n"));
+        assert!(result.ends_with("</file>"));
+
+        // Verify line numbering starts at 3
+        assert!(result.contains("00003| line 3"));
+        assert!(result.contains("00004| line 4"));
+        assert!(result.contains("00005| line 5"));
+        assert!(!result.contains("00001| line 1"));
+        assert!(!result.contains("00002| line 2"));
+
+        // Verify metadata
+        assert!(result.contains("(End of file - total 5 lines)"));
     }
 
     #[tokio::test]
@@ -275,12 +304,22 @@ mod tests {
         });
 
         let result = tool.call(args, &context).await.unwrap();
-        let parsed: Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(parsed["content"].as_str().unwrap(), "line 2\nline 3");
-        assert_eq!(parsed["start_line"], 2);
-        assert_eq!(parsed["end_line"], 3);
-        assert_eq!(parsed["total_lines"], 5);
+        // Verify format
+        assert!(result.starts_with("<file>\n"));
+        assert!(result.ends_with("</file>"));
+
+        // Verify only lines 2-3 are included
+        assert!(result.contains("00002| line 2"));
+        assert!(result.contains("00003| line 3"));
+        assert!(!result.contains("00001| line 1"));
+        assert!(!result.contains("00004| line 4"));
+        assert!(!result.contains("00005| line 5"));
+
+        // Verify truncation message (not at EOF)
+        assert!(
+            result.contains("(File has more lines. Use 'offset' parameter to read beyond line 3)")
+        );
     }
 
     #[tokio::test]
@@ -298,13 +337,18 @@ mod tests {
         });
 
         let result = tool.call(args, &context).await.unwrap();
-        let parsed: Value = serde_json::from_str(&result).unwrap();
+
+        // Verify format
+        assert!(result.starts_with("<file>\n"));
+        assert!(result.ends_with("</file>"));
 
         // Should read from line 2 to EOF (lines 2 and 3)
-        assert_eq!(parsed["content"].as_str().unwrap(), "line 2\nline 3");
-        assert_eq!(parsed["start_line"], 2);
-        assert_eq!(parsed["end_line"], 3);
-        assert_eq!(parsed["total_lines"], 3);
+        assert!(result.contains("00002| line 2"));
+        assert!(result.contains("00003| line 3"));
+        assert!(!result.contains("00001| line 1"));
+
+        // Verify EOF message (reached end of file)
+        assert!(result.contains("(End of file - total 3 lines)"));
     }
 
     #[tokio::test]
@@ -320,12 +364,16 @@ mod tests {
         });
 
         let result = tool.call(args, &context).await.unwrap();
-        let parsed: Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(parsed["content"].as_str().unwrap(), "");
-        assert_eq!(parsed["start_line"], Value::Null);
-        assert_eq!(parsed["end_line"], Value::Null);
-        assert_eq!(parsed["total_lines"], 0);
+        // Verify format
+        assert!(result.starts_with("<file>\n"));
+        assert!(result.ends_with("</file>"));
+
+        // Verify no content lines (empty file)
+        assert!(!result.contains("00001|"));
+
+        // Verify metadata shows 0 lines
+        assert!(result.contains("(End of file - total 0 lines)"));
     }
 
     #[tokio::test]
@@ -366,11 +414,18 @@ mod tests {
         });
 
         let result = tool.call(args, &context).await.unwrap();
-        let parsed: Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(parsed["content"].as_str().unwrap(), "content line 1");
-        assert_eq!(parsed["start_line"], 1);
-        assert_eq!(parsed["end_line"], 1);
-        assert_eq!(parsed["total_lines"], 2);
+        // Verify format
+        assert!(result.starts_with("<file>\n"));
+        assert!(result.ends_with("</file>"));
+
+        // Verify only first line is included
+        assert!(result.contains("00001| content line 1"));
+        assert!(!result.contains("00002| content line 2"));
+
+        // Verify truncation message (not at EOF)
+        assert!(
+            result.contains("(File has more lines. Use 'offset' parameter to read beyond line 1)")
+        );
     }
 }

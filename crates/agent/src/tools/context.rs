@@ -179,6 +179,26 @@ pub trait Tool: Send + Sync {
         context: &dyn ToolContext,
     ) -> Result<String, ToolError>;
 
+    /// Returns a context-aware hint to show when this tool's output is truncated.
+    ///
+    /// This method is called when the tool's output exceeds the configured limits
+    /// and is truncated. The hint is appended to the standard truncation message
+    /// to provide tool-specific guidance on how to access the full content.
+    ///
+    /// # Returns
+    /// * `Some(hint)` - A hint string to append (e.g., "TIP: Use search_text...")
+    /// * `None` - Use only the standard truncation message (default)
+    ///
+    /// # Example
+    /// ```
+    /// fn truncation_hint(&self) -> Option<&'static str> {
+    ///     Some("TIP: Use search_text to find specific content in the full output.")
+    /// }
+    /// ```
+    fn truncation_hint(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Lifecycle hook: called when tool is initialized (optional)
     async fn initialize(&mut self, _context: &dyn ToolContext) -> Result<(), ToolError> {
         Ok(())

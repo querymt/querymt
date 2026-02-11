@@ -1,13 +1,14 @@
 use crate::agent::core::{
-    DelegationContextConfig, DelegationContextTiming, QueryMTAgent, SnapshotPolicy, ToolConfig,
-    ToolPolicy,
+    AgentMode, DelegationContextConfig, DelegationContextTiming, QueryMTAgent, SnapshotPolicy,
+    ToolConfig, ToolPolicy,
 };
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
-use crate::config::RateLimitConfig;
+use crate::config::{PruningConfig, RateLimitConfig, ToolOutputConfig};
 use crate::delegation::{AgentInfo, DefaultAgentRegistry, DelegationOrchestrator};
 use crate::event_bus::EventBus;
 use crate::events::StopType;
+use crate::index::{WorkspaceIndexManager, WorkspaceIndexManagerConfig};
 use crate::middleware::{
     AgentStats, ConversationContext, DelegationGuardMiddleware, ExecutionState, LlmResponse,
     MiddlewareDriver,
@@ -276,13 +277,13 @@ impl TestHarness {
             session_runtime: Arc::new(Mutex::new(HashMap::new())),
             max_steps: None,
             snapshot_policy: SnapshotPolicy::None,
-            assume_mutating: false,
+            assume_mutating: true,
             mutating_tools: HashSet::new(),
             max_prompt_bytes: None,
             tool_config: Arc::new(StdMutex::new(ToolConfig::default())),
             tool_registry: Arc::new(StdMutex::new(ToolRegistry::new())),
             middleware_drivers: Arc::new(std::sync::Mutex::new(Vec::new())),
-            agent_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            agent_mode: Arc::new(std::sync::atomic::AtomicU8::new(AgentMode::Build as u8)),
             event_bus: Arc::new(EventBus::new()),
             client_state: Arc::new(StdMutex::new(None)),
             auth_methods: Arc::new(StdMutex::new(Vec::new())),
@@ -293,11 +294,12 @@ impl TestHarness {
                 timing: DelegationContextTiming::FirstTurnOnly,
                 auto_inject: true,
             },
-            workspace_index_manager: Arc::new(crate::index::WorkspaceIndexManager::new(
-                crate::index::WorkspaceIndexManagerConfig::default(),
+            workspace_index_manager: Arc::new(WorkspaceIndexManager::new(
+                WorkspaceIndexManagerConfig::default(),
             )),
-            tool_output_config: crate::config::ToolOutputConfig::default(),
-            pruning_config: crate::config::PruningConfig::default(),
+            execution_timeout_secs: 300,
+            tool_output_config: ToolOutputConfig::default(),
+            pruning_config: PruningConfig::default(),
             compaction_config: crate::config::CompactionConfig::default(),
             compaction: crate::session::compaction::SessionCompaction::new(),
             snapshot_backend: None,
@@ -329,6 +331,7 @@ impl TestHarness {
             function_index: Arc::new(tokio::sync::OnceCell::new()),
             turn_snapshot: StdMutex::new(None),
             turn_diffs: StdMutex::new(Default::default()),
+            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
         let session_id = "sess-test".to_string();

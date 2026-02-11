@@ -8,7 +8,7 @@
 
 import { Clock, AlertTriangle, X } from 'lucide-react';
 import { useEffect } from 'react';
-import { useUiStore } from '../store/uiStore';
+import { useUiStore, UiState } from '../store/uiStore';
 
 interface RateLimitIndicatorProps {
   sessionId: string;
@@ -29,7 +29,7 @@ export function RateLimitIndicator({
   remainingSecs,
   onCancel,
 }: RateLimitIndicatorProps) {
-  const updateRemainingTime = useUiStore(state => state.updateRemainingTime);
+  const updateRemainingTime = useUiStore((state: UiState) => state.updateRemainingTime);
   
   // Update countdown timer every second
   useEffect(() => {

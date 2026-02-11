@@ -72,6 +72,7 @@ async fn test_undo_handler_single_agent() -> Result<()> {
             function_index: Arc::new(tokio::sync::OnceCell::new()),
             turn_snapshot: std::sync::Mutex::new(None),
             turn_diffs: std::sync::Mutex::new(Default::default()),
+            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         });
         let mut runtimes = agent.session_runtime.lock().await;
         runtimes.insert(session_id.clone(), runtime);
@@ -264,6 +265,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
             function_index: Arc::new(tokio::sync::OnceCell::new()),
             turn_snapshot: std::sync::Mutex::new(None),
             turn_diffs: std::sync::Mutex::new(Default::default()),
+            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         });
         let mut runtimes = agent.session_runtime.lock().await;
         runtimes.insert(parent_id.clone(), runtime.clone());

@@ -151,6 +151,11 @@ pub enum AgentEventKind {
         /// Execution metrics at time of stop
         metrics: ExecutionMetrics,
     },
+    /// Emitted when a prompt is queued because another operation is executing
+    SessionQueued {
+        /// Reason for queueing (e.g., "waiting for previous operation to complete")
+        reason: String,
+    },
     Cancelled,
     Error {
         message: String,

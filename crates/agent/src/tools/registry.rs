@@ -22,6 +22,13 @@ impl ToolRegistry {
         self
     }
 
+    pub fn extend(&mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> &mut Self {
+        for tool in tools {
+            self.add(tool);
+        }
+        self
+    }
+
     pub fn definitions(&self) -> Vec<querymt::chat::Tool> {
         self.tools.values().map(|tool| tool.definition()).collect()
     }

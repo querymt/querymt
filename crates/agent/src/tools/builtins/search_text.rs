@@ -448,6 +448,13 @@ impl ToolTrait for SearchTextTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn truncation_hint(&self) -> Option<&'static str> {
+        Some(
+            "TIP: Many matches found and truncated. Refine your search pattern, \
+             add file type/path filters, or increase specificity to narrow results.",
+        )
+    }
+
     async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
         let pattern = args
             .get("pattern")

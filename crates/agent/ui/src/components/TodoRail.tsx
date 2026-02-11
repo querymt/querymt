@@ -49,7 +49,7 @@ export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyCh
   return (
     <div className="w-72 border-l border-cyber-border/50 bg-cyber-bg/60 backdrop-blur-sm flex flex-col relative">
       {/* Header */}
-      <div className="px-4 py-3 border-b border-cyber-border/50 bg-cyber-surface/40 flex items-center justify-between">
+      <div className="px-4 py-2 border-b border-cyber-border/50 bg-cyber-surface/40 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="text-lg">📋</span>
           <span className="text-sm font-semibold text-gray-200">Tasks</span>

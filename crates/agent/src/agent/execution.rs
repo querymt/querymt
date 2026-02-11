@@ -38,8 +38,23 @@ pub enum CycleOutcome {
     Stopped(StopReason),
 }
 
+// Error code constants
+const ERROR_SESSION_BUSY: i32 = -32001;
+const ERROR_SESSION_TIMEOUT: i32 = -32002;
+
 impl QueryMTAgent {
-    /// Processes a prompt request and executes the agent loop.
+    /// Executes a prompt for the given session, waiting if another operation is in progress.
+    ///
+    /// Multiple concurrent calls for the same session will be queued and executed in FIFO order.
+    /// This ensures tool_use/tool_result message sequencing remains valid.
+    ///
+    /// # Cancellation
+    ///
+    /// Prompts can be cancelled via `cancel_session`. A cancelled prompt continues
+    /// to hold the execution permit until cleanup completes, preventing race conditions
+    /// with subsequent prompts.
+    ///
+    /// For non-blocking behavior, use [`Self::try_run_prompt`].
     #[instrument(
         name = "agent.run_prompt",
         skip(self, req),
@@ -50,6 +65,34 @@ impl QueryMTAgent {
         )
     )]
     pub async fn run_prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
+        self.run_prompt_impl(req, true).await
+    }
+
+    /// Attempts to execute a prompt for the given session, failing immediately if busy.
+    ///
+    /// Returns an error with code `-32001` if another operation is currently executing
+    /// for this session. Useful for fail-fast scenarios or health checks.
+    ///
+    /// For blocking behavior, use [`Self::run_prompt`].
+    #[instrument(
+        name = "agent.try_run_prompt",
+        skip(self, req),
+        fields(
+            session_id = %req.session_id,
+            prompt_blocks = req.prompt.len(),
+            otel.kind = "server"
+        )
+    )]
+    pub async fn try_run_prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
+        self.run_prompt_impl(req, false).await
+    }
+
+    /// Internal implementation shared by run_prompt and try_run_prompt
+    async fn run_prompt_impl(
+        &self,
+        req: PromptRequest,
+        blocking: bool,
+    ) -> Result<PromptResponse, Error> {
         let session_id = req.session_id.to_string();
         info!(
             "Prompt request for session {} with {} block(s)",
@@ -67,6 +110,81 @@ impl QueryMTAgent {
                 "message": "unknown session",
                 "sessionId": session_id,
             })));
+        };
+
+        // Acquire execution permit (blocking or non-blocking)
+        let _permit = if blocking {
+            // Blocking path: wait for permit with logging and timeout
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                runtime.execution_permit.acquire(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => {
+                    debug!(
+                        "Session {} execution permit acquired immediately",
+                        session_id
+                    );
+                    permit
+                }
+                Ok(Err(_)) => {
+                    return Err(Error::new(-32000, "Session semaphore closed"));
+                }
+                Err(_) => {
+                    // Permit not available within 100ms - we're queued
+                    info!(
+                        "Session {} is busy, waiting for previous operation to complete...",
+                        session_id
+                    );
+
+                    // Emit event for UI
+                    self.emit_event(
+                        &session_id,
+                        AgentEventKind::SessionQueued {
+                            reason: "waiting for previous operation to complete".to_string(),
+                        },
+                    );
+
+                    // Wait with timeout
+                    let timeout_duration =
+                        std::time::Duration::from_secs(self.execution_timeout_secs);
+                    match tokio::time::timeout(timeout_duration, runtime.execution_permit.acquire())
+                        .await
+                    {
+                        Ok(Ok(permit)) => {
+                            info!("Session {} permit acquired after waiting", session_id);
+                            permit
+                        }
+                        Ok(Err(_)) => {
+                            return Err(Error::new(-32000, "Session semaphore closed"));
+                        }
+                        Err(_) => {
+                            warn!(
+                                "Session {} execution timeout after {}s - previous operation may be stuck",
+                                session_id, self.execution_timeout_secs
+                            );
+                            return Err(Error::new(ERROR_SESSION_TIMEOUT, "Session execution timeout")
+                                .data(serde_json::json!({
+                                    "sessionId": session_id,
+                                    "timeoutSecs": self.execution_timeout_secs,
+                                    "message": "Waited too long for previous operation to complete. It may be stuck."
+                                })));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Non-blocking path: try or fail immediately
+            runtime.execution_permit.try_acquire()
+                .map_err(|_| {
+                    debug!("Session {} is busy, try_run_prompt failing immediately", session_id);
+                    Error::new(ERROR_SESSION_BUSY, "Session is currently busy")
+                        .data(serde_json::json!({
+                            "sessionId": session_id,
+                            "message": "Another operation is in progress. Use run_prompt() to wait, or retry later."
+                        }))
+                })?
         };
 
         // 1. Setup Cancellation
