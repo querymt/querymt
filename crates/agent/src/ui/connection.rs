@@ -255,6 +255,51 @@ pub async fn subscribe_to_file_index(
         workspace_root
     );
 
+    // IMPORTANT: Send the current index immediately to avoid subscription race condition
+    // When subscribing to a broadcast channel, we only receive FUTURE messages.
+    // If the workspace already existed (cached), the initial index was sent before we subscribed.
+    // This ensures new subscribers get the current state immediately.
+    if let Some(current_index) = workspace.file_index() {
+        // Get current session's cwd to filter the index
+        let cwd = {
+            let connections = state.connections.lock().await;
+            let conn = connections.get(&conn_id);
+            let session_id = conn.and_then(|c| c.sessions.get(&c.active_agent_id).cloned());
+
+            if let Some(session_id) = session_id {
+                let cwds = state.session_cwds.lock().await;
+                cwds.get(&session_id).cloned()
+            } else {
+                None
+            }
+        };
+
+        if let Some(cwd) = cwd {
+            if let Ok(relative_cwd) = cwd.strip_prefix(&workspace_root) {
+                let files = super::mentions::filter_index_for_cwd(&current_index, relative_cwd);
+
+                // Send initial index
+                if let Err(err) = send_message(
+                    &tx,
+                    UiServerMessage::FileIndex {
+                        files,
+                        generated_at: current_index.generated_at,
+                    },
+                )
+                .await
+                {
+                    log::warn!(
+                        "Failed to send initial file index to connection {}: {}",
+                        conn_id,
+                        err
+                    );
+                } else {
+                    log::debug!("Sent initial file index to connection {}", conn_id);
+                }
+            }
+        }
+    }
+
     // Spawn a task to forward file index updates to the client
     tokio::spawn(async move {
         while let Ok(index) = index_rx.recv().await {

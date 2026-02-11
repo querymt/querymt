@@ -237,9 +237,13 @@ impl FileIndexWatcher {
         let watcher_config = Config::default().with_poll_interval(Duration::from_secs(2));
 
         let mut watcher = RecommendedWatcher::new(
-            move |res: Result<Event, notify::Error>| {
-                if let Ok(event) = res {
+            move |res: Result<Event, notify::Error>| match res {
+                Ok(event) => {
+                    log::trace!("FileWatcher: received event {:?}", event.kind);
                     let _ = event_tx.blocking_send(event);
+                }
+                Err(e) => {
+                    log::warn!("FileWatcher: error receiving event: {:?}", e);
                 }
             },
             watcher_config,
@@ -311,6 +315,10 @@ impl FileIndexWatcher {
                             pending_events.clear();
 
                             if !change_set.changes.is_empty() {
+                                log::debug!(
+                                    "FileIndexWatcher: Processing {} file changes",
+                                    change_set.changes.len()
+                                );
                                 let _ = changes_tx_clone.send(change_set.clone());
                                 if let Some(current) = (**index_clone.load()).clone() {
                                     let updated = apply_changes_to_index(
@@ -321,9 +329,14 @@ impl FileIndexWatcher {
                                         &overrides_clone,
                                     );
                                     index_clone.store(Arc::new(Some(updated.clone())));
+                                    log::debug!(
+                                        "FileIndexWatcher: Broadcasting updated index with {} files",
+                                        updated.files.len()
+                                    );
                                     let _ = index_tx_clone.send(updated);
                                 } else {
                                     // No current index, do full rebuild in spawn_blocking
+                                    log::debug!("FileIndexWatcher: No current index, performing full rebuild");
                                     let root = root_clone.clone();
                                     let config = config_clone.clone();
                                     let overrides = overrides_clone.clone();
@@ -332,6 +345,10 @@ impl FileIndexWatcher {
                                         build_file_index(&root, &config, &overrides)
                                     }).await {
                                         index_clone.store(Arc::new(Some(new_index.clone())));
+                                        log::debug!(
+                                            "FileIndexWatcher: Broadcasting rebuilt index with {} files",
+                                            new_index.files.len()
+                                        );
                                         let _ = index_tx_clone.send(new_index);
                                     }
                                 }
@@ -487,7 +504,17 @@ fn process_events(events: &[Event], root: &Path, overrides: &Override) -> FileCh
                 continue;
             }
 
-            let is_dir = path.is_dir();
+            // Determine if this is a directory
+            // For CreateKind::Folder and RemoveKind::Folder, we know it's a directory from the event
+            // For other cases, we need to check the filesystem (which may have timing issues)
+            let is_dir = match &event.kind {
+                EventKind::Create(CreateKind::Folder) => true,
+                EventKind::Create(CreateKind::File) => false,
+                EventKind::Remove(RemoveKind::Folder) => true,
+                EventKind::Remove(RemoveKind::File) => false,
+                // For Any/Other/Modify events, check the filesystem
+                _ => path.is_dir(),
+            };
 
             let relative = match path.strip_prefix(root) {
                 Ok(rel) => rel.to_string_lossy().to_string(),
@@ -499,15 +526,20 @@ fn process_events(events: &[Event], root: &Path, overrides: &Override) -> FileCh
             }
 
             let change_kind = match &event.kind {
-                EventKind::Create(CreateKind::File) | EventKind::Create(CreateKind::Folder) => {
-                    Some(FileChangeKind::Created)
-                }
+                // Handle all CreateKind variants
+                // CreateKind::Any is the catch-all used when the specific kind is unknown
+                // (common on macOS with FSEvents which doesn't distinguish file vs folder)
+                EventKind::Create(CreateKind::File)
+                | EventKind::Create(CreateKind::Folder)
+                | EventKind::Create(CreateKind::Any)
+                | EventKind::Create(CreateKind::Other) => Some(FileChangeKind::Created),
                 EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Any) => {
                     Some(FileChangeKind::Modified)
                 }
-                EventKind::Remove(RemoveKind::File) | EventKind::Remove(RemoveKind::Folder) => {
-                    Some(FileChangeKind::Removed)
-                }
+                EventKind::Remove(RemoveKind::File)
+                | EventKind::Remove(RemoveKind::Folder)
+                | EventKind::Remove(RemoveKind::Any)
+                | EventKind::Remove(RemoveKind::Other) => Some(FileChangeKind::Removed),
                 EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
                     rename_from = Some(path.clone());
                     None
@@ -522,6 +554,18 @@ fn process_events(events: &[Event], root: &Path, overrides: &Override) -> FileCh
                     // Both paths are in event.paths
                     Some(FileChangeKind::Modified)
                 }
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any))
+                | EventKind::Modify(ModifyKind::Name(RenameMode::Other)) => {
+                    // FSEvents (macOS) sends RenameMode::Any for both source and destination
+                    // of a rename/move. We can't correlate them, so check if path exists:
+                    // - Exists: destination of rename → Created
+                    // - Doesn't exist: source of rename → Removed
+                    if path.exists() {
+                        Some(FileChangeKind::Created)
+                    } else {
+                        Some(FileChangeKind::Removed)
+                    }
+                }
                 _ => None,
             };
 
@@ -529,12 +573,25 @@ fn process_events(events: &[Event], root: &Path, overrides: &Override) -> FileCh
                 // Check if path is within root
                 if path.starts_with(root) {
                     seen_paths.insert(path.clone());
+                    log::debug!(
+                        "FileIndexWatcher: Detected {:?} event for {} (is_dir: {})",
+                        kind,
+                        relative,
+                        is_dir
+                    );
                     changes.push(FileChange {
                         path: path.clone(),
                         kind,
                         is_dir,
                     });
                 }
+            } else {
+                // Log events we're ignoring (helps debugging)
+                log::trace!(
+                    "FileIndexWatcher: Ignoring event {:?} for path {:?}",
+                    event.kind,
+                    relative
+                );
             }
         }
     }
@@ -1195,5 +1252,439 @@ mod tests {
         );
 
         println!("\n✓ UI directory correctly ignores node_modules");
+    }
+
+    /// Test that CreateKind::Any events are properly handled
+    /// This is critical for macOS FSEvents which often uses Any instead of File/Folder
+    #[test]
+    fn test_create_kind_any_handling() {
+        use notify::event::CreateKind;
+        use notify::{Event, EventKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        println!("\n=== Testing CreateKind::Any Handling ===\n");
+
+        // Create test file
+        fs::write(root.join("test.txt"), "content").unwrap();
+
+        let config = FileIndexConfig::default();
+        let overrides = compile_overrides(root, &config).unwrap();
+
+        // Test all CreateKind variants
+        let create_variants = vec![
+            (CreateKind::File, "File"),
+            (CreateKind::Folder, "Folder"),
+            (CreateKind::Any, "Any"),
+            (CreateKind::Other, "Other"),
+        ];
+
+        for (create_kind, name) in create_variants {
+            println!("Testing CreateKind::{}", name);
+
+            let mut event = Event::new(EventKind::Create(create_kind));
+            event.paths.push(root.join("test.txt"));
+
+            let change_set = process_events(&[event], root, &overrides);
+
+            assert_eq!(
+                change_set.changes.len(),
+                1,
+                "CreateKind::{} should be detected",
+                name
+            );
+
+            let change = &change_set.changes[0];
+            assert_eq!(change.kind, FileChangeKind::Created);
+            assert_eq!(
+                change.path,
+                root.join("test.txt"),
+                "Path should match for CreateKind::{}",
+                name
+            );
+
+            println!("  ✓ CreateKind::{} correctly detected", name);
+        }
+
+        println!("\n✓ All CreateKind variants properly handled");
+    }
+
+    /// Test that RemoveKind::Any events are properly handled
+    #[test]
+    fn test_remove_kind_any_handling() {
+        use notify::event::RemoveKind;
+        use notify::{Event, EventKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        println!("\n=== Testing RemoveKind::Any Handling ===\n");
+
+        let config = FileIndexConfig::default();
+        let overrides = compile_overrides(root, &config).unwrap();
+
+        // Test all RemoveKind variants
+        let remove_variants = vec![
+            (RemoveKind::File, "File"),
+            (RemoveKind::Folder, "Folder"),
+            (RemoveKind::Any, "Any"),
+            (RemoveKind::Other, "Other"),
+        ];
+
+        for (remove_kind, name) in remove_variants {
+            println!("Testing RemoveKind::{}", name);
+
+            let mut event = Event::new(EventKind::Remove(remove_kind));
+            event.paths.push(root.join("deleted.txt"));
+
+            let change_set = process_events(&[event], root, &overrides);
+
+            assert_eq!(
+                change_set.changes.len(),
+                1,
+                "RemoveKind::{} should be detected",
+                name
+            );
+
+            let change = &change_set.changes[0];
+            assert_eq!(change.kind, FileChangeKind::Removed);
+
+            println!("  ✓ RemoveKind::{} correctly detected", name);
+        }
+
+        println!("\n✓ All RemoveKind variants properly handled");
+    }
+
+    /// Test is_dir detection using event kind
+    #[test]
+    fn test_is_dir_from_event_kind() {
+        use notify::event::{CreateKind, RemoveKind};
+        use notify::{Event, EventKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        println!("\n=== Testing is_dir Detection from Event Kind ===\n");
+
+        // Create test directory and file
+        fs::create_dir(root.join("test_dir")).unwrap();
+        fs::write(root.join("test_file.txt"), "content").unwrap();
+
+        let config = FileIndexConfig::default();
+        let overrides = compile_overrides(root, &config).unwrap();
+
+        // Test CreateKind::Folder
+        let mut folder_create = Event::new(EventKind::Create(CreateKind::Folder));
+        folder_create.paths.push(root.join("test_dir"));
+        let change_set = process_events(&[folder_create], root, &overrides);
+        assert!(
+            change_set.changes[0].is_dir,
+            "CreateKind::Folder should set is_dir=true"
+        );
+        println!("  ✓ CreateKind::Folder correctly sets is_dir=true");
+
+        // Test CreateKind::File
+        let mut file_create = Event::new(EventKind::Create(CreateKind::File));
+        file_create.paths.push(root.join("test_file.txt"));
+        let change_set = process_events(&[file_create], root, &overrides);
+        assert!(
+            !change_set.changes[0].is_dir,
+            "CreateKind::File should set is_dir=false"
+        );
+        println!("  ✓ CreateKind::File correctly sets is_dir=false");
+
+        // Test RemoveKind::Folder
+        let mut folder_remove = Event::new(EventKind::Remove(RemoveKind::Folder));
+        folder_remove.paths.push(root.join("test_dir"));
+        let change_set = process_events(&[folder_remove], root, &overrides);
+        assert!(
+            change_set.changes[0].is_dir,
+            "RemoveKind::Folder should set is_dir=true"
+        );
+        println!("  ✓ RemoveKind::Folder correctly sets is_dir=true");
+
+        // Test RemoveKind::File
+        let mut file_remove = Event::new(EventKind::Remove(RemoveKind::File));
+        file_remove.paths.push(root.join("test_file.txt"));
+        let change_set = process_events(&[file_remove], root, &overrides);
+        assert!(
+            !change_set.changes[0].is_dir,
+            "RemoveKind::File should set is_dir=false"
+        );
+        println!("  ✓ RemoveKind::File correctly sets is_dir=false");
+
+        // Test CreateKind::Any falls back to filesystem check
+        let mut any_create = Event::new(EventKind::Create(CreateKind::Any));
+        any_create.paths.push(root.join("test_dir"));
+        let change_set = process_events(&[any_create], root, &overrides);
+        assert!(
+            change_set.changes[0].is_dir,
+            "CreateKind::Any should detect directory from filesystem"
+        );
+        println!("  ✓ CreateKind::Any correctly falls back to filesystem check");
+
+        println!("\n✓ is_dir detection working correctly");
+    }
+
+    /// Test RenameMode::Any handling - the core fix for macOS rename detection
+    #[test]
+    fn test_rename_mode_any_handling() {
+        use notify::event::ModifyKind;
+        use notify::{Event, EventKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        println!("\n=== Testing RenameMode::Any Handling ===\n");
+
+        let config = FileIndexConfig::default();
+        let overrides = compile_overrides(root, &config).unwrap();
+
+        // Test Case 1: RenameMode::Any for a file that EXISTS (destination of rename)
+        println!("Test Case 1: RenameMode::Any for existing file (destination)");
+        let existing_file = root.join("destination.txt");
+        fs::write(&existing_file, "content").unwrap();
+
+        let mut event_exists = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)));
+        event_exists.paths.push(existing_file.clone());
+
+        let change_set = process_events(&[event_exists], root, &overrides);
+
+        assert_eq!(
+            change_set.changes.len(),
+            1,
+            "RenameMode::Any for existing file should be detected"
+        );
+        assert_eq!(
+            change_set.changes[0].kind,
+            FileChangeKind::Created,
+            "Existing path should be treated as Created"
+        );
+        assert_eq!(change_set.changes[0].path, existing_file);
+        println!("  ✓ Existing file correctly detected as Created\n");
+
+        // Test Case 2: RenameMode::Any for a file that DOESN'T EXIST (source of rename)
+        println!("Test Case 2: RenameMode::Any for non-existing file (source)");
+        let non_existing_file = root.join("source.txt");
+        // Don't create this file - it should not exist
+
+        let mut event_not_exists = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)));
+        event_not_exists.paths.push(non_existing_file.clone());
+
+        let change_set = process_events(&[event_not_exists], root, &overrides);
+
+        assert_eq!(
+            change_set.changes.len(),
+            1,
+            "RenameMode::Any for non-existing file should be detected"
+        );
+        assert_eq!(
+            change_set.changes[0].kind,
+            FileChangeKind::Removed,
+            "Non-existing path should be treated as Removed"
+        );
+        assert_eq!(change_set.changes[0].path, non_existing_file);
+        println!("  ✓ Non-existing file correctly detected as Removed\n");
+
+        // Test Case 3: Simulate a full rename operation (both source and destination)
+        println!("Test Case 3: Simulated rename operation (source → destination)");
+        let source_path = root.join("old_name.txt");
+        let dest_path = root.join("new_name.txt");
+
+        // Initially, source exists, destination doesn't
+        fs::write(&source_path, "content").unwrap();
+
+        // First event: source path (still exists at this point in real scenario, but we'll
+        // simulate after the rename when it doesn't exist)
+        let mut source_event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)));
+        source_event.paths.push(source_path.clone());
+
+        // Second event: destination path (now exists)
+        let mut dest_event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)));
+        dest_event.paths.push(dest_path.clone());
+
+        // Simulate the rename: move source to dest
+        fs::rename(&source_path, &dest_path).unwrap();
+
+        // Process both events (as FSEvents would send them)
+        let change_set = process_events(&[source_event, dest_event], root, &overrides);
+
+        // Should get 2 changes: one Removed (source), one Created (dest)
+        assert_eq!(
+            change_set.changes.len(),
+            2,
+            "Should detect both source removal and destination creation"
+        );
+
+        let has_removed = change_set
+            .changes
+            .iter()
+            .any(|c| c.path == source_path && c.kind == FileChangeKind::Removed);
+        let has_created = change_set
+            .changes
+            .iter()
+            .any(|c| c.path == dest_path && c.kind == FileChangeKind::Created);
+
+        assert!(
+            has_removed,
+            "Source path should be detected as Removed: {:?}",
+            change_set.changes
+        );
+        assert!(
+            has_created,
+            "Destination path should be detected as Created: {:?}",
+            change_set.changes
+        );
+
+        println!("  ✓ Source correctly detected as Removed");
+        println!("  ✓ Destination correctly detected as Created");
+
+        println!("\n✓ RenameMode::Any handling working correctly");
+    }
+
+    /// Test RenameMode::Other handling (should behave like RenameMode::Any)
+    #[test]
+    fn test_rename_mode_other_handling() {
+        use notify::event::ModifyKind;
+        use notify::{Event, EventKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        println!("\n=== Testing RenameMode::Other Handling ===\n");
+
+        let config = FileIndexConfig::default();
+        let overrides = compile_overrides(root, &config).unwrap();
+
+        // Test with existing file
+        let existing_file = root.join("test.txt");
+        fs::write(&existing_file, "content").unwrap();
+
+        let mut event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Other)));
+        event.paths.push(existing_file.clone());
+
+        let change_set = process_events(&[event], root, &overrides);
+
+        assert_eq!(
+            change_set.changes.len(),
+            1,
+            "RenameMode::Other should be detected"
+        );
+        assert_eq!(
+            change_set.changes[0].kind,
+            FileChangeKind::Created,
+            "Should behave like RenameMode::Any"
+        );
+
+        println!("  ✓ RenameMode::Other correctly handled\n");
+    }
+
+    /// Integration test: Verify file move is detected and index is updated
+    /// This test is marked #[ignore] because it relies on actual file system events
+    /// and timing, which can be flaky in CI environments.
+    #[tokio::test]
+    #[ignore]
+    async fn test_file_move_detected() {
+        use tokio::time::{Duration, sleep};
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().to_path_buf();
+
+        println!("\n=== Integration Test: File Move Detection ===\n");
+
+        // Create watcher with shorter intervals for faster testing
+        let config = FileIndexConfig {
+            debounce: Duration::from_millis(100),
+            rebuild_interval: Duration::from_millis(500),
+            ..Default::default()
+        };
+
+        let watcher = FileIndexWatcher::with_config(root.clone(), config)
+            .await
+            .unwrap();
+
+        let mut changes_rx = watcher.subscribe_changes();
+
+        // Step 1: Create initial file
+        println!("Step 1: Creating initial file 'original.txt'");
+        let original_path = root.join("original.txt");
+        fs::write(&original_path, "test content").unwrap();
+
+        // Wait for debounce + rebuild
+        sleep(Duration::from_millis(800)).await;
+
+        // Verify file appears in index
+        let index = watcher.get_index().unwrap();
+        assert!(
+            index.files.iter().any(|f| f.path == "original.txt"),
+            "Original file should be in index"
+        );
+        println!("  ✓ Original file indexed");
+
+        // Step 2: Move/rename the file
+        println!("\nStep 2: Moving 'original.txt' → 'renamed.txt'");
+        let renamed_path = root.join("renamed.txt");
+        fs::rename(&original_path, &renamed_path).unwrap();
+
+        // Wait for debounce + rebuild
+        sleep(Duration::from_millis(800)).await;
+
+        // Step 3: Check for change events
+        println!("\nStep 3: Checking for change events");
+        let mut found_changes = false;
+        let mut has_removed = false;
+        let mut has_created = false;
+
+        // Try to receive changes (with timeout)
+        match tokio::time::timeout(Duration::from_millis(500), changes_rx.recv()).await {
+            Ok(Ok(change_set)) => {
+                found_changes = true;
+                println!("  Received {} changes:", change_set.changes.len());
+                for change in &change_set.changes {
+                    let relative = change.path.strip_prefix(&root).unwrap_or(&change.path);
+                    println!("    - {:?}: {:?}", relative, change.kind);
+
+                    if relative == Path::new("original.txt")
+                        && change.kind == FileChangeKind::Removed
+                    {
+                        has_removed = true;
+                    }
+                    if relative == Path::new("renamed.txt")
+                        && change.kind == FileChangeKind::Created
+                    {
+                        has_created = true;
+                    }
+                }
+            }
+            Ok(Err(e)) => println!("  Error receiving changes: {:?}", e),
+            Err(_) => println!("  No changes received (timeout)"),
+        }
+
+        if found_changes {
+            println!("\n  ✓ Change events detected");
+            if has_removed {
+                println!("  ✓ Original file detected as Removed");
+            }
+            if has_created {
+                println!("  ✓ Renamed file detected as Created");
+            }
+        }
+
+        // Step 4: Verify final index state
+        println!("\nStep 4: Verifying final index state");
+        let final_index = watcher.get_index().unwrap();
+
+        let has_original = final_index.files.iter().any(|f| f.path == "original.txt");
+        let has_renamed = final_index.files.iter().any(|f| f.path == "renamed.txt");
+
+        println!("  Index contains 'original.txt': {}", has_original);
+        println!("  Index contains 'renamed.txt': {}", has_renamed);
+
+        assert!(!has_original, "Original file should be removed from index");
+        assert!(has_renamed, "Renamed file should be in index");
+
+        println!("\n  ✓ Index correctly reflects the file move");
+        println!("\n✓ File move integration test passed");
     }
 }
