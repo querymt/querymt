@@ -115,6 +115,12 @@ export function ChatView() {
     return () => setFileIndexErrorCallback(null);
   }, [setFileIndexErrorCallback, fileMention.handleFileIndexError]);
 
+  // Clear file index when session changes (different session = different CWD = different files)
+  useEffect(() => {
+    fileMention.resetIndex();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
+
   // useSessionManager for session navigation
   const { selectSession, createSession } = useSessionManager();
 

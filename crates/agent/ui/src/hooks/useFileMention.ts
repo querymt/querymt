@@ -19,6 +19,7 @@ export interface UseFileMentionReturn {
   handleFileIndex: (files: FileIndexEntry[], generatedAt: number) => void;
   handleFileIndexError: (message: string) => void;
   requestIndex: () => void;
+  resetIndex: () => void;
 }
 
 export function useFileMention(
@@ -76,6 +77,14 @@ export function useFileMention(
     console.warn('[useFileMention] File index error:', message);
     setIsLoading(false);  // Reset loading state so user can retry
   }, []);
+
+  // Reset file index state (used when switching sessions with different CWDs)
+  const resetIndex = useCallback(() => {
+    setFileIndex(null);
+    setIsLoading(false);
+    setQuery('');
+    setSelectedIndex(0);
+  }, []);
   
   // Local search (instant, no network)
   const search = useCallback((q: string) => {
@@ -112,5 +121,6 @@ export function useFileMention(
     handleFileIndex,
     handleFileIndexError,
     requestIndex,
+    resetIndex,
   };
 }

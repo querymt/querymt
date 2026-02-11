@@ -288,4 +288,76 @@ describe('useFileMention', () => {
     
     expect(result.current.selectedIndex).toBe(4);
   });
+
+  it('clears file index and resets state when resetIndex is called', () => {
+    const { result } = renderHook(() => useFileMention(mockRequestFileIndex));
+    
+    // Load initial files
+    act(() => {
+      result.current.handleFileIndex(mockFiles, Date.now());
+    });
+    
+    expect(result.current.hasIndex).toBe(true);
+    expect(result.current.allFiles).toHaveLength(mockFiles.length);
+    
+    // Perform a search and set selection
+    act(() => {
+      result.current.search('test');
+      result.current.setSelectedIndex(2);
+    });
+    
+    // Reset the index
+    act(() => {
+      result.current.resetIndex();
+    });
+    
+    // Verify all state is cleared
+    expect(result.current.hasIndex).toBe(false);
+    expect(result.current.allFiles).toEqual([]);
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.selectedIndex).toBe(0);
+    expect(result.current.results).toEqual([]);
+  });
+
+  it('allows re-requesting index after resetIndex (simulating session switch)', () => {
+    const { result } = renderHook(() => useFileMention(mockRequestFileIndex));
+    
+    // Load initial files for "session A"
+    act(() => {
+      result.current.handleFileIndex(mockFiles, Date.now());
+    });
+    
+    expect(result.current.hasIndex).toBe(true);
+    expect(mockRequestFileIndex).toHaveBeenCalledTimes(0);
+    
+    // Simulate session switch - reset the index
+    act(() => {
+      result.current.resetIndex();
+    });
+    
+    expect(result.current.hasIndex).toBe(false);
+    expect(result.current.allFiles).toEqual([]);
+    
+    // Now search should trigger a new request (for "session B")
+    act(() => {
+      result.current.search('test');
+    });
+    
+    expect(mockRequestFileIndex).toHaveBeenCalledTimes(1);
+    expect(result.current.isLoading).toBe(true);
+    
+    // Simulate receiving new files from session B
+    const sessionBFiles: FileIndexEntry[] = [
+      { path: 'different/path.ts', is_dir: false },
+      { path: 'another/file.tsx', is_dir: false },
+    ];
+    
+    act(() => {
+      result.current.handleFileIndex(sessionBFiles, Date.now());
+    });
+    
+    expect(result.current.hasIndex).toBe(true);
+    expect(result.current.allFiles).toEqual(sessionBFiles);
+    expect(result.current.isLoading).toBe(false);
+  });
 });
