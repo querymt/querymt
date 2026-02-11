@@ -22,5 +22,4 @@ system = [{file = "../prompts/coder.md"}]
 
 [delegates.parameters]
 base_url = "http://localhost:9999"
-extra_body = { target_provider = "llama_cpp", model_path = "hf:unsloth/Qwen3-VL-8B-Instruct-GGUF:Qwen3-VL-8B-Instruct-Q5_K_M.gguf" }
-
+extra_body = { model_path = "hf:unsloth/Qwen3-VL-8B-Instruct-GGUF:Qwen3-VL-8B-Instruct-Q5_K_M.gguf" }
