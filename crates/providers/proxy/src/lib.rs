@@ -1026,6 +1026,20 @@ mod tests {
         assert_eq!(usage.input_tokens, 1);
         assert_eq!(usage.output_tokens, 2);
     }
+
+    #[test]
+    fn deserialize_base_url_adds_trailing_slash() {
+        let json = r#"{"base_url":"http://localhost:8080","model":"llama_cpp:test"}"#;
+        let cfg: ProxyConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.base_url.as_str(), "http://localhost:8080/");
+    }
+
+    #[test]
+    fn deserialize_base_url_preserves_trailing_slash() {
+        let json = r#"{"base_url":"http://localhost:8080/","model":"llama_cpp:test"}"#;
+        let cfg: ProxyConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.base_url.as_str(), "http://localhost:8080/");
+    }
 }
 
 #[cfg(feature = "native")]
