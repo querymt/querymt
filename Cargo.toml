@@ -5,7 +5,7 @@ members = [
     "crates/querymt",
     "crates/cli",
     "crates/querymt-utils",
-    "crates/service",
+    "crates/querymt-service",
     "crates/providers/*", "crates/querymt-extism-macros",
 ]
 
