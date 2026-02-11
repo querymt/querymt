@@ -274,28 +274,28 @@ pub async fn subscribe_to_file_index(
             }
         };
 
-        if let Some(cwd) = cwd {
-            if let Ok(relative_cwd) = cwd.strip_prefix(&workspace_root) {
-                let files = super::mentions::filter_index_for_cwd(&current_index, relative_cwd);
+        if let Some(cwd) = cwd
+            && let Ok(relative_cwd) = cwd.strip_prefix(&workspace_root)
+        {
+            let files = super::mentions::filter_index_for_cwd(&current_index, relative_cwd);
 
-                // Send initial index
-                if let Err(err) = send_message(
-                    &tx,
-                    UiServerMessage::FileIndex {
-                        files,
-                        generated_at: current_index.generated_at,
-                    },
-                )
-                .await
-                {
-                    log::warn!(
-                        "Failed to send initial file index to connection {}: {}",
-                        conn_id,
-                        err
-                    );
-                } else {
-                    log::debug!("Sent initial file index to connection {}", conn_id);
-                }
+            // Send initial index
+            if let Err(err) = send_message(
+                &tx,
+                UiServerMessage::FileIndex {
+                    files,
+                    generated_at: current_index.generated_at,
+                },
+            )
+            .await
+            {
+                log::warn!(
+                    "Failed to send initial file index to connection {}: {}",
+                    conn_id,
+                    err
+                );
+            } else {
+                log::debug!("Sent initial file index to connection {}", conn_id);
             }
         }
     }
