@@ -17,6 +17,7 @@ extism = ["extism-pdk", "querymt", "querymt-extism-macros"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+base64.workspace = true
 querymt = { path = "../../querymt", default-features = false, optional = true }
 querymt-extism-macros = { path = "../../querymt-extism-macros", optional = true }
 serde.workspace = true

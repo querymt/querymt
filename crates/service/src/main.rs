@@ -7,14 +7,16 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::post,
+    routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::Parser;
 use futures::StreamExt;
 use futures::stream as futures_stream;
 use querymt::{
-    FunctionCall, LLMProvider, ToolCall,
-    chat::{ChatMessage, ChatRole, MessageType, StreamChunk, Tool},
+    FunctionCall, LLMProvider, ToolCall, Usage,
+    chat::{ChatMessage, ChatRole, ImageMime, MessageType, StreamChunk, Tool},
+    completion::CompletionRequest as QmtCompletionRequest,
     error::LLMError,
     plugin::{
         default_providers_path,
@@ -59,7 +61,7 @@ struct ServerState {
 
 #[derive(Deserialize)]
 struct ChatRequest {
-    pub messages: Option<Vec<Message>>,
+    pub messages: Option<Vec<MessageIn>>,
     pub model: Option<String>,
     #[serde(default)]
     pub steps: Vec<ChainStepRequest>,
@@ -71,6 +73,34 @@ struct ChatRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub tools: Option<Vec<Tool>>,
+    #[serde(default, flatten)]
+    pub options: HashMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct CompletionHttpRequest {
+    pub prompt: Option<String>,
+    pub suffix: Option<String>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default, flatten)]
+    pub options: HashMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    Single(String),
+    Multi(Vec<String>),
+}
+
+#[derive(Deserialize)]
+struct EmbeddingsHttpRequest {
+    pub input: Option<EmbeddingInput>,
+    pub model: Option<String>,
     #[serde(default, flatten)]
     pub options: HashMap<String, Value>,
 }
@@ -88,11 +118,68 @@ struct ChainStepRequest {
     pub response_transform: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
+struct MessageIn {
+    pub role: String,
+    #[serde(default)]
+    pub content: Option<MessageContentIn>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "reasoning_content"
+    )]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MessageContentIn {
+    Text(String),
+    Parts(Vec<MessageContentPartIn>),
+}
+
+#[derive(Deserialize)]
+struct MessageContentPartIn {
+    #[serde(rename = "type")]
+    part_type: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    image_url: Option<MessageImageUrlIn>,
+    #[serde(default)]
+    source: Option<MessageContentSourceIn>,
+}
+
+#[derive(Deserialize)]
+struct MessageImageUrlIn {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct MessageContentSourceIn {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Serialize)]
 struct Message {
     pub role: String,
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "reasoning_content"
+    )]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,6 +195,49 @@ struct ChatResponse {
     pub created: u64,
     pub model: String,
     pub choices: Vec<Choice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Serialize)]
+struct CompletionHttpResponse {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<CompletionChoice>,
+}
+
+#[derive(Serialize)]
+struct CompletionChoice {
+    pub index: usize,
+    pub text: String,
+    pub finish_reason: String,
+}
+
+#[derive(Serialize)]
+struct EmbeddingsHttpResponse {
+    pub object: String,
+    pub model: String,
+    pub data: Vec<EmbeddingData>,
+}
+
+#[derive(Serialize)]
+struct ModelsHttpResponse {
+    pub object: String,
+    pub data: Vec<ModelInfo>,
+}
+
+#[derive(Serialize)]
+struct ModelInfo {
+    pub id: String,
+}
+
+#[derive(Serialize)]
+struct EmbeddingData {
+    pub object: String,
+    pub embedding: Vec<f32>,
+    pub index: usize,
 }
 
 #[derive(Serialize)]
@@ -123,6 +253,7 @@ struct StreamState {
     saw_tool_calls: bool,
     finished: bool,
     stop_reason: Option<String>,
+    last_usage: Option<Usage>,
 }
 
 #[derive(Default)]
@@ -163,6 +294,9 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/v1/chat/completions", post(handle_chat))
+        .route("/v1/completions", post(handle_completion))
+        .route("/v1/embeddings", post(handle_embeddings))
+        .route("/v1/models", get(handle_models))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -213,8 +347,10 @@ async fn handle_chat(
             .map(IntoResponse::into_response);
     }
 
-    let target_provider = take_target_provider(&mut options)?;
-    let (provider_id, model_name) = resolve_provider_and_model(&req, target_provider.as_deref())?;
+    let (provider_id, model_name) = resolve_provider_and_model(&req)?;
+
+    normalize_system_option_for_provider(&provider_id, &mut options)?;
+
     info!(provider = %provider_id, model = %model_name, "building provider");
     let provider = build_provider(
         &state.registry,
@@ -330,14 +466,273 @@ async fn handle_chat(
             message: Message {
                 role: "assistant".to_string(),
                 content: response.text(),
+                reasoning_content: response.thinking(),
                 tool_calls,
                 tool_call_id: None,
                 tool_name: None,
             },
             finish_reason: finish_reason.to_string(),
         }],
+        usage: response.usage(),
     })
     .into_response())
+}
+
+async fn handle_completion(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(req): Json<CompletionHttpRequest>,
+) -> Result<Json<CompletionHttpResponse>, (StatusCode, String)> {
+    if let Some(key) = &state.auth_key {
+        let auth_header = headers.get("Authorization").ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Missing authorization".to_string(),
+        ))?;
+
+        let auth_str = auth_header.to_str().map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "Invalid authorization header".to_string(),
+            )
+        })?;
+
+        if !auth_str.starts_with("Bearer ") || &auth_str[7..] != key {
+            warn!("unauthorized request");
+            return Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()));
+        }
+    }
+
+    let prompt = req
+        .prompt
+        .clone()
+        .ok_or((StatusCode::BAD_REQUEST, "Prompt is required".to_string()))?;
+    let model = req
+        .model
+        .as_ref()
+        .ok_or((StatusCode::BAD_REQUEST, "Model is required".to_string()))?;
+
+    let mut options = req.options.clone();
+    let (provider_id, model_name) = resolve_provider_and_model_from_model(model)?;
+
+    normalize_system_option_for_provider(&provider_id, &mut options)?;
+
+    info!(provider = %provider_id, model = %model_name, "building provider");
+    let provider = build_provider(
+        &state.registry,
+        &provider_id,
+        Some(&model_name),
+        req.temperature,
+        req.max_tokens,
+        Some(&options),
+    )
+    .await
+    .map_err(|e| {
+        error!(provider = %provider_id, error = %e, "failed to build provider");
+        (StatusCode::BAD_REQUEST, e.to_string())
+    })?;
+
+    let completion_req = QmtCompletionRequest {
+        prompt,
+        suffix: req.suffix.clone(),
+        max_tokens: req.max_tokens,
+        temperature: req.temperature,
+    };
+
+    let resp = provider.complete(&completion_req).await.map_err(|e| {
+        error!(provider = %provider_id, error = %e, "completion request failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    Ok(Json(CompletionHttpResponse {
+        id: format!("cmpl-{}", Uuid::new_v4()),
+        object: "text_completion".to_string(),
+        created: now_unix_seconds(),
+        model: model_name,
+        choices: vec![CompletionChoice {
+            index: 0,
+            text: resp.text,
+            finish_reason: "stop".to_string(),
+        }],
+    }))
+}
+
+async fn handle_embeddings(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(req): Json<EmbeddingsHttpRequest>,
+) -> Result<Json<EmbeddingsHttpResponse>, (StatusCode, String)> {
+    if let Some(key) = &state.auth_key {
+        let auth_header = headers.get("Authorization").ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Missing authorization".to_string(),
+        ))?;
+
+        let auth_str = auth_header.to_str().map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "Invalid authorization header".to_string(),
+            )
+        })?;
+
+        if !auth_str.starts_with("Bearer ") || &auth_str[7..] != key {
+            warn!("unauthorized request");
+            return Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()));
+        }
+    }
+
+    let model = req
+        .model
+        .as_ref()
+        .ok_or((StatusCode::BAD_REQUEST, "Model is required".to_string()))?;
+
+    let inputs: Vec<String> = match req.input {
+        Some(EmbeddingInput::Single(s)) => vec![s],
+        Some(EmbeddingInput::Multi(v)) => v,
+        None => {
+            return Err((StatusCode::BAD_REQUEST, "Input is required".to_string()));
+        }
+    };
+    if inputs.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Input must not be empty".to_string(),
+        ));
+    }
+
+    let mut options = req.options.clone();
+    let (provider_id, model_name) = resolve_provider_and_model_from_model(model)?;
+
+    normalize_system_option_for_provider(&provider_id, &mut options)?;
+
+    info!(provider = %provider_id, model = %model_name, "building provider");
+    let provider = build_provider(
+        &state.registry,
+        &provider_id,
+        Some(&model_name),
+        None,
+        None,
+        Some(&options),
+    )
+    .await
+    .map_err(|e| {
+        error!(provider = %provider_id, error = %e, "failed to build provider");
+        (StatusCode::BAD_REQUEST, e.to_string())
+    })?;
+
+    let embeddings = provider.embed(inputs).await.map_err(|e| {
+        error!(provider = %provider_id, error = %e, "embedding request failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    let data = embeddings
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| EmbeddingData {
+            object: "embedding".to_string(),
+            embedding,
+            index,
+        })
+        .collect();
+
+    Ok(Json(EmbeddingsHttpResponse {
+        object: "list".to_string(),
+        model: model_name,
+        data,
+    }))
+}
+
+async fn handle_models(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<ModelsHttpResponse>, (StatusCode, String)> {
+    if let Some(key) = &state.auth_key {
+        let auth_header = headers.get("Authorization").ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Missing authorization".to_string(),
+        ))?;
+
+        let auth_str = auth_header.to_str().map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "Invalid authorization header".to_string(),
+            )
+        })?;
+
+        if !auth_str.starts_with("Bearer ") || &auth_str[7..] != key {
+            warn!("unauthorized request");
+            return Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()));
+        }
+    }
+
+    let providers: Vec<String> = state
+        .registry
+        .config
+        .providers
+        .iter()
+        .map(|p| p.name.clone())
+        .filter(|name| ensure_allowed_provider(name).is_ok())
+        .collect();
+
+    let mut out = Vec::new();
+    for provider_id in providers {
+        let factory = state.registry.get(&provider_id).await.ok_or((
+            StatusCode::BAD_REQUEST,
+            format!("Unknown provider: {provider_id}"),
+        ))?;
+
+        let provider_cfg = state
+            .registry
+            .config
+            .providers
+            .iter()
+            .find(|cfg| cfg.name == provider_id)
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                format!("Unknown provider: {provider_id}"),
+            ))?;
+
+        let cfg = base_provider_config(provider_cfg).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build provider config: {e}"),
+            )
+        })?;
+
+        let schema: Value = serde_json::from_str(&factory.config_schema()).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to parse config schema: {e}"),
+            )
+        })?;
+        let pruned_cfg = prune_config_by_schema(&cfg, &schema);
+        let pruned_cfg_str = serde_json::to_string(&pruned_cfg).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to serialize config: {e}"),
+            )
+        })?;
+
+        let models = match factory.list_models(&pruned_cfg_str).await {
+            Ok(models) => models,
+            Err(e) => {
+                // Model listing is best-effort: some providers require mandatory config fields
+                // (e.g. a local model_path) that may only be provided per-request.
+                warn!(provider = %provider_id, error = %e, "list_models failed; skipping provider");
+                continue;
+            }
+        };
+
+        for m in models {
+            out.push(ModelInfo {
+                id: format!("{provider_id}:{m}"),
+            });
+        }
+    }
+
+    Ok(Json(ModelsHttpResponse {
+        object: "list".to_string(),
+        data: out,
+    }))
 }
 
 async fn handle_chain_request(
@@ -346,8 +741,7 @@ async fn handle_chain_request(
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
     let mut provider_ids = Vec::new();
     let mut memory: HashMap<String, String> = HashMap::new();
-    let mut options = req.options.clone();
-    let target_provider = take_target_provider(&mut options)?;
+    let options = req.options.clone();
 
     let last_step_id = if let Some(last_step) = req.steps.last() {
         last_step.id.clone()
@@ -380,8 +774,7 @@ async fn handle_chain_request(
     };
 
     if req.model.is_some() {
-        let (provider_id, model_name) =
-            resolve_provider_and_model(&req, target_provider.as_deref())?;
+        let (provider_id, model_name) = resolve_provider_and_model(&req)?;
         provider_ids.push(provider_id.clone());
         info!(provider = %provider_id, model = %model_name, "processing chain initial step");
 
@@ -389,8 +782,15 @@ async fn handle_chain_request(
             .messages
             .as_ref()
             .and_then(|messages| messages.last())
-            .and_then(|msg| msg.content.clone())
-            .ok_or((StatusCode::BAD_REQUEST, "No messages provided".to_string()))?;
+            .and_then(|msg| match msg.content.as_ref() {
+                Some(MessageContentIn::Text(s)) => Some(s.clone()),
+                Some(MessageContentIn::Parts(_)) => None,
+                None => None,
+            })
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "Chain initial step requires a text message".to_string(),
+            ))?;
 
         let provider = build_provider(
             &state.registry,
@@ -466,7 +866,7 @@ async fn handle_chain_request(
 
     let final_response = memory.get(&last_step_id).ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("No response found for step {}", last_step_id),
+        format!("No response found for step {last_step_id}"),
     ))?;
 
     Ok(Json(ChatResponse {
@@ -482,38 +882,33 @@ async fn handle_chain_request(
             message: Message {
                 role: "assistant".to_string(),
                 content: Some(final_response.to_string()),
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 tool_name: None,
             },
             finish_reason: "stop".to_string(),
         }],
+        usage: None,
     }))
 }
 
-fn resolve_provider_and_model(
-    req: &ChatRequest,
-    target_provider: Option<&str>,
-) -> Result<(String, String), (StatusCode, String)> {
+fn resolve_provider_and_model(req: &ChatRequest) -> Result<(String, String), (StatusCode, String)> {
     let model = req
         .model
         .as_ref()
         .ok_or((StatusCode::BAD_REQUEST, "Model is required".to_string()))?;
+    resolve_provider_and_model_from_model(model)
+}
 
-    if let Some(target) = target_provider {
-        ensure_allowed_provider(target)?;
-        let model_name = model
-            .split_once(':')
-            .map(|(_, name)| name)
-            .unwrap_or(model.as_str());
-        Ok((target.to_string(), model_name.to_string()))
-    } else {
-        let (provider_id, model_name) = model
-            .split_once(':')
-            .ok_or((StatusCode::BAD_REQUEST, "Invalid model format".to_string()))?;
-        ensure_allowed_provider(provider_id)?;
-        Ok((provider_id.to_string(), model_name.to_string()))
-    }
+fn resolve_provider_and_model_from_model(
+    model: &str,
+) -> Result<(String, String), (StatusCode, String)> {
+    let (provider_id, model_name) = model
+        .split_once(':')
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid model format".to_string()))?;
+    ensure_allowed_provider(provider_id)?;
+    Ok((provider_id.to_string(), model_name.to_string()))
 }
 
 fn ensure_allowed_provider(provider_id: &str) -> Result<(), (StatusCode, String)> {
@@ -526,17 +921,42 @@ fn ensure_allowed_provider(provider_id: &str) -> Result<(), (StatusCode, String)
     }
 }
 
-fn take_target_provider(
+fn normalize_system_option_for_provider(
+    provider_id: &str,
     options: &mut HashMap<String, Value>,
-) -> Result<Option<String>, (StatusCode, String)> {
-    match options.remove("target_provider") {
-        None => Ok(None),
-        Some(Value::String(val)) => Ok(Some(val)),
-        Some(_) => Err((
-            StatusCode::BAD_REQUEST,
-            "target_provider must be a string".to_string(),
-        )),
+) -> Result<(), (StatusCode, String)> {
+    if provider_id != "llama_cpp" {
+        return Ok(());
     }
+
+    let Some(val) = options.get_mut("system") else {
+        return Ok(());
+    };
+
+    match val {
+        Value::Null => {
+            options.remove("system");
+        }
+        Value::String(s) => {
+            *val = Value::Array(vec![Value::String(s.clone())]);
+        }
+        Value::Array(arr) => {
+            if !arr.iter().all(|v| matches!(v, Value::String(_))) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "system must be a string or array of strings".to_string(),
+                ));
+            }
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "system must be a string or array of strings".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 async fn build_provider(
@@ -550,14 +970,14 @@ async fn build_provider(
     let factory = registry
         .get(provider_id)
         .await
-        .ok_or_else(|| LLMError::InvalidRequest(format!("Unknown provider: {}", provider_id)))?;
+        .ok_or_else(|| LLMError::InvalidRequest(format!("Unknown provider: {provider_id}")))?;
 
     let provider_cfg = registry
         .config
         .providers
         .iter()
         .find(|cfg| cfg.name == provider_id)
-        .ok_or_else(|| LLMError::InvalidRequest(format!("Unknown provider: {}", provider_id)))?;
+        .ok_or_else(|| LLMError::InvalidRequest(format!("Unknown provider: {provider_id}")))?;
 
     let mut cfg = base_provider_config(provider_cfg)?;
 
@@ -569,8 +989,7 @@ async fn build_provider(
         set_json_field(&mut cfg, "model", Value::String(model.to_string()));
     } else if !has_json_field(&cfg, "model") {
         return Err(LLMError::InvalidRequest(format!(
-            "Provider '{}' requires a model",
-            provider_id
+            "Provider '{provider_id}' requires a model"
         )));
     }
 
@@ -633,11 +1052,18 @@ fn merge_extra_options(cfg: &mut Value, options: &HashMap<String, Value>) {
     }
 }
 
-fn map_request_messages(messages: Vec<Message>) -> Result<Vec<ChatMessage>, (StatusCode, String)> {
+fn map_request_messages(
+    messages: Vec<MessageIn>,
+) -> Result<Vec<ChatMessage>, (StatusCode, String)> {
     let mut out = Vec::with_capacity(messages.len());
 
     for msg in messages {
-        let content = msg.content.unwrap_or_default();
+        let thinking = msg.reasoning_content.clone();
+
+        let content = match msg.content {
+            None => MessageContentIn::Text(String::new()),
+            Some(c) => c,
+        };
         let has_tool_calls = msg
             .tool_calls
             .as_ref()
@@ -645,18 +1071,71 @@ fn map_request_messages(messages: Vec<Message>) -> Result<Vec<ChatMessage>, (Sta
             .unwrap_or(false);
         let is_tool_result = msg.role == "tool" || msg.tool_call_id.is_some();
 
+        let content_text_only =
+            |content: MessageContentIn| -> Result<String, (StatusCode, String)> {
+                match content {
+                    MessageContentIn::Text(s) => Ok(s),
+                    MessageContentIn::Parts(parts) => {
+                        let mut texts = Vec::new();
+                        for part in parts {
+                            if part.part_type == "text" {
+                                if let Some(t) = part.text {
+                                    if !t.is_empty() {
+                                        texts.push(t);
+                                    }
+                                    continue;
+                                }
+                                return Err((
+                                    StatusCode::BAD_REQUEST,
+                                    "content part `text` requires `text` field".to_string(),
+                                ));
+                            }
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                "tool messages only support text content".to_string(),
+                            ));
+                        }
+                        Ok(texts.join("\n"))
+                    }
+                }
+            };
+
+        let parse_image_mime = |media_type: &str| -> Result<ImageMime, (StatusCode, String)> {
+            match media_type {
+                "image/jpeg" => Ok(ImageMime::JPEG),
+                "image/png" => Ok(ImageMime::PNG),
+                "image/gif" => Ok(ImageMime::GIF),
+                "image/webp" => Ok(ImageMime::WEBP),
+                other => Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("unsupported image media_type: {other}"),
+                )),
+            }
+        };
+
+        let decode_base64 = |data: &str| -> Result<Vec<u8>, (StatusCode, String)> {
+            BASE64.decode(data.as_bytes()).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid base64 payload: {e}"),
+                )
+            })
+        };
+
         if has_tool_calls {
+            let content = content_text_only(content)?;
             out.push(ChatMessage {
                 role: ChatRole::Assistant,
                 message_type: MessageType::ToolUse(msg.tool_calls.unwrap_or_default()),
                 content,
-                thinking: None,
+                thinking,
                 cache: None,
             });
             continue;
         }
 
         if is_tool_result {
+            let content = content_text_only(content)?;
             let call_id = msg.tool_call_id.ok_or((
                 StatusCode::BAD_REQUEST,
                 "tool_call_id is required for tool messages".to_string(),
@@ -679,7 +1158,7 @@ fn map_request_messages(messages: Vec<Message>) -> Result<Vec<ChatMessage>, (Sta
                 role: ChatRole::User,
                 message_type: MessageType::ToolResult(vec![tool_call]),
                 content,
-                thinking: None,
+                thinking,
                 cache: None,
             });
             continue;
@@ -690,13 +1169,121 @@ fn map_request_messages(messages: Vec<Message>) -> Result<Vec<ChatMessage>, (Sta
             _ => ChatRole::User,
         };
 
-        out.push(ChatMessage {
-            role,
-            message_type: MessageType::Text,
-            content,
-            thinking: None,
-            cache: None,
-        });
+        match content {
+            MessageContentIn::Text(content) => {
+                out.push(ChatMessage {
+                    role,
+                    message_type: MessageType::Text,
+                    content,
+                    thinking,
+                    cache: None,
+                });
+            }
+            MessageContentIn::Parts(parts) => {
+                let mut text_parts = Vec::new();
+                let mut attachments = Vec::new();
+
+                for part in parts {
+                    match part.part_type.as_str() {
+                        "text" => {
+                            let t = part.text.ok_or((
+                                StatusCode::BAD_REQUEST,
+                                "content part `text` requires `text` field".to_string(),
+                            ))?;
+                            if !t.is_empty() {
+                                text_parts.push(t);
+                            }
+                        }
+                        "image_url" => {
+                            let url = part.image_url.ok_or((
+                                StatusCode::BAD_REQUEST,
+                                "content part `image_url` requires `image_url` field".to_string(),
+                            ))?;
+                            attachments.push(MessageType::ImageURL(url.url));
+                        }
+                        "image" => {
+                            let src = part.source.ok_or((
+                                StatusCode::BAD_REQUEST,
+                                "content part `image` requires `source` field".to_string(),
+                            ))?;
+                            if src.source_type != "base64" {
+                                return Err((
+                                    StatusCode::BAD_REQUEST,
+                                    "only base64 sources are supported".to_string(),
+                                ));
+                            }
+                            let mime = parse_image_mime(&src.media_type)?;
+                            let bytes = decode_base64(&src.data)?;
+                            attachments.push(MessageType::Image((mime, bytes)));
+                        }
+                        "document" | "pdf" => {
+                            let src = part.source.ok_or((
+                                StatusCode::BAD_REQUEST,
+                                "content part `document` requires `source` field".to_string(),
+                            ))?;
+                            if src.source_type != "base64" {
+                                return Err((
+                                    StatusCode::BAD_REQUEST,
+                                    "only base64 sources are supported".to_string(),
+                                ));
+                            }
+                            if src.media_type != "application/pdf" {
+                                return Err((
+                                    StatusCode::BAD_REQUEST,
+                                    format!("unsupported document media_type: {}", src.media_type),
+                                ));
+                            }
+                            let bytes = decode_base64(&src.data)?;
+                            attachments.push(MessageType::Pdf(bytes));
+                        }
+                        other => {
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                format!("unsupported content part type: {other}"),
+                            ));
+                        }
+                    }
+                }
+
+                let combined_text = text_parts.join("\n");
+                if attachments.is_empty() {
+                    out.push(ChatMessage {
+                        role,
+                        message_type: MessageType::Text,
+                        content: combined_text,
+                        thinking,
+                        cache: None,
+                    });
+                } else if attachments.len() == 1 {
+                    out.push(ChatMessage {
+                        role,
+                        message_type: attachments.remove(0),
+                        content: combined_text,
+                        thinking,
+                        cache: None,
+                    });
+                } else {
+                    if !combined_text.is_empty() {
+                        out.push(ChatMessage {
+                            role: role.clone(),
+                            message_type: MessageType::Text,
+                            content: combined_text,
+                            thinking: thinking.clone(),
+                            cache: None,
+                        });
+                    }
+                    for attachment in attachments {
+                        out.push(ChatMessage {
+                            role: role.clone(),
+                            message_type: attachment,
+                            content: String::new(),
+                            thinking: thinking.clone(),
+                            cache: None,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     Ok(out)
@@ -836,7 +1423,22 @@ fn render_stream_chunk(
             entry.name = tool_call.function.name.clone();
             entry.arguments_buffer = tool_call.function.arguments.clone();
         }
-        StreamChunk::Usage(_) => {}
+        StreamChunk::Usage(usage) => {
+            state.last_usage = Some(usage.clone());
+            events.push(
+                Event::default().data(
+                    json!({
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [],
+                        "usage": usage,
+                    })
+                    .to_string(),
+                ),
+            );
+        }
         StreamChunk::Done { stop_reason } => {
             state.stop_reason = Some(stop_reason);
             let finish_reason = if state.saw_tool_calls {
@@ -849,22 +1451,22 @@ fn render_stream_chunk(
                 }
             };
 
-            events.push(
-                Event::default().data(
-                    json!({
-                        "id": stream_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": finish_reason
-                        }]
-                    })
-                    .to_string(),
-                ),
-            );
+            let mut payload = json!({
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": finish_reason
+                }]
+            });
+            if let Some(usage) = state.last_usage.clone() {
+                payload["usage"] = serde_json::to_value(usage).unwrap_or(Value::Null);
+            }
+
+            events.push(Event::default().data(payload.to_string()));
             state.finished = true;
         }
     }
@@ -895,8 +1497,250 @@ fn prune_config_by_schema(cfg: &Value, schema: &Value) -> Value {
 fn replace_template(input: &str, memory: &HashMap<String, String>) -> String {
     let mut out = input.to_string();
     for (k, v) in memory {
-        let pattern = format!("{{{{{}}}}}", k);
+        let pattern = format!("{{{{{k}}}}}");
         out = out.replace(&pattern, v);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg_user(content: Option<MessageContentIn>) -> MessageIn {
+        MessageIn {
+            role: "user".to_string(),
+            content,
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
+    #[test]
+    fn normalize_system_llama_cpp_string_to_vec() {
+        let mut options = HashMap::new();
+        options.insert("system".to_string(), Value::String("hello".to_string()));
+
+        normalize_system_option_for_provider("llama_cpp", &mut options).unwrap();
+        assert_eq!(
+            options.get("system"),
+            Some(&Value::Array(vec![Value::String("hello".to_string())]))
+        );
+    }
+
+    #[test]
+    fn normalize_system_non_llama_cpp_unchanged() {
+        let mut options = HashMap::new();
+        options.insert("system".to_string(), Value::String("hello".to_string()));
+
+        normalize_system_option_for_provider("mrs", &mut options).unwrap();
+        assert_eq!(
+            options.get("system"),
+            Some(&Value::String("hello".to_string()))
+        );
+    }
+
+    #[test]
+    fn map_request_messages_text_string() {
+        let out = map_request_messages(vec![msg_user(Some(MessageContentIn::Text(
+            "hi".to_string(),
+        )))])
+        .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, ChatRole::User);
+        assert_eq!(out[0].message_type, MessageType::Text);
+        assert_eq!(out[0].content, "hi");
+    }
+
+    #[test]
+    fn map_request_messages_parts_text_join() {
+        let out = map_request_messages(vec![msg_user(Some(MessageContentIn::Parts(vec![
+            MessageContentPartIn {
+                part_type: "text".to_string(),
+                text: Some("a".to_string()),
+                image_url: None,
+                source: None,
+            },
+            MessageContentPartIn {
+                part_type: "text".to_string(),
+                text: Some("b".to_string()),
+                image_url: None,
+                source: None,
+            },
+        ])))])
+        .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].message_type, MessageType::Text);
+        assert_eq!(out[0].content, "a\nb");
+    }
+
+    #[test]
+    fn map_request_messages_parts_image_url_single_attachment() {
+        let out = map_request_messages(vec![msg_user(Some(MessageContentIn::Parts(vec![
+            MessageContentPartIn {
+                part_type: "text".to_string(),
+                text: Some("caption".to_string()),
+                image_url: None,
+                source: None,
+            },
+            MessageContentPartIn {
+                part_type: "image_url".to_string(),
+                text: None,
+                image_url: Some(MessageImageUrlIn {
+                    url: "https://example.com/img.png".to_string(),
+                }),
+                source: None,
+            },
+        ])))])
+        .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, ChatRole::User);
+        assert_eq!(out[0].content, "caption");
+        assert_eq!(
+            out[0].message_type,
+            MessageType::ImageURL("https://example.com/img.png".to_string())
+        );
+    }
+
+    #[test]
+    fn map_request_messages_parts_inline_image_base64() {
+        let raw = b"pngbytes".to_vec();
+        let encoded = BASE64.encode(&raw);
+
+        let out = map_request_messages(vec![msg_user(Some(MessageContentIn::Parts(vec![
+            MessageContentPartIn {
+                part_type: "image".to_string(),
+                text: None,
+                image_url: None,
+                source: Some(MessageContentSourceIn {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: encoded,
+                }),
+            },
+        ])))])
+        .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, ChatRole::User);
+        assert_eq!(out[0].content, "");
+        assert_eq!(
+            out[0].message_type,
+            MessageType::Image((ImageMime::PNG, raw))
+        );
+    }
+
+    #[test]
+    fn map_request_messages_parts_inline_pdf_base64() {
+        let raw = b"pdfbytes".to_vec();
+        let encoded = BASE64.encode(&raw);
+
+        let out = map_request_messages(vec![msg_user(Some(MessageContentIn::Parts(vec![
+            MessageContentPartIn {
+                part_type: "document".to_string(),
+                text: None,
+                image_url: None,
+                source: Some(MessageContentSourceIn {
+                    source_type: "base64".to_string(),
+                    media_type: "application/pdf".to_string(),
+                    data: encoded,
+                }),
+            },
+        ])))])
+        .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].message_type, MessageType::Pdf(raw));
+    }
+
+    #[test]
+    fn map_request_messages_multiple_attachments_expands() {
+        let img = BASE64.encode(b"img");
+        let pdf = BASE64.encode(b"pdf");
+
+        let out = map_request_messages(vec![msg_user(Some(MessageContentIn::Parts(vec![
+            MessageContentPartIn {
+                part_type: "text".to_string(),
+                text: Some("t".to_string()),
+                image_url: None,
+                source: None,
+            },
+            MessageContentPartIn {
+                part_type: "image".to_string(),
+                text: None,
+                image_url: None,
+                source: Some(MessageContentSourceIn {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: img,
+                }),
+            },
+            MessageContentPartIn {
+                part_type: "document".to_string(),
+                text: None,
+                image_url: None,
+                source: Some(MessageContentSourceIn {
+                    source_type: "base64".to_string(),
+                    media_type: "application/pdf".to_string(),
+                    data: pdf,
+                }),
+            },
+        ])))])
+        .unwrap();
+
+        // 1 text + 2 attachments
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].message_type, MessageType::Text);
+        assert_eq!(out[1].role, ChatRole::User);
+        assert!(matches!(out[1].message_type, MessageType::Image(_)));
+        assert_eq!(out[2].role, ChatRole::User);
+        assert!(matches!(out[2].message_type, MessageType::Pdf(_)));
+    }
+
+    #[test]
+    fn map_request_messages_invalid_base64_errors() {
+        let err = map_request_messages(vec![msg_user(Some(MessageContentIn::Parts(vec![
+            MessageContentPartIn {
+                part_type: "image".to_string(),
+                text: None,
+                image_url: None,
+                source: Some(MessageContentSourceIn {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "not base64".to_string(),
+                }),
+            },
+        ])))])
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn render_stream_chunk_usage_updates_state_and_emits_event() {
+        let mut state = StreamState::default();
+        let usage = Usage {
+            input_tokens: 1,
+            output_tokens: 2,
+            reasoning_tokens: 0,
+            cache_read: 0,
+            cache_write: 0,
+        };
+
+        let events = render_stream_chunk(
+            "id",
+            0,
+            "model",
+            StreamChunk::Usage(usage.clone()),
+            &mut state,
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(state.last_usage, Some(usage));
+    }
 }

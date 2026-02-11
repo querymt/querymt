@@ -8555,6 +8555,7 @@ dependencies = [
 name = "qmt-proxy"
 version = "0.2.0"
 dependencies = [
+ "base64 0.22.1",
  "extism-pdk",
  "http",
  "querymt",
@@ -8677,6 +8678,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
+ "base64 0.22.1",
  "clap",
  "futures",
  "querymt",
