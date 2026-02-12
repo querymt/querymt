@@ -25,6 +25,7 @@ pub mod send_agent;
 #[cfg(feature = "dashboard")]
 pub mod server;
 pub mod session;
+pub mod skills;
 pub mod snapshot;
 pub mod tasks;
 pub mod tools;

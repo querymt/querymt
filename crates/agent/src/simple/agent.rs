@@ -11,7 +11,7 @@ use crate::agent::builder::AgentBuilderExt;
 use crate::agent::core::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
 use crate::config::{
     CompactionConfig, MiddlewareEntry, PruningConfig, RateLimitConfig, SingleAgentConfig,
-    SnapshotBackendConfig, ToolOutputConfig,
+    SkillsConfig, SnapshotBackendConfig, ToolOutputConfig,
 };
 use crate::events::AgentEvent;
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
@@ -46,6 +46,7 @@ pub struct AgentBuilder {
     compaction_config: Option<CompactionConfig>,
     snapshot_backend_config: Option<SnapshotBackendConfig>,
     rate_limit_config: Option<RateLimitConfig>,
+    skills_config: Option<SkillsConfig>,
 }
 
 impl Default for AgentBuilder {
@@ -69,6 +70,7 @@ impl AgentBuilder {
             compaction_config: None,
             snapshot_backend_config: None,
             rate_limit_config: None,
+            skills_config: None,
         }
     }
 
@@ -192,6 +194,84 @@ impl AgentBuilder {
         let mut agent = QueryMTAgent::new(registry, backend.session_store(), llm_config)
             .with_snapshot_policy(snapshot_policy);
         agent.add_observer(backend.event_observer());
+
+        // Initialize skills system if enabled
+        if let Some(skills_config) = self.skills_config {
+            if skills_config.enabled {
+                use crate::skills::{SkillRegistry, SkillTool, default_search_paths};
+                use std::sync::Mutex;
+
+                // Determine project root for skill discovery
+                let project_root = cwd.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+
+                // Build search paths from defaults + config
+                let mut search_paths = default_search_paths(project_root);
+
+                // Add custom configured paths with highest priority
+                for custom_path in &skills_config.paths {
+                    search_paths.push(crate::skills::types::SkillSource::Configured(
+                        custom_path.clone(),
+                    ));
+                }
+
+                // Create registry and discover skills
+                let mut skill_registry = SkillRegistry::new();
+                match skill_registry
+                    .load_from_sources(&search_paths, skills_config.include_external)
+                {
+                    Ok(count) => {
+                        if count > 0 {
+                            // Get compatible skill names for logging
+                            let compatible_skills =
+                                skill_registry.compatible_with(&skills_config.agent_id);
+                            let compatible_names: Vec<_> = compatible_skills
+                                .iter()
+                                .map(|s| s.metadata.name.clone())
+                                .collect();
+
+                            log::info!(
+                                "Skills system initialized: {} skills discovered, {} compatible with agent '{}'",
+                                count,
+                                compatible_names.len(),
+                                skills_config.agent_id
+                            );
+
+                            if !compatible_names.is_empty() {
+                                log::debug!("Compatible skills: {}", compatible_names.join(", "));
+                            }
+                        } else {
+                            log::debug!(
+                                "Skills system enabled but no skills found in {} search paths",
+                                search_paths.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to discover skills: {}. Skills system will be unavailable.",
+                            e
+                        );
+                    }
+                }
+
+                // Always register the skill tool, even if no skills are discovered yet
+                // This allows the agent to use the tool, and skills can be added later
+                let registry_arc = Arc::new(Mutex::new(skill_registry));
+                let skill_tool = SkillTool::new(
+                    registry_arc,
+                    Some(skills_config.agent_id.clone()),
+                    Arc::new(skills_config.permissions.clone()),
+                );
+
+                agent
+                    .tool_registry
+                    .lock()
+                    .unwrap()
+                    .add(Arc::new(skill_tool));
+            } else {
+                log::debug!("Skills system disabled in configuration");
+            }
+        }
 
         if !self.tools.is_empty() {
             agent = agent
@@ -514,6 +594,7 @@ impl Agent {
         builder.compaction_config = Some(config.agent.compaction);
         builder.snapshot_backend_config = Some(config.agent.snapshot);
         builder.rate_limit_config = Some(config.agent.rate_limit);
+        builder.skills_config = Some(config.agent.skills);
 
         builder.build().await
     }

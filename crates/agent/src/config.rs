@@ -525,6 +525,9 @@ pub struct AgentSettings {
     /// Rate limit retry configuration
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Skills system configuration
+    #[serde(default)]
+    pub skills: SkillsConfig,
 }
 
 /// Multi-agent quorum configuration
@@ -945,6 +948,60 @@ pub fn resolve_tools(
         mcp_servers,
     })
 }
+
+// ============================================================================
+// Skills Configuration
+// ============================================================================
+
+fn default_agent_id() -> String {
+    "querymt".to_string()
+}
+
+/// Configuration for skills system
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsConfig {
+    /// Enable skills system (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Check external paths (Claude Code, agents conventions)
+    #[serde(default = "default_true")]
+    pub include_external: bool,
+
+    /// Custom search paths (added to defaults)
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+
+    /// Remote skill URLs (Phase 2 - not yet implemented)
+    #[serde(default)]
+    pub urls: Vec<String>,
+
+    /// Agent identifier for compatibility filtering
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+
+    /// Skill permissions
+    #[serde(default)]
+    pub permissions: crate::skills::SkillPermissions,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            include_external: true,
+            paths: vec![],
+            urls: vec![],
+            agent_id: default_agent_id(),
+            permissions: crate::skills::SkillPermissions::default(),
+        }
+    }
+}
+
+// ============================================================================
+// End Skills Configuration
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
