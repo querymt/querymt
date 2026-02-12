@@ -34,7 +34,6 @@ use tokio::sync::{Mutex, oneshot, watch};
 struct TestHarness {
     agent: QueryMTAgent,
     session_id: String,
-    context: SessionHandle,
     exec_ctx: ExecutionContext,
     provider: Arc<Mutex<MockLlmProvider>>,
     _temp_dir: TempDir,
@@ -86,6 +85,11 @@ impl TestHarness {
         store
             .expect_get_session_llm_config()
             .returning(move |_| Ok(Some(llm_config.clone())))
+            .times(0..);
+        let llm_config_for_handle = mock_llm_config();
+        store
+            .expect_get_llm_config()
+            .returning(move |_| Ok(Some(llm_config_for_handle.clone())))
             .times(0..);
         store
             .expect_add_message()
@@ -194,12 +198,16 @@ impl TestHarness {
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
-        let exec_ctx = ExecutionContext::new(session_id.clone(), session_runtime, runtime_context);
+        let exec_ctx = ExecutionContext::new(
+            session_id.clone(),
+            session_runtime,
+            runtime_context,
+            context,
+        );
 
         Self {
             agent,
             session_id,
-            context,
             exec_ctx,
             provider,
             _temp_dir: temp_dir,
@@ -208,7 +216,7 @@ impl TestHarness {
 
     async fn run(&mut self, cancel_rx: watch::Receiver<bool>) -> CycleOutcome {
         self.agent
-            .execute_cycle_state_machine(&self.context, &mut self.exec_ctx, cancel_rx)
+            .execute_cycle_state_machine(&mut self.exec_ctx, cancel_rx)
             .await
             .expect("state machine")
     }
@@ -403,7 +411,7 @@ async fn test_llm_error_returns_err() {
     let (_tx, rx) = watch::channel(false);
     let result = harness
         .agent
-        .execute_cycle_state_machine(&harness.context, &mut harness.exec_ctx, rx)
+        .execute_cycle_state_machine(&mut harness.exec_ctx, rx)
         .await;
 
     assert!(result.is_err());

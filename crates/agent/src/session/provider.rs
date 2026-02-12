@@ -62,15 +62,20 @@ type ProviderCache = Arc<RwLock<Option<(i64, Arc<dyn LLMProvider>)>>>;
 ///
 /// # Provider Caching
 ///
-/// TODO: This implementation uses a simple single-entry cache to avoid reloading
-/// heavy models (e.g., llama_cpp GGUF models) on every agent step. For production
-/// multi-model scenarios, consider:
-/// - Option B: Model pool at LlamaCppFactory level with LRU eviction
-/// - Option C: Persistent SessionHandle with lazy provider initialization
+/// Provider construction is cached at two levels:
 ///
-/// The cache is keyed on LLMConfig.id (content-addressed in DB). When a session's
-/// config changes mid-session (e.g., user switches models via dashboard), the old
-/// cached provider is dropped (freeing VRAM) before the new one is loaded.
+/// 1. **Global cache** (`cached_provider`): A single-entry cache keyed on
+///    `LLMConfig.id`. Avoids rebuilding identical providers across turns.
+///    For multi-model scenarios consider an LRU at the factory level.
+///
+/// 2. **Per-turn cache** (`SessionHandle::cached_llm_provider`): Each
+///    `SessionHandle` lazily caches its resolved provider for the lifetime of
+///    the turn. This means the global cache is consulted at most once per turn
+///    instead of on every state-machine transition (~8× reduction).
+///
+/// Model switches via the dashboard write a new `llm_config_id` to the DB but
+/// take effect only when the **next** `SessionHandle` is constructed (i.e. the
+/// next `run_prompt` call), not mid-turn.
 pub struct SessionProvider {
     plugin_registry: Arc<PluginRegistry>,
     history_store: Arc<dyn SessionStore>,
@@ -252,14 +257,51 @@ impl Clone for SessionProvider {
 ///
 /// This handle encapsulates the session state and provides methods for interacting
 /// with the LLM and managing conversation history.
+///
+/// # Turn-pinned semantics
+///
+/// A `SessionHandle` captures the session's `LLMConfig` at construction time and
+/// caches the resolved `LLMProvider` for reuse within a turn. Model switches
+/// (e.g. via the dashboard) take effect on the **next** `run_prompt`, not mid-turn.
+/// This avoids redundant DB lookups and ensures consistent provider/model identity
+/// throughout a single execution cycle.
 pub struct SessionHandle {
     provider: Arc<SessionProvider>,
     session: Session,
+    /// LLM config resolved once at construction time (turn-pinned).
+    llm_config: Option<LLMConfig>,
+    /// Lazily cached LLM provider for this turn.
+    cached_llm_provider: tokio::sync::OnceCell<Arc<dyn LLMProvider>>,
+}
+
+impl Clone for SessionHandle {
+    fn clone(&self) -> Self {
+        Self {
+            provider: self.provider.clone(),
+            session: self.session.clone(),
+            llm_config: self.llm_config.clone(),
+            // Each clone gets its own OnceCell; the first `.provider()` call
+            // will still hit the global cache (cheap Arc::clone on hit) so
+            // this is fine — it just won't share the local cell.
+            cached_llm_provider: tokio::sync::OnceCell::new(),
+        }
+    }
 }
 
 impl SessionHandle {
     pub async fn new(provider: Arc<SessionProvider>, session: Session) -> SessionResult<Self> {
-        Ok(Self { provider, session })
+        // Eagerly resolve the LLM config so callers never need a separate DB fetch.
+        let llm_config = if let Some(config_id) = session.llm_config_id {
+            provider.get_llm_config(config_id).await?
+        } else {
+            None
+        };
+        Ok(Self {
+            provider,
+            session,
+            llm_config,
+            cached_llm_provider: tokio::sync::OnceCell::new(),
+        })
     }
 
     /// Get the session information
@@ -267,10 +309,20 @@ impl SessionHandle {
         &self.session
     }
 
+    /// Get the LLM config captured at handle creation time (turn-pinned).
+    pub fn llm_config(&self) -> Option<&LLMConfig> {
+        self.llm_config.as_ref()
+    }
+
     pub async fn provider(&self) -> SessionResult<Arc<dyn LLMProvider>> {
-        self.provider
-            .build_provider_for_session(&self.session.public_id)
+        self.cached_llm_provider
+            .get_or_try_init(|| async {
+                self.provider
+                    .build_provider_for_session(&self.session.public_id)
+                    .await
+            })
             .await
+            .map(Arc::clone)
     }
 
     /// Get the session history as rich AgentMessages
@@ -362,11 +414,14 @@ impl SessionHandle {
         Ok(response)
     }
 
-    /// Get pricing information for this session's model
-    pub async fn get_pricing(&self) -> SessionResult<Option<ModelPricing>> {
-        self.provider
-            .get_session_pricing(&self.session.public_id)
-            .await
+    /// Get pricing information for this session's model.
+    ///
+    /// Uses the turn-pinned `LLMConfig` instead of querying the DB.
+    pub fn get_pricing(&self) -> Option<ModelPricing> {
+        self.llm_config
+            .as_ref()
+            .and_then(|config| get_model_info(&config.provider, &config.model))
+            .map(|info| info.pricing)
     }
 
     pub fn convert_chat_to_agent(&self, msg: &ChatMessage) -> AgentMessage {

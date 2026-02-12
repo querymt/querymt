@@ -160,7 +160,6 @@ impl SendAgent for StubDelegateAgent {
 
 struct TestHarness {
     agent: Arc<QueryMTAgent>,
-    context: SessionHandle,
     exec_ctx: ExecutionContext,
     provider: Arc<Mutex<MockLlmProvider>>,
     _temp_dir: TempDir,
@@ -212,6 +211,11 @@ impl TestHarness {
         store
             .expect_get_session_llm_config()
             .returning(move |_| Ok(Some(llm_config.clone())))
+            .times(0..);
+        let llm_config_for_handle = mock_llm_config();
+        store
+            .expect_get_llm_config()
+            .returning(move |_| Ok(Some(llm_config_for_handle.clone())))
             .times(0..);
         store
             .expect_add_message()
@@ -335,11 +339,10 @@ impl TestHarness {
         });
 
         let session_id = "sess-test".to_string();
-        let exec_ctx = ExecutionContext::new(session_id, session_runtime, runtime_context);
+        let exec_ctx = ExecutionContext::new(session_id, session_runtime, runtime_context, context);
 
         Self {
             agent,
-            context,
             exec_ctx,
             provider,
             _temp_dir: temp_dir,
@@ -349,7 +352,7 @@ impl TestHarness {
     async fn run(&mut self) -> CycleOutcome {
         let (_tx, rx) = tokio::sync::watch::channel(false);
         self.agent
-            .execute_cycle_state_machine(&self.context, &mut self.exec_ctx, rx)
+            .execute_cycle_state_machine(&mut self.exec_ctx, rx)
             .await
             .expect("state machine")
     }

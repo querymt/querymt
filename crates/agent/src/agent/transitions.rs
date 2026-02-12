@@ -79,12 +79,8 @@ impl QueryMTAgent {
             return Ok(ExecutionState::Cancelled);
         }
 
-        let provider_context = self
-            .provider
-            .with_session(&exec_ctx.session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
-        let provider = provider_context
+        let provider = exec_ctx
+            .session_handle
             .provider()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to build provider: {}", e))?;
@@ -122,9 +118,9 @@ impl QueryMTAgent {
 
     #[instrument(
         name = "agent.llm_call",
-        skip(self, context, tools, cancel_rx),
+        skip(self, context, tools, cancel_rx, exec_ctx),
         fields(
-            session_id = %session_id,
+            session_id = %exec_ctx.session_id,
             message_count = %context.messages.len(),
             tool_count = %tools.len(),
             input_tokens = tracing::field::Empty,
@@ -138,8 +134,9 @@ impl QueryMTAgent {
         context: &Arc<ConversationContext>,
         tools: &Arc<[querymt::chat::Tool]>,
         cancel_rx: &watch::Receiver<bool>,
-        session_id: &str,
+        exec_ctx: &ExecutionContext,
     ) -> Result<ExecutionState, anyhow::Error> {
+        let session_id = &exec_ctx.session_id;
         debug!(
             "CallLlm: session={}, messages={}",
             session_id,
@@ -157,11 +154,7 @@ impl QueryMTAgent {
             },
         );
 
-        let provider_context = self
-            .provider
-            .with_session(session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
+        let session_handle = &exec_ctx.session_handle;
 
         // Apply cache breakpoints to last 2 messages for providers that support caching
         let messages_with_cache = apply_cache_breakpoints(&context.messages);
@@ -171,12 +164,11 @@ impl QueryMTAgent {
             // Race the LLM request with cancellation for faster cancellation
             let cancel_rx_clone = cancel_rx.clone();
             self.call_llm_with_retry(session_id, cancel_rx, || {
-                let provider_context = &provider_context;
                 let messages_with_cache = &messages_with_cache;
                 let mut cancel_rx_clone = cancel_rx_clone.clone();
                 async move {
                     tokio::select! {
-                        result = provider_context.submit_request(messages_with_cache) => {
+                        result = session_handle.submit_request(messages_with_cache) => {
                             result.map_err(|e| anyhow::anyhow!("LLM request failed: {}", e))
                         }
                         _ = cancel_rx_clone.changed() => {
@@ -187,7 +179,7 @@ impl QueryMTAgent {
             })
             .await?
         } else {
-            let provider = provider_context
+            let provider = session_handle
                 .provider()
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to build provider: {}", e))?;
@@ -281,7 +273,7 @@ impl QueryMTAgent {
 
         // Calculate cost for this request using ModelPricing methods
         let (request_cost, cumulative_cost) = if let Some(usage_info) = response.usage() {
-            let pricing = provider_context.get_pricing().await.ok().flatten();
+            let pricing = session_handle.get_pricing();
             let request_cost = pricing.as_ref().and_then(|p| {
                 p.calculate_cost(
                     usage_info.input_tokens as u64,
@@ -445,13 +437,7 @@ impl QueryMTAgent {
             parent_message_id: None,
         };
 
-        let provider_context = self
-            .provider
-            .with_session(&exec_ctx.session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
-
-        provider_context
+        exec_ctx
             .add_message(assistant_msg.clone())
             .await
             .map_err(|e| anyhow::anyhow!("Failed to store assistant message: {}", e))?;
@@ -479,7 +465,7 @@ impl QueryMTAgent {
             updated_stats.steps += 1;
 
             // Update cost information if pricing is available
-            if let Ok(Some(pricing)) = provider_context.get_pricing().await {
+            if let Some(pricing) = exec_ctx.session_handle.get_pricing() {
                 updated_stats.update_costs(&pricing);
             }
         }
@@ -692,7 +678,7 @@ impl QueryMTAgent {
 
                     if let Some(message) = match_wait_event(wait, &event) {
                         let new_context = self
-                            .inject_wait_message(context, &exec_ctx.session_id, message)
+                            .inject_wait_message(context, exec_ctx, message)
                             .await?;
                         return Ok(ExecutionState::BeforeLlmCall {
                             context: new_context,
@@ -706,18 +692,12 @@ impl QueryMTAgent {
     async fn inject_wait_message(
         &self,
         context: &Arc<ConversationContext>,
-        session_id: &str,
+        exec_ctx: &ExecutionContext,
         content: String,
     ) -> Result<Arc<ConversationContext>, anyhow::Error> {
-        let provider_context = self
-            .provider
-            .with_session(session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
-
         let agent_msg = AgentMessage {
             id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
+            session_id: exec_ctx.session_id.clone(),
             role: ChatRole::User,
             parts: vec![MessagePart::Text {
                 content: content.clone(),
@@ -726,13 +706,13 @@ impl QueryMTAgent {
             parent_message_id: None,
         };
 
-        provider_context
+        exec_ctx
             .add_message(agent_msg)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to store wait message: {}", e))?;
 
         self.emit_event(
-            session_id,
+            &exec_ctx.session_id,
             AgentEventKind::UserMessageStored {
                 content: content.clone(),
             },

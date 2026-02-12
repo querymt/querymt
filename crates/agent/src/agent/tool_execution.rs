@@ -90,12 +90,6 @@ impl QueryMTAgent {
         let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
             .unwrap_or_else(|_| serde_json::json!({}));
 
-        let provider_context = self
-            .provider
-            .with_session(&exec_ctx.session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
-
         // Set up elicitation channel for this tool call
         let (elicitation_tx, mut elicitation_rx) =
             tokio::sync::mpsc::channel::<crate::tools::ElicitationRequest>(1);
@@ -156,7 +150,8 @@ impl QueryMTAgent {
         {
             ("Error: permission denied".to_string(), true)
         } else {
-            match provider_context
+            match exec_ctx
+                .session_handle
                 .call_tool(&call.function.name, args.clone())
                 .await
             {
@@ -378,12 +373,6 @@ impl QueryMTAgent {
             results.len()
         );
 
-        let provider_context = self
-            .provider
-            .with_session(&exec_ctx.session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get provider context: {}", e))?;
-
         // Store each tool result as a separate message
         let mut messages = (*context.messages).to_vec();
         let mut wait_conditions = Vec::new();
@@ -410,7 +399,7 @@ impl QueryMTAgent {
                 parent_message_id: None,
             };
 
-            provider_context
+            exec_ctx
                 .add_message(result_msg.clone())
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to store tool result: {}", e))?;

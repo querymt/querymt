@@ -15,7 +15,6 @@ use crate::events::{AgentEventKind, ExecutionMetrics, StopType};
 use crate::middleware::{AgentStats, ConversationContext, ExecutionState};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::compaction::SessionCompaction;
-use crate::session::provider::SessionHandle;
 use crate::session::pruning::{
     PruneConfig, SimpleTokenEstimator, compute_prune_candidates, extract_call_ids,
 };
@@ -194,8 +193,8 @@ impl QueryMTAgent {
             active.insert(session_id.clone(), tx);
         }
 
-        // 2. Get Session Context
-        let context = self
+        // 2. Get Session Context (turn-pinned: config + provider resolved once)
+        let session_handle = self
             .provider
             .with_session(&session_id)
             .await
@@ -215,6 +214,14 @@ impl QueryMTAgent {
         if let Err(e) = self.cleanup_revert_on_prompt(&session_id).await {
             warn!("Failed to clean up revert state: {}", e);
         }
+
+        // 3b. Create execution context early so all pre-loop operations use it
+        let mut exec_ctx = ExecutionContext::new(
+            session_id.clone(),
+            runtime.clone(),
+            runtime_context,
+            session_handle,
+        );
 
         // 4. Store User Messages
         // Full content for LLM and events (includes attachments)
@@ -242,7 +249,8 @@ impl QueryMTAgent {
         );
 
         // Update intent snapshot with clean user text (no attachment content)
-        runtime_context
+        exec_ctx
+            .state
             .update_intent_snapshot(user_text, None, None)
             .await
             .map_err(|e| Error::new(-32000, e.to_string()))?;
@@ -258,7 +266,7 @@ impl QueryMTAgent {
             parent_message_id: None,
         };
 
-        if let Err(e) = context.add_message(agent_msg).await {
+        if let Err(e) = exec_ctx.add_message(agent_msg).await {
             let mut active = self.active_sessions.lock().await;
             active.remove(&session_id);
             self.emit_event(
@@ -305,7 +313,7 @@ impl QueryMTAgent {
                         parent_message_id: None,
                     };
 
-                    if let Err(e) = context.add_message(snapshot_msg).await {
+                    if let Err(e) = exec_ctx.add_message(snapshot_msg).await {
                         warn!("Failed to store turn snapshot start: {}", e);
                     } else {
                         debug!("Pre-turn snapshot start stored (turn {})", turn_id);
@@ -319,11 +327,7 @@ impl QueryMTAgent {
 
         // 5. Execute Agent Loop using State Machine
         info!("Initializing execution cycle for session {}", session_id);
-        let mut exec_ctx =
-            ExecutionContext::new(session_id.clone(), runtime.clone(), runtime_context);
-        let result = self
-            .execute_cycle_state_machine(&context, &mut exec_ctx, rx)
-            .await;
+        let result = self.execute_cycle_state_machine(&mut exec_ctx, rx).await;
 
         // 6. Take post-turn snapshot and record changes for undo/redo
         if let Some(ref backend) = self.snapshot_backend
@@ -360,7 +364,7 @@ impl QueryMTAgent {
                                         parent_message_id: None,
                                     };
 
-                                    if let Err(e) = context.add_message(snapshot_msg).await {
+                                    if let Err(e) = exec_ctx.add_message(snapshot_msg).await {
                                         warn!("Failed to store turn snapshot patch: {}", e);
                                     } else {
                                         debug!(
@@ -417,28 +421,27 @@ impl QueryMTAgent {
     /// Executes a single agent cycle using state machine pattern
     #[instrument(
         name = "agent.execute_cycle",
-        skip(self, context, exec_ctx, cancel_rx),
+        skip(self, exec_ctx, cancel_rx),
         fields(
-            session_id = %context.session().public_id,
+            session_id = %exec_ctx.session_id,
             provider = tracing::field::Empty,
             model = tracing::field::Empty
         )
     )]
     pub(crate) async fn execute_cycle_state_machine(
         &self,
-        context: &SessionHandle,
         exec_ctx: &mut ExecutionContext,
         mut cancel_rx: watch::Receiver<bool>,
     ) -> Result<CycleOutcome, anyhow::Error> {
         debug!(
             "Starting state machine execution for session: {}",
-            context.session().public_id
+            exec_ctx.session_id
         );
 
         let driver = self.create_driver();
 
         let messages: Arc<[querymt::chat::ChatMessage]> =
-            Arc::from(context.history().await.into_boxed_slice());
+            Arc::from(exec_ctx.session_handle.history().await.into_boxed_slice());
         let turns = messages
             .iter()
             .filter(|msg| matches!(msg.role, ChatRole::User))
@@ -450,17 +453,13 @@ impl QueryMTAgent {
         };
         let stats = Arc::new(stats);
 
-        // Fetch current provider/model for this session
-        let llm_config = self
-            .provider
-            .history_store()
-            .get_session_llm_config(&context.session().public_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get LLM config: {}", e))?
+        // Use the turn-pinned LLM config from the session handle
+        let llm_config = exec_ctx
+            .llm_config()
             .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
 
         let initial_context = Arc::new(ConversationContext::new(
-            context.session().public_id.as_str().into(),
+            exec_ctx.session_id.as_str().into(),
             messages,
             stats,
             llm_config.provider.as_str().into(),
@@ -485,7 +484,7 @@ impl QueryMTAgent {
             if *cancel_rx.borrow() {
                 debug!(
                     "State machine cancelled for session {}",
-                    context.session().public_id
+                    exec_ctx.session_id
                 );
                 return Ok(CycleOutcome::Cancelled);
             }
@@ -493,8 +492,7 @@ impl QueryMTAgent {
             let state_name = state.name();
             trace!(
                 "State machine iteration: {} for session {}",
-                state_name,
-                context.session().public_id
+                state_name, exec_ctx.session_id
             );
 
             state = match state {
@@ -519,7 +517,7 @@ impl QueryMTAgent {
                     ref context,
                     ref tools,
                 } => {
-                    self.transition_call_llm(context, tools, &cancel_rx, &context.session_id)
+                    self.transition_call_llm(context, tools, &cancel_rx, exec_ctx)
                         .await?
                 }
 
@@ -597,7 +595,7 @@ impl QueryMTAgent {
 
                             // Run pruning if enabled
                             if self.pruning_config.enabled
-                                && let Err(e) = self.run_pruning(context).await
+                                && let Err(e) = self.run_pruning(exec_ctx).await
                             {
                                 warn!("Pruning failed: {}", e);
                                 // Don't fail the whole operation, just log the warning
@@ -629,7 +627,7 @@ impl QueryMTAgent {
                     if stop_type == StopType::ContextThreshold && self.compaction_config.auto {
                         info!("Context threshold reached, triggering AI compaction");
 
-                        match self.run_ai_compaction(context, &state).await {
+                        match self.run_ai_compaction(exec_ctx, &state).await {
                             Ok(new_state) => {
                                 // Compaction succeeded, continue with the new state
                                 state = new_state;
@@ -653,7 +651,7 @@ impl QueryMTAgent {
 
                     // Emit MiddlewareStopped event so UI can display the reason
                     self.emit_event(
-                        &context.session().public_id,
+                        &exec_ctx.session_id,
                         AgentEventKind::MiddlewareStopped {
                             stop_type,
                             reason: message.to_string(),
@@ -676,9 +674,10 @@ impl QueryMTAgent {
     /// Run pruning on the session history
     ///
     /// This marks old tool results as compacted based on the pruning configuration.
-    async fn run_pruning(&self, context: &SessionHandle) -> Result<(), anyhow::Error> {
-        let session_id = &context.session().public_id;
-        let messages = context
+    async fn run_pruning(&self, exec_ctx: &ExecutionContext) -> Result<(), anyhow::Error> {
+        let session_id = &exec_ctx.session_id;
+        let messages = exec_ctx
+            .session_handle
             .get_agent_history()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get agent history: {}", e))?;
@@ -728,11 +727,12 @@ impl QueryMTAgent {
     /// then returns a new state to continue execution with filtered history.
     async fn run_ai_compaction(
         &self,
-        context: &SessionHandle,
+        exec_ctx: &ExecutionContext,
         current_state: &ExecutionState,
     ) -> Result<ExecutionState, anyhow::Error> {
-        let session_id = &context.session().public_id;
-        let messages = context
+        let session_id = &exec_ctx.session_id;
+        let messages = exec_ctx
+            .session_handle
             .get_agent_history()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get agent history: {}", e))?;
@@ -757,25 +757,15 @@ impl QueryMTAgent {
             AgentEventKind::CompactionStart { token_estimate },
         );
 
-        // Get the provider for compaction
-        // Use compaction-specific provider/model if configured, otherwise use session's provider
-        let provider = self
-            .provider
-            .with_session(session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get session provider: {}", e))?;
-
-        let llm_provider = provider
+        // Get the provider for compaction from the turn-pinned session handle
+        let llm_provider = exec_ctx
+            .session_handle
             .provider()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get LLM provider: {}", e))?;
 
-        let llm_config = self
-            .provider
-            .history_store()
-            .get_session_llm_config(session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get LLM config: {}", e))?
+        let llm_config = exec_ctx
+            .llm_config()
             .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
 
         let model = self
@@ -810,7 +800,7 @@ impl QueryMTAgent {
             result.original_token_count,
         );
 
-        context
+        exec_ctx
             .add_message(compaction_msg)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to store compaction message: {}", e))?;
@@ -825,7 +815,8 @@ impl QueryMTAgent {
         );
 
         // Get the new filtered history and create a new state to continue
-        let new_messages = context
+        let new_messages = exec_ctx
+            .session_handle
             .get_agent_history()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get new history: {}", e))?;
