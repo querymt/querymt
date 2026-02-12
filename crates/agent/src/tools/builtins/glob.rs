@@ -157,20 +157,23 @@ impl Tool for GlobTool {
         let matches = Self::glob_files(pattern, &root, limit)?;
 
         let was_truncated = matches.len() >= limit;
-        let result = json!({
-            "matches": matches.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            "count": matches.len(),
-            "truncated": was_truncated,
-        });
 
-        let mut output = serde_json::to_string_pretty(&result)
-            .map_err(|e| ToolError::ProviderError(format!("Failed to serialize result: {}", e)))?;
+        // Format as simple list with relative paths
+        let mut output = String::new();
+        for path in &matches {
+            if let Ok(relative) = path.strip_prefix(&root) {
+                output.push_str(&format!("{}\n", relative.display()));
+            } else {
+                output.push_str(&format!("{}\n", path.display()));
+            }
+        }
 
+        // Add count footer
+        let count = matches.len();
         if was_truncated {
-            output.push_str(&format!(
-                "\n\n[Results limited to {}. Refine your pattern to see more specific matches.]",
-                limit
-            ));
+            output.push_str(&format!("({} matches, truncated)", count));
+        } else {
+            output.push_str(&format!("({} matches)", count));
         }
 
         Ok(output)
@@ -203,9 +206,12 @@ mod tests {
         });
 
         let result = tool.call(args, &context).await.unwrap();
+
+        // Check simple list format
         assert!(result.contains("test.rs"));
-        assert!(result.contains("main.rs"));
+        assert!(result.contains("src/main.rs") || result.contains("main.rs"));
         assert!(!result.contains("test.txt"));
+        assert!(result.contains("matches)"));
     }
 
     #[tokio::test]
@@ -227,7 +233,12 @@ mod tests {
         });
 
         let result = tool.call(args, &context).await.unwrap();
-        assert!(result.contains("\"count\": 5"));
-        assert!(result.contains("\"truncated\": true"));
+
+        // Check truncation message
+        assert!(result.contains("(5 matches, truncated)"));
+
+        // Should have exactly 5 matches + 1 count line = 6 lines
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 6);
     }
 }
