@@ -47,6 +47,9 @@ pub mod tts;
 /// Error types and handling
 pub mod error;
 
+/// Credential resolution for dynamic API keys (OAuth, token refresh)
+pub mod auth;
+
 #[cfg(feature = "http-client")]
 pub mod outbound;
 
@@ -104,6 +107,17 @@ pub trait LLMProvider:
     async fn speech(&self, _req: &tts::TtsRequest) -> Result<tts::TtsResponse, error::LLMError> {
         Err(error::LLMError::NotImplemented("TTS not supported".into()))
     }
+
+    /// Set an API key resolver for dynamic credential refresh (e.g., OAuth).
+    /// Default implementation is a no-op for providers that don't support dynamic credentials.
+    fn set_key_resolver(&mut self, _resolver: std::sync::Arc<dyn auth::ApiKeyResolver>) {
+        // Default: no-op for providers that don't support dynamic credentials
+    }
+
+    /// Get the current key resolver, if any.
+    fn key_resolver(&self) -> Option<&std::sync::Arc<dyn auth::ApiKeyResolver>> {
+        None
+    }
 }
 
 pub trait HTTPLLMProvider:
@@ -143,6 +157,23 @@ pub trait HTTPLLMProvider:
         _resp: http::Response<Vec<u8>>,
     ) -> Result<tts::TtsResponse, error::LLMError> {
         Err(error::LLMError::NotImplemented("TTS not supported".into()))
+    }
+
+    /// Returns the API key resolver for this provider, if one is set.
+    ///
+    /// The adapter layer calls this to obtain the resolver, then invokes
+    /// [`ApiKeyResolver::resolve()`](auth::ApiKeyResolver::resolve) before
+    /// each request to ensure credentials are fresh.
+    fn key_resolver(&self) -> Option<&std::sync::Arc<dyn auth::ApiKeyResolver>> {
+        None
+    }
+
+    /// Attach a key resolver for dynamic credential refresh.
+    ///
+    /// Called after provider construction (e.g., by the session layer) to
+    /// enable OAuth token refresh without rebuilding the provider.
+    fn set_key_resolver(&mut self, _resolver: std::sync::Arc<dyn auth::ApiKeyResolver>) {
+        // Default: ignore. Providers that support dynamic credentials override this.
     }
 }
 

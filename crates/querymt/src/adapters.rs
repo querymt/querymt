@@ -21,11 +21,25 @@ impl LLMProviderFromHTTP {
         Self { inner }
     }
 
+    /// Ensure the provider's credential is fresh before building a request.
+    ///
+    /// If the provider has an [`ApiKeyResolver`](crate::auth::ApiKeyResolver),
+    /// this calls `resolve()` so that subsequent sync calls to `current()`
+    /// in the provider's request builders return a valid credential.
+    async fn ensure_credential_fresh(&self) -> Result<(), LLMError> {
+        if let Some(resolver) = self.inner.key_resolver() {
+            resolver.resolve().await?;
+        }
+        Ok(())
+    }
+
     async fn do_chat(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        self.ensure_credential_fresh().await?;
+
         let req = self
             .inner
             .chat_request(messages, tools)
@@ -66,6 +80,8 @@ impl ChatProvider for LLMProviderFromHTTP {
                 "Streaming not supported by underlying HTTP provider".into(),
             ));
         }
+
+        self.ensure_credential_fresh().await?;
 
         let req = self
             .inner
@@ -135,6 +151,7 @@ impl ChatProvider for LLMProviderFromHTTP {
 impl EmbeddingProvider for LLMProviderFromHTTP {
     #[instrument(name = "http_adapter.embed", skip_all)]
     async fn embed(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+        self.ensure_credential_fresh().await?;
         let req = self.inner.embed_request(&inputs)?;
         let resp = call_outbound(req)
             .await
@@ -149,6 +166,7 @@ impl EmbeddingProvider for LLMProviderFromHTTP {
 impl CompletionProvider for LLMProviderFromHTTP {
     #[instrument(name = "http_adapter.complete", skip_all)]
     async fn complete(&self, req_obj: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
+        self.ensure_credential_fresh().await?;
         let req = self.inner.complete_request(req_obj)?;
         let resp = call_outbound(req)
             .await
@@ -167,6 +185,7 @@ impl LLMProvider for LLMProviderFromHTTP {
 
     #[instrument(name = "http_adapter.transcribe", skip_all)]
     async fn transcribe(&self, req_obj: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
+        self.ensure_credential_fresh().await?;
         let req = self.inner.stt_request(req_obj)?;
         let resp = call_outbound(req)
             .await
@@ -178,6 +197,7 @@ impl LLMProvider for LLMProviderFromHTTP {
 
     #[instrument(name = "http_adapter.speech", skip_all)]
     async fn speech(&self, req_obj: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
+        self.ensure_credential_fresh().await?;
         let req = self.inner.tts_request(req_obj)?;
         let resp = call_outbound(req)
             .await

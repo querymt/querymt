@@ -459,6 +459,10 @@ pub async fn build_provider_from_config(
     let defaults = ModelDefaults::for_model(provider_name, model);
     defaults.apply_to(&mut builder_config, "standalone");
 
+    // Track whether we should attach an OAuth key resolver after construction.
+    // The resolver enables transparent token refresh without rebuilding the provider.
+    let mut _use_oauth_resolver = false;
+
     // Get API key - try override, then OAuth (if feature enabled), then env var
     if let Some(http_factory) = factory.as_http()
         && let Some(env_var_name) = http_factory.api_key_name()
@@ -476,6 +480,7 @@ pub async fn build_provider_from_config(
                 match get_or_refresh_token(provider_name).await {
                     Ok(token) => {
                         log::debug!("Using OAuth token for provider: {}", provider_name);
+                        _use_oauth_resolver = true;
                         Some(token)
                     }
                     Err(e) => {
@@ -529,6 +534,69 @@ pub async fn build_provider_from_config(
     }
 
     let pruned_config_str = serde_json::to_string(&pruned_config)?;
+
+    // If OAuth was used, attach a resolver so expired tokens are refreshed
+    // transparently on each request.
+    //
+    // We try the generic LLMProviderFactory path first: Extism providers
+    // handle HTTP internally and accept set_key_resolver directly on the
+    // LLMProvider. For native HTTP providers the generic path wraps the
+    // inner HTTP provider in Arc before we can set the resolver, so we
+    // fall back to the HTTPLLMProviderFactory path to set it on the inner
+    // provider before wrapping.
+    #[cfg(feature = "oauth")]
+    if _use_oauth_resolver {
+        let initial_key = builder_config
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let resolver = std::sync::Arc::new(crate::auth::OAuthKeyResolver::new(
+            provider_name,
+            &initial_key,
+        ));
+
+        // Generic path — works for Extism providers that implement set_key_resolver.
+        let mut provider = factory.from_config(&pruned_config_str)?;
+        provider.set_key_resolver(resolver.clone());
+
+        if provider.key_resolver().is_some() {
+            log::debug!(
+                "Attached OAuthKeyResolver via LLMProvider for '{}' (model: {})",
+                provider_name,
+                model
+            );
+            return Ok(Arc::from(provider));
+        }
+
+        // Fallback for native HTTP providers: set the resolver on the inner
+        // HTTPLLMProvider before it gets wrapped in Arc by the adapter.
+        if let Some(http_factory) = factory.as_http() {
+            let mut http_provider = http_factory.from_config(&pruned_config_str)?;
+            http_provider.set_key_resolver(resolver);
+
+            log::debug!(
+                "Attached OAuthKeyResolver via HTTPLLMProvider for '{}' (model: {})",
+                provider_name,
+                model
+            );
+
+            let arc_provider: std::sync::Arc<dyn querymt::HTTPLLMProvider> =
+                std::sync::Arc::from(http_provider);
+            let adapter = querymt::adapters::LLMProviderFromHTTP::new(arc_provider);
+            return Ok(Arc::from(Box::new(adapter) as Box<dyn LLMProvider>));
+        }
+
+        // Neither path attached a resolver — return the provider as-is.
+        log::warn!(
+            "OAuthKeyResolver could not be attached for provider '{}' (model: {})",
+            provider_name,
+            model
+        );
+        return Ok(Arc::from(provider));
+    }
+
     let provider = factory.from_config(&pruned_config_str)?;
     Ok(Arc::from(provider))
 }

@@ -72,7 +72,7 @@ fn normalize_extra_body_map(map: Map<String, Value>) -> Map<String, Value> {
 }
 
 pub trait CodexProviderConfig {
-    fn api_key(&self) -> &str;
+    fn api_key(&self) -> String;
     fn base_url(&self) -> &Url;
     fn model(&self) -> &str;
     fn max_tokens(&self) -> Option<&u32>;
@@ -427,7 +427,7 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
         .join("responses")
         .map_err(|e| LLMError::HttpError(e.to_string()))?;
     let api_key = cfg.api_key();
-    let account_id = chatgpt_account_id(api_key)?;
+    let account_id = chatgpt_account_id(&api_key)?;
 
     Ok(Request::builder()
         .method(Method::POST)
@@ -817,7 +817,7 @@ pub fn codex_list_models_request<C: CodexProviderConfig>(
         .append_pair("client_version", client_version);
 
     let api_key = cfg.api_key();
-    let account_id = chatgpt_account_id(api_key)?;
+    let account_id = chatgpt_account_id(&api_key)?;
 
     Ok(Request::builder()
         .method(Method::GET)

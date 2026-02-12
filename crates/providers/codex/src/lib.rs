@@ -3,6 +3,7 @@
 use http::{Method, Request, Response};
 use querymt::{
     HTTPLLMProvider,
+    auth::ApiKeyResolver,
     chat::{ChatMessage, ChatResponse, StreamChunk, Tool, ToolChoice, http::HTTPChatProvider},
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -56,6 +57,10 @@ pub struct Codex {
     #[schemars(skip)]
     #[serde(default = "Codex::default_tool_state_buffer")]
     pub tool_state_buffer: Arc<Mutex<HashMap<usize, api::CodexToolUseState>>>,
+    /// Optional resolver for dynamic credential refresh (e.g., OAuth tokens).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub key_resolver: Option<Arc<dyn ApiKeyResolver>>,
 }
 
 impl Codex {
@@ -69,8 +74,12 @@ impl Codex {
 }
 
 impl api::CodexProviderConfig for Codex {
-    fn api_key(&self) -> &str {
-        &self.api_key
+    fn api_key(&self) -> String {
+        if let Some(ref resolver) = self.key_resolver {
+            resolver.current()
+        } else {
+            self.api_key.clone()
+        }
     }
 
     fn base_url(&self) -> &Url {
@@ -183,6 +192,14 @@ impl HTTPCompletionProvider for Codex {
 impl HTTPLLMProvider for Codex {
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
+    }
+
+    fn key_resolver(&self) -> Option<&Arc<dyn ApiKeyResolver>> {
+        self.key_resolver.as_ref()
+    }
+
+    fn set_key_resolver(&mut self, resolver: Arc<dyn ApiKeyResolver>) {
+        self.key_resolver = Some(resolver);
     }
 }
 

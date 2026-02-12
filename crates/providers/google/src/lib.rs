@@ -43,6 +43,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use http::{Method, Request, Response, header::CONTENT_TYPE};
 use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
+    auth::ApiKeyResolver,
     chat::{
         ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, StructuredOutputFormat,
         Tool, ToolChoice, http::HTTPChatProvider,
@@ -57,6 +58,7 @@ use querymt::{
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 use url::Url;
 
 /// Client for interacting with Google's Gemini API.
@@ -101,6 +103,10 @@ pub struct Google {
     #[serde(skip, default = "default_stream_buffer")]
     #[schemars(skip)]
     stream_buffer: std::sync::Mutex<String>,
+    /// Optional resolver for dynamic credential refresh (e.g., OAuth tokens).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub key_resolver: Option<Arc<dyn ApiKeyResolver>>,
 }
 
 fn default_stream_buffer() -> std::sync::Mutex<String> {
@@ -126,6 +132,7 @@ impl Clone for Google {
             cached_content: self.cached_content.clone(),
             // Create a new empty buffer for the cloned instance
             stream_buffer: std::sync::Mutex::new(String::new()),
+            key_resolver: self.key_resolver.clone(),
         }
     }
 }
@@ -571,6 +578,15 @@ impl Google {
     fn default_base_url() -> Url {
         Url::parse("https://generativelanguage.googleapis.com/v1beta/models/").unwrap()
     }
+
+    /// Returns the current API key, using the resolver if available.
+    fn resolved_key(&self) -> String {
+        if let Some(ref resolver) = self.key_resolver {
+            resolver.current()
+        } else {
+            self.api_key.clone()
+        }
+    }
 }
 
 impl HTTPChatProvider for Google {
@@ -579,7 +595,8 @@ impl HTTPChatProvider for Google {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<Request<Vec<u8>>, LLMError> {
-        if self.api_key.is_empty() {
+        let resolved_key = self.resolved_key();
+        if resolved_key.is_empty() {
             return Err(LLMError::AuthError("Missing Google API key".into()));
         }
 
@@ -728,7 +745,7 @@ impl HTTPChatProvider for Google {
         let mut url = Google::default_base_url()
             .join(&path)
             .map_err(|e| LLMError::HttpError(e.to_string()))?;
-        url.set_query(Some(&format!("key={}", &self.api_key)));
+        url.set_query(Some(&format!("key={}", &resolved_key)));
 
         Ok(Request::builder()
             .method(Method::POST)
@@ -812,7 +829,8 @@ impl HTTPCompletionProvider for Google {
 
 impl HTTPEmbeddingProvider for Google {
     fn embed_request(&self, inputs: &[String]) -> Result<Request<Vec<u8>>, LLMError> {
-        if self.api_key.is_empty() {
+        let resolved_key = self.resolved_key();
+        if resolved_key.is_empty() {
             return Err(LLMError::AuthError("Missing Google API key".to_string()));
         }
         let embedding_model = "text-embedding-004";
@@ -836,7 +854,7 @@ impl HTTPEmbeddingProvider for Google {
             .map_err(|e| LLMError::HttpError(e.to_string()))?
             .join(":embedContent")
             .map_err(|e| LLMError::HttpError(e.to_string()))?;
-        url.set_query(Some(&format!("key={}", &self.api_key)));
+        url.set_query(Some(&format!("key={}", &resolved_key)));
 
         unimplemented!();
         Err(LLMError::ProviderError("asd".to_string()))
@@ -861,6 +879,14 @@ impl HTTPEmbeddingProvider for Google {
 impl HTTPLLMProvider for Google {
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
+    }
+
+    fn key_resolver(&self) -> Option<&Arc<dyn ApiKeyResolver>> {
+        self.key_resolver.as_ref()
+    }
+
+    fn set_key_resolver(&mut self, resolver: Arc<dyn ApiKeyResolver>) {
+        self.key_resolver = Some(resolver);
     }
 }
 

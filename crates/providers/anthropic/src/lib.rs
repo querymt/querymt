@@ -16,6 +16,7 @@ use http::{
 };
 use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
+    auth::ApiKeyResolver,
     chat::{
         ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, Tool, ToolChoice,
         http::HTTPChatProvider,
@@ -29,6 +30,7 @@ use querymt::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 use url::Url;
 
 /// Authentication type for Anthropic API
@@ -116,6 +118,10 @@ pub struct Anthropic {
     pub tool_choice: Option<ToolChoice>,
     pub reasoning: Option<bool>,
     pub thinking_budget_tokens: Option<u32>,
+    /// Optional resolver for dynamic credential refresh (e.g., OAuth tokens).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub key_resolver: Option<Arc<dyn ApiKeyResolver>>,
 }
 
 /// Anthropic-specific tool format that matches their API structure
@@ -533,10 +539,20 @@ impl Anthropic {
         Url::parse("https://api.anthropic.com/v1/").unwrap()
     }
 
+    /// Returns the current API key, using the resolver if available.
+    fn resolved_key(&self) -> String {
+        if let Some(ref resolver) = self.key_resolver {
+            resolver.current()
+        } else {
+            self.api_key.clone()
+        }
+    }
+
     /// Determines the authentication type to use.
     /// Delegates to `detect_auth_type` for the actual logic.
     fn determine_auth_type(&self) -> AuthType {
-        detect_auth_type(&self.api_key, self.auth_type.clone())
+        let key = self.resolved_key();
+        detect_auth_type(&key, self.auth_type.clone())
     }
 
     /// Returns true if using OAuth authentication
@@ -591,16 +607,17 @@ impl Anthropic {
 
     /// Adds authentication headers to the request builder based on auth type
     fn add_auth_headers(&self, builder: http::request::Builder) -> http::request::Builder {
+        let key = self.resolved_key();
         let auth_type = self.determine_auth_type();
         let builder = match auth_type {
             AuthType::OAuth => builder
-                .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+                .header(AUTHORIZATION, format!("Bearer {}", key))
                 .header(
                     "anthropic-beta",
                     "oauth-2025-04-20,interleaved-thinking-2025-05-14",
                 )
                 .header(USER_AGENT, "claude-cli/2.1.2 (external, cli)"),
-            AuthType::ApiKey => builder.header("x-api-key", &self.api_key),
+            AuthType::ApiKey => builder.header("x-api-key", &key),
         };
         builder.header("anthropic-version", "2023-06-01")
     }
@@ -612,7 +629,7 @@ impl HTTPChatProvider for Anthropic {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<Request<Vec<u8>>, LLMError> {
-        if self.api_key.is_empty() {
+        if self.resolved_key().is_empty() {
             return Err(LLMError::AuthError("Missing Anthropic API key".to_string()));
         }
 
@@ -970,6 +987,14 @@ impl HTTPEmbeddingProvider for Anthropic {
 impl HTTPLLMProvider for Anthropic {
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
+    }
+
+    fn key_resolver(&self) -> Option<&Arc<dyn ApiKeyResolver>> {
+        self.key_resolver.as_ref()
+    }
+
+    fn set_key_resolver(&mut self, resolver: Arc<dyn ApiKeyResolver>) {
+        self.key_resolver = Some(resolver);
     }
 }
 

@@ -1,7 +1,10 @@
 use crate::{
-    chat::{ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool},
-    completion::{CompletionProvider, CompletionRequest, CompletionResponse},
-    embedding::EmbeddingProvider,
+    auth::ApiKeyResolver,
+    chat::{http::HTTPChatProvider, ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool},
+    completion::{
+        http::HTTPCompletionProvider, CompletionProvider, CompletionRequest, CompletionResponse,
+    },
+    embedding::{http::HTTPEmbeddingProvider, EmbeddingProvider},
     error::LLMError,
     plugin::{
         extism_impl::{
@@ -11,7 +14,7 @@ use crate::{
         Fut, HTTPLLMProviderFactory, LLMProviderFactory,
     },
     providers::read_providers_from_cache,
-    stt, tts, LLMProvider,
+    stt, tts, HTTPLLMProvider, LLMProvider,
 };
 
 use async_trait::async_trait;
@@ -208,6 +211,7 @@ impl LLMProviderFactory for ExtismFactory {
             plugin: self.plugin.clone(),
             config: cfg_value,
             user_data: self.user_data.clone(),
+            key_resolver: None,
         };
         Ok(Box::new(provider))
     }
@@ -242,7 +246,26 @@ impl LLMProviderFactory for ExtismFactory {
     }
 
     fn as_http(&self) -> Option<&dyn crate::plugin::http::HTTPLLMProviderFactory> {
-        Some(self)
+        // Only return Some if the plugin is HTTP-based
+        // Check if plugin exports the api_key_name function (exported by impl_extism_http_plugin!)
+        let is_http_based = {
+            let plug = self.plugin.lock().unwrap();
+            plug.function_exists("api_key_name")
+        };
+
+        if is_http_based {
+            log::debug!(
+                "Extism plugin '{}' detected as HTTP-based provider",
+                self.name
+            );
+            Some(self)
+        } else {
+            log::debug!(
+                "Extism plugin '{}' detected as non-HTTP provider",
+                self.name
+            );
+            None
+        }
     }
 }
 
@@ -255,10 +278,21 @@ impl HTTPLLMProviderFactory for ExtismFactory {
         (self as &dyn LLMProviderFactory).config_schema()
     }
 
-    fn from_config(&self, _cfg: &str) -> Result<Box<dyn crate::HTTPLLMProvider>, LLMError> {
-        Err(LLMError::PluginError(
-            "ExtismProvider should not be used as HTTPLLMProviderFactory".into(),
-        ))
+    fn from_config(&self, cfg: &str) -> Result<Box<dyn crate::HTTPLLMProvider>, LLMError> {
+        let cfg_value: Value = serde_json::from_str(cfg)
+            .map_err(|e| LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))?;
+
+        let _from_cfg = self
+            .call("from_config", &cfg_value)
+            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
+
+        let provider = ExtismProvider {
+            plugin: self.plugin.clone(),
+            config: cfg_value,
+            user_data: self.user_data.clone(),
+            key_resolver: None,
+        };
+        Ok(Box::new(provider))
     }
 
     fn list_models_request(&self, _cfg: &str) -> Result<http::Request<Vec<u8>>, LLMError> {
@@ -284,6 +318,7 @@ pub struct ExtismProvider {
     plugin: Arc<Mutex<Plugin>>,
     config: Value,
     user_data: Option<extism::UserData<functions::HostState>>,
+    key_resolver: Option<Arc<dyn ApiKeyResolver>>,
 }
 
 impl ExtismProvider {
@@ -393,8 +428,21 @@ impl ChatProvider for ExtismProvider {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        let mut cfg = self.config.clone();
+
+        // Refresh OAuth token if resolver is present
+        if let Some(ref resolver) = self.key_resolver {
+            resolver.resolve().await?;
+            if let Some(obj) = cfg.as_object_mut() {
+                obj.insert(
+                    "api_key".to_string(),
+                    serde_json::Value::String(resolver.current()),
+                );
+            }
+        }
+
         let arg = ExtismChatRequest {
-            cfg: self.config.clone(),
+            cfg,
             messages: messages.to_vec(),
             tools: tools.map(|v| v.to_vec()),
         };
@@ -422,7 +470,7 @@ impl ChatProvider for ExtismProvider {
         std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
         LLMError,
     > {
-        if !self.supports_streaming() {
+        if !ChatProvider::supports_streaming(self) {
             return Err(LLMError::NotImplemented(
                 "Streaming not supported by this plugin".into(),
             ));
@@ -448,6 +496,18 @@ impl ChatProvider for ExtismProvider {
         let plugin = self.plugin.clone();
         let user_data_clone = self.user_data.clone().unwrap();
         let mut cfg = self.config.clone();
+
+        // Refresh OAuth token if resolver is present
+        if let Some(ref resolver) = self.key_resolver {
+            resolver.resolve().await?;
+            if let Some(obj) = cfg.as_object_mut() {
+                obj.insert(
+                    "api_key".to_string(),
+                    serde_json::Value::String(resolver.current()),
+                );
+            }
+        }
+
         if let Some(obj) = cfg.as_object_mut() {
             obj.insert("stream".to_string(), serde_json::Value::Bool(true));
         }
@@ -576,10 +636,20 @@ impl ChatProvider for ExtismProvider {
 impl EmbeddingProvider for ExtismProvider {
     #[instrument(name = "extism_provider.embed", skip_all)]
     async fn embed(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
-        let arg = ExtismEmbedRequest {
-            cfg: self.config.clone(),
-            inputs: input,
-        };
+        let mut cfg = self.config.clone();
+
+        // Refresh OAuth token if resolver is present
+        if let Some(ref resolver) = self.key_resolver {
+            resolver.resolve().await?;
+            if let Some(obj) = cfg.as_object_mut() {
+                obj.insert(
+                    "api_key".to_string(),
+                    serde_json::Value::String(resolver.current()),
+                );
+            }
+        }
+
+        let arg = ExtismEmbedRequest { cfg, inputs: input };
 
         self.call_blocking_with_cancel("embed", move |plug| {
             let out: Json<Vec<Vec<f32>>> = plug
@@ -595,8 +665,21 @@ impl EmbeddingProvider for ExtismProvider {
 impl CompletionProvider for ExtismProvider {
     #[instrument(name = "extism_provider.complete", skip_all)]
     async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
+        let mut cfg = self.config.clone();
+
+        // Refresh OAuth token if resolver is present
+        if let Some(ref resolver) = self.key_resolver {
+            resolver.resolve().await?;
+            if let Some(obj) = cfg.as_object_mut() {
+                obj.insert(
+                    "api_key".to_string(),
+                    serde_json::Value::String(resolver.current()),
+                );
+            }
+        }
+
         let arg = ExtismCompleteRequest {
-            cfg: self.config.clone(),
+            cfg,
             req: req.clone(),
         };
 
@@ -613,7 +696,19 @@ impl CompletionProvider for ExtismProvider {
 #[async_trait]
 impl LLMProvider for ExtismProvider {
     async fn transcribe(&self, req: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
-        let cfg = self.config.clone();
+        let mut cfg = self.config.clone();
+
+        // Refresh OAuth token if resolver is present
+        if let Some(ref resolver) = self.key_resolver {
+            resolver.resolve().await?;
+            if let Some(obj) = cfg.as_object_mut() {
+                obj.insert(
+                    "api_key".to_string(),
+                    serde_json::Value::String(resolver.current()),
+                );
+            }
+        }
+
         let audio_base64 = BASE64.encode(&req.audio);
         let filename = req.filename.clone();
         let mime_type = req.mime_type.clone();
@@ -648,7 +743,19 @@ impl LLMProvider for ExtismProvider {
     }
 
     async fn speech(&self, req: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
-        let cfg = self.config.clone();
+        let mut cfg = self.config.clone();
+
+        // Refresh OAuth token if resolver is present
+        if let Some(ref resolver) = self.key_resolver {
+            resolver.resolve().await?;
+            if let Some(obj) = cfg.as_object_mut() {
+                obj.insert(
+                    "api_key".to_string(),
+                    serde_json::Value::String(resolver.current()),
+                );
+            }
+        }
+
         let text = req.text.clone();
         let model = req.model.clone();
         let voice = req.voice.clone();
@@ -681,5 +788,74 @@ impl LLMProvider for ExtismProvider {
 
         out.into_tts_response()
             .map_err(|e| LLMError::PluginError(e.to_string()))
+    }
+
+    fn set_key_resolver(&mut self, resolver: Arc<dyn ApiKeyResolver>) {
+        self.key_resolver = Some(resolver);
+    }
+
+    fn key_resolver(&self) -> Option<&Arc<dyn ApiKeyResolver>> {
+        self.key_resolver.as_ref()
+    }
+}
+
+impl HTTPChatProvider for ExtismProvider {
+    fn chat_request(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: Option<&[Tool]>,
+    ) -> Result<http::Request<Vec<u8>>, LLMError> {
+        Err(LLMError::NotImplemented(
+            "Extism plugins don't expose HTTP requests".into(),
+        ))
+    }
+
+    fn parse_chat(
+        &self,
+        _resp: http::Response<Vec<u8>>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        Err(LLMError::NotImplemented(
+            "Extism plugins don't parse HTTP responses".into(),
+        ))
+    }
+}
+
+impl HTTPCompletionProvider for ExtismProvider {
+    fn complete_request(
+        &self,
+        _req: &CompletionRequest,
+    ) -> Result<http::Request<Vec<u8>>, LLMError> {
+        Err(LLMError::NotImplemented(
+            "Extism plugins don't expose HTTP requests".into(),
+        ))
+    }
+
+    fn parse_complete(
+        &self,
+        _resp: http::Response<Vec<u8>>,
+    ) -> Result<CompletionResponse, LLMError> {
+        Err(LLMError::NotImplemented(
+            "Extism plugins don't parse HTTP responses".into(),
+        ))
+    }
+}
+
+impl HTTPEmbeddingProvider for ExtismProvider {
+    fn embed_request(&self, _inputs: &[String]) -> Result<http::Request<Vec<u8>>, LLMError> {
+        Err(LLMError::NotImplemented(
+            "Extism plugins don't expose HTTP requests".into(),
+        ))
+    }
+
+    fn parse_embed(&self, _resp: http::Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
+        Err(LLMError::NotImplemented(
+            "Extism plugins don't parse HTTP responses".into(),
+        ))
+    }
+}
+
+impl HTTPLLMProvider for ExtismProvider {
+    fn tools(&self) -> Option<&[Tool]> {
+        None
     }
 }
