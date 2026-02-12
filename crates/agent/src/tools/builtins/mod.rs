@@ -1,4 +1,5 @@
 pub mod apply_patch;
+pub mod browse;
 pub mod create_task;
 pub mod delegate;
 pub mod delete_file;
@@ -20,6 +21,7 @@ pub mod web_fetch;
 pub mod write_file;
 
 pub use apply_patch::ApplyPatchTool;
+pub use browse::BrowseTool;
 pub use create_task::CreateTaskTool;
 pub use delegate::DelegateTool;
 pub use delete_file::DeleteFileTool;
@@ -47,6 +49,7 @@ use std::sync::Arc;
 pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ApplyPatchTool::new()),
+        Arc::new(BrowseTool::new()),
         Arc::new(SemanticEditTool::new()),
         Arc::new(CreateTaskTool::new()),
         Arc::new(DelegateTool::new()),

@@ -31,7 +31,7 @@ tracing = { version = "0.1", features = ["attributes"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli", "deflate"] }
 rusqlite = { version = "0.37", features = ["bundled", "uuid", "time"] }
 time = { version = "0.3", features = ["serde"] }
 uuid = { version = "1.18", features = ["v4", "v7"] }
@@ -66,6 +66,7 @@ infer = "0.16"
 rayon = "1.11"
 indexmap = { version = "2", features = ["serde"] }
 gray_matter = "0.3"
+fast_html2md = { package = "fast_html2md", version = "0.0.58", features = ["scraper"] }
 
 # Markdown Query cli tool for agent `mdq` tool
 mdq = "0.9.0"

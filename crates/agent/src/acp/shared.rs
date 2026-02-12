@@ -154,7 +154,7 @@ pub fn tool_kind_for_tool(name: &str) -> ToolKind {
         "write_file" | "apply_patch" => ToolKind::Edit,
         "delete_file" => ToolKind::Delete,
         "shell" => ToolKind::Execute,
-        "web_fetch" => ToolKind::Fetch,
+        "web_fetch" | "browse" => ToolKind::Fetch,
         _ => ToolKind::Other,
     }
 }

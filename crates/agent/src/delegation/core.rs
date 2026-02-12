@@ -891,7 +891,7 @@ fn extract_tool_args_preview(tool_name: &str, args_json: &str) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        "web_fetch" => args
+        "web_fetch" | "browse" => args
             .get("url")
             .and_then(|v| v.as_str())
             .unwrap_or("")
