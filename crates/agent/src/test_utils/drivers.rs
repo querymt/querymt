@@ -35,22 +35,38 @@ impl StateRecordingDriver {
 
 #[async_trait]
 impl MiddlewareDriver for StateRecordingDriver {
-    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         self.record(&state);
         Ok(state)
     }
 
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         self.record(&state);
         Ok(state)
     }
 
-    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_after_llm(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         self.record(&state);
         Ok(state)
     }
 
-    async fn on_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_processing_tool_calls(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         self.record(&state);
         Ok(state)
     }
@@ -74,11 +90,19 @@ pub struct MessageInjectingDriver {
 
 #[async_trait]
 impl MiddlewareDriver for MessageInjectingDriver {
-    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         self.inject(state)
     }
 
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         self.inject(state)
     }
 
@@ -140,19 +164,35 @@ impl StopDriver {
 
 #[async_trait]
 impl MiddlewareDriver for StopDriver {
-    async fn on_turn_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(
+        &self,
+        _state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Ok(self.stopped_state())
     }
 
-    async fn on_step_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        _state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Ok(self.stopped_state())
     }
 
-    async fn on_after_llm(&self, _state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_after_llm(
+        &self,
+        _state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Ok(self.stopped_state())
     }
 
-    async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_processing_tool_calls(
+        &self,
+        _state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Ok(self.stopped_state())
     }
 
@@ -173,7 +213,11 @@ pub struct AlwaysStopDriver {
 
 #[async_trait]
 impl MiddlewareDriver for AlwaysStopDriver {
-    async fn on_turn_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(
+        &self,
+        _state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Ok(ExecutionState::Stopped {
             message: "stopped by middleware".into(),
             stop_type: self.stop_type,
@@ -181,16 +225,28 @@ impl MiddlewareDriver for AlwaysStopDriver {
         })
     }
 
-    async fn on_step_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
+    async fn on_step_start(
+        &self,
+        _state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.on_turn_start(_state, runtime).await
     }
 
-    async fn on_after_llm(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
+    async fn on_after_llm(
+        &self,
+        _state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.on_turn_start(_state, runtime).await
     }
 
-    async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
+    async fn on_processing_tool_calls(
+        &self,
+        _state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.on_turn_start(_state, runtime).await
     }
 
     fn reset(&self) {}
@@ -208,20 +264,36 @@ pub struct CompleteDriver;
 
 #[async_trait]
 impl MiddlewareDriver for CompleteDriver {
-    async fn on_turn_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(
+        &self,
+        _state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Ok(ExecutionState::Complete)
     }
 
-    async fn on_step_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
+    async fn on_step_start(
+        &self,
+        _state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.on_turn_start(_state, runtime).await
     }
 
-    async fn on_after_llm(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
+    async fn on_after_llm(
+        &self,
+        _state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.on_turn_start(_state, runtime).await
     }
 
-    async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
+    async fn on_processing_tool_calls(
+        &self,
+        _state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.on_turn_start(_state, runtime).await
     }
 
     fn reset(&self) {}
@@ -239,20 +311,36 @@ pub struct CancelDriver;
 
 #[async_trait]
 impl MiddlewareDriver for CancelDriver {
-    async fn on_turn_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(
+        &self,
+        _state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Ok(ExecutionState::Cancelled)
     }
 
-    async fn on_step_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
+    async fn on_step_start(
+        &self,
+        _state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.on_turn_start(_state, runtime).await
     }
 
-    async fn on_after_llm(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
+    async fn on_after_llm(
+        &self,
+        _state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.on_turn_start(_state, runtime).await
     }
 
-    async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
+    async fn on_processing_tool_calls(
+        &self,
+        _state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.on_turn_start(_state, runtime).await
     }
 
     fn reset(&self) {}
@@ -296,22 +384,38 @@ impl Default for CountingDriver {
 
 #[async_trait]
 impl MiddlewareDriver for CountingDriver {
-    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         self.bump();
         Ok(state)
     }
 
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         self.bump();
         Ok(state)
     }
 
-    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_after_llm(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         self.bump();
         Ok(state)
     }
 
-    async fn on_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_processing_tool_calls(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         self.bump();
         Ok(state)
     }
@@ -333,22 +437,38 @@ pub struct ErrorDriver;
 
 #[async_trait]
 impl MiddlewareDriver for ErrorDriver {
-    async fn on_turn_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(
+        &self,
+        _state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Err(crate::middleware::MiddlewareError::ExecutionError(
             "test error".into(),
         ))
     }
 
-    async fn on_step_start(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
+    async fn on_step_start(
+        &self,
+        _state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.on_turn_start(_state, runtime).await
     }
 
-    async fn on_after_llm(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
+    async fn on_after_llm(
+        &self,
+        _state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.on_turn_start(_state, runtime).await
     }
 
-    async fn on_processing_tool_calls(&self, _state: ExecutionState) -> Result<ExecutionState> {
-        self.on_turn_start(_state).await
+    async fn on_processing_tool_calls(
+        &self,
+        _state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.on_turn_start(_state, runtime).await
     }
 
     fn reset(&self) {}
@@ -366,7 +486,11 @@ pub struct BeforeLlmCallToCallLlmDriver;
 
 #[async_trait]
 impl MiddlewareDriver for BeforeLlmCallToCallLlmDriver {
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         match state {
             ExecutionState::BeforeLlmCall { context } => Ok(ExecutionState::CallLlm {
                 context,
@@ -391,7 +515,11 @@ pub struct StopOnBeforeLlmCall;
 
 #[async_trait]
 impl MiddlewareDriver for StopOnBeforeLlmCall {
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         match state {
             ExecutionState::BeforeLlmCall { .. } => Ok(ExecutionState::Stopped {
                 message: "stopped".into(),

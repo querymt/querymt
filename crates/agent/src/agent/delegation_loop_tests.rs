@@ -1,6 +1,7 @@
+use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{
-    AgentMode, DelegationContextConfig, DelegationContextTiming, QueryMTAgent, SnapshotPolicy,
-    ToolConfig, ToolPolicy,
+    AgentMode, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy, ToolConfig,
+    ToolPolicy,
 };
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
@@ -159,7 +160,7 @@ impl SendAgent for StubDelegateAgent {
 }
 
 struct TestHarness {
-    agent: Arc<QueryMTAgent>,
+    config: Arc<AgentConfig>,
     exec_ctx: ExecutionContext,
     provider: Arc<Mutex<MockLlmProvider>>,
     _temp_dir: TempDir,
@@ -279,54 +280,60 @@ impl TestHarness {
         }
         let agent_registry: Arc<DefaultAgentRegistry> = Arc::new(agent_registry);
 
-        let agent = Arc::new(QueryMTAgent {
+        let event_bus = Arc::new(EventBus::new());
+        let tool_registry = ToolRegistry::new();
+
+        let config = Arc::new(AgentConfig {
             provider: provider_context,
-            active_sessions: Arc::new(Mutex::new(HashMap::new())),
-            session_runtime: Arc::new(Mutex::new(HashMap::new())),
+            event_bus: event_bus.clone(),
+            agent_registry: agent_registry.clone(),
+            workspace_index_manager: Arc::new(WorkspaceIndexManager::new(
+                WorkspaceIndexManagerConfig::default(),
+            )),
+            default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
+            tool_config: ToolConfig {
+                policy: ToolPolicy::ProviderOnly,
+                ..ToolConfig::default()
+            },
+            tool_registry: tool_registry.clone(),
+            middleware_drivers: Vec::new(),
+            auth_methods: Vec::new(),
             max_steps: None,
             snapshot_policy: SnapshotPolicy::None,
             assume_mutating: true,
             mutating_tools: HashSet::new(),
             max_prompt_bytes: None,
-            tool_config: Arc::new(StdMutex::new(ToolConfig::default())),
-            tool_registry: Arc::new(StdMutex::new(ToolRegistry::new())),
-            middleware_drivers: Arc::new(std::sync::Mutex::new(Vec::new())),
-            agent_mode: Arc::new(std::sync::atomic::AtomicU8::new(AgentMode::Build as u8)),
-            event_bus: Arc::new(EventBus::new()),
-            client_state: Arc::new(StdMutex::new(None)),
-            auth_methods: Arc::new(StdMutex::new(Vec::new())),
-            client: Arc::new(StdMutex::new(None)),
-            bridge: Arc::new(StdMutex::new(None)),
-            agent_registry: agent_registry.clone(),
-            delegation_context_config: DelegationContextConfig {
-                timing: DelegationContextTiming::FirstTurnOnly,
-                auto_inject: true,
-            },
-            workspace_index_manager: Arc::new(WorkspaceIndexManager::new(
-                WorkspaceIndexManagerConfig::default(),
-            )),
             execution_timeout_secs: 300,
             tool_output_config: ToolOutputConfig::default(),
             pruning_config: PruningConfig::default(),
             compaction_config: crate::config::CompactionConfig::default(),
             compaction: crate::session::compaction::SessionCompaction::new(),
+            rate_limit_config: RateLimitConfig::default(),
             snapshot_backend: None,
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
+            delegation_context_config: DelegationContextConfig {
+                timing: DelegationContextTiming::FirstTurnOnly,
+                auto_inject: true,
+            },
             pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
-            rate_limit_config: RateLimitConfig::default(),
         });
 
-        if let Ok(mut config) = agent.tool_config.lock() {
-            config.policy = ToolPolicy::ProviderOnly;
-        }
+        // Create a KameoSendAgent wrapping a SessionRegistry for delegation
+        let kameo_registry = Arc::new(Mutex::new(crate::agent::SessionRegistry::new(
+            config.clone(),
+        )));
+        let delegator: Arc<dyn SendAgent> =
+            Arc::new(crate::send_agent::KameoSendAgent::new(kameo_registry));
 
         let orchestrator = Arc::new(DelegationOrchestrator::new(
-            agent.clone(),
+            delegator,
+            event_bus.clone(),
             store.clone(),
             agent_registry.clone(),
+            Arc::new(tool_registry),
             None,
         ));
-        agent.add_observer(orchestrator);
+        config.add_observer(orchestrator);
 
         // Create a SessionRuntime for the execution context
         let session_runtime = Arc::new(crate::agent::core::SessionRuntime {
@@ -346,7 +353,7 @@ impl TestHarness {
         let exec_ctx = ExecutionContext::new(session_id, session_runtime, runtime_context, context);
 
         Self {
-            agent,
+            config,
             exec_ctx,
             provider,
             _temp_dir: temp_dir,
@@ -355,10 +362,15 @@ impl TestHarness {
 
     async fn run(&mut self) -> CycleOutcome {
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        self.agent
-            .execute_cycle_state_machine(&mut self.exec_ctx, rx)
-            .await
-            .expect("state machine")
+        crate::agent::execution::execute_cycle_state_machine(
+            &self.config,
+            &mut self.exec_ctx,
+            rx,
+            None,
+            crate::agent::core::AgentMode::Build,
+        )
+        .await
+        .expect("state machine")
     }
 
     async fn provider_mut(&self) -> tokio::sync::MutexGuard<'_, MockLlmProvider> {
@@ -688,7 +700,7 @@ async fn test_delegation_guard_blocks_duplicate() {
         )),
     };
 
-    let result = middleware.on_after_llm(state).await.unwrap();
+    let result = middleware.on_after_llm(state, None).await.unwrap();
 
     assert!(matches!(
         result,
@@ -763,7 +775,7 @@ async fn test_delegation_guard_blocks_max_retries() {
         )),
     };
 
-    let result = middleware.on_after_llm(state).await.unwrap();
+    let result = middleware.on_after_llm(state, None).await.unwrap();
 
     assert!(matches!(
         result,

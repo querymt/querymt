@@ -1,6 +1,7 @@
+use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{
-    AgentMode, DelegationContextConfig, DelegationContextTiming, QueryMTAgent, SnapshotPolicy,
-    ToolConfig, ToolPolicy,
+    AgentMode, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy, ToolConfig,
+    ToolPolicy,
 };
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
@@ -32,7 +33,7 @@ use tokio::sync::{Mutex, oneshot, watch};
 // Mock implementations moved to crate::test_utils::mocks
 
 struct TestHarness {
-    agent: QueryMTAgent,
+    config: Arc<AgentConfig>,
     session_id: String,
     exec_ctx: ExecutionContext,
     provider: Arc<Mutex<MockLlmProvider>>,
@@ -147,46 +148,40 @@ impl TestHarness {
             .await
             .expect("load context");
 
-        let agent = QueryMTAgent {
+        let config = Arc::new(AgentConfig {
             provider: provider_context,
-            active_sessions: Arc::new(Mutex::new(HashMap::new())),
-            session_runtime: Arc::new(Mutex::new(HashMap::new())),
+            event_bus: Arc::new(EventBus::new()),
+            agent_registry: Arc::new(DefaultAgentRegistry::new()),
+            workspace_index_manager: Arc::new(WorkspaceIndexManager::new(
+                WorkspaceIndexManagerConfig::default(),
+            )),
+            default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
+            tool_config: ToolConfig {
+                policy: ToolPolicy::ProviderOnly,
+                ..ToolConfig::default()
+            },
+            tool_registry: ToolRegistry::new(),
+            middleware_drivers: Vec::new(),
+            auth_methods: Vec::new(),
             max_steps: None,
             snapshot_policy: SnapshotPolicy::None,
             assume_mutating: true,
             mutating_tools: HashSet::new(),
             max_prompt_bytes: None,
-            tool_config: Arc::new(StdMutex::new(ToolConfig::default())),
-            tool_registry: Arc::new(StdMutex::new(ToolRegistry::new())),
-            middleware_drivers: Arc::new(std::sync::Mutex::new(Vec::new())),
-            agent_mode: Arc::new(std::sync::atomic::AtomicU8::new(AgentMode::Build as u8)),
-            event_bus: Arc::new(EventBus::new()),
-            client_state: Arc::new(StdMutex::new(None)),
-            auth_methods: Arc::new(StdMutex::new(Vec::new())),
-            client: Arc::new(StdMutex::new(None)),
-            bridge: Arc::new(StdMutex::new(None)),
-            agent_registry: Arc::new(DefaultAgentRegistry::new()),
-            delegation_context_config: DelegationContextConfig {
-                timing: DelegationContextTiming::FirstTurnOnly,
-                auto_inject: true,
-            },
-            workspace_index_manager: Arc::new(WorkspaceIndexManager::new(
-                WorkspaceIndexManagerConfig::default(),
-            )),
             execution_timeout_secs: 300,
             tool_output_config: ToolOutputConfig::default(),
             pruning_config: PruningConfig::default(),
             compaction_config: crate::config::CompactionConfig::default(),
             compaction: crate::session::compaction::SessionCompaction::new(),
+            rate_limit_config: RateLimitConfig::default(),
             snapshot_backend: None,
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
+            delegation_context_config: DelegationContextConfig {
+                timing: DelegationContextTiming::FirstTurnOnly,
+                auto_inject: true,
+            },
             pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
-            rate_limit_config: RateLimitConfig::default(),
-        };
-
-        if let Ok(mut config) = agent.tool_config.lock() {
-            config.policy = ToolPolicy::ProviderOnly;
-        }
+        });
 
         // Create a SessionRuntime for the execution context
         let session_runtime = Arc::new(crate::agent::core::SessionRuntime {
@@ -210,7 +205,7 @@ impl TestHarness {
         );
 
         Self {
-            agent,
+            config,
             session_id,
             exec_ctx,
             provider,
@@ -219,10 +214,15 @@ impl TestHarness {
     }
 
     async fn run(&mut self, cancel_rx: watch::Receiver<bool>) -> CycleOutcome {
-        self.agent
-            .execute_cycle_state_machine(&mut self.exec_ctx, cancel_rx)
-            .await
-            .expect("state machine")
+        crate::agent::execution::execute_cycle_state_machine(
+            &self.config,
+            &mut self.exec_ctx,
+            cancel_rx,
+            None,
+            crate::agent::core::AgentMode::Build,
+        )
+        .await
+        .expect("state machine")
     }
 
     async fn provider_mut(&self) -> tokio::sync::MutexGuard<'_, MockLlmProvider> {
@@ -413,10 +413,14 @@ async fn test_llm_error_returns_err() {
         .times(0..);
 
     let (_tx, rx) = watch::channel(false);
-    let result = harness
-        .agent
-        .execute_cycle_state_machine(&mut harness.exec_ctx, rx)
-        .await;
+    let result = crate::agent::execution::execute_cycle_state_machine(
+        &harness.config,
+        &mut harness.exec_ctx,
+        rx,
+        None,
+        crate::agent::core::AgentMode::Build,
+    )
+    .await;
 
     assert!(result.is_err());
 }
@@ -424,9 +428,34 @@ async fn test_llm_error_returns_err() {
 #[tokio::test]
 async fn test_middleware_stops_execution() {
     let mut harness = TestHarness::new(vec![], None).await;
-    if let Ok(mut drivers) = harness.agent.middleware_drivers.lock() {
-        drivers.push(Arc::new(StopOnBeforeLlmCall));
-    }
+    // Rebuild config with the StopOnBeforeLlmCall middleware
+    let old_config = harness.config.as_ref();
+    harness.config = Arc::new(AgentConfig {
+        provider: old_config.provider.clone(),
+        event_bus: old_config.event_bus.clone(),
+        agent_registry: old_config.agent_registry.clone(),
+        workspace_index_manager: old_config.workspace_index_manager.clone(),
+        default_mode: old_config.default_mode.clone(),
+        tool_config: old_config.tool_config.clone(),
+        tool_registry: old_config.tool_registry.clone(),
+        middleware_drivers: vec![Arc::new(StopOnBeforeLlmCall)],
+        auth_methods: old_config.auth_methods.clone(),
+        max_steps: old_config.max_steps,
+        snapshot_policy: old_config.snapshot_policy,
+        assume_mutating: old_config.assume_mutating,
+        mutating_tools: old_config.mutating_tools.clone(),
+        max_prompt_bytes: old_config.max_prompt_bytes,
+        execution_timeout_secs: old_config.execution_timeout_secs,
+        tool_output_config: old_config.tool_output_config.clone(),
+        pruning_config: old_config.pruning_config.clone(),
+        compaction_config: old_config.compaction_config.clone(),
+        compaction: old_config.compaction.clone(),
+        rate_limit_config: old_config.rate_limit_config.clone(),
+        snapshot_backend: old_config.snapshot_backend.clone(),
+        snapshot_gc_config: old_config.snapshot_gc_config.clone(),
+        delegation_context_config: old_config.delegation_context_config.clone(),
+        pending_elicitations: old_config.pending_elicitations.clone(),
+    });
     harness
         .provider_mut()
         .await
@@ -528,7 +557,7 @@ async fn test_waiting_for_event_delegation() {
         .times(0..);
 
     let session_id = harness.session_id.clone();
-    let event_bus = harness.agent.event_bus();
+    let event_bus = harness.config.event_bus.clone();
     tokio::spawn(async move {
         let delegation_id = delegation_rx.await.expect("delegation id");
         event_bus.publish(

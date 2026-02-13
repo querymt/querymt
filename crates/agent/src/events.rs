@@ -257,6 +257,10 @@ pub enum AgentEventKind {
         mode: String,
         previous_mode: String,
     },
+    /// Emitted when a session's mode changes (per-session mode in actor model)
+    SessionModeChanged {
+        mode: crate::agent::core::AgentMode,
+    },
     /// LLM request was rate limited, execution is paused and waiting
     RateLimited {
         /// Human-readable message from the provider

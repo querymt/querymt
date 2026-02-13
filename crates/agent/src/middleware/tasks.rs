@@ -26,7 +26,11 @@ impl TaskAutoCompletionMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for TaskAutoCompletionMiddleware {
-    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_after_llm(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "TaskAutoCompletionMiddleware::on_after_llm entering state: {}",
             state.name()
@@ -242,7 +246,11 @@ impl DuplicateToolCallMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for DuplicateToolCallMiddleware {
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "DuplicateToolCallMiddleware::on_step_start entering state: {}",
             state.name()

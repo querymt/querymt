@@ -1,5 +1,4 @@
 use crate::acp::AcpServer;
-use crate::agent::QueryMTAgent;
 use crate::session::projection::ViewStore;
 use crate::ui::UiServer;
 use axum::{
@@ -17,14 +16,14 @@ use std::sync::Arc;
 struct Assets;
 
 pub struct AgentServer {
-    agent: Arc<QueryMTAgent>,
+    agent: Arc<crate::agent::AgentHandle>,
     view_store: Arc<dyn ViewStore>,
     default_cwd: Option<PathBuf>,
 }
 
 impl AgentServer {
     pub fn new(
-        agent: Arc<QueryMTAgent>,
+        agent: Arc<crate::agent::AgentHandle>,
         view_store: Arc<dyn ViewStore>,
         default_cwd: Option<PathBuf>,
     ) -> Self {

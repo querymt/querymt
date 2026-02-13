@@ -37,7 +37,6 @@
 
 use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
 use crate::acp::shutdown;
-use crate::agent::QueryMTAgent;
 use crate::event_bus::EventBus;
 use crate::send_agent::ApcAgentAdapter;
 use agent_client_protocol::{AgentSideConnection, Client, SessionId, SessionNotification};
@@ -209,7 +208,7 @@ fn spawn_event_bridge_forwarder(
 /// The server handles SIGTERM and SIGINT (Ctrl+C) for graceful shutdown.
 /// Current operations are allowed to complete before exit.
 #[instrument(name = "acp.serve_stdio", skip(agent))]
-pub async fn serve_stdio(agent: Arc<QueryMTAgent>) -> anyhow::Result<()> {
+pub async fn serve_stdio(agent: Arc<crate::agent::AgentHandle>) -> anyhow::Result<()> {
     let local = tokio::task::LocalSet::new();
 
     local

@@ -4,7 +4,7 @@
 //! ACP server implementations, including JSON-RPC types, event translation, and
 //! RPC message handling.
 
-use crate::agent::QueryMTAgent;
+use crate::agent::AgentHandle;
 use crate::event_bus::EventBus;
 use crate::events::{AgentEvent, AgentEventKind};
 use crate::send_agent::SendAgent;
@@ -260,7 +260,7 @@ pub async fn is_event_owned(
 ///
 /// # Returns
 /// A vector of unique EventBus instances
-pub fn collect_event_sources(agent: &Arc<QueryMTAgent>) -> Vec<Arc<EventBus>> {
+pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<EventBus>> {
     let mut sources = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -271,14 +271,27 @@ pub fn collect_event_sources(agent: &Arc<QueryMTAgent>) -> Vec<Arc<EventBus>> {
 
     let registry = agent.agent_registry();
     for info in registry.list_agents() {
-        if let Some(instance) = registry.get_agent_instance(&info.id)
-            && let Some(bus) = instance
+        if let Some(instance) = registry.get_agent_instance(&info.id) {
+            // Try downcasting to AgentHandle (new path)
+            if let Some(bus) = instance
                 .as_any()
-                .downcast_ref::<QueryMTAgent>()
+                .downcast_ref::<AgentHandle>()
                 .map(|agent| agent.event_bus())
-            && seen.insert(Arc::as_ptr(&bus) as usize)
-        {
-            sources.push(bus);
+            {
+                if seen.insert(Arc::as_ptr(&bus) as usize) {
+                    sources.push(bus);
+                }
+            }
+            // Try downcasting to KameoSendAgent (kameo path)
+            else if let Some(kameo_agent) = instance
+                .as_any()
+                .downcast_ref::<crate::send_agent::KameoSendAgent>()
+            {
+                let bus = kameo_agent.event_bus();
+                if seen.insert(Arc::as_ptr(&bus) as usize) {
+                    sources.push(bus);
+                }
+            }
         }
     }
 
@@ -349,22 +362,45 @@ pub async fn handle_rpc_message<S: SendAgent>(
                 Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
             }
         },
-        m if m == AGENT_METHOD_NAMES.session_fork => {
-            log::warn!("session/fork not yet implemented");
-            Err(Error::new(-32601, "session/fork not implemented yet"))
-        }
-        m if m == AGENT_METHOD_NAMES.session_list => {
-            log::warn!("session/list not yet implemented");
-            Err(Error::new(-32601, "session/list not implemented yet"))
-        }
-        m if m == AGENT_METHOD_NAMES.session_load => {
-            log::warn!("session/load not yet implemented");
-            Err(Error::new(-32601, "session/load not implemented yet"))
-        }
-        m if m == AGENT_METHOD_NAMES.session_resume => {
-            log::warn!("session/resume not yet implemented");
-            Err(Error::new(-32601, "session/resume not implemented yet"))
-        }
+        m if m == AGENT_METHOD_NAMES.session_fork => match serde_json::from_value(req.params) {
+            Ok(params) => agent
+                .fork_session(params)
+                .await
+                .map(|r| serde_json::to_value(r).unwrap()),
+            Err(e) => {
+                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+            }
+        },
+        m if m == AGENT_METHOD_NAMES.session_list => match serde_json::from_value(req.params) {
+            Ok(params) => agent
+                .list_sessions(params)
+                .await
+                .map(|r| serde_json::to_value(r).unwrap()),
+            Err(e) => {
+                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+            }
+        },
+        m if m == AGENT_METHOD_NAMES.session_load => match serde_json::from_value(req.params) {
+            Ok(params) => {
+                let response = agent.load_session(params).await;
+                match response {
+                    Ok(r) => Ok(serde_json::to_value(r).unwrap()),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => {
+                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+            }
+        },
+        m if m == AGENT_METHOD_NAMES.session_resume => match serde_json::from_value(req.params) {
+            Ok(params) => agent
+                .resume_session(params)
+                .await
+                .map(|r| serde_json::to_value(r).unwrap()),
+            Err(e) => {
+                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+            }
+        },
         m if m == AGENT_METHOD_NAMES.session_set_config_option => {
             log::warn!("session/set_config_option not implemented yet");
             Err(Error::new(
@@ -373,12 +409,20 @@ pub async fn handle_rpc_message<S: SendAgent>(
             ))
         }
         m if m == AGENT_METHOD_NAMES.session_set_mode => {
-            log::warn!("session/set_mode not yet implemented");
+            // TODO: Implement once we expose mode setting via SendAgent or direct actor message
+            log::warn!("session/set_mode not yet implemented via RPC");
             Err(Error::new(-32601, "session/set_mode not implemented yet"))
         }
         m if m == AGENT_METHOD_NAMES.session_set_model => {
-            log::warn!("session/set_model not yet implemented");
-            Err(Error::new(-32601, "session/set_model not implemented yet"))
+            match serde_json::from_value(req.params) {
+                Ok(params) => agent
+                    .set_session_model(params)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap()),
+                Err(e) => {
+                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                }
+            }
         }
 
         "permission_result" => {

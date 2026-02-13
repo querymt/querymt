@@ -29,7 +29,7 @@ pub use crate::runner::{
 };
 
 // Core agent types
-pub use crate::agent::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
+pub use crate::agent::{AgentHandle, SnapshotPolicy, ToolPolicy};
 pub use crate::quorum::{AgentQuorum, DelegateAgent};
 
 // Events

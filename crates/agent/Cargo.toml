@@ -23,6 +23,7 @@ querymt = { path = "../querymt", default-features = false, features = ["extism_h
 querymt-utils = { path = "../querymt-utils", features = ["providers"] }
 agent-client-protocol = { version = "0.9", features = ["unstable"] }
 agent-client-protocol-schema = { version = "0.10", features = ["unstable"]}
+kameo = "0.19"
 async-trait.workspace = true
 anyhow = "1.0"
 thiserror = "2.0"

@@ -12,7 +12,7 @@
 //! let agent = Agent::single()
 //!     .provider("anthropic", "claude-sonnet")
 //!     .middleware(|agent| {
-//!         DedupCheckMiddleware::new(agent.session_runtime())
+//!         DedupCheckMiddleware::new()
 //!             .threshold(0.8)
 //!             .min_lines(5)
 //!             .with_event_bus(agent.event_bus())
@@ -30,7 +30,6 @@
 //! min_lines = 5
 //! ```
 
-use crate::agent::core::QueryMTAgent;
 use crate::event_bus::EventBus;
 use crate::events::AgentEventKind;
 use crate::index::{DiffPaths, FunctionIndex, IndexedFunctionEntry, SimilarFunctionMatch};
@@ -42,7 +41,6 @@ use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,8 +108,6 @@ pub struct DedupCheckMiddleware {
     threshold: f64,
     /// Minimum number of lines for a function to be analyzed
     min_lines: usize,
-    /// Session runtime map for accessing function indexes
-    session_runtime: Arc<Mutex<HashMap<String, Arc<crate::agent::core::SessionRuntime>>>>,
     /// Accumulated tool results from the current batch (reset each cycle)
     pending_results: Arc<Mutex<Vec<ToolResult>>>,
     /// Optional event bus for emitting duplicate detection events
@@ -122,6 +118,12 @@ pub struct DedupCheckMiddleware {
     last_context: Arc<Mutex<Option<Arc<ConversationContext>>>>,
 }
 
+impl Default for DedupCheckMiddleware {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DedupCheckMiddleware {
     /// Create a new DedupCheckMiddleware with default settings
     ///
@@ -129,14 +131,11 @@ impl DedupCheckMiddleware {
     /// - enabled: true
     /// - threshold: 0.8 (80% similarity)
     /// - min_lines: 5
-    pub fn new(
-        session_runtime: Arc<Mutex<HashMap<String, Arc<crate::agent::core::SessionRuntime>>>>,
-    ) -> Self {
+    pub fn new() -> Self {
         Self {
             enabled: true,
             threshold: 0.8,
             min_lines: 5,
-            session_runtime,
             pending_results: Arc::new(Mutex::new(Vec::new())),
             event_bus: None,
             already_reviewed_this_turn: AtomicBool::new(false),
@@ -391,7 +390,11 @@ impl DedupCheckMiddleware {
 #[async_trait]
 impl MiddlewareDriver for DedupCheckMiddleware {
     /// Capture the latest context for use in on_turn_end
-    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_after_llm(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         // Capture the latest context for use in on_turn_end
         if let Some(ctx) = state.context() {
             *self.last_context.lock().await = Some(ctx.clone());
@@ -401,7 +404,7 @@ impl MiddlewareDriver for DedupCheckMiddleware {
 
     #[instrument(
         name = "middleware.dedup_check.turn_end",
-        skip(self, state),
+        skip(self, state, runtime),
         fields(
             input_state = %state.name(),
             output_state = tracing::field::Empty,
@@ -410,7 +413,11 @@ impl MiddlewareDriver for DedupCheckMiddleware {
             review_injected = tracing::field::Empty
         )
     )]
-    async fn on_turn_end(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_end(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         if !self.enabled {
             tracing::Span::current().record("output_state", state.name());
             return Ok(state);
@@ -435,32 +442,24 @@ impl MiddlewareDriver for DedupCheckMiddleware {
             return Ok(state);
         };
 
-        // Find an active session with turn_diffs
-        let (function_index, turn_diffs) = {
-            let runtimes = self.session_runtime.lock().await;
-
-            // Try to find the session matching our context
-            let session_id = &context.session_id;
-            let runtime = runtimes.get(session_id.as_ref());
-
-            let function_index = runtime.and_then(|r| r.function_index.get().cloned());
-
-            // Get and clear turn_diffs
-            let turn_diffs = runtime.and_then(|r| {
-                r.turn_diffs.lock().ok().map(|mut diffs| {
-                    let accumulated = diffs.clone();
-                    *diffs = DiffPaths::default();
-                    accumulated
-                })
-            });
-
-            (function_index, turn_diffs)
+        // Get function_index and turn_diffs from the runtime parameter
+        let Some(runtime) = runtime else {
+            tracing::Span::current().record("output_state", "Complete");
+            return Ok(state);
         };
 
+        let function_index = runtime.function_index.get().cloned();
         let Some(function_index) = function_index else {
             tracing::Span::current().record("output_state", "Complete");
             return Ok(state);
         };
+
+        // Get and clear turn_diffs
+        let turn_diffs = runtime.turn_diffs.lock().ok().map(|mut diffs| {
+            let accumulated = diffs.clone();
+            *diffs = DiffPaths::default();
+            accumulated
+        });
 
         let Some(turn_diffs) = turn_diffs else {
             tracing::Span::current().record("files_checked", 0usize);
@@ -555,7 +554,7 @@ impl MiddlewareFactory for DedupCheckFactory {
     fn create(
         &self,
         config: &Value,
-        agent: &QueryMTAgent,
+        agent_config: &crate::agent::agent_config::AgentConfig,
     ) -> AnyhowResult<Arc<dyn MiddlewareDriver>> {
         // Check if explicitly disabled
         let enabled = config
@@ -567,8 +566,7 @@ impl MiddlewareFactory for DedupCheckFactory {
             return Err(anyhow::anyhow!("Middleware disabled"));
         }
 
-        let mut mw =
-            DedupCheckMiddleware::new(agent.session_runtime()).with_event_bus(agent.event_bus());
+        let mut mw = DedupCheckMiddleware::new().with_event_bus(agent_config.event_bus.clone());
 
         if let Some(v) = config.get("threshold").and_then(|v| v.as_f64()) {
             mw = mw.threshold(v);
@@ -588,8 +586,7 @@ mod tests {
 
     #[test]
     fn test_middleware_defaults() {
-        let session_runtime = Arc::new(Mutex::new(HashMap::new()));
-        let mw = DedupCheckMiddleware::new(session_runtime);
+        let mw = DedupCheckMiddleware::new();
         assert!(mw.enabled);
         assert!((mw.threshold - 0.8).abs() < f64::EPSILON);
         assert_eq!(mw.min_lines, 5);
@@ -597,8 +594,7 @@ mod tests {
 
     #[test]
     fn test_middleware_builder() {
-        let session_runtime = Arc::new(Mutex::new(HashMap::new()));
-        let mw = DedupCheckMiddleware::new(session_runtime)
+        let mw = DedupCheckMiddleware::new()
             .enabled(false)
             .threshold(0.9)
             .min_lines(10);

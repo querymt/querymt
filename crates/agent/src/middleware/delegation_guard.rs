@@ -129,7 +129,11 @@ impl DelegationGuardMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for DelegationGuardMiddleware {
-    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_after_llm(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "DelegationGuardMiddleware::on_after_llm entering state: {}",
             state.name()

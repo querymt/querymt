@@ -35,7 +35,7 @@ async fn test_undo_single_agent_with_file_changes() -> Result<()> {
     assert_eq!(fixture.read_file("test.txt")?, "modified");
 
     // Undo
-    let result = fixture.agent.undo(&session_id, &user_msg_id).await?;
+    let result = fixture.undo(&session_id, &user_msg_id).await?;
 
     // Verify reverted
     assert_eq!(fixture.read_file("test.txt")?, "original");
@@ -68,7 +68,7 @@ async fn test_undo_multiple_files() -> Result<()> {
         .await?;
 
     // Undo
-    let result = fixture.agent.undo(&session_id, &user_msg_id).await?;
+    let result = fixture.undo(&session_id, &user_msg_id).await?;
 
     // Verify both files reverted
     assert_eq!(fixture.read_file("a.txt")?, "a-original");
@@ -99,7 +99,7 @@ async fn test_undo_file_deletion() -> Result<()> {
     assert!(fixture.worktree.path().join("new.txt").exists());
 
     // Undo
-    let _result = fixture.agent.undo(&session_id, &user_msg_id).await?;
+    let _result = fixture.undo(&session_id, &user_msg_id).await?;
 
     // Verify new file was removed
     assert!(!fixture.worktree.path().join("new.txt").exists());
@@ -133,7 +133,7 @@ async fn test_undo_cross_session_delegation() -> Result<()> {
     assert_eq!(fixture.read_file("test.txt")?, "modified by delegate");
 
     // Undo on PARENT session (this is the critical test!)
-    let result = fixture.agent.undo(&parent_id, &user_msg_id).await?;
+    let result = fixture.undo(&parent_id, &user_msg_id).await?;
 
     // Should revert child session's changes
     assert_eq!(fixture.read_file("test.txt")?, "original");
@@ -177,7 +177,7 @@ async fn test_undo_multiple_child_sessions() -> Result<()> {
     assert_eq!(fixture.read_file("b.txt")?, "b-modified");
 
     // Undo on parent should revert both children's changes
-    let result = fixture.agent.undo(&parent_id, &user_msg_id).await?;
+    let result = fixture.undo(&parent_id, &user_msg_id).await?;
 
     assert_eq!(fixture.read_file("a.txt")?, "a-original");
     assert_eq!(fixture.read_file("b.txt")?, "b-original");
@@ -211,11 +211,11 @@ async fn test_redo_restores_file_modification() -> Result<()> {
     assert_eq!(fixture.read_file("test.txt")?, "modified");
 
     // Undo - should restore to "original"
-    fixture.agent.undo(&session_id, &user_msg_id).await?;
+    fixture.undo(&session_id, &user_msg_id).await?;
     assert_eq!(fixture.read_file("test.txt")?, "original");
 
     // Redo - should restore to "modified"
-    let redo_result = fixture.agent.redo(&session_id).await?;
+    let redo_result = fixture.redo(&session_id).await?;
     assert!(redo_result.restored);
     assert_eq!(fixture.read_file("test.txt")?, "modified");
 
@@ -245,12 +245,12 @@ async fn test_redo_restores_file_deletion() -> Result<()> {
     assert!(!fixture.worktree.path().join("to_delete.txt").exists());
 
     // Undo - should restore the file
-    fixture.agent.undo(&session_id, &user_msg_id).await?;
+    fixture.undo(&session_id, &user_msg_id).await?;
     assert!(fixture.worktree.path().join("to_delete.txt").exists());
     assert_eq!(fixture.read_file("to_delete.txt")?, "content");
 
     // Redo - should delete the file again (THIS IS THE BUG FIX TEST)
-    let redo_result = fixture.agent.redo(&session_id).await?;
+    let redo_result = fixture.redo(&session_id).await?;
     assert!(redo_result.restored);
     assert!(!fixture.worktree.path().join("to_delete.txt").exists());
 
@@ -277,11 +277,11 @@ async fn test_redo_restores_file_creation() -> Result<()> {
     assert!(fixture.worktree.path().join("new.txt").exists());
 
     // Undo - should remove the newly created file
-    fixture.agent.undo(&session_id, &user_msg_id).await?;
+    fixture.undo(&session_id, &user_msg_id).await?;
     assert!(!fixture.worktree.path().join("new.txt").exists());
 
     // Redo - should recreate the file
-    let redo_result = fixture.agent.redo(&session_id).await?;
+    let redo_result = fixture.redo(&session_id).await?;
     assert!(redo_result.restored);
     assert!(fixture.worktree.path().join("new.txt").exists());
     assert_eq!(fixture.read_file("new.txt")?, "new content");
@@ -295,7 +295,7 @@ async fn test_redo_with_no_revert_state_fails() -> Result<()> {
     let session_id = fixture.create_session().await?;
 
     // Try to redo without having done an undo first
-    let result = fixture.agent.redo(&session_id).await;
+    let result = fixture.redo(&session_id).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("Nothing to redo"));
 
@@ -329,15 +329,15 @@ async fn test_undo_twice_then_redo_once_restores_latest_undone_step() -> Result<
     assert_eq!(fixture.read_file("test.txt")?, "v2");
 
     // Undo latest turn (v2 -> v1)
-    fixture.agent.undo(&session_id, &user_msg_2).await?;
+    fixture.undo(&session_id, &user_msg_2).await?;
     assert_eq!(fixture.read_file("test.txt")?, "v1");
 
     // Undo previous turn (v1 -> original)
-    fixture.agent.undo(&session_id, &user_msg_1).await?;
+    fixture.undo(&session_id, &user_msg_1).await?;
     assert_eq!(fixture.read_file("test.txt")?, "original");
 
     // Redo once should restore only the most recently undone step (original -> v1)
-    let redo_result = fixture.agent.redo(&session_id).await?;
+    let redo_result = fixture.redo(&session_id).await?;
     assert!(redo_result.restored);
     assert_eq!(fixture.read_file("test.txt")?, "v1");
 
@@ -389,14 +389,14 @@ async fn test_delete_two_files_full_undo_redo_cycle_tracks_stack_depth() -> Resu
     assert_eq!(revert_stack_len().await?, 0);
 
     // Undo second deletion: second.txt restored, first.txt still deleted
-    fixture.agent.undo(&session_id, &user_msg_2).await?;
+    fixture.undo(&session_id, &user_msg_2).await?;
     assert!(!fixture.worktree.path().join("first.txt").exists());
     assert!(fixture.worktree.path().join("second.txt").exists());
     assert_eq!(fixture.read_file("second.txt")?, "second");
     assert_eq!(revert_stack_len().await?, 1);
 
     // Undo first deletion: both files restored
-    fixture.agent.undo(&session_id, &user_msg_1).await?;
+    fixture.undo(&session_id, &user_msg_1).await?;
     assert!(fixture.worktree.path().join("first.txt").exists());
     assert!(fixture.worktree.path().join("second.txt").exists());
     assert_eq!(fixture.read_file("first.txt")?, "first");
@@ -404,20 +404,20 @@ async fn test_delete_two_files_full_undo_redo_cycle_tracks_stack_depth() -> Resu
     assert_eq!(revert_stack_len().await?, 2);
 
     // Redo once: re-apply first deletion only
-    fixture.agent.redo(&session_id).await?;
+    fixture.redo(&session_id).await?;
     assert!(!fixture.worktree.path().join("first.txt").exists());
     assert!(fixture.worktree.path().join("second.txt").exists());
     assert_eq!(fixture.read_file("second.txt")?, "second");
     assert_eq!(revert_stack_len().await?, 1);
 
     // Redo twice: re-apply second deletion, both files deleted again
-    fixture.agent.redo(&session_id).await?;
+    fixture.redo(&session_id).await?;
     assert!(!fixture.worktree.path().join("first.txt").exists());
     assert!(!fixture.worktree.path().join("second.txt").exists());
     assert_eq!(revert_stack_len().await?, 0);
 
     // Third redo should fail and keep stack empty
-    let third_redo = fixture.agent.redo(&session_id).await;
+    let third_redo = fixture.redo(&session_id).await;
     assert!(third_redo.is_err());
     assert!(
         third_redo

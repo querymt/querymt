@@ -156,7 +156,11 @@ impl ContextMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for ContextMiddleware {
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "ContextMiddleware::on_step_start entering state: {}",
             state.name()
@@ -254,7 +258,7 @@ impl MiddlewareFactory for ContextFactory {
     fn create(
         &self,
         config: &serde_json::Value,
-        agent: &crate::agent::core::QueryMTAgent,
+        agent_config: &crate::agent::agent_config::AgentConfig,
     ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
         let cfg: ContextFactoryConfig = serde_json::from_value(config.clone())?;
 
@@ -262,8 +266,8 @@ impl MiddlewareFactory for ContextFactory {
             return Err(anyhow::anyhow!("Middleware disabled"));
         }
 
-        // Read auto_compact from agent's compaction_config
-        let auto_compact = agent.compaction_config.auto;
+        // Read auto_compact from agent config's compaction_config
+        let auto_compact = agent_config.compaction_config.auto;
 
         let context_config = ContextConfig {
             warn_at_percent: cfg.warn_at_percent,
@@ -331,7 +335,7 @@ mod tests {
         }
 
         async fn run_step(&self, state: ExecutionState) -> Result<ExecutionState> {
-            self.middleware.on_step_start(state).await
+            self.middleware.on_step_start(state, None).await
         }
     }
 

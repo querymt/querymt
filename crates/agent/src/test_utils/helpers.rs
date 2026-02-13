@@ -1,7 +1,8 @@
 //! Helper functions for creating test fixtures
 
 use crate::agent::builder::AgentBuilderExt;
-use crate::agent::core::{QueryMTAgent, SnapshotPolicy};
+use crate::agent::core::{AgentMode, QueryMTAgent, SnapshotPolicy};
+use crate::agent::AgentHandle;
 use crate::middleware::{AgentStats, ConversationContext, ToolCall, ToolFunction};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::backend::StorageBackend;
@@ -164,7 +165,7 @@ pub struct UndoTestFixture {
     pub snapshot_base: TempDir,
     pub config_dir: TempDir,
     pub storage: Arc<SqliteStorage>,
-    pub agent: QueryMTAgent,
+    pub(crate) handle: AgentHandle,
     pub backend: GitSnapshotBackend,
 }
 
@@ -190,12 +191,27 @@ impl UndoTestFixture {
 
         agent.add_observer(storage.event_observer());
 
+        let handle = AgentHandle {
+            config: agent.agent_config(),
+            registry: agent.kameo_registry(),
+            client_state: agent.client_state.clone(),
+            client: agent.client.clone(),
+            bridge: agent.bridge.clone(),
+            default_mode: std::sync::Mutex::new(
+                agent
+                    .default_mode
+                    .lock()
+                    .map(|m| *m)
+                    .unwrap_or(AgentMode::Build),
+            ),
+        };
+
         Ok(Self {
             worktree,
             snapshot_base,
             config_dir,
             storage,
-            agent,
+            handle,
             backend: GitSnapshotBackend::with_snapshot_base(snapshot_base_path),
         })
     }
@@ -208,8 +224,8 @@ impl UndoTestFixture {
             .create_session(None, Some(self.worktree.path().to_path_buf()), None, None)
             .await?;
 
-        // Create SessionRuntime for undo/redo to work
-        self.create_session_runtime(&session.public_id).await;
+        // Spawn a SessionActor via the kameo registry
+        self.register_session_actor(&session.public_id).await;
 
         Ok(session.public_id)
     }
@@ -227,14 +243,17 @@ impl UndoTestFixture {
             )
             .await?;
 
-        // Create SessionRuntime for undo/redo to work
-        self.create_session_runtime(&session.public_id).await;
+        // Spawn a SessionActor via the kameo registry
+        self.register_session_actor(&session.public_id).await;
 
         Ok(session.public_id)
     }
 
-    /// Helper to create a SessionRuntime entry for a session (needed for undo/redo)
-    async fn create_session_runtime(&self, session_id: &str) {
+    /// Helper to spawn a SessionActor for a session (needed for undo/redo via kameo)
+    async fn register_session_actor(&self, session_id: &str) {
+        use crate::agent::session_actor::SessionActor;
+        use kameo::actor::Spawn;
+
         let runtime = Arc::new(crate::agent::core::SessionRuntime {
             cwd: Some(self.worktree.path().to_path_buf()),
             _mcp_services: std::collections::HashMap::new(),
@@ -248,8 +267,11 @@ impl UndoTestFixture {
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
-        let mut runtimes = self.agent.session_runtime.lock().await;
-        runtimes.insert(session_id.to_string(), runtime);
+        let actor = SessionActor::new(self.handle.config.clone(), session_id.to_string(), runtime);
+        let actor_ref = SessionActor::spawn(actor);
+
+        let mut registry = self.handle.registry.lock().await;
+        registry.insert(session_id.to_string(), actor_ref);
     }
 
     /// Simulate a user message and return its ID
@@ -344,5 +366,19 @@ impl UndoTestFixture {
     /// Convenience: read a file from the worktree
     pub fn read_file(&self, name: &str) -> Result<String> {
         Ok(std::fs::read_to_string(self.worktree.path().join(name))?)
+    }
+
+    /// Perform undo operation via AgentHandle
+    pub async fn undo(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<crate::agent::undo::UndoResult> {
+        self.handle.undo(session_id, message_id).await
+    }
+
+    /// Perform redo operation via AgentHandle
+    pub async fn redo(&self, session_id: &str) -> Result<crate::agent::undo::RedoResult> {
+        self.handle.redo(session_id).await
     }
 }

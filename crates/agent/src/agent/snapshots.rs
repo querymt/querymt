@@ -1,6 +1,5 @@
 //! Snapshot management utilities
 
-use crate::agent::core::{QueryMTAgent, SnapshotPolicy};
 use crate::index::merkle::{DiffPaths, MerkleTree};
 use crate::model::MessagePart;
 use std::path::Path;
@@ -15,28 +14,6 @@ pub enum SnapshotState {
         pre_tree: MerkleTree,
         root: std::path::PathBuf,
     },
-}
-
-impl QueryMTAgent {
-    /// Prepares a snapshot configuration if enabled.
-    pub(crate) fn prepare_snapshot(
-        &self,
-        cwd: Option<&std::path::Path>,
-    ) -> Option<(std::path::PathBuf, SnapshotPolicy)> {
-        if self.snapshot_policy == SnapshotPolicy::None {
-            return None;
-        }
-        let root = cwd?.to_path_buf();
-        Some((root, self.snapshot_policy))
-    }
-
-    /// Determines if a tool should trigger snapshotting.
-    pub(crate) fn should_snapshot_tool(&self, tool_name: &str) -> bool {
-        if self.mutating_tools.contains(tool_name) {
-            return true;
-        }
-        self.assume_mutating
-    }
 }
 
 /// Generates metadata snapshot of a directory

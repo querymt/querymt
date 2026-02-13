@@ -5,7 +5,7 @@
 /// multi-threaded contexts without blocking.
 ///
 /// This trait is used internally for:
-/// 1. The core `QueryMTAgent` implementation (which is `Send + Sync`)
+/// 1. The `AgentHandle` facade (which is `Send + Sync`)
 /// 2. Proxies that wrap ACP SDK Clients for delegation
 /// 3. The agent registry to store heterogeneous agents
 ///
@@ -19,10 +19,11 @@
 /// - `prompt`: The main interaction method
 /// - `cancel`: Cancellation support
 use agent_client_protocol::{
-    AuthenticateRequest, AuthenticateResponse, CancelNotification, Error, ExtNotification,
-    ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
-    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification, Error,
+    ExtNotification, ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, McpCapabilities, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
     ResumeSessionRequest, ResumeSessionResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use async_trait::async_trait;
@@ -254,6 +255,177 @@ impl SendAgent for ApcClientProxy {
             -32601,
             "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
         ))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  KameoSendAgent - bridges SessionRegistry to SendAgent trait
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Bridges `SessionRegistry` to the `SendAgent` trait interface.
+///
+/// Used by delegation, ACP handlers, and any code expecting `SendAgent`.
+/// Routes session-scoped operations to the right `SessionActor` via the registry.
+pub struct KameoSendAgent {
+    registry: std::sync::Arc<tokio::sync::Mutex<crate::agent::SessionRegistry>>,
+}
+
+impl KameoSendAgent {
+    /// Create a new `KameoSendAgent` wrapping a `SessionRegistry`.
+    pub fn new(
+        registry: std::sync::Arc<tokio::sync::Mutex<crate::agent::SessionRegistry>>,
+    ) -> Self {
+        Self { registry }
+    }
+
+    /// Access the event bus from the underlying AgentConfig.
+    ///
+    /// This is used by `collect_event_sources` to gather event buses from delegate agents.
+    pub fn event_bus(&self) -> std::sync::Arc<crate::event_bus::EventBus> {
+        // We can't await the lock in a sync method, so we use try_lock.
+        // This is only called during initialization (collect_event_sources), not at runtime.
+        if let Ok(registry) = self.registry.try_lock() {
+            registry.config.event_bus.clone()
+        } else {
+            // Fallback: create a new empty EventBus (shouldn't happen in practice)
+            std::sync::Arc::new(crate::event_bus::EventBus::new())
+        }
+    }
+
+    /// Access the underlying registry.
+    pub fn registry(&self) -> &std::sync::Arc<tokio::sync::Mutex<crate::agent::SessionRegistry>> {
+        &self.registry
+    }
+}
+
+#[async_trait]
+impl SendAgent for KameoSendAgent {
+    async fn initialize(&self, req: InitializeRequest) -> Result<InitializeResponse, Error> {
+        let registry = self.registry.lock().await;
+        let config = &registry.config;
+
+        let protocol_version = if req.protocol_version <= ProtocolVersion::LATEST {
+            req.protocol_version
+        } else {
+            ProtocolVersion::LATEST
+        };
+
+        let auth_methods = config.auth_methods.clone();
+
+        let mut capabilities = AgentCapabilities::new()
+            .load_session(true)
+            .prompt_capabilities(PromptCapabilities::new().embedded_context(true))
+            .mcp_capabilities(McpCapabilities::new().http(true).sse(true));
+
+        if let Some(delegation_meta) = config.build_delegation_meta() {
+            capabilities = capabilities.meta(delegation_meta);
+        }
+
+        Ok(
+            InitializeResponse::new(agent_client_protocol::ProtocolVersion::LATEST)
+                .agent_capabilities(capabilities)
+                .auth_methods(auth_methods)
+                .agent_info(
+                    agent_client_protocol::Implementation::new(
+                        "querymt-agent",
+                        env!("CARGO_PKG_VERSION"),
+                    )
+                    .title("QueryMT Agent"),
+                ),
+        )
+    }
+
+    async fn authenticate(&self, _req: AuthenticateRequest) -> Result<AuthenticateResponse, Error> {
+        Ok(AuthenticateResponse::new())
+    }
+
+    async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+        let mut registry = self.registry.lock().await;
+        registry.new_session(req).await
+    }
+
+    async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
+        let session_id = req.session_id.to_string();
+        let actor_ref = {
+            let registry = self.registry.lock().await;
+            registry.get(&session_id).cloned().ok_or_else(|| {
+                Error::invalid_params().data(serde_json::json!({
+                    "message": "unknown session",
+                    "sessionId": session_id,
+                }))
+            })?
+        };
+        actor_ref
+            .ask(crate::agent::messages::Prompt { req })
+            .await
+            .map_err(|e| Error::new(-32000, e.to_string()))
+    }
+
+    async fn cancel(&self, notif: CancelNotification) -> Result<(), Error> {
+        let session_id = notif.session_id.to_string();
+        let actor_ref = {
+            let registry = self.registry.lock().await;
+            registry.get(&session_id).cloned()
+        };
+        if let Some(actor_ref) = actor_ref {
+            let _ = actor_ref.tell(crate::agent::messages::Cancel).await;
+        }
+        Ok(())
+    }
+
+    async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
+        let mut registry = self.registry.lock().await;
+        registry.load_session(req).await
+    }
+
+    async fn list_sessions(&self, req: ListSessionsRequest) -> Result<ListSessionsResponse, Error> {
+        let registry = self.registry.lock().await;
+        registry.list_sessions(req).await
+    }
+
+    async fn fork_session(&self, req: ForkSessionRequest) -> Result<ForkSessionResponse, Error> {
+        let registry = self.registry.lock().await;
+        registry.fork_session(req).await
+    }
+
+    async fn resume_session(
+        &self,
+        req: ResumeSessionRequest,
+    ) -> Result<ResumeSessionResponse, Error> {
+        let mut registry = self.registry.lock().await;
+        registry.resume_session(req).await
+    }
+
+    async fn set_session_model(
+        &self,
+        req: SetSessionModelRequest,
+    ) -> Result<SetSessionModelResponse, Error> {
+        let session_id = req.session_id.to_string();
+        let actor_ref = {
+            let registry = self.registry.lock().await;
+            registry
+                .get(&session_id)
+                .cloned()
+                .ok_or_else(Error::invalid_params)?
+        };
+        actor_ref
+            .ask(crate::agent::messages::SetSessionModel { req })
+            .await
+            .map_err(|e| Error::new(-32000, e.to_string()))
+    }
+
+    async fn ext_method(&self, _req: ExtRequest) -> Result<ExtResponse, Error> {
+        let raw_value = serde_json::value::RawValue::from_string("null".to_string())
+            .map_err(|e| Error::new(-32000, e.to_string()))?;
+        Ok(ExtResponse::new(std::sync::Arc::from(raw_value)))
+    }
+
+    async fn ext_notification(&self, _notif: ExtNotification) -> Result<(), Error> {
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn Any {

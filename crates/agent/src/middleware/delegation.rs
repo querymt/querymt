@@ -197,7 +197,11 @@ impl DelegationMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for DelegationMiddleware {
-    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "DelegationMiddleware::on_turn_start entering state: {}",
             state.name()
@@ -222,7 +226,11 @@ impl MiddlewareDriver for DelegationMiddleware {
         }
     }
 
-    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_after_llm(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         match state {
             ExecutionState::AfterLlm { ref context, .. } => {
                 if !self.config.prevent_duplicates {
@@ -386,7 +394,11 @@ impl DelegationContextMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for DelegationContextMiddleware {
-    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "DelegationContextMiddleware::on_turn_start entering state: {}",
             state.name()

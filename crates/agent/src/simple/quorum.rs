@@ -6,10 +6,12 @@ use super::utils::{
     build_llm_config, default_registry, infer_required_capabilities, latest_assistant_message,
     to_absolute_path,
 };
+use crate::agent::AgentHandle;
 use crate::agent::builder::AgentBuilderExt;
 use crate::agent::core::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
 use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
 use crate::delegation::AgentInfo;
+use crate::event_bus::EventBus;
 use crate::events::AgentEvent;
 use crate::middleware::MIDDLEWARE_REGISTRY;
 use crate::quorum::AgentQuorum;
@@ -18,6 +20,7 @@ use crate::send_agent::SendAgent;
 #[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
 use crate::session::projection::ViewStore;
+use crate::session::store::SessionStore;
 use crate::snapshot::GitSnapshotBackend;
 use crate::tools::CapabilityRequirement;
 use crate::tools::builtins::all_builtin_tools;
@@ -27,7 +30,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Mutex as StdMutex};
 
 /// Builder for multi-agent quorum with closure-based configuration
 pub struct QuorumBuilder {
@@ -164,10 +167,11 @@ impl QuorumBuilder {
             let snapshot_policy_for_delegate = self.snapshot_policy;
             let _cwd_for_delegate = cwd.clone();
             builder = builder.add_delegate_agent(agent_info, move |store, event_bus| {
-                let mut agent = QueryMTAgent::new(registry.clone(), store, llm_config.clone())
-                    .with_event_bus(event_bus)
-                    .with_tool_policy(ToolPolicy::BuiltInOnly)
-                    .with_snapshot_policy(snapshot_policy_for_delegate);
+                let mut agent =
+                    QueryMTAgent::new(registry.clone(), store.clone(), llm_config.clone())
+                        .with_event_bus(event_bus.clone())
+                        .with_tool_policy(ToolPolicy::BuiltInOnly)
+                        .with_snapshot_policy(snapshot_policy_for_delegate);
 
                 // Set snapshot backend if snapshot policy is enabled
                 if snapshot_policy_for_delegate != SnapshotPolicy::None {
@@ -208,7 +212,24 @@ impl QuorumBuilder {
                     }
                 }
 
-                Arc::new(agent)
+                // Convert QueryMTAgent to AgentHandle
+                let config = agent.agent_config();
+                let registry = agent.kameo_registry();
+                let handle = AgentHandle {
+                    config,
+                    registry,
+                    client_state: agent.client_state.clone(),
+                    client: agent.client.clone(),
+                    bridge: agent.bridge.clone(),
+                    default_mode: StdMutex::new(
+                        agent
+                            .default_mode
+                            .lock()
+                            .map(|m| *m)
+                            .unwrap_or(crate::agent::core::AgentMode::Build),
+                    ),
+                };
+                Arc::new(handle) as Arc<dyn SendAgent>
             });
         }
 
@@ -224,11 +245,14 @@ impl QuorumBuilder {
         let snapshot_policy_for_planner = self.snapshot_policy;
         let _cwd_for_planner = cwd.clone();
         builder = builder.with_planner(move |store, event_bus, agent_registry| {
-            let mut agent =
-                QueryMTAgent::new(registry_for_planner.clone(), store, planner_llm.clone())
-                    .with_event_bus(event_bus)
-                    .with_agent_registry(agent_registry)
-                    .with_snapshot_policy(snapshot_policy_for_planner);
+            let mut agent = QueryMTAgent::new(
+                registry_for_planner.clone(),
+                store.clone(),
+                planner_llm.clone(),
+            )
+            .with_event_bus(event_bus.clone())
+            .with_agent_registry(agent_registry)
+            .with_snapshot_policy(snapshot_policy_for_planner);
 
             // Set snapshot root and backend if snapshot policy is enabled and cwd is available
             // Set snapshot backend if snapshot policy is enabled
@@ -265,7 +289,24 @@ impl QuorumBuilder {
                 }
             }
 
-            Arc::new(agent)
+            // Convert QueryMTAgent to AgentHandle
+            let config = agent.agent_config();
+            let registry = agent.kameo_registry();
+            let handle = AgentHandle {
+                config,
+                registry,
+                client_state: agent.client_state.clone(),
+                client: agent.client.clone(),
+                bridge: agent.bridge.clone(),
+                default_mode: StdMutex::new(
+                    agent
+                        .default_mode
+                        .lock()
+                        .map(|m| *m)
+                        .unwrap_or(crate::agent::core::AgentMode::Build),
+                ),
+            };
+            Arc::new(handle) as Arc<dyn SendAgent>
         });
 
         builder = builder
@@ -303,9 +344,32 @@ impl QuorumBuilder {
 
         let quorum = builder.build().map_err(|e| anyhow!(e.to_string()))?;
         let view_store = quorum.view_store();
+
+        // Extract planner handle for dashboard use
+        let planner = quorum.planner();
+        let planner_handle = planner
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .ok_or_else(|| anyhow!("Planner is not an AgentHandle"))?;
+        let planner_handle = Arc::new(AgentHandle {
+            config: planner_handle.config.clone(),
+            registry: planner_handle.registry.clone(),
+            client_state: planner_handle.client_state.clone(),
+            client: planner_handle.client.clone(),
+            bridge: planner_handle.bridge.clone(),
+            default_mode: StdMutex::new(
+                planner_handle
+                    .default_mode
+                    .lock()
+                    .map(|m| *m)
+                    .unwrap_or(crate::agent::core::AgentMode::Build),
+            ),
+        });
+
         Ok(Quorum {
             inner: quorum,
             view_store,
+            planner_handle,
             planner_session_id: Arc::new(Mutex::new(None)),
             cwd,
             callbacks: Arc::new(EventCallbacksState::new(None)),
@@ -317,6 +381,8 @@ pub struct Quorum {
     inner: AgentQuorum,
     #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
     view_store: Arc<dyn ViewStore>,
+    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
+    planner_handle: Arc<AgentHandle>,
     planner_session_id: Arc<Mutex<Option<String>>>,
     cwd: Option<PathBuf>,
     callbacks: Arc<EventCallbacksState>,
@@ -334,9 +400,9 @@ impl Quorum {
             .prompt(request)
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
-        let history = planner
-            .provider
-            .history_store()
+        let history = self
+            .inner
+            .store()
             .get_history(&session_id)
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
@@ -347,17 +413,21 @@ impl Quorum {
         &self.inner
     }
 
-    pub fn planner(&self) -> Arc<QueryMTAgent> {
+    pub fn planner(&self) -> Arc<dyn SendAgent> {
         self.inner.planner()
     }
 
-    pub fn delegate(&self, id: &str) -> Option<Arc<QueryMTAgent>> {
+    pub fn delegate(&self, id: &str) -> Option<Arc<dyn SendAgent>> {
         self.inner.delegate(id)
     }
 
     #[cfg(feature = "dashboard")]
     pub fn dashboard(&self) -> AgentServer {
-        AgentServer::new(self.planner(), self.view_store.clone(), self.cwd.clone())
+        AgentServer::new(
+            self.planner_handle.clone(),
+            self.view_store.clone(),
+            self.cwd.clone(),
+        )
     }
 
     /// Start an ACP server with the specified transport.
@@ -381,7 +451,7 @@ impl Quorum {
     /// ```
     pub async fn acp(&self, transport: &str) -> Result<()> {
         match transport {
-            "stdio" => crate::acp::serve_stdio(self.planner())
+            "stdio" => crate::acp::serve_stdio(self.planner_handle.clone())
                 .await
                 .map_err(|e| anyhow!("ACP stdio error: {}", e)),
             addr if addr.contains(':') => Err(anyhow!(
@@ -564,42 +634,48 @@ impl ChatRunner for Quorum {
 
     async fn chat_session(&self) -> Result<Box<dyn ChatSession>> {
         let session_id = self.create_new_planner_session().await?;
-        let session = QuorumSession::new(self.inner.planner(), session_id, self.cwd.clone());
+        let session = QuorumSession::new(
+            self.inner.planner(),
+            self.inner.event_bus(),
+            self.inner.store(),
+            session_id,
+            self.cwd.clone(),
+        );
         Ok(Box::new(session))
     }
 
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
-        self.inner.planner().subscribe_events()
+        self.inner.event_bus().subscribe()
     }
 
     fn on_tool_call_boxed(&self, callback: Box<dyn Fn(String, Value) + Send + Sync>) {
         self.callbacks.on_tool_call(callback);
         self.callbacks
-            .ensure_listener(self.inner.planner().subscribe_events());
+            .ensure_listener(self.inner.event_bus().subscribe());
     }
 
     fn on_tool_complete_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_tool_complete(callback);
         self.callbacks
-            .ensure_listener(self.inner.planner().subscribe_events());
+            .ensure_listener(self.inner.event_bus().subscribe());
     }
 
     fn on_message_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_message(callback);
         self.callbacks
-            .ensure_listener(self.inner.planner().subscribe_events());
+            .ensure_listener(self.inner.event_bus().subscribe());
     }
 
     fn on_delegation_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_delegation(callback);
         self.callbacks
-            .ensure_listener(self.inner.planner().subscribe_events());
+            .ensure_listener(self.inner.event_bus().subscribe());
     }
 
     fn on_error_boxed(&self, callback: Box<dyn Fn(String) + Send + Sync>) {
         self.callbacks.on_error(callback);
         self.callbacks
-            .ensure_listener(self.inner.planner().subscribe_events());
+            .ensure_listener(self.inner.event_bus().subscribe());
     }
 
     #[cfg(feature = "dashboard")]
@@ -610,20 +686,30 @@ impl ChatRunner for Quorum {
 
 /// A session for interacting with a Quorum's planner agent
 pub struct QuorumSession {
-    planner: Arc<QueryMTAgent>,
+    planner: Arc<dyn SendAgent>,
     session_id: String,
     callbacks: Arc<EventCallbacksState>,
+    event_bus: Arc<EventBus>,
+    store: Arc<dyn SessionStore>,
     #[allow(dead_code)]
     cwd: Option<PathBuf>,
 }
 
 impl QuorumSession {
-    fn new(planner: Arc<QueryMTAgent>, session_id: String, cwd: Option<PathBuf>) -> Self {
+    fn new(
+        planner: Arc<dyn SendAgent>,
+        event_bus: Arc<EventBus>,
+        store: Arc<dyn SessionStore>,
+        session_id: String,
+        cwd: Option<PathBuf>,
+    ) -> Self {
         let callbacks = Arc::new(EventCallbacksState::new(Some(session_id.clone())));
         Self {
             planner,
             session_id,
             callbacks,
+            event_bus,
+            store,
             cwd,
         }
     }
@@ -645,9 +731,7 @@ impl ChatSession for QuorumSession {
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
         let history = self
-            .planner
-            .provider
-            .history_store()
+            .store
             .get_history(&self.session_id)
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
@@ -656,26 +740,22 @@ impl ChatSession for QuorumSession {
 
     fn on_tool_call_boxed(&self, callback: Box<dyn Fn(String, Value) + Send + Sync>) {
         self.callbacks.on_tool_call(callback);
-        self.callbacks
-            .ensure_listener(self.planner.subscribe_events());
+        self.callbacks.ensure_listener(self.event_bus.subscribe());
     }
 
     fn on_tool_complete_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_tool_complete(callback);
-        self.callbacks
-            .ensure_listener(self.planner.subscribe_events());
+        self.callbacks.ensure_listener(self.event_bus.subscribe());
     }
 
     fn on_message_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_message(callback);
-        self.callbacks
-            .ensure_listener(self.planner.subscribe_events());
+        self.callbacks.ensure_listener(self.event_bus.subscribe());
     }
 
     fn on_error_boxed(&self, callback: Box<dyn Fn(String) + Send + Sync>) {
         self.callbacks.on_error(callback);
-        self.callbacks
-            .ensure_listener(self.planner.subscribe_events());
+        self.callbacks.ensure_listener(self.event_bus.subscribe());
     }
 }
 
@@ -699,8 +779,10 @@ fn apply_middleware_from_config(
     entries: &[MiddlewareEntry],
     auto_compact: bool,
 ) {
+    // Build a temporary AgentConfig for middleware factories
+    let factory_config = agent.agent_config();
     for entry in entries {
-        match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, agent) {
+        match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &factory_config) {
             Ok(middleware) => {
                 agent.middleware_drivers.lock().unwrap().push(middleware);
             }

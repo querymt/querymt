@@ -5,7 +5,7 @@
 
 use super::ServerState;
 use super::messages::{RoutingMode, UiAgentInfo, UiPromptBlock, UiServerMessage};
-use crate::agent::QueryMTAgent;
+use crate::agent::AgentHandle;
 use crate::index::{normalize_cwd, resolve_workspace_root};
 use crate::send_agent::SendAgent;
 use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest};
@@ -299,27 +299,7 @@ pub fn resolve_cwd(cwd: Option<String>) -> Option<PathBuf> {
 }
 
 /// Collect event sources from the agent and its registry.
-pub fn collect_event_sources(agent: &Arc<QueryMTAgent>) -> Vec<Arc<crate::event_bus::EventBus>> {
-    let mut sources = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    let primary = agent.event_bus();
-    if seen.insert(Arc::as_ptr(&primary) as usize) {
-        sources.push(primary);
-    }
-
-    let registry = agent.agent_registry();
-    for info in registry.list_agents() {
-        if let Some(instance) = registry.get_agent_instance(&info.id)
-            && let Some(bus) = instance
-                .as_any()
-                .downcast_ref::<QueryMTAgent>()
-                .map(|agent| agent.event_bus())
-            && seen.insert(Arc::as_ptr(&bus) as usize)
-        {
-            sources.push(bus);
-        }
-    }
-
-    sources
+pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<crate::event_bus::EventBus>> {
+    // Delegate to the shared implementation in acp/shared.rs
+    crate::acp::shared::collect_event_sources(agent)
 }

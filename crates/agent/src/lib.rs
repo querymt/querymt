@@ -37,6 +37,10 @@ pub mod verification;
 pub mod test_utils;
 
 // Re-export main agent types for backward compatibility
-pub use agent::{DelegationContextConfig, DelegationContextTiming, QueryMTAgent};
+pub use agent::{AgentHandle, DelegationContextConfig, DelegationContextTiming};
 pub use event_bus::EventBus;
 pub use quorum::{AgentQuorum, AgentQuorumBuilder, AgentQuorumError, DelegateAgent};
+
+// Re-export kameo actor types
+pub use agent::{AgentConfig, SessionActor, SessionRegistry};
+pub use send_agent::KameoSendAgent;

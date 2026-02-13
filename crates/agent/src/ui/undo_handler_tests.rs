@@ -60,7 +60,7 @@ async fn test_undo_handler_single_agent() -> Result<()> {
         .await?;
     let session_id = session.public_id.clone();
 
-    // Create SessionRuntime for undo to work
+    // Spawn a SessionActor for undo to work (routes through kameo)
     {
         let runtime = Arc::new(crate::agent::core::SessionRuntime {
             cwd: Some(worktree.path().to_path_buf()),
@@ -74,8 +74,13 @@ async fn test_undo_handler_single_agent() -> Result<()> {
             turn_diffs: std::sync::Mutex::new(Default::default()),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         });
-        let mut runtimes = agent.session_runtime.lock().await;
-        runtimes.insert(session_id.clone(), runtime);
+        let config = agent.agent_config();
+        let actor =
+            crate::agent::session_actor::SessionActor::new(config, session_id.clone(), runtime);
+        let actor_ref = kameo::actor::Spawn::spawn(actor);
+        let registry = agent.kameo_registry();
+        let mut registry = registry.lock().await;
+        registry.insert(session_id.clone(), actor_ref);
     }
 
     // Add user message
@@ -153,8 +158,23 @@ async fn test_undo_handler_single_agent() -> Result<()> {
     );
 
     // Create UI server state
+    let handle = Arc::new(crate::agent::AgentHandle {
+        config: agent.agent_config(),
+        registry: agent.kameo_registry(),
+        client_state: agent.client_state.clone(),
+        client: agent.client.clone(),
+        bridge: agent.bridge.clone(),
+        default_mode: std::sync::Mutex::new(
+            agent
+                .default_mode
+                .lock()
+                .map(|m| *m)
+                .unwrap_or(crate::agent::core::AgentMode::Build),
+        ),
+    });
+
     let state = super::ServerState {
-        agent: Arc::new(agent),
+        agent: handle,
         view_store: storage.clone(),
         default_cwd: None,
         event_sources: vec![],
@@ -262,7 +282,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
         .await?;
     let child_id = child.public_id.clone();
 
-    // Create SessionRuntime for both parent and child
+    // Spawn SessionActors for undo to work (routes through kameo)
     {
         let runtime = Arc::new(crate::agent::core::SessionRuntime {
             cwd: Some(worktree.path().to_path_buf()),
@@ -276,9 +296,20 @@ async fn test_undo_handler_cross_session() -> Result<()> {
             turn_diffs: std::sync::Mutex::new(Default::default()),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         });
-        let mut runtimes = agent.session_runtime.lock().await;
-        runtimes.insert(parent_id.clone(), runtime.clone());
-        runtimes.insert(child_id.clone(), runtime);
+        let config = agent.agent_config();
+        let registry = agent.kameo_registry();
+        let mut registry = registry.lock().await;
+
+        let parent_actor = crate::agent::session_actor::SessionActor::new(
+            config.clone(),
+            parent_id.clone(),
+            runtime.clone(),
+        );
+        registry.insert(parent_id.clone(), kameo::actor::Spawn::spawn(parent_actor));
+
+        let child_actor =
+            crate::agent::session_actor::SessionActor::new(config, child_id.clone(), runtime);
+        registry.insert(child_id.clone(), kameo::actor::Spawn::spawn(child_actor));
     }
 
     // Add user message in parent
@@ -358,8 +389,23 @@ async fn test_undo_handler_cross_session() -> Result<()> {
     );
 
     // Create UI server state
+    let handle = Arc::new(crate::agent::AgentHandle {
+        config: agent.agent_config(),
+        registry: agent.kameo_registry(),
+        client_state: agent.client_state.clone(),
+        client: agent.client.clone(),
+        bridge: agent.bridge.clone(),
+        default_mode: std::sync::Mutex::new(
+            agent
+                .default_mode
+                .lock()
+                .map(|m| *m)
+                .unwrap_or(crate::agent::core::AgentMode::Build),
+        ),
+    });
+
     let state = super::ServerState {
-        agent: Arc::new(agent),
+        agent: handle,
         view_store: storage.clone(),
         default_cwd: None,
         event_sources: vec![],

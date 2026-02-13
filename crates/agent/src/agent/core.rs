@@ -4,23 +4,19 @@ use crate::acp::client_bridge::ClientBridgeSender;
 use crate::config::{CompactionConfig, PruningConfig, ToolOutputConfig};
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_bus::EventBus;
-use crate::events::AgentEvent;
 use crate::index::{WorkspaceIndexManager, WorkspaceIndexManagerConfig};
-use crate::middleware::{CompositeDriver, MiddlewareDriver};
+use crate::middleware::MiddlewareDriver;
 use crate::session::compaction::SessionCompaction;
 use crate::session::provider::SessionProvider;
-use crate::session::store::{LLMConfig, SessionExecutionConfig, SessionStore};
+use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
-use agent_client_protocol::{
-    AuthMethod, ClientCapabilities, Error, Implementation, ProtocolVersion, SessionId,
-    SessionNotification, SessionUpdate,
-};
+use agent_client_protocol::{AuthMethod, ClientCapabilities, Implementation, ProtocolVersion};
 use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{Mutex, OnceCell, broadcast, watch};
+use tokio::sync::{Mutex, OnceCell};
 
 /// Runtime operating mode for the agent.
 /// Modes control what the agent is allowed to do and what system reminders are injected.
@@ -91,10 +87,9 @@ impl std::str::FromStr for AgentMode {
 
 /// Main agent implementation that coordinates LLM interactions, tool execution,
 /// session management, and protocol compliance.
-pub struct QueryMTAgent {
+pub(crate) struct QueryMTAgent {
     pub(crate) provider: Arc<SessionProvider>,
-    pub(crate) active_sessions: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
-    pub(crate) session_runtime: Arc<Mutex<HashMap<String, Arc<SessionRuntime>>>>,
+    pub(crate) default_mode: Arc<StdMutex<AgentMode>>,
     pub(crate) max_steps: Option<usize>,
     pub(crate) snapshot_policy: SnapshotPolicy,
     pub(crate) assume_mutating: bool,
@@ -103,7 +98,6 @@ pub struct QueryMTAgent {
     pub(crate) tool_config: Arc<StdMutex<ToolConfig>>,
     pub(crate) tool_registry: Arc<StdMutex<ToolRegistry>>,
     pub(crate) middleware_drivers: Arc<std::sync::Mutex<Vec<Arc<dyn MiddlewareDriver>>>>,
-    pub(crate) agent_mode: Arc<std::sync::atomic::AtomicU8>,
     pub(crate) event_bus: Arc<EventBus>,
     pub(crate) client_state: Arc<StdMutex<Option<ClientState>>>,
     pub(crate) auth_methods: Arc<StdMutex<Vec<AuthMethod>>>,
@@ -140,6 +134,16 @@ pub struct QueryMTAgent {
     // Question handling for interactive tools
     /// Pending elicitation requests from tools and MCP servers (elicitation_id -> response sender)
     pub(crate) pending_elicitations: crate::elicitation::PendingElicitationMap,
+
+    // ── Kameo actor infrastructure (lazily initialized) ──────────────
+    /// Cached AgentConfig built from this agent's fields.
+    /// Lazily constructed on first access to avoid breaking existing construction patterns.
+    pub(crate) kameo_config: std::sync::OnceLock<std::sync::Arc<crate::agent::AgentConfig>>,
+
+    /// Session registry for kameo actor management.
+    /// Lazily constructed alongside kameo_config.
+    pub(crate) kameo_registry:
+        std::sync::OnceLock<std::sync::Arc<Mutex<crate::agent::SessionRegistry>>>,
 }
 
 /// Configuration for when and how delegation context is injected into conversations.
@@ -233,19 +237,6 @@ impl std::fmt::Display for SnapshotPolicy {
 }
 
 impl QueryMTAgent {
-    pub(crate) fn execution_config_snapshot(&self) -> SessionExecutionConfig {
-        SessionExecutionConfig {
-            max_steps: self.max_steps,
-            max_prompt_bytes: self.max_prompt_bytes,
-            execution_timeout_secs: self.execution_timeout_secs,
-            snapshot_policy: self.snapshot_policy.to_string(),
-            tool_output_config: self.tool_output_config.clone(),
-            pruning_config: self.pruning_config.clone(),
-            compaction_config: self.compaction_config.clone(),
-            rate_limit_config: self.rate_limit_config.clone(),
-        }
-    }
-
     /// Creates a new agent instance with the specified plugin registry and session store.
     pub fn new(
         plugin_registry: Arc<PluginRegistry>,
@@ -261,8 +252,7 @@ impl QueryMTAgent {
 
         Self {
             provider: session_provider,
-            active_sessions: Arc::new(Mutex::new(HashMap::new())),
-            session_runtime: Arc::new(Mutex::new(HashMap::new())),
+            default_mode: Arc::new(StdMutex::new(AgentMode::Build)),
             max_steps: None,
             snapshot_policy: SnapshotPolicy::None,
             assume_mutating: true,
@@ -271,7 +261,6 @@ impl QueryMTAgent {
             tool_config: Arc::new(StdMutex::new(ToolConfig::default())),
             tool_registry: Arc::new(StdMutex::new(tool_registry)),
             middleware_drivers: Arc::new(std::sync::Mutex::new(Vec::new())),
-            agent_mode: Arc::new(std::sync::atomic::AtomicU8::new(AgentMode::Build as u8)),
             event_bus: Arc::new(EventBus::new()),
             client_state: Arc::new(StdMutex::new(None)),
             auth_methods: Arc::new(StdMutex::new(Vec::new())),
@@ -298,342 +287,83 @@ impl QueryMTAgent {
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
             // Elicitation handling - empty by default
             pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
+
+            // Kameo infrastructure - lazily initialized
+            kameo_config: std::sync::OnceLock::new(),
+            kameo_registry: std::sync::OnceLock::new(),
         }
     }
 
-    pub fn workspace_index_manager(&self) -> Arc<WorkspaceIndexManager> {
-        self.workspace_index_manager.clone()
-    }
+    /// Get or build the `AgentConfig` from this agent's current fields.
+    ///
+    /// This provides a bridge to the kameo actor architecture during the
+    /// build process. The config is built once and cached.
+    ///
+    /// Note: `default_mode` is passed as an Arc<Mutex> (live shared reference),
+    /// not a snapshot, so session actors always read the current value.
+    pub fn agent_config(&self) -> std::sync::Arc<crate::agent::AgentConfig> {
+        self.kameo_config
+            .get_or_init(|| {
+                let tool_config = self
+                    .tool_config
+                    .lock()
+                    .map(|c| c.clone())
+                    .unwrap_or_default();
+                let tool_registry = self.tool_registry.lock().unwrap().clone();
+                let middleware_drivers = self
+                    .middleware_drivers
+                    .lock()
+                    .map(|d| d.clone())
+                    .unwrap_or_default();
+                let auth_methods = self
+                    .auth_methods
+                    .lock()
+                    .map(|m| m.clone())
+                    .unwrap_or_default();
 
-    /// Creates a CompositeDriver from the configured middleware drivers
-    pub(crate) fn create_driver(&self) -> CompositeDriver {
-        use crate::middleware::{LimitsConfig, LimitsMiddleware};
-
-        let mut drivers: Vec<Arc<dyn MiddlewareDriver>> = Vec::new();
-
-        // Add LimitsMiddleware if configured
-        if let Some(max_steps) = self.max_steps {
-            drivers.push(Arc::new(LimitsMiddleware::new(
-                LimitsConfig::default().max_steps(max_steps),
-            )));
-        }
-
-        // Add all user-configured middleware drivers
-        if let Ok(middleware_drivers) = self.middleware_drivers.lock() {
-            for driver in middleware_drivers.iter() {
-                drivers.push(driver.clone());
-            }
-        }
-
-        CompositeDriver::new(drivers)
-    }
-
-    /// Returns the session limits from configured middleware
-    pub fn get_session_limits(&self) -> Option<crate::events::SessionLimits> {
-        self.create_driver().get_limits()
-    }
-
-    /// Builds delegation metadata for ACP AgentCapabilities._meta field
-    pub(crate) fn build_delegation_meta(
-        &self,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        let agents = self.agent_registry.list_agents();
-        if agents.is_empty() {
-            return None;
-        }
-
-        let delegation_value = serde_json::json!({
-            "version": "1",
-            "available": true,
-            "agents": agents.iter().map(|agent| {
-                serde_json::json!({
-                    "id": agent.id,
-                    "name": agent.name,
-                    "description": agent.description,
-                    "capabilities": agent.capabilities,
+                std::sync::Arc::new(crate::agent::AgentConfig {
+                    provider: self.provider.clone(),
+                    event_bus: self.event_bus.clone(),
+                    agent_registry: self.agent_registry.clone(),
+                    workspace_index_manager: self.workspace_index_manager.clone(),
+                    default_mode: self.default_mode.clone(),
+                    tool_config,
+                    tool_registry,
+                    middleware_drivers,
+                    auth_methods,
+                    max_steps: self.max_steps,
+                    snapshot_policy: self.snapshot_policy,
+                    assume_mutating: self.assume_mutating,
+                    mutating_tools: self.mutating_tools.clone(),
+                    max_prompt_bytes: self.max_prompt_bytes,
+                    execution_timeout_secs: self.execution_timeout_secs,
+                    tool_output_config: self.tool_output_config.clone(),
+                    pruning_config: self.pruning_config.clone(),
+                    compaction_config: self.compaction_config.clone(),
+                    compaction: self.compaction.clone(),
+                    rate_limit_config: self.rate_limit_config.clone(),
+                    snapshot_backend: self.snapshot_backend.clone(),
+                    snapshot_gc_config: self.snapshot_gc_config.clone(),
+                    delegation_context_config: self.delegation_context_config.clone(),
+                    pending_elicitations: self.pending_elicitations.clone(),
                 })
-            }).collect::<Vec<_>>()
-        });
-
-        let mut meta = serde_json::Map::new();
-        meta.insert("mt.query.agent.delegation".to_string(), delegation_value);
-        Some(meta)
+            })
+            .clone()
     }
 
-    /// Gets a snapshot of the current tool configuration.
-    pub(crate) fn tool_config_snapshot(&self) -> ToolConfig {
-        self.tool_config
-            .lock()
-            .map(|config| config.clone())
-            .unwrap_or_default()
-    }
-
-    /// Checks if a tool requires permission for execution.
-    pub(crate) fn requires_permission_for_tool(&self, tool_name: &str) -> bool {
-        self.mutating_tools.contains(tool_name)
-            || matches!(
-                crate::agent::utils::tool_kind_for_tool(tool_name),
-                agent_client_protocol::ToolKind::Edit
-                    | agent_client_protocol::ToolKind::Delete
-                    | agent_client_protocol::ToolKind::Execute
-            )
-    }
-
-    /// Sets the agent operating mode.
-    pub fn set_agent_mode(&self, mode: AgentMode) {
-        self.agent_mode
-            .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Gets the current agent mode.
-    pub fn get_agent_mode(&self) -> AgentMode {
-        AgentMode::from_u8(self.agent_mode.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
-    /// Gets the agent mode atomic for sharing with middleware.
-    pub fn agent_mode_flag(&self) -> Arc<std::sync::atomic::AtomicU8> {
-        self.agent_mode.clone()
-    }
-
-    /// Subscribes to agent events.
-    pub fn subscribe_events(&self) -> broadcast::Receiver<AgentEvent> {
-        self.event_bus.subscribe()
+    /// Get or create the `SessionRegistry` backed by kameo actors.
+    pub fn kameo_registry(&self) -> std::sync::Arc<Mutex<crate::agent::SessionRegistry>> {
+        self.kameo_registry
+            .get_or_init(|| {
+                let config = self.agent_config();
+                std::sync::Arc::new(Mutex::new(crate::agent::SessionRegistry::new(config)))
+            })
+            .clone()
     }
 
     /// Adds an event observer after agent creation.
     pub fn add_observer(&self, observer: Arc<dyn crate::events::EventObserver>) {
         self.event_bus.add_observer(observer);
-    }
-
-    /// Access the underlying event bus.
-    pub fn event_bus(&self) -> Arc<EventBus> {
-        self.event_bus.clone()
-    }
-
-    /// Access the session runtime map.
-    ///
-    /// This is primarily used by middleware that needs access to per-session state
-    /// like the function index for duplicate code detection.
-    pub fn session_runtime(&self) -> Arc<Mutex<HashMap<String, Arc<SessionRuntime>>>> {
-        self.session_runtime.clone()
-    }
-
-    /// Access the agent registry.
-    pub fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
-        self.agent_registry.clone()
-    }
-
-    /// Access the tool registry for built-in tool execution.
-    pub fn tool_registry(&self) -> Arc<crate::tools::ToolRegistry> {
-        let registry = self.tool_registry.lock().unwrap();
-        Arc::new(registry.clone())
-    }
-
-    /// Access the pending elicitations map for resolving tool and MCP server elicitation requests.
-    pub fn pending_elicitations(&self) -> crate::elicitation::PendingElicitationMap {
-        self.pending_elicitations.clone()
-    }
-
-    /// Sets the client for protocol communication.
-    pub fn set_client(&self, client: Arc<dyn agent_client_protocol::Client + Send + Sync>) {
-        if let Ok(mut handle) = self.client.lock() {
-            *handle = Some(client);
-        }
-    }
-
-    /// Sets the client bridge for ACP stdio communication.
-    ///
-    /// This is used internally by the ACP stdio server to enable
-    /// agent→client communication through the Send/!Send boundary.
-    pub fn set_bridge(&self, bridge: ClientBridgeSender) {
-        if let Ok(mut handle) = self.bridge.lock() {
-            *handle = Some(bridge);
-        }
-    }
-
-    /// Gets a clone of the bridge sender if available.
-    ///
-    /// Returns None if no bridge has been set (e.g., not running in ACP stdio mode).
-    pub(crate) fn bridge(&self) -> Option<ClientBridgeSender> {
-        self.bridge.lock().ok().and_then(|b| b.clone())
-    }
-
-    /// Emits an event for external observers.
-    pub fn emit_event(&self, session_id: &str, kind: crate::events::AgentEventKind) {
-        self.event_bus.publish(session_id, kind);
-    }
-
-    /// Switch provider and model for a session (simple form)
-    pub async fn set_provider(
-        &self,
-        session_id: &str,
-        provider: &str,
-        model: &str,
-    ) -> Result<(), Error> {
-        // Preserve the system prompt when switching models
-        let system_prompt = self.get_session_system_prompt(session_id).await;
-
-        let mut config = LLMParams::new().provider(provider).model(model);
-
-        // Add system prompt to config
-        for prompt_part in system_prompt {
-            config = config.system(prompt_part);
-        }
-
-        self.set_llm_config(session_id, config).await
-    }
-
-    /// Helper method to extract system prompt from current session config
-    pub(crate) async fn get_session_system_prompt(&self, session_id: &str) -> Vec<String> {
-        // Try to get the current session's LLM config
-        if let Ok(Some(current_config)) = self
-            .provider
-            .history_store()
-            .get_session_llm_config(session_id)
-            .await
-        {
-            // Try to extract system prompt from params JSON
-            if let Some(params) = &current_config.params
-                && let Some(system_array) = params.get("system").and_then(|v| v.as_array())
-            {
-                // Parse the array of strings
-                let mut system_parts = Vec::new();
-                for item in system_array {
-                    if let Some(s) = item.as_str() {
-                        system_parts.push(s.to_string());
-                    }
-                }
-                if !system_parts.is_empty() {
-                    return system_parts;
-                }
-            }
-        }
-
-        // Fall back to initial_config system prompt
-        self.provider.initial_config().system.clone()
-    }
-
-    /// Switch provider configuration for a session (advanced form)
-    pub async fn set_llm_config(&self, session_id: &str, config: LLMParams) -> Result<(), Error> {
-        let provider_name = config
-            .provider
-            .as_ref()
-            .ok_or_else(|| Error::new(-32000, "Provider is required in config".to_string()))?;
-
-        if self
-            .provider
-            .plugin_registry()
-            .get(provider_name)
-            .await
-            .is_none()
-        {
-            return Err(Error::new(
-                -32000,
-                format!("Unknown provider: {}", provider_name),
-            ));
-        }
-        let llm_config = self
-            .provider
-            .history_store()
-            .create_or_get_llm_config(&config)
-            .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
-        self.provider
-            .history_store()
-            .set_session_llm_config(session_id, llm_config.id)
-            .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
-
-        // Fetch context limit from model info
-        let context_limit =
-            crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
-                .and_then(|m| m.context_limit());
-
-        self.emit_event(
-            session_id,
-            crate::events::AgentEventKind::ProviderChanged {
-                provider: llm_config.provider.clone(),
-                model: llm_config.model.clone(),
-                config_id: llm_config.id,
-                context_limit,
-            },
-        );
-        Ok(())
-    }
-
-    /// Get current LLM config for a session
-    pub async fn get_session_llm_config(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<LLMConfig>, Error> {
-        self.provider
-            .history_store()
-            .get_session_llm_config(session_id)
-            .await
-            .map_err(|e| Error::new(-32000, e.to_string()))
-    }
-
-    /// Get LLM config by ID
-    pub async fn get_llm_config(&self, config_id: i64) -> Result<Option<LLMConfig>, Error> {
-        self.provider
-            .history_store()
-            .get_llm_config(config_id)
-            .await
-            .map_err(|e| Error::new(-32000, e.to_string()))
-    }
-
-    /// Invalidate cached provider instance so the next request rebuilds with fresh credentials.
-    pub async fn invalidate_provider_cache(&self) {
-        self.provider.clear_provider_cache().await;
-    }
-
-    /// Sends a session update notification to the client.
-    ///
-    /// Uses the client bridge if available (ACP stdio mode), otherwise no-op.
-    /// The notification is sent asynchronously (fire-and-forget) to avoid blocking.
-    pub(crate) fn send_session_update(&self, session_id: &str, update: SessionUpdate) {
-        if let Some(bridge) = self.bridge() {
-            let notification =
-                SessionNotification::new(SessionId::from(session_id.to_string()), update);
-            // Fire-and-forget - spawn to avoid blocking the caller
-            tokio::spawn(async move {
-                if let Err(e) = bridge.notify(notification).await {
-                    log::debug!("Failed to send session update: {}", e);
-                }
-            });
-        }
-        // If no bridge, silently ignore (backward compatible with WebSocket mode)
-    }
-
-    /// Gracefully shutdown the agent and all background tasks.
-    ///
-    /// This method:
-    /// 1. Signals all active sessions to cancel
-    /// 2. Shuts down the event bus (aborting observer tasks)
-    /// 3. Waits briefly for cleanup
-    pub async fn shutdown(&self) {
-        log::info!("QueryMTAgent: Starting graceful shutdown");
-
-        // 1. Cancel all active sessions
-        let sessions: Vec<_> = {
-            let mut active = self.active_sessions.lock().await;
-            active.drain().collect()
-        };
-        log::debug!(
-            "QueryMTAgent: Cancelling {} active sessions",
-            sessions.len()
-        );
-        for (_id, tx) in sessions {
-            let _ = tx.send(true); // Signal cancellation
-        }
-
-        // 2. Shutdown event bus (abort all observer tasks)
-        self.event_bus.shutdown().await;
-
-        // 3. Wait briefly for cleanup
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        log::info!("QueryMTAgent: Shutdown complete");
     }
 }
 

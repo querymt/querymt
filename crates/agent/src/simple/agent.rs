@@ -7,6 +7,7 @@ use super::utils::{default_registry, latest_assistant_message, to_absolute_path}
 use crate::acp::AcpTransport;
 use crate::acp::stdio::serve_stdio;
 use crate::acp::websocket::serve_websocket;
+use crate::agent::AgentHandle;
 use crate::agent::builder::AgentBuilderExt;
 use crate::agent::core::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
 use crate::config::{
@@ -31,7 +32,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Type alias for middleware factory closures
-type MiddlewareFactory = Box<dyn FnOnce(&QueryMTAgent) -> Arc<dyn MiddlewareDriver> + Send>;
+type MiddlewareFactory = Box<dyn FnOnce(&AgentHandle) -> Arc<dyn MiddlewareDriver> + Send>;
 
 pub struct AgentBuilder {
     pub(super) llm_config: Option<LLMParams>,
@@ -133,7 +134,7 @@ impl AgentBuilder {
     /// Add a middleware to the agent using a factory closure.
     ///
     /// The closure receives a reference to the constructed `QueryMTAgent`,
-    /// allowing access to internal state like `session_runtime()` and `event_bus()`.
+    /// allowing access to internal state like `event_bus()`.
     ///
     /// # Example
     ///
@@ -147,7 +148,7 @@ impl AgentBuilder {
     ///     .provider("openai", "gpt-4")
     ///     .cwd(".")
     ///     .middleware(|agent| {
-    ///         DedupCheckMiddleware::new(agent.session_runtime())
+    ///         DedupCheckMiddleware::new()
     ///             .threshold(0.8)
     ///             .min_lines(5)
     ///             .with_event_bus(agent.event_bus())
@@ -159,7 +160,7 @@ impl AgentBuilder {
     /// ```
     pub fn middleware<F, M>(mut self, factory: F) -> Self
     where
-        F: FnOnce(&QueryMTAgent) -> M + Send + 'static,
+        F: FnOnce(&AgentHandle) -> M + Send + 'static,
         M: MiddlewareDriver + 'static,
     {
         self.middleware_factories
@@ -309,17 +310,39 @@ impl AgentBuilder {
             }
         }
 
-        // Apply middleware factories - each factory receives the agent and returns a middleware
+        // Build AgentConfig first without middleware
+        let config = agent.agent_config();
+
+        // Build a temporary AgentHandle for middleware factories
+        // The registry will be rebuilt later with the final middleware list
+        let temp_registry = agent.kameo_registry();
+        let temp_handle = Arc::new(AgentHandle {
+            config: config.clone(),
+            registry: temp_registry.clone(),
+            client_state: agent.client_state.clone(),
+            client: agent.client.clone(),
+            bridge: agent.bridge.clone(),
+            default_mode: std::sync::Mutex::new(
+                agent
+                    .default_mode
+                    .lock()
+                    .map(|m| *m)
+                    .unwrap_or(crate::agent::core::AgentMode::Build),
+            ),
+        });
+
+        // Apply middleware factories - each factory receives the handle
+        let mut middleware_drivers: Vec<Arc<dyn MiddlewareDriver>> = Vec::new();
         for factory in self.middleware_factories {
-            let middleware = factory(&agent);
-            agent.middleware_drivers.lock().unwrap().push(middleware);
+            let middleware = factory(&temp_handle);
+            middleware_drivers.push(middleware);
         }
 
         // Apply config-based middleware entries
         for entry in &self.middleware_entries {
-            match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &agent) {
+            match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &config) {
                 Ok(middleware) => {
-                    agent.middleware_drivers.lock().unwrap().push(middleware);
+                    middleware_drivers.push(middleware);
                 }
                 Err(e) => {
                     // Skip if middleware is disabled, otherwise fail
@@ -337,23 +360,73 @@ impl AgentBuilder {
 
         // Auto-add ContextMiddleware if compaction.auto is true and user didn't provide one
         if agent.compaction_config.auto {
-            let mut drivers = agent.middleware_drivers.lock().unwrap();
-            let already_has = drivers.iter().any(|d| d.name() == "ContextMiddleware");
+            let already_has = middleware_drivers
+                .iter()
+                .any(|d| d.name() == "ContextMiddleware");
             if !already_has {
                 log::info!("Auto-enabling ContextMiddleware for compaction");
                 let context_middleware = crate::middleware::ContextMiddleware::new(
                     crate::middleware::ContextConfig::default().auto_compact(true),
                 );
-                drivers.push(Arc::new(context_middleware));
+                middleware_drivers.push(Arc::new(context_middleware));
             }
         }
+
+        // Build final AgentConfig with all middleware
+        let final_config = Arc::new(crate::agent::AgentConfig {
+            provider: config.provider.clone(),
+            event_bus: config.event_bus.clone(),
+            agent_registry: config.agent_registry.clone(),
+            workspace_index_manager: config.workspace_index_manager.clone(),
+            default_mode: config.default_mode.clone(),
+            tool_config: config.tool_config.clone(),
+            tool_registry: config.tool_registry.clone(),
+            middleware_drivers,
+            auth_methods: config.auth_methods.clone(),
+            max_steps: config.max_steps,
+            snapshot_policy: config.snapshot_policy,
+            assume_mutating: config.assume_mutating,
+            mutating_tools: config.mutating_tools.clone(),
+            max_prompt_bytes: config.max_prompt_bytes,
+            execution_timeout_secs: config.execution_timeout_secs,
+            tool_output_config: config.tool_output_config.clone(),
+            pruning_config: config.pruning_config.clone(),
+            compaction_config: config.compaction_config.clone(),
+            compaction: config.compaction.clone(),
+            rate_limit_config: config.rate_limit_config.clone(),
+            snapshot_backend: config.snapshot_backend.clone(),
+            snapshot_gc_config: config.snapshot_gc_config.clone(),
+            delegation_context_config: config.delegation_context_config.clone(),
+            pending_elicitations: config.pending_elicitations.clone(),
+        });
+
+        // Build final registry with the final config
+        let final_registry = Arc::new(tokio::sync::Mutex::new(crate::agent::SessionRegistry::new(
+            final_config.clone(),
+        )));
+
+        // Build final AgentHandle
+        let handle = Arc::new(AgentHandle {
+            config: final_config,
+            registry: final_registry,
+            client_state: agent.client_state.clone(),
+            client: agent.client.clone(),
+            bridge: agent.bridge.clone(),
+            default_mode: std::sync::Mutex::new(
+                agent
+                    .default_mode
+                    .lock()
+                    .map(|m| *m)
+                    .unwrap_or(crate::agent::core::AgentMode::Build),
+            ),
+        });
 
         let view_store = backend
             .view_store()
             .expect("SqliteStorage always provides ViewStore");
 
         Ok(Agent {
-            inner: Arc::new(agent),
+            inner: handle,
             view_store,
             default_session_id: Arc::new(Mutex::new(None)),
             cwd,
@@ -363,7 +436,7 @@ impl AgentBuilder {
 }
 
 pub struct Agent {
-    pub(super) inner: Arc<QueryMTAgent>,
+    pub(super) inner: Arc<AgentHandle>,
     #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
     pub(super) view_store: Arc<dyn ViewStore>,
     default_session_id: Arc<Mutex<Option<String>>>,
@@ -516,7 +589,7 @@ impl Agent {
         }
     }
 
-    pub fn inner(&self) -> Arc<QueryMTAgent> {
+    pub fn inner(&self) -> Arc<AgentHandle> {
         self.inner.clone()
     }
 
@@ -553,6 +626,7 @@ impl Agent {
             .map_err(|e| anyhow!(e.to_string()))?;
         let history = self
             .inner
+            .config
             .provider
             .history_store()
             .get_history(session_id)
