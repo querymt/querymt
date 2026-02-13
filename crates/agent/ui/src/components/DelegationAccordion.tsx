@@ -94,7 +94,7 @@ export function DelegationAccordion({
             ${isExpanded ? 'bg-cyber-surface/80' : 'bg-cyber-surface/40 hover:bg-cyber-surface/60'}
           `}
         >
-          <span className="flex-shrink-0 text-gray-400">
+          <span className="flex-shrink-0 text-ui-secondary">
             {isExpanded ? (
               <ChevronDown className="w-4 h-4" />
             ) : (
@@ -126,12 +126,12 @@ export function DelegationAccordion({
           </span>
 
           {!isExpanded && (
-            <span className="flex-1 text-xs text-gray-400 truncate">
+            <span className="flex-1 text-xs text-ui-secondary truncate">
               {toolCallCount} tool call{toolCallCount !== 1 ? 's' : ''}
             </span>
           )}
 
-          <span className="flex-shrink-0 flex items-center gap-1 text-xs text-gray-500">
+          <span className="flex-shrink-0 flex items-center gap-1 text-xs text-ui-muted">
             <Clock className="w-3 h-3" />
             {durationStr}
           </span>
@@ -141,7 +141,7 @@ export function DelegationAccordion({
         <Collapsible.Content className="border-t border-cyber-border/30 bg-cyber-bg/30">
           <div className="p-2 space-y-1 max-h-96 overflow-auto">
             {group.events.length === 0 ? (
-              <div className="text-xs text-gray-500 text-center py-4">
+              <div className="text-xs text-ui-muted text-center py-4">
                 No events yet...
               </div>
             ) : (

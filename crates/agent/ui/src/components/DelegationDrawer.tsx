@@ -136,7 +136,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                 >
                   {agentName}
                 </span>
-                <span className="text-[10px] text-gray-500">
+                <span className="text-[10px] text-ui-muted">
                   Delegation
                 </span>
                 {/* Model label in header */}
@@ -150,7 +150,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                   >
                     <button
                       type="button"
-                      className="text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-gray-400 truncate max-w-[160px] hover:border-cyber-cyan/40 hover:text-gray-300 cursor-pointer transition-colors"
+                      className="text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-ui-secondary truncate max-w-[160px] hover:border-cyber-cyan/40 hover:text-ui-secondary cursor-pointer transition-colors"
                       title={modelLabel}
                     >
                       {modelLabel}
@@ -158,7 +158,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                   </ModelConfigPopover>
                 ) : modelLabel ? (
                   <span
-                    className="text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-gray-400 truncate max-w-[160px] cursor-default"
+                    className="text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-ui-secondary truncate max-w-[160px] cursor-default"
                     title={modelLabel}
                   >
                     {modelLabel}
@@ -166,7 +166,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                 ) : null}
               </div>
               <div className="flex items-center gap-2 mt-1">
-                <Dialog.Title className="text-sm text-gray-300">
+                <Dialog.Title className="text-sm text-ui-secondary">
                   {objective ?? 'Delegated task'}
                 </Dialog.Title>
                 {objective && (
@@ -178,7 +178,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                     {copiedValue === 'delegation-objective' ? (
                       <Check className="w-3.5 h-3.5 text-cyber-lime" />
                     ) : (
-                      <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
+                      <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-cyber-cyan" />
                     )}
                   </button>
                 )}
@@ -188,7 +188,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                 <span className={`flex items-center gap-1 ${
                   (stats.contextPercent ?? 0) >= 80 ? 'text-cyber-orange' :
                   (stats.contextPercent ?? 0) >= 70 ? 'text-cyber-cyan' :
-                  'text-gray-400'
+                  'text-ui-secondary'
                 }`}>
                   <Cpu className="w-3 h-3" />
                   {stats.contextPercent !== undefined
@@ -198,7 +198,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                       : '—'}
                 </span>
                 <span className="text-cyber-border/60">·</span>
-                <span className="flex items-center gap-1 text-gray-400">
+                <span className="flex items-center gap-1 text-ui-secondary">
                   <Wrench className="w-3 h-3" />
                   {stats.toolCallCount} call{stats.toolCallCount === 1 ? '' : 's'}
                 </span>
@@ -214,7 +214,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
               </div>
             </div>
             <Dialog.Close
-              className="p-2 rounded-md hover:bg-cyber-bg/70 transition-colors text-gray-400 hover:text-gray-200"
+              className="p-2 rounded-md hover:bg-cyber-bg/70 transition-colors text-ui-secondary hover:text-ui-primary"
               aria-label="Close delegation details"
             >
               <X className="w-4 h-4" />
@@ -224,7 +224,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
           {/* Events list */}
           <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
             {visibleEvents.length === 0 ? (
-              <div className="text-sm text-gray-500">No delegation events yet.</div>
+              <div className="text-sm text-ui-muted">No delegation events yet.</div>
             ) : (
               visibleEvents.map((event) => {
                 if (event.type === 'tool_call') {
@@ -253,7 +253,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                         >
                           {eventAgentName}
                         </span>
-                        <span className="text-[10px] text-gray-500">
+                        <span className="text-[10px] text-ui-muted">
                           {formatTimestamp(event.timestamp)}
                         </span>
                         <button
@@ -264,7 +264,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                           {copiedValue === `delegation-message-${event.id}` ? (
                             <Check className="w-3.5 h-3.5 text-cyber-lime" />
                           ) : (
-                            <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
+                            <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-cyber-cyan" />
                           )}
                         </button>
                       </div>

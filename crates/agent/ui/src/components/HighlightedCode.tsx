@@ -67,7 +67,7 @@ export function HighlightedCode({
   if (loading) {
     return (
       <div className="flex items-center justify-center p-8">
-        <div className="text-sm text-gray-500">Highlighting code...</div>
+        <div className="text-sm text-ui-muted">Highlighting code...</div>
       </div>
     );
   }

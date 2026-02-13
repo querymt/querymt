@@ -57,24 +57,24 @@ export function ShortcutGateway({ open, onOpenChange, onSelectTheme }: ShortcutG
               <Keyboard className="w-4 h-4" />
               <span className="text-sm font-medium">Shortcut Gateway</span>
             </div>
-            <kbd className="px-2 py-1 text-[10px] font-mono bg-cyber-bg border border-cyber-border rounded text-gray-500">
+            <kbd className="px-2 py-1 text-[10px] font-mono bg-cyber-bg border border-cyber-border rounded text-ui-muted">
               ESC
             </kbd>
           </div>
 
           <div className="flex items-center gap-2 px-4 py-2.5 border-b border-cyber-border/40">
-            <span className="text-xs text-gray-500 font-mono">Ctrl+X</span>
+            <span className="text-xs text-ui-muted font-mono">Ctrl+X</span>
             <Command.Input
               ref={inputRef}
               value={search}
               onValueChange={setSearch}
               placeholder="Type command or use Up/Down then Enter..."
-              className="flex-1 bg-transparent text-gray-100 placeholder-gray-500 text-sm focus:outline-none"
+              className="flex-1 bg-transparent text-ui-primary placeholder:text-ui-muted text-sm focus:outline-none"
             />
           </div>
 
           <Command.List className="max-h-[280px] overflow-y-auto p-2 custom-scrollbar">
-            <Command.Empty className="px-4 py-6 text-sm text-center text-gray-500">
+            <Command.Empty className="px-4 py-6 text-sm text-center text-ui-muted">
               No shortcut commands found
             </Command.Empty>
 
@@ -89,10 +89,10 @@ export function ShortcutGateway({ open, onOpenChange, onSelectTheme }: ShortcutG
                   <Palette className="w-3.5 h-3.5 text-cyber-cyan" />
                 </div>
                 <div className="flex-1 min-w-0">
-                  <div className="text-sm text-gray-200">Theme Selector</div>
-                  <div className="text-xs text-gray-500">Open searchable theme switcher</div>
+                  <div className="text-sm text-ui-primary">Theme Selector</div>
+                  <div className="text-xs text-ui-muted">Open searchable theme switcher</div>
                 </div>
-                <kbd className="px-2 py-1 text-[10px] font-mono bg-cyber-bg border border-cyber-border rounded text-gray-400">
+                <kbd className="px-2 py-1 text-[10px] font-mono bg-cyber-bg border border-cyber-border rounded text-ui-secondary">
                   T
                 </kbd>
               </Command.Item>

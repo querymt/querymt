@@ -42,7 +42,7 @@ export function DelegationsView({
             {/* Expand button */}
             <button
               onClick={() => setPanelCollapsed(false)}
-              className="p-1.5 rounded text-gray-500 hover:text-cyber-cyan transition-colors"
+              className="p-1.5 rounded text-ui-muted hover:text-cyber-cyan transition-colors"
               title="Show delegations list"
             >
               <PanelLeftOpen className="w-4 h-4" />
@@ -93,7 +93,7 @@ export function DelegationsView({
             <div className="flex justify-end px-2 pt-2 flex-shrink-0">
               <button
                 onClick={() => setPanelCollapsed(true)}
-                className="p-1 rounded text-gray-500 hover:text-cyber-cyan transition-colors"
+                className="p-1 rounded text-ui-muted hover:text-cyber-cyan transition-colors"
                 title="Hide delegations list"
               >
                 <PanelLeftClose className="w-4 h-4" />

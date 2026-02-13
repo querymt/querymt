@@ -131,7 +131,7 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
           }}
         >
           {/* Title with optional child indicator */}
-          <div className="font-medium text-gray-200 mb-1 group-hover:text-cyber-cyan transition-colors flex items-center gap-2">
+          <div className="font-medium text-ui-primary mb-1 group-hover:text-cyber-cyan transition-colors flex items-center gap-2">
             {isChild && (
               <GitBranch className="w-3.5 h-3.5 text-cyber-cyan/70 flex-shrink-0" />
             )}
@@ -162,7 +162,7 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
           </div>
           
           {/* Metadata */}
-          <div className="flex items-center gap-4 text-xs text-gray-500">
+          <div className="flex items-center gap-4 text-xs text-ui-muted">
             <span className="font-mono">
               {session.session_id.slice(0, 12)}...
             </span>
@@ -196,7 +196,7 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
           <h1 className="text-3xl font-bold text-cyber-cyan neon-text-cyan mb-2">
             Select a Session
           </h1>
-          <p className="text-gray-400 text-sm">
+          <p className="text-ui-secondary text-sm">
             Resume your work or start fresh
           </p>
         </div>
@@ -210,7 +210,7 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
               placeholder="Filter by session ID or title..."
               value={filterText}
               onChange={(e) => setFilterText(e.target.value)}
-              className="w-full pl-12 pr-4 py-3 bg-cyber-surface border-2 border-cyber-border rounded-lg text-gray-100 placeholder-gray-500 focus:border-cyber-cyan focus:outline-none transition-colors session-filter-input"
+              className="w-full pl-12 pr-4 py-3 bg-cyber-surface border-2 border-cyber-border rounded-lg text-ui-primary placeholder:text-ui-muted focus:border-cyber-cyan focus:outline-none transition-colors session-filter-input"
             />
           </div>
         </div>
@@ -218,7 +218,7 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
         {/* Sessions list */}
         <div className="space-y-4 mb-6 max-h-[50vh] overflow-y-auto custom-scrollbar">
           {filteredGroups.length === 0 ? (
-            <div className="text-center py-8 text-gray-500">
+            <div className="text-center py-8 text-ui-muted">
               <p>No sessions found matching "{filterText}"</p>
             </div>
           ) : (
@@ -244,7 +244,7 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
                     <span className="flex-1 text-left font-mono text-sm text-cyber-cyan">
                       {groupLabel}
                     </span>
-                    <span className="text-xs text-gray-500">
+                    <span className="text-xs text-ui-muted">
                       {group.sessions.length} session{group.sessions.length !== 1 ? 's' : ''}
                     </span>
                   </Collapsible.Trigger>
@@ -271,7 +271,7 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
             <Plus className="w-6 h-6" />
             <GlitchText text="Start New Session" variant="0" hoverOnly />
           </button>
-          <p className="text-xs text-gray-500 mt-2">
+          <p className="text-xs text-ui-muted mt-2">
             or press{' '}
             <kbd className="px-2 py-1 bg-cyber-bg border border-cyber-border rounded text-cyber-cyan font-mono text-[10px]">
               {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+N

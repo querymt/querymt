@@ -178,7 +178,7 @@ export const TurnCard = memo(function TurnCard({
             <span className="text-xs font-semibold text-cyber-magenta uppercase tracking-wide">
               User
             </span>
-            <span className="text-[10px] text-gray-500">
+            <span className="text-[10px] text-ui-muted">
               {new Date(turn.userMessage.timestamp).toLocaleTimeString()}
             </span>
             <button
@@ -189,7 +189,7 @@ export const TurnCard = memo(function TurnCard({
               {copiedSection === 'user-message' ? (
                 <Check className="w-3.5 h-3.5 text-cyber-lime" />
               ) : (
-                <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
+                <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-cyber-cyan" />
               )}
             </button>
           </div>
@@ -210,7 +210,7 @@ export const TurnCard = memo(function TurnCard({
             >
               {agentName}
             </span>
-            <span className="text-[10px] text-gray-500 leading-none">
+            <span className="text-[10px] text-ui-muted leading-none">
               {turn.agentMessages.length > 0
                 ? new Date(turn.agentMessages[0].timestamp).toLocaleTimeString()
                 : new Date(turn.startTime).toLocaleTimeString()}
@@ -232,7 +232,7 @@ export const TurnCard = memo(function TurnCard({
               {copiedSection === 'agent-turn' ? (
                 <Check className="w-3.5 h-3.5 text-cyber-lime" />
               ) : (
-                <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
+                <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-cyber-cyan" />
               )}
             </button>
           </div>
@@ -247,7 +247,7 @@ export const TurnCard = memo(function TurnCard({
             >
               <button
                 type="button"
-                className="flex-shrink-0 text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-gray-400 truncate max-w-[200px] hover:border-cyber-cyan/40 hover:text-gray-300 cursor-pointer transition-colors"
+                className="flex-shrink-0 text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-ui-secondary truncate max-w-[200px] hover:border-cyber-cyan/40 hover:text-ui-secondary cursor-pointer transition-colors"
                 title={turn.modelLabel}
               >
                 {turn.modelLabel}
@@ -255,7 +255,7 @@ export const TurnCard = memo(function TurnCard({
             </ModelConfigPopover>
           ) : showModelLabel && turn.modelLabel ? (
             <span
-              className="flex-shrink-0 text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-gray-400 truncate max-w-[200px] cursor-default"
+              className="flex-shrink-0 text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-ui-secondary truncate max-w-[200px] cursor-default"
               title={turn.modelLabel}
             >
               {turn.modelLabel}
@@ -286,7 +286,7 @@ export const TurnCard = memo(function TurnCard({
                         {copiedSection === `message-${item.event.id}` ? (
                           <Check className="w-3.5 h-3.5 text-cyber-lime" />
                         ) : (
-                          <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
+                          <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-cyber-cyan" />
                         )}
                       </button>
                       <MessageContent content={item.event.content} />
@@ -313,7 +313,7 @@ export const TurnCard = memo(function TurnCard({
               })}
             </div>
           ) : turn.isActive ? (
-            <div className="text-sm text-gray-500 italic">Working...</div>
+            <div className="text-sm text-ui-muted italic">Working...</div>
           ) : null}
 
           {/* Undone state overlay */}
@@ -322,7 +322,7 @@ export const TurnCard = memo(function TurnCard({
               <div className="max-w-md w-full space-y-4">
                 <div className="text-center">
                   <h3 className="text-lg font-semibold text-cyber-orange mb-2">Changes Undone</h3>
-                  <p className="text-sm text-gray-400">
+                  <p className="text-sm text-ui-secondary">
                     {revertedFiles.length > 0 
                       ? `${revertedFiles.length} file${revertedFiles.length !== 1 ? 's' : ''} reverted`
                       : 'No filesystem changes were made in this turn'}
@@ -334,12 +334,12 @@ export const TurnCard = memo(function TurnCard({
                   <div className="bg-cyber-surface/60 border border-cyber-border/40 rounded-lg p-3 max-h-40 overflow-y-auto">
                     <div className="space-y-1">
                       {revertedFiles.slice(0, 5).map((file, idx) => (
-                        <div key={idx} className="text-xs text-gray-300 font-mono truncate" title={file}>
+                        <div key={idx} className="text-xs text-ui-secondary font-mono truncate" title={file}>
                           {file}
                         </div>
                       ))}
                       {revertedFiles.length > 5 && (
-                        <div className="text-xs text-gray-500 italic">
+                        <div className="text-xs text-ui-muted italic">
                           +{revertedFiles.length - 5} more file{revertedFiles.length - 5 !== 1 ? 's' : ''}
                         </div>
                       )}
@@ -367,7 +367,7 @@ export const TurnCard = memo(function TurnCard({
           <div className="mt-2 flex justify-end opacity-60 group-hover:opacity-100 transition-opacity">
             <button
               onClick={onUndo}
-              className="flex items-center gap-1.5 px-2 py-1 rounded text-xs text-gray-400 hover:text-cyber-orange hover:bg-cyber-orange/10 border border-transparent hover:border-cyber-orange/40 transition-colors"
+              className="flex items-center gap-1.5 px-2 py-1 rounded text-xs text-ui-secondary hover:text-cyber-orange hover:bg-cyber-orange/10 border border-transparent hover:border-cyber-orange/40 transition-colors"
               title="Undo changes from this turn"
             >
               <Undo2 className="w-3.5 h-3.5" />

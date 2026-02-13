@@ -8,7 +8,7 @@ import { PatchDiff } from '@pierre/diffs/react';
 import { generateToolSummary } from '../utils/toolSummary';
 import { EventItem } from '../types';
 import { useUiStore } from '../store/uiStore';
-import { getDiffThemeForDashboard } from '../utils/dashboardThemes';
+import { getDashboardThemeVariant, getDiffThemeForDashboard } from '../utils/dashboardThemes';
 
 export interface ToolSummaryProps {
   event: EventItem & { mergedResult?: EventItem };
@@ -20,6 +20,7 @@ export interface ToolSummaryProps {
 export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegate, onDelegateClick }: ToolSummaryProps) {
   const selectedTheme = useUiStore((state) => state.selectedTheme);
   const diffTheme = getDiffThemeForDashboard(selectedTheme);
+  const diffThemeType = getDashboardThemeVariant(selectedTheme);
   const toolKind = event.toolCall?.kind;
   const toolName = inferToolName(event);
   const rawInput = parseJsonMaybe(event.toolCall?.raw_input) ?? event.toolCall?.raw_input;
@@ -90,7 +91,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
         {hasInlinePreview && previewData && (
           <button
             onClick={handlePreviewToggle}
-            className="flex-shrink-0 p-0.5 rounded hover:bg-cyber-bg/50 text-gray-400 hover:text-cyber-cyan transition-colors"
+            className="flex-shrink-0 p-0.5 rounded hover:bg-cyber-bg/50 text-ui-secondary hover:text-cyber-cyan transition-colors"
             title={showPreview ? 'Hide preview' : 'Show preview'}
           >
             {showPreview ? (
@@ -107,12 +108,12 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
         </span>
 
         {/* Summary text */}
-        <span className="flex-1 text-xs text-gray-300 truncate font-mono">
+        <span className="flex-1 text-xs text-ui-secondary truncate font-mono">
           {summary.keyParam ? (
             <>
               <span className="text-cyber-cyan">{summary.name}</span>
-              <span className="text-gray-500">: </span>
-              <span className="text-gray-400">{summary.keyParam}</span>
+              <span className="text-ui-muted">: </span>
+              <span className="text-ui-secondary">{summary.keyParam}</span>
             </>
           ) : (
             <span className="text-cyber-cyan">{summary.name}</span>
@@ -123,7 +124,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
         {summary.diffStats && (summary.diffStats.additions > 0 || summary.diffStats.deletions > 0) && (
           <span className="flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyber-bg/80 border border-cyber-border/35">
             <span className="text-cyber-lime">+{summary.diffStats.additions}</span>
-            <span className="text-gray-500 mx-0.5">/</span>
+            <span className="text-ui-muted mx-0.5">/</span>
             <span className="text-cyber-magenta">-{summary.diffStats.deletions}</span>
           </span>
         )}
@@ -151,7 +152,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
         </span>
 
         {/* Expand indicator */}
-        <ChevronRight className="w-3.5 h-3.5 text-gray-500 group-hover:text-cyber-cyan transition-colors flex-shrink-0" />
+        <ChevronRight className="w-3.5 h-3.5 text-ui-muted group-hover:text-cyber-cyan transition-colors flex-shrink-0" />
 
         {/* Delegate link indicator */}
         {isDelegate && (
@@ -176,11 +177,11 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
         >
           {previewData.type === 'diff' && previewData.patch && (
             <div className="event-diff-container m-0 border-0 text-[11px]">
-                <PatchDiff
-                  patch={previewData.patch}
-                  options={{
-                    theme: diffTheme,
-                    themeType: 'dark',
+              <PatchDiff
+                patch={previewData.patch}
+                options={{
+                  theme: diffTheme,
+                  themeType: diffThemeType,
                   diffStyle: 'split',
                   diffIndicators: 'bars',
                   lineDiffType: 'word-alt',
@@ -195,7 +196,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
           {previewData.type === 'shell' && (
             <div className="px-3 py-2 font-mono text-[11px] max-h-64 overflow-auto">
               {previewData.stdout && (
-                <pre className="whitespace-pre-wrap break-words text-gray-300 leading-tight">
+                <pre className="whitespace-pre-wrap break-words text-ui-secondary leading-tight">
                   {truncateOutput(previewData.stdout, 500)}
                 </pre>
               )}
@@ -205,7 +206,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
                 </pre>
               )}
               {!previewData.stdout && !previewData.stderr && (
-                <span className="text-gray-500 italic text-[10px]">No output</span>
+                <span className="text-ui-muted italic text-[10px]">No output</span>
               )}
             </div>
           )}

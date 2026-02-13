@@ -93,7 +93,7 @@ export function getFileIconColor(extension?: string, isDir?: boolean): string {
   }
 
   if (!extension) {
-    return 'text-gray-400';
+    return 'text-ui-secondary';
   }
 
   const colorMap: Record<string, string> = {
@@ -125,5 +125,5 @@ export function getFileIconColor(extension?: string, isDir?: boolean): string {
     'mdx': 'text-cyber-cyan',
   };
 
-  return colorMap[extension.toLowerCase()] || 'text-gray-400';
+  return colorMap[extension.toLowerCase()] || 'text-ui-secondary';
 }

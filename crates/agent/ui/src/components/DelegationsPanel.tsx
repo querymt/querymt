@@ -39,7 +39,7 @@ export function DelegationsPanel({
 
   if (delegations.length === 0) {
     return (
-      <div className="flex items-center justify-center h-full text-gray-500">
+      <div className="flex items-center justify-center h-full text-ui-muted">
         No delegations yet.
       </div>
     );
@@ -48,7 +48,7 @@ export function DelegationsPanel({
   return (
     <div className="px-6 py-4 space-y-3 h-full overflow-y-auto">
       {/* Aggregate stats */}
-      <div className="flex items-center gap-3 text-[10px] text-gray-500 pb-2 mb-1 border-b border-cyber-border/30">
+      <div className="flex items-center gap-3 text-[10px] text-ui-muted pb-2 mb-1 border-b border-cyber-border/30">
         <span className="flex items-center gap-1">
           <Layers className="w-3 h-3" />
           {delegations.length} delegation{delegations.length === 1 ? '' : 's'}

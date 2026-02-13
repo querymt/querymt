@@ -337,7 +337,7 @@ export function AppShell() {
   }, []);
   
   return (
-    <div className="flex flex-col h-screen bg-cyber-bg text-gray-100">
+    <div className="flex flex-col h-screen bg-cyber-bg text-ui-primary">
       {/* Header */}
       <header className="flex items-center justify-between gap-4 px-6 py-4 bg-cyber-surface border-b border-cyber-border shadow-[0_0_20px_rgba(var(--cyber-cyan-rgb),0.05)]">
         {/* Left section */}
@@ -374,7 +374,7 @@ export function AppShell() {
                       isSessionActive
                         ? 'bg-cyber-cyan animate-pulse'
                         : isConversationComplete
-                        ? 'bg-gray-500'
+                        ? 'bg-ui-muted'
                         : 'bg-cyber-lime'
                     }`}
                     title={
@@ -385,10 +385,10 @@ export function AppShell() {
                         : 'Idle'
                     }
                   />
-                  <span className="text-xs font-mono text-gray-400 group-hover:text-cyber-cyan transition-colors">
+                  <span className="text-xs font-mono text-ui-secondary group-hover:text-cyber-cyan transition-colors">
                     {String(sessionId).substring(0, 12)}...
                   </span>
-                  <span className="text-gray-600">·</span>
+                  <span className="text-ui-muted">·</span>
                 </button>
                 
                 {/* Mode part - click to cycle mode */}
@@ -413,7 +413,7 @@ export function AppShell() {
                 {sessionCopied ? (
                   <Check className="w-3.5 h-3.5 text-cyber-lime" />
                 ) : (
-                  <Copy className="w-3.5 h-3.5 text-gray-500 hover:text-cyber-cyan transition-colors" />
+                  <Copy className="w-3.5 h-3.5 text-ui-muted hover:text-cyber-cyan transition-colors" />
                 )}
               </button>
             </div>

@@ -77,11 +77,11 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       <div className="mt-3 space-y-1.5">
         {attachments.map((att, i) => (
           <details key={i} className="border border-cyber-border/40 rounded-md overflow-hidden">
-            <summary className="px-3 py-1.5 text-xs font-mono text-gray-400 bg-cyber-surface/40 cursor-pointer hover:text-gray-300 hover:bg-cyber-surface/60 transition-colors select-none">
+            <summary className="px-3 py-1.5 text-xs font-mono text-ui-secondary bg-cyber-surface/40 cursor-pointer hover:text-ui-secondary hover:bg-cyber-surface/60 transition-colors select-none">
               {att.kind === 'dir' ? '\uD83D\uDCC1' : '\uD83D\uDCCE'} {att.name}
             </summary>
             <div className="px-3 py-2 bg-cyber-bg/30 border-t border-cyber-border/30">
-              <pre className="text-[11px] font-mono text-gray-300 whitespace-pre-wrap break-words leading-tight overflow-auto max-h-64">
+              <pre className="text-[11px] font-mono text-ui-secondary whitespace-pre-wrap break-words leading-tight overflow-auto max-h-64">
                 {att.body}
               </pre>
             </div>
@@ -121,7 +121,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       p(props: ComponentPropsWithoutRef<'p'>) {
         const { children, ...rest } = props;
         return (
-          <p className="mb-2 text-sm leading-relaxed text-gray-200" {...rest}>
+          <p className="mb-2 text-sm leading-relaxed text-ui-primary" {...rest}>
             {children}
           </p>
         );
@@ -130,7 +130,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       ul(props: ComponentPropsWithoutRef<'ul'>) {
         const { children, ...rest } = props;
         return (
-          <ul className="my-2 ml-4 space-y-1 list-disc text-sm text-gray-200" {...rest}>
+          <ul className="my-2 ml-4 space-y-1 list-disc text-sm text-ui-primary" {...rest}>
             {children}
           </ul>
         );
@@ -138,7 +138,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       ol(props: ComponentPropsWithoutRef<'ol'>) {
         const { children, ...rest } = props;
         return (
-          <ol className="my-2 ml-4 space-y-1 list-decimal text-sm text-gray-200" {...rest}>
+          <ol className="my-2 ml-4 space-y-1 list-decimal text-sm text-ui-primary" {...rest}>
             {children}
           </ol>
         );
@@ -146,7 +146,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       li(props: ComponentPropsWithoutRef<'li'>) {
         const { children, ...rest } = props;
         return (
-          <li className="text-gray-200" {...rest}>
+          <li className="text-ui-primary" {...rest}>
             {children}
           </li>
         );
@@ -171,7 +171,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       h3(props: ComponentPropsWithoutRef<'h3'>) {
         const { children, ...rest } = props;
         return (
-          <h3 className="text-sm font-semibold mt-2 mb-1 text-gray-300" {...rest}>
+          <h3 className="text-sm font-semibold mt-2 mb-1 text-ui-secondary" {...rest}>
             {children}
           </h3>
         );
@@ -180,7 +180,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       blockquote(props: ComponentPropsWithoutRef<'blockquote'>) {
         const { children, ...rest } = props;
         return (
-          <blockquote className="my-2 pl-4 border-l-2 border-cyber-cyan/50 text-gray-400 italic text-sm" {...rest}>
+          <blockquote className="my-2 pl-4 border-l-2 border-cyber-cyan/50 text-ui-secondary italic text-sm" {...rest}>
             {children}
           </blockquote>
         );

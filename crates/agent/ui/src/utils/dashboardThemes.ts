@@ -41,7 +41,7 @@ export interface DashboardTheme {
 export const DASHBOARD_THEME_SOURCE = TINTED_BASE16_SOURCE;
 export const DEFAULT_DASHBOARD_THEME_ID: DashboardThemeId = 'base16-querymate';
 
-const SUPPORTED_VARIANTS: ReadonlySet<DashboardThemeVariant> = new Set(['dark']);
+const SUPPORTED_VARIANTS: ReadonlySet<DashboardThemeVariant> = new Set(['dark', 'light']);
 
 const SHIKI_BUNDLED_THEME_IDS: ReadonlySet<string> = new Set([
   'andromeeda',
@@ -267,6 +267,10 @@ export function getShikiThemeForDashboard(themeId: DashboardThemeId): string {
 
 export function getDiffThemeForDashboard(themeId: DashboardThemeId): string {
   return getDashboardTheme(themeId).diffTheme;
+}
+
+export function getDashboardThemeVariant(themeId: DashboardThemeId): DashboardThemeVariant {
+  return getDashboardTheme(themeId).variant;
 }
 
 export function applyDashboardTheme(

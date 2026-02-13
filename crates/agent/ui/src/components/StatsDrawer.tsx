@@ -105,7 +105,7 @@ export function StatsDrawer({
               <div className="flex items-center gap-3">
                 {/* Expert Mode Toggle */}
                 <label className="flex items-center gap-2 cursor-pointer group">
-                  <span className="text-xs text-gray-400 group-hover:text-gray-300 transition-colors">
+                  <span className="text-xs text-ui-secondary group-hover:text-ui-secondary transition-colors">
                     Expert Mode
                   </span>
                   <div className="relative">
@@ -116,7 +116,7 @@ export function StatsDrawer({
                       className="sr-only peer"
                     />
                     <div className="w-9 h-5 bg-cyber-bg border border-cyber-border rounded-full peer-checked:bg-cyber-purple/20 peer-checked:border-cyber-purple transition-colors" />
-                    <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-gray-500 rounded-full transition-all peer-checked:translate-x-4 peer-checked:bg-cyber-purple" />
+                    <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-ui-muted rounded-full transition-all peer-checked:translate-x-4 peer-checked:bg-cyber-purple" />
                   </div>
                 </label>
                 
@@ -126,7 +126,7 @@ export function StatsDrawer({
                   className="p-1.5 hover:bg-cyber-bg/50 rounded-lg transition-colors"
                   title="Close"
                 >
-                  <X className="w-4 h-4 text-gray-400 hover:text-gray-200" />
+                  <X className="w-4 h-4 text-ui-secondary hover:text-ui-primary" />
                 </button>
               </div>
             </div>
@@ -137,14 +137,14 @@ export function StatsDrawer({
               <div className="grid grid-cols-4 gap-4 mb-4">
                 {/* Elapsed Time */}
                 <div className="p-4 rounded-lg bg-cyber-bg/50 border border-cyber-border/50">
-                  <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">
+                  <div className="text-[10px] uppercase tracking-wider text-ui-muted mb-1">
                     Elapsed Time
                   </div>
                   <div className="text-2xl font-mono font-semibold text-cyber-cyan">
                     {formatDuration(globalElapsedMs)}
                   </div>
                   {isSessionActive && (
-                    <div className="mt-1 text-[10px] text-gray-500">
+                    <div className="mt-1 text-[10px] text-ui-muted">
                       (active)
                     </div>
                   )}
@@ -152,15 +152,15 @@ export function StatsDrawer({
                 
                 {/* Context Usage */}
                 <div className="p-4 rounded-lg bg-cyber-bg/50 border border-cyber-border/50">
-                  <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">
+                  <div className="text-[10px] uppercase tracking-wider text-ui-muted mb-1">
                     Context
                   </div>
                   {enrichedPerAgent.length === 1 ? (
                     <>
-                      <div className="text-2xl font-mono font-semibold text-gray-200">
+                      <div className="text-2xl font-mono font-semibold text-ui-primary">
                         {formatTokensAbbrev(enrichedPerAgent[0].currentContextTokens)}
                         {enrichedPerAgent[0].maxContextTokens && (
-                          <span className="text-sm text-gray-500">
+                          <span className="text-sm text-ui-muted">
                             /{formatTokensAbbrev(enrichedPerAgent[0].maxContextTokens)}
                           </span>
                         )}
@@ -178,7 +178,7 @@ export function StatsDrawer({
                               }}
                             />
                           </div>
-                          <div className="mt-1 text-[10px] text-gray-500">
+                          <div className="mt-1 text-[10px] text-ui-muted">
                             {formatPercentage(
                               enrichedPerAgent[0].currentContextTokens,
                               enrichedPerAgent[0].maxContextTokens
@@ -198,10 +198,10 @@ export function StatsDrawer({
                             className="w-2 h-2 rounded-full flex-shrink-0"
                             style={{ backgroundColor: getAgentColor(agentStats.agentId) }}
                           />
-                          <span className="font-mono text-gray-300">
+                          <span className="font-mono text-ui-secondary">
                             {formatTokensAbbrev(agentStats.currentContextTokens)}
                             {agentStats.maxContextTokens && (
-                              <span className="text-gray-500">
+                              <span className="text-ui-muted">
                                 /{formatTokensAbbrev(agentStats.maxContextTokens)}
                               </span>
                             )}
@@ -214,26 +214,26 @@ export function StatsDrawer({
                 
                 {/* Tool Calls */}
                 <div className="p-4 rounded-lg bg-cyber-bg/50 border border-cyber-border/50">
-                  <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">
+                  <div className="text-[10px] uppercase tracking-wider text-ui-muted mb-1">
                     Tools
                   </div>
-                  <div className="text-2xl font-mono font-semibold text-gray-200">
+                  <div className="text-2xl font-mono font-semibold text-ui-primary">
                     {session.totalToolCalls}
                   </div>
-                  <div className="mt-1 text-[10px] text-gray-500">
+                  <div className="mt-1 text-[10px] text-ui-muted">
                     {session.totalToolCalls === 1 ? 'call' : 'calls'}
                   </div>
                 </div>
                 
                 {/* Cost */}
                 <div className="p-4 rounded-lg bg-cyber-bg/50 border border-cyber-border/50">
-                  <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">
+                  <div className="text-[10px] uppercase tracking-wider text-ui-muted mb-1">
                     Cost
                   </div>
                   <div className="text-2xl font-mono font-semibold text-cyber-cyan">
                     {formatCost(session.totalCostUsd)}
                     {session.limits?.max_cost_usd && (
-                      <span className="text-sm text-gray-500">
+                      <span className="text-sm text-ui-muted">
                         /{formatCost(session.limits.max_cost_usd)}
                       </span>
                     )}
@@ -251,7 +251,7 @@ export function StatsDrawer({
                           }}
                         />
                       </div>
-                      <div className="mt-1 text-[10px] text-gray-500">
+                      <div className="mt-1 text-[10px] text-ui-muted">
                         {formatPercentage(
                           session.totalCostUsd,
                           session.limits.max_cost_usd
@@ -263,13 +263,13 @@ export function StatsDrawer({
               </div>
               
               {/* Session Metadata */}
-              <div className="flex items-center gap-6 text-xs text-gray-500 mb-4 px-4 py-2 bg-cyber-bg/30 rounded-lg">
-                <span>Messages: <span className="text-gray-300 font-mono">{session.totalMessages}</span></span>
-                <span>Steps: <span className="text-gray-300 font-mono">{session.totalSteps}</span></span>
-                <span>Turns: <span className="text-gray-300 font-mono">{session.totalTurns}</span></span>
+              <div className="flex items-center gap-6 text-xs text-ui-muted mb-4 px-4 py-2 bg-cyber-bg/30 rounded-lg">
+                <span>Messages: <span className="text-ui-secondary font-mono">{session.totalMessages}</span></span>
+                <span>Steps: <span className="text-ui-secondary font-mono">{session.totalSteps}</span></span>
+                <span>Turns: <span className="text-ui-secondary font-mono">{session.totalTurns}</span></span>
                 {hasTodos && todoStats && (
                   <span>
-                    📋 Tasks: <span className="text-gray-300 font-mono">
+                    📋 Tasks: <span className="text-ui-secondary font-mono">
                       {todoStats.completed}/{todoStats.total} completed
                     </span>
                     {todoStats.inProgress > 0 && (
@@ -282,7 +282,7 @@ export function StatsDrawer({
               {/* Per-Agent Breakdown (Expert Mode) */}
               {expertMode && enrichedPerAgent.length > 0 && (
                 <div className="space-y-2">
-                  <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider px-2 mb-3">
+                  <div className="text-xs font-semibold text-ui-secondary uppercase tracking-wider px-2 mb-3">
                     Per-Agent Breakdown
                   </div>
                   {enrichedPerAgent.map((agentStats) => {
@@ -304,9 +304,9 @@ export function StatsDrawer({
                         >
                           <div className="flex-shrink-0">
                             {isExpanded ? (
-                              <ChevronDown className="w-4 h-4 text-gray-400" />
+                              <ChevronDown className="w-4 h-4 text-ui-secondary" />
                             ) : (
-                              <ChevronRight className="w-4 h-4 text-gray-400" />
+                              <ChevronRight className="w-4 h-4 text-ui-secondary" />
                             )}
                           </div>
                           <span
@@ -315,14 +315,14 @@ export function StatsDrawer({
                           />
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2 mb-1">
-                              <span className="font-medium text-gray-200">{agentName}</span>
+                              <span className="font-medium text-ui-primary">{agentName}</span>
                               {model && (
-                                <span className="text-[10px] text-gray-500 font-mono">
+                                <span className="text-[10px] text-ui-muted font-mono">
                                   {model.provider}/{model.model}
                                 </span>
                               )}
                             </div>
-                            <div className="flex items-center gap-4 text-xs text-gray-500">
+                            <div className="flex items-center gap-4 text-xs text-ui-muted">
                               <span>ctx:{formatTokensAbbrev(agentStats.currentContextTokens)}</span>
                               <span>{formatCost(agentStats.costUsd)}</span>
                               <span>🔧{agentStats.toolCallCount}</span>
@@ -337,7 +337,7 @@ export function StatsDrawer({
                             {/* Tool breakdown */}
                             {agentStats.toolBreakdown && Object.keys(agentStats.toolBreakdown).length > 0 && (
                               <div className="pt-3">
-                                <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-2">
+                                <div className="text-[10px] text-ui-muted uppercase tracking-wider mb-2">
                                   Tools Used
                                 </div>
                                 <div className="flex flex-wrap gap-2">
@@ -348,9 +348,9 @@ export function StatsDrawer({
                                         key={toolName}
                                         className="px-2 py-1 bg-cyber-surface/60 border border-cyber-border/40 rounded text-xs"
                                       >
-                                        <span className="text-gray-400">{toolName}</span>
-                                        <span className="text-gray-600 mx-1">×</span>
-                                        <span className="text-gray-300 font-mono">{count as number}</span>
+                                        <span className="text-ui-secondary">{toolName}</span>
+                                        <span className="text-ui-muted mx-1">×</span>
+                                        <span className="text-ui-secondary font-mono">{count as number}</span>
                                       </div>
                                     ))}
                                 </div>
@@ -360,16 +360,16 @@ export function StatsDrawer({
                             {/* Stats grid */}
                             <div className="grid grid-cols-3 gap-3 pt-2">
                               <div>
-                                <div className="text-[10px] text-gray-500 uppercase">Messages</div>
-                                <div className="text-sm font-mono text-gray-300">{agentStats.messageCount}</div>
+                                <div className="text-[10px] text-ui-muted uppercase">Messages</div>
+                                <div className="text-sm font-mono text-ui-secondary">{agentStats.messageCount}</div>
                               </div>
                               <div>
-                                <div className="text-[10px] text-gray-500 uppercase">Steps</div>
-                                <div className="text-sm font-mono text-gray-300">{agentStats.steps}</div>
+                                <div className="text-[10px] text-ui-muted uppercase">Steps</div>
+                                <div className="text-sm font-mono text-ui-secondary">{agentStats.steps}</div>
                               </div>
                               <div>
-                                <div className="text-[10px] text-gray-500 uppercase">Turns</div>
-                                <div className="text-sm font-mono text-gray-300">{agentStats.turns}</div>
+                                <div className="text-[10px] text-ui-muted uppercase">Turns</div>
+                                <div className="text-sm font-mono text-ui-secondary">{agentStats.turns}</div>
                               </div>
                             </div>
                           </div>

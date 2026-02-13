@@ -8,24 +8,24 @@
 @layer base {
   :root {
     /* Dashboard theme variables (updated dynamically from Base16 theme selection) */
-    --cyber-bg-rgb: 43, 48, 59;
-    --cyber-surface-rgb: 52, 61, 70;
-    --cyber-border-rgb: 79, 91, 102;
-    --cyber-cyan-rgb: 150, 181, 180;
-    --cyber-magenta-rgb: 180, 142, 173;
-    --cyber-purple-rgb: 143, 161, 179;
-    --cyber-lime-rgb: 163, 190, 140;
-    --cyber-orange-rgb: 208, 135, 112;
-    --ui-text-primary-rgb: 192, 197, 206;
-    --ui-text-secondary-rgb: 167, 173, 186;
-    --ui-text-muted-rgb: 101, 115, 126;
-    --code-bg-rgb: 43, 48, 59;
-    --glitch-fg-rgb: 223, 225, 232;
-    --glitch-shadow-red-rgb: 191, 97, 106;
-    --glitch-shadow-cyan-rgb: 150, 181, 180;
-    --agent-accent-1-rgb: 143, 161, 179;
-    --agent-accent-2-rgb: 180, 142, 173;
-    --agent-accent-3-rgb: 235, 203, 139;
+    --cyber-bg-rgb: 10, 14, 39;
+    --cyber-surface-rgb: 20, 27, 61;
+    --cyber-border-rgb: 30, 42, 94;
+    --cyber-cyan-rgb: 0, 255, 249;
+    --cyber-magenta-rgb: 255, 0, 255;
+    --cyber-purple-rgb: 176, 38, 255;
+    --cyber-lime-rgb: 57, 255, 20;
+    --cyber-orange-rgb: 255, 107, 53;
+    --ui-text-primary-rgb: 243, 244, 246;
+    --ui-text-secondary-rgb: 156, 163, 175;
+    --ui-text-muted-rgb: 107, 114, 128;
+    --code-bg-rgb: 10, 14, 39;
+    --glitch-fg-rgb: 255, 255, 255;
+    --glitch-shadow-red-rgb: 255, 0, 0;
+    --glitch-shadow-cyan-rgb: 0, 255, 249;
+    --agent-accent-1-rgb: 176, 38, 255;
+    --agent-accent-2-rgb: 255, 0, 255;
+    --agent-accent-3-rgb: 127, 255, 0;
 
     /* Default mode colors (build/lime) - updated dynamically by AppShell */
     --mode-rgb: 163, 190, 140;
@@ -33,9 +33,8 @@
   }
 
   body {
-    @apply bg-cyber-bg text-gray-100;
+    @apply bg-cyber-bg text-ui-primary;
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
-    color-scheme: dark;
     background-image: 
       radial-gradient(circle at 20% 50%, rgba(var(--cyber-cyan-rgb), 0.03) 0%, transparent 50%),
       radial-gradient(circle at 80% 80%, rgba(var(--cyber-magenta-rgb), 0.03) 0%, transparent 50%);

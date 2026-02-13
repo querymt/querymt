@@ -73,8 +73,8 @@ export function HeaderStatsBar({
     >
       {/* Elapsed Time */}
       <div className="flex items-center gap-1.5">
-        <Clock className={`w-3.5 h-3.5 ${isSessionActive ? 'text-cyber-cyan animate-pulse' : 'text-gray-500'}`} />
-        <span className="text-gray-300">{formatDurationCompact(globalElapsedMs)}</span>
+        <Clock className={`w-3.5 h-3.5 ${isSessionActive ? 'text-cyber-cyan animate-pulse' : 'text-ui-muted'}`} />
+        <span className="text-ui-secondary">{formatDurationCompact(globalElapsedMs)}</span>
       </div>
       
       <span className="text-cyber-border">│</span>
@@ -84,12 +84,12 @@ export function HeaderStatsBar({
         <Cpu className={`w-3.5 h-3.5 ${
           contextPercent >= 80 ? 'text-cyber-orange' : 
           contextPercent >= 70 ? 'text-cyber-cyan' : 
-          'text-gray-500'
+          'text-ui-muted'
         }`} />
         <span className={`${
           contextPercent >= 80 ? 'text-cyber-orange' : 
           contextPercent >= 70 ? 'text-cyber-cyan' : 
-          'text-gray-300'
+          'text-ui-secondary'
         }`}>
           {contextDisplay}
         </span>
@@ -99,8 +99,8 @@ export function HeaderStatsBar({
       
       {/* Tool Calls */}
       <div className="flex items-center gap-1.5">
-        <Wrench className="w-3.5 h-3.5 text-gray-500" />
-        <span className="text-gray-300">{session.totalToolCalls}</span>
+        <Wrench className="w-3.5 h-3.5 text-ui-muted" />
+        <span className="text-ui-secondary">{session.totalToolCalls}</span>
       </div>
       
       <span className="text-cyber-border">│</span>
@@ -110,7 +110,7 @@ export function HeaderStatsBar({
         <DollarSign className={`w-3.5 h-3.5 ${
           costPercent > 90 ? 'text-cyber-orange' : 
           costPercent > 70 ? 'text-cyber-cyan' : 
-          'text-gray-500'
+          'text-ui-muted'
         }`} />
         <span className={`${
           costPercent > 90 ? 'text-cyber-orange' : 

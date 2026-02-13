@@ -3,6 +3,7 @@ import {
   DEFAULT_DASHBOARD_THEME_ID,
   applyDashboardTheme,
   getDashboardTheme,
+  getDashboardThemeVariant,
   getDashboardThemes,
   getDiffThemeForDashboard,
   getShikiThemeForDashboard,
@@ -20,11 +21,13 @@ describe('dashboardThemes', () => {
 
   it('exposes querymate plus many dark tinted base16 themes', () => {
     const themes = getDashboardThemes();
-    expect(themes.length).toBeGreaterThan(200);
+    expect(themes.length).toBeGreaterThan(280);
     expect(themes.every((theme) => theme.id.startsWith('base16-'))).toBe(true);
     expect(themes.some((theme) => theme.id === 'base16-querymate')).toBe(true);
     expect(themes.some((theme) => theme.id === 'base16-ocean')).toBe(true);
     expect(themes.some((theme) => theme.id === 'base16-kanagawa-dragon')).toBe(true);
+    expect(themes.some((theme) => theme.variant === 'light')).toBe(true);
+    expect(themes.some((theme) => theme.variant === 'dark')).toBe(true);
   });
 
   it('applies theme CSS variables to the document root', () => {
@@ -47,10 +50,12 @@ describe('dashboardThemes', () => {
   it('returns theme metadata for syntax and diff renderers', () => {
     expect(getShikiThemeForDashboard('base16-querymate')).toBe('github-dark');
     expect(getDiffThemeForDashboard('base16-querymate')).toBe('pierre-dark');
+    expect(getDashboardThemeVariant('base16-querymate')).toBe('dark');
     expect(getShikiThemeForDashboard('base16-gruvbox-dark')).toBe('dark-plus');
     expect(getDiffThemeForDashboard('base16-atelier-forest')).toBe('everforest-dark');
     expect(getShikiThemeForDashboard('base16-kanagawa')).toBe('kanagawa-wave');
     expect(getDiffThemeForDashboard('base16-kanagawa-dragon')).toBe('kanagawa-dragon');
+    expect(getDashboardThemeVariant('base16-default-light')).toBe('light');
 
     const defaultTheme = getDashboardTheme(DEFAULT_DASHBOARD_THEME_ID);
     expect(defaultTheme.id).toBe('base16-querymate');

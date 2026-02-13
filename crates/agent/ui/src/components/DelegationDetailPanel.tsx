@@ -28,7 +28,7 @@ export function DelegationDetailPanel({
 
   if (!delegation || !turn) {
     return (
-      <div className="flex-1 flex items-center justify-center text-gray-500">
+      <div className="flex-1 flex items-center justify-center text-ui-muted">
         Select a delegation to view details.
       </div>
     );
@@ -64,7 +64,7 @@ export function DelegationDetailPanel({
               <XCircle className="w-3.5 h-3.5 text-cyber-orange" />
             )}
           </span>
-          <span className="text-xs text-gray-400 truncate flex-1">
+          <span className="text-xs text-ui-secondary truncate flex-1">
             {objective ?? 'Delegated task'}
           </span>
           {objective && (
@@ -76,11 +76,11 @@ export function DelegationDetailPanel({
               {copiedValue === 'delegation-detail-objective' ? (
                 <Check className="w-3.5 h-3.5 text-cyber-lime" />
               ) : (
-                <Copy className="w-3.5 h-3.5 text-gray-400 hover:text-cyber-cyan" />
+                <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-cyber-cyan" />
               )}
             </button>
           )}
-          <span className="text-[10px] text-gray-500 flex items-center gap-1">
+          <span className="text-[10px] text-ui-muted flex items-center gap-1">
             <Clock className="w-3 h-3" />
             {durationLabel}
           </span>
@@ -91,7 +91,7 @@ export function DelegationDetailPanel({
           <span className={`flex items-center gap-1 ${
             (stats.contextPercent ?? 0) >= 80 ? 'text-cyber-orange' :
             (stats.contextPercent ?? 0) >= 70 ? 'text-cyber-cyan' :
-            'text-gray-400'
+            'text-ui-secondary'
           }`}>
             <Cpu className="w-3 h-3" />
             {stats.contextPercent !== undefined
@@ -101,12 +101,12 @@ export function DelegationDetailPanel({
                 : 'no ctx data'}
           </span>
           <span className="text-cyber-border/60">·</span>
-          <span className="flex items-center gap-1 text-gray-400">
+          <span className="flex items-center gap-1 text-ui-secondary">
             <Wrench className="w-3 h-3" />
             {stats.toolCallCount} tool call{stats.toolCallCount === 1 ? '' : 's'}
           </span>
           <span className="text-cyber-border/60">·</span>
-          <span className="text-gray-400">{stats.messageCount} message{stats.messageCount === 1 ? '' : 's'}</span>
+          <span className="text-ui-secondary">{stats.messageCount} message{stats.messageCount === 1 ? '' : 's'}</span>
           {stats.costUsd > 0 && (
             <>
               <span className="text-cyber-border/60">·</span>

@@ -50,21 +50,21 @@ export function DelegationSummaryCard({ group, agents, onOpen }: DelegationSumma
             <XCircle className="w-3.5 h-3.5 text-cyber-orange" />
           )}
         </span>
-        <span className="text-xs text-gray-400 truncate flex-1">
+        <span className="text-xs text-ui-secondary truncate flex-1">
           {objective ?? 'Delegated task'}
         </span>
-        <span className="text-[10px] text-gray-500 flex items-center gap-1">
+        <span className="text-[10px] text-ui-muted flex items-center gap-1">
           <Clock className="w-3 h-3" />
           {durationLabel}
         </span>
-        <ChevronRight className="w-3.5 h-3.5 text-gray-500" />
+        <ChevronRight className="w-3.5 h-3.5 text-ui-muted" />
       </div>
-      <div className="mt-1 text-[11px] text-gray-500 flex items-center gap-3">
+      <div className="mt-1 text-[11px] text-ui-muted flex items-center gap-3">
         {/* Context usage */}
         <span className={`flex items-center gap-1 ${
           (stats.contextPercent ?? 0) >= 80 ? 'text-cyber-orange' :
           (stats.contextPercent ?? 0) >= 70 ? 'text-cyber-cyan' :
-          'text-gray-500'
+          'text-ui-muted'
         }`}>
           <Cpu className="w-3 h-3" />
           {stats.contextPercent !== undefined

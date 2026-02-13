@@ -373,7 +373,7 @@ export function ChatView() {
 
   return (
     <div 
-      className="flex flex-col flex-1 min-h-0 text-gray-100 relative"
+      className="flex flex-col flex-1 min-h-0 text-ui-primary relative"
       style={{ ['--todo-rail-width' as any]: showTodoRail ? (todoRailCollapsed ? '2rem' : '18rem') : '0px' }}
     >
       {/* Event Timeline with Todo Rail */}
@@ -390,7 +390,7 @@ export function ChatView() {
               className={`text-xs uppercase tracking-wider px-3 py-1.5 rounded-full border transition-colors ${
                 activeTimelineView === 'chat'
                   ? 'border-cyber-cyan text-cyber-cyan bg-cyber-cyan/10'
-                  : 'border-cyber-border/60 text-gray-400 hover:border-cyber-cyan/40 hover:text-gray-200'
+                  : 'border-cyber-border/60 text-ui-secondary hover:border-cyber-cyan/40 hover:text-ui-primary'
               }`}
             >
               Chat
@@ -411,12 +411,12 @@ export function ChatView() {
               className={`text-xs uppercase tracking-wider px-3 py-1.5 rounded-full border transition-colors ${
                 activeTimelineView === 'delegations'
                   ? 'border-cyber-purple text-cyber-purple bg-cyber-purple/10'
-                  : 'border-cyber-border/60 text-gray-400 hover:border-cyber-purple/40 hover:text-gray-200'
+                  : 'border-cyber-border/60 text-ui-secondary hover:border-cyber-purple/40 hover:text-ui-primary'
               }`}
             >
               Delegations
               {hasDelegations && (
-                <span className="ml-2 text-[10px] text-gray-500">{delegations.length}</span>
+                <span className="ml-2 text-[10px] text-ui-muted">{delegations.length}</span>
               )}
             </button>
           </div>
@@ -441,7 +441,7 @@ export function ChatView() {
                   // No sessions exist - show welcome + new session button
                   <div className="text-center space-y-6 animate-fade-in">
                     <div>
-                      <p className="text-lg text-gray-400 mb-6">Welcome to QueryMT</p>
+                      <p className="text-lg text-ui-secondary mb-6">Welcome to QueryMT</p>
                       <button
                         onClick={handleNewSession}
                         disabled={!connected || loading}
@@ -467,7 +467,7 @@ export function ChatView() {
                           </>
                         )}
                       </button>
-                      <p className="text-xs text-gray-500 mt-3">
+                      <p className="text-xs text-ui-muted mt-3">
                         or press <kbd className="px-2 py-1 bg-cyber-bg border border-cyber-border rounded text-cyber-cyan font-mono text-[10px]">
                           {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+N
                         </kbd> to create a session
@@ -488,11 +488,11 @@ export function ChatView() {
                 )
               ) : (
                 // Active session but no events yet - ready to chat
-                <div className="text-center space-y-6 animate-fade-in text-gray-500">
+                <div className="text-center space-y-6 animate-fade-in text-ui-muted">
                   <Activity className="w-16 h-16 mx-auto text-cyber-cyan opacity-30" />
                   <div>
-                    <p className="text-lg text-gray-400">Session Ready</p>
-                    <p className="text-sm text-gray-500 mt-2">Start chatting below to begin</p>
+                    <p className="text-lg text-ui-secondary">Session Ready</p>
+                    <p className="text-sm text-ui-muted mt-2">Start chatting below to begin</p>
                   </div>
                 </div>
               )}
@@ -543,7 +543,7 @@ export function ChatView() {
                   behavior: 'smooth',
                 });
               }}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs text-gray-200 bg-cyber-bg/80 border border-cyber-border/70 shadow-[0_0_18px_rgba(var(--cyber-cyan-rgb),0.12)] hover:border-cyber-cyan/60 hover:text-cyber-cyan transition-all animate-fade-in-up"
+              className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs text-ui-primary bg-cyber-bg/80 border border-cyber-border/70 shadow-[0_0_18px_rgba(var(--cyber-cyan-rgb),0.12)] hover:border-cyber-cyan/60 hover:text-cyber-cyan transition-all animate-fade-in-up"
             >
               <span>Scroll to latest</span>
               <ChevronDown className="w-3.5 h-3.5" />

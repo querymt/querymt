@@ -13,7 +13,7 @@ import { isMarkdownFile } from '../utils/languageDetection';
 import { MessageContent } from './MessageContent';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
 import { useUiStore } from '../store/uiStore';
-import { getDiffThemeForDashboard } from '../utils/dashboardThemes';
+import { getDashboardThemeVariant, getDiffThemeForDashboard } from '../utils/dashboardThemes';
 
 export interface ToolDetailModalProps {
   event: EventItem & { mergedResult?: EventItem };
@@ -23,6 +23,7 @@ export interface ToolDetailModalProps {
 export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
   const selectedTheme = useUiStore((state) => state.selectedTheme);
   const diffTheme = getDiffThemeForDashboard(selectedTheme);
+  const diffThemeType = getDashboardThemeVariant(selectedTheme);
   const toolKind = event.toolCall?.kind;
   const toolName = inferToolName(event);
   const rawInput = parseJsonMaybe(event.toolCall?.raw_input) ?? event.toolCall?.raw_input;
@@ -71,7 +72,7 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
                   {summary.name}
                 </Dialog.Title>
                 {summary.keyParam && (
-                  <p className="text-xs text-gray-400 font-mono truncate max-w-md">
+                  <p className="text-xs text-ui-secondary font-mono truncate max-w-md">
                     {summary.keyParam}
                   </p>
                 )}
@@ -100,12 +101,12 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
                 )}
               </div>
               {/* Timestamp */}
-              <span className="flex items-center gap-1 text-xs text-gray-500">
+              <span className="flex items-center gap-1 text-xs text-ui-muted">
                 <Clock className="w-3.5 h-3.5" />
                 {new Date(event.timestamp).toLocaleTimeString()}
               </span>
               {/* Close button */}
-              <Dialog.Close className="p-1.5 rounded hover:bg-cyber-bg transition-colors text-gray-400 hover:text-gray-200">
+              <Dialog.Close className="p-1.5 rounded hover:bg-cyber-bg transition-colors text-ui-secondary hover:text-ui-primary">
                 <X className="w-5 h-5" />
               </Dialog.Close>
             </div>
@@ -122,7 +123,12 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
                 copied={copiedSection === 'input'}
               >
                 {(isEdit || isPatch) ? (
-                  <DiffView toolKind={toolKind} rawInput={rawInput} diffTheme={diffTheme} />
+                  <DiffView
+                    toolKind={toolKind}
+                    rawInput={rawInput}
+                    diffTheme={diffTheme}
+                    diffThemeType={diffThemeType}
+                  />
                 ) : (
                   <JsonView data={rawInput} />
                 )}
@@ -154,7 +160,7 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
 
             {/* Raw Data Section (collapsed by default) */}
             <details className="group">
-              <summary className="text-xs text-gray-500 cursor-pointer hover:text-gray-400 transition-colors py-2">
+              <summary className="text-xs text-ui-muted cursor-pointer hover:text-ui-secondary transition-colors py-2">
                 Show raw event data
               </summary>
               <div className="mt-2">
@@ -185,13 +191,13 @@ function Section({
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-medium text-gray-300 uppercase tracking-wider">
+        <h3 className="text-sm font-medium text-ui-secondary uppercase tracking-wider">
           {title}
         </h3>
         {copyable && onCopy && (
           <button
             onClick={onCopy}
-            className="flex items-center gap-1 text-xs text-gray-500 hover:text-cyber-cyan transition-colors"
+            className="flex items-center gap-1 text-xs text-ui-muted hover:text-cyber-cyan transition-colors"
           >
             {copied ? (
               <>
@@ -218,7 +224,7 @@ function Section({
 function JsonView({ data }: { data: unknown }) {
   const formatted = JSON.stringify(data, null, 2);
   return (
-    <pre className="p-4 text-xs font-mono text-gray-300 overflow-auto max-h-96 whitespace-pre-wrap break-words">
+    <pre className="p-4 text-xs font-mono text-ui-secondary overflow-auto max-h-96 whitespace-pre-wrap break-words">
       {formatted}
     </pre>
   );
@@ -229,10 +235,12 @@ function DiffView({
   toolKind,
   rawInput,
   diffTheme,
+  diffThemeType,
 }: {
   toolKind?: string;
   rawInput: unknown;
   diffTheme: string;
+  diffThemeType: 'dark' | 'light';
 }) {
   const input = rawInput as Record<string, unknown>;
   
@@ -256,7 +264,7 @@ function DiffView({
       
       return (
         <div>
-          <div className="text-[11px] text-gray-400 mb-2 font-mono">
+          <div className="text-[11px] text-ui-secondary mb-2 font-mono">
             Writing to: <span className="text-cyber-cyan">{filePath as string}</span>
           </div>
           <div className="event-diff-container m-0 border-0">
@@ -264,7 +272,7 @@ function DiffView({
               patch={patch}
               options={{
                 theme: diffTheme,
-                themeType: 'dark',
+                themeType: diffThemeType,
                 diffStyle: 'split',
                 diffIndicators: 'bars',
                 lineDiffType: 'word-alt',
@@ -291,7 +299,7 @@ function DiffView({
             patch={patch}
             options={{
               theme: diffTheme,
-              themeType: 'dark',
+              themeType: diffThemeType,
               diffStyle: 'split',
               diffIndicators: 'bars',
               lineDiffType: 'word-alt',
@@ -315,7 +323,7 @@ function DiffView({
           patch={patchValue}
           options={{
             theme: diffTheme,
-            themeType: 'dark',
+            themeType: diffThemeType,
             diffStyle: 'unified',
             diffIndicators: 'bars',
             overflow: 'wrap',
@@ -344,7 +352,7 @@ function ShellResultView({ event }: { event: EventItem }) {
     <div className="font-mono text-xs">
       {/* Header with exit code */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-cyber-border/50 bg-cyber-bg/50">
-        <span className="text-gray-500 uppercase tracking-wide text-[10px]">Terminal Output</span>
+        <span className="text-ui-muted uppercase tracking-wide text-[10px]">Terminal Output</span>
         {exitCode !== undefined && (
           <span className={`text-[10px] ${exitCode === 0 ? 'text-cyber-lime' : 'text-cyber-orange'}`}>
             exit {exitCode}
@@ -355,18 +363,18 @@ function ShellResultView({ event }: { event: EventItem }) {
       <div className="p-4 space-y-3 max-h-96 overflow-auto bg-cyber-bg/60">
         {stdout && (
           <div>
-            <div className="text-[10px] uppercase tracking-wide text-gray-500 mb-1">stdout</div>
-            <pre className="whitespace-pre-wrap break-words text-gray-200">{stdout}</pre>
+            <div className="text-[10px] uppercase tracking-wide text-ui-muted mb-1">stdout</div>
+            <pre className="whitespace-pre-wrap break-words text-ui-primary">{stdout}</pre>
           </div>
         )}
         {stderr && (
           <div>
-            <div className="text-[10px] uppercase tracking-wide text-gray-500 mb-1">stderr</div>
+            <div className="text-[10px] uppercase tracking-wide text-ui-muted mb-1">stderr</div>
             <pre className="whitespace-pre-wrap break-words text-cyber-orange/80">{stderr}</pre>
           </div>
         )}
         {!stdout && !stderr && (
-          <div className="text-gray-500 italic">No output</div>
+          <div className="text-ui-muted italic">No output</div>
         )}
       </div>
     </div>
@@ -394,7 +402,7 @@ function FileReadView({ event }: { event: EventItem }) {
           {filePath || 'File Content'}
         </span>
         {startLine !== undefined && endLine !== undefined && (
-          <span className="text-gray-500 text-[10px]">
+          <span className="text-ui-muted text-[10px]">
             Lines {startLine}-{endLine}
           </span>
         )}
@@ -415,7 +423,7 @@ function FileReadView({ event }: { event: EventItem }) {
             maxHeight="24rem"
           />
         ) : (
-          <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words text-gray-200 font-mono">
+          <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words text-ui-primary font-mono">
             {content || 'No content'}
           </pre>
         )}
@@ -438,7 +446,7 @@ function ResultView({ event }: { event: EventItem }) {
   
   // Plain text
   return (
-    <pre className="p-4 text-xs font-mono text-gray-300 overflow-auto max-h-96 whitespace-pre-wrap break-words">
+    <pre className="p-4 text-xs font-mono text-ui-secondary overflow-auto max-h-96 whitespace-pre-wrap break-words">
       {rawOutput ?? content ?? 'No result'}
     </pre>
   );

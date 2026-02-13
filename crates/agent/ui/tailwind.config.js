@@ -16,6 +16,11 @@ export default {
           purple: 'rgba(var(--cyber-purple-rgb), <alpha-value>)',
           lime: 'rgba(var(--cyber-lime-rgb), <alpha-value>)',
           orange: 'rgba(var(--cyber-orange-rgb), <alpha-value>)',
+        },
+        ui: {
+          primary: 'rgba(var(--ui-text-primary-rgb), <alpha-value>)',
+          secondary: 'rgba(var(--ui-text-secondary-rgb), <alpha-value>)',
+          muted: 'rgba(var(--ui-text-muted-rgb), <alpha-value>)',
         }
       },
       boxShadow: {

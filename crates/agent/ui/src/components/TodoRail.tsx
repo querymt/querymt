@@ -32,7 +32,7 @@ export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyCh
         
         {/* Vertical "Tasks" text */}
         <div className="mt-16 flex-1 flex items-center justify-center">
-          <div className="transform -rotate-90 whitespace-nowrap text-xs text-gray-500 flex items-center gap-2">
+          <div className="transform -rotate-90 whitespace-nowrap text-xs text-ui-muted flex items-center gap-2">
             <span>📋</span>
             <span>{stats.completed}/{stats.total}</span>
           </div>
@@ -52,8 +52,8 @@ export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyCh
       <div className="px-4 py-2 border-b border-cyber-border/50 bg-cyber-surface/40 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="text-lg">📋</span>
-          <span className="text-sm font-semibold text-gray-200">Tasks</span>
-          <span className="text-xs text-gray-500 ml-1">
+          <span className="text-sm font-semibold text-ui-primary">Tasks</span>
+          <span className="text-xs text-ui-muted ml-1">
             {stats.completed}/{stats.total}
           </span>
         </div>
@@ -66,7 +66,7 @@ export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyCh
             border border-cyber-border/50 hover:border-cyber-cyan/50
             flex items-center justify-center
             transition-all duration-200
-            text-gray-400 hover:text-cyber-cyan
+            text-ui-secondary hover:text-cyber-cyan
           "
           title="Collapse tasks (Cmd+Shift+T)"
         >
@@ -94,7 +94,7 @@ export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyCh
         </div>
         
         {/* Stats breakdown */}
-        <div className="mt-2 flex items-center gap-3 text-[10px] text-gray-500">
+        <div className="mt-2 flex items-center gap-3 text-[10px] text-ui-muted">
           {stats.inProgress > 0 && (
             <span className="flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-cyber-cyan animate-pulse" />
@@ -103,7 +103,7 @@ export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyCh
           )}
           {stats.pending > 0 && (
             <span className="flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-gray-500" />
+              <span className="w-1.5 h-1.5 rounded-full bg-ui-muted" />
               {stats.pending} pending
             </span>
           )}
@@ -142,16 +142,16 @@ function TodoItemRow({ todo, isRecentlyChanged }: TodoItemRowProps) {
         <div className="w-2 h-2 rounded-full bg-cyber-cyan animate-pulse" />
       </div>
     ),
-    pending: <Circle className="w-4 h-4 text-gray-500" />,
+    pending: <Circle className="w-4 h-4 text-ui-muted" />,
     completed: <CheckCircle className="w-4 h-4 text-cyber-lime" />,
     cancelled: <XCircle className="w-4 h-4 text-red-400" />,
   }[todo.status];
   
   const textStyle = {
-    in_progress: 'text-gray-100 font-medium',
-    pending: 'text-gray-300',
-    completed: 'text-gray-500 line-through',
-    cancelled: 'text-gray-600 line-through',
+    in_progress: 'text-ui-primary font-medium',
+    pending: 'text-ui-secondary',
+    completed: 'text-ui-muted line-through',
+    cancelled: 'text-ui-muted line-through',
   }[todo.status];
   
   return (

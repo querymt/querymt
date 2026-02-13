@@ -164,7 +164,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
             </h3>
           </div>
           {sourceLabel && (
-            <span className="text-[10px] text-gray-500 px-2 py-0.5 rounded bg-cyber-surface/40 border border-cyber-border/30">
+            <span className="text-[10px] text-ui-muted px-2 py-0.5 rounded bg-cyber-surface/40 border border-cyber-border/30">
               via {sourceLabel}
             </span>
           )}
@@ -173,7 +173,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
 
       {/* Message */}
       <div className="px-4 py-3 border-b border-cyber-border/30">
-        <p className="text-sm text-gray-200 leading-relaxed">{data.message}</p>
+        <p className="text-sm text-ui-primary leading-relaxed">{data.message}</p>
       </div>
 
       {/* Form Fields */}
@@ -182,7 +182,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
           <div key={field.name} className="space-y-2">
             {/* Field Label */}
             <div className="flex items-baseline gap-2">
-              <label className="text-sm font-medium text-gray-300">
+              <label className="text-sm font-medium text-ui-secondary">
                 {field.title || field.name}
                 {field.required && <span className="text-cyber-orange ml-1">*</span>}
               </label>
@@ -190,7 +190,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
             
             {/* Field Description */}
             {field.description && (
-              <p className="text-xs text-gray-400 leading-relaxed">{field.description}</p>
+              <p className="text-xs text-ui-secondary leading-relaxed">{field.description}</p>
             )}
 
             {/* Field Input */}
@@ -232,7 +232,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                               }`} />
                             </div>
                           ) : (
-                            <Circle className="w-4 h-4 text-gray-500" />
+                            <Circle className="w-4 h-4 text-ui-muted" />
                           )}
                         </div>
                         <div className="flex-1 min-w-0">
@@ -241,12 +241,12 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                               ? 'text-cyber-lime' 
                               : isSelected 
                               ? 'text-cyber-cyan' 
-                              : 'text-gray-200'
+                              : 'text-ui-primary'
                           }`}>
                             {option.title || String(option.value)}
                           </div>
                           {option.description && (
-                            <div className="text-xs text-gray-400 mt-1 leading-relaxed">
+                            <div className="text-xs text-ui-secondary mt-1 leading-relaxed">
                               {option.description}
                             </div>
                           )}
@@ -294,7 +294,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                               submitted && action === 'accept' ? 'text-cyber-lime' : 'text-cyber-cyan'
                             }`} />
                           ) : (
-                            <Square className="w-4 h-4 text-gray-500" />
+                            <Square className="w-4 h-4 text-ui-muted" />
                           )}
                         </div>
                         <div className="flex-1 min-w-0">
@@ -303,12 +303,12 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                               ? 'text-cyber-lime'
                               : isSelected
                               ? 'text-cyber-cyan'
-                              : 'text-gray-200'
+                              : 'text-ui-primary'
                           }`}>
                             {option.title || String(option.value)}
                           </div>
                           {option.description && (
-                            <div className="text-xs text-gray-400 mt-1 leading-relaxed">
+                            <div className="text-xs text-ui-secondary mt-1 leading-relaxed">
                               {option.description}
                             </div>
                           )}
@@ -349,7 +349,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                         submitted && action === 'accept' ? 'text-cyber-lime' : 'text-cyber-cyan'
                       }`} />
                     ) : (
-                      <Square className="w-4 h-4 text-gray-500" />
+                      <Square className="w-4 h-4 text-ui-muted" />
                     )}
                   </div>
                   <span className={`text-sm font-medium ${
@@ -357,7 +357,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                       ? 'text-cyber-lime'
                       : formState[field.name]
                       ? 'text-cyber-cyan'
-                      : 'text-gray-200'
+                      : 'text-ui-primary'
                   }`}>
                     {formState[field.name] ? 'Yes' : 'No'}
                   </span>
@@ -376,7 +376,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                 }}
                 onKeyDown={(e) => handleKeyDown(e)}
                 disabled={submitted}
-                className="w-full px-4 py-2.5 rounded-lg bg-cyber-bg border border-cyber-cyan/40 text-gray-200 text-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyber-cyan/50 focus:border-cyber-cyan transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                className="w-full px-4 py-2.5 rounded-lg bg-cyber-bg border border-cyber-cyan/40 text-ui-primary text-sm placeholder:text-ui-muted focus:outline-none focus:ring-2 focus:ring-cyber-cyan/50 focus:border-cyber-cyan transition-all disabled:opacity-60 disabled:cursor-not-allowed"
                 placeholder={field.type === 'integer' ? 'Enter a whole number...' : 'Enter a number...'}
               />
             ) : (
@@ -387,7 +387,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                 onChange={(e) => handleFieldChange(field.name, e.target.value)}
                 onKeyDown={(e) => handleKeyDown(e)}
                 disabled={submitted}
-                className="w-full px-4 py-2.5 rounded-lg bg-cyber-bg border border-cyber-cyan/40 text-gray-200 text-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyber-cyan/50 focus:border-cyber-cyan transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                className="w-full px-4 py-2.5 rounded-lg bg-cyber-bg border border-cyber-cyan/40 text-ui-primary text-sm placeholder:text-ui-muted focus:outline-none focus:ring-2 focus:ring-cyber-cyan/50 focus:border-cyber-cyan transition-all disabled:opacity-60 disabled:cursor-not-allowed"
                 placeholder="Enter text..."
               />
             )}
@@ -413,8 +413,8 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
             )}
             {action === 'cancel' && (
               <>
-                <Ban className="w-4 h-4 text-gray-400" />
-                <span className="text-sm font-medium text-gray-400">Request cancelled</span>
+                <Ban className="w-4 h-4 text-ui-secondary" />
+                <span className="text-sm font-medium text-ui-secondary">Request cancelled</span>
               </>
             )}
           </div>
@@ -438,7 +438,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                 transition-all duration-200
                 ${canSubmit
                   ? 'bg-cyber-cyan/20 border border-cyber-cyan/60 text-cyber-cyan hover:bg-cyber-cyan/30 hover:border-cyber-cyan cursor-pointer'
-                  : 'bg-cyber-surface/60 border border-cyber-border/40 text-gray-500 cursor-not-allowed opacity-50'
+                  : 'bg-cyber-surface/60 border border-cyber-border/40 text-ui-muted cursor-not-allowed opacity-50'
                 }
               `}
             >

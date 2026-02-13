@@ -63,7 +63,7 @@ export function HomePage() {
     <div className="flex items-center justify-center h-full">
       <div className="text-center space-y-6 animate-fade-in">
         <div>
-          <p className="text-lg text-gray-400 mb-6">Welcome to QueryMT</p>
+          <p className="text-lg text-ui-secondary mb-6">Welcome to QueryMT</p>
           <button
             onClick={handleNewSession}
             disabled={!connected || loading}
@@ -89,7 +89,7 @@ export function HomePage() {
               </>
             )}
           </button>
-          <p className="text-xs text-gray-500 mt-3">
+          <p className="text-xs text-ui-muted mt-3">
             or press{' '}
             <kbd className="px-2 py-1 bg-cyber-bg border border-cyber-border rounded text-cyber-cyan font-mono text-[10px]">
               {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+N

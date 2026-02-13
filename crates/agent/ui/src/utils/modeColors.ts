@@ -83,19 +83,16 @@ function hslToRgb(h: number, s: number, l: number): { r: number; g: number; b: n
 
 /**
  * Generate a neon color from mode name hash
- * Uses high saturation and medium-high lightness for neon effect
+ * Uses variant-aware saturation/lightness for contrast in dark/light themes
  */
-function hashToRgb(mode: string): { rgb: string; hex: string } {
+function hashToRgb(mode: string, variant: 'dark' | 'light'): { rgb: string; hex: string } {
   const hash = hashString(mode);
   
   // Generate hue from hash (0-360)
   const hue = hash % 360;
   
-  // High saturation for neon effect (85-95%)
-  const saturation = 85 + (hash % 11);
-  
-  // Medium-high lightness for visibility on dark bg (55-70%)
-  const lightness = 55 + (hash % 16);
+  const saturation = variant === 'light' ? 70 + (hash % 16) : 85 + (hash % 11);
+  const lightness = variant === 'light' ? 30 + (hash % 16) : 55 + (hash % 16);
   
   const { r, g, b } = hslToRgb(hue, saturation, lightness);
   
@@ -135,7 +132,8 @@ export function getModeColors(
     };
   }
 
-  const generated = hashToRgb(mode);
+  const variant = themeId ? getDashboardTheme(themeId).variant : 'dark';
+  const generated = hashToRgb(mode, variant);
   return {
     ...generated,
     cssColor: generated.hex,

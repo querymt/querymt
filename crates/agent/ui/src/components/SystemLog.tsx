@@ -78,8 +78,8 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
               <AlertTriangle className="h-4 w-4 text-cyber-orange" />
             </div>
             <div>
-              <p className="text-sm font-semibold text-gray-100">System Log</p>
-              <p className="text-xs text-gray-400">{events.length} error{events.length === 1 ? '' : 's'} recorded</p>
+              <p className="text-sm font-semibold text-ui-primary">System Log</p>
+              <p className="text-xs text-ui-secondary">{events.length} error{events.length === 1 ? '' : 's'} recorded</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -95,7 +95,7 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
             <button
               type="button"
               onClick={onClear}
-              className="flex items-center gap-1 rounded-md border border-cyber-border/60 px-2 py-1 text-xs text-gray-300 transition-colors hover:bg-cyber-bg/60"
+              className="flex items-center gap-1 rounded-md border border-cyber-border/60 px-2 py-1 text-xs text-ui-secondary transition-colors hover:bg-cyber-bg/60"
               title="Clear and hide"
             >
               <Trash2 className="h-3 w-3" />
@@ -104,7 +104,7 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
             <button
               type="button"
               onClick={() => setIsCollapsed((prev) => !prev)}
-              className="rounded-md border border-cyber-border/60 p-1 text-gray-300 transition-colors hover:bg-cyber-bg/60"
+              className="rounded-md border border-cyber-border/60 p-1 text-ui-secondary transition-colors hover:bg-cyber-bg/60"
               title={isCollapsed ? 'Expand' : 'Collapse'}
             >
               {isCollapsed ? (
@@ -123,7 +123,7 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
                 {displayEvents.map((event) => (
                   <div
                     key={event.id}
-                    className="rounded-lg border border-cyber-orange/20 bg-cyber-surface/50 px-3 py-2 text-sm text-gray-100 shadow-[0_0_12px_rgba(var(--cyber-orange-rgb),0.15)]"
+                    className="rounded-lg border border-cyber-orange/20 bg-cyber-surface/50 px-3 py-2 text-sm text-ui-primary shadow-[0_0_12px_rgba(var(--cyber-orange-rgb),0.15)]"
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div className="font-mono text-[11px] uppercase tracking-wider text-cyber-orange">
@@ -139,7 +139,7 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
                         {copiedId === event.id ? 'Copied' : 'Copy'}
                       </button>
                     </div>
-                    <div className="mt-2 whitespace-pre-wrap font-mono text-xs text-gray-200">
+                    <div className="mt-2 whitespace-pre-wrap font-mono text-xs text-ui-primary">
                       {event.content}
                     </div>
                   </div>

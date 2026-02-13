@@ -25,4 +25,14 @@ describe('modeColors', () => {
     expect(first.hex).toBe(second.hex);
     expect(first.rgb).toBe(second.rgb);
   });
+
+  it('adapts generated unknown-mode colors for light variants', () => {
+    const dark = getModeColors('custom-mode', 'base16-ocean');
+    const light = getModeColors('custom-mode', 'base16-default-light');
+    const lightAgain = getModeColors('custom-mode', 'base16-gruvbox-light');
+
+    expect(light.hex).toBe(lightAgain.hex);
+    expect(light.rgb).toBe(lightAgain.rgb);
+    expect(light.hex).not.toBe(dark.hex);
+  });
 });

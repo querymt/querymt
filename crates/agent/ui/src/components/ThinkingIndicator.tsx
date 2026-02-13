@@ -20,7 +20,7 @@ export function ThinkingIndicator({ agentId, agents, isComplete = false }: Think
           className="w-4 h-4"
           style={{ color: 'rgb(var(--cyber-lime-rgb))' }}
         />
-        <span className="text-sm text-gray-400">
+        <span className="text-sm text-ui-secondary">
           <span style={{ color }} className="font-medium">{name}</span>
           {' '}response complete
         </span>
@@ -36,7 +36,7 @@ export function ThinkingIndicator({ agentId, agents, isComplete = false }: Think
           backgroundColor: color,
         }}
       />
-      <span className="text-sm text-gray-400">
+      <span className="text-sm text-ui-secondary">
         <span style={{ color }} className="font-medium">{name}</span>
         {' '}is thinking...
       </span>

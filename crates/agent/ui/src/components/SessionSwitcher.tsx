@@ -174,16 +174,16 @@ export function SessionSwitcher({
               value={search}
               onValueChange={setSearch}
               placeholder="Search sessions by ID, title, or workspace..."
-              className="flex-1 bg-transparent text-gray-100 placeholder-gray-500 text-sm focus:outline-none"
+              className="flex-1 bg-transparent text-ui-primary placeholder:text-ui-muted text-sm focus:outline-none"
             />
-            <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-cyber-bg border border-cyber-border rounded text-gray-500">
+            <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-cyber-bg border border-cyber-border rounded text-ui-muted">
               ESC
             </kbd>
           </div>
           
           {/* Results */}
           <Command.List className="max-h-[400px] overflow-y-auto p-2 custom-scrollbar">
-            <Command.Empty className="px-4 py-8 text-center text-sm text-gray-500">
+            <Command.Empty className="px-4 py-8 text-center text-sm text-ui-muted">
               No sessions found
             </Command.Empty>
             
@@ -208,7 +208,7 @@ export function SessionSwitcher({
                         ) : isThinking ? (
                           <span className="w-2 h-2 rounded-full bg-cyber-purple animate-pulse" />
                         ) : (
-                          <span className="w-2 h-2 rounded-full bg-gray-600" />
+                          <span className="w-2 h-2 rounded-full bg-ui-muted" />
                         )}
                       </div>
                       
@@ -219,7 +219,7 @@ export function SessionSwitcher({
                           {session.isChild && (
                             <GitBranch className="w-3 h-3 text-cyber-cyan/70 flex-shrink-0" />
                           )}
-                          <span className="text-sm text-gray-200 font-medium truncate group-data-[selected=true]:text-cyber-cyan">
+                          <span className="text-sm text-ui-primary font-medium truncate group-data-[selected=true]:text-cyber-cyan">
                             {session.title || session.name || 'Untitled session'}
                           </span>
                           {isActive && (
@@ -240,7 +240,7 @@ export function SessionSwitcher({
                         </div>
                         
                         {/* Metadata */}
-                        <div className="flex items-center gap-3 text-xs text-gray-500">
+                        <div className="flex items-center gap-3 text-xs text-ui-muted">
                           <span className="font-mono truncate">
                             {session.session_id.slice(0, 12)}...
                           </span>
@@ -250,7 +250,7 @@ export function SessionSwitcher({
                               {formatTimestamp(session.updated_at)}
                             </span>
                           )}
-                          <span className="truncate text-gray-600">
+                          <span className="truncate text-ui-muted">
                             {session.workspace}
                           </span>
                         </div>
@@ -282,7 +282,7 @@ export function SessionSwitcher({
                         ) : isThinking ? (
                           <span className="w-2 h-2 rounded-full bg-cyber-purple animate-pulse" />
                         ) : (
-                          <span className="w-2 h-2 rounded-full bg-gray-600" />
+                          <span className="w-2 h-2 rounded-full bg-ui-muted" />
                         )}
                       </div>
                       
@@ -293,7 +293,7 @@ export function SessionSwitcher({
                           {session.isChild && (
                             <GitBranch className="w-3 h-3 text-cyber-cyan/70 flex-shrink-0" />
                           )}
-                          <span className="text-sm text-gray-200 font-medium truncate group-data-[selected=true]:text-cyber-cyan">
+                          <span className="text-sm text-ui-primary font-medium truncate group-data-[selected=true]:text-cyber-cyan">
                             {session.title || session.name || 'Untitled session'}
                           </span>
                           {isActive && (
@@ -314,7 +314,7 @@ export function SessionSwitcher({
                         </div>
                         
                         {/* Metadata */}
-                        <div className="flex items-center gap-3 text-xs text-gray-500">
+                        <div className="flex items-center gap-3 text-xs text-ui-muted">
                           <span className="font-mono truncate">
                             {session.session_id.slice(0, 12)}...
                           </span>
@@ -324,7 +324,7 @@ export function SessionSwitcher({
                               {formatTimestamp(session.updated_at)}
                             </span>
                           )}
-                          <span className="truncate text-gray-600">
+                          <span className="truncate text-ui-muted">
                             {session.workspace}
                           </span>
                         </div>
@@ -345,8 +345,8 @@ export function SessionSwitcher({
                 className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-cyber-border/20 cursor-pointer transition-colors data-[selected=true]:bg-cyber-cyan/15 data-[selected=true]:border-cyber-cyan/35 hover:bg-cyber-surface/60 hover:border-cyber-border/40 data-[disabled=true]:opacity-50 data-[disabled=true]:cursor-not-allowed"
               >
                 <Plus className="w-4 h-4 text-cyber-cyan flex-shrink-0" />
-                <span className="flex-1 text-sm text-gray-200">New Session</span>
-                <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-cyber-bg border border-cyber-border rounded text-gray-500">
+                <span className="flex-1 text-sm text-ui-primary">New Session</span>
+                <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-cyber-bg border border-cyber-border rounded text-ui-muted">
                   {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}N
                 </kbd>
               </Command.Item>

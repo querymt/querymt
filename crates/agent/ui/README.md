@@ -80,7 +80,7 @@ src/
 
 ### Built-in Dashboard Themes
 
-- Use the header theme picker (palette icon) to switch between built-in dark themes (Base16 + Kanagawa).
+- Use the header theme picker (palette icon) to switch between built-in Base16 themes (dark + light) and the QueryMate default theme.
 - Theme choice is persisted in local storage (`dashboardTheme`) via the UI store.
 - Theme variables are applied at runtime using CSS custom properties so existing Tailwind classes update automatically.
 - Code highlighting and diffs follow the selected dashboard theme.
@@ -198,7 +198,6 @@ Open browser DevTools → Network tab → WS filter to see WebSocket messages in
 - [ ] Inline code review with annotations and comments
 - [ ] Message reactions and threading
 - [ ] Export conversation history to markdown/JSON
-- [ ] Light-mode dashboard theme pack
 - [ ] Keyboard shortcuts for common actions
 - [ ] Search and filter messages in timeline
 - [ ] Voice input support
