@@ -16,6 +16,14 @@
   }:
     flake-parts.lib.mkFlake {inherit inputs;} {
       systems = ["x86_64-linux" "aarch64-linux" "aarch64-darwin"];
+      flake = let
+        querymtServiceModule = import ./nix/nixos-module/querymt-service.nix {inherit self;};
+      in {
+        nixosModules = {
+          querymt-service = querymtServiceModule;
+          default = querymtServiceModule;
+        };
+      };
       perSystem = {system, ...}: let
         overlays = [(import rust-overlay)];
         nixpkgsConfig = {
@@ -48,6 +56,7 @@
 
         agentCargoToml = builtins.fromTOML (builtins.readFile ./crates/agent/Cargo.toml);
         cliCargoToml = builtins.fromTOML (builtins.readFile ./crates/cli/Cargo.toml);
+        serviceCargoToml = builtins.fromTOML (builtins.readFile ./crates/querymt-service/Cargo.toml);
 
         commonInputs = with pkgs; [
           rustToolchain
@@ -161,6 +170,39 @@
               runHook postInstall
             '';
           };
+
+          qmt-service = pkgs.rustPlatform.buildRustPackage {
+            pname = "qmt-service";
+            version = serviceCargoToml.package.version;
+            src = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [
+              "-p"
+              "querymt-service"
+              "--bin"
+              "qmt-service"
+            ];
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.cmake
+              pkgs.gnumake
+            ];
+            buildInputs = commonInputs;
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
+            auditable = false;
+            doCheck = false;
+            buildPhase = "cargoBuildHook";
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out/bin
+              install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/qmt-service $out/bin/qmt-service
+              runHook postInstall
+            '';
+          };
         };
 
         apps = {
@@ -171,6 +213,10 @@
           qmt = {
             type = "app";
             program = "${self.packages.${system}.qmt}/bin/qmt";
+          };
+          qmt-service = {
+            type = "app";
+            program = "${self.packages.${system}.qmt-service}/bin/qmt-service";
           };
         };
 
