@@ -22,22 +22,31 @@ async fn test_state_recording_middleware() {
     ));
 
     composite
-        .run_turn_start(ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        })
+        .run_turn_start(
+            ExecutionState::BeforeLlmCall {
+                context: context.clone(),
+            },
+            None,
+        )
         .await
         .unwrap();
     composite
-        .run_step_start(ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        })
+        .run_step_start(
+            ExecutionState::BeforeLlmCall {
+                context: context.clone(),
+            },
+            None,
+        )
         .await
         .unwrap();
     composite
-        .run_after_llm(ExecutionState::AfterLlm {
-            response,
-            context: context.clone(),
-        })
+        .run_after_llm(
+            ExecutionState::AfterLlm {
+                response,
+                context: context.clone(),
+            },
+            None,
+        )
         .await
         .unwrap();
 
@@ -57,7 +66,7 @@ async fn test_message_injection_flow() {
     let context = test_context("sess-1", 0);
     let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.run_turn_start(state).await.unwrap();
+    let result = composite.run_turn_start(state, None).await.unwrap();
 
     if let ExecutionState::BeforeLlmCall { context } = result {
         assert_eq!(context.messages.len(), 1);
@@ -81,7 +90,7 @@ async fn test_multiple_middleware_interaction() {
     let context = test_context("sess-1", 0);
 
     let result = composite
-        .run_turn_start(ExecutionState::BeforeLlmCall { context })
+        .run_turn_start(ExecutionState::BeforeLlmCall { context }, None)
         .await
         .unwrap();
 
@@ -100,7 +109,7 @@ async fn test_middleware_can_transform_call_llm() {
     let context = test_context("sess-1", 0);
 
     let result = composite
-        .run_step_start(ExecutionState::BeforeLlmCall { context })
+        .run_step_start(ExecutionState::BeforeLlmCall { context }, None)
         .await
         .unwrap();
 
@@ -121,26 +130,35 @@ async fn test_middleware_can_transform_to_stopped() {
     ));
 
     let result = composite
-        .run_turn_start(ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        })
+        .run_turn_start(
+            ExecutionState::BeforeLlmCall {
+                context: context.clone(),
+            },
+            None,
+        )
         .await
         .unwrap();
     assert!(matches!(result, ExecutionState::Stopped { .. }));
 
     let result = composite
-        .run_step_start(ExecutionState::BeforeLlmCall {
-            context: context.clone(),
-        })
+        .run_step_start(
+            ExecutionState::BeforeLlmCall {
+                context: context.clone(),
+            },
+            None,
+        )
         .await
         .unwrap();
     assert!(matches!(result, ExecutionState::Stopped { .. }));
 
     let result = composite
-        .run_after_llm(ExecutionState::AfterLlm {
-            response,
-            context: context.clone(),
-        })
+        .run_after_llm(
+            ExecutionState::AfterLlm {
+                response,
+                context: context.clone(),
+            },
+            None,
+        )
         .await
         .unwrap();
     assert!(matches!(result, ExecutionState::Stopped { .. }));
@@ -166,7 +184,7 @@ async fn test_stats_propagate_through_middleware() {
     ));
 
     let result = composite
-        .run_turn_start(ExecutionState::BeforeLlmCall { context })
+        .run_turn_start(ExecutionState::BeforeLlmCall { context }, None)
         .await
         .unwrap();
 
@@ -188,9 +206,12 @@ async fn test_context_immutability() {
     let original_len = original.messages.len();
 
     let result = composite
-        .run_turn_start(ExecutionState::BeforeLlmCall {
-            context: original.clone(),
-        })
+        .run_turn_start(
+            ExecutionState::BeforeLlmCall {
+                context: original.clone(),
+            },
+            None,
+        )
         .await
         .unwrap();
 

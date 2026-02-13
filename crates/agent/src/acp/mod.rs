@@ -19,7 +19,6 @@ use crate::acp::shared::{
     PendingElicitationMap, PermissionMap, RpcRequest, SessionOwnerMap, collect_event_sources,
     handle_rpc_message, is_event_owned, translate_event_to_notification,
 };
-use crate::agent::QueryMTAgent;
 use crate::event_bus::EventBus;
 use agent_client_protocol::{Error, RequestPermissionRequest, RequestPermissionResponse};
 use axum::{
@@ -39,7 +38,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 pub struct AcpServer {
-    agent: Arc<QueryMTAgent>,
+    agent: Arc<crate::agent::AgentHandle>,
     pending_permissions: PermissionMap,
     pending_elicitations: PendingElicitationMap,
     event_sources: Vec<Arc<EventBus>>,
@@ -48,7 +47,7 @@ pub struct AcpServer {
 
 #[derive(Clone)]
 struct ServerState {
-    agent: Arc<QueryMTAgent>,
+    agent: Arc<crate::agent::AgentHandle>,
     pending_permissions: PermissionMap,
     pending_elicitations: PendingElicitationMap,
     event_sources: Vec<Arc<EventBus>>,
@@ -56,7 +55,7 @@ struct ServerState {
 }
 
 impl AcpServer {
-    pub fn new(agent: Arc<QueryMTAgent>) -> Self {
+    pub fn new(agent: Arc<crate::agent::AgentHandle>) -> Self {
         let event_sources = collect_event_sources(&agent);
         let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations = agent.pending_elicitations();

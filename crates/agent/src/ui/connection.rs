@@ -108,7 +108,37 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
     };
 
     let agents = build_agent_list(state);
-    let agent_mode = state.agent.get_agent_mode().as_str().to_string();
+
+    // Try to get mode from active session actor, fall back to default_mode
+    let agent_mode = if let Some(ref session_id) = active_session_id {
+        let registry = state.agent.registry.lock().await;
+        if let Some(actor_ref) = registry.get(session_id) {
+            match actor_ref.ask(crate::agent::messages::GetMode).await {
+                Ok(m) => m.as_str().to_string(),
+                Err(_) => state
+                    .agent
+                    .default_mode
+                    .lock()
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_else(|_| "build".to_string()),
+            }
+        } else {
+            state
+                .agent
+                .default_mode
+                .lock()
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|_| "build".to_string())
+        }
+    } else {
+        state
+            .agent
+            .default_mode
+            .lock()
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_else(|_| "build".to_string())
+    };
+
     let _ = send_message(
         tx,
         UiServerMessage::State {

@@ -1,6 +1,6 @@
 //! Client bridge for Send/!Send boundary crossing.
 //!
-//! This module provides types that allow a `Send + Sync` agent (like `QueryMTAgent`)
+//! This module provides types that allow a `Send + Sync` agent (like `AgentHandle`)
 //! to communicate with a `!Send` client connection (like `AgentSideConnection` from the SDK).
 //!
 //! ## Architecture

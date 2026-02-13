@@ -18,7 +18,7 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 
 fn resolve_base_url_for_provider(state: &ServerState, provider: &str) -> Option<String> {
-    let cfg: &LLMParams = state.agent.provider.initial_config();
+    let cfg: &LLMParams = state.agent.config.provider.initial_config();
     if cfg.provider.as_deref()? != provider {
         return None;
     }
@@ -167,10 +167,10 @@ pub async fn handle_ui_message(
             handle_elicitation_response(state, &elicitation_id, &action, content.as_ref()).await;
         }
         UiClientMessage::SetAgentMode { mode } => {
-            handle_set_agent_mode(state, &mode, tx).await;
+            handle_set_agent_mode(state, conn_id, &mode, tx).await;
         }
         UiClientMessage::GetAgentMode => {
-            handle_get_agent_mode(state, tx).await;
+            handle_get_agent_mode(state, conn_id, tx).await;
         }
     }
 }
@@ -231,7 +231,8 @@ pub async fn handle_load_session(
     };
 
     // 1a. Load session to get cwd and populate session_cwds
-    let cwd_path = if let Ok(Some(session)) = state.agent.provider.get_session(session_id).await
+    let cwd_path = if let Ok(Some(session)) =
+        state.agent.config.provider.get_session(session_id).await
         && let Some(cwd) = session.cwd
     {
         let mut cwds = state.session_cwds.lock().await;
@@ -357,7 +358,7 @@ async fn fetch_all_models(
     state: &ServerState,
     tx: &mpsc::Sender<String>,
 ) -> Result<Vec<ModelEntry>, String> {
-    let registry = state.agent.provider.plugin_registry();
+    let registry = state.agent.config.provider.plugin_registry();
     registry.load_all_plugins().await;
 
     // Build futures for all providers in parallel, skipping those without API keys
@@ -747,15 +748,97 @@ pub async fn handle_elicitation_response(
 }
 
 /// Handle agent mode change request.
-pub async fn handle_set_agent_mode(state: &ServerState, mode: &str, tx: &mpsc::Sender<String>) {
+///
+/// Sets the mode on the active session actor (per-session mode) and updates
+/// the default mode for new sessions.
+pub async fn handle_set_agent_mode(
+    state: &ServerState,
+    conn_id: &str,
+    mode: &str,
+    tx: &mpsc::Sender<String>,
+) {
     match mode.parse::<AgentMode>() {
         Ok(new_mode) => {
-            let previous_mode = state.agent.get_agent_mode();
-            state.agent.set_agent_mode(new_mode);
+            // Get the previous mode from the active session or default
+            let session_id = {
+                let connections = state.connections.lock().await;
+                connections
+                    .get(conn_id)
+                    .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
+            };
 
-            log::info!("Agent mode changed: {} -> {}", previous_mode, new_mode);
+            let previous_mode = if let Some(ref session_id) = session_id {
+                let registry = state.agent.registry.lock().await;
+                if let Some(actor_ref) = registry.get(session_id) {
+                    actor_ref.ask(crate::agent::messages::GetMode).await.ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+            .unwrap_or_else(|| {
+                state
+                    .agent
+                    .default_mode
+                    .lock()
+                    .map(|m| *m)
+                    .unwrap_or(AgentMode::Build)
+            });
 
-            // Send mode confirmation back
+            // Update default mode for new sessions (always succeeds)
+            if let Ok(mut default_mode) = state.agent.default_mode.lock() {
+                *default_mode = new_mode;
+            }
+
+            // Update mode on active session actor via kameo (if exists)
+            let mode_set_on_actor = if let Some(ref session_id) = session_id {
+                let registry = state.agent.registry.lock().await;
+                if let Some(actor_ref) = registry.get(session_id) {
+                    match actor_ref
+                        .tell(crate::agent::messages::SetMode { mode: new_mode })
+                        .await
+                    {
+                        Ok(_) => {
+                            log::info!(
+                                "Agent mode changed on session {}: {} -> {}",
+                                session_id,
+                                previous_mode,
+                                new_mode
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to set mode on session {}: {}. Mode will apply to next session.",
+                                session_id,
+                                e
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    log::debug!(
+                        "No active session actor for {}. Mode will apply to next session.",
+                        session_id
+                    );
+                    false
+                }
+            } else {
+                log::debug!("No active session. Mode will apply to next session.");
+                false
+            };
+
+            // Always send confirmation - the mode is at least set for next session
+            // Even if there's no current session actor, this is the intended behavior
+            if !mode_set_on_actor {
+                log::info!(
+                    "Default agent mode changed: {} -> {} (will apply to next session)",
+                    previous_mode,
+                    new_mode
+                );
+            }
+
             let _ = send_message(
                 tx,
                 UiServerMessage::AgentMode {
@@ -771,8 +854,47 @@ pub async fn handle_set_agent_mode(state: &ServerState, mode: &str, tx: &mpsc::S
 }
 
 /// Handle get agent mode request.
-pub async fn handle_get_agent_mode(state: &ServerState, tx: &mpsc::Sender<String>) {
-    let mode = state.agent.get_agent_mode();
+///
+/// Reads mode from the active session actor if available, otherwise from the
+/// default mode.
+pub async fn handle_get_agent_mode(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<String>) {
+    // Try to get mode from active session actor
+    let session_id = {
+        let connections = state.connections.lock().await;
+        connections
+            .get(conn_id)
+            .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
+    };
+
+    let mode = if let Some(session_id) = session_id {
+        let registry = state.agent.registry.lock().await;
+        if let Some(actor_ref) = registry.get(&session_id) {
+            match actor_ref.ask(crate::agent::messages::GetMode).await {
+                Ok(m) => m,
+                Err(_) => state
+                    .agent
+                    .default_mode
+                    .lock()
+                    .map(|m| *m)
+                    .unwrap_or(AgentMode::Build),
+            }
+        } else {
+            state
+                .agent
+                .default_mode
+                .lock()
+                .map(|m| *m)
+                .unwrap_or(AgentMode::Build)
+        }
+    } else {
+        state
+            .agent
+            .default_mode
+            .lock()
+            .map(|m| *m)
+            .unwrap_or(AgentMode::Build)
+    };
+
     let _ = send_message(
         tx,
         UiServerMessage::AgentMode {
