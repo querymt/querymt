@@ -123,7 +123,7 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
                 {displayEvents.map((event) => (
                   <div
                     key={event.id}
-                    className="rounded-lg border border-cyber-orange/20 bg-cyber-surface/50 px-3 py-2 text-sm text-gray-100 shadow-[0_0_12px_rgba(255,107,53,0.15)]"
+                    className="rounded-lg border border-cyber-orange/20 bg-cyber-surface/50 px-3 py-2 text-sm text-gray-100 shadow-[0_0_12px_rgba(var(--cyber-orange-rgb),0.15)]"
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div className="font-mono text-[11px] uppercase tracking-wider text-cyber-orange">

@@ -18,7 +18,7 @@ interface MentionInputProps {
 // Cyberpunk theme styles for MentionsInput
 const mentionsInputStyle: MentionsInputStyle = {
   control: {
-    backgroundColor: 'rgb(20, 27, 61)',
+    backgroundColor: 'rgb(var(--cyber-surface-rgb))',
     fontSize: 16,
     fontWeight: 'normal',
     width: '100%',
@@ -42,7 +42,7 @@ const mentionsInputStyle: MentionsInputStyle = {
       border: 'none',
       borderRadius: '0',
       backgroundColor: 'transparent',
-      color: 'white',
+      color: 'rgb(var(--ui-text-primary-rgb))',
       minHeight: '48px',
       outline: 'none',
     },
@@ -66,7 +66,7 @@ const mentionsInputStyle: MentionsInputStyle = {
       border: 'none',
       borderRadius: '0',
       backgroundColor: 'transparent',
-      color: 'white',
+      color: 'rgb(var(--ui-text-primary-rgb))',
       minHeight: '48px',
       outline: 'none',
       resize: 'none',
@@ -78,13 +78,13 @@ const mentionsInputStyle: MentionsInputStyle = {
   },
   suggestions: {
     list: {
-      backgroundColor: '#0a0e27',  // cyber-bg (was cyber-surface)
-      border: '1px solid rgba(0, 255, 249, 0.3)',  // 1px, 30% opacity (was 2px, 100%)
+      backgroundColor: 'rgb(var(--cyber-bg-rgb))',
+      border: '1px solid rgba(var(--cyber-cyan-rgb), 0.3)',
       borderRadius: '12px',  // rounded-xl (was 8px)
       fontSize: 12,  // text-xs ~12px (was 14)
       maxHeight: '240px',  // match ModelPicker (was 200px)
       overflow: 'auto',
-      boxShadow: '0 8px 30px rgba(0, 0, 0, 0.4), 0 0 20px rgba(0, 255, 249, 0.15)',  // layered shadow like ModelPicker
+      boxShadow: '0 8px 30px rgba(0, 0, 0, 0.4), 0 0 20px rgba(var(--cyber-cyan-rgb), 0.15)',
       zIndex: 9999,
       fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif",
       padding: '4px',  // inner padding like cmdk px-1 py-1
@@ -102,12 +102,12 @@ const mentionsInputStyle: MentionsInputStyle = {
       backgroundColor: 'transparent',  // transparent default (was semi-transparent)
       transition: 'all 0.15s ease',
       margin: '1px 0',  // small gap between items
-      color: '#d1d5db',  // text-gray-300
+      color: 'rgb(var(--ui-text-primary-rgb))',
       fontSize: '12px',  // text-xs
       '&focused': {
-        backgroundColor: 'rgba(0, 255, 249, 0.2)',  // data-[selected=true]:bg-cyber-cyan/20
-        color: '#00fff9',  // text-cyber-cyan
-        border: '1px solid rgba(0, 255, 249, 0.4)',  // border-cyber-cyan/40
+        backgroundColor: 'rgba(var(--cyber-cyan-rgb), 0.2)',
+        color: 'rgb(var(--cyber-cyan-rgb))',
+        border: '1px solid rgba(var(--cyber-cyan-rgb), 0.4)',
         boxShadow: 'none',  // remove inset shadow
       },
     },
@@ -138,10 +138,10 @@ const mentionsInputStyle: MentionsInputStyle = {
 // - borderRadius (rounds the background)
 // - boxShadow (creates visual border without affecting layout)
 const mentionStyle = {
-  backgroundColor: 'rgba(0, 255, 249, 0.15)',
+  backgroundColor: 'rgba(var(--cyber-cyan-rgb), 0.15)',
   borderRadius: '4px',
   // Use inset box-shadow for a visual border without affecting text layout
-  boxShadow: 'inset 0 0 0 1px rgba(0, 255, 249, 0.4)',
+  boxShadow: 'inset 0 0 0 1px rgba(var(--cyber-cyan-rgb), 0.4)',
 };
 
 export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
@@ -422,9 +422,9 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
           padding: '16px 8px',
           fontSize: '12px',
         }}>
-          <Loader className="w-3.5 h-3.5 animate-spin" style={{ color: '#6b7280' }} />
+          <Loader className="w-3.5 h-3.5 animate-spin" style={{ color: 'rgb(var(--ui-text-muted-rgb))' }} />
           <span style={{
-            color: '#6b7280',
+            color: 'rgb(var(--ui-text-muted-rgb))',
           }}>
             {suggestion.display}
           </span>
@@ -437,14 +437,14 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
     return (
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%' }}>
         {isDir ? (
-          <Folder className="w-3.5 h-3.5 flex-shrink-0" style={{ color: focused ? '#00fff9' : '#9ca3af' }} />
+          <Folder className="w-3.5 h-3.5 flex-shrink-0" style={{ color: focused ? 'rgb(var(--cyber-cyan-rgb))' : 'rgb(var(--ui-text-secondary-rgb))' }} />
         ) : (
-          <File className="w-3.5 h-3.5 flex-shrink-0" style={{ color: focused ? '#00fff9' : '#9ca3af' }} />
+          <File className="w-3.5 h-3.5 flex-shrink-0" style={{ color: focused ? 'rgb(var(--cyber-cyan-rgb))' : 'rgb(var(--ui-text-secondary-rgb))' }} />
         )}
         <span style={{
           fontFamily: "'Monaco', 'Menlo', 'Ubuntu Mono', monospace",
           fontSize: '12px',
-          color: focused ? '#00fff9' : '#d1d5db',
+          color: focused ? 'rgb(var(--cyber-cyan-rgb))' : 'rgb(var(--ui-text-primary-rgb))',
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
@@ -519,7 +519,7 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
           right: '12px',
           top: '50%',
           transform: 'translateY(-50%)',
-          color: '#00fff9',
+          color: 'rgb(var(--cyber-cyan-rgb))',
         }}>
           <Loader className="w-4 h-4 animate-spin" />
         </div>

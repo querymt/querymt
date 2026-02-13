@@ -12,6 +12,8 @@ import { HighlightedCode } from './HighlightedCode';
 import { isMarkdownFile } from '../utils/languageDetection';
 import { MessageContent } from './MessageContent';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
+import { useUiStore } from '../store/uiStore';
+import { getDiffThemeForDashboard } from '../utils/dashboardThemes';
 
 export interface ToolDetailModalProps {
   event: EventItem & { mergedResult?: EventItem };
@@ -19,6 +21,8 @@ export interface ToolDetailModalProps {
 }
 
 export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
+  const selectedTheme = useUiStore((state) => state.selectedTheme);
+  const diffTheme = getDiffThemeForDashboard(selectedTheme);
   const toolKind = event.toolCall?.kind;
   const toolName = inferToolName(event);
   const rawInput = parseJsonMaybe(event.toolCall?.raw_input) ?? event.toolCall?.raw_input;
@@ -46,7 +50,7 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
   return (
     <Dialog.Root open onOpenChange={(open) => { if (!open) onClose(); }}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/80 animate-fade-in" />
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-cyber-bg/80 animate-fade-in" />
         <Dialog.Content
           className="
             fixed z-50 top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2
@@ -118,7 +122,7 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
                 copied={copiedSection === 'input'}
               >
                 {(isEdit || isPatch) ? (
-                  <DiffView toolKind={toolKind} rawInput={rawInput} />
+                  <DiffView toolKind={toolKind} rawInput={rawInput} diffTheme={diffTheme} />
                 ) : (
                   <JsonView data={rawInput} />
                 )}
@@ -221,7 +225,15 @@ function JsonView({ data }: { data: unknown }) {
 }
 
 // Diff viewer for edit/patch tools
-function DiffView({ toolKind, rawInput }: { toolKind?: string; rawInput: unknown }) {
+function DiffView({
+  toolKind,
+  rawInput,
+  diffTheme,
+}: {
+  toolKind?: string;
+  rawInput: unknown;
+  diffTheme: string;
+}) {
   const input = rawInput as Record<string, unknown>;
   
   // Handle write tool - show as diff with empty left side
@@ -251,7 +263,7 @@ function DiffView({ toolKind, rawInput }: { toolKind?: string; rawInput: unknown
             <PatchDiff
               patch={patch}
               options={{
-                theme: 'pierre-dark',
+                theme: diffTheme,
                 themeType: 'dark',
                 diffStyle: 'split',
                 diffIndicators: 'bars',
@@ -278,7 +290,7 @@ function DiffView({ toolKind, rawInput }: { toolKind?: string; rawInput: unknown
           <PatchDiff
             patch={patch}
             options={{
-              theme: 'pierre-dark',
+              theme: diffTheme,
               themeType: 'dark',
               diffStyle: 'split',
               diffIndicators: 'bars',
@@ -302,7 +314,7 @@ function DiffView({ toolKind, rawInput }: { toolKind?: string; rawInput: unknown
         <PatchDiff
           patch={patchValue}
           options={{
-            theme: 'github-dark',
+            theme: diffTheme,
             themeType: 'dark',
             diffStyle: 'unified',
             diffIndicators: 'bars',
@@ -331,7 +343,7 @@ function ShellResultView({ event }: { event: EventItem }) {
   return (
     <div className="font-mono text-xs">
       {/* Header with exit code */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-cyber-border/50 bg-black/30">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-cyber-border/50 bg-cyber-bg/50">
         <span className="text-gray-500 uppercase tracking-wide text-[10px]">Terminal Output</span>
         {exitCode !== undefined && (
           <span className={`text-[10px] ${exitCode === 0 ? 'text-cyber-lime' : 'text-cyber-orange'}`}>
@@ -340,7 +352,7 @@ function ShellResultView({ event }: { event: EventItem }) {
         )}
       </div>
       
-      <div className="p-4 space-y-3 max-h-96 overflow-auto bg-black/40">
+      <div className="p-4 space-y-3 max-h-96 overflow-auto bg-cyber-bg/60">
         {stdout && (
           <div>
             <div className="text-[10px] uppercase tracking-wide text-gray-500 mb-1">stdout</div>
@@ -377,7 +389,7 @@ function FileReadView({ event }: { event: EventItem }) {
   return (
     <div className="text-xs">
       {/* Header with file info */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-cyber-border/50 bg-black/30">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-cyber-border/50 bg-cyber-bg/50">
         <span className="text-cyber-cyan truncate max-w-lg font-mono">
           {filePath || 'File Content'}
         </span>
@@ -389,7 +401,7 @@ function FileReadView({ event }: { event: EventItem }) {
       </div>
       
       {/* Content with syntax highlighting */}
-      <div className="p-4 bg-black">
+      <div className="p-4 bg-cyber-bg">
         {isMarkdown ? (
           <div className="prose prose-invert prose-sm max-w-none">
             <MessageContent content={content} />

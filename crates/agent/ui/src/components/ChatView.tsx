@@ -390,7 +390,7 @@ export function ChatView() {
               className={`text-xs uppercase tracking-wider px-3 py-1.5 rounded-full border transition-colors ${
                 activeTimelineView === 'chat'
                   ? 'border-cyber-cyan text-cyber-cyan bg-cyber-cyan/10'
-                  : 'border-cyber-border text-gray-400 hover:border-cyber-cyan/60 hover:text-gray-200'
+                  : 'border-cyber-border/60 text-gray-400 hover:border-cyber-cyan/40 hover:text-gray-200'
               }`}
             >
               Chat
@@ -411,7 +411,7 @@ export function ChatView() {
               className={`text-xs uppercase tracking-wider px-3 py-1.5 rounded-full border transition-colors ${
                 activeTimelineView === 'delegations'
                   ? 'border-cyber-purple text-cyber-purple bg-cyber-purple/10'
-                  : 'border-cyber-border text-gray-400 hover:border-cyber-purple/60 hover:text-gray-200'
+                  : 'border-cyber-border/60 text-gray-400 hover:border-cyber-purple/40 hover:text-gray-200'
               }`}
             >
               Delegations
@@ -543,7 +543,7 @@ export function ChatView() {
                   behavior: 'smooth',
                 });
               }}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs text-gray-200 bg-black/70 border border-cyber-border/70 shadow-[0_0_18px_rgba(0,255,249,0.12)] hover:border-cyber-cyan/60 hover:text-cyber-cyan transition-all animate-fade-in-up"
+              className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs text-gray-200 bg-cyber-bg/80 border border-cyber-border/70 shadow-[0_0_18px_rgba(var(--cyber-cyan-rgb),0.12)] hover:border-cyber-cyan/60 hover:text-cyber-cyan transition-all animate-fade-in-up"
             >
               <span>Scroll to latest</span>
               <ChevronDown className="w-3.5 h-3.5" />
@@ -594,7 +594,7 @@ export function ChatView() {
       )}
 
       {/* Input Area */}
-      <div className="px-6 py-4 bg-cyber-surface border-t border-cyber-border shadow-[0_-4px_20px_rgba(0,255,249,0.05)]">
+      <div className="px-6 py-4 bg-cyber-surface border-t border-cyber-border shadow-[0_-4px_20px_rgba(var(--cyber-cyan-rgb),0.05)]">
         <div 
           className="flex gap-3 relative items-end p-0.5 rounded-lg transition-colors duration-200"
           style={{ 
@@ -626,7 +626,7 @@ export function ChatView() {
               className="
                 px-6 py-3 rounded-lg font-medium transition-all duration-200
                 bg-cyber-orange/10 border-2 border-cyber-orange text-cyber-orange
-                hover:bg-cyber-orange/20 hover:shadow-[0_0_15px_rgba(255,165,0,0.3)]
+                hover:bg-cyber-orange/20 hover:shadow-[0_0_15px_rgba(var(--cyber-orange-rgb),0.3)]
                 flex items-center gap-2 overflow-visible self-end min-h-[48px]
               "
               title="Stop generation (Esc Esc)"

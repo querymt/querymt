@@ -1,7 +1,7 @@
 import { CheckCircle, Clock, XCircle, Copy, Check, Cpu, Wrench, DollarSign } from 'lucide-react';
 import { DelegationGroupInfo, Turn, UiAgentInfo, LlmConfigDetails } from '../types';
 import { TurnCard } from './TurnCard';
-import { getAgentColor } from '../utils/agentColors';
+import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
 import { calculateDelegationStats } from '../utils/statsCalculator';
@@ -36,7 +36,7 @@ export function DelegationDetailPanel({
 
   const agentId = delegation.targetAgentId ?? delegation.agentId;
   const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
-  const agentColor = agentId ? getAgentColor(agentId) : '#b026ff';
+  const agentColor = agentId ? getAgentColor(agentId) : 'rgb(var(--cyber-purple-rgb))';
   const durationLabel = formatDurationFromTimestamps(delegation.startTime, delegation.endTime);
   const stats = calculateDelegationStats(delegation);
   const objective = delegation.objective ??
@@ -50,8 +50,8 @@ export function DelegationDetailPanel({
             className="text-xs font-semibold uppercase tracking-wide px-2 py-0.5 rounded"
             style={{
               color: agentColor,
-              backgroundColor: `${agentColor}20`,
-              border: `1px solid ${agentColor}40`,
+              backgroundColor: colorWithAlpha(agentColor, 0.12),
+              border: `1px solid ${colorWithAlpha(agentColor, 0.24)}`,
             }}
           >
             {agentName}
@@ -90,7 +90,7 @@ export function DelegationDetailPanel({
           {/* Context usage */}
           <span className={`flex items-center gap-1 ${
             (stats.contextPercent ?? 0) >= 80 ? 'text-cyber-orange' :
-            (stats.contextPercent ?? 0) >= 70 ? 'text-yellow-500' :
+            (stats.contextPercent ?? 0) >= 70 ? 'text-cyber-cyan' :
             'text-gray-400'
           }`}>
             <Cpu className="w-3 h-3" />

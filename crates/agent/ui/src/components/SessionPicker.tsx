@@ -122,8 +122,8 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
           disabled={disabled}
           className={`w-full text-left px-4 py-3 bg-cyber-surface/40 hover:bg-cyber-surface border ${
             isChild ? 'border-l-2 border-l-cyber-cyan/60' : ''
-          } border-cyber-border/50 hover:border-cyber-cyan/40 rounded-lg transition-all duration-200 group session-card disabled:opacity-50 disabled:cursor-not-allowed overflow-visible ${indentClass} ${
-            isActive ? 'ring-2 ring-cyber-cyan/50 bg-cyber-surface/60' : ''
+          } border-cyber-border/35 hover:border-cyber-cyan/30 rounded-lg transition-all duration-200 group session-card disabled:opacity-50 disabled:cursor-not-allowed overflow-visible ${indentClass} ${
+            isActive ? 'ring-2 ring-cyber-cyan/35 bg-cyber-surface/60' : ''
           }`}
           style={{
             animation: `session-card-entrance 0.3s ease-out ${sessionIndex * 0.05}s both`,
@@ -149,13 +149,13 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
             {isThinking && (
               <span className="flex items-center gap-1">
                 <span className="w-2 h-2 rounded-full bg-cyber-purple animate-pulse" />
-                <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded border border-purple-500/30">
+                <span className="text-[10px] px-1.5 py-0.5 bg-cyber-purple/20 text-cyber-purple rounded border border-cyber-purple/30">
                   thinking
                 </span>
               </span>
             )}
             {isDelegation && (
-              <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded border border-purple-500/30">
+              <span className="text-[10px] px-1.5 py-0.5 bg-cyber-purple/20 text-cyber-purple rounded border border-cyber-purple/30">
                 delegated
               </span>
             )}

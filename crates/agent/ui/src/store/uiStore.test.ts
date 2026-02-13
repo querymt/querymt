@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { useUiStore } from './uiStore';
 import { EventRow } from '../types';
+import { DEFAULT_DASHBOARD_THEME_ID } from '../utils/dashboardThemes';
 
 describe('UiStore', () => {
   beforeEach(() => {
@@ -25,6 +26,7 @@ describe('UiStore', () => {
       delegationDrawerOpen: false,
       sessionViewCache: new Map(),
       modeModelPreferences: {},
+      selectedTheme: DEFAULT_DASHBOARD_THEME_ID,
     });
   });
 
@@ -394,6 +396,7 @@ describe('UiStore', () => {
       expect(state.delegationDrawerOpen).toBe(false);
       expect(state.sessionViewCache).toBeInstanceOf(Map);
       expect(state.sessionViewCache.size).toBe(0);
+      expect(state.selectedTheme).toBe(DEFAULT_DASHBOARD_THEME_ID);
     });
   });
 
@@ -438,6 +441,61 @@ describe('UiStore', () => {
       const cached = useUiStore.getState().sessionViewCache.get('session-A');
       expect(cached?.activeDelegationId).toBe('del-updated');
       expect(cached?.delegationsPanelCollapsed).toBe(true);
+    });
+  });
+
+  describe('selectedTheme', () => {
+    it('should update selectedTheme', () => {
+      const store = useUiStore.getState();
+
+      store.setSelectedTheme('base16-gruvbox-dark');
+
+      const state = useUiStore.getState();
+      expect(state.selectedTheme).toBe('base16-gruvbox-dark');
+    });
+
+    it('should normalize legacy selectedTheme ids', () => {
+      const store = useUiStore.getState();
+
+      store.setSelectedTheme('kanagawa-wave');
+
+      const state = useUiStore.getState();
+      expect(state.selectedTheme).toBe('base16-kanagawa');
+    });
+
+    it('should persist selectedTheme to localStorage', () => {
+      const store = useUiStore.getState();
+
+      store.setSelectedTheme('base16-tomorrow-night');
+
+      expect(localStorage.getItem('dashboardTheme')).toBe('base16-tomorrow-night');
+    });
+
+    it('should hydrate selectedTheme from localStorage', () => {
+      localStorage.setItem('dashboardTheme', 'base16-atelier-forest');
+
+      const store = useUiStore.getState();
+      store.loadPersistedState();
+
+      expect(useUiStore.getState().selectedTheme).toBe('base16-atelier-forest');
+    });
+
+    it('should fall back to default theme for invalid localStorage value', () => {
+      localStorage.setItem('dashboardTheme', 'not-a-real-theme');
+
+      const store = useUiStore.getState();
+      store.loadPersistedState();
+
+      expect(useUiStore.getState().selectedTheme).toBe(DEFAULT_DASHBOARD_THEME_ID);
+    });
+
+    it('should normalize legacy localStorage theme ids', () => {
+      localStorage.setItem('dashboardTheme', 'kanagawa-wave');
+
+      const store = useUiStore.getState();
+      store.loadPersistedState();
+
+      expect(useUiStore.getState().selectedTheme).toBe('base16-kanagawa');
     });
   });
 
@@ -534,12 +592,14 @@ describe('UiStore', () => {
           plan: { provider: 'openai', model: 'gpt-4-turbo' },
         };
         localStorage.setItem('modeModelPreferences', JSON.stringify(preferences));
+        localStorage.setItem('dashboardTheme', 'base16-tomorrow-night');
         
         const store = useUiStore.getState();
         store.loadPersistedState();
         
         const state = useUiStore.getState();
         expect(state.modeModelPreferences).toEqual(preferences);
+        expect(state.selectedTheme).toBe('base16-tomorrow-night');
       });
       
       it('should handle missing modeModelPreferences in localStorage', () => {
@@ -549,6 +609,7 @@ describe('UiStore', () => {
         
         const state = useUiStore.getState();
         expect(state.modeModelPreferences).toEqual({});
+        expect(state.selectedTheme).toBe(DEFAULT_DASHBOARD_THEME_ID);
       });
       
       it('should handle invalid JSON in localStorage', () => {
@@ -560,8 +621,9 @@ describe('UiStore', () => {
         expect(() => store.loadPersistedState()).toThrow();
       });
       
-      it('should load both todoRailCollapsed and modeModelPreferences', () => {
+      it('should load todo rail, model preferences, and theme', () => {
         localStorage.setItem('todoRailCollapsed', 'true');
+        localStorage.setItem('dashboardTheme', 'base16-default-dark');
         localStorage.setItem('modeModelPreferences', JSON.stringify({
           build: { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' },
         }));
@@ -571,6 +633,7 @@ describe('UiStore', () => {
         
         const state = useUiStore.getState();
         expect(state.todoRailCollapsed).toBe(true);
+        expect(state.selectedTheme).toBe('base16-default-dark');
         expect(state.modeModelPreferences).toEqual({
           build: { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' },
         });

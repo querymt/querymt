@@ -1,16 +1,36 @@
 /**
  * Mode color utility - generates consistent colors for agent modes
  * 
- * Known modes (build, plan, review) have predefined neon colors.
+ * Known modes (build, plan, review) use theme-derived accents when available.
  * Unknown modes get deterministic hash-based colors in the neon palette.
  */
 
-// Known modes with predefined colors (RGB and hex for CSS usage)
-const KNOWN_MODES: Record<string, { rgb: string; hex: string }> = {
+import { getDashboardTheme, type DashboardThemeId } from './dashboardThemes';
+
+// Known modes with fallback colors (RGB and hex for CSS usage)
+const KNOWN_MODE_FALLBACKS: Record<string, { rgb: string; hex: string }> = {
   build: { rgb: '57, 255, 20', hex: '#39ff14' },      // cyber-lime
   plan: { rgb: '255, 107, 53', hex: '#ff6b35' },      // cyber-orange
   review: { rgb: '176, 38, 255', hex: '#b026ff' },    // cyber-purple
 };
+
+// Known modes mapped to base16 palette tokens for theme-aware accents
+const KNOWN_MODE_THEME_TOKENS: Record<string, 'base0B' | 'base09' | 'base0D'> = {
+  build: 'base0B',
+  plan: 'base09',
+  review: 'base0D',
+};
+
+function hexToRgbTuple(hex: string): string {
+  const normalized = hex.trim().replace('#', '');
+  if (normalized.length !== 6) {
+    return '255, 255, 255';
+  }
+  const r = parseInt(normalized.slice(0, 2), 16);
+  const g = parseInt(normalized.slice(2, 4), 16);
+  const b = parseInt(normalized.slice(4, 6), 16);
+  return `${r}, ${g}, ${b}`;
+}
 
 /**
  * Simple string hash function
@@ -89,9 +109,37 @@ function hashToRgb(mode: string): { rgb: string; hex: string } {
  * Get colors (RGB and hex) for a given mode
  * Returns known colors for build/plan/review, generates hash-based color for unknown modes
  */
-export function getModeColors(mode: string): { rgb: string; hex: string } {
+export function getModeColors(
+  mode: string,
+  themeId?: DashboardThemeId,
+): { rgb: string; hex: string; cssColor: string } {
   const normalized = mode.toLowerCase().trim();
-  return KNOWN_MODES[normalized] ?? hashToRgb(mode);
+
+  if (KNOWN_MODE_FALLBACKS[normalized]) {
+    if (themeId) {
+      const theme = getDashboardTheme(themeId);
+      const token = KNOWN_MODE_THEME_TOKENS[normalized];
+      const hex = theme.palette[token];
+      const rgb = hexToRgbTuple(hex);
+      return {
+        rgb,
+        hex,
+        cssColor: `rgb(${rgb})`,
+      };
+    }
+
+    const fallback = KNOWN_MODE_FALLBACKS[normalized];
+    return {
+      ...fallback,
+      cssColor: fallback.hex,
+    };
+  }
+
+  const generated = hashToRgb(mode);
+  return {
+    ...generated,
+    cssColor: generated.hex,
+  };
 }
 
 /**
@@ -106,5 +154,5 @@ export function getModeDisplayName(mode: string): string {
  * Get all known mode names
  */
 export function getKnownModes(): string[] {
-  return Object.keys(KNOWN_MODES);
+  return Object.keys(KNOWN_MODE_FALLBACKS);
 }

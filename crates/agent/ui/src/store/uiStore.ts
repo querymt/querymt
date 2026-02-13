@@ -1,6 +1,11 @@
 import { create } from 'zustand';
 import type { RefObject } from 'react';
 import { EventRow, RateLimitState } from '../types';
+import {
+  DEFAULT_DASHBOARD_THEME_ID,
+  normalizeDashboardThemeId,
+  type DashboardThemeId,
+} from '../utils/dashboardThemes';
 
 /**
  * UI State Store
@@ -38,6 +43,10 @@ export interface UiState {
   // Agent mode -> model preferences (persisted to localStorage)
   modeModelPreferences: Record<string, { provider: string; model: string }>;
   setModeModelPreference: (mode: string, provider: string, model: string) => void;
+
+  // Dashboard theme (persisted to localStorage)
+  selectedTheme: DashboardThemeId;
+  setSelectedTheme: (themeId: DashboardThemeId) => void;
   
   // Session/navigation state
   sessionCopied: boolean;
@@ -125,6 +134,7 @@ export const useUiStore = create<UiState>((set, get) => ({
   delegationDrawerOpen: false,
   sessionViewCache: new Map(),
   modeModelPreferences: {},
+  selectedTheme: DEFAULT_DASHBOARD_THEME_ID,
   rateLimitBySession: new Map(),
   sessionTimerCache: new Map(),
   
@@ -153,6 +163,12 @@ export const useUiStore = create<UiState>((set, get) => ({
       localStorage.setItem('modeModelPreferences', JSON.stringify(updated));
       return { modeModelPreferences: updated };
     });
+  },
+
+  setSelectedTheme: (themeId) => {
+    const normalizedThemeId = normalizeDashboardThemeId(themeId) ?? DEFAULT_DASHBOARD_THEME_ID;
+    set({ selectedTheme: normalizedThemeId });
+    localStorage.setItem('dashboardTheme', normalizedThemeId);
   },
   
   setSessionCopied: (copied) => set({ sessionCopied: copied }),
@@ -273,6 +289,10 @@ export const useUiStore = create<UiState>((set, get) => ({
     const todoRailCollapsed = localStorage.getItem('todoRailCollapsed') === 'true';
     const modeModelPreferencesRaw = localStorage.getItem('modeModelPreferences');
     const modeModelPreferences = modeModelPreferencesRaw ? JSON.parse(modeModelPreferencesRaw) : {};
-    set({ todoRailCollapsed, modeModelPreferences });
+    const selectedThemeRaw = localStorage.getItem('dashboardTheme');
+    const selectedTheme = selectedThemeRaw
+      ? (normalizeDashboardThemeId(selectedThemeRaw) ?? DEFAULT_DASHBOARD_THEME_ID)
+      : DEFAULT_DASHBOARD_THEME_ID;
+    set({ todoRailCollapsed, modeModelPreferences, selectedTheme });
   },
 }));

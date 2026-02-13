@@ -78,14 +78,14 @@ export function StatsDrawer({
     <>
       {/* Backdrop */}
       <div 
-        className="fixed inset-0 bg-black/20 z-30 animate-fade-in"
+        className="fixed inset-0 bg-cyber-bg/40 z-30 animate-fade-in"
         onClick={() => onOpenChange(false)}
       />
       
       {/* Drawer */}
       <div className="fixed left-0 right-0 top-[72px] z-40 animate-slide-down">
         <div className="max-w-6xl mx-auto px-6">
-          <div className="bg-cyber-surface/95 backdrop-blur-sm border-2 border-cyber-cyan/30 rounded-b-xl shadow-[0_8px_40px_rgba(0,255,249,0.2)]">
+          <div className="bg-cyber-surface/95 backdrop-blur-sm border-2 border-cyber-cyan/30 rounded-b-xl shadow-[0_8px_40px_rgba(var(--cyber-cyan-rgb),0.2)]">
             {/* Header */}
             <div className="flex items-center justify-between px-6 py-3 border-b border-cyber-border/40">
               <div className="flex items-center gap-3">

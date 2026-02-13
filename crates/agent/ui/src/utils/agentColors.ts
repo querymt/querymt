@@ -1,15 +1,33 @@
 const AGENT_COLORS = [
-  '#00fff9', // cyan (primary)
-  '#ff00ff', // magenta
-  '#39ff14', // lime
-  '#b026ff', // purple
-  '#ff6b35', // orange
-  '#00d4ff', // sky blue
-  '#ff1493', // deep pink
-  '#7fff00', // chartreuse
+  'rgb(var(--agent-accent-1-rgb))', // primary contrast accent
+  'rgb(var(--agent-accent-2-rgb))', // secondary accent
+  'rgb(var(--agent-accent-3-rgb))', // tertiary accent
+  'rgb(var(--cyber-cyan-rgb))',
+  'rgb(var(--cyber-magenta-rgb))',
+  'rgb(var(--cyber-lime-rgb))',
+  'rgb(var(--cyber-orange-rgb))',
+  'rgb(var(--cyber-purple-rgb))',
 ];
 
 const colorCache = new Map<string, string>();
+
+export function colorWithAlpha(color: string, alpha: number): string {
+  const clampedAlpha = Math.max(0, Math.min(1, alpha));
+
+  if (color.startsWith('#') && color.length === 7) {
+    const r = parseInt(color.slice(1, 3), 16);
+    const g = parseInt(color.slice(3, 5), 16);
+    const b = parseInt(color.slice(5, 7), 16);
+    return `rgba(${r}, ${g}, ${b}, ${clampedAlpha})`;
+  }
+
+  const rgbMatch = color.match(/^rgb\((.+)\)$/i);
+  if (rgbMatch?.[1]) {
+    return `rgba(${rgbMatch[1]}, ${clampedAlpha})`;
+  }
+
+  return color;
+}
 
 export function getAgentColor(agentId: string): string {
   if (colorCache.has(agentId)) {
@@ -32,9 +50,5 @@ export function getAgentColor(agentId: string): string {
 }
 
 export function getAgentColorWithAlpha(agentId: string, alpha: number): string {
-  const hex = getAgentColor(agentId);
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  return colorWithAlpha(getAgentColor(agentId), alpha);
 }

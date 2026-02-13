@@ -6,7 +6,7 @@ import { DelegationGroupInfo, EventRow, UiAgentInfo, LlmConfigDetails } from '..
 import { MessageContent } from './MessageContent';
 import { ToolSummary } from './ToolSummary';
 import { ModelConfigPopover } from './ModelConfigPopover';
-import { getAgentColor } from '../utils/agentColors';
+import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
 import { calculateDelegationStats } from '../utils/statsCalculator';
@@ -76,7 +76,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
 
   const agentId = delegation.targetAgentId ?? delegation.agentId;
   const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
-  const agentColor = agentId ? getAgentColor(agentId) : '#b026ff';
+  const agentColor = agentId ? getAgentColor(agentId) : 'rgb(var(--cyber-purple-rgb))';
   const stats = calculateDelegationStats(delegation);
   const objective = delegation.objective ??
     (delegation.delegateEvent.toolCall?.raw_input as { objective?: string } | undefined)?.objective;
@@ -106,9 +106,9 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
   return (
     <Dialog.Root open onOpenChange={(open) => { if (!open) onClose(); }}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-40 bg-black/50" />
+        <Dialog.Overlay className="fixed inset-0 z-40 bg-cyber-bg/70" />
         <Dialog.Content
-          className="fixed top-0 right-0 z-50 h-full bg-cyber-surface border-l border-cyber-border shadow-[0_0_30px_rgba(0,255,249,0.12)] flex flex-col"
+          className="fixed top-0 right-0 z-50 h-full bg-cyber-surface border-l border-cyber-border shadow-[0_0_30px_rgba(var(--cyber-cyan-rgb),0.12)] flex flex-col"
           style={{ width: isMobile ? '100%' : `${drawerWidth}px` }}
           aria-describedby={undefined}
           onOpenAutoFocus={(e) => e.preventDefault()}
@@ -130,8 +130,8 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                   className="text-xs font-semibold uppercase tracking-wide px-2 py-0.5 rounded"
                   style={{
                     color: agentColor,
-                    backgroundColor: `${agentColor}20`,
-                    border: `1px solid ${agentColor}40`,
+                    backgroundColor: colorWithAlpha(agentColor, 0.12),
+                    border: `1px solid ${colorWithAlpha(agentColor, 0.24)}`,
                   }}
                 >
                   {agentName}
@@ -187,7 +187,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
               <div className="flex items-center gap-3 mt-1.5 text-[10px]">
                 <span className={`flex items-center gap-1 ${
                   (stats.contextPercent ?? 0) >= 80 ? 'text-cyber-orange' :
-                  (stats.contextPercent ?? 0) >= 70 ? 'text-yellow-500' :
+                  (stats.contextPercent ?? 0) >= 70 ? 'text-cyber-cyan' :
                   'text-gray-400'
                 }`}>
                   <Cpu className="w-3 h-3" />

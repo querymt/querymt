@@ -1,6 +1,6 @@
 import { CheckCircle, ChevronRight, Clock, Loader, XCircle, Cpu, Wrench } from 'lucide-react';
 import { DelegationGroupInfo, UiAgentInfo } from '../types';
-import { getAgentColor } from '../utils/agentColors';
+import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
 import { calculateDelegationStats } from '../utils/statsCalculator';
 import { formatTokensAbbrev, formatCost, formatDurationFromTimestamps } from '../utils/formatters';
@@ -16,7 +16,7 @@ interface DelegationSummaryCardProps {
 export function DelegationSummaryCard({ group, agents, onOpen }: DelegationSummaryCardProps) {
   const agentId = group.targetAgentId ?? group.agentId;
   const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
-  const agentColor = agentId ? getAgentColor(agentId) : '#b026ff';
+  const agentColor = agentId ? getAgentColor(agentId) : 'rgb(var(--cyber-purple-rgb))';
   const durationLabel = formatDurationFromTimestamps(group.startTime, group.endTime);
   const stats = calculateDelegationStats(group);
   const objective = group.objective ??
@@ -33,8 +33,8 @@ export function DelegationSummaryCard({ group, agents, onOpen }: DelegationSumma
           className="text-[11px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded"
           style={{
             color: agentColor,
-            backgroundColor: `${agentColor}20`,
-            border: `1px solid ${agentColor}40`,
+            backgroundColor: colorWithAlpha(agentColor, 0.12),
+            border: `1px solid ${colorWithAlpha(agentColor, 0.24)}`,
           }}
         >
           {agentName}
@@ -63,7 +63,7 @@ export function DelegationSummaryCard({ group, agents, onOpen }: DelegationSumma
         {/* Context usage */}
         <span className={`flex items-center gap-1 ${
           (stats.contextPercent ?? 0) >= 80 ? 'text-cyber-orange' :
-          (stats.contextPercent ?? 0) >= 70 ? 'text-yellow-500' :
+          (stats.contextPercent ?? 0) >= 70 ? 'text-cyber-cyan' :
           'text-gray-500'
         }`}>
           <Cpu className="w-3 h-3" />

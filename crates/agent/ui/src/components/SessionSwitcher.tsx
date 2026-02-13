@@ -146,12 +146,14 @@ export function SessionSwitcher({
     <>
       {/* Backdrop */}
       <div 
-        className="fixed inset-0 bg-black/60 backdrop-blur-sm z-40 animate-fade-in"
+        data-testid="session-switcher-backdrop"
+        className="fixed inset-0 bg-cyber-bg/70 backdrop-blur-sm z-40 animate-fade-in"
         onClick={() => onOpenChange(false)}
       />
       
       {/* Command Palette - Wrapper for click-outside handling */}
       <div 
+        data-testid="session-switcher-container"
         className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh] px-4"
         onClick={(e) => {
           // Close on click outside the command palette
@@ -161,7 +163,7 @@ export function SessionSwitcher({
         }}
       >
         <Command
-          className="w-full max-w-2xl bg-cyber-surface border-2 border-cyber-cyan/40 rounded-xl shadow-[0_0_40px_rgba(0,255,249,0.3)] overflow-hidden animate-scale-in"
+          className="w-full max-w-2xl bg-cyber-surface border-2 border-cyber-cyan/40 rounded-xl shadow-[0_0_40px_rgba(var(--cyber-cyan-rgb),0.3)] overflow-hidden animate-scale-in"
           shouldFilter={false} // We handle filtering manually with fuse.js
         >
           {/* Search input */}
@@ -197,7 +199,7 @@ export function SessionSwitcher({
                       key={session.session_id}
                       value={session.session_id}
                       onSelect={() => handleSelectSession(session.session_id)}
-                      className="flex items-start gap-3 px-3 py-2.5 rounded-lg cursor-pointer transition-colors data-[selected=true]:bg-cyber-cyan/20 data-[selected=true]:border data-[selected=true]:border-cyber-cyan/40 hover:bg-cyber-surface/60 group"
+                      className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-cyber-border/20 cursor-pointer transition-colors data-[selected=true]:bg-cyber-cyan/15 data-[selected=true]:border-cyber-cyan/35 hover:bg-cyber-surface/60 hover:border-cyber-border/40 group"
                     >
                       {/* Status indicator */}
                       <div className="flex-shrink-0 pt-1">
@@ -226,12 +228,12 @@ export function SessionSwitcher({
                             </span>
                           )}
                           {isThinking && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded border border-purple-500/30 flex-shrink-0">
+                            <span className="text-[10px] px-1.5 py-0.5 bg-cyber-purple/20 text-cyber-purple rounded border border-cyber-purple/30 flex-shrink-0">
                               thinking
                             </span>
                           )}
                           {session.isDelegation && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded border border-purple-500/30 flex-shrink-0">
+                            <span className="text-[10px] px-1.5 py-0.5 bg-cyber-purple/20 text-cyber-purple rounded border border-cyber-purple/30 flex-shrink-0">
                               delegated
                             </span>
                           )}
@@ -271,7 +273,7 @@ export function SessionSwitcher({
                       key={session.session_id}
                       value={session.session_id}
                       onSelect={() => handleSelectSession(session.session_id)}
-                      className="flex items-start gap-3 px-3 py-2.5 rounded-lg cursor-pointer transition-colors data-[selected=true]:bg-cyber-cyan/20 data-[selected=true]:border data-[selected=true]:border-cyber-cyan/40 hover:bg-cyber-surface/60 group"
+                      className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-cyber-border/20 cursor-pointer transition-colors data-[selected=true]:bg-cyber-cyan/15 data-[selected=true]:border-cyber-cyan/35 hover:bg-cyber-surface/60 hover:border-cyber-border/40 group"
                     >
                       {/* Status indicator */}
                       <div className="flex-shrink-0 pt-1">
@@ -300,12 +302,12 @@ export function SessionSwitcher({
                             </span>
                           )}
                           {isThinking && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded border border-purple-500/30 flex-shrink-0">
+                            <span className="text-[10px] px-1.5 py-0.5 bg-cyber-purple/20 text-cyber-purple rounded border border-cyber-purple/30 flex-shrink-0">
                               thinking
                             </span>
                           )}
                           {session.isDelegation && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded border border-purple-500/30 flex-shrink-0">
+                            <span className="text-[10px] px-1.5 py-0.5 bg-cyber-purple/20 text-cyber-purple rounded border border-cyber-purple/30 flex-shrink-0">
                               delegated
                             </span>
                           )}
@@ -340,7 +342,7 @@ export function SessionSwitcher({
               <Command.Item
                 onSelect={handleNewSession}
                 disabled={!connected}
-                className="flex items-center gap-3 px-3 py-2.5 rounded-lg cursor-pointer transition-colors data-[selected=true]:bg-cyber-cyan/20 data-[selected=true]:border data-[selected=true]:border-cyber-cyan/40 hover:bg-cyber-surface/60 data-[disabled=true]:opacity-50 data-[disabled=true]:cursor-not-allowed"
+                className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-cyber-border/20 cursor-pointer transition-colors data-[selected=true]:bg-cyber-cyan/15 data-[selected=true]:border-cyber-cyan/35 hover:bg-cyber-surface/60 hover:border-cyber-border/40 data-[disabled=true]:opacity-50 data-[disabled=true]:cursor-not-allowed"
               >
                 <Plus className="w-4 h-4 text-cyber-cyan flex-shrink-0" />
                 <span className="flex-1 text-sm text-gray-200">New Session</span>

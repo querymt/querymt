@@ -83,12 +83,12 @@ export function HeaderStatsBar({
       <div className="flex items-center gap-1.5">
         <Cpu className={`w-3.5 h-3.5 ${
           contextPercent >= 80 ? 'text-cyber-orange' : 
-          contextPercent >= 70 ? 'text-yellow-500' : 
+          contextPercent >= 70 ? 'text-cyber-cyan' : 
           'text-gray-500'
         }`} />
         <span className={`${
           contextPercent >= 80 ? 'text-cyber-orange' : 
-          contextPercent >= 70 ? 'text-yellow-500' : 
+          contextPercent >= 70 ? 'text-cyber-cyan' : 
           'text-gray-300'
         }`}>
           {contextDisplay}
@@ -109,12 +109,12 @@ export function HeaderStatsBar({
       <div className="flex items-center gap-1.5">
         <DollarSign className={`w-3.5 h-3.5 ${
           costPercent > 90 ? 'text-cyber-orange' : 
-          costPercent > 70 ? 'text-yellow-500' : 
+          costPercent > 70 ? 'text-cyber-cyan' : 
           'text-gray-500'
         }`} />
         <span className={`${
           costPercent > 90 ? 'text-cyber-orange' : 
-          costPercent > 70 ? 'text-yellow-500' : 
+          costPercent > 70 ? 'text-cyber-cyan' : 
           'text-cyber-cyan'
         }`}>
           {costDisplay}

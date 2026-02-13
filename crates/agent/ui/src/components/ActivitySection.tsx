@@ -51,7 +51,7 @@ export function ActivitySection({
       {/* Header */}
       <button
         onClick={() => setIsExpanded(!isExpanded)}
-        className="flex items-center gap-2 w-full text-left px-3 py-2 rounded-md bg-cyber-surface/30 hover:bg-cyber-surface/50 border border-cyber-border/30 transition-colors"
+        className="flex items-center gap-2 w-full text-left px-3 py-2 rounded-md bg-cyber-surface/30 hover:bg-cyber-surface/50 border border-cyber-border/20 transition-colors"
       >
         <span className="text-gray-400 flex-shrink-0">
           {isExpanded ? (

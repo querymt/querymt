@@ -7,6 +7,8 @@ import { Loader, CheckCircle, XCircle, ChevronRight, ChevronDown, Eye } from 'lu
 import { PatchDiff } from '@pierre/diffs/react';
 import { generateToolSummary } from '../utils/toolSummary';
 import { EventItem } from '../types';
+import { useUiStore } from '../store/uiStore';
+import { getDiffThemeForDashboard } from '../utils/dashboardThemes';
 
 export interface ToolSummaryProps {
   event: EventItem & { mergedResult?: EventItem };
@@ -16,6 +18,8 @@ export interface ToolSummaryProps {
 }
 
 export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegate, onDelegateClick }: ToolSummaryProps) {
+  const selectedTheme = useUiStore((state) => state.selectedTheme);
+  const diffTheme = getDiffThemeForDashboard(selectedTheme);
   const toolKind = event.toolCall?.kind;
   const toolName = inferToolName(event);
   const rawInput = parseJsonMaybe(event.toolCall?.raw_input) ?? event.toolCall?.raw_input;
@@ -69,7 +73,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
   };
 
   return (
-    <div className="rounded-md border border-cyber-border/50 overflow-hidden">
+    <div className="rounded-md border border-cyber-border/35 overflow-hidden">
       {/* Summary row */}
       <div
         className={`
@@ -117,7 +121,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
 
         {/* Diff stats badge */}
         {summary.diffStats && (summary.diffStats.additions > 0 || summary.diffStats.deletions > 0) && (
-          <span className="flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyber-bg/80 border border-cyber-border/50">
+          <span className="flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyber-bg/80 border border-cyber-border/35">
             <span className="text-cyber-lime">+{summary.diffStats.additions}</span>
             <span className="text-gray-500 mx-0.5">/</span>
             <span className="text-cyber-magenta">-{summary.diffStats.deletions}</span>
@@ -126,7 +130,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
 
         {/* Shell exit code badge (inline) */}
         {isShell && previewData?.type === 'shell' && previewData.exitCode !== undefined && (
-          <span className={`flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyber-bg/80 border border-cyber-border/50 ${
+          <span className={`flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyber-bg/80 border border-cyber-border/35 ${
             previewData.exitCode === 0 ? 'text-cyber-lime' : 'text-cyber-orange'
           }`}>
             exit {previewData.exitCode}
@@ -166,17 +170,17 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
       {/* Inline preview */}
       {showPreview && previewData && (
         <div
-          className="border-t border-cyber-border/30 bg-cyber-bg/30 cursor-pointer"
+          className="border-t border-cyber-border/20 bg-cyber-bg/30 cursor-pointer"
           onClick={handleClick}
           title="Click for full details"
         >
           {previewData.type === 'diff' && previewData.patch && (
             <div className="event-diff-container m-0 border-0 text-[11px]">
-              <PatchDiff
-                patch={previewData.patch}
-                options={{
-                  theme: 'pierre-dark',
-                  themeType: 'dark',
+                <PatchDiff
+                  patch={previewData.patch}
+                  options={{
+                    theme: diffTheme,
+                    themeType: 'dark',
                   diffStyle: 'split',
                   diffIndicators: 'bars',
                   lineDiffType: 'word-alt',

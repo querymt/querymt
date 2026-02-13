@@ -99,7 +99,7 @@ export function EventFiltersBar({
             placeholder="Search events..."
             value={filters.searchQuery}
             onChange={(e) => onFiltersChange({ ...filters, searchQuery: e.target.value })}
-            className="w-full pl-9 pr-3 py-1.5 bg-cyber-bg border border-cyber-border rounded text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:border-cyber-cyan"
+            className="w-full pl-9 pr-3 py-1.5 bg-cyber-bg border border-cyber-border/60 rounded text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:border-cyber-cyan"
           />
           {filters.searchQuery && (
             <button
@@ -116,7 +116,7 @@ export function EventFiltersBar({
           className={`flex items-center gap-1 px-3 py-1.5 rounded border text-sm transition-colors ${
             expertMode
               ? 'border-cyber-purple text-cyber-purple bg-cyber-purple/10'
-              : 'border-cyber-border text-gray-400 hover:border-cyber-purple/50'
+              : 'border-cyber-border/60 text-gray-400 hover:border-cyber-purple/40'
           }`}
           title="Toggle expert mode (show all internal events)"
         >
@@ -128,7 +128,7 @@ export function EventFiltersBar({
           className={`flex items-center gap-1 px-3 py-1.5 rounded border text-sm transition-colors ${
             hasActiveFilters
               ? 'border-cyber-cyan text-cyber-cyan bg-cyber-cyan/10'
-              : 'border-cyber-border text-gray-400 hover:border-cyber-cyan/50'
+              : 'border-cyber-border/60 text-gray-400 hover:border-cyber-cyan/40'
           }`}
         >
           <Filter className="w-4 h-4" />
@@ -162,7 +162,7 @@ export function EventFiltersBar({
                 className={`text-xs px-2 py-1 rounded border transition-colors ${
                   filters.types.has(type)
                     ? 'border-cyber-cyan text-cyber-cyan bg-cyber-cyan/10'
-                    : 'border-cyber-border text-gray-500 hover:border-gray-400'
+                    : 'border-cyber-border/50 text-gray-500 hover:border-cyber-border/70 hover:text-gray-300'
                 }`}
               >
                 {type.replace('_', ' ')}
@@ -184,7 +184,7 @@ export function EventFiltersBar({
                     className={`text-xs px-2 py-1 rounded border transition-colors ${
                       filters.agents.has(agentId)
                         ? 'border-cyber-magenta text-cyber-magenta bg-cyber-magenta/10'
-                        : 'border-cyber-border text-gray-500 hover:border-gray-400'
+                        : 'border-cyber-border/50 text-gray-500 hover:border-cyber-border/70 hover:text-gray-300'
                     }`}
                   >
                     {displayName}
@@ -206,7 +206,7 @@ export function EventFiltersBar({
                   className={`text-xs px-2 py-1 rounded border transition-colors ${
                     filters.tools.has(tool)
                       ? 'border-cyber-purple text-cyber-purple bg-cyber-purple/10'
-                      : 'border-cyber-border text-gray-500 hover:border-gray-400'
+                      : 'border-cyber-border/50 text-gray-500 hover:border-cyber-border/70 hover:text-gray-300'
                   }`}
                 >
                   {tool}

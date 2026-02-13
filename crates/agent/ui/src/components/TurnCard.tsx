@@ -10,7 +10,7 @@ import { PinnedUserMessage } from './PinnedUserMessage';
 import { ModelConfigPopover } from './ModelConfigPopover';
 import { ElicitationCard } from './ElicitationCard';
 import { getAgentShortName } from '../utils/agentNames';
-import { getAgentColor } from '../utils/agentColors';
+import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
 import { Undo2, Redo2, Copy, Check } from 'lucide-react';
 
@@ -193,7 +193,7 @@ export const TurnCard = memo(function TurnCard({
               )}
             </button>
           </div>
-          <div className="bg-cyber-surface/60 border border-cyber-magenta/20 rounded-lg px-4 py-3">
+          <div className="bg-cyber-surface/60 border border-cyber-magenta/15 rounded-lg px-4 py-3">
             <MessageContent content={turn.userMessage.content} />
           </div>
         </div>
@@ -206,7 +206,7 @@ export const TurnCard = memo(function TurnCard({
           <div className="flex items-baseline gap-2">
             <span
               className="text-xs font-semibold uppercase tracking-wide leading-none"
-              style={{ color: agentColor || '#00fff9' }}
+              style={{ color: agentColor || 'rgb(var(--agent-accent-1-rgb))' }}
             >
               {agentName}
             </span>
@@ -266,9 +266,9 @@ export const TurnCard = memo(function TurnCard({
         <div
           className="bg-cyber-surface/40 border rounded-lg px-4 py-3 relative"
           style={{
-            borderColor: agentColor ? `${agentColor}40` : 'rgba(0, 255, 249, 0.2)',
+            borderColor: agentColor ? colorWithAlpha(agentColor, 0.22) : 'rgba(var(--agent-accent-1-rgb), 0.14)',
             borderLeftWidth: '3px',
-            borderLeftColor: agentColor,
+            borderLeftColor: agentColor || 'rgb(var(--agent-accent-1-rgb))',
           }}
         >
           {/* Interleaved content: messages and activities in chronological order */}
@@ -277,7 +277,7 @@ export const TurnCard = memo(function TurnCard({
               {interleaved.map((item, idx) => {
                 if (item.type === 'message') {
                   return (
-                    <div key={item.event.id} className={`${idx > 0 ? 'pt-3 border-t border-cyber-border/30' : ''} group/message relative`}>
+                    <div key={item.event.id} className={`${idx > 0 ? 'pt-3 border-t border-cyber-border/20' : ''} group/message relative`}>
                       <button
                         onClick={() => copyToClipboard(item.event.content, `message-${item.event.id}`)}
                         className="absolute top-2 right-2 opacity-0 group-hover/message:opacity-100 transition-opacity p-1.5 rounded hover:bg-cyber-bg/50"

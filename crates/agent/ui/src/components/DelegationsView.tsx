@@ -56,7 +56,7 @@ export function DelegationsView({
               {delegations.map((group) => {
                 const agentId = group.targetAgentId ?? group.agentId;
                 const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
-                const agentColor = agentId ? getAgentColor(agentId) : '#b026ff';
+                const agentColor = agentId ? getAgentColor(agentId) : 'rgb(var(--cyber-purple-rgb))';
                 const isActive = activeDelegationId === group.id;
                 const initial = agentName.charAt(0).toUpperCase();
                 const objective = group.objective ?? 'Delegated task';

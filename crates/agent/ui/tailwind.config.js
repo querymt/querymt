@@ -8,24 +8,24 @@ export default {
     extend: {
       colors: {
         cyber: {
-          bg: '#0a0e27',        // Deep dark blue-black
-          surface: '#141b3d',   // Slightly lighter surface
-          border: '#1e2a5e',    // Dark blue border
-          cyan: '#00fff9',      // Neon cyan
-          magenta: '#ff00ff',   // Neon magenta
-          purple: '#b026ff',    // Neon purple
-          lime: '#39ff14',      // Neon lime green
-          orange: '#ff6b35',    // Neon orange
+          bg: 'rgba(var(--cyber-bg-rgb), <alpha-value>)',
+          surface: 'rgba(var(--cyber-surface-rgb), <alpha-value>)',
+          border: 'rgba(var(--cyber-border-rgb), <alpha-value>)',
+          cyan: 'rgba(var(--cyber-cyan-rgb), <alpha-value>)',
+          magenta: 'rgba(var(--cyber-magenta-rgb), <alpha-value>)',
+          purple: 'rgba(var(--cyber-purple-rgb), <alpha-value>)',
+          lime: 'rgba(var(--cyber-lime-rgb), <alpha-value>)',
+          orange: 'rgba(var(--cyber-orange-rgb), <alpha-value>)',
         }
       },
       boxShadow: {
-        'neon-cyan': '0 0 10px rgba(0, 255, 249, 0.5)',
-        'neon-magenta': '0 0 10px rgba(255, 0, 255, 0.5)',
-        'neon-purple': '0 0 10px rgba(176, 38, 255, 0.5)',
-        'neon-lime': '0 0 10px rgba(57, 255, 20, 0.5)',
+        'neon-cyan': '0 0 10px rgba(var(--cyber-cyan-rgb), 0.5)',
+        'neon-magenta': '0 0 10px rgba(var(--cyber-magenta-rgb), 0.5)',
+        'neon-purple': '0 0 10px rgba(var(--cyber-purple-rgb), 0.5)',
+        'neon-lime': '0 0 10px rgba(var(--cyber-lime-rgb), 0.5)',
       },
       backgroundImage: {
-        'grid-pattern': 'linear-gradient(rgba(0, 255, 249, 0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(0, 255, 249, 0.1) 1px, transparent 1px)',
+        'grid-pattern': 'linear-gradient(rgba(var(--cyber-cyan-rgb), 0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(var(--cyber-cyan-rgb), 0.1) 1px, transparent 1px)',
       },
       animation: {
         'glow-pulse': 'glow-pulse 2s ease-in-out infinite',
@@ -38,8 +38,8 @@ export default {
       },
       keyframes: {
         'glow-pulse': {
-          '0%, 100%': { boxShadow: '0 0 5px rgba(0, 255, 249, 0.5)' },
-          '50%': { boxShadow: '0 0 20px rgba(0, 255, 249, 0.8)' },
+          '0%, 100%': { boxShadow: '0 0 5px rgba(var(--cyber-cyan-rgb), 0.5)' },
+          '50%': { boxShadow: '0 0 20px rgba(var(--cyber-cyan-rgb), 0.8)' },
         },
         'slide-in-right': {
           '0%': { transform: 'translateX(100%)' },

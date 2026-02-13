@@ -19,7 +19,7 @@ A cyberpunk-themed web interface for interacting with the QueryMT agent via the 
 
 ### Message Display
 - **Markdown Rendering**: Full GitHub Flavored Markdown support with `react-markdown`
-- **Syntax Highlighting**: Code blocks with cyberpunk-themed styling (ready for @pierre/diffs)
+- **Syntax Highlighting**: Code blocks and diffs adapt to the active dashboard theme
 - **Tool Call Visualization**: Dedicated UI for tool calls and results with status indicators
 - **Typing Indicator**: Animated indicator shows when agent is processing
 - **Event Timeline**: Virtualized scrolling with react-virtuoso for performance
@@ -77,6 +77,13 @@ src/
 - **Typography Plugin**: Better prose styling with `@tailwindcss/typography`
 
 ## 🎨 Theme Customization
+
+### Built-in Dashboard Themes
+
+- Use the header theme picker (palette icon) to switch between built-in dark themes (Base16 + Kanagawa).
+- Theme choice is persisted in local storage (`dashboardTheme`) via the UI store.
+- Theme variables are applied at runtime using CSS custom properties so existing Tailwind classes update automatically.
+- Code highlighting and diffs follow the selected dashboard theme.
 
 ### Color Palette
 
@@ -191,7 +198,7 @@ Open browser DevTools → Network tab → WS filter to see WebSocket messages in
 - [ ] Inline code review with annotations and comments
 - [ ] Message reactions and threading
 - [ ] Export conversation history to markdown/JSON
-- [ ] Custom themes and user-configurable color schemes
+- [ ] Light-mode dashboard theme pack
 - [ ] Keyboard shortcuts for common actions
 - [ ] Search and filter messages in timeline
 - [ ] Voice input support

@@ -8,7 +8,7 @@ import { useState, useRef, useEffect } from 'react';
 import * as Collapsible from '@radix-ui/react-collapsible';
 import { ChevronDown, ChevronRight, Clock, CheckCircle, XCircle, Loader } from 'lucide-react';
 import { UiAgentInfo, EventRow } from '../types';
-import { getAgentColor } from '../utils/agentColors';
+import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
 import { formatDuration } from '../utils/formatters';
 
@@ -48,7 +48,7 @@ export function DelegationAccordion({
   const accordionRef = useRef<HTMLDivElement>(null);
 
   const toolCallCount = group.events.filter(e => e.type === 'tool_call').length;
-  const agentColor = group.agentId ? getAgentColor(group.agentId) : '#b026ff';
+  const agentColor = group.agentId ? getAgentColor(group.agentId) : 'rgb(var(--cyber-purple-rgb))';
   const agentName = group.agentId ? getAgentShortName(group.agentId, agents) : 'Sub-agent';
 
   const durationMs = group.endTime
@@ -71,7 +71,7 @@ export function DelegationAccordion({
         ref={accordionRef}
         className={`
           relative rounded-lg border overflow-hidden transition-all duration-300
-          ${isActive ? 'border-cyber-purple shadow-[0_0_20px_rgba(176,38,255,0.3)]' : 'border-cyber-border/50'}
+          ${isActive ? 'border-cyber-purple shadow-[0_0_20px_rgba(var(--cyber-purple-rgb),0.3)]' : 'border-cyber-border/50'}
           ${isHighlighted ? 'ring-2 ring-cyber-cyan ring-offset-2 ring-offset-cyber-bg' : ''}
         `}
         style={{
@@ -105,9 +105,9 @@ export function DelegationAccordion({
           <span
             className="flex-shrink-0 text-xs font-semibold px-2 py-0.5 rounded"
             style={{
-              backgroundColor: `${agentColor}20`,
+              backgroundColor: colorWithAlpha(agentColor, 0.12),
               color: agentColor,
-              border: `1px solid ${agentColor}40`,
+              border: `1px solid ${colorWithAlpha(agentColor, 0.24)}`,
             }}
           >
             {agentName}
@@ -200,5 +200,3 @@ export function DelegationConnector({ startY, endY, startX, color, isActive }: D
     </svg>
   );
 }
-
-
