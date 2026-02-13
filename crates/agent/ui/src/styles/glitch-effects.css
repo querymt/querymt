@@ -12,7 +12,7 @@
 }
 
 .glitch .char {
-  color: #fff;
+  color: rgb(var(--glitch-fg-rgb));
 }
 
 /* ===== GLITCH-0 VARIANT - Jump and translate (CodePen) ===== */
@@ -65,7 +65,7 @@
   left: 0;
   height: 100%;
   width: 100%;
-  color: #fff;
+  color: rgb(var(--glitch-fg-rgb));
   -webkit-clip-path: var(--clip);
   clip-path: var(--clip);
 }
@@ -73,12 +73,12 @@
 .glitch--3 [data-char]::after {
   transform: translate(calc(var(--shift) * 1%), 0);
   --clip: inset(0 0 calc(var(--split) * 1%) 0);
-  text-shadow: calc(var(--shadow) * 1px) calc(var(--shadow) * 1px) #ff0000;
+  text-shadow: calc(var(--shadow) * 1px) calc(var(--shadow) * 1px) rgb(var(--glitch-shadow-red-rgb));
 }
 
 .glitch--3 [data-char]::before {
   --clip: inset(calc((95 - var(--split)) * 1%) 0 0 0);
-  text-shadow: calc(var(--shadow) * -1px) 0 #00fff9;
+  text-shadow: calc(var(--shadow) * -1px) 0 rgb(var(--glitch-shadow-cyan-rgb));
 }
 
 @keyframes glitch--3 {
@@ -130,7 +130,7 @@
   left: 0;
   height: 100%;
   width: 100%;
-  color: #fff;
+  color: rgb(var(--glitch-fg-rgb));
   -webkit-clip-path: var(--clip);
   clip-path: var(--clip);
 }
@@ -176,16 +176,16 @@
   left: 0;
   height: 100%;
   width: 100%;
-  color: #fff;
+  color: rgb(var(--glitch-fg-rgb));
   opacity: 0.75;
 }
 
 .glitch--5 [data-char]::after {
-  text-shadow: calc(var(--spread, 0) * -1px) calc(var(--spread, 0) * -1px) #ff0000;
+  text-shadow: calc(var(--spread, 0) * -1px) calc(var(--spread, 0) * -1px) rgb(var(--glitch-shadow-red-rgb));
 }
 
 .glitch--5 [data-char]::before {
-  text-shadow: calc(var(--spread, 0) * 1px) calc(var(--spread, 0) * 1px) #00fff9;
+  text-shadow: calc(var(--spread, 0) * 1px) calc(var(--spread, 0) * 1px) rgb(var(--glitch-shadow-cyan-rgb));
 }
 
 @keyframes glitch--5 {
@@ -250,7 +250,7 @@
   left: 0;
   height: 100%;
   width: 100%;
-  color: #fff;
+  color: rgb(var(--glitch-fg-rgb));
   -webkit-clip-path: var(--clip);
   clip-path: var(--clip);
 }

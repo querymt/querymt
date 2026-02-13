@@ -8,7 +8,7 @@ import { useState, useRef, useEffect } from 'react';
 import * as Collapsible from '@radix-ui/react-collapsible';
 import { ChevronDown, ChevronRight, Clock, CheckCircle, XCircle, Loader } from 'lucide-react';
 import { UiAgentInfo, EventRow } from '../types';
-import { getAgentColor } from '../utils/agentColors';
+import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
 import { formatDuration } from '../utils/formatters';
 
@@ -48,7 +48,7 @@ export function DelegationAccordion({
   const accordionRef = useRef<HTMLDivElement>(null);
 
   const toolCallCount = group.events.filter(e => e.type === 'tool_call').length;
-  const agentColor = group.agentId ? getAgentColor(group.agentId) : '#b026ff';
+  const agentColor = group.agentId ? getAgentColor(group.agentId) : 'rgb(var(--accent-tertiary-rgb))';
   const agentName = group.agentId ? getAgentShortName(group.agentId, agents) : 'Sub-agent';
 
   const durationMs = group.endTime
@@ -71,8 +71,8 @@ export function DelegationAccordion({
         ref={accordionRef}
         className={`
           relative rounded-lg border overflow-hidden transition-all duration-300
-          ${isActive ? 'border-cyber-purple shadow-[0_0_20px_rgba(176,38,255,0.3)]' : 'border-cyber-border/50'}
-          ${isHighlighted ? 'ring-2 ring-cyber-cyan ring-offset-2 ring-offset-cyber-bg' : ''}
+          ${isActive ? 'border-accent-tertiary shadow-[0_0_20px_rgba(var(--accent-tertiary-rgb),0.3)]' : 'border-surface-border/50'}
+          ${isHighlighted ? 'ring-2 ring-accent-primary ring-offset-2 ring-offset-surface-canvas' : ''}
         `}
         style={{
           borderLeftWidth: '3px',
@@ -91,10 +91,10 @@ export function DelegationAccordion({
           className={`
             w-full flex items-center gap-3 px-4 py-2.5 text-left
             transition-colors duration-200
-            ${isExpanded ? 'bg-cyber-surface/80' : 'bg-cyber-surface/40 hover:bg-cyber-surface/60'}
+            ${isExpanded ? 'bg-surface-elevated/80' : 'bg-surface-elevated/40 hover:bg-surface-elevated/60'}
           `}
         >
-          <span className="flex-shrink-0 text-gray-400">
+          <span className="flex-shrink-0 text-ui-secondary">
             {isExpanded ? (
               <ChevronDown className="w-4 h-4" />
             ) : (
@@ -105,9 +105,9 @@ export function DelegationAccordion({
           <span
             className="flex-shrink-0 text-xs font-semibold px-2 py-0.5 rounded"
             style={{
-              backgroundColor: `${agentColor}20`,
+              backgroundColor: colorWithAlpha(agentColor, 0.12),
               color: agentColor,
-              border: `1px solid ${agentColor}40`,
+              border: `1px solid ${colorWithAlpha(agentColor, 0.24)}`,
             }}
           >
             {agentName}
@@ -115,33 +115,33 @@ export function DelegationAccordion({
 
           <span className="flex-shrink-0">
             {group.status === 'in_progress' && (
-              <Loader className="w-4 h-4 text-cyber-purple animate-spin" />
+              <Loader className="w-4 h-4 text-accent-tertiary animate-spin" />
             )}
             {group.status === 'completed' && (
-              <CheckCircle className="w-4 h-4 text-cyber-lime" />
+              <CheckCircle className="w-4 h-4 text-status-success" />
             )}
             {group.status === 'failed' && (
-              <XCircle className="w-4 h-4 text-cyber-orange" />
+              <XCircle className="w-4 h-4 text-status-warning" />
             )}
           </span>
 
           {!isExpanded && (
-            <span className="flex-1 text-xs text-gray-400 truncate">
+            <span className="flex-1 text-xs text-ui-secondary truncate">
               {toolCallCount} tool call{toolCallCount !== 1 ? 's' : ''}
             </span>
           )}
 
-          <span className="flex-shrink-0 flex items-center gap-1 text-xs text-gray-500">
+          <span className="flex-shrink-0 flex items-center gap-1 text-xs text-ui-muted">
             <Clock className="w-3 h-3" />
             {durationStr}
           </span>
         </Collapsible.Trigger>
 
         {/* Expanded content */}
-        <Collapsible.Content className="border-t border-cyber-border/30 bg-cyber-bg/30">
+        <Collapsible.Content className="border-t border-surface-border/30 bg-surface-canvas/30">
           <div className="p-2 space-y-1 max-h-96 overflow-auto">
             {group.events.length === 0 ? (
-              <div className="text-xs text-gray-500 text-center py-4">
+              <div className="text-xs text-ui-muted text-center py-4">
                 No events yet...
               </div>
             ) : (
@@ -200,5 +200,3 @@ export function DelegationConnector({ startY, endY, startX, color, isActive }: D
     </svg>
   );
 }
-
-

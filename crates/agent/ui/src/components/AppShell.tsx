@@ -1,6 +1,6 @@
-import { useEffect, useRef, useCallback, useMemo } from 'react';
+import { useEffect, useRef, useCallback, useMemo, useState } from 'react';
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
-import { Home, Copy, Check } from 'lucide-react';
+import { Home, Copy, Check, Palette } from 'lucide-react';
 import { useUiClientContext } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
 import { useSessionTimer } from '../hooks/useSessionTimer';
@@ -9,8 +9,14 @@ import { ModelPickerPopover } from './ModelPickerPopover';
 import { HeaderStatsBar } from './HeaderStatsBar';
 import { SessionSwitcher } from './SessionSwitcher';
 import { StatsDrawer } from './StatsDrawer';
+import { ThemeSwitcher } from './ThemeSwitcher';
+import { ShortcutGateway } from './ShortcutGateway';
 import { copyToClipboard } from '../utils/clipboard';
 import { getModeColors, getModeDisplayName } from '../utils/modeColors';
+import {
+  applyDashboardTheme,
+  getDashboardThemes,
+} from '../utils/dashboardThemes';
 
 /**
  * AppShell - Main layout wrapper for all routes
@@ -65,13 +71,22 @@ export function AppShell() {
     setModelPickerOpen,
     statsDrawerOpen,
     setStatsDrawerOpen,
+    selectedTheme,
+    setSelectedTheme,
   } = useUiStore();
   
   const location = useLocation();
   const isHomePage = location.pathname === '/';
   const copyTimeoutRef = useRef<number | null>(null);
+  const [shortcutGatewayOpen, setShortcutGatewayOpen] = useState(false);
+  const [themeSwitcherOpen, setThemeSwitcherOpen] = useState(false);
   const prevAgentModeRef = useRef(agentMode);
-  
+  const availableThemes = useMemo(() => getDashboardThemes(), []);
+  const selectedThemeLabel = useMemo(
+    () => availableThemes.find((theme) => theme.id === selectedTheme)?.label ?? selectedTheme,
+    [availableThemes, selectedTheme],
+  );
+
   // Live timer hook (per-session)
   const { globalElapsedMs, agentElapsedMs, isSessionActive } = useSessionTimer(
     events,
@@ -99,15 +114,37 @@ export function AppShell() {
   // Global keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      const normalizedKey = e.key.toLowerCase();
+
+      // Intentionally global: the gateway works even when an input is focused.
+      // If this conflicts with editing workflows later, add an editable-target guard.
+      // Ctrl+X gateway for command chords (e.g., Ctrl+X T)
+      if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && normalizedKey === 'x') {
+        e.preventDefault();
+        setShortcutGatewayOpen((open) => !open);
+        return;
+      }
+
+      if (shortcutGatewayOpen && !e.metaKey && !e.altKey && normalizedKey === 't') {
+        e.preventDefault();
+        setShortcutGatewayOpen(false);
+        setThemeSwitcherOpen(true);
+        return;
+      }
+
+      if (shortcutGatewayOpen) {
+        return;
+      }
+
       // Ctrl+E / Cmd+E - Cycle agent mode
-      if ((e.metaKey || e.ctrlKey) && e.key === 'e') {
+      if ((e.metaKey || e.ctrlKey) && normalizedKey === 'e') {
         e.preventDefault();
         cycleAgentMode();
         return;
       }
       
       // Cmd+Shift+M / Ctrl+Shift+M - Toggle model picker
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'm') {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && normalizedKey === 'm') {
         e.preventDefault();
         setModelPickerOpen(!modelPickerOpen);
         return;
@@ -120,7 +157,7 @@ export function AppShell() {
       }
       
       // Cmd+N / Ctrl+N - New session
-      if ((e.metaKey || e.ctrlKey) && e.key === 'n') {
+      if ((e.metaKey || e.ctrlKey) && normalizedKey === 'n') {
         e.preventDefault();
         if (connected && !loading) {
           handleNewSession();
@@ -130,7 +167,18 @@ export function AppShell() {
     
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [connected, loading, newSession, sessionSwitcherOpen, setSessionSwitcherOpen, cycleAgentMode, modelPickerOpen, setModelPickerOpen]);
+  }, [
+    connected,
+    loading,
+    shortcutGatewayOpen,
+    sessionSwitcherOpen,
+    setSessionSwitcherOpen,
+    cycleAgentMode,
+    modelPickerOpen,
+    setModelPickerOpen,
+    setShortcutGatewayOpen,
+    setThemeSwitcherOpen,
+  ]);
   
   // ESC handling: close modals first, then double-escape to cancel session
   // Reads state directly from Zustand store for guaranteed latest values
@@ -154,13 +202,25 @@ export function AppShell() {
           setModelPickerOpen(false);
           return;
         }
+        if (shortcutGatewayOpen) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          setShortcutGatewayOpen(false);
+          return;
+        }
+        if (themeSwitcherOpen) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          setThemeSwitcherOpen(false);
+          return;
+        }
         if (statsDrawerOpen) {
           e.preventDefault();
           e.stopImmediatePropagation();
           setStatsDrawerOpen(false);
           return;
         }
-        
+
         // Priority 2: Double-escape to cancel session (when agent is thinking)
         const now = Date.now();
         const timeSinceLastEsc = now - lastEscapeTime;
@@ -178,21 +238,35 @@ export function AppShell() {
     
     window.addEventListener('keydown', handleKeyDown, { capture: true });
     return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [thinkingAgentId, cancelSession, setSessionSwitcherOpen, setModelPickerOpen, setStatsDrawerOpen]);
+  }, [
+    thinkingAgentId,
+    cancelSession,
+    shortcutGatewayOpen,
+    themeSwitcherOpen,
+    setSessionSwitcherOpen,
+    setModelPickerOpen,
+    setShortcutGatewayOpen,
+    setStatsDrawerOpen,
+  ]);
   
   // Set CSS custom properties for mode theming
   useEffect(() => {
-    const colors = getModeColors(agentMode);
+    const colors = getModeColors(agentMode, selectedTheme);
     const root = document.documentElement;
     
     root.style.setProperty('--mode-rgb', colors.rgb);
-    root.style.setProperty('--mode-color', colors.hex);
+    root.style.setProperty('--mode-color', colors.cssColor);
     
     return () => {
       root.style.removeProperty('--mode-rgb');
       root.style.removeProperty('--mode-color');
     };
-  }, [agentMode]);
+  }, [agentMode, selectedTheme]);
+
+  // Set CSS custom properties for dashboard theme
+  useEffect(() => {
+    applyDashboardTheme(selectedTheme);
+  }, [selectedTheme]);
   
   // Auto-switch model when agent mode changes (if preference exists)
   useEffect(() => {
@@ -263,23 +337,23 @@ export function AppShell() {
   }, []);
   
   return (
-    <div className="flex flex-col h-screen bg-cyber-bg text-gray-100">
+    <div className="flex flex-col h-screen bg-surface-canvas text-ui-primary">
       {/* Header */}
-      <header className="flex items-center justify-between gap-4 px-6 py-4 bg-cyber-surface border-b border-cyber-border shadow-[0_0_20px_rgba(0,255,249,0.05)]">
+      <header className="flex items-center justify-between gap-4 px-6 py-4 bg-surface-elevated border-b border-surface-border shadow-[0_0_20px_rgba(var(--accent-primary-rgb),0.05)]">
         {/* Left section */}
         <div className="flex items-center gap-3">
           <Link
             to="/"
             className={`p-2 rounded-lg transition-colors ${
               isHomePage
-                ? 'text-cyber-cyan/50 cursor-default'
-                : 'text-cyber-cyan hover:bg-cyber-bg'
+                ? 'text-accent-primary/50 cursor-default'
+                : 'text-accent-primary hover:bg-surface-canvas'
             }`}
             title="Home"
           >
             <Home className="w-5 h-5" />
           </Link>
-          <h1 className="text-xl font-semibold neon-text-cyan">
+          <h1 className="text-xl font-semibold glow-text-primary">
             <GlitchText text="QueryMT" variant="3" hoverOnly />
           </h1>
           
@@ -287,21 +361,21 @@ export function AppShell() {
           {sessionId && (
             <div className="flex items-center gap-2">
               {/* Combined session chip with mode */}
-              <div className="flex items-center rounded-lg border border-cyber-border bg-cyber-bg overflow-hidden">
+              <div className="flex items-center rounded-lg border border-surface-border bg-surface-canvas overflow-hidden">
                 {/* Session ID part - click to open session switcher */}
                 <button
                   type="button"
                   onClick={() => setSessionSwitcherOpen(true)}
                   title={`Click to switch sessions (${navigator.platform.includes('Mac') ? 'Cmd' : 'Ctrl'}+/)`}
-                  className="flex items-center gap-1.5 px-3 py-1.5 hover:bg-cyber-surface/50 transition-colors group"
+                  className="flex items-center gap-1.5 px-3 py-1.5 hover:bg-surface-elevated/50 transition-colors group"
                 >
                   <span
                     className={`w-2 h-2 rounded-full ${
                       isSessionActive
-                        ? 'bg-cyber-cyan animate-pulse'
+                        ? 'bg-accent-primary animate-pulse'
                         : isConversationComplete
-                        ? 'bg-gray-500'
-                        : 'bg-cyber-lime'
+                        ? 'bg-ui-muted'
+                        : 'bg-status-success'
                     }`}
                     title={
                       isSessionActive
@@ -311,10 +385,10 @@ export function AppShell() {
                         : 'Idle'
                     }
                   />
-                  <span className="text-xs font-mono text-gray-400 group-hover:text-cyber-cyan transition-colors">
+                  <span className="text-xs font-mono text-ui-secondary group-hover:text-accent-primary transition-colors">
                     {String(sessionId).substring(0, 12)}...
                   </span>
-                  <span className="text-gray-600">·</span>
+                  <span className="text-ui-muted">·</span>
                 </button>
                 
                 {/* Mode part - click to cycle mode */}
@@ -322,7 +396,7 @@ export function AppShell() {
                   type="button"
                   onClick={cycleAgentMode}
                   title={`Mode: ${agentMode} (${navigator.platform.includes('Mac') ? '⌘E' : 'Ctrl+E'} to cycle)`}
-                  className="px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-cyber-surface/50"
+                  className="px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-surface-elevated/50"
                   style={{ color: 'var(--mode-color)' }}
                 >
                   {getModeDisplayName(agentMode)}
@@ -334,12 +408,12 @@ export function AppShell() {
                 type="button"
                 onClick={handleCopySessionId}
                 title="Copy session ID to clipboard"
-                className="p-1.5 rounded-lg border border-cyber-border bg-cyber-bg hover:border-cyber-cyan/60 hover:bg-cyber-surface/50 transition-colors"
+                className="p-1.5 rounded-lg border border-surface-border bg-surface-canvas hover:border-accent-primary/60 hover:bg-surface-elevated/50 transition-colors"
               >
                 {sessionCopied ? (
-                  <Check className="w-3.5 h-3.5 text-cyber-lime" />
+                  <Check className="w-3.5 h-3.5 text-status-success" />
                 ) : (
-                  <Copy className="w-3.5 h-3.5 text-gray-500 hover:text-cyber-cyan transition-colors" />
+                  <Copy className="w-3.5 h-3.5 text-ui-muted hover:text-accent-primary transition-colors" />
                 )}
               </button>
             </div>
@@ -379,11 +453,22 @@ export function AppShell() {
             onRefresh={refreshAllModels}
             onSetSessionModel={setSessionModel}
           />
+
+          {/* Dashboard theme picker */}
+          <button
+            type="button"
+            onClick={() => setThemeSwitcherOpen(true)}
+            className="h-8 w-8 inline-flex items-center justify-center rounded-lg border border-surface-border bg-surface-canvas/60 transition-colors hover:border-accent-primary/40"
+            title={`Dashboard theme: ${selectedThemeLabel} (Ctrl+X then T)`}
+            aria-label="Open theme switcher"
+          >
+            <Palette className="w-3.5 h-3.5 text-accent-primary" />
+          </button>
           
           {/* Connection status dot */}
           <div
             className={`w-3 h-3 rounded-full transition-colors ${
-              connected ? 'bg-cyber-lime' : 'bg-cyber-orange'
+              connected ? 'bg-status-success' : 'bg-status-warning'
             }`}
             title={connected ? 'Connected' : 'Disconnected'}
           />
@@ -414,6 +499,23 @@ export function AppShell() {
         onNewSession={handleNewSession}
         onSelectSession={handleSelectSession}
         connected={connected}
+      />
+
+      <ShortcutGateway
+        open={shortcutGatewayOpen}
+        onOpenChange={setShortcutGatewayOpen}
+        onSelectTheme={() => {
+          setShortcutGatewayOpen(false);
+          setThemeSwitcherOpen(true);
+        }}
+      />
+
+      <ThemeSwitcher
+        open={themeSwitcherOpen}
+        onOpenChange={setThemeSwitcherOpen}
+        themes={availableThemes}
+        selectedTheme={selectedTheme}
+        onSelectTheme={setSelectedTheme}
       />
       
       {/* Stats Drawer - Phase 4 */}

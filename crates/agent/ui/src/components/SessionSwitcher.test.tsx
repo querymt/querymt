@@ -101,11 +101,9 @@ describe('SessionSwitcher', () => {
     const user = userEvent.setup();
     render(<SessionSwitcher {...defaultProps} />);
     
-    // The backdrop is the first fixed overlay with bg-black
-    const backdrop = document.querySelector('.fixed.inset-0.bg-black\\/60');
-    expect(backdrop).toBeTruthy();
+    const backdrop = screen.getByTestId('session-switcher-backdrop');
     
-    await user.click(backdrop!);
+    await user.click(backdrop);
     expect(defaultProps.onOpenChange).toHaveBeenCalledWith(false);
   });
 
@@ -245,10 +243,9 @@ describe('SessionSwitcher', () => {
     render(<SessionSwitcher {...defaultProps} />);
     
     // Click on the outer wrapper (not the backdrop, but the centering container)
-    const wrapper = document.querySelector('.fixed.inset-0.z-50');
-    expect(wrapper).toBeTruthy();
+    const wrapper = screen.getByTestId('session-switcher-container');
     
-    await user.click(wrapper!);
+    await user.click(wrapper);
     expect(defaultProps.onOpenChange).toHaveBeenCalledWith(false);
   });
 

@@ -90,21 +90,21 @@ export function EventFiltersBar({
   };
   
   return (
-    <Collapsible.Root open={showFilters} onOpenChange={setShowFilters} className="px-4 py-2 bg-cyber-surface/50 border-b border-cyber-border">
+    <Collapsible.Root open={showFilters} onOpenChange={setShowFilters} className="px-4 py-2 bg-surface-elevated/50 border-b border-surface-border">
       <div className="flex items-center gap-2">
         <div className="flex-1 relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-ui-muted" />
           <input
             type="text"
             placeholder="Search events..."
             value={filters.searchQuery}
             onChange={(e) => onFiltersChange({ ...filters, searchQuery: e.target.value })}
-            className="w-full pl-9 pr-3 py-1.5 bg-cyber-bg border border-cyber-border rounded text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:border-cyber-cyan"
+            className="w-full pl-9 pr-3 py-1.5 bg-surface-canvas border border-surface-border/60 rounded text-sm text-ui-primary placeholder:text-ui-muted focus:outline-none focus:border-accent-primary"
           />
           {filters.searchQuery && (
             <button
               onClick={() => onFiltersChange({ ...filters, searchQuery: '' })}
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-ui-muted hover:text-ui-secondary"
             >
               <X className="w-4 h-4" />
             </button>
@@ -115,8 +115,8 @@ export function EventFiltersBar({
           onClick={() => onExpertModeChange(!expertMode)}
           className={`flex items-center gap-1 px-3 py-1.5 rounded border text-sm transition-colors ${
             expertMode
-              ? 'border-cyber-purple text-cyber-purple bg-cyber-purple/10'
-              : 'border-cyber-border text-gray-400 hover:border-cyber-purple/50'
+              ? 'border-accent-tertiary text-accent-tertiary bg-accent-tertiary/10'
+              : 'border-surface-border/60 text-ui-secondary hover:border-accent-tertiary/40'
           }`}
           title="Toggle expert mode (show all internal events)"
         >
@@ -127,14 +127,14 @@ export function EventFiltersBar({
         <Collapsible.Trigger
           className={`flex items-center gap-1 px-3 py-1.5 rounded border text-sm transition-colors ${
             hasActiveFilters
-              ? 'border-cyber-cyan text-cyber-cyan bg-cyber-cyan/10'
-              : 'border-cyber-border text-gray-400 hover:border-cyber-cyan/50'
+              ? 'border-accent-primary text-accent-primary bg-accent-primary/10'
+              : 'border-surface-border/60 text-ui-secondary hover:border-accent-primary/40'
           }`}
         >
           <Filter className="w-4 h-4" />
           <span>Filters</span>
           {hasActiveFilters && (
-            <span className="ml-1 px-1.5 py-0.5 text-[10px] bg-cyber-cyan/20 rounded">
+            <span className="ml-1 px-1.5 py-0.5 text-[10px] bg-accent-primary/20 rounded">
               {filteredCount}/{totalCount}
             </span>
           )}
@@ -144,16 +144,16 @@ export function EventFiltersBar({
         {hasActiveFilters && (
           <button
             onClick={clearFilters}
-            className="text-xs text-gray-500 hover:text-cyber-orange"
+            className="text-xs text-ui-muted hover:text-status-warning"
           >
             Clear
           </button>
         )}
       </div>
       
-      <Collapsible.Content className="mt-3 pt-3 border-t border-cyber-border/50 space-y-3">
+      <Collapsible.Content className="mt-3 pt-3 border-t border-surface-border/50 space-y-3">
         <div>
-          <span className="text-[10px] text-gray-500 uppercase">Event Types</span>
+          <span className="text-[10px] text-ui-muted uppercase">Event Types</span>
           <div className="flex flex-wrap gap-1 mt-1">
             {EVENT_TYPES.map((type) => (
               <button
@@ -161,8 +161,8 @@ export function EventFiltersBar({
                 onClick={() => toggleType(type)}
                 className={`text-xs px-2 py-1 rounded border transition-colors ${
                   filters.types.has(type)
-                    ? 'border-cyber-cyan text-cyber-cyan bg-cyber-cyan/10'
-                    : 'border-cyber-border text-gray-500 hover:border-gray-400'
+                    ? 'border-accent-primary text-accent-primary bg-accent-primary/10'
+                    : 'border-surface-border/50 text-ui-muted hover:border-surface-border/70 hover:text-ui-secondary'
                 }`}
               >
                 {type.replace('_', ' ')}
@@ -173,7 +173,7 @@ export function EventFiltersBar({
         
         {agentIds.length > 1 && (
           <div>
-            <span className="text-[10px] text-gray-500 uppercase">Agents</span>
+            <span className="text-[10px] text-ui-muted uppercase">Agents</span>
             <div className="flex flex-wrap gap-1 mt-1">
               {agentIds.map((agentId) => {
                 const displayName = getAgentDisplayName(agentId, agents);
@@ -183,8 +183,8 @@ export function EventFiltersBar({
                     onClick={() => toggleAgent(agentId)}
                     className={`text-xs px-2 py-1 rounded border transition-colors ${
                       filters.agents.has(agentId)
-                        ? 'border-cyber-magenta text-cyber-magenta bg-cyber-magenta/10'
-                        : 'border-cyber-border text-gray-500 hover:border-gray-400'
+                        ? 'border-accent-secondary text-accent-secondary bg-accent-secondary/10'
+                        : 'border-surface-border/50 text-ui-muted hover:border-surface-border/70 hover:text-ui-secondary'
                     }`}
                   >
                     {displayName}
@@ -197,7 +197,7 @@ export function EventFiltersBar({
         
         {tools.length > 0 && (
           <div>
-            <span className="text-[10px] text-gray-500 uppercase">Tools</span>
+            <span className="text-[10px] text-ui-muted uppercase">Tools</span>
             <div className="flex flex-wrap gap-1 mt-1">
               {tools.map((tool) => (
                 <button
@@ -205,8 +205,8 @@ export function EventFiltersBar({
                   onClick={() => toggleTool(tool)}
                   className={`text-xs px-2 py-1 rounded border transition-colors ${
                     filters.tools.has(tool)
-                      ? 'border-cyber-purple text-cyber-purple bg-cyber-purple/10'
-                      : 'border-cyber-border text-gray-500 hover:border-gray-400'
+                      ? 'border-accent-tertiary text-accent-tertiary bg-accent-tertiary/10'
+                      : 'border-surface-border/50 text-ui-muted hover:border-surface-border/70 hover:text-ui-secondary'
                   }`}
                 >
                   {tool}

@@ -5,6 +5,8 @@
 import { useEffect, useState } from 'react';
 import { codeToHtml } from 'shiki';
 import { detectLanguage } from '../utils/languageDetection';
+import { useUiStore } from '../store/uiStore';
+import { getShikiThemeForDashboard } from '../utils/dashboardThemes';
 
 export interface HighlightedCodeProps {
   code: string;
@@ -25,6 +27,8 @@ export function HighlightedCode({
 }: HighlightedCodeProps) {
   const [html, setHtml] = useState<string>('');
   const [loading, setLoading] = useState(true);
+  const selectedTheme = useUiStore((state) => state.selectedTheme);
+  const shikiTheme = getShikiThemeForDashboard(selectedTheme);
 
   useEffect(() => {
     let cancelled = false;
@@ -36,7 +40,7 @@ export function HighlightedCode({
         
         const highlighted = await codeToHtml(code, {
           lang,
-          theme: 'github-dark',
+          theme: shikiTheme,
         });
 
         if (!cancelled) {
@@ -58,12 +62,12 @@ export function HighlightedCode({
     return () => {
       cancelled = true;
     };
-  }, [code, filePath, providedLanguage, lineNumbers, startLine]);
+  }, [code, filePath, providedLanguage, lineNumbers, shikiTheme, startLine]);
 
   if (loading) {
     return (
       <div className="flex items-center justify-center p-8">
-        <div className="text-sm text-gray-500">Highlighting code...</div>
+        <div className="text-sm text-ui-muted">Highlighting code...</div>
       </div>
     );
   }

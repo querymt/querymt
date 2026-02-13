@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "sync:themes": "node ./scripts/sync-tinted-base16.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

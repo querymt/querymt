@@ -7,6 +7,8 @@ import { Loader, CheckCircle, XCircle, ChevronRight, ChevronDown, Eye } from 'lu
 import { PatchDiff } from '@pierre/diffs/react';
 import { generateToolSummary } from '../utils/toolSummary';
 import { EventItem } from '../types';
+import { useUiStore } from '../store/uiStore';
+import { getDashboardThemeVariant, getDiffThemeForDashboard } from '../utils/dashboardThemes';
 
 export interface ToolSummaryProps {
   event: EventItem & { mergedResult?: EventItem };
@@ -16,6 +18,9 @@ export interface ToolSummaryProps {
 }
 
 export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegate, onDelegateClick }: ToolSummaryProps) {
+  const selectedTheme = useUiStore((state) => state.selectedTheme);
+  const diffTheme = getDiffThemeForDashboard(selectedTheme);
+  const diffThemeType = getDashboardThemeVariant(selectedTheme);
   const toolKind = event.toolCall?.kind;
   const toolName = inferToolName(event);
   const rawInput = parseJsonMaybe(event.toolCall?.raw_input) ?? event.toolCall?.raw_input;
@@ -69,16 +74,16 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
   };
 
   return (
-    <div className="rounded-md border border-cyber-border/50 overflow-hidden">
+    <div className="rounded-md border border-surface-border/35 overflow-hidden">
       {/* Summary row */}
       <div
         className={`
           group flex items-center gap-2 px-3 py-1.5 cursor-pointer
           transition-all duration-200
-          bg-cyber-surface/60
-          hover:bg-cyber-surface hover:border-cyber-cyan/40
-          ${isDelegate ? 'border-l-2 border-l-cyber-purple' : ''}
-          ${isFailed ? 'border-l-2 border-l-cyber-orange' : ''}
+          bg-surface-elevated/60
+          hover:bg-surface-elevated hover:border-accent-primary/40
+          ${isDelegate ? 'border-l-2 border-l-accent-tertiary' : ''}
+          ${isFailed ? 'border-l-2 border-l-status-warning' : ''}
         `}
         onClick={handleClick}
       >
@@ -86,7 +91,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
         {hasInlinePreview && previewData && (
           <button
             onClick={handlePreviewToggle}
-            className="flex-shrink-0 p-0.5 rounded hover:bg-cyber-bg/50 text-gray-400 hover:text-cyber-cyan transition-colors"
+            className="flex-shrink-0 p-0.5 rounded hover:bg-surface-canvas/50 text-ui-secondary hover:text-accent-primary transition-colors"
             title={showPreview ? 'Hide preview' : 'Show preview'}
           >
             {showPreview ? (
@@ -103,31 +108,31 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
         </span>
 
         {/* Summary text */}
-        <span className="flex-1 text-xs text-gray-300 truncate font-mono">
+        <span className="flex-1 text-xs text-ui-secondary truncate font-mono">
           {summary.keyParam ? (
             <>
-              <span className="text-cyber-cyan">{summary.name}</span>
-              <span className="text-gray-500">: </span>
-              <span className="text-gray-400">{summary.keyParam}</span>
+              <span className="text-accent-primary">{summary.name}</span>
+              <span className="text-ui-muted">: </span>
+              <span className="text-ui-secondary">{summary.keyParam}</span>
             </>
           ) : (
-            <span className="text-cyber-cyan">{summary.name}</span>
+            <span className="text-accent-primary">{summary.name}</span>
           )}
         </span>
 
         {/* Diff stats badge */}
         {summary.diffStats && (summary.diffStats.additions > 0 || summary.diffStats.deletions > 0) && (
-          <span className="flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyber-bg/80 border border-cyber-border/50">
-            <span className="text-cyber-lime">+{summary.diffStats.additions}</span>
-            <span className="text-gray-500 mx-0.5">/</span>
-            <span className="text-cyber-magenta">-{summary.diffStats.deletions}</span>
+          <span className="flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-surface-canvas/80 border border-surface-border/35">
+            <span className="text-status-success">+{summary.diffStats.additions}</span>
+            <span className="text-ui-muted mx-0.5">/</span>
+            <span className="text-accent-secondary">-{summary.diffStats.deletions}</span>
           </span>
         )}
 
         {/* Shell exit code badge (inline) */}
         {isShell && previewData?.type === 'shell' && previewData.exitCode !== undefined && (
-          <span className={`flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyber-bg/80 border border-cyber-border/50 ${
-            previewData.exitCode === 0 ? 'text-cyber-lime' : 'text-cyber-orange'
+          <span className={`flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-surface-canvas/80 border border-surface-border/35 ${
+            previewData.exitCode === 0 ? 'text-status-success' : 'text-status-warning'
           }`}>
             exit {previewData.exitCode}
           </span>
@@ -136,23 +141,23 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
         {/* Status indicator */}
         <span className="flex-shrink-0">
           {isInProgress && (
-            <Loader className="w-3.5 h-3.5 text-cyber-purple animate-spin" />
+            <Loader className="w-3.5 h-3.5 text-accent-tertiary animate-spin" />
           )}
           {isCompleted && (
-            <CheckCircle className="w-3.5 h-3.5 text-cyber-lime" />
+            <CheckCircle className="w-3.5 h-3.5 text-status-success" />
           )}
           {isFailed && (
-            <XCircle className="w-3.5 h-3.5 text-cyber-orange" />
+            <XCircle className="w-3.5 h-3.5 text-status-warning" />
           )}
         </span>
 
         {/* Expand indicator */}
-        <ChevronRight className="w-3.5 h-3.5 text-gray-500 group-hover:text-cyber-cyan transition-colors flex-shrink-0" />
+        <ChevronRight className="w-3.5 h-3.5 text-ui-muted group-hover:text-accent-primary transition-colors flex-shrink-0" />
 
         {/* Delegate link indicator */}
         {isDelegate && (
           <span
-            className="flex-shrink-0 text-[9px] uppercase tracking-wider text-cyber-purple px-1.5 py-0.5 rounded bg-cyber-purple/10 border border-cyber-purple/30"
+            className="flex-shrink-0 text-[9px] uppercase tracking-wider text-accent-tertiary px-1.5 py-0.5 rounded bg-accent-tertiary/10 border border-accent-tertiary/30"
             onClick={(e) => {
               e.stopPropagation();
               onClick(); // Show modal for delegate details
@@ -166,7 +171,7 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
       {/* Inline preview */}
       {showPreview && previewData && (
         <div
-          className="border-t border-cyber-border/30 bg-cyber-bg/30 cursor-pointer"
+          className="border-t border-surface-border/20 bg-surface-canvas/30 cursor-pointer"
           onClick={handleClick}
           title="Click for full details"
         >
@@ -175,8 +180,8 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
               <PatchDiff
                 patch={previewData.patch}
                 options={{
-                  theme: 'pierre-dark',
-                  themeType: 'dark',
+                  theme: diffTheme,
+                  themeType: diffThemeType,
                   diffStyle: 'split',
                   diffIndicators: 'bars',
                   lineDiffType: 'word-alt',
@@ -191,17 +196,17 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
           {previewData.type === 'shell' && (
             <div className="px-3 py-2 font-mono text-[11px] max-h-64 overflow-auto">
               {previewData.stdout && (
-                <pre className="whitespace-pre-wrap break-words text-gray-300 leading-tight">
+                <pre className="whitespace-pre-wrap break-words text-ui-secondary leading-tight">
                   {truncateOutput(previewData.stdout, 500)}
                 </pre>
               )}
               {previewData.stderr && (
-                <pre className="whitespace-pre-wrap break-words text-cyber-orange/70 leading-tight mt-1">
+                <pre className="whitespace-pre-wrap break-words text-status-warning/70 leading-tight mt-1">
                   {truncateOutput(previewData.stderr, 300)}
                 </pre>
               )}
               {!previewData.stdout && !previewData.stderr && (
-                <span className="text-gray-500 italic text-[10px]">No output</span>
+                <span className="text-ui-muted italic text-[10px]">No output</span>
               )}
             </div>
           )}
@@ -335,9 +340,9 @@ export function ToolStatusBadge({ status }: { status?: string }) {
     <span
       className={`
         inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded
-        ${isCompleted ? 'bg-cyber-lime/10 text-cyber-lime border border-cyber-lime/30' : ''}
-        ${isFailed ? 'bg-cyber-orange/10 text-cyber-orange border border-cyber-orange/30' : ''}
-        ${!isCompleted && !isFailed ? 'bg-cyber-purple/10 text-cyber-purple border border-cyber-purple/30' : ''}
+        ${isCompleted ? 'bg-status-success/10 text-status-success border border-status-success/30' : ''}
+        ${isFailed ? 'bg-status-warning/10 text-status-warning border border-status-warning/30' : ''}
+        ${!isCompleted && !isFailed ? 'bg-accent-tertiary/10 text-accent-tertiary border border-accent-tertiary/30' : ''}
       `}
     >
       {isCompleted && <CheckCircle className="w-2.5 h-2.5" />}

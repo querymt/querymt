@@ -153,18 +153,18 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
     : data.source;
 
   return (
-    <div className="elicitation-card my-4 rounded-lg border border-cyber-cyan/30 bg-cyber-surface/60 overflow-hidden">
+    <div className="elicitation-card my-4 rounded-lg border border-accent-primary/30 bg-surface-elevated/60 overflow-hidden">
       {/* Header */}
-      <div className="px-4 py-3 bg-cyber-cyan/10 border-b border-cyber-cyan/30">
+      <div className="px-4 py-3 bg-accent-primary/10 border-b border-accent-primary/30">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
-            <div className="w-2 h-2 rounded-full bg-cyber-cyan animate-pulse" />
-            <h3 className="text-sm font-semibold text-cyber-cyan uppercase tracking-wide">
+            <div className="w-2 h-2 rounded-full bg-accent-primary animate-pulse" />
+            <h3 className="text-sm font-semibold text-accent-primary uppercase tracking-wide">
               Elicitation Request
             </h3>
           </div>
           {sourceLabel && (
-            <span className="text-[10px] text-gray-500 px-2 py-0.5 rounded bg-cyber-surface/40 border border-cyber-border/30">
+            <span className="text-[10px] text-ui-muted px-2 py-0.5 rounded bg-surface-elevated/40 border border-surface-border/30">
               via {sourceLabel}
             </span>
           )}
@@ -172,8 +172,8 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
       </div>
 
       {/* Message */}
-      <div className="px-4 py-3 border-b border-cyber-border/30">
-        <p className="text-sm text-gray-200 leading-relaxed">{data.message}</p>
+      <div className="px-4 py-3 border-b border-surface-border/30">
+        <p className="text-sm text-ui-primary leading-relaxed">{data.message}</p>
       </div>
 
       {/* Form Fields */}
@@ -182,15 +182,15 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
           <div key={field.name} className="space-y-2">
             {/* Field Label */}
             <div className="flex items-baseline gap-2">
-              <label className="text-sm font-medium text-gray-300">
+              <label className="text-sm font-medium text-ui-secondary">
                 {field.title || field.name}
-                {field.required && <span className="text-cyber-orange ml-1">*</span>}
+                {field.required && <span className="text-status-warning ml-1">*</span>}
               </label>
             </div>
             
             {/* Field Description */}
             {field.description && (
-              <p className="text-xs text-gray-400 leading-relaxed">{field.description}</p>
+              <p className="text-xs text-ui-secondary leading-relaxed">{field.description}</p>
             )}
 
             {/* Field Input */}
@@ -209,14 +209,14 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                         w-full text-left px-4 py-3 rounded-lg border transition-all duration-200
                         ${submitted 
                           ? 'cursor-default opacity-60' 
-                          : 'cursor-pointer hover:border-cyber-cyan/50 hover:bg-cyber-cyan/5'
+                          : 'cursor-pointer hover:border-accent-primary/50 hover:bg-accent-primary/5'
                         }
                         ${isSelected && !submitted
-                          ? 'border-cyber-cyan/60 bg-cyber-cyan/10'
-                          : 'border-cyber-border/40 bg-cyber-surface/40'
+                          ? 'border-accent-primary/60 bg-accent-primary/10'
+                          : 'border-surface-border/40 bg-surface-elevated/40'
                         }
                         ${isSelected && submitted && action === 'accept'
-                          ? 'border-cyber-lime/60 bg-cyber-lime/10'
+                          ? 'border-status-success/60 bg-status-success/10'
                           : ''
                         }
                       `}
@@ -225,34 +225,34 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                         <div className="flex-shrink-0 mt-0.5">
                           {isSelected ? (
                             <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
-                              submitted && action === 'accept' ? 'border-cyber-lime' : 'border-cyber-cyan'
+                              submitted && action === 'accept' ? 'border-status-success' : 'border-accent-primary'
                             }`}>
                               <div className={`w-2 h-2 rounded-full ${
-                                submitted && action === 'accept' ? 'bg-cyber-lime' : 'bg-cyber-cyan'
+                                submitted && action === 'accept' ? 'bg-status-success' : 'bg-accent-primary'
                               }`} />
                             </div>
                           ) : (
-                            <Circle className="w-4 h-4 text-gray-500" />
+                            <Circle className="w-4 h-4 text-ui-muted" />
                           )}
                         </div>
                         <div className="flex-1 min-w-0">
                           <div className={`text-sm font-medium ${
                             isSelected && submitted && action === 'accept' 
-                              ? 'text-cyber-lime' 
+                              ? 'text-status-success' 
                               : isSelected 
-                              ? 'text-cyber-cyan' 
-                              : 'text-gray-200'
+                              ? 'text-accent-primary' 
+                              : 'text-ui-primary'
                           }`}>
                             {option.title || String(option.value)}
                           </div>
                           {option.description && (
-                            <div className="text-xs text-gray-400 mt-1 leading-relaxed">
+                            <div className="text-xs text-ui-secondary mt-1 leading-relaxed">
                               {option.description}
                             </div>
                           )}
                         </div>
                         {isSelected && submitted && action === 'accept' && (
-                          <Check className="w-4 h-4 text-cyber-lime flex-shrink-0 mt-0.5" />
+                          <Check className="w-4 h-4 text-status-success flex-shrink-0 mt-0.5" />
                         )}
                       </div>
                     </button>
@@ -275,14 +275,14 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                         w-full text-left px-4 py-3 rounded-lg border transition-all duration-200
                         ${submitted 
                           ? 'cursor-default opacity-60' 
-                          : 'cursor-pointer hover:border-cyber-cyan/50 hover:bg-cyber-cyan/5'
+                          : 'cursor-pointer hover:border-accent-primary/50 hover:bg-accent-primary/5'
                         }
                         ${isSelected && !submitted
-                          ? 'border-cyber-cyan/60 bg-cyber-cyan/10'
-                          : 'border-cyber-border/40 bg-cyber-surface/40'
+                          ? 'border-accent-primary/60 bg-accent-primary/10'
+                          : 'border-surface-border/40 bg-surface-elevated/40'
                         }
                         ${isSelected && submitted && action === 'accept'
-                          ? 'border-cyber-lime/60 bg-cyber-lime/10'
+                          ? 'border-status-success/60 bg-status-success/10'
                           : ''
                         }
                       `}
@@ -291,30 +291,30 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                         <div className="flex-shrink-0 mt-0.5">
                           {isSelected ? (
                             <CheckSquare className={`w-4 h-4 ${
-                              submitted && action === 'accept' ? 'text-cyber-lime' : 'text-cyber-cyan'
+                              submitted && action === 'accept' ? 'text-status-success' : 'text-accent-primary'
                             }`} />
                           ) : (
-                            <Square className="w-4 h-4 text-gray-500" />
+                            <Square className="w-4 h-4 text-ui-muted" />
                           )}
                         </div>
                         <div className="flex-1 min-w-0">
                           <div className={`text-sm font-medium ${
                             isSelected && submitted && action === 'accept'
-                              ? 'text-cyber-lime'
+                              ? 'text-status-success'
                               : isSelected
-                              ? 'text-cyber-cyan'
-                              : 'text-gray-200'
+                              ? 'text-accent-primary'
+                              : 'text-ui-primary'
                           }`}>
                             {option.title || String(option.value)}
                           </div>
                           {option.description && (
-                            <div className="text-xs text-gray-400 mt-1 leading-relaxed">
+                            <div className="text-xs text-ui-secondary mt-1 leading-relaxed">
                               {option.description}
                             </div>
                           )}
                         </div>
                         {isSelected && submitted && action === 'accept' && (
-                          <Check className="w-4 h-4 text-cyber-lime flex-shrink-0 mt-0.5" />
+                          <Check className="w-4 h-4 text-status-success flex-shrink-0 mt-0.5" />
                         )}
                       </div>
                     </button>
@@ -330,14 +330,14 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                   w-full text-left px-4 py-3 rounded-lg border transition-all duration-200
                   ${submitted 
                     ? 'cursor-default opacity-60' 
-                    : 'cursor-pointer hover:border-cyber-cyan/50 hover:bg-cyber-cyan/5'
+                    : 'cursor-pointer hover:border-accent-primary/50 hover:bg-accent-primary/5'
                   }
                   ${formState[field.name] && !submitted
-                    ? 'border-cyber-cyan/60 bg-cyber-cyan/10'
-                    : 'border-cyber-border/40 bg-cyber-surface/40'
+                    ? 'border-accent-primary/60 bg-accent-primary/10'
+                    : 'border-surface-border/40 bg-surface-elevated/40'
                   }
                   ${formState[field.name] && submitted && action === 'accept'
-                    ? 'border-cyber-lime/60 bg-cyber-lime/10'
+                    ? 'border-status-success/60 bg-status-success/10'
                     : ''
                   }
                 `}
@@ -346,18 +346,18 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                   <div className="flex-shrink-0">
                     {formState[field.name] ? (
                       <CheckSquare className={`w-4 h-4 ${
-                        submitted && action === 'accept' ? 'text-cyber-lime' : 'text-cyber-cyan'
+                        submitted && action === 'accept' ? 'text-status-success' : 'text-accent-primary'
                       }`} />
                     ) : (
-                      <Square className="w-4 h-4 text-gray-500" />
+                      <Square className="w-4 h-4 text-ui-muted" />
                     )}
                   </div>
                   <span className={`text-sm font-medium ${
                     formState[field.name] && submitted && action === 'accept'
-                      ? 'text-cyber-lime'
+                      ? 'text-status-success'
                       : formState[field.name]
-                      ? 'text-cyber-cyan'
-                      : 'text-gray-200'
+                      ? 'text-accent-primary'
+                      : 'text-ui-primary'
                   }`}>
                     {formState[field.name] ? 'Yes' : 'No'}
                   </span>
@@ -376,7 +376,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                 }}
                 onKeyDown={(e) => handleKeyDown(e)}
                 disabled={submitted}
-                className="w-full px-4 py-2.5 rounded-lg bg-cyber-bg border border-cyber-cyan/40 text-gray-200 text-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyber-cyan/50 focus:border-cyber-cyan transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                className="w-full px-4 py-2.5 rounded-lg bg-surface-canvas border border-accent-primary/40 text-ui-primary text-sm placeholder:text-ui-muted focus:outline-none focus:ring-2 focus:ring-accent-primary/50 focus:border-accent-primary transition-all disabled:opacity-60 disabled:cursor-not-allowed"
                 placeholder={field.type === 'integer' ? 'Enter a whole number...' : 'Enter a number...'}
               />
             ) : (
@@ -387,7 +387,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                 onChange={(e) => handleFieldChange(field.name, e.target.value)}
                 onKeyDown={(e) => handleKeyDown(e)}
                 disabled={submitted}
-                className="w-full px-4 py-2.5 rounded-lg bg-cyber-bg border border-cyber-cyan/40 text-gray-200 text-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyber-cyan/50 focus:border-cyber-cyan transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                className="w-full px-4 py-2.5 rounded-lg bg-surface-canvas border border-accent-primary/40 text-ui-primary text-sm placeholder:text-ui-muted focus:outline-none focus:ring-2 focus:ring-accent-primary/50 focus:border-accent-primary transition-all disabled:opacity-60 disabled:cursor-not-allowed"
                 placeholder="Enter text..."
               />
             )}
@@ -396,25 +396,25 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
       </div>
 
       {/* Action Buttons */}
-      <div className="px-4 py-3 border-t border-cyber-border/30 bg-cyber-surface/40">
+      <div className="px-4 py-3 border-t border-surface-border/30 bg-surface-elevated/40">
         {submitted ? (
           <div className="flex items-center justify-center gap-2 py-2">
             {action === 'accept' && (
               <>
-                <Check className="w-4 h-4 text-cyber-lime" />
-                <span className="text-sm font-medium text-cyber-lime">Response submitted</span>
+                <Check className="w-4 h-4 text-status-success" />
+                <span className="text-sm font-medium text-status-success">Response submitted</span>
               </>
             )}
             {action === 'decline' && (
               <>
-                <X className="w-4 h-4 text-cyber-orange" />
-                <span className="text-sm font-medium text-cyber-orange">Request declined</span>
+                <X className="w-4 h-4 text-status-warning" />
+                <span className="text-sm font-medium text-status-warning">Request declined</span>
               </>
             )}
             {action === 'cancel' && (
               <>
-                <Ban className="w-4 h-4 text-gray-400" />
-                <span className="text-sm font-medium text-gray-400">Request cancelled</span>
+                <Ban className="w-4 h-4 text-ui-secondary" />
+                <span className="text-sm font-medium text-ui-secondary">Request cancelled</span>
               </>
             )}
           </div>
@@ -423,7 +423,7 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
             {/* Decline button */}
             <button
               onClick={() => handleSubmit('decline')}
-              className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg font-medium text-sm transition-all duration-200 bg-cyber-surface/60 border border-cyber-orange/40 text-cyber-orange hover:bg-cyber-orange/10 hover:border-cyber-orange"
+              className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg font-medium text-sm transition-all duration-200 bg-surface-elevated/60 border border-status-warning/40 text-status-warning hover:bg-status-warning/10 hover:border-status-warning"
             >
               <X className="w-4 h-4" />
               <span>Decline</span>
@@ -437,8 +437,8 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
                 flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg font-medium text-sm
                 transition-all duration-200
                 ${canSubmit
-                  ? 'bg-cyber-cyan/20 border border-cyber-cyan/60 text-cyber-cyan hover:bg-cyber-cyan/30 hover:border-cyber-cyan cursor-pointer'
-                  : 'bg-cyber-surface/60 border border-cyber-border/40 text-gray-500 cursor-not-allowed opacity-50'
+                  ? 'bg-accent-primary/20 border border-accent-primary/60 text-accent-primary hover:bg-accent-primary/30 hover:border-accent-primary cursor-pointer'
+                  : 'bg-surface-elevated/60 border border-surface-border/40 text-ui-muted cursor-not-allowed opacity-50'
                 }
               `}
             >
