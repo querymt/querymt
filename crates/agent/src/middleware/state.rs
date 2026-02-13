@@ -104,6 +104,10 @@ pub struct ConversationContext {
     pub provider: Arc<str>,
     /// Current model for the session (for dynamic model info lookup)
     pub model: Arc<str>,
+    /// Per-session agent mode (Build, Plan, Review).
+    /// Used by `AgentModeMiddleware` to inject mode-specific reminders.
+    /// Defaults to `Build` for backward compatibility.
+    pub session_mode: crate::agent::core::AgentMode,
 }
 
 impl ConversationContext {
@@ -120,6 +124,7 @@ impl ConversationContext {
             stats,
             provider,
             model,
+            session_mode: crate::agent::core::AgentMode::Build,
         }
     }
 
@@ -151,7 +156,14 @@ impl ConversationContext {
             stats: self.stats.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
+            session_mode: self.session_mode,
         }
+    }
+
+    /// Set the per-session mode on this context (builder-style).
+    pub fn with_session_mode(mut self, mode: crate::agent::core::AgentMode) -> Self {
+        self.session_mode = mode;
+        self
     }
 
     /// Returns true if this is the first user turn

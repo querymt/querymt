@@ -22,7 +22,6 @@ pub use messages::{RoutingMode, UiAgentInfo};
 #[cfg(test)]
 mod undo_handler_tests;
 
-use crate::agent::QueryMTAgent;
 use crate::event_bus::EventBus;
 use crate::index::WorkspaceIndexManager;
 use crate::session::projection::ViewStore;
@@ -46,7 +45,7 @@ const MODEL_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// UI WebSocket server.
 pub struct UiServer {
-    agent: Arc<QueryMTAgent>,
+    agent: Arc<crate::agent::AgentHandle>,
     view_store: Arc<dyn ViewStore>,
     event_sources: Vec<Arc<EventBus>>,
     connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
@@ -59,7 +58,7 @@ pub struct UiServer {
 /// Shared server state for request handlers.
 #[derive(Clone)]
 pub(crate) struct ServerState {
-    pub agent: Arc<QueryMTAgent>,
+    pub agent: Arc<crate::agent::AgentHandle>,
     pub view_store: Arc<dyn ViewStore>,
     pub event_sources: Vec<Arc<EventBus>>,
     pub connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
@@ -81,7 +80,7 @@ pub(crate) struct ConnectionState {
 
 impl UiServer {
     /// Create a new UI server.
-    pub fn new(agent: Arc<QueryMTAgent>, view_store: Arc<dyn ViewStore>) -> Self {
+    pub fn new(agent: Arc<crate::agent::AgentHandle>, view_store: Arc<dyn ViewStore>) -> Self {
         let event_sources = collect_event_sources(&agent);
         let model_cache = Cache::builder().time_to_live(MODEL_CACHE_TTL).build();
 

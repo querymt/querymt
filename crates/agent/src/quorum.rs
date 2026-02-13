@@ -1,6 +1,6 @@
-use crate::agent::QueryMTAgent;
 use crate::delegation::{AgentInfo, AgentRegistry, DefaultAgentRegistry, DelegationOrchestrator};
 use crate::event_bus::EventBus;
+use crate::send_agent::SendAgent;
 
 use crate::session::backend::StorageBackend;
 use crate::session::error::SessionError;
@@ -12,14 +12,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 type DelegateFactory =
-    Box<dyn FnOnce(Arc<dyn SessionStore>, Arc<EventBus>) -> Arc<QueryMTAgent> + Send>;
+    Box<dyn FnOnce(Arc<dyn SessionStore>, Arc<EventBus>) -> Arc<dyn SendAgent> + Send>;
 
 type PlannerFactory = Box<
     dyn FnOnce(
             Arc<dyn SessionStore>,
             Arc<EventBus>,
             Arc<dyn AgentRegistry + Send + Sync>,
-        ) -> Arc<QueryMTAgent>
+        ) -> Arc<dyn SendAgent>
         + Send,
 >;
 
@@ -35,7 +35,7 @@ pub enum AgentQuorumError {
 
 pub struct DelegateAgent {
     pub info: AgentInfo,
-    pub agent: Arc<QueryMTAgent>,
+    pub agent: Arc<dyn SendAgent>,
 }
 
 pub struct AgentQuorum {
@@ -43,7 +43,7 @@ pub struct AgentQuorum {
     view_store: Arc<dyn ViewStore>,
     event_bus: Arc<EventBus>,
     registry: Arc<dyn AgentRegistry + Send + Sync>,
-    planner: Arc<QueryMTAgent>,
+    planner: Arc<dyn SendAgent>,
     delegates: Vec<DelegateAgent>,
     orchestrator: Option<Arc<DelegationOrchestrator>>,
     cwd: Option<PathBuf>,
@@ -56,7 +56,7 @@ impl AgentQuorum {
         Ok(AgentQuorumBuilder::from_backend(backend))
     }
 
-    pub fn planner(&self) -> Arc<QueryMTAgent> {
+    pub fn planner(&self) -> Arc<dyn SendAgent> {
         self.planner.clone()
     }
 
@@ -64,7 +64,7 @@ impl AgentQuorum {
         &self.delegates
     }
 
-    pub fn delegate(&self, id: &str) -> Option<Arc<QueryMTAgent>> {
+    pub fn delegate(&self, id: &str) -> Option<Arc<dyn SendAgent>> {
         self.delegates
             .iter()
             .find(|entry| entry.info.id == id)
@@ -154,7 +154,7 @@ impl AgentQuorumBuilder {
 
     pub fn add_delegate_agent<F>(mut self, info: AgentInfo, factory: F) -> Self
     where
-        F: FnOnce(Arc<dyn SessionStore>, Arc<EventBus>) -> Arc<QueryMTAgent> + Send + 'static,
+        F: FnOnce(Arc<dyn SessionStore>, Arc<EventBus>) -> Arc<dyn SendAgent> + Send + 'static,
     {
         self.delegate_factories.push((info, Box::new(factory)));
         self
@@ -166,7 +166,7 @@ impl AgentQuorumBuilder {
                 Arc<dyn SessionStore>,
                 Arc<EventBus>,
                 Arc<dyn AgentRegistry + Send + Sync>,
-            ) -> Arc<QueryMTAgent>
+            ) -> Arc<dyn SendAgent>
             + Send
             + 'static,
     {
@@ -224,17 +224,30 @@ impl AgentQuorumBuilder {
         let planner = planner_factory(self.store.clone(), self.event_bus.clone(), registry.clone());
 
         let orchestrator = if self.delegation_enabled {
+            // We need to get the tool_registry. For now, we'll use a default/empty one
+            // This will be properly addressed when we pass AgentHandle which has tool_registry()
+            // For compatibility, we create a minimal tool registry here
+            use crate::tools::ToolRegistry;
+            let tool_registry = Arc::new(ToolRegistry::new());
+
             let orchestrator = Arc::new(
                 DelegationOrchestrator::new(
                     planner.clone(),
+                    self.event_bus.clone(),
                     self.store.clone(),
                     registry.clone(),
+                    tool_registry,
                     self.cwd.clone(),
                 )
                 .with_verification(self.verification_enabled)
                 .with_summarizer(self.delegation_summarizer.clone()),
             );
-            planner.add_observer(orchestrator.clone());
+
+            // Note: We can't call add_observer on Arc<dyn SendAgent> directly
+            // This will be fixed when we use AgentHandle in the factories
+            // For now, skip the observer registration
+            // planner.add_observer(orchestrator.clone());
+
             Some(orchestrator)
         } else {
             None

@@ -258,7 +258,7 @@ impl AgentBuilderExt for QueryMTAgent {
     }
 
     fn with_agent_mode_middleware<T: Into<String>>(self, reminder: T) -> Self {
-        let middleware = AgentModeMiddleware::new(self.agent_mode.clone(), reminder.into());
+        let middleware = AgentModeMiddleware::new(reminder.into());
         self.middleware_drivers
             .lock()
             .unwrap()
@@ -349,8 +349,9 @@ impl AgentBuilderExt for QueryMTAgent {
     }
 
     fn with_agent_mode(self, mode: AgentMode) -> Self {
-        self.agent_mode
-            .store(mode as u8, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut default_mode) = self.default_mode.lock() {
+            *default_mode = mode;
+        }
         self
     }
 
@@ -425,47 +426,6 @@ impl AgentBuilderExt for QueryMTAgent {
     }
 }
 
-impl QueryMTAgent {
-    /// Sets the tool policy.
-    pub fn set_tool_policy(&self, policy: ToolPolicy) {
-        if let Ok(mut config) = self.tool_config.lock() {
-            config.policy = policy;
-        }
-    }
-
-    /// Sets the allowed tools whitelist.
-    pub fn set_allowed_tools<I, S>(&self, tool_names: I)
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        if let Ok(mut config) = self.tool_config.lock() {
-            config.allowlist = Some(tool_names.into_iter().map(Into::into).collect());
-        }
-    }
-
-    /// Clears the allowed tools whitelist.
-    pub fn clear_allowed_tools(&self) {
-        if let Ok(mut config) = self.tool_config.lock() {
-            config.allowlist = None;
-        }
-    }
-
-    /// Sets the denied tools blacklist.
-    pub fn set_denied_tools<I, S>(&self, tool_names: I)
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        if let Ok(mut config) = self.tool_config.lock() {
-            config.denylist = tool_names.into_iter().map(Into::into).collect();
-        }
-    }
-
-    /// Clears the denied tools blacklist.
-    pub fn clear_denied_tools(&self) {
-        if let Ok(mut config) = self.tool_config.lock() {
-            config.denylist.clear();
-        }
-    }
-}
+// These tool policy methods have been removed as they are unused.
+// Tool policy configuration should be done via the builder pattern before
+// creating the agent, not by mutating the agent after construction.
