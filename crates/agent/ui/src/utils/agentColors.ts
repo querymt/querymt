@@ -2,11 +2,11 @@ const AGENT_COLORS = [
   'rgb(var(--agent-accent-1-rgb))', // primary contrast accent
   'rgb(var(--agent-accent-2-rgb))', // secondary accent
   'rgb(var(--agent-accent-3-rgb))', // tertiary accent
-  'rgb(var(--cyber-cyan-rgb))',
-  'rgb(var(--cyber-magenta-rgb))',
-  'rgb(var(--cyber-lime-rgb))',
-  'rgb(var(--cyber-orange-rgb))',
-  'rgb(var(--cyber-purple-rgb))',
+  'rgb(var(--accent-primary-rgb))',
+  'rgb(var(--accent-secondary-rgb))',
+  'rgb(var(--status-success-rgb))',
+  'rgb(var(--status-warning-rgb))',
+  'rgb(var(--accent-tertiary-rgb))',
 ];
 
 const colorCache = new Map<string, string>();

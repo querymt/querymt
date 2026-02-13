@@ -1,13 +1,13 @@
 # QueryMT Agent Dashboard
 
-A cyberpunk-themed web interface for interacting with the QueryMT agent via the Agent Client Protocol (ACP).
+A themeable web interface for interacting with the QueryMT agent via the Agent Client Protocol (ACP).
 
 ## ✨ Features
 
 ### Visual Design
-- **Cyberpunk/Neon Theme**: Dark background with neon accent colors (cyan, magenta, purple, lime)
-- **Glowing Effects**: Interactive elements have neon glow effects that intensify on hover
-- **Grid Background**: Subtle cyberpunk-style grid pattern
+- **Base16 Theme System**: Switchable dark and light themes, with QueryMate as the default preset
+- **Glow Effects**: Interactive elements use accent-based glow effects that intensify on hover
+- **Grid Background**: Subtle accent-grid pattern
 - **Smooth Animations**: Fade-in, slide, and pulse animations throughout
 - **Responsive Design**: Works seamlessly on desktop and mobile devices
 
@@ -71,8 +71,8 @@ src/
 
 ### Styling
 
-- **Tailwind CSS**: Utility-first CSS framework with custom cyberpunk theme
-- **Custom Theme**: Neon colors, glows, and animations in `tailwind.config.js`
+- **Tailwind CSS**: Utility-first CSS framework with semantic design tokens
+- **Custom Theme Tokens**: Surface/accent/status colors, glows, and animations in `tailwind.config.js`
 - **Global Styles**: Base styles and utilities in `index.css`
 - **Typography Plugin**: Better prose styling with `@tailwindcss/typography`
 
@@ -89,32 +89,36 @@ src/
 
 ```javascript
 colors: {
-  cyber: {
-    bg: '#0a0e27',        // Deep dark blue-black
-    surface: '#141b3d',   // Slightly lighter surface
-    border: '#1e2a5e',    // Dark blue border
-    cyan: '#00fff9',      // Neon cyan (primary)
-    magenta: '#ff00ff',   // Neon magenta (user messages)
-    purple: '#b026ff',    // Neon purple (tool calls)
-    lime: '#39ff14',      // Neon lime (success states)
-    orange: '#ff6b35',    // Neon orange (warnings)
+  surface: {
+    canvas: 'rgba(var(--surface-canvas-rgb), <alpha-value>)',
+    elevated: 'rgba(var(--surface-elevated-rgb), <alpha-value>)',
+    border: 'rgba(var(--surface-border-rgb), <alpha-value>)',
+  },
+  accent: {
+    primary: 'rgba(var(--accent-primary-rgb), <alpha-value>)',
+    secondary: 'rgba(var(--accent-secondary-rgb), <alpha-value>)',
+    tertiary: 'rgba(var(--accent-tertiary-rgb), <alpha-value>)',
+  },
+  status: {
+    success: 'rgba(var(--status-success-rgb), <alpha-value>)',
+    warning: 'rgba(var(--status-warning-rgb), <alpha-value>)',
   }
 }
 ```
 
 ### Custom Utilities
 
-- `.neon-border-cyan`: Cyan border with glow effect
-- `.neon-border-magenta`: Magenta border with glow
-- `.neon-border-purple`: Purple border with glow
-- `.neon-text-cyan`: Cyan text with text-shadow glow
-- `.neon-text-magenta`: Magenta text with glow
-- `.neon-text-lime`: Lime text with glow
-- `.grid-background`: Cyberpunk grid pattern overlay
+- `.glow-border-primary`: Primary accent border with glow effect
+- `.glow-border-secondary`: Secondary accent border with glow
+- `.glow-border-tertiary`: Tertiary accent border with glow
+- `.glow-text-primary`: Primary accent text with glow
+- `.glow-text-secondary`: Secondary accent text with glow
+- `.glow-text-success`: Success text with glow
+- `.grid-background`: Accent grid pattern overlay
 
 ### Animations
 
-- `animate-glow-pulse`: Pulsing glow effect
+- `animate-accent-pulse`: Pulsing glow effect
 - `animate-fade-in`: Fade in animation
 - `animate-fade-in-up`: Fade in with upward motion
 - `animate-slide-in-left`: Slide in from left

@@ -33,7 +33,7 @@ export function DelegationsView({
     <div className="flex flex-col lg:flex-row h-full overflow-hidden">
       {/* Collapsible left panel */}
       <div className={`
-        border-b lg:border-b-0 lg:border-r border-cyber-border/50 bg-cyber-bg/40
+        border-b lg:border-b-0 lg:border-r border-surface-border/50 bg-surface-canvas/40
         transition-all duration-200 flex-shrink-0
         ${panelCollapsed ? 'w-full lg:w-12' : 'w-full lg:w-80'}
       `}>
@@ -42,21 +42,21 @@ export function DelegationsView({
             {/* Expand button */}
             <button
               onClick={() => setPanelCollapsed(false)}
-              className="p-1.5 rounded text-ui-muted hover:text-cyber-cyan transition-colors"
+              className="p-1.5 rounded text-ui-muted hover:text-accent-primary transition-colors"
               title="Show delegations list"
             >
               <PanelLeftOpen className="w-4 h-4" />
             </button>
             
             {/* Divider */}
-            <div className="w-6 border-t border-cyber-border/30 my-1" />
+            <div className="w-6 border-t border-surface-border/30 my-1" />
             
             {/* Mini delegation indicators */}
             <div className="flex-1 overflow-y-auto flex flex-col items-center gap-1 px-1">
               {delegations.map((group) => {
                 const agentId = group.targetAgentId ?? group.agentId;
                 const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
-                const agentColor = agentId ? getAgentColor(agentId) : 'rgb(var(--cyber-purple-rgb))';
+                const agentColor = agentId ? getAgentColor(agentId) : 'rgb(var(--accent-tertiary-rgb))';
                 const isActive = activeDelegationId === group.id;
                 const initial = agentName.charAt(0).toUpperCase();
                 const objective = group.objective ?? 'Delegated task';
@@ -71,17 +71,17 @@ export function DelegationsView({
                       relative w-8 h-8 rounded-md flex items-center justify-center
                       text-[11px] font-bold transition-all duration-150
                       ${isActive 
-                        ? 'ring-1 ring-cyber-cyan bg-cyber-cyan/10' 
+                        ? 'ring-1 ring-accent-primary bg-accent-primary/10' 
                         : 'hover:bg-white/5'}
                     `}
                     style={{ color: agentColor }}
                   >
                     {initial}
                     {/* Status dot */}
-                    <span className={`absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full border border-cyber-bg ${
-                      group.status === 'completed' ? 'bg-cyber-lime' :
-                      group.status === 'failed' ? 'bg-cyber-orange' :
-                      'bg-cyber-purple animate-pulse'
+                    <span className={`absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full border border-surface-canvas ${
+                      group.status === 'completed' ? 'bg-status-success' :
+                      group.status === 'failed' ? 'bg-status-warning' :
+                      'bg-accent-tertiary animate-pulse'
                     }`} />
                   </button>
                 );
@@ -93,7 +93,7 @@ export function DelegationsView({
             <div className="flex justify-end px-2 pt-2 flex-shrink-0">
               <button
                 onClick={() => setPanelCollapsed(true)}
-                className="p-1 rounded text-ui-muted hover:text-cyber-cyan transition-colors"
+                className="p-1 rounded text-ui-muted hover:text-accent-primary transition-colors"
                 title="Hide delegations list"
               >
                 <PanelLeftClose className="w-4 h-4" />

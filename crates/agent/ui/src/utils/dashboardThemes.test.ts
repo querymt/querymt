@@ -14,8 +14,8 @@ describe('dashboardThemes', () => {
   beforeEach(() => {
     const root = document.documentElement;
     root.removeAttribute('data-theme');
-    root.style.removeProperty('--cyber-bg-rgb');
-    root.style.removeProperty('--cyber-cyan-rgb');
+    root.style.removeProperty('--surface-canvas-rgb');
+    root.style.removeProperty('--accent-primary-rgb');
     root.style.removeProperty('color-scheme');
   });
 
@@ -35,16 +35,16 @@ describe('dashboardThemes', () => {
     applyDashboardTheme('base16-querymate', root);
 
     expect(root.getAttribute('data-theme')).toBe('base16-querymate');
-    expect(root.style.getPropertyValue('--cyber-bg-rgb').trim()).toBe('10, 14, 39');
-    expect(root.style.getPropertyValue('--cyber-cyan-rgb').trim()).toBe('0, 255, 249');
-    expect(root.style.getPropertyValue('--cyber-purple-rgb').trim()).toBe('176, 38, 255');
+    expect(root.style.getPropertyValue('--surface-canvas-rgb').trim()).toBe('10, 14, 39');
+    expect(root.style.getPropertyValue('--accent-primary-rgb').trim()).toBe('0, 255, 249');
+    expect(root.style.getPropertyValue('--accent-tertiary-rgb').trim()).toBe('176, 38, 255');
     expect(root.style.getPropertyValue('color-scheme').trim()).toBe('dark');
   });
 
   it('validates known and unknown theme ids', () => {
     expect(isDashboardThemeId('base16-gruvbox-dark')).toBe(true);
     expect(isDashboardThemeId('kanagawa-wave')).toBe(true);
-    expect(isDashboardThemeId('cyberpunk-neon')).toBe(false);
+    expect(isDashboardThemeId('unknown-theme-id')).toBe(false);
   });
 
   it('returns theme metadata for syntax and diff renderers', () => {

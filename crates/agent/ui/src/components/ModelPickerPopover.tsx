@@ -184,7 +184,7 @@ export function ModelPickerPopover({
       <Popover.Trigger asChild>
         <button
           type="button"
-          className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-cyber-border bg-cyber-bg/60 text-xs text-ui-secondary hover:border-cyber-cyan/60 hover:text-cyber-cyan transition-colors max-w-[280px]"
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-surface-border bg-surface-canvas/60 text-xs text-ui-secondary hover:border-accent-primary/60 hover:text-accent-primary transition-colors max-w-[280px]"
           title={currentProvider && currentModel 
             ? `${currentProvider} / ${currentModel} (${navigator.platform.includes('Mac') ? '⌘⇧M' : 'Ctrl+Shift+M'} to open)` 
             : `Select model (${navigator.platform.includes('Mac') ? '⌘⇧M' : 'Ctrl+Shift+M'})`}
@@ -200,7 +200,7 @@ export function ModelPickerPopover({
         <Popover.Content
           align="end"
           sideOffset={8}
-          className="z-50 w-[480px] max-h-[420px] flex flex-col rounded-xl border border-cyber-cyan/30 bg-cyber-bg shadow-lg shadow-cyber-cyan/25 animate-fade-in"
+          className="z-50 w-[480px] max-h-[420px] flex flex-col rounded-xl border border-accent-primary/30 bg-surface-canvas shadow-lg shadow-accent-primary/25 animate-fade-in"
           onOpenAutoFocus={(e) => {
             e.preventDefault();
             inputRef.current?.focus();
@@ -211,7 +211,7 @@ export function ModelPickerPopover({
           }}
         >
           {/* Header */}
-          <div className="flex items-center justify-between px-3 py-2 border-b border-cyber-border/60">
+          <div className="flex items-center justify-between px-3 py-2 border-b border-surface-border/60">
             <span className="text-xs font-semibold text-ui-secondary uppercase tracking-wider">
               Switch Model
             </span>
@@ -220,25 +220,25 @@ export function ModelPickerPopover({
                 type="button"
                 onClick={handleRefresh}
                 disabled={!connected || isRefreshing}
-                className="p-1 rounded text-ui-secondary hover:text-cyber-cyan hover:bg-cyber-cyan/10 transition-colors disabled:opacity-50"
+                className="p-1 rounded text-ui-secondary hover:text-accent-primary hover:bg-accent-primary/10 transition-colors disabled:opacity-50"
                 title="Refresh model list"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
               </button>
-              <Popover.Close className="p-1 rounded text-ui-secondary hover:text-ui-primary hover:bg-cyber-surface/60 transition-colors">
+              <Popover.Close className="p-1 rounded text-ui-secondary hover:text-ui-primary hover:bg-surface-elevated/60 transition-colors">
                 <X className="h-3.5 w-3.5" />
               </Popover.Close>
             </div>
           </div>
 
           {/* Target selector */}
-          <div className="px-3 py-2 border-b border-cyber-border/40">
+          <div className="px-3 py-2 border-b border-surface-border/40">
             <div className="flex items-center gap-2 text-xs">
               <span className="text-[10px] uppercase tracking-widest text-ui-muted">Target</span>
               <select
                 value={target}
                 onChange={(e) => setTarget(e.target.value)}
-                className="flex-1 rounded-lg border border-cyber-border bg-cyber-surface/70 px-2 py-1 text-xs text-ui-primary focus:border-cyber-cyan focus:outline-none"
+                className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-2 py-1 text-xs text-ui-primary focus:border-accent-primary focus:outline-none"
                 disabled={!connected}
               >
                 <option value={TARGET_ACTIVE}>Active agent</option>
@@ -266,13 +266,13 @@ export function ModelPickerPopover({
             }}
           >
             {/* Filter input */}
-            <div className="px-3 py-2 border-b border-cyber-border/40">
+            <div className="px-3 py-2 border-b border-surface-border/40">
               <div className="relative">
                 <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-ui-muted pointer-events-none" />
                 <Command.Input
                   ref={inputRef}
                   placeholder="Filter models..."
-                  className="w-full rounded-lg border border-cyber-border bg-cyber-surface/70 pl-8 pr-3 py-1.5 text-xs text-ui-primary placeholder:text-ui-muted focus:border-cyber-cyan focus:outline-none"
+                  className="w-full rounded-lg border border-surface-border bg-surface-elevated/70 pl-8 pr-3 py-1.5 text-xs text-ui-primary placeholder:text-ui-muted focus:border-accent-primary focus:outline-none"
                 />
               </div>
             </div>
@@ -293,7 +293,7 @@ export function ModelPickerPopover({
                   {recentModels.length > 0 && (
                     <Command.Group
                       heading="Recent"
-                      className="mb-2 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-cyber-cyan [&_[cmdk-group-heading]]:bg-cyber-bg/95"
+                      className="mb-2 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-accent-primary [&_[cmdk-group-heading]]:bg-surface-canvas/95"
                     >
                       {recentModels.map((entry) => {
                         const itemValue = `${entry.provider}/${entry.model}`;
@@ -306,14 +306,14 @@ export function ModelPickerPopover({
                             value={`${RECENT_PREFIX}${itemValue}`}
                             keywords={[entry.provider, entry.model]}
                             onSelect={(val) => switchModel(val)}
-                            className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-ui-secondary data-[selected=true]:bg-cyber-cyan/20 data-[selected=true]:text-cyber-cyan data-[selected=true]:border data-[selected=true]:border-cyber-cyan/40 hover:bg-cyber-surface/60 cursor-pointer"
+                            className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-ui-secondary data-[selected=true]:bg-accent-primary/20 data-[selected=true]:text-accent-primary data-[selected=true]:border data-[selected=true]:border-accent-primary/40 hover:bg-surface-elevated/60 cursor-pointer"
                           >
-                            <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-cyber-cyan transition-opacity" />
+                            <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-accent-primary transition-opacity" />
                             <span className="flex-1 truncate">
                               {entry.provider} / {entry.model}
                             </span>
                             {isCurrent && (
-                              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-cyber-purple/20 text-cyber-purple border border-cyber-purple/30">
+                              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-accent-tertiary/20 text-accent-tertiary border border-accent-tertiary/30">
                                 current
                               </span>
                             )}
@@ -325,7 +325,7 @@ export function ModelPickerPopover({
 
                   {/* Separator if we have recent models */}
                   {recentModels.length > 0 && (
-                    <div className="h-px bg-cyber-border/40 my-2" />
+                    <div className="h-px bg-surface-border/40 my-2" />
                   )}
 
                   {/* Provider-grouped models */}
@@ -333,7 +333,7 @@ export function ModelPickerPopover({
                     <Command.Group
                       key={group.provider}
                       heading={group.provider}
-                      className="mb-1 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-ui-muted [&_[cmdk-group-heading]]:bg-cyber-bg/95"
+                      className="mb-1 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-ui-muted [&_[cmdk-group-heading]]:bg-surface-canvas/95"
                     >
                       {group.models.map((model) => {
                         const itemValue = `${group.provider}/${model}`;
@@ -346,12 +346,12 @@ export function ModelPickerPopover({
                             value={itemValue}
                             keywords={[group.provider, model]}
                             onSelect={(val) => switchModel(val)}
-                            className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-ui-secondary data-[selected=true]:bg-cyber-cyan/20 data-[selected=true]:text-cyber-cyan data-[selected=true]:border data-[selected=true]:border-cyber-cyan/40 hover:bg-cyber-surface/60 cursor-pointer"
+                            className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-ui-secondary data-[selected=true]:bg-accent-primary/20 data-[selected=true]:text-accent-primary data-[selected=true]:border data-[selected=true]:border-accent-primary/40 hover:bg-surface-elevated/60 cursor-pointer"
                           >
-                            <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-cyber-cyan transition-opacity" />
+                            <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-accent-primary transition-opacity" />
                             <span className="flex-1 truncate">{model}</span>
                             {isCurrent && (
-                              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-cyber-purple/20 text-cyber-purple border border-cyber-purple/30">
+                              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-accent-tertiary/20 text-accent-tertiary border border-accent-tertiary/30">
                                 current
                               </span>
                             )}
@@ -366,7 +366,7 @@ export function ModelPickerPopover({
           </Command>
 
           {/* Footer with switch button */}
-          <div className="px-3 py-2 border-t border-cyber-border/60 bg-cyber-surface/30">
+          <div className="px-3 py-2 border-t border-surface-border/60 bg-surface-elevated/30">
             <div className="flex items-center justify-between gap-3">
               <div className="text-[10px] text-ui-muted truncate flex-1">
                 {selectedEntry ? (
@@ -383,8 +383,8 @@ export function ModelPickerPopover({
                 disabled={!canSwitch}
                 className={`px-4 py-1.5 rounded-lg text-xs font-medium transition-all ${
                   canSwitch
-                    ? 'bg-cyber-cyan/20 border border-cyber-cyan text-cyber-cyan hover:bg-cyber-cyan/30 hover:shadow-neon-cyan'
-                    : 'bg-cyber-surface/50 border border-cyber-border text-ui-muted cursor-not-allowed'
+                    ? 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30 hover:shadow-glow-primary'
+                    : 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
                 }`}
               >
                 {routingMode === 'broadcast' && target === TARGET_ALL ? 'Switch all' : 'Switch'}

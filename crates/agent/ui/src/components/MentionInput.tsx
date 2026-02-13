@@ -18,7 +18,7 @@ interface MentionInputProps {
 // Cyberpunk theme styles for MentionsInput
 const mentionsInputStyle: MentionsInputStyle = {
   control: {
-    backgroundColor: 'rgb(var(--cyber-surface-rgb))',
+    backgroundColor: 'rgb(var(--surface-elevated-rgb))',
     fontSize: 16,
     fontWeight: 'normal',
     width: '100%',
@@ -78,13 +78,13 @@ const mentionsInputStyle: MentionsInputStyle = {
   },
   suggestions: {
     list: {
-      backgroundColor: 'rgb(var(--cyber-bg-rgb))',
-      border: '1px solid rgba(var(--cyber-cyan-rgb), 0.3)',
+      backgroundColor: 'rgb(var(--surface-canvas-rgb))',
+      border: '1px solid rgba(var(--accent-primary-rgb), 0.3)',
       borderRadius: '12px',  // rounded-xl (was 8px)
       fontSize: 12,  // text-xs ~12px (was 14)
       maxHeight: '240px',  // match ModelPicker (was 200px)
       overflow: 'auto',
-      boxShadow: '0 8px 30px rgba(0, 0, 0, 0.4), 0 0 20px rgba(var(--cyber-cyan-rgb), 0.15)',
+      boxShadow: '0 8px 30px rgba(0, 0, 0, 0.4), 0 0 20px rgba(var(--accent-primary-rgb), 0.15)',
       zIndex: 9999,
       fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif",
       padding: '4px',  // inner padding like cmdk px-1 py-1
@@ -105,9 +105,9 @@ const mentionsInputStyle: MentionsInputStyle = {
       color: 'rgb(var(--ui-text-primary-rgb))',
       fontSize: '12px',  // text-xs
       '&focused': {
-        backgroundColor: 'rgba(var(--cyber-cyan-rgb), 0.2)',
-        color: 'rgb(var(--cyber-cyan-rgb))',
-        border: '1px solid rgba(var(--cyber-cyan-rgb), 0.4)',
+        backgroundColor: 'rgba(var(--accent-primary-rgb), 0.2)',
+        color: 'rgb(var(--accent-primary-rgb))',
+        border: '1px solid rgba(var(--accent-primary-rgb), 0.4)',
         boxShadow: 'none',  // remove inset shadow
       },
     },
@@ -138,10 +138,10 @@ const mentionsInputStyle: MentionsInputStyle = {
 // - borderRadius (rounds the background)
 // - boxShadow (creates visual border without affecting layout)
 const mentionStyle = {
-  backgroundColor: 'rgba(var(--cyber-cyan-rgb), 0.15)',
+  backgroundColor: 'rgba(var(--accent-primary-rgb), 0.15)',
   borderRadius: '4px',
   // Use inset box-shadow for a visual border without affecting text layout
-  boxShadow: 'inset 0 0 0 1px rgba(var(--cyber-cyan-rgb), 0.4)',
+  boxShadow: 'inset 0 0 0 1px rgba(var(--accent-primary-rgb), 0.4)',
 };
 
 export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
@@ -437,14 +437,14 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
     return (
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%' }}>
         {isDir ? (
-          <Folder className="w-3.5 h-3.5 flex-shrink-0" style={{ color: focused ? 'rgb(var(--cyber-cyan-rgb))' : 'rgb(var(--ui-text-secondary-rgb))' }} />
+          <Folder className="w-3.5 h-3.5 flex-shrink-0" style={{ color: focused ? 'rgb(var(--accent-primary-rgb))' : 'rgb(var(--ui-text-secondary-rgb))' }} />
         ) : (
-          <File className="w-3.5 h-3.5 flex-shrink-0" style={{ color: focused ? 'rgb(var(--cyber-cyan-rgb))' : 'rgb(var(--ui-text-secondary-rgb))' }} />
+          <File className="w-3.5 h-3.5 flex-shrink-0" style={{ color: focused ? 'rgb(var(--accent-primary-rgb))' : 'rgb(var(--ui-text-secondary-rgb))' }} />
         )}
         <span style={{
           fontFamily: "'Monaco', 'Menlo', 'Ubuntu Mono', monospace",
           fontSize: '12px',
-          color: focused ? 'rgb(var(--cyber-cyan-rgb))' : 'rgb(var(--ui-text-primary-rgb))',
+          color: focused ? 'rgb(var(--accent-primary-rgb))' : 'rgb(var(--ui-text-primary-rgb))',
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
@@ -519,7 +519,7 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
           right: '12px',
           top: '50%',
           transform: 'translateY(-50%)',
-          color: 'rgb(var(--cyber-cyan-rgb))',
+          color: 'rgb(var(--accent-primary-rgb))',
         }}>
           <Loader className="w-4 h-4 animate-spin" />
         </div>

@@ -68,14 +68,14 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
   return (
     <div className="w-full px-6 pb-2">
       <div
-        className={`mx-auto w-full max-w-[960px] rounded-2xl border border-cyber-orange/50 bg-cyber-surface/95 shadow-lg shadow-cyber-orange/25 transition-all duration-300 ${
+        className={`mx-auto w-full max-w-[960px] rounded-2xl border border-status-warning/50 bg-surface-elevated/95 shadow-lg shadow-status-warning/25 transition-all duration-300 ${
           justOpened ? 'animate-fade-in-up' : ''
         }`}
       >
         <div className="flex items-center justify-between px-4 py-3">
           <div className="flex items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-full border border-cyber-orange/40 bg-cyber-orange/10">
-              <AlertTriangle className="h-4 w-4 text-cyber-orange" />
+            <div className="flex h-9 w-9 items-center justify-center rounded-full border border-status-warning/40 bg-status-warning/10">
+              <AlertTriangle className="h-4 w-4 text-status-warning" />
             </div>
             <div>
               <p className="text-sm font-semibold text-ui-primary">System Log</p>
@@ -86,7 +86,7 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
             <button
               type="button"
               onClick={handleCopyAll}
-              className="flex items-center gap-1 rounded-md border border-cyber-orange/40 px-2 py-1 text-xs text-cyber-orange transition-colors hover:bg-cyber-orange/10"
+              className="flex items-center gap-1 rounded-md border border-status-warning/40 px-2 py-1 text-xs text-status-warning transition-colors hover:bg-status-warning/10"
               title="Copy all errors"
             >
               <Copy className="h-3 w-3" />
@@ -95,7 +95,7 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
             <button
               type="button"
               onClick={onClear}
-              className="flex items-center gap-1 rounded-md border border-cyber-border/60 px-2 py-1 text-xs text-ui-secondary transition-colors hover:bg-cyber-bg/60"
+              className="flex items-center gap-1 rounded-md border border-surface-border/60 px-2 py-1 text-xs text-ui-secondary transition-colors hover:bg-surface-canvas/60"
               title="Clear and hide"
             >
               <Trash2 className="h-3 w-3" />
@@ -104,7 +104,7 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
             <button
               type="button"
               onClick={() => setIsCollapsed((prev) => !prev)}
-              className="rounded-md border border-cyber-border/60 p-1 text-ui-secondary transition-colors hover:bg-cyber-bg/60"
+              className="rounded-md border border-surface-border/60 p-1 text-ui-secondary transition-colors hover:bg-surface-canvas/60"
               title={isCollapsed ? 'Expand' : 'Collapse'}
             >
               {isCollapsed ? (
@@ -117,22 +117,22 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
         </div>
 
         {!isCollapsed && (
-          <div className="border-t border-cyber-border/60 bg-cyber-bg/55">
+          <div className="border-t border-surface-border/60 bg-surface-canvas/55">
             <div ref={scrollRef} className="max-h-56 overflow-y-auto px-4 py-3">
               <div className="space-y-2">
                 {displayEvents.map((event) => (
                   <div
                     key={event.id}
-                    className="rounded-lg border border-cyber-orange/20 bg-cyber-surface/50 px-3 py-2 text-sm text-ui-primary shadow-[0_0_12px_rgba(var(--cyber-orange-rgb),0.15)]"
+                    className="rounded-lg border border-status-warning/20 bg-surface-elevated/50 px-3 py-2 text-sm text-ui-primary shadow-[0_0_12px_rgba(var(--status-warning-rgb),0.15)]"
                   >
                     <div className="flex items-start justify-between gap-3">
-                      <div className="font-mono text-[11px] uppercase tracking-wider text-cyber-orange">
+                      <div className="font-mono text-[11px] uppercase tracking-wider text-status-warning">
                         {formatTimestamp(event.timestamp)}
                       </div>
                       <button
                         type="button"
                         onClick={() => handleCopyEntry(event.id, event.content)}
-                        className="flex items-center gap-1 rounded border border-cyber-orange/30 px-2 py-1 text-[11px] text-cyber-orange transition-colors hover:bg-cyber-orange/10"
+                        className="flex items-center gap-1 rounded border border-status-warning/30 px-2 py-1 text-[11px] text-status-warning transition-colors hover:bg-status-warning/10"
                         title="Copy message"
                       >
                         <Copy className="h-3 w-3" />

@@ -48,7 +48,7 @@ export function DelegationAccordion({
   const accordionRef = useRef<HTMLDivElement>(null);
 
   const toolCallCount = group.events.filter(e => e.type === 'tool_call').length;
-  const agentColor = group.agentId ? getAgentColor(group.agentId) : 'rgb(var(--cyber-purple-rgb))';
+  const agentColor = group.agentId ? getAgentColor(group.agentId) : 'rgb(var(--accent-tertiary-rgb))';
   const agentName = group.agentId ? getAgentShortName(group.agentId, agents) : 'Sub-agent';
 
   const durationMs = group.endTime
@@ -71,8 +71,8 @@ export function DelegationAccordion({
         ref={accordionRef}
         className={`
           relative rounded-lg border overflow-hidden transition-all duration-300
-          ${isActive ? 'border-cyber-purple shadow-[0_0_20px_rgba(var(--cyber-purple-rgb),0.3)]' : 'border-cyber-border/50'}
-          ${isHighlighted ? 'ring-2 ring-cyber-cyan ring-offset-2 ring-offset-cyber-bg' : ''}
+          ${isActive ? 'border-accent-tertiary shadow-[0_0_20px_rgba(var(--accent-tertiary-rgb),0.3)]' : 'border-surface-border/50'}
+          ${isHighlighted ? 'ring-2 ring-accent-primary ring-offset-2 ring-offset-surface-canvas' : ''}
         `}
         style={{
           borderLeftWidth: '3px',
@@ -91,7 +91,7 @@ export function DelegationAccordion({
           className={`
             w-full flex items-center gap-3 px-4 py-2.5 text-left
             transition-colors duration-200
-            ${isExpanded ? 'bg-cyber-surface/80' : 'bg-cyber-surface/40 hover:bg-cyber-surface/60'}
+            ${isExpanded ? 'bg-surface-elevated/80' : 'bg-surface-elevated/40 hover:bg-surface-elevated/60'}
           `}
         >
           <span className="flex-shrink-0 text-ui-secondary">
@@ -115,13 +115,13 @@ export function DelegationAccordion({
 
           <span className="flex-shrink-0">
             {group.status === 'in_progress' && (
-              <Loader className="w-4 h-4 text-cyber-purple animate-spin" />
+              <Loader className="w-4 h-4 text-accent-tertiary animate-spin" />
             )}
             {group.status === 'completed' && (
-              <CheckCircle className="w-4 h-4 text-cyber-lime" />
+              <CheckCircle className="w-4 h-4 text-status-success" />
             )}
             {group.status === 'failed' && (
-              <XCircle className="w-4 h-4 text-cyber-orange" />
+              <XCircle className="w-4 h-4 text-status-warning" />
             )}
           </span>
 
@@ -138,7 +138,7 @@ export function DelegationAccordion({
         </Collapsible.Trigger>
 
         {/* Expanded content */}
-        <Collapsible.Content className="border-t border-cyber-border/30 bg-cyber-bg/30">
+        <Collapsible.Content className="border-t border-surface-border/30 bg-surface-canvas/30">
           <div className="p-2 space-y-1 max-h-96 overflow-auto">
             {group.events.length === 0 ? (
               <div className="text-xs text-ui-muted text-center py-4">

@@ -48,7 +48,7 @@ export function DelegationsPanel({
   return (
     <div className="px-6 py-4 space-y-3 h-full overflow-y-auto">
       {/* Aggregate stats */}
-      <div className="flex items-center gap-3 text-[10px] text-ui-muted pb-2 mb-1 border-b border-cyber-border/30">
+      <div className="flex items-center gap-3 text-[10px] text-ui-muted pb-2 mb-1 border-b border-surface-border/30">
         <span className="flex items-center gap-1">
           <Layers className="w-3 h-3" />
           {delegations.length} delegation{delegations.length === 1 ? '' : 's'}
@@ -58,7 +58,7 @@ export function DelegationsPanel({
           {aggregateStats.totalToolCalls} tool call{aggregateStats.totalToolCalls === 1 ? '' : 's'}
         </span>
         {aggregateStats.totalCost > 0 && (
-          <span className="flex items-center gap-1 text-cyber-cyan">
+          <span className="flex items-center gap-1 text-accent-primary">
             <DollarSign className="w-3 h-3" />
             {formatCost(aggregateStats.totalCost)}
           </span>
@@ -67,7 +67,7 @@ export function DelegationsPanel({
       {delegations.map((group) => (
         <div
           key={group.id}
-          className={activeDelegationId === group.id ? 'ring-1 ring-cyber-cyan/50 rounded-md' : ''}
+          className={activeDelegationId === group.id ? 'ring-1 ring-accent-primary/50 rounded-md' : ''}
         >
           <DelegationSummaryCard
             group={group}

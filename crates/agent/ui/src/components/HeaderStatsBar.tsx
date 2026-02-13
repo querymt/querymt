@@ -66,36 +66,36 @@ export function HeaderStatsBar({
   return (
     <div
       onClick={onClick}
-      className={`flex items-center gap-3 px-3 py-1.5 rounded-lg border border-cyber-border/40 bg-cyber-surface/50 text-xs font-mono transition-colors ${
-        onClick ? 'cursor-pointer hover:border-cyber-cyan/60 hover:bg-cyber-surface/80' : ''
+      className={`flex items-center gap-3 px-3 py-1.5 rounded-lg border border-surface-border/40 bg-surface-elevated/50 text-xs font-mono transition-colors ${
+        onClick ? 'cursor-pointer hover:border-accent-primary/60 hover:bg-surface-elevated/80' : ''
       }`}
       title="Click for detailed stats"
     >
       {/* Elapsed Time */}
       <div className="flex items-center gap-1.5">
-        <Clock className={`w-3.5 h-3.5 ${isSessionActive ? 'text-cyber-cyan animate-pulse' : 'text-ui-muted'}`} />
+        <Clock className={`w-3.5 h-3.5 ${isSessionActive ? 'text-accent-primary animate-pulse' : 'text-ui-muted'}`} />
         <span className="text-ui-secondary">{formatDurationCompact(globalElapsedMs)}</span>
       </div>
       
-      <span className="text-cyber-border">│</span>
+      <span className="text-surface-border">│</span>
       
       {/* Context Usage */}
       <div className="flex items-center gap-1.5">
         <Cpu className={`w-3.5 h-3.5 ${
-          contextPercent >= 80 ? 'text-cyber-orange' : 
-          contextPercent >= 70 ? 'text-cyber-cyan' : 
+          contextPercent >= 80 ? 'text-status-warning' : 
+          contextPercent >= 70 ? 'text-accent-primary' : 
           'text-ui-muted'
         }`} />
         <span className={`${
-          contextPercent >= 80 ? 'text-cyber-orange' : 
-          contextPercent >= 70 ? 'text-cyber-cyan' : 
+          contextPercent >= 80 ? 'text-status-warning' : 
+          contextPercent >= 70 ? 'text-accent-primary' : 
           'text-ui-secondary'
         }`}>
           {contextDisplay}
         </span>
       </div>
       
-      <span className="text-cyber-border">│</span>
+      <span className="text-surface-border">│</span>
       
       {/* Tool Calls */}
       <div className="flex items-center gap-1.5">
@@ -103,19 +103,19 @@ export function HeaderStatsBar({
         <span className="text-ui-secondary">{session.totalToolCalls}</span>
       </div>
       
-      <span className="text-cyber-border">│</span>
+      <span className="text-surface-border">│</span>
       
       {/* Cost */}
       <div className="flex items-center gap-1.5">
         <DollarSign className={`w-3.5 h-3.5 ${
-          costPercent > 90 ? 'text-cyber-orange' : 
-          costPercent > 70 ? 'text-cyber-cyan' : 
+          costPercent > 90 ? 'text-status-warning' : 
+          costPercent > 70 ? 'text-accent-primary' : 
           'text-ui-muted'
         }`} />
         <span className={`${
-          costPercent > 90 ? 'text-cyber-orange' : 
-          costPercent > 70 ? 'text-cyber-cyan' : 
-          'text-cyber-cyan'
+          costPercent > 90 ? 'text-status-warning' : 
+          costPercent > 70 ? 'text-accent-primary' : 
+          'text-accent-primary'
         }`}>
           {costDisplay}
         </span>

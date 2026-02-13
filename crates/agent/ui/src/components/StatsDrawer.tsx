@@ -78,24 +78,24 @@ export function StatsDrawer({
     <>
       {/* Backdrop */}
       <div 
-        className="fixed inset-0 bg-cyber-bg/40 z-30 animate-fade-in"
+        className="fixed inset-0 bg-surface-canvas/40 z-30 animate-fade-in"
         onClick={() => onOpenChange(false)}
       />
       
       {/* Drawer */}
       <div className="fixed left-0 right-0 top-[72px] z-40 animate-slide-down">
         <div className="max-w-6xl mx-auto px-6">
-          <div className="bg-cyber-surface/95 backdrop-blur-sm border-2 border-cyber-cyan/30 rounded-b-xl shadow-[0_8px_40px_rgba(var(--cyber-cyan-rgb),0.2)]">
+          <div className="bg-surface-elevated/95 backdrop-blur-sm border-2 border-accent-primary/30 rounded-b-xl shadow-[0_8px_40px_rgba(var(--accent-primary-rgb),0.2)]">
             {/* Header */}
-            <div className="flex items-center justify-between px-6 py-3 border-b border-cyber-border/40">
+            <div className="flex items-center justify-between px-6 py-3 border-b border-surface-border/40">
               <div className="flex items-center gap-3">
-                <span className="text-sm font-semibold text-cyber-cyan uppercase tracking-wider">
+                <span className="text-sm font-semibold text-accent-primary uppercase tracking-wider">
                   Session Statistics
                 </span>
                 {isSessionActive && (
-                  <div className="flex items-center gap-1.5 px-2 py-1 bg-cyber-cyan/10 border border-cyber-cyan/30 rounded-md">
-                    <span className="w-2 h-2 rounded-full bg-cyber-cyan animate-pulse" />
-                    <span className="text-[10px] text-cyber-cyan font-medium uppercase tracking-wide">
+                  <div className="flex items-center gap-1.5 px-2 py-1 bg-accent-primary/10 border border-accent-primary/30 rounded-md">
+                    <span className="w-2 h-2 rounded-full bg-accent-primary animate-pulse" />
+                    <span className="text-[10px] text-accent-primary font-medium uppercase tracking-wide">
                       Active
                     </span>
                   </div>
@@ -115,15 +115,15 @@ export function StatsDrawer({
                       onChange={(e) => setExpertMode(e.target.checked)}
                       className="sr-only peer"
                     />
-                    <div className="w-9 h-5 bg-cyber-bg border border-cyber-border rounded-full peer-checked:bg-cyber-purple/20 peer-checked:border-cyber-purple transition-colors" />
-                    <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-ui-muted rounded-full transition-all peer-checked:translate-x-4 peer-checked:bg-cyber-purple" />
+                    <div className="w-9 h-5 bg-surface-canvas border border-surface-border rounded-full peer-checked:bg-accent-tertiary/20 peer-checked:border-accent-tertiary transition-colors" />
+                    <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-ui-muted rounded-full transition-all peer-checked:translate-x-4 peer-checked:bg-accent-tertiary" />
                   </div>
                 </label>
                 
                 {/* Close button */}
                 <button
                   onClick={() => onOpenChange(false)}
-                  className="p-1.5 hover:bg-cyber-bg/50 rounded-lg transition-colors"
+                  className="p-1.5 hover:bg-surface-canvas/50 rounded-lg transition-colors"
                   title="Close"
                 >
                   <X className="w-4 h-4 text-ui-secondary hover:text-ui-primary" />
@@ -136,11 +136,11 @@ export function StatsDrawer({
               {/* Session Overview */}
               <div className="grid grid-cols-4 gap-4 mb-4">
                 {/* Elapsed Time */}
-                <div className="p-4 rounded-lg bg-cyber-bg/50 border border-cyber-border/50">
+                <div className="p-4 rounded-lg bg-surface-canvas/50 border border-surface-border/50">
                   <div className="text-[10px] uppercase tracking-wider text-ui-muted mb-1">
                     Elapsed Time
                   </div>
-                  <div className="text-2xl font-mono font-semibold text-cyber-cyan">
+                  <div className="text-2xl font-mono font-semibold text-accent-primary">
                     {formatDuration(globalElapsedMs)}
                   </div>
                   {isSessionActive && (
@@ -151,7 +151,7 @@ export function StatsDrawer({
                 </div>
                 
                 {/* Context Usage */}
-                <div className="p-4 rounded-lg bg-cyber-bg/50 border border-cyber-border/50">
+                <div className="p-4 rounded-lg bg-surface-canvas/50 border border-surface-border/50">
                   <div className="text-[10px] uppercase tracking-wider text-ui-muted mb-1">
                     Context
                   </div>
@@ -167,9 +167,9 @@ export function StatsDrawer({
                       </div>
                       {enrichedPerAgent[0].maxContextTokens && (
                         <>
-                          <div className="mt-2 w-full bg-cyber-bg rounded-full h-1.5 overflow-hidden">
+                          <div className="mt-2 w-full bg-surface-canvas rounded-full h-1.5 overflow-hidden">
                             <div
-                              className="h-full bg-gradient-to-r from-cyber-cyan to-cyber-purple transition-all"
+                              className="h-full bg-gradient-to-r from-accent-primary to-accent-tertiary transition-all"
                               style={{
                                 width: formatPercentage(
                                   enrichedPerAgent[0].currentContextTokens,
@@ -213,7 +213,7 @@ export function StatsDrawer({
                 </div>
                 
                 {/* Tool Calls */}
-                <div className="p-4 rounded-lg bg-cyber-bg/50 border border-cyber-border/50">
+                <div className="p-4 rounded-lg bg-surface-canvas/50 border border-surface-border/50">
                   <div className="text-[10px] uppercase tracking-wider text-ui-muted mb-1">
                     Tools
                   </div>
@@ -226,11 +226,11 @@ export function StatsDrawer({
                 </div>
                 
                 {/* Cost */}
-                <div className="p-4 rounded-lg bg-cyber-bg/50 border border-cyber-border/50">
+                <div className="p-4 rounded-lg bg-surface-canvas/50 border border-surface-border/50">
                   <div className="text-[10px] uppercase tracking-wider text-ui-muted mb-1">
                     Cost
                   </div>
-                  <div className="text-2xl font-mono font-semibold text-cyber-cyan">
+                  <div className="text-2xl font-mono font-semibold text-accent-primary">
                     {formatCost(session.totalCostUsd)}
                     {session.limits?.max_cost_usd && (
                       <span className="text-sm text-ui-muted">
@@ -240,9 +240,9 @@ export function StatsDrawer({
                   </div>
                   {session.limits?.max_cost_usd && (
                     <>
-                      <div className="mt-2 w-full bg-cyber-bg rounded-full h-1.5 overflow-hidden">
+                      <div className="mt-2 w-full bg-surface-canvas rounded-full h-1.5 overflow-hidden">
                         <div
-                          className="h-full bg-gradient-to-r from-cyber-lime to-cyber-orange transition-all"
+                          className="h-full bg-gradient-to-r from-status-success to-status-warning transition-all"
                           style={{
                             width: formatPercentage(
                               session.totalCostUsd,
@@ -263,7 +263,7 @@ export function StatsDrawer({
               </div>
               
               {/* Session Metadata */}
-              <div className="flex items-center gap-6 text-xs text-ui-muted mb-4 px-4 py-2 bg-cyber-bg/30 rounded-lg">
+              <div className="flex items-center gap-6 text-xs text-ui-muted mb-4 px-4 py-2 bg-surface-canvas/30 rounded-lg">
                 <span>Messages: <span className="text-ui-secondary font-mono">{session.totalMessages}</span></span>
                 <span>Steps: <span className="text-ui-secondary font-mono">{session.totalSteps}</span></span>
                 <span>Turns: <span className="text-ui-secondary font-mono">{session.totalTurns}</span></span>
@@ -295,12 +295,12 @@ export function StatsDrawer({
                     return (
                       <div
                         key={agentStats.agentId}
-                        className="rounded-lg border border-cyber-border/50 bg-cyber-bg/30 overflow-hidden"
+                        className="rounded-lg border border-surface-border/50 bg-surface-canvas/30 overflow-hidden"
                       >
                         {/* Agent Header */}
                         <button
                           onClick={() => toggleAgent(agentStats.agentId)}
-                          className="w-full px-4 py-3 flex items-center gap-3 hover:bg-cyber-bg/50 transition-colors text-left"
+                          className="w-full px-4 py-3 flex items-center gap-3 hover:bg-surface-canvas/50 transition-colors text-left"
                         >
                           <div className="flex-shrink-0">
                             {isExpanded ? (
@@ -333,7 +333,7 @@ export function StatsDrawer({
                         
                         {/* Expanded Agent Details */}
                         {isExpanded && (
-                          <div className="px-4 pb-3 space-y-2 border-t border-cyber-border/30">
+                          <div className="px-4 pb-3 space-y-2 border-t border-surface-border/30">
                             {/* Tool breakdown */}
                             {agentStats.toolBreakdown && Object.keys(agentStats.toolBreakdown).length > 0 && (
                               <div className="pt-3">
@@ -346,7 +346,7 @@ export function StatsDrawer({
                                     .map(([toolName, count]) => (
                                       <div
                                         key={toolName}
-                                        className="px-2 py-1 bg-cyber-surface/60 border border-cyber-border/40 rounded text-xs"
+                                        className="px-2 py-1 bg-surface-elevated/60 border border-surface-border/40 rounded text-xs"
                                       >
                                         <span className="text-ui-secondary">{toolName}</span>
                                         <span className="text-ui-muted mx-1">×</span>

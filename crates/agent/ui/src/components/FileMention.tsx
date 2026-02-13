@@ -30,7 +30,7 @@ export function FileMention({ mention }: FileMentionProps) {
         {mention.path}
       </span>
       {copied && (
-        <span className="absolute -top-6 left-1/2 -translate-x-1/2 bg-cyber-surface border border-cyber-lime px-2 py-1 rounded text-xs text-cyber-lime whitespace-nowrap flex items-center gap-1 animate-fade-in">
+        <span className="absolute -top-6 left-1/2 -translate-x-1/2 bg-surface-elevated border border-status-success px-2 py-1 rounded text-xs text-status-success whitespace-nowrap flex items-center gap-1 animate-fade-in">
           <Check className="w-3 h-3" />
           Copied!
         </span>

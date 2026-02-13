@@ -147,7 +147,7 @@ export function SessionSwitcher({
       {/* Backdrop */}
       <div 
         data-testid="session-switcher-backdrop"
-        className="fixed inset-0 bg-cyber-bg/70 backdrop-blur-sm z-40 animate-fade-in"
+        className="fixed inset-0 bg-surface-canvas/70 backdrop-blur-sm z-40 animate-fade-in"
         onClick={() => onOpenChange(false)}
       />
       
@@ -163,12 +163,12 @@ export function SessionSwitcher({
         }}
       >
         <Command
-          className="w-full max-w-2xl bg-cyber-surface border-2 border-cyber-cyan/40 rounded-xl shadow-[0_0_40px_rgba(var(--cyber-cyan-rgb),0.3)] overflow-hidden animate-scale-in"
+          className="w-full max-w-2xl bg-surface-elevated border-2 border-accent-primary/40 rounded-xl shadow-[0_0_40px_rgba(var(--accent-primary-rgb),0.3)] overflow-hidden animate-scale-in"
           shouldFilter={false} // We handle filtering manually with fuse.js
         >
           {/* Search input */}
-          <div className="flex items-center gap-3 px-4 py-3 border-b border-cyber-border/60">
-            <div className="text-cyber-cyan text-sm font-mono">🔍</div>
+          <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-border/60">
+            <div className="text-accent-primary text-sm font-mono">🔍</div>
             <Command.Input
               ref={inputRef}
               value={search}
@@ -176,7 +176,7 @@ export function SessionSwitcher({
               placeholder="Search sessions by ID, title, or workspace..."
               className="flex-1 bg-transparent text-ui-primary placeholder:text-ui-muted text-sm focus:outline-none"
             />
-            <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-cyber-bg border border-cyber-border rounded text-ui-muted">
+            <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-muted">
               ESC
             </kbd>
           </div>
@@ -199,14 +199,14 @@ export function SessionSwitcher({
                       key={session.session_id}
                       value={session.session_id}
                       onSelect={() => handleSelectSession(session.session_id)}
-                      className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-cyber-border/20 cursor-pointer transition-colors data-[selected=true]:bg-cyber-cyan/15 data-[selected=true]:border-cyber-cyan/35 hover:bg-cyber-surface/60 hover:border-cyber-border/40 group"
+                      className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40 group"
                     >
                       {/* Status indicator */}
                       <div className="flex-shrink-0 pt-1">
                         {isActive ? (
-                          <span className="w-2 h-2 rounded-full bg-cyber-cyan animate-pulse" />
+                          <span className="w-2 h-2 rounded-full bg-accent-primary animate-pulse" />
                         ) : isThinking ? (
-                          <span className="w-2 h-2 rounded-full bg-cyber-purple animate-pulse" />
+                          <span className="w-2 h-2 rounded-full bg-accent-tertiary animate-pulse" />
                         ) : (
                           <span className="w-2 h-2 rounded-full bg-ui-muted" />
                         )}
@@ -217,23 +217,23 @@ export function SessionSwitcher({
                         {/* Title */}
                         <div className="flex items-center gap-2 mb-1">
                           {session.isChild && (
-                            <GitBranch className="w-3 h-3 text-cyber-cyan/70 flex-shrink-0" />
+                            <GitBranch className="w-3 h-3 text-accent-primary/70 flex-shrink-0" />
                           )}
-                          <span className="text-sm text-ui-primary font-medium truncate group-data-[selected=true]:text-cyber-cyan">
+                          <span className="text-sm text-ui-primary font-medium truncate group-data-[selected=true]:text-accent-primary">
                             {session.title || session.name || 'Untitled session'}
                           </span>
                           {isActive && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-cyber-cyan/20 text-cyber-cyan rounded border border-cyber-cyan/30 flex-shrink-0">
+                            <span className="text-[10px] px-1.5 py-0.5 bg-accent-primary/20 text-accent-primary rounded border border-accent-primary/30 flex-shrink-0">
                               active
                             </span>
                           )}
                           {isThinking && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-cyber-purple/20 text-cyber-purple rounded border border-cyber-purple/30 flex-shrink-0">
+                            <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30 flex-shrink-0">
                               thinking
                             </span>
                           )}
                           {session.isDelegation && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-cyber-purple/20 text-cyber-purple rounded border border-cyber-purple/30 flex-shrink-0">
+                            <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30 flex-shrink-0">
                               delegated
                             </span>
                           )}
@@ -273,14 +273,14 @@ export function SessionSwitcher({
                       key={session.session_id}
                       value={session.session_id}
                       onSelect={() => handleSelectSession(session.session_id)}
-                      className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-cyber-border/20 cursor-pointer transition-colors data-[selected=true]:bg-cyber-cyan/15 data-[selected=true]:border-cyber-cyan/35 hover:bg-cyber-surface/60 hover:border-cyber-border/40 group"
+                      className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40 group"
                     >
                       {/* Status indicator */}
                       <div className="flex-shrink-0 pt-1">
                         {isActive ? (
-                          <span className="w-2 h-2 rounded-full bg-cyber-cyan animate-pulse" />
+                          <span className="w-2 h-2 rounded-full bg-accent-primary animate-pulse" />
                         ) : isThinking ? (
-                          <span className="w-2 h-2 rounded-full bg-cyber-purple animate-pulse" />
+                          <span className="w-2 h-2 rounded-full bg-accent-tertiary animate-pulse" />
                         ) : (
                           <span className="w-2 h-2 rounded-full bg-ui-muted" />
                         )}
@@ -291,23 +291,23 @@ export function SessionSwitcher({
                         {/* Title */}
                         <div className="flex items-center gap-2 mb-1">
                           {session.isChild && (
-                            <GitBranch className="w-3 h-3 text-cyber-cyan/70 flex-shrink-0" />
+                            <GitBranch className="w-3 h-3 text-accent-primary/70 flex-shrink-0" />
                           )}
-                          <span className="text-sm text-ui-primary font-medium truncate group-data-[selected=true]:text-cyber-cyan">
+                          <span className="text-sm text-ui-primary font-medium truncate group-data-[selected=true]:text-accent-primary">
                             {session.title || session.name || 'Untitled session'}
                           </span>
                           {isActive && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-cyber-cyan/20 text-cyber-cyan rounded border border-cyber-cyan/30 flex-shrink-0">
+                            <span className="text-[10px] px-1.5 py-0.5 bg-accent-primary/20 text-accent-primary rounded border border-accent-primary/30 flex-shrink-0">
                               active
                             </span>
                           )}
                           {isThinking && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-cyber-purple/20 text-cyber-purple rounded border border-cyber-purple/30 flex-shrink-0">
+                            <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30 flex-shrink-0">
                               thinking
                             </span>
                           )}
                           {session.isDelegation && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-cyber-purple/20 text-cyber-purple rounded border border-cyber-purple/30 flex-shrink-0">
+                            <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30 flex-shrink-0">
                               delegated
                             </span>
                           )}
@@ -336,17 +336,17 @@ export function SessionSwitcher({
             )}
             
             {/* Actions */}
-            <Command.Separator className="my-2 border-t border-cyber-border/40" />
+            <Command.Separator className="my-2 border-t border-surface-border/40" />
             
             <Command.Group heading="Actions">
               <Command.Item
                 onSelect={handleNewSession}
                 disabled={!connected}
-                className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-cyber-border/20 cursor-pointer transition-colors data-[selected=true]:bg-cyber-cyan/15 data-[selected=true]:border-cyber-cyan/35 hover:bg-cyber-surface/60 hover:border-cyber-border/40 data-[disabled=true]:opacity-50 data-[disabled=true]:cursor-not-allowed"
+                className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40 data-[disabled=true]:opacity-50 data-[disabled=true]:cursor-not-allowed"
               >
-                <Plus className="w-4 h-4 text-cyber-cyan flex-shrink-0" />
+                <Plus className="w-4 h-4 text-accent-primary flex-shrink-0" />
                 <span className="flex-1 text-sm text-ui-primary">New Session</span>
-                <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-cyber-bg border border-cyber-border rounded text-ui-muted">
+                <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-muted">
                   {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}N
                 </kbd>
               </Command.Item>

@@ -51,7 +51,7 @@ export function ActivitySection({
       {/* Header */}
       <button
         onClick={() => setIsExpanded(!isExpanded)}
-        className="flex items-center gap-2 w-full text-left px-3 py-2 rounded-md bg-cyber-surface/30 hover:bg-cyber-surface/50 border border-cyber-border/20 transition-colors"
+        className="flex items-center gap-2 w-full text-left px-3 py-2 rounded-md bg-surface-elevated/30 hover:bg-surface-elevated/50 border border-surface-border/20 transition-colors"
       >
         <span className="text-ui-secondary flex-shrink-0">
           {isExpanded ? (
@@ -69,15 +69,15 @@ export function ActivitySection({
           {totalDelegations > 0 && `${totalDelegations} delegation${totalDelegations !== 1 ? 's' : ''}`}
         </span>
         {isActive && (
-          <Loader className="w-3.5 h-3.5 text-cyber-purple animate-spin ml-auto" />
+          <Loader className="w-3.5 h-3.5 text-accent-tertiary animate-spin ml-auto" />
         )}
         {!isActive && failedTools > 0 && (
-          <span className="text-[10px] text-cyber-orange ml-auto">
+          <span className="text-[10px] text-status-warning ml-auto">
             {failedTools} failed
           </span>
         )}
         {!isActive && failedTools === 0 && completedTools > 0 && (
-          <span className="text-[10px] text-cyber-lime ml-auto">
+          <span className="text-[10px] text-status-success ml-auto">
             {completedTools}/{totalTools} completed
           </span>
         )}

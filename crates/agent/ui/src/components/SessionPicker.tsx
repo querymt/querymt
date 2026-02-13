@@ -120,10 +120,10 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
         <button
           onClick={() => onSelectSession(session.session_id)}
           disabled={disabled}
-          className={`w-full text-left px-4 py-3 bg-cyber-surface/40 hover:bg-cyber-surface border ${
-            isChild ? 'border-l-2 border-l-cyber-cyan/60' : ''
-          } border-cyber-border/35 hover:border-cyber-cyan/30 rounded-lg transition-all duration-200 group session-card disabled:opacity-50 disabled:cursor-not-allowed overflow-visible ${indentClass} ${
-            isActive ? 'ring-2 ring-cyber-cyan/35 bg-cyber-surface/60' : ''
+          className={`w-full text-left px-4 py-3 bg-surface-elevated/40 hover:bg-surface-elevated border ${
+            isChild ? 'border-l-2 border-l-accent-primary/60' : ''
+          } border-surface-border/35 hover:border-accent-primary/30 rounded-lg transition-all duration-200 group session-card disabled:opacity-50 disabled:cursor-not-allowed overflow-visible ${indentClass} ${
+            isActive ? 'ring-2 ring-accent-primary/35 bg-surface-elevated/60' : ''
           }`}
           style={{
             animation: `session-card-entrance 0.3s ease-out ${sessionIndex * 0.05}s both`,
@@ -131,31 +131,31 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
           }}
         >
           {/* Title with optional child indicator */}
-          <div className="font-medium text-ui-primary mb-1 group-hover:text-cyber-cyan transition-colors flex items-center gap-2">
+          <div className="font-medium text-ui-primary mb-1 group-hover:text-accent-primary transition-colors flex items-center gap-2">
             {isChild && (
-              <GitBranch className="w-3.5 h-3.5 text-cyber-cyan/70 flex-shrink-0" />
+              <GitBranch className="w-3.5 h-3.5 text-accent-primary/70 flex-shrink-0" />
             )}
             <span className={isChild ? 'text-sm' : ''}>
               {session.title || session.name || 'Untitled session'}
             </span>
             {isActive && (
               <span className="flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-cyber-cyan animate-pulse" />
-                <span className="text-[10px] px-1.5 py-0.5 bg-cyber-cyan/20 text-cyber-cyan rounded border border-cyber-cyan/30">
+                <span className="w-2 h-2 rounded-full bg-accent-primary animate-pulse" />
+                <span className="text-[10px] px-1.5 py-0.5 bg-accent-primary/20 text-accent-primary rounded border border-accent-primary/30">
                   active
                 </span>
               </span>
             )}
             {isThinking && (
               <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-cyber-purple animate-pulse" />
-                <span className="text-[10px] px-1.5 py-0.5 bg-cyber-purple/20 text-cyber-purple rounded border border-cyber-purple/30">
+                <span className="w-2 h-2 rounded-full bg-accent-tertiary animate-pulse" />
+                <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30">
                   thinking
                 </span>
               </span>
             )}
             {isDelegation && (
-              <span className="text-[10px] px-1.5 py-0.5 bg-cyber-purple/20 text-cyber-purple rounded border border-cyber-purple/30">
+              <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30">
                 delegated
               </span>
             )}
@@ -193,7 +193,7 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
       <div className="relative z-10 w-full max-w-4xl animate-fade-in">
         {/* Header */}
         <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold text-cyber-cyan neon-text-cyan mb-2">
+          <h1 className="text-3xl font-bold text-accent-primary glow-text-primary mb-2">
             Select a Session
           </h1>
           <p className="text-ui-secondary text-sm">
@@ -204,13 +204,13 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
         {/* Filter input */}
         <div className="mb-6">
           <div className="relative">
-            <Search className="absolute left-4 top-1/2 transform -translate-y-1/2 w-5 h-5 text-cyber-cyan" />
+            <Search className="absolute left-4 top-1/2 transform -translate-y-1/2 w-5 h-5 text-accent-primary" />
             <input
               type="text"
               placeholder="Filter by session ID or title..."
               value={filterText}
               onChange={(e) => setFilterText(e.target.value)}
-              className="w-full pl-12 pr-4 py-3 bg-cyber-surface border-2 border-cyber-border rounded-lg text-ui-primary placeholder:text-ui-muted focus:border-cyber-cyan focus:outline-none transition-colors session-filter-input"
+              className="w-full pl-12 pr-4 py-3 bg-surface-elevated border-2 border-surface-border rounded-lg text-ui-primary placeholder:text-ui-muted focus:border-accent-primary focus:outline-none transition-colors session-filter-input"
             />
           </div>
         </div>
@@ -235,13 +235,13 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
                   onOpenChange={() => toggleGroup(groupIndex)}
                 >
                   {/* Group header */}
-                  <Collapsible.Trigger className="w-full flex items-center gap-3 px-4 py-3 bg-cyber-surface/60 hover:bg-cyber-surface rounded-lg transition-colors session-group-header">
+                  <Collapsible.Trigger className="w-full flex items-center gap-3 px-4 py-3 bg-surface-elevated/60 hover:bg-surface-elevated rounded-lg transition-colors session-group-header">
                     {isExpanded ? (
-                      <ChevronDown className="w-5 h-5 text-cyber-cyan" />
+                      <ChevronDown className="w-5 h-5 text-accent-primary" />
                     ) : (
-                      <ChevronRight className="w-5 h-5 text-cyber-cyan" />
+                      <ChevronRight className="w-5 h-5 text-accent-primary" />
                     )}
-                    <span className="flex-1 text-left font-mono text-sm text-cyber-cyan">
+                    <span className="flex-1 text-left font-mono text-sm text-accent-primary">
                       {groupLabel}
                     </span>
                     <span className="text-xs text-ui-muted">
@@ -266,18 +266,18 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
           <button
             onClick={onNewSession}
             disabled={disabled}
-            className="px-8 py-4 rounded-lg font-medium text-base bg-cyber-cyan/10 border-2 border-cyber-cyan text-cyber-cyan hover:bg-cyber-cyan/20 hover:shadow-neon-cyan disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-200 flex items-center justify-center gap-3 mx-auto overflow-visible"
+            className="px-8 py-4 rounded-lg font-medium text-base bg-accent-primary/10 border-2 border-accent-primary text-accent-primary hover:bg-accent-primary/20 hover:shadow-glow-primary disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-200 flex items-center justify-center gap-3 mx-auto overflow-visible"
           >
             <Plus className="w-6 h-6" />
             <GlitchText text="Start New Session" variant="0" hoverOnly />
           </button>
           <p className="text-xs text-ui-muted mt-2">
             or press{' '}
-            <kbd className="px-2 py-1 bg-cyber-bg border border-cyber-border rounded text-cyber-cyan font-mono text-[10px]">
+            <kbd className="px-2 py-1 bg-surface-canvas border border-surface-border rounded text-accent-primary font-mono text-[10px]">
               {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+N
             </kbd>{' '}
             to create a session, or{' '}
-            <kbd className="px-2 py-1 bg-cyber-bg border border-cyber-border rounded text-cyber-cyan font-mono text-[10px]">
+            <kbd className="px-2 py-1 bg-surface-canvas border border-surface-border rounded text-accent-primary font-mono text-[10px]">
               {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+/
             </kbd>{' '}
             to open quick switcher

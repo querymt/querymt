@@ -2,16 +2,16 @@
  * Mode color utility - generates consistent colors for agent modes
  * 
  * Known modes (build, plan, review) use theme-derived accents when available.
- * Unknown modes get deterministic hash-based colors in the neon palette.
+ * Unknown modes get deterministic hash-based colors in the accent palette.
  */
 
 import { getDashboardTheme, type DashboardThemeId } from './dashboardThemes';
 
 // Known modes with fallback colors (RGB and hex for CSS usage)
 const KNOWN_MODE_FALLBACKS: Record<string, { rgb: string; hex: string }> = {
-  build: { rgb: '57, 255, 20', hex: '#39ff14' },      // cyber-lime
-  plan: { rgb: '255, 107, 53', hex: '#ff6b35' },      // cyber-orange
-  review: { rgb: '176, 38, 255', hex: '#b026ff' },    // cyber-purple
+  build: { rgb: '57, 255, 20', hex: '#39ff14' },      // status-success
+  plan: { rgb: '255, 107, 53', hex: '#ff6b35' },      // status-warning
+  review: { rgb: '176, 38, 255', hex: '#b026ff' },    // accent-tertiary
 };
 
 // Known modes mapped to base16 palette tokens for theme-aware accents
@@ -82,7 +82,7 @@ function hslToRgb(h: number, s: number, l: number): { r: number; g: number; b: n
 }
 
 /**
- * Generate a neon color from mode name hash
+ * Generate an accent color from mode name hash
  * Uses variant-aware saturation/lightness for contrast in dark/light themes
  */
 function hashToRgb(mode: string, variant: 'dark' | 'light'): { rgb: string; hex: string } {

@@ -76,7 +76,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
 
   const agentId = delegation.targetAgentId ?? delegation.agentId;
   const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
-  const agentColor = agentId ? getAgentColor(agentId) : 'rgb(var(--cyber-purple-rgb))';
+  const agentColor = agentId ? getAgentColor(agentId) : 'rgb(var(--accent-tertiary-rgb))';
   const stats = calculateDelegationStats(delegation);
   const objective = delegation.objective ??
     (delegation.delegateEvent.toolCall?.raw_input as { objective?: string } | undefined)?.objective;
@@ -106,9 +106,9 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
   return (
     <Dialog.Root open onOpenChange={(open) => { if (!open) onClose(); }}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-40 bg-cyber-bg/70" />
+        <Dialog.Overlay className="fixed inset-0 z-40 bg-surface-canvas/70" />
         <Dialog.Content
-          className="fixed top-0 right-0 z-50 h-full bg-cyber-surface border-l border-cyber-border shadow-[0_0_30px_rgba(var(--cyber-cyan-rgb),0.12)] flex flex-col"
+          className="fixed top-0 right-0 z-50 h-full bg-surface-elevated border-l border-surface-border shadow-[0_0_30px_rgba(var(--accent-primary-rgb),0.12)] flex flex-col"
           style={{ width: isMobile ? '100%' : `${drawerWidth}px` }}
           aria-describedby={undefined}
           onOpenAutoFocus={(e) => e.preventDefault()}
@@ -117,13 +117,13 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
           {!isMobile && (
             <div
               onMouseDown={handleDragStart}
-              className="absolute left-0 top-0 h-full w-1.5 cursor-col-resize bg-cyber-border/40 hover:bg-cyber-cyan/60 transition-colors"
+              className="absolute left-0 top-0 h-full w-1.5 cursor-col-resize bg-surface-border/40 hover:bg-accent-primary/60 transition-colors"
               title="Drag to resize"
             />
           )}
 
           {/* Header */}
-          <div className="group px-5 py-4 border-b border-cyber-border/50 flex items-start justify-between gap-3">
+          <div className="group px-5 py-4 border-b border-surface-border/50 flex items-start justify-between gap-3">
             <div className="flex-1">
               <div className="flex items-center gap-2 flex-wrap">
                 <span
@@ -150,7 +150,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                   >
                     <button
                       type="button"
-                      className="text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-ui-secondary truncate max-w-[160px] hover:border-cyber-cyan/40 hover:text-ui-secondary cursor-pointer transition-colors"
+                      className="text-[10px] leading-none px-1.5 py-px rounded bg-surface-elevated/60 border border-surface-border/40 text-ui-secondary truncate max-w-[160px] hover:border-accent-primary/40 hover:text-ui-secondary cursor-pointer transition-colors"
                       title={modelLabel}
                     >
                       {modelLabel}
@@ -158,7 +158,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                   </ModelConfigPopover>
                 ) : modelLabel ? (
                   <span
-                    className="text-[10px] leading-none px-1.5 py-px rounded bg-cyber-surface/60 border border-cyber-border/40 text-ui-secondary truncate max-w-[160px] cursor-default"
+                    className="text-[10px] leading-none px-1.5 py-px rounded bg-surface-elevated/60 border border-surface-border/40 text-ui-secondary truncate max-w-[160px] cursor-default"
                     title={modelLabel}
                   >
                     {modelLabel}
@@ -172,13 +172,13 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                 {objective && (
                   <button
                     onClick={() => copyToClipboard(objective, 'delegation-objective')}
-                    className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-cyber-bg/50"
+                    className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-surface-canvas/50"
                     title="Copy objective"
                   >
                     {copiedValue === 'delegation-objective' ? (
-                      <Check className="w-3.5 h-3.5 text-cyber-lime" />
+                      <Check className="w-3.5 h-3.5 text-status-success" />
                     ) : (
-                      <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-cyber-cyan" />
+                      <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-accent-primary" />
                     )}
                   </button>
                 )}
@@ -186,8 +186,8 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
               {/* Delegation stats */}
               <div className="flex items-center gap-3 mt-1.5 text-[10px]">
                 <span className={`flex items-center gap-1 ${
-                  (stats.contextPercent ?? 0) >= 80 ? 'text-cyber-orange' :
-                  (stats.contextPercent ?? 0) >= 70 ? 'text-cyber-cyan' :
+                  (stats.contextPercent ?? 0) >= 80 ? 'text-status-warning' :
+                  (stats.contextPercent ?? 0) >= 70 ? 'text-accent-primary' :
                   'text-ui-secondary'
                 }`}>
                   <Cpu className="w-3 h-3" />
@@ -197,15 +197,15 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                       ? formatTokensAbbrev(stats.contextTokens)
                       : '—'}
                 </span>
-                <span className="text-cyber-border/60">·</span>
+                <span className="text-surface-border/60">·</span>
                 <span className="flex items-center gap-1 text-ui-secondary">
                   <Wrench className="w-3 h-3" />
                   {stats.toolCallCount} call{stats.toolCallCount === 1 ? '' : 's'}
                 </span>
                 {stats.costUsd > 0 && (
                   <>
-                    <span className="text-cyber-border/60">·</span>
-                    <span className="flex items-center gap-1 text-cyber-cyan">
+                    <span className="text-surface-border/60">·</span>
+                    <span className="flex items-center gap-1 text-accent-primary">
                       <DollarSign className="w-3 h-3" />
                       {formatCost(stats.costUsd)}
                     </span>
@@ -214,7 +214,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
               </div>
             </div>
             <Dialog.Close
-              className="p-2 rounded-md hover:bg-cyber-bg/70 transition-colors text-ui-secondary hover:text-ui-primary"
+              className="p-2 rounded-md hover:bg-surface-canvas/70 transition-colors text-ui-secondary hover:text-ui-primary"
               aria-label="Close delegation details"
             >
               <X className="w-4 h-4" />
@@ -245,7 +245,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                     ? getAgentColor(eventAgentId)
                     : agentColor;
                   return (
-                    <div key={event.id} className="group/message rounded-md border border-cyber-border/40 bg-cyber-bg/40 px-3 py-2">
+                    <div key={event.id} className="group/message rounded-md border border-surface-border/40 bg-surface-canvas/40 px-3 py-2">
                       <div className="flex items-center gap-2 mb-1">
                         <span
                           className="text-[10px] font-semibold uppercase tracking-wide"
@@ -258,13 +258,13 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                         </span>
                         <button
                           onClick={() => copyToClipboard(event.content, `delegation-message-${event.id}`)}
-                          className="opacity-0 group-hover/message:opacity-100 transition-opacity p-1 rounded hover:bg-cyber-bg/50"
+                          className="opacity-0 group-hover/message:opacity-100 transition-opacity p-1 rounded hover:bg-surface-canvas/50"
                           title="Copy message"
                         >
                           {copiedValue === `delegation-message-${event.id}` ? (
-                            <Check className="w-3.5 h-3.5 text-cyber-lime" />
+                            <Check className="w-3.5 h-3.5 text-status-success" />
                           ) : (
-                            <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-cyber-cyan" />
+                            <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-accent-primary" />
                           )}
                         </button>
                       </div>

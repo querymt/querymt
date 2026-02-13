@@ -62,18 +62,18 @@ export function ModelConfigPopover({
         <Popover.Content
           align="end"
           sideOffset={8}
-          className="z-50 w-96 rounded-lg border border-cyber-cyan/30 bg-cyber-bg shadow-lg shadow-cyber-cyan/25 animate-fade-in"
+          className="z-50 w-96 rounded-lg border border-accent-primary/30 bg-surface-canvas shadow-lg shadow-accent-primary/25 animate-fade-in"
           onOpenAutoFocus={(e) => e.preventDefault()}
         >
           {/* Header */}
-          <div className="flex items-center justify-between px-3 py-2 border-b border-cyber-border/40">
+          <div className="flex items-center justify-between px-3 py-2 border-b border-surface-border/40">
             <div className="flex items-center gap-2">
-              <Cpu className="w-3.5 h-3.5 text-cyber-cyan" />
+              <Cpu className="w-3.5 h-3.5 text-accent-primary" />
               <span className="text-xs font-semibold text-ui-secondary uppercase tracking-wider">
                 Model Config
               </span>
             </div>
-            <Popover.Close className="p-1 rounded text-ui-secondary hover:text-ui-primary hover:bg-cyber-surface/60 transition-colors">
+            <Popover.Close className="p-1 rounded text-ui-secondary hover:text-ui-primary hover:bg-surface-elevated/60 transition-colors">
               <X className="h-3.5 w-3.5" />
             </Popover.Close>
           </div>
@@ -82,7 +82,7 @@ export function ModelConfigPopover({
           <div className="px-3 py-2">
             {loading ? (
               <div className="flex items-center justify-center py-4">
-                <Loader className="w-5 h-5 animate-spin text-cyber-cyan" />
+                <Loader className="w-5 h-5 animate-spin text-accent-primary" />
               </div>
             ) : config ? (
               <div className="space-y-2">
@@ -102,7 +102,7 @@ export function ModelConfigPopover({
 
                 {/* Parameters */}
                 {config.params && Object.keys(config.params).length > 0 && (
-                  <div className="pt-2 border-t border-cyber-border/30">
+                  <div className="pt-2 border-t border-surface-border/30">
                     <span className="text-[10px] uppercase tracking-widest text-ui-muted block mb-1">
                       Parameters
                     </span>
@@ -121,7 +121,7 @@ export function ModelConfigPopover({
 
                 {/* No params message */}
                 {(!config.params || Object.keys(config.params).length === 0) && (
-                  <div className="pt-2 border-t border-cyber-border/30">
+                  <div className="pt-2 border-t border-surface-border/30">
                     <span className="text-[10px] text-ui-muted italic">
                       Default parameters
                     </span>

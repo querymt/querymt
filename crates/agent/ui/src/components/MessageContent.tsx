@@ -76,11 +76,11 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
     const attachmentElements = attachments.length > 0 ? (
       <div className="mt-3 space-y-1.5">
         {attachments.map((att, i) => (
-          <details key={i} className="border border-cyber-border/40 rounded-md overflow-hidden">
-            <summary className="px-3 py-1.5 text-xs font-mono text-ui-secondary bg-cyber-surface/40 cursor-pointer hover:text-ui-secondary hover:bg-cyber-surface/60 transition-colors select-none">
+          <details key={i} className="border border-surface-border/40 rounded-md overflow-hidden">
+            <summary className="px-3 py-1.5 text-xs font-mono text-ui-secondary bg-surface-elevated/40 cursor-pointer hover:text-ui-secondary hover:bg-surface-elevated/60 transition-colors select-none">
               {att.kind === 'dir' ? '\uD83D\uDCC1' : '\uD83D\uDCCE'} {att.name}
             </summary>
-            <div className="px-3 py-2 bg-cyber-bg/30 border-t border-cyber-border/30">
+            <div className="px-3 py-2 bg-surface-canvas/30 border-t border-surface-border/30">
               <pre className="text-[11px] font-mono text-ui-secondary whitespace-pre-wrap break-words leading-tight overflow-auto max-h-64">
                 {att.body}
               </pre>
@@ -97,13 +97,13 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
         const { inline, className, children, ...rest } = props;
         const isInline = inline ?? !className;
         return !isInline ? (
-          <pre className="my-3 bg-cyber-bg/70 border border-cyber-border rounded-md p-3 overflow-x-auto font-mono text-sm">
+          <pre className="my-3 bg-surface-canvas/70 border border-surface-border rounded-md p-3 overflow-x-auto font-mono text-sm">
             <code className={className} {...rest}>
               {children}
             </code>
           </pre>
         ) : (
-          <code className="bg-cyber-bg/50 px-1.5 py-0.5 rounded text-cyber-cyan font-mono text-sm" {...rest}>
+          <code className="bg-surface-canvas/50 px-1.5 py-0.5 rounded text-accent-primary font-mono text-sm" {...rest}>
             {children}
           </code>
         );
@@ -112,7 +112,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       a(props: ComponentPropsWithoutRef<'a'>) {
         const { children, ...rest } = props;
         return (
-          <a className="text-cyber-cyan hover:text-cyber-magenta transition-colors underline" {...rest}>
+          <a className="text-accent-primary hover:text-accent-secondary transition-colors underline" {...rest}>
             {children}
           </a>
         );
@@ -155,7 +155,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       h1(props: ComponentPropsWithoutRef<'h1'>) {
         const { children, ...rest } = props;
         return (
-          <h1 className="text-lg font-semibold mt-4 mb-2 text-cyber-cyan" {...rest}>
+          <h1 className="text-lg font-semibold mt-4 mb-2 text-accent-primary" {...rest}>
             {children}
           </h1>
         );
@@ -163,7 +163,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       h2(props: ComponentPropsWithoutRef<'h2'>) {
         const { children, ...rest } = props;
         return (
-          <h2 className="text-base font-semibold mt-3 mb-2 text-cyber-cyan" {...rest}>
+          <h2 className="text-base font-semibold mt-3 mb-2 text-accent-primary" {...rest}>
             {children}
           </h2>
         );
@@ -180,7 +180,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       blockquote(props: ComponentPropsWithoutRef<'blockquote'>) {
         const { children, ...rest } = props;
         return (
-          <blockquote className="my-2 pl-4 border-l-2 border-cyber-cyan/50 text-ui-secondary italic text-sm" {...rest}>
+          <blockquote className="my-2 pl-4 border-l-2 border-accent-primary/50 text-ui-secondary italic text-sm" {...rest}>
             {children}
           </blockquote>
         );

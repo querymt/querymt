@@ -36,7 +36,7 @@ export function DelegationDetailPanel({
 
   const agentId = delegation.targetAgentId ?? delegation.agentId;
   const agentName = agentId ? getAgentShortName(agentId, agents) : 'Sub-agent';
-  const agentColor = agentId ? getAgentColor(agentId) : 'rgb(var(--cyber-purple-rgb))';
+  const agentColor = agentId ? getAgentColor(agentId) : 'rgb(var(--accent-tertiary-rgb))';
   const durationLabel = formatDurationFromTimestamps(delegation.startTime, delegation.endTime);
   const stats = calculateDelegationStats(delegation);
   const objective = delegation.objective ??
@@ -44,7 +44,7 @@ export function DelegationDetailPanel({
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
-      <div className="group px-6 py-4 border-b border-cyber-border/50 bg-cyber-surface/40">
+      <div className="group px-6 py-4 border-b border-surface-border/50 bg-surface-elevated/40">
         <div className="flex items-center gap-2">
           <span
             className="text-xs font-semibold uppercase tracking-wide px-2 py-0.5 rounded"
@@ -58,10 +58,10 @@ export function DelegationDetailPanel({
           </span>
           <span className="flex-shrink-0">
             {delegation.status === 'completed' && (
-              <CheckCircle className="w-3.5 h-3.5 text-cyber-lime" />
+              <CheckCircle className="w-3.5 h-3.5 text-status-success" />
             )}
             {delegation.status === 'failed' && (
-              <XCircle className="w-3.5 h-3.5 text-cyber-orange" />
+              <XCircle className="w-3.5 h-3.5 text-status-warning" />
             )}
           </span>
           <span className="text-xs text-ui-secondary truncate flex-1">
@@ -70,13 +70,13 @@ export function DelegationDetailPanel({
           {objective && (
             <button
               onClick={() => copyToClipboard(objective, 'delegation-detail-objective')}
-              className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-cyber-bg/50"
+              className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-surface-canvas/50"
               title="Copy objective"
             >
               {copiedValue === 'delegation-detail-objective' ? (
-                <Check className="w-3.5 h-3.5 text-cyber-lime" />
+                <Check className="w-3.5 h-3.5 text-status-success" />
               ) : (
-                <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-cyber-cyan" />
+                <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-accent-primary" />
               )}
             </button>
           )}
@@ -89,8 +89,8 @@ export function DelegationDetailPanel({
         <div className="flex items-center gap-3 mt-2 text-[11px]">
           {/* Context usage */}
           <span className={`flex items-center gap-1 ${
-            (stats.contextPercent ?? 0) >= 80 ? 'text-cyber-orange' :
-            (stats.contextPercent ?? 0) >= 70 ? 'text-cyber-cyan' :
+            (stats.contextPercent ?? 0) >= 80 ? 'text-status-warning' :
+            (stats.contextPercent ?? 0) >= 70 ? 'text-accent-primary' :
             'text-ui-secondary'
           }`}>
             <Cpu className="w-3 h-3" />
@@ -100,17 +100,17 @@ export function DelegationDetailPanel({
                 ? formatTokensAbbrev(stats.contextTokens)
                 : 'no ctx data'}
           </span>
-          <span className="text-cyber-border/60">·</span>
+          <span className="text-surface-border/60">·</span>
           <span className="flex items-center gap-1 text-ui-secondary">
             <Wrench className="w-3 h-3" />
             {stats.toolCallCount} tool call{stats.toolCallCount === 1 ? '' : 's'}
           </span>
-          <span className="text-cyber-border/60">·</span>
+          <span className="text-surface-border/60">·</span>
           <span className="text-ui-secondary">{stats.messageCount} message{stats.messageCount === 1 ? '' : 's'}</span>
           {stats.costUsd > 0 && (
             <>
-              <span className="text-cyber-border/60">·</span>
-              <span className="flex items-center gap-1 text-cyber-cyan">
+              <span className="text-surface-border/60">·</span>
+              <span className="flex items-center gap-1 text-accent-primary">
                 <DollarSign className="w-3 h-3" />
                 {formatCost(stats.costUsd)}
               </span>

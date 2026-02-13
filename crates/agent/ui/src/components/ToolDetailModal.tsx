@@ -51,24 +51,24 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
   return (
     <Dialog.Root open onOpenChange={(open) => { if (!open) onClose(); }}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-cyber-bg/80 animate-fade-in" />
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-surface-canvas/80 animate-fade-in" />
         <Dialog.Content
           className="
             fixed z-50 top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2
             w-[96vw] max-w-none h-[85vh] max-h-[900px]
-            bg-cyber-surface border border-cyber-cyan/30 rounded-lg
-            shadow-lg shadow-cyber-cyan/25
+            bg-surface-elevated border border-accent-primary/30 rounded-lg
+            shadow-lg shadow-accent-primary/25
             flex flex-col overflow-hidden
             animate-fade-in
           "
           aria-describedby={undefined}
         >
           {/* Header */}
-          <div className="flex items-center justify-between px-5 py-3 border-b border-cyber-border bg-cyber-bg/50">
+          <div className="flex items-center justify-between px-5 py-3 border-b border-surface-border bg-surface-canvas/50">
             <div className="flex items-center gap-3">
               <span className="text-xl">{summary.icon}</span>
               <div>
-                <Dialog.Title className="text-lg font-semibold text-cyber-cyan">
+                <Dialog.Title className="text-lg font-semibold text-accent-primary">
                   {summary.name}
                 </Dialog.Title>
                 {summary.keyParam && (
@@ -82,19 +82,19 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
               {/* Status */}
               <div className="flex items-center gap-2">
                 {isInProgress && (
-                  <span className="flex items-center gap-1.5 text-xs text-cyber-purple">
+                  <span className="flex items-center gap-1.5 text-xs text-accent-tertiary">
                     <Loader className="w-4 h-4 animate-spin" />
                     Running...
                   </span>
                 )}
                 {isCompleted && (
-                  <span className="flex items-center gap-1.5 text-xs text-cyber-lime">
+                  <span className="flex items-center gap-1.5 text-xs text-status-success">
                     <CheckCircle className="w-4 h-4" />
                     Completed
                   </span>
                 )}
                 {isFailed && (
-                  <span className="flex items-center gap-1.5 text-xs text-cyber-orange">
+                  <span className="flex items-center gap-1.5 text-xs text-status-warning">
                     <XCircle className="w-4 h-4" />
                     Failed
                   </span>
@@ -106,7 +106,7 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
                 {new Date(event.timestamp).toLocaleTimeString()}
               </span>
               {/* Close button */}
-              <Dialog.Close className="p-1.5 rounded hover:bg-cyber-bg transition-colors text-ui-secondary hover:text-ui-primary">
+              <Dialog.Close className="p-1.5 rounded hover:bg-surface-canvas transition-colors text-ui-secondary hover:text-ui-primary">
                 <X className="w-5 h-5" />
               </Dialog.Close>
             </div>
@@ -197,7 +197,7 @@ function Section({
         {copyable && onCopy && (
           <button
             onClick={onCopy}
-            className="flex items-center gap-1 text-xs text-ui-muted hover:text-cyber-cyan transition-colors"
+            className="flex items-center gap-1 text-xs text-ui-muted hover:text-accent-primary transition-colors"
           >
             {copied ? (
               <>
@@ -213,7 +213,7 @@ function Section({
           </button>
         )}
       </div>
-      <div className="rounded-md border border-cyber-border/50 bg-cyber-bg/50 overflow-hidden">
+      <div className="rounded-md border border-surface-border/50 bg-surface-canvas/50 overflow-hidden">
         {children}
       </div>
     </div>
@@ -265,7 +265,7 @@ function DiffView({
       return (
         <div>
           <div className="text-[11px] text-ui-secondary mb-2 font-mono">
-            Writing to: <span className="text-cyber-cyan">{filePath as string}</span>
+            Writing to: <span className="text-accent-primary">{filePath as string}</span>
           </div>
           <div className="event-diff-container m-0 border-0">
             <PatchDiff
@@ -351,16 +351,16 @@ function ShellResultView({ event }: { event: EventItem }) {
   return (
     <div className="font-mono text-xs">
       {/* Header with exit code */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-cyber-border/50 bg-cyber-bg/50">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-surface-border/50 bg-surface-canvas/50">
         <span className="text-ui-muted uppercase tracking-wide text-[10px]">Terminal Output</span>
         {exitCode !== undefined && (
-          <span className={`text-[10px] ${exitCode === 0 ? 'text-cyber-lime' : 'text-cyber-orange'}`}>
+          <span className={`text-[10px] ${exitCode === 0 ? 'text-status-success' : 'text-status-warning'}`}>
             exit {exitCode}
           </span>
         )}
       </div>
       
-      <div className="p-4 space-y-3 max-h-96 overflow-auto bg-cyber-bg/60">
+      <div className="p-4 space-y-3 max-h-96 overflow-auto bg-surface-canvas/60">
         {stdout && (
           <div>
             <div className="text-[10px] uppercase tracking-wide text-ui-muted mb-1">stdout</div>
@@ -370,7 +370,7 @@ function ShellResultView({ event }: { event: EventItem }) {
         {stderr && (
           <div>
             <div className="text-[10px] uppercase tracking-wide text-ui-muted mb-1">stderr</div>
-            <pre className="whitespace-pre-wrap break-words text-cyber-orange/80">{stderr}</pre>
+            <pre className="whitespace-pre-wrap break-words text-status-warning/80">{stderr}</pre>
           </div>
         )}
         {!stdout && !stderr && (
@@ -397,8 +397,8 @@ function FileReadView({ event }: { event: EventItem }) {
   return (
     <div className="text-xs">
       {/* Header with file info */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-cyber-border/50 bg-cyber-bg/50">
-        <span className="text-cyber-cyan truncate max-w-lg font-mono">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-surface-border/50 bg-surface-canvas/50">
+        <span className="text-accent-primary truncate max-w-lg font-mono">
           {filePath || 'File Content'}
         </span>
         {startLine !== undefined && endLine !== undefined && (
@@ -409,7 +409,7 @@ function FileReadView({ event }: { event: EventItem }) {
       </div>
       
       {/* Content with syntax highlighting */}
-      <div className="p-4 bg-cyber-bg">
+      <div className="p-4 bg-surface-canvas">
         {isMarkdown ? (
           <div className="prose prose-invert prose-sm max-w-none">
             <MessageContent content={content} />

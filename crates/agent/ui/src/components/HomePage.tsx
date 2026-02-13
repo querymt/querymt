@@ -69,9 +69,9 @@ export function HomePage() {
             disabled={!connected || loading}
             className="
               px-8 py-4 rounded-lg font-medium text-base
-              bg-cyber-cyan/10 border-2 border-cyber-cyan
-              text-cyber-cyan
-              hover:bg-cyber-cyan/20 hover:shadow-neon-cyan
+              bg-accent-primary/10 border-2 border-accent-primary
+              text-accent-primary
+              hover:bg-accent-primary/20 hover:shadow-glow-primary
               disabled:opacity-30 disabled:cursor-not-allowed
               transition-all duration-200
               flex items-center justify-center gap-3 mx-auto
@@ -91,7 +91,7 @@ export function HomePage() {
           </button>
           <p className="text-xs text-ui-muted mt-3">
             or press{' '}
-            <kbd className="px-2 py-1 bg-cyber-bg border border-cyber-border rounded text-cyber-cyan font-mono text-[10px]">
+            <kbd className="px-2 py-1 bg-surface-canvas border border-surface-border rounded text-accent-primary font-mono text-[10px]">
               {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+N
             </kbd>{' '}
             to create a session

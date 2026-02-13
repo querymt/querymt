@@ -43,7 +43,7 @@ export function SessionTimeline({
         label: turn.userMessage.content.slice(0, 50),
         size: 'large',
         opacity: 1,
-        color: 'cyber-magenta'
+        color: 'accent-secondary'
       });
     }
 
@@ -57,24 +57,24 @@ export function SessionTimeline({
       let dotType: TimelineDot['type'] = 'tool';
       let dotSize: TimelineDot['size'] = 'small';
       let dotOpacity = 0.5;
-      let dotColor = 'cyber-purple';
+      let dotColor = 'accent-tertiary';
 
       // Check if it's a delegation
       if (toolCall.isDelegateToolCall) {
         dotType = 'delegation';
         dotSize = 'medium';
         dotOpacity = 0.7;
-        dotColor = 'cyber-purple';
+        dotColor = 'accent-tertiary';
       } else if (toolCall.toolCall?.status === 'failed' || toolCall.mergedResult?.toolCall?.status === 'failed') {
         dotType = 'error';
         dotOpacity = 1;
-        dotColor = 'cyber-orange';
+        dotColor = 'status-warning';
       } else if (!toolCall.isMessage) {
         // Internal events
         dotType = 'internal';
         dotSize = 'tiny';
         dotOpacity = 0.25;
-        dotColor = 'cyber-cyan';
+        dotColor = 'accent-primary';
       }
 
       dots.push({
@@ -99,7 +99,7 @@ export function SessionTimeline({
         label: message.content.slice(0, 50),
         size: 'large',
         opacity: 0.8,
-        color: 'cyber-cyan'
+        color: 'accent-primary'
       });
     });
   });

@@ -337,23 +337,23 @@ export function AppShell() {
   }, []);
   
   return (
-    <div className="flex flex-col h-screen bg-cyber-bg text-ui-primary">
+    <div className="flex flex-col h-screen bg-surface-canvas text-ui-primary">
       {/* Header */}
-      <header className="flex items-center justify-between gap-4 px-6 py-4 bg-cyber-surface border-b border-cyber-border shadow-[0_0_20px_rgba(var(--cyber-cyan-rgb),0.05)]">
+      <header className="flex items-center justify-between gap-4 px-6 py-4 bg-surface-elevated border-b border-surface-border shadow-[0_0_20px_rgba(var(--accent-primary-rgb),0.05)]">
         {/* Left section */}
         <div className="flex items-center gap-3">
           <Link
             to="/"
             className={`p-2 rounded-lg transition-colors ${
               isHomePage
-                ? 'text-cyber-cyan/50 cursor-default'
-                : 'text-cyber-cyan hover:bg-cyber-bg'
+                ? 'text-accent-primary/50 cursor-default'
+                : 'text-accent-primary hover:bg-surface-canvas'
             }`}
             title="Home"
           >
             <Home className="w-5 h-5" />
           </Link>
-          <h1 className="text-xl font-semibold neon-text-cyan">
+          <h1 className="text-xl font-semibold glow-text-primary">
             <GlitchText text="QueryMT" variant="3" hoverOnly />
           </h1>
           
@@ -361,21 +361,21 @@ export function AppShell() {
           {sessionId && (
             <div className="flex items-center gap-2">
               {/* Combined session chip with mode */}
-              <div className="flex items-center rounded-lg border border-cyber-border bg-cyber-bg overflow-hidden">
+              <div className="flex items-center rounded-lg border border-surface-border bg-surface-canvas overflow-hidden">
                 {/* Session ID part - click to open session switcher */}
                 <button
                   type="button"
                   onClick={() => setSessionSwitcherOpen(true)}
                   title={`Click to switch sessions (${navigator.platform.includes('Mac') ? 'Cmd' : 'Ctrl'}+/)`}
-                  className="flex items-center gap-1.5 px-3 py-1.5 hover:bg-cyber-surface/50 transition-colors group"
+                  className="flex items-center gap-1.5 px-3 py-1.5 hover:bg-surface-elevated/50 transition-colors group"
                 >
                   <span
                     className={`w-2 h-2 rounded-full ${
                       isSessionActive
-                        ? 'bg-cyber-cyan animate-pulse'
+                        ? 'bg-accent-primary animate-pulse'
                         : isConversationComplete
                         ? 'bg-ui-muted'
-                        : 'bg-cyber-lime'
+                        : 'bg-status-success'
                     }`}
                     title={
                       isSessionActive
@@ -385,7 +385,7 @@ export function AppShell() {
                         : 'Idle'
                     }
                   />
-                  <span className="text-xs font-mono text-ui-secondary group-hover:text-cyber-cyan transition-colors">
+                  <span className="text-xs font-mono text-ui-secondary group-hover:text-accent-primary transition-colors">
                     {String(sessionId).substring(0, 12)}...
                   </span>
                   <span className="text-ui-muted">·</span>
@@ -396,7 +396,7 @@ export function AppShell() {
                   type="button"
                   onClick={cycleAgentMode}
                   title={`Mode: ${agentMode} (${navigator.platform.includes('Mac') ? '⌘E' : 'Ctrl+E'} to cycle)`}
-                  className="px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-cyber-surface/50"
+                  className="px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-surface-elevated/50"
                   style={{ color: 'var(--mode-color)' }}
                 >
                   {getModeDisplayName(agentMode)}
@@ -408,12 +408,12 @@ export function AppShell() {
                 type="button"
                 onClick={handleCopySessionId}
                 title="Copy session ID to clipboard"
-                className="p-1.5 rounded-lg border border-cyber-border bg-cyber-bg hover:border-cyber-cyan/60 hover:bg-cyber-surface/50 transition-colors"
+                className="p-1.5 rounded-lg border border-surface-border bg-surface-canvas hover:border-accent-primary/60 hover:bg-surface-elevated/50 transition-colors"
               >
                 {sessionCopied ? (
-                  <Check className="w-3.5 h-3.5 text-cyber-lime" />
+                  <Check className="w-3.5 h-3.5 text-status-success" />
                 ) : (
-                  <Copy className="w-3.5 h-3.5 text-ui-muted hover:text-cyber-cyan transition-colors" />
+                  <Copy className="w-3.5 h-3.5 text-ui-muted hover:text-accent-primary transition-colors" />
                 )}
               </button>
             </div>
@@ -458,17 +458,17 @@ export function AppShell() {
           <button
             type="button"
             onClick={() => setThemeSwitcherOpen(true)}
-            className="h-8 w-8 inline-flex items-center justify-center rounded-lg border border-cyber-border bg-cyber-bg/60 transition-colors hover:border-cyber-cyan/40"
+            className="h-8 w-8 inline-flex items-center justify-center rounded-lg border border-surface-border bg-surface-canvas/60 transition-colors hover:border-accent-primary/40"
             title={`Dashboard theme: ${selectedThemeLabel} (Ctrl+X then T)`}
             aria-label="Open theme switcher"
           >
-            <Palette className="w-3.5 h-3.5 text-cyber-cyan" />
+            <Palette className="w-3.5 h-3.5 text-accent-primary" />
           </button>
           
           {/* Connection status dot */}
           <div
             className={`w-3 h-3 rounded-full transition-colors ${
-              connected ? 'bg-cyber-lime' : 'bg-cyber-orange'
+              connected ? 'bg-status-success' : 'bg-status-warning'
             }`}
             title={connected ? 'Connected' : 'Disconnected'}
           />

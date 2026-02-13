@@ -89,7 +89,7 @@ export function getFileIcon(extension?: string, isDir?: boolean): LucideIcon {
  */
 export function getFileIconColor(extension?: string, isDir?: boolean): string {
   if (isDir) {
-    return 'text-cyber-purple';
+    return 'text-accent-tertiary';
   }
 
   if (!extension) {
@@ -98,31 +98,31 @@ export function getFileIconColor(extension?: string, isDir?: boolean): string {
 
   const colorMap: Record<string, string> = {
     // TypeScript - cyan
-    'ts': 'text-cyber-cyan',
-    'tsx': 'text-cyber-cyan',
+    'ts': 'text-accent-primary',
+    'tsx': 'text-accent-primary',
     
     // JavaScript - lime
-    'js': 'text-cyber-lime',
-    'jsx': 'text-cyber-lime',
-    'mjs': 'text-cyber-lime',
-    'cjs': 'text-cyber-lime',
+    'js': 'text-status-success',
+    'jsx': 'text-status-success',
+    'mjs': 'text-status-success',
+    'cjs': 'text-status-success',
     
     // Rust - orange
-    'rs': 'text-cyber-orange',
-    'toml': 'text-cyber-orange',
+    'rs': 'text-status-warning',
+    'toml': 'text-status-warning',
     
     // JSON - lime
-    'json': 'text-cyber-lime',
+    'json': 'text-status-success',
     
     // Styles - magenta
-    'css': 'text-cyber-magenta',
-    'scss': 'text-cyber-magenta',
-    'sass': 'text-cyber-magenta',
-    'less': 'text-cyber-magenta',
+    'css': 'text-accent-secondary',
+    'scss': 'text-accent-secondary',
+    'sass': 'text-accent-secondary',
+    'less': 'text-accent-secondary',
     
     // Markdown - cyan
-    'md': 'text-cyber-cyan',
-    'mdx': 'text-cyber-cyan',
+    'md': 'text-accent-primary',
+    'mdx': 'text-accent-primary',
   };
 
   return colorMap[extension.toLowerCase()] || 'text-ui-secondary';

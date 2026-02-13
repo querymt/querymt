@@ -13,17 +13,17 @@ interface TodoRailProps {
 export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyChangedIds }: TodoRailProps) {
   if (collapsed) {
     return (
-      <div className="w-8 border-l border-cyber-border/50 bg-cyber-bg/60 backdrop-blur-sm flex flex-col items-center py-4 relative">
+      <div className="w-8 border-l border-surface-border/50 bg-surface-canvas/60 backdrop-blur-sm flex flex-col items-center py-4 relative">
         <button
           onClick={onToggleCollapse}
           className="
             absolute top-4 left-0 right-0 mx-auto
             w-6 h-6 rounded-full
-            bg-cyber-cyan/20 hover:bg-cyber-cyan/30
-            border border-cyber-cyan/50
+            bg-accent-primary/20 hover:bg-accent-primary/30
+            border border-accent-primary/50
             flex items-center justify-center
             transition-all duration-200
-            text-cyber-cyan
+            text-accent-primary
           "
           title="Expand tasks (Cmd+Shift+T)"
         >
@@ -40,16 +40,16 @@ export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyCh
         
         {/* Glow indicator when recently updated */}
         {recentlyChangedIds.size > 0 && (
-          <div className="absolute inset-0 animate-glow-pulse border-l-2 border-cyber-cyan/50 pointer-events-none" />
+          <div className="absolute inset-0 animate-accent-pulse border-l-2 border-accent-primary/50 pointer-events-none" />
         )}
       </div>
     );
   }
   
   return (
-    <div className="w-72 border-l border-cyber-border/50 bg-cyber-bg/60 backdrop-blur-sm flex flex-col relative">
+    <div className="w-72 border-l border-surface-border/50 bg-surface-canvas/60 backdrop-blur-sm flex flex-col relative">
       {/* Header */}
-      <div className="px-4 py-2 border-b border-cyber-border/50 bg-cyber-surface/40 flex items-center justify-between">
+      <div className="px-4 py-2 border-b border-surface-border/50 bg-surface-elevated/40 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="text-lg">📋</span>
           <span className="text-sm font-semibold text-ui-primary">Tasks</span>
@@ -62,11 +62,11 @@ export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyCh
           onClick={onToggleCollapse}
           className="
             w-5 h-5 rounded
-            bg-cyber-bg/40 hover:bg-cyber-cyan/20
-            border border-cyber-border/50 hover:border-cyber-cyan/50
+            bg-surface-canvas/40 hover:bg-accent-primary/20
+            border border-surface-border/50 hover:border-accent-primary/50
             flex items-center justify-center
             transition-all duration-200
-            text-ui-secondary hover:text-cyber-cyan
+            text-ui-secondary hover:text-accent-primary
           "
           title="Collapse tasks (Cmd+Shift+T)"
         >
@@ -75,19 +75,19 @@ export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyCh
       </div>
       
       {/* Progress bar */}
-      <div className="px-4 py-3 border-b border-cyber-border/50">
-        <div className="h-1.5 bg-cyber-border/30 rounded-full overflow-hidden flex">
+      <div className="px-4 py-3 border-b border-surface-border/50">
+        <div className="h-1.5 bg-surface-border/30 rounded-full overflow-hidden flex">
           {/* Completed segment */}
           {stats.completed > 0 && (
             <div
-              className="bg-cyber-lime h-full transition-all duration-300"
+              className="bg-status-success h-full transition-all duration-300"
               style={{ width: `${(stats.completed / stats.total) * 100}%` }}
             />
           )}
           {/* In-progress segment */}
           {stats.inProgress > 0 && (
             <div
-              className="bg-cyber-cyan/60 h-full transition-all duration-300"
+              className="bg-accent-primary/60 h-full transition-all duration-300"
               style={{ width: `${(stats.inProgress / stats.total) * 100}%` }}
             />
           )}
@@ -97,7 +97,7 @@ export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyCh
         <div className="mt-2 flex items-center gap-3 text-[10px] text-ui-muted">
           {stats.inProgress > 0 && (
             <span className="flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-cyber-cyan animate-pulse" />
+              <span className="w-1.5 h-1.5 rounded-full bg-accent-primary animate-pulse" />
               {stats.inProgress} active
             </span>
           )}
@@ -131,19 +131,19 @@ interface TodoItemRowProps {
 
 function TodoItemRow({ todo, isRecentlyChanged }: TodoItemRowProps) {
   const priorityColor = {
-    high: 'bg-cyber-orange',
-    medium: 'bg-cyber-cyan',
-    low: 'bg-cyber-purple',
+    high: 'bg-status-warning',
+    medium: 'bg-accent-primary',
+    low: 'bg-accent-tertiary',
   }[todo.priority];
   
   const statusIcon = {
     in_progress: (
-      <div className="w-4 h-4 rounded-full bg-cyber-cyan/20 flex items-center justify-center">
-        <div className="w-2 h-2 rounded-full bg-cyber-cyan animate-pulse" />
+      <div className="w-4 h-4 rounded-full bg-accent-primary/20 flex items-center justify-center">
+        <div className="w-2 h-2 rounded-full bg-accent-primary animate-pulse" />
       </div>
     ),
     pending: <Circle className="w-4 h-4 text-ui-muted" />,
-    completed: <CheckCircle className="w-4 h-4 text-cyber-lime" />,
+    completed: <CheckCircle className="w-4 h-4 text-status-success" />,
     cancelled: <XCircle className="w-4 h-4 text-red-400" />,
   }[todo.status];
   
@@ -158,10 +158,10 @@ function TodoItemRow({ todo, isRecentlyChanged }: TodoItemRowProps) {
     <div
       className={`
         relative pl-3 pr-2 py-2 rounded-md
-        bg-cyber-surface/30 border border-transparent
-        hover:bg-cyber-surface/50
+        bg-surface-elevated/30 border border-transparent
+        hover:bg-surface-elevated/50
         transition-all duration-200
-        ${isRecentlyChanged ? 'ring-1 ring-cyber-cyan/50 shadow-neon-cyan' : ''}
+        ${isRecentlyChanged ? 'ring-1 ring-accent-primary/50 shadow-glow-primary' : ''}
       `}
     >
       {/* Priority color bar */}

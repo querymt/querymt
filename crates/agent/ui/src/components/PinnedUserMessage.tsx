@@ -26,7 +26,7 @@ export function PinnedUserMessage({
   return (
     <div className="pinned-user-bar-container">
       <div className="pinned-user-bar">
-        <MessageSquare className="w-4 h-4 text-cyber-magenta flex-shrink-0" />
+        <MessageSquare className="w-4 h-4 text-accent-secondary flex-shrink-0" />
         <span className="pinned-user-bar-text">
           "{truncatedMessage}"
         </span>

@@ -49,7 +49,7 @@ export function ThemeSwitcher({
     <>
       <div
         data-testid="theme-switcher-backdrop"
-        className="fixed inset-0 bg-cyber-bg/70 backdrop-blur-sm z-40 animate-fade-in"
+        className="fixed inset-0 bg-surface-canvas/70 backdrop-blur-sm z-40 animate-fade-in"
         onClick={close}
       />
 
@@ -64,10 +64,10 @@ export function ThemeSwitcher({
       >
         <Command
           label="Theme switcher"
-          className="w-full max-w-xl bg-cyber-surface border-2 border-cyber-cyan/30 rounded-xl shadow-[0_0_40px_rgba(var(--cyber-cyan-rgb),0.25)] overflow-hidden animate-scale-in"
+          className="w-full max-w-xl bg-surface-elevated border-2 border-accent-primary/30 rounded-xl shadow-[0_0_40px_rgba(var(--accent-primary-rgb),0.25)] overflow-hidden animate-scale-in"
         >
-          <div className="flex items-center gap-3 px-4 py-3 border-b border-cyber-border/60">
-            <Palette className="w-4 h-4 text-cyber-cyan" />
+          <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-border/60">
+            <Palette className="w-4 h-4 text-accent-primary" />
             <Command.Input
               ref={inputRef}
               value={search}
@@ -75,7 +75,7 @@ export function ThemeSwitcher({
               placeholder={`Search dashboard themes (${themes.length})...`}
               className="flex-1 bg-transparent text-ui-primary placeholder:text-ui-muted text-sm focus:outline-none"
             />
-            <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-cyber-bg border border-cyber-border rounded text-ui-muted">
+            <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-muted">
               ESC
             </kbd>
           </div>
@@ -92,7 +92,7 @@ export function ThemeSwitcher({
                   value={`${theme.label} ${theme.variant}`}
                   keywords={[theme.id, theme.description, theme.variant]}
                   onSelect={() => handleSelectTheme(theme.id)}
-                  className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-cyber-border/20 cursor-pointer transition-colors data-[selected=true]:bg-cyber-cyan/15 data-[selected=true]:border-cyber-cyan/35 hover:bg-cyber-surface/60 hover:border-cyber-border/40"
+                  className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
                 >
                   <div className="flex-1 min-w-0">
                     <div className="text-sm text-ui-primary truncate">{theme.label}</div>
@@ -102,16 +102,16 @@ export function ThemeSwitcher({
                     <span
                       className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider ${
                         theme.variant === 'light'
-                          ? 'border-cyber-orange/45 bg-cyber-orange/10 text-cyber-orange'
-                          : 'border-cyber-cyan/45 bg-cyber-cyan/10 text-cyber-cyan'
+                          ? 'border-status-warning/45 bg-status-warning/10 text-status-warning'
+                          : 'border-accent-primary/45 bg-accent-primary/10 text-accent-primary'
                       }`}
                     >
                       {theme.variant}
                     </span>
                     <span className="text-[10px] text-ui-muted font-mono">{theme.id}</span>
                     {selectedTheme === theme.id && (
-                      <span className="inline-flex items-center justify-center w-5 h-5 rounded border border-cyber-cyan/35 bg-cyber-cyan/10">
-                        <Check className="w-3 h-3 text-cyber-cyan" />
+                      <span className="inline-flex items-center justify-center w-5 h-5 rounded border border-accent-primary/35 bg-accent-primary/10">
+                        <Check className="w-3 h-3 text-accent-primary" />
                       </span>
                     )}
                   </div>

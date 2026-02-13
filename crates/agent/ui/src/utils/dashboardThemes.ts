@@ -127,14 +127,14 @@ const LEGACY_THEME_ID_ALIASES: Record<string, DashboardThemeId> = {
 };
 
 const TOKEN_BY_CSS_VAR: Record<string, Base16Key> = {
-  '--cyber-bg-rgb': 'base00',
-  '--cyber-surface-rgb': 'base01',
-  '--cyber-border-rgb': 'base02',
-  '--cyber-cyan-rgb': 'base0C',
-  '--cyber-magenta-rgb': 'base0E',
-  '--cyber-purple-rgb': 'base0D',
-  '--cyber-lime-rgb': 'base0B',
-  '--cyber-orange-rgb': 'base09',
+  '--surface-canvas-rgb': 'base00',
+  '--surface-elevated-rgb': 'base01',
+  '--surface-border-rgb': 'base02',
+  '--accent-primary-rgb': 'base0C',
+  '--accent-secondary-rgb': 'base0E',
+  '--accent-tertiary-rgb': 'base0D',
+  '--status-success-rgb': 'base0B',
+  '--status-warning-rgb': 'base09',
   '--ui-text-primary-rgb': 'base05',
   '--ui-text-secondary-rgb': 'base04',
   '--ui-text-muted-rgb': 'base03',
