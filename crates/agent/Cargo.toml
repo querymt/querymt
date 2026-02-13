@@ -8,8 +8,8 @@ description = "Agent and Session management for querymt"
 [features]
 default = []
 # Enables the web dashboard UI with React frontend
-# Requires Node.js/npm or bun to be installed for building the UI assets
-# The build script will automatically run npm install and npm run build
+# Locally, the build script uses bun (or npm fallback) to build UI assets.
+# Packagers can bypass runtime installs by setting QMT_UI_DIST to a prebuilt dist/.
 dashboard = []
 # Enables OAuth token support for authentication (reads tokens from system keyring)
 oauth = ["querymt-utils/oauth"]

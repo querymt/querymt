@@ -1,4 +1,6 @@
 #[cfg(feature = "dashboard")]
+use std::fs;
+#[cfg(feature = "dashboard")]
 use std::path::Path;
 #[cfg(feature = "dashboard")]
 use std::process::Command;
@@ -33,6 +35,24 @@ fn build_ui() {
     println!("cargo:rerun-if-changed=ui/index.html");
     println!("cargo:rerun-if-changed=ui/vite.config.ts");
     println!("cargo:rerun-if-changed=ui/tsconfig.json");
+
+    println!("cargo:rerun-if-env-changed=QMT_UI_DIST");
+    if let Ok(dist_path) = std::env::var("QMT_UI_DIST") {
+        let dist_src = Path::new(&dist_path);
+        if !dist_src.exists() {
+            panic!("QMT_UI_DIST does not exist: {}", dist_path);
+        }
+
+        let dist_dst = ui_dir.join("dist");
+        if dist_dst.exists() {
+            fs::remove_dir_all(&dist_dst)
+                .unwrap_or_else(|err| panic!("Failed to remove existing dist: {err}"));
+        }
+        copy_dir_all(dist_src, &dist_dst)
+            .unwrap_or_else(|err| panic!("Failed to copy UI dist: {err}"));
+        println!("cargo:warning=Using prebuilt UI from QMT_UI_DIST");
+        return;
+    }
 
     let pm = get_package_manager();
 
@@ -71,4 +91,21 @@ fn build_ui() {
     }
 
     println!("cargo:warning=UI build complete!");
+}
+
+#[cfg(feature = "dashboard")]
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }

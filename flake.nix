@@ -46,6 +46,9 @@
           extensions = ["rust-src"];
         };
 
+        agentCargoToml = builtins.fromTOML (builtins.readFile ./crates/agent/Cargo.toml);
+        cliCargoToml = builtins.fromTOML (builtins.readFile ./crates/cli/Cargo.toml);
+
         commonInputs = with pkgs; [
           rustToolchain
           openssl
@@ -60,7 +63,117 @@
           libgcc
           gdb
         ];
+
+        agentUi = pkgs.buildNpmPackage {
+          pname = "qmt-agent-ui";
+          version = agentCargoToml.package.version;
+          src = ./crates/agent/ui;
+          npmDepsHash = "sha256-EHiEmsoECK9+O56+zgbrfSR5hriFXYnS0VIZ0FMQY54=";
+          npmBuildScript = "build";
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out/dist
+            cp -R dist/. $out/dist/
+            runHook postInstall
+          '';
+        };
       in {
+        packages = {
+          agent-ui = agentUi;
+
+          qmt-agent = pkgs.rustPlatform.buildRustPackage {
+            pname = "qmt-agent";
+            version = agentCargoToml.package.version;
+            src = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [
+              "-p"
+              "qmt-agent"
+              "--example"
+              "coder_agent"
+              "--features"
+              "dashboard,oauth,dbus-secret-service"
+            ];
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.cmake
+              pkgs.gnumake
+            ];
+            buildInputs = commonInputs;
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
+            QMT_UI_DIST = "${agentUi}/dist";
+            # cargo-auditable currently fails on this workspace's `dep:` feature
+            # metadata resolution; we can re-enable it later if embedded
+            # dependency metadata in binaries becomes a requirement.
+            auditable = false;
+            # Temporarily disable checkPhase: the current workspace-level cargo
+            # test/check path is broken for this package in Nix and needs follow-up
+            # to scope/fix checks before re-enabling.
+            doCheck = false;
+            buildPhase = "cargoBuildHook";
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out/bin
+              install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/examples/coder_agent $out/bin/qmt-agent
+              runHook postInstall
+            '';
+          };
+
+          qmt = pkgs.rustPlatform.buildRustPackage {
+            pname = "qmt";
+            version = cliCargoToml.package.version;
+            src = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [
+              "-p"
+              "querymt-cli"
+              "--bin"
+              "qmt"
+            ];
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.cmake
+              pkgs.gnumake
+            ];
+            buildInputs = commonInputs;
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
+            # cargo-auditable currently fails on this workspace's `dep:` feature
+            # metadata resolution; we can re-enable it later if embedded
+            # dependency metadata in binaries becomes a requirement.
+            auditable = false;
+            # Temporarily disable checkPhase: the current workspace-level cargo
+            # test/check path is broken for this package in Nix and needs follow-up
+            # to scope/fix checks before re-enabling.
+            doCheck = false;
+            buildPhase = "cargoBuildHook";
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out/bin
+              install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/qmt $out/bin/qmt
+              runHook postInstall
+            '';
+          };
+        };
+
+        apps = {
+          qmt-agent = {
+            type = "app";
+            program = "${self.packages.${system}.qmt-agent}/bin/qmt-agent";
+          };
+          qmt = {
+            type = "app";
+            program = "${self.packages.${system}.qmt}/bin/qmt";
+          };
+        };
+
         devShells =
           {
             default = pkgs.mkShell {
