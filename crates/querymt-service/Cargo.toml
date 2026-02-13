@@ -14,7 +14,7 @@ homepage = "https://query.mt"
 anyhow = "1.0"
 axum = { version = "0.7", features = ["macros"] }
 base64.workspace = true
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 querymt = { path = "../querymt", default-features = false, features = ["http-client", "extism_host", "native", "tracing", "mcp"] }
 serde = { version = "1.0", features = ["derive"] }

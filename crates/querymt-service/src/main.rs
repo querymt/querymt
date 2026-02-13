@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::State,
@@ -43,14 +43,22 @@ use uuid::Uuid;
 #[command(author, version, about)]
 struct Args {
     /// Address to bind the service to
-    #[arg(long, default_value = "0.0.0.0:8080")]
+    #[arg(long, env = "QMT_SERVICE_ADDR", default_value = "0.0.0.0:8080")]
     addr: String,
     /// Path to providers config file
-    #[arg(long)]
+    #[arg(long, env = "QMT_SERVICE_PROVIDERS")]
     providers: Option<PathBuf>,
     /// Optional auth key required for requests (Bearer token)
-    #[arg(long)]
+    #[arg(
+        long,
+        env = "QMT_SERVICE_AUTH_KEY",
+        hide_env_values = true,
+        conflicts_with = "auth_key_file"
+    )]
     auth_key: Option<String>,
+    /// Path to file containing auth key (trimmed, recommended for secrets)
+    #[arg(long, env = "QMT_SERVICE_AUTH_KEY_FILE", conflicts_with = "auth_key")]
+    auth_key_file: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -274,12 +282,13 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let auth_key = resolve_auth_key(&args)?;
     let providers_path = args.providers.unwrap_or_else(default_providers_path);
 
     info!(
         addr = %args.addr,
         providers = %providers_path.display(),
-        auth = %args.auth_key.as_ref().map(|_| "enabled").unwrap_or("disabled"),
+        auth = %auth_key.as_ref().map(|_| "enabled").unwrap_or("disabled"),
         "starting service"
     );
 
@@ -289,7 +298,7 @@ async fn main() -> Result<()> {
 
     let state = ServerState {
         registry: Arc::new(registry),
-        auth_key: args.auth_key,
+        auth_key,
     };
 
     let app = Router::new()
@@ -1307,6 +1316,23 @@ fn now_unix_seconds() -> u64 {
         .as_secs()
 }
 
+fn resolve_auth_key(args: &Args) -> Result<Option<String>> {
+    if let Some(path) = &args.auth_key_file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read auth key file at {}", path.display()))?;
+        let key = raw.trim().to_string();
+        if key.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Auth key file is empty: {}",
+                path.display()
+            ));
+        }
+        return Ok(Some(key));
+    }
+
+    Ok(args.auth_key.clone())
+}
+
 fn render_stream_chunk(
     stream_id: &str,
     created: u64,
@@ -1742,5 +1768,69 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(state.last_usage, Some(usage));
+    }
+
+    #[test]
+    fn resolve_auth_key_prefers_direct_key() {
+        let args = Args {
+            addr: "127.0.0.1:8080".to_string(),
+            providers: None,
+            auth_key: Some("secret".to_string()),
+            auth_key_file: None,
+        };
+
+        assert_eq!(resolve_auth_key(&args).unwrap(), Some("secret".to_string()));
+    }
+
+    #[test]
+    fn resolve_auth_key_reads_and_trims_file() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("qmt-service-auth-key-{now}.txt"));
+        fs::write(&path, "secret-from-file\n").unwrap();
+
+        let args = Args {
+            addr: "127.0.0.1:8080".to_string(),
+            providers: None,
+            auth_key: None,
+            auth_key_file: Some(path.clone()),
+        };
+
+        let key = resolve_auth_key(&args).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(key, Some("secret-from-file".to_string()));
+    }
+
+    #[test]
+    fn resolve_auth_key_rejects_empty_file() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("qmt-service-auth-key-empty-{now}.txt"));
+        fs::write(&path, "\n").unwrap();
+
+        let args = Args {
+            addr: "127.0.0.1:8080".to_string(),
+            providers: None,
+            auth_key: None,
+            auth_key_file: Some(path.clone()),
+        };
+
+        let err = resolve_auth_key(&args).unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(err.to_string().contains("Auth key file is empty"));
     }
 }

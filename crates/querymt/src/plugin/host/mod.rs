@@ -61,7 +61,14 @@ impl PluginRegistry {
                 path.push("querymt");
                 path
             })
-            .unwrap();
+            .or_else(|| {
+                dirs::home_dir().map(|mut path| {
+                    path.push(".cache");
+                    path.push("querymt");
+                    path
+                })
+            })
+            .unwrap_or_else(|| std::env::temp_dir().join("querymt"));
         Self::from_config_with_cache_path(config, cache_dir)
     }
 
