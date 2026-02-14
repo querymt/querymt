@@ -6,7 +6,6 @@ use querymt::plugin::HTTPLLMProviderFactory;
 use rustyline::{Config, Editor, error::ReadlineError};
 use serde_json::Value;
 use std::io::{Write, stdout};
-use std::path::PathBuf;
 
 use crate::secret_store::SecretStore;
 
@@ -327,19 +326,4 @@ impl ToolLoadingStats {
             self.disabled_tools
         );
     }
-}
-
-/// Find a config file in the user's home .qmt directory
-pub fn find_config_in_home(filenames: &[&str]) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let home = dirs::home_dir().ok_or("No home directory found")?;
-    let config_dir = home.join(".qmt");
-
-    for filename in filenames {
-        let candidate = config_dir.join(filename);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    Err(format!("No config file found in {:?}", config_dir).into())
 }

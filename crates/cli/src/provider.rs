@@ -1,13 +1,10 @@
 use querymt::builder::LLMBuilder;
 use querymt::plugin::{
-    default_providers_path, extism_impl::host::ExtismLoader, host::PluginRegistry,
-    host::native::NativeLoader,
+    extism_impl::host::ExtismLoader, host::PluginRegistry, host::native::NativeLoader,
 };
-use std::path::PathBuf;
 
 use crate::cli_args::CliArgs;
 use crate::secret_store::SecretStore;
-use crate::utils::find_config_in_home;
 use querymt::error::LLMError;
 use serde_json::Value;
 
@@ -77,30 +74,13 @@ pub async fn get_api_key(
 
 /// Initializes provider registry WITHOUT loading plugins (lazy loading)
 pub async fn get_provider_registry(args: &CliArgs) -> Result<PluginRegistry, LLMError> {
-    // Determine config file path
-    let cfg_file = if let Some(cfg) = &args.provider_config {
-        PathBuf::from(cfg)
-    } else {
-        let default_cfg = default_providers_path();
-        if default_cfg.is_file() {
-            default_cfg
-        } else {
-            find_config_in_home(&["providers.json", "providers.toml", "providers.yaml"]).map_err(
-                |_| {
-                    LLMError::InvalidRequest(format!(
-                        "Config file for providers is missing. Expected {:?}.",
-                        default_providers_path()
-                    ))
-                },
-            )?
-        }
-    };
+    let cfg_path = querymt_utils::providers::get_providers_config(args.provider_config.clone())
+        .await
+        .map_err(|e| LLMError::GenericError(format!("{:?}", e)))?;
 
-    let mut registry = PluginRegistry::from_path(cfg_file)?;
-
+    let mut registry = PluginRegistry::from_path(cfg_path)?;
     registry.register_loader(Box::new(ExtismLoader));
     registry.register_loader(Box::new(NativeLoader));
-    // Don't load all plugins - they will be loaded on-demand
 
     Ok(registry)
 }

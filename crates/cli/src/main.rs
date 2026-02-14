@@ -27,10 +27,10 @@ use provider::{
 };
 use secret_store::SecretStore;
 use tracing::setup_logging;
-use utils::{ToolLoadingStats, find_config_in_home, get_provider_api_key, parse_tool_names};
+use utils::{ToolLoadingStats, get_provider_api_key, parse_tool_names};
 
 fn load_tool_config() -> Result<ToolConfig, Box<dyn std::error::Error>> {
-    match find_config_in_home(&["tools-policy.toml"]) {
+    match querymt_utils::providers::find_config_in_home(&["tools-policy.toml"]) {
         Ok(cfg_file) => {
             let content = fs::read_to_string(cfg_file)?;
             // TODO: Generalize to use `yaml`, `json` and `jsonc`
@@ -291,11 +291,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Commands::Update => {
+                println!("{}", "Updating providers config...".bright_blue());
+                match querymt_utils::providers::fetch_providers_repository(None).await {
+                    Ok(content) => {
+                        let cfg_path =
+                            querymt_utils::providers::config_dir()?.join("providers.json");
+                        std::fs::write(cfg_path.clone(), content)?;
+                        println!(
+                            "{} {}",
+                            "✓".bright_green(),
+                            format!("Providers config updated at {}", cfg_path.display())
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("{} {}", "Error:".bright_red(), e);
+                    }
+                }
+
                 println!("{}", "Updating OCI provider plugins...".bright_blue());
                 for provider_cfg in &registry.config.providers {
                     if provider_cfg.path.starts_with("oci://") {
                         let name = provider_cfg.name.clone();
-                        // start spinner (choose preset you like)
                         let mut spinner =
                             Spinner::new(Spinners::Dots, format!("Updating {}...", name.bold()));
 
@@ -310,7 +326,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .await
                         {
                             Ok(_) => {
-                                // stop and show success
                                 spinner.stop_and_persist(
                                     "🚀",
                                     format!("{} has been updated.", name.bold()),

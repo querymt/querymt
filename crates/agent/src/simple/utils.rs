@@ -28,12 +28,11 @@ pub(super) fn to_absolute_path(path: PathBuf) -> Result<PathBuf> {
 }
 
 pub(super) async fn default_registry() -> Result<PluginRegistry> {
-    let mut registry = PluginRegistry::from_default_path()
+    let cfg_path = querymt_utils::providers::get_providers_config(None).await?;
+    let mut registry = PluginRegistry::from_path(&cfg_path)
         .map_err(|e| anyhow!("Failed to load plugin registry: {}", e))?;
     registry.register_loader(Box::new(ExtismLoader));
     registry.register_loader(Box::new(NativeLoader));
-    // Removed eager plugin loading - plugins are now loaded on-demand for faster startup
-    // registry.load_all_plugins().await;
     Ok(registry)
 }
 

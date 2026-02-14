@@ -17,7 +17,7 @@ dbus-secret-service = ["querymt-utils/dbus-secret-service"]
 [dependencies]
 anyhow = "1.0"
 querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
-querymt-utils = { path = "../querymt-utils", features = ["secret-store", "oauth"] }
+querymt-utils = { path = "../querymt-utils", features = ["secret-store", "oauth", "providers"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 rustyline = "17"

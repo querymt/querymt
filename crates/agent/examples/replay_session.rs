@@ -286,7 +286,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
 
         // Initialize plugin registry
-        let mut registry = PluginRegistry::from_default_path()?;
+        let cfg_path = querymt_utils::providers::get_providers_config(None).await?;
+        let mut registry = PluginRegistry::from_path(cfg_path)?;
         registry.register_loader(Box::new(ExtismLoader));
         registry.register_loader(Box::new(NativeLoader));
 

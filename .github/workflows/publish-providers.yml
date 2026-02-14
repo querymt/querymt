@@ -3,13 +3,13 @@ name: Build & Publish Provider Plugins
 on:
   push:
     branches: [ main ]
-    # (optional) add:
-    # tags: [ 'v*.*.*' ]
+    tags: [ 'v*.*.*' ]
   workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
+  deployments: write
 
 jobs:
   detect-changes:
@@ -99,6 +99,86 @@ jobs:
           joined=$(IFS=, ; echo "${entries[*]}")
           matrix="{\"include\":[${joined}]}"
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+  publish-providers-json:
+    needs: [detect-changes, publish-plugins]
+    runs-on: ubuntu-latest
+    if: ${{ needs.publish-plugins.result == 'success' && !contains(needs.detect-changes.outputs.matrix, '"crate":"noop"') }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Generate providers JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          providers=$(python - <<'PY'
+          import json
+          matrix = json.loads(r'''${{ needs.detect-changes.outputs.matrix }}''')
+          providers = []
+          for entry in matrix.get("include", []):
+            if entry.get("crate") == "noop":
+              continue
+            if entry.get("provider_type") != "wasm":
+              continue
+            providers.append(entry["crate"])
+          print("\n".join(sorted(set(providers))))
+          PY
+          )
+
+          if [[ -z "$providers" ]]; then
+            echo "No wasm providers in matrix, skipping JSON publish"
+            exit 0
+          fi
+
+          output="providers.json"
+          echo '{"providers":[' > "$output"
+
+          first=1
+          while IFS= read -r name; do
+            if [[ -z "$name" ]]; then
+              continue
+            fi
+            if [[ "$first" -eq 0 ]]; then
+              echo ',' >> "$output"
+            fi
+
+            if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+              version=$(grep '^version' "crates/providers/$name/Cargo.toml" | head -n1 | cut -d'"' -f2)
+              image_tag="$version"
+            else
+              image_tag="latest"
+            fi
+
+            echo "{\"name\":\"$name\",\"path\":\"oci://ghcr.io/${{ github.repository_owner }}/$name:$image_tag\"}" >> "$output"
+            first=0
+          done <<< "$providers"
+
+          echo ']}' >> "$output"
+          cat "$output"
+
+      - name: Prepare JSON asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="nightly.json"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            target="stable.json"
+          fi
+          mkdir -p deploy
+          cp providers.json "deploy/$target"
+
+      - name: Upload to Cloudflare Pages
+        uses: cloudflare/pages-action@v1
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          projectName: ${{ secrets.CLOUDFLARE_REPO_PROJECT }}
+          directory: .
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          wranglerVersion: "3"
 
   publish-plugins:
     needs: detect-changes
