@@ -172,17 +172,83 @@ struct GoogleSystemInstruction<'a> {
     parts: Vec<GoogleContentPart<'a>>,
 }
 
-/// Text content within a chat message
+/// Individual part of a content message
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-enum GoogleContentPart<'a> {
+struct GoogleContentPart<'a> {
     /// The actual text content
-    #[serde(rename = "text")]
-    Text(&'a str),
-    InlineData(GoogleInlineData),
-    FunctionCall(GoogleFunctionCall),
-    #[serde(rename = "functionResponse")]
-    FunctionResponse(GoogleFunctionResponse),
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inline_data: Option<GoogleInlineData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function_call: Option<GoogleFunctionCall>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "functionResponse")]
+    function_response: Option<GoogleFunctionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thought: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
+    thought_signature: Option<String>,
+}
+
+impl<'a> GoogleContentPart<'a> {
+    fn text(text: &'a str) -> Self {
+        Self {
+            text: Some(text),
+            inline_data: None,
+            function_call: None,
+            function_response: None,
+            thought: None,
+            thought_signature: None,
+        }
+    }
+
+    fn thought(text: &'a str) -> Self {
+        Self {
+            text: Some(text),
+            inline_data: None,
+            function_call: None,
+            function_response: None,
+            thought: Some(true),
+            thought_signature: None,
+        }
+    }
+
+    fn inline_data(mime_type: String, data: String) -> Self {
+        Self {
+            text: None,
+            inline_data: Some(GoogleInlineData { mime_type, data }),
+            function_call: None,
+            function_response: None,
+            thought: None,
+            thought_signature: None,
+        }
+    }
+
+    fn function_call(name: String, args: Value, thought_signature: Option<String>) -> Self {
+        Self {
+            text: None,
+            inline_data: None,
+            function_call: Some(GoogleFunctionCall { name, args }),
+            function_response: None,
+            thought: None,
+            thought_signature,
+        }
+    }
+
+    fn function_response(name: String, content: Value) -> Self {
+        Self {
+            text: None,
+            inline_data: None,
+            function_call: None,
+            function_response: Some(GoogleFunctionResponse {
+                name: name.clone(),
+                response: GoogleFunctionResponseContent { name, content },
+            }),
+            thought: None,
+            thought_signature: None,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -257,35 +323,58 @@ impl std::fmt::Display for GoogleChatResponse {
 
 /// Individual completion candidate
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 struct GoogleCandidate {
     /// Content of the candidate response
     content: GoogleResponseContent,
     /// Finish reason (only present in final streaming chunk or complete response)
-    #[serde(rename = "finishReason")]
     finish_reason: Option<String>,
     /// Index of this candidate
     index: usize,
 }
 
-/// Content block within a response
-#[derive(Deserialize, Debug)]
+/// Response content block
+#[derive(Deserialize, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GoogleResponseContent {
-    /// Parts making up the content (might be absent when only function calls are present)
+    /// Parts making up the content
     #[serde(default)]
     parts: Vec<GoogleResponsePart>,
-    /// Function calls if any are used - can be a single object or array
+    /// Function calls if any are used
     #[serde(skip_serializing_if = "Option::is_none")]
     function_call: Option<GoogleFunctionCall>,
-    /// Function calls as array (newer format in some responses)
+    /// Function calls as array
     #[serde(skip_serializing_if = "Option::is_none")]
     function_calls: Option<Vec<GoogleFunctionCall>>,
 }
 
 impl ChatResponse for GoogleChatResponse {
     fn text(&self) -> Option<String> {
-        self.candidates
-            .first()
-            .map(|c| c.content.parts.iter().map(|p| p.text.clone()).collect())
+        self.candidates.first().map(|c| {
+            c.content
+                .parts
+                .iter()
+                .filter(|p| !p.thought)
+                .map(|p| p.text.clone().unwrap_or_default())
+                .collect()
+        })
+    }
+
+    fn thinking(&self) -> Option<String> {
+        self.candidates.first().and_then(|c| {
+            let thoughts: String = c
+                .content
+                .parts
+                .iter()
+                .filter(|p| p.thought)
+                .map(|p| p.text.clone().unwrap_or_default())
+                .collect();
+            if thoughts.is_empty() {
+                None
+            } else {
+                Some(thoughts)
+            }
+        })
     }
 
     fn tool_calls(&self) -> Option<Vec<ToolCall>> {
@@ -296,13 +385,21 @@ impl ChatResponse for GoogleChatResponse {
                 .parts
                 .iter()
                 .filter_map(|part| {
-                    part.function_call.as_ref().map(|f| ToolCall {
-                        id: format!("call_{}", f.name),
-                        call_type: "function".to_string(),
-                        function: FunctionCall {
-                            name: f.name.clone(),
-                            arguments: serde_json::to_string(&f.args).unwrap_or_default(),
-                        },
+                    part.function_call.as_ref().map(|f| {
+                        let id = if let Some(sig) = &part.thought_signature {
+                            format!("call_{}:{}", f.name, sig)
+                        } else {
+                            format!("call_{}", f.name)
+                        };
+
+                        ToolCall {
+                            id,
+                            call_type: "function".to_string(),
+                            function: FunctionCall {
+                                name: f.name.clone(),
+                                arguments: serde_json::to_string(&f.args).unwrap_or_default(),
+                            },
+                        }
                     })
                 })
                 .collect();
@@ -316,20 +413,26 @@ impl ChatResponse for GoogleChatResponse {
                 // Process array of function calls
                 Some(
                     fc.iter()
-                        .map(|f| ToolCall {
-                            id: format!("call_{}", f.name),
-                            call_type: "function".to_string(),
-                            function: FunctionCall {
-                                name: f.name.clone(),
-                                arguments: serde_json::to_string(&f.args).unwrap_or_default(),
-                            },
+                        .map(|f| {
+                            let id = format!("call_{}", f.name);
+
+                            ToolCall {
+                                id,
+                                call_type: "function".to_string(),
+                                function: FunctionCall {
+                                    name: f.name.clone(),
+                                    arguments: serde_json::to_string(&f.args).unwrap_or_default(),
+                                },
+                            }
                         })
                         .collect(),
                 )
             } else {
                 c.content.function_call.as_ref().map(|f| {
+                    let id = format!("call_{}", f.name);
+
                     vec![ToolCall {
-                        id: format!("call_{}", f.name),
+                        id,
                         call_type: "function".to_string(),
                         function: FunctionCall {
                             name: f.name.clone(),
@@ -376,14 +479,27 @@ impl ChatResponse for GoogleChatResponse {
 }
 
 /// Individual part of response content
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GoogleResponsePart {
     /// Text content of this part (may be absent if functionCall is present)
-    #[serde(default)]
-    text: String,
+    text: Option<String>,
     /// Function call contained in this part
-    #[serde(rename = "functionCall")]
     function_call: Option<GoogleFunctionCall>,
+    /// Whether this part is a thought part
+    #[serde(default)]
+    thought: bool,
+    /// Thought signature for the function call
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
+    thought_signature: Option<String>,
+}
+
+/// Google's function calling tool definition
+#[derive(Serialize, Debug)]
+struct GoogleTool {
+    /// The function declarations array
+    #[serde(rename = "functionDeclarations")]
+    function_declarations: Vec<GoogleFunctionDeclaration>,
 }
 
 /// MIME type of the response
@@ -398,14 +514,6 @@ enum GoogleResponseMimeType {
     /// ENUM as a string response in the response candidates.
     #[serde(rename = "text/x.enum")]
     Enum,
-}
-
-/// Google's function calling tool definition
-#[derive(Serialize, Debug)]
-struct GoogleTool {
-    /// The function declarations array
-    #[serde(rename = "functionDeclarations")]
-    function_declarations: Vec<GoogleFunctionDeclaration>,
 }
 
 /// Google's tool configuration
@@ -619,56 +727,80 @@ impl HTTPChatProvider for Google {
                 },
             };
 
-            chat_contents.push(GoogleChatContent {
-                role,
-                parts: match &msg.message_type {
-                    MessageType::Text => vec![GoogleContentPart::Text(&msg.content)],
-                    MessageType::Image((image_mime, raw_bytes)) => {
-                        vec![GoogleContentPart::InlineData(GoogleInlineData {
-                            mime_type: image_mime.mime_type().to_string(),
-                            data: BASE64.encode(raw_bytes),
-                        })]
-                    }
-                    MessageType::ImageURL(_) => unimplemented!(),
-                    MessageType::Pdf(raw_bytes) => {
-                        vec![GoogleContentPart::InlineData(GoogleInlineData {
-                            mime_type: "application/pdf".to_string(),
-                            data: BASE64.encode(raw_bytes),
-                        })]
-                    }
-                    MessageType::ToolUse(calls) => calls
-                        .iter()
-                        .map(|call| {
-                            GoogleContentPart::FunctionCall(GoogleFunctionCall {
-                                name: call.function.name.clone(),
-                                args: serde_json::from_str(&call.function.arguments)
-                                    .unwrap_or(serde_json::Value::Null),
-                            })
-                        })
-                        .collect(),
-                    MessageType::ToolResult(result) => result
-                        .iter()
-                        .map(|result| {
-                            let parsed_args =
-                                serde_json::from_str::<Value>(&result.function.arguments)
-                                    .unwrap_or(serde_json::Value::Null);
+            let mut parts = Vec::new();
 
-                            GoogleContentPart::FunctionResponse(GoogleFunctionResponse {
-                                name: result.function.name.clone(),
-                                response: GoogleFunctionResponseContent {
-                                    name: result.function.name.clone(),
-                                    content: parsed_args,
-                                },
-                            })
-                        })
-                        .collect(),
-                },
-            });
+            // Restore thinking if present
+            if let Some(thinking) = &msg.thinking {
+                parts.push(GoogleContentPart::thought(thinking));
+            }
+
+            // Always add text content if it's not empty, except for ToolResult which handles it differently
+            if !msg.content.is_empty() && !matches!(msg.message_type, MessageType::ToolResult(_)) {
+                parts.push(GoogleContentPart::text(&msg.content));
+            }
+
+            let msg_parts = match &msg.message_type {
+                MessageType::Text => vec![], // Already added above
+                MessageType::Image((image_mime, raw_bytes)) => {
+                    vec![GoogleContentPart::inline_data(
+                        image_mime.mime_type().to_string(),
+                        BASE64.encode(raw_bytes),
+                    )]
+                }
+                MessageType::ImageURL(_) => unimplemented!(),
+                MessageType::Pdf(raw_bytes) => {
+                    vec![GoogleContentPart::inline_data(
+                        "application/pdf".to_string(),
+                        BASE64.encode(raw_bytes),
+                    )]
+                }
+                MessageType::ToolUse(calls) => {
+                    let mut tool_parts = Vec::with_capacity(calls.len());
+                    for call in calls {
+                        let (name, signature) = {
+                            let expected_prefix = format!("call_{}:", call.function.name);
+                            if call.id.starts_with(&expected_prefix) {
+                                (
+                                    call.function.name.clone(),
+                                    Some(call.id[expected_prefix.len()..].to_string()),
+                                )
+                            } else {
+                                (call.function.name.clone(), None)
+                            }
+                        };
+
+                        tool_parts.push(GoogleContentPart::function_call(
+                            name,
+                            serde_json::from_str(&call.function.arguments)
+                                .unwrap_or(serde_json::Value::Null),
+                            signature,
+                        ));
+                    }
+                    tool_parts
+                }
+                MessageType::ToolResult(result) => {
+                    let mut tool_parts = Vec::with_capacity(result.len());
+                    for res in result {
+                        let parsed_args = serde_json::from_str::<Value>(&res.function.arguments)
+                            .unwrap_or(serde_json::Value::Null);
+
+                        tool_parts.push(GoogleContentPart::function_response(
+                            res.function.name.clone(),
+                            parsed_args,
+                        ));
+                    }
+                    tool_parts
+                }
+            };
+
+            parts.extend(msg_parts);
+
+            chat_contents.push(GoogleChatContent { role, parts });
         }
 
         // Add system message if present
         let system_instruction = self.system.as_ref().map(|system| GoogleSystemInstruction {
-            parts: vec![GoogleContentPart::Text(system)],
+            parts: vec![GoogleContentPart::text(system)],
         });
 
         // Convert tools to Google's format if provided
@@ -843,7 +975,7 @@ impl HTTPEmbeddingProvider for Google {
             let req_body = GoogleEmbeddingRequest {
                 model: "models/text-embedding-004",
                 content: GoogleEmbeddingContent {
-                    parts: vec![GoogleContentPart::Text(text)],
+                    parts: vec![GoogleContentPart::text(text)],
                 },
             };
             json_body = serde_json::to_vec(&req_body)?;
@@ -974,22 +1106,34 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
     if let Some(candidate) = response.candidates.first() {
         // Extract text from parts
         for (index, part) in candidate.content.parts.iter().enumerate() {
-            if !part.text.is_empty() {
-                chunks.push(querymt::chat::StreamChunk::Text(part.text.clone()));
+            if let Some(text) = &part.text {
+                if !text.is_empty() {
+                    if part.thought {
+                        chunks.push(querymt::chat::StreamChunk::Thinking(text.clone()));
+                    } else {
+                        chunks.push(querymt::chat::StreamChunk::Text(text.clone()));
+                    }
+                }
             }
 
             // Extract tool calls
             if let Some(function_call) = &part.function_call {
+                let id = if let Some(sig) = &part.thought_signature {
+                    format!("call_{}:{}", function_call.name, sig)
+                } else {
+                    format!("call_{}", function_call.name)
+                };
+
                 chunks.push(querymt::chat::StreamChunk::ToolUseStart {
                     index,
-                    id: format!("call_{}", function_call.name),
+                    id: id.clone(),
                     name: function_call.name.clone(),
                 });
 
                 chunks.push(querymt::chat::StreamChunk::ToolUseComplete {
                     index,
                     tool_call: querymt::ToolCall {
-                        id: format!("call_{}", function_call.name),
+                        id,
                         call_type: "function".to_string(),
                         function: querymt::FunctionCall {
                             name: function_call.name.clone(),
@@ -1001,17 +1145,19 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
             }
         }
 
-        // Handle content-level function calls
+        // Handle content-level function calls (older format)
         if let Some(fc) = &candidate.content.function_call {
+            let id = format!("call_{}", fc.name);
+
             chunks.push(querymt::chat::StreamChunk::ToolUseStart {
                 index: 0,
-                id: format!("call_{}", fc.name),
+                id: id.clone(),
                 name: fc.name.clone(),
             });
             chunks.push(querymt::chat::StreamChunk::ToolUseComplete {
                 index: 0,
                 tool_call: querymt::ToolCall {
-                    id: format!("call_{}", fc.name),
+                    id,
                     call_type: "function".to_string(),
                     function: querymt::FunctionCall {
                         name: fc.name.clone(),
@@ -1023,15 +1169,17 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
 
         if let Some(fcs) = &candidate.content.function_calls {
             for (index, fc) in fcs.iter().enumerate() {
+                let id = format!("call_{}", fc.name);
+
                 chunks.push(querymt::chat::StreamChunk::ToolUseStart {
                     index,
-                    id: format!("call_{}", fc.name),
+                    id: id.clone(),
                     name: fc.name.clone(),
                 });
                 chunks.push(querymt::chat::StreamChunk::ToolUseComplete {
                     index,
                     tool_call: querymt::ToolCall {
-                        id: format!("call_{}", fc.name),
+                        id,
                         call_type: "function".to_string(),
                         function: querymt::FunctionCall {
                             name: fc.name.clone(),
