@@ -7,6 +7,7 @@ describe('ShortcutGateway', () => {
   const defaultProps = {
     open: true,
     onOpenChange: vi.fn(),
+    onStartNewSession: vi.fn(),
     onSelectTheme: vi.fn(),
   };
 
@@ -17,8 +18,20 @@ describe('ShortcutGateway', () => {
   it('renders when open is true', () => {
     render(<ShortcutGateway {...defaultProps} />);
     expect(screen.getByText('Shortcut Gateway')).toBeInTheDocument();
+    expect(screen.getByText('Start New Session')).toBeInTheDocument();
     expect(screen.getByText('Theme Selector')).toBeInTheDocument();
     expect(screen.getByPlaceholderText(/type command/i)).toBeInTheDocument();
+  });
+
+  it('calls onStartNewSession when clicking start new session command', async () => {
+    const user = userEvent.setup();
+    render(<ShortcutGateway {...defaultProps} />);
+
+    const startSessionItem = screen.getByText('Start New Session').closest('[cmdk-item]');
+    expect(startSessionItem).toBeTruthy();
+    await user.click(startSessionItem!);
+
+    expect(defaultProps.onStartNewSession).toHaveBeenCalledTimes(1);
   });
 
   it('does not render when open is false', () => {
@@ -52,6 +65,7 @@ describe('ShortcutGateway', () => {
 
     const input = screen.getByPlaceholderText(/type command/i);
     await user.click(input);
+    await user.type(input, 'theme');
     await user.keyboard('{ArrowDown}{Enter}');
 
     expect(defaultProps.onSelectTheme).toHaveBeenCalledTimes(1);

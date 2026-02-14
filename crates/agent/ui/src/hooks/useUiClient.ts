@@ -50,11 +50,15 @@ export function useUiClient() {
   const [llmConfigCache, setLlmConfigCache] = useState<Record<number, LlmConfigDetails>>({});
   const [sessionLimits, setSessionLimits] = useState<SessionLimits | null>(null);
   const [undoState, setUndoState] = useState<{ turnId: string; revertedFiles: string[] } | null>(null);
+  const [defaultCwd, setDefaultCwd] = useState<string | null>(null);
+  const [workspacePathDialogOpen, setWorkspacePathDialogOpen] = useState(false);
+  const [workspacePathDialogDefaultValue, setWorkspacePathDialogDefaultValue] = useState('');
   const socketRef = useRef<WebSocket | null>(null);
   const fileIndexCallbackRef = useRef<FileIndexCallback | null>(null);
   const fileIndexErrorCallbackRef = useRef<FileIndexErrorCallback | null>(null);
   const llmConfigCallbacksRef = useRef<Map<number, (config: LlmConfigDetails) => void>>(new Map());
   const pendingRequestsRef = useRef<Map<string, (sessionId: string) => void>>(new Map());
+  const workspacePathDialogResolverRef = useRef<((value: string | null) => void) | null>(null);
   const sessionCreatingRef = useRef(false);
 
   // Derive main session events for backward compatibility
@@ -105,6 +109,11 @@ export function useUiClient() {
 
     return () => {
       mounted = false;
+      const resolver = workspacePathDialogResolverRef.current;
+      workspacePathDialogResolverRef.current = null;
+      if (resolver) {
+        resolver(null);
+      }
       if (socketRef.current) {
         socketRef.current.close();
       }
@@ -119,6 +128,7 @@ export function useUiClient() {
         setRoutingMode(msg.routing_mode);
         setActiveAgentId(msg.active_agent_id);
         setSessionId(msg.active_session_id ?? null);
+        setDefaultCwd(msg.default_cwd ?? null);
         setSessionsByAgent(msg.sessions_by_agent ?? {});
         if (msg.agent_mode) {
           setAgentModeState(msg.agent_mode);
@@ -554,12 +564,40 @@ export function useUiClient() {
     socket.send(JSON.stringify(message));
   };
 
+  const requestWorkspacePath = useCallback((defaultValue: string) => {
+    setWorkspacePathDialogDefaultValue(defaultValue);
+    setWorkspacePathDialogOpen(true);
+    return new Promise<string | null>((resolve) => {
+      workspacePathDialogResolverRef.current = resolve;
+    });
+  }, []);
+
+  const submitWorkspacePathDialog = useCallback((value: string) => {
+    const resolver = workspacePathDialogResolverRef.current;
+    workspacePathDialogResolverRef.current = null;
+    setWorkspacePathDialogOpen(false);
+    if (resolver) {
+      resolver(value);
+    }
+  }, []);
+
+  const cancelWorkspacePathDialog = useCallback(() => {
+    const resolver = workspacePathDialogResolverRef.current;
+    workspacePathDialogResolverRef.current = null;
+    setWorkspacePathDialogOpen(false);
+    if (resolver) {
+      resolver(null);
+    }
+  }, []);
+
   const newSession = useCallback(async (): Promise<string> => {
-    const input = window.prompt('Workspace path (blank for none):', '');
+    const currentWorkspace = findCurrentWorkspace(sessionGroups, sessionId);
+    const initialWorkspace = currentWorkspace ?? (sessionId ? '' : defaultCwd ?? '');
+    const input = await requestWorkspacePath(initialWorkspace);
     if (input === null) {
       throw new Error('Session creation cancelled');
     }
-    const cwd = input.trim();
+    const cwd = input.trim() || initialWorkspace.trim();
     const requestId = uuidv7();
     
     // Signal that session creation is in progress to prevent route sync interference.
@@ -574,7 +612,7 @@ export function useUiClient() {
         request_id: requestId 
       });
     });
-  }, []);
+  }, [requestWorkspacePath, sessionGroups, sessionId, defaultCwd]);
 
   const sendPrompt = useCallback(async (promptText: string) => {
     sendMessage({ type: 'prompt', text: promptText });
@@ -726,12 +764,28 @@ export function useUiClient() {
     sendRedo,
     undoState,
     sessionCreatingRef,
+    workspacePathDialogOpen,
+    workspacePathDialogDefaultValue,
+    submitWorkspacePathDialog,
+    cancelWorkspacePathDialog,
     sendElicitationResponse,
     agentMode,
     availableModes,
     setAgentMode,
     cycleAgentMode,
   };
+}
+
+function findCurrentWorkspace(groups: SessionGroup[], activeSessionId: string | null): string | null {
+  if (!activeSessionId) {
+    return null;
+  }
+  for (const group of groups) {
+    if (group.sessions.some((session) => session.session_id === activeSessionId)) {
+      return group.cwd ?? null;
+    }
+  }
+  return null;
 }
 
 function translateAgentEvent(agentId: string, event: any): EventItem {
@@ -937,4 +991,3 @@ function summarizeUnknownEvent(event: any): string {
   }
   return 'Event';
 }
-

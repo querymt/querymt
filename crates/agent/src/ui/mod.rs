@@ -48,6 +48,7 @@ const MODEL_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 pub struct UiServer {
     agent: Arc<QueryMTAgent>,
     view_store: Arc<dyn ViewStore>,
+    default_cwd: Option<PathBuf>,
     event_sources: Vec<Arc<EventBus>>,
     connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     session_agents: Arc<Mutex<HashMap<String, String>>>,
@@ -61,6 +62,7 @@ pub struct UiServer {
 pub(crate) struct ServerState {
     pub agent: Arc<QueryMTAgent>,
     pub view_store: Arc<dyn ViewStore>,
+    pub default_cwd: Option<PathBuf>,
     pub event_sources: Vec<Arc<EventBus>>,
     pub connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     pub session_agents: Arc<Mutex<HashMap<String, String>>>,
@@ -81,13 +83,18 @@ pub(crate) struct ConnectionState {
 
 impl UiServer {
     /// Create a new UI server.
-    pub fn new(agent: Arc<QueryMTAgent>, view_store: Arc<dyn ViewStore>) -> Self {
+    pub fn new(
+        agent: Arc<QueryMTAgent>,
+        view_store: Arc<dyn ViewStore>,
+        default_cwd: Option<PathBuf>,
+    ) -> Self {
         let event_sources = collect_event_sources(&agent);
         let model_cache = Cache::builder().time_to_live(MODEL_CACHE_TTL).build();
 
         Self {
             agent: agent.clone(),
             view_store,
+            default_cwd: default_cwd.or_else(|| std::env::current_dir().ok()),
             event_sources,
             connections: Arc::new(Mutex::new(HashMap::new())),
             session_agents: Arc::new(Mutex::new(HashMap::new())),
@@ -102,6 +109,7 @@ impl UiServer {
         let state = ServerState {
             agent: self.agent,
             view_store: self.view_store,
+            default_cwd: self.default_cwd,
             event_sources: self.event_sources,
             connections: self.connections,
             session_agents: self.session_agents,
