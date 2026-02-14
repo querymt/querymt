@@ -69,6 +69,8 @@ export interface UiState {
   // Scroll state
   isAtBottom: boolean;
   setIsAtBottom: (atBottom: boolean) => void;
+  followNewMessages: boolean;
+  setFollowNewMessages: (enabled: boolean) => void;
   
   chatScrollIndex: number;
   setChatScrollIndex: (index: number) => void;
@@ -126,6 +128,7 @@ export const useUiStore = create<UiState>((set, get) => ({
   selectedToolEvent: null,
   modelPickerOpen: false,
   isAtBottom: true,
+  followNewMessages: true,
   chatScrollIndex: 0,
   prompt: '',
   loading: false,
@@ -177,6 +180,10 @@ export const useUiStore = create<UiState>((set, get) => ({
   setSelectedToolEvent: (event) => set({ selectedToolEvent: event }),
   setModelPickerOpen: (open) => set({ modelPickerOpen: open }),
   setIsAtBottom: (atBottom) => set({ isAtBottom: atBottom }),
+  setFollowNewMessages: (enabled) => {
+    set({ followNewMessages: enabled });
+    localStorage.setItem('followNewMessages', enabled.toString());
+  },
   setChatScrollIndex: (index) => set({ chatScrollIndex: index }),
   setPrompt: (prompt) => set({ prompt }),
   setLoading: (loading) => set({ loading }),
@@ -289,10 +296,11 @@ export const useUiStore = create<UiState>((set, get) => ({
     const todoRailCollapsed = localStorage.getItem('todoRailCollapsed') === 'true';
     const modeModelPreferencesRaw = localStorage.getItem('modeModelPreferences');
     const modeModelPreferences = modeModelPreferencesRaw ? JSON.parse(modeModelPreferencesRaw) : {};
+    const followNewMessages = localStorage.getItem('followNewMessages') !== 'false';
     const selectedThemeRaw = localStorage.getItem('dashboardTheme');
     const selectedTheme = selectedThemeRaw
       ? (normalizeDashboardThemeId(selectedThemeRaw) ?? DEFAULT_DASHBOARD_THEME_ID)
       : DEFAULT_DASHBOARD_THEME_ID;
-    set({ todoRailCollapsed, modeModelPreferences, selectedTheme });
+    set({ todoRailCollapsed, modeModelPreferences, followNewMessages, selectedTheme });
   },
 }));

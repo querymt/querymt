@@ -18,6 +18,7 @@ describe('UiStore', () => {
       selectedToolEvent: null,
       modelPickerOpen: false,
       isAtBottom: true,
+      followNewMessages: true,
       chatScrollIndex: 0,
       prompt: '',
       loading: false,
@@ -334,6 +335,15 @@ describe('UiStore', () => {
       store.setChatScrollIndex(42);
       expect(useUiStore.getState().chatScrollIndex).toBe(42);
     });
+
+    it('should set followNewMessages', () => {
+      const store = useUiStore.getState();
+      expect(store.followNewMessages).toBe(true);
+
+      store.setFollowNewMessages(false);
+      expect(useUiStore.getState().followNewMessages).toBe(false);
+      expect(localStorage.getItem('followNewMessages')).toBe('false');
+    });
     
     it('should set prompt', () => {
       const store = useUiStore.getState();
@@ -388,6 +398,7 @@ describe('UiStore', () => {
       expect(state.selectedToolEvent).toBeNull();
       expect(state.modelPickerOpen).toBe(false);
       expect(state.isAtBottom).toBe(true);
+      expect(state.followNewMessages).toBe(true);
       expect(state.chatScrollIndex).toBe(0);
       expect(state.prompt).toBe('');
       expect(state.loading).toBe(false);
@@ -623,6 +634,7 @@ describe('UiStore', () => {
       
       it('should load todo rail, model preferences, and theme', () => {
         localStorage.setItem('todoRailCollapsed', 'true');
+        localStorage.setItem('followNewMessages', 'false');
         localStorage.setItem('dashboardTheme', 'base16-default-dark');
         localStorage.setItem('modeModelPreferences', JSON.stringify({
           build: { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' },
@@ -633,6 +645,7 @@ describe('UiStore', () => {
         
         const state = useUiStore.getState();
         expect(state.todoRailCollapsed).toBe(true);
+        expect(state.followNewMessages).toBe(false);
         expect(state.selectedTheme).toBe('base16-default-dark');
         expect(state.modeModelPreferences).toEqual({
           build: { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' },

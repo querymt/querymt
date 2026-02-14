@@ -71,6 +71,7 @@ export function ChatView() {
     setActiveTimelineView,
     activeDelegationId,
     setActiveDelegationId,
+    followNewMessages,
     selectedToolEvent,
     setSelectedToolEvent,
     delegationDrawerOpen,
@@ -96,6 +97,11 @@ export function ChatView() {
   const sessionConversationComplete = sessionId === mainSessionId ? isConversationComplete : false;
   
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+  const chatTimelineRef = useRef<HTMLDivElement | null>(null);
+  const followArmedRef = useRef(false);
+  const previousEventCountRef = useRef(0);
+  const trailingFollowTimeoutRef = useRef<number | null>(null);
+  const previousThinkingAgentIdRef = useRef<string | null>(null);
   const mentionInputRef = useRef<HTMLTextAreaElement>(null);
   const activeIndexStatus = sessionId ? workspaceIndexStatus[sessionId]?.status : undefined;
 
@@ -158,12 +164,14 @@ export function ChatView() {
     if (!prompt.trim() || loading || !sessionId) return;
 
     fileMention.clear();
+    followArmedRef.current = followNewMessages;
 
     setLoading(true);
     try {
       await sendPrompt(prompt);
       setPrompt('');
     } catch (err) {
+      followArmedRef.current = false;
       console.error('Failed to send prompt:', err);
     } finally {
       setLoading(false);
@@ -371,6 +379,160 @@ export function ChatView() {
     }
   }, [delegations, activeTimelineView, activeDelegationId]);
 
+  const scrollToLatest = useCallback((behavior: 'auto' | 'smooth' = 'auto') => {
+    if (filteredTurns.length === 0) {
+      return;
+    }
+    const index = filteredTurns.length - 1;
+    const scroll = () => {
+      virtuosoRef.current?.scrollToIndex({
+        index,
+        align: 'end',
+        behavior,
+      });
+    };
+
+    scroll();
+    const rafOne = window.requestAnimationFrame(scroll);
+    const rafTwo = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(scroll);
+    });
+
+    return () => {
+      window.cancelAnimationFrame(rafOne);
+      window.cancelAnimationFrame(rafTwo);
+    };
+  }, [filteredTurns.length]);
+
+  const clearTrailingFollowTimeout = useCallback(() => {
+    if (trailingFollowTimeoutRef.current !== null) {
+      window.clearTimeout(trailingFollowTimeoutRef.current);
+      trailingFollowTimeoutRef.current = null;
+    }
+  }, []);
+
+  const scheduleTrailingFollowScroll = useCallback(() => {
+    clearTrailingFollowTimeout();
+    trailingFollowTimeoutRef.current = window.setTimeout(() => {
+      trailingFollowTimeoutRef.current = null;
+      if (
+        !followNewMessages ||
+        !followArmedRef.current ||
+        activeTimelineView !== 'chat' ||
+        filteredTurns.length === 0
+      ) {
+        return;
+      }
+      scrollToLatest('auto');
+    }, 120);
+  }, [clearTrailingFollowTimeout, followNewMessages, activeTimelineView, filteredTurns.length, scrollToLatest]);
+
+  const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
+    setIsAtBottom(atBottom);
+    if (atBottom && followNewMessages) {
+      followArmedRef.current = true;
+    }
+  }, [setIsAtBottom, followNewMessages]);
+
+  useEffect(() => {
+    const previousEventCount = previousEventCountRef.current;
+    const hasNewEvents = events.length > previousEventCount;
+    previousEventCountRef.current = events.length;
+
+    if (
+      !hasNewEvents ||
+      !followNewMessages ||
+      !followArmedRef.current ||
+      activeTimelineView !== 'chat' ||
+      filteredTurns.length === 0
+    ) {
+      return;
+    }
+
+    const cancelImmediateScroll = scrollToLatest('auto');
+    scheduleTrailingFollowScroll();
+    return () => {
+      if (cancelImmediateScroll) {
+        cancelImmediateScroll();
+      }
+      clearTrailingFollowTimeout();
+    };
+  }, [
+    events.length,
+    followNewMessages,
+    activeTimelineView,
+    filteredTurns.length,
+    scrollToLatest,
+    scheduleTrailingFollowScroll,
+    clearTrailingFollowTimeout,
+  ]);
+
+  useEffect(() => {
+    const wasThinking = previousThinkingAgentIdRef.current !== null;
+    const isThinking = sessionThinkingAgentId !== null;
+    previousThinkingAgentIdRef.current = sessionThinkingAgentId;
+
+    if (!wasThinking || isThinking) {
+      return;
+    }
+    if (
+      !followNewMessages ||
+      !followArmedRef.current ||
+      activeTimelineView !== 'chat' ||
+      filteredTurns.length === 0
+    ) {
+      return;
+    }
+
+    scheduleTrailingFollowScroll();
+    return clearTrailingFollowTimeout;
+  }, [
+    sessionThinkingAgentId,
+    followNewMessages,
+    activeTimelineView,
+    filteredTurns.length,
+    scheduleTrailingFollowScroll,
+    clearTrailingFollowTimeout,
+  ]);
+
+  useEffect(() => {
+    if (!followNewMessages) {
+      followArmedRef.current = false;
+    }
+  }, [followNewMessages]);
+
+  useEffect(() => {
+    previousEventCountRef.current = 0;
+    previousThinkingAgentIdRef.current = null;
+    followArmedRef.current = false;
+    clearTrailingFollowTimeout();
+  }, [sessionId, clearTrailingFollowTimeout]);
+
+  useEffect(() => {
+    return clearTrailingFollowTimeout;
+  }, [clearTrailingFollowTimeout]);
+
+  useEffect(() => {
+    const timelineNode = chatTimelineRef.current;
+    if (!timelineNode) {
+      return;
+    }
+
+    const disarmFollow = () => {
+      if (followArmedRef.current) {
+        followArmedRef.current = false;
+      }
+    };
+
+    timelineNode.addEventListener('wheel', disarmFollow, { passive: true, capture: true });
+    timelineNode.addEventListener('touchmove', disarmFollow, { passive: true, capture: true });
+
+    return () => {
+      timelineNode.removeEventListener('wheel', disarmFollow, true);
+      timelineNode.removeEventListener('touchmove', disarmFollow, true);
+    };
+  }, []);
+
   return (
     <div 
       className="flex flex-col flex-1 min-h-0 text-ui-primary relative"
@@ -421,7 +583,7 @@ export function ChatView() {
             </button>
           </div>
         )}
-        <div className="flex-1 overflow-hidden relative">
+        <div ref={chatTimelineRef} className="flex-1 overflow-hidden relative">
           {activeTimelineView === 'delegations' ? (
             <DelegationsView
               delegations={delegations}
@@ -526,7 +688,7 @@ export function ChatView() {
                   />
                 );
               }}
-              atBottomStateChange={setIsAtBottom}
+              atBottomStateChange={handleAtBottomStateChange}
               className="h-full"
             />
           )}
@@ -536,12 +698,10 @@ export function ChatView() {
             <button
               type="button"
               onClick={() => {
-                if (filteredTurns.length === 0) return;
-                virtuosoRef.current?.scrollToIndex({
-                  index: filteredTurns.length - 1,
-                  align: 'end',
-                  behavior: 'smooth',
-                });
+                if (followNewMessages) {
+                  followArmedRef.current = true;
+                }
+                scrollToLatest('smooth');
               }}
               className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs text-ui-primary bg-surface-canvas/80 border border-surface-border/70 shadow-[0_0_18px_rgba(var(--accent-primary-rgb),0.12)] hover:border-accent-primary/60 hover:text-accent-primary transition-all animate-fade-in-up"
             >
