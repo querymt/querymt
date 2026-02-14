@@ -43,6 +43,23 @@ pub struct RecentModelEntry {
     pub use_count: u32,
 }
 
+/// OAuth authentication status for a provider.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthStatus {
+    NotAuthenticated,
+    Expired,
+    Connected,
+}
+
+/// OAuth-capable provider entry for dashboard auth UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthProviderEntry {
+    pub provider: String,
+    pub display_name: String,
+    pub status: OAuthStatus,
+}
+
 /// Summary of a session for listing.
 #[derive(Serialize)]
 pub struct SessionSummary {
@@ -134,6 +151,17 @@ pub enum UiClientMessage {
         action: String,
         content: Option<serde_json::Value>,
     },
+    /// List configured OAuth-capable providers and their auth status
+    ListAuthProviders,
+    /// Start OAuth login flow for provider
+    StartOAuthLogin {
+        provider: String,
+    },
+    /// Complete OAuth login flow using pasted callback URL/code
+    CompleteOAuthLogin {
+        flow_id: String,
+        response: String,
+    },
     /// Set the agent's operating mode (build/plan/review)
     SetAgentMode {
         mode: String,
@@ -222,6 +250,22 @@ pub enum UiServerMessage {
     AgentMode {
         mode: String,
     },
+    /// OAuth-capable providers and current authentication status
+    AuthProviders {
+        providers: Vec<AuthProviderEntry>,
+    },
+    /// OAuth flow started; frontend should open authorization_url
+    OAuthFlowStarted {
+        flow_id: String,
+        provider: String,
+        authorization_url: String,
+    },
+    /// OAuth flow completion result
+    OAuthResult {
+        provider: String,
+        success: bool,
+        message: String,
+    },
 }
 
 impl UiServerMessage {
@@ -243,6 +287,9 @@ impl UiServerMessage {
             Self::UndoResult { .. } => "undo_result",
             Self::RedoResult { .. } => "redo_result",
             Self::AgentMode { .. } => "agent_mode",
+            Self::AuthProviders { .. } => "auth_providers",
+            Self::OAuthFlowStarted { .. } => "oauth_flow_started",
+            Self::OAuthResult { .. } => "oauth_result",
         }
     }
 }

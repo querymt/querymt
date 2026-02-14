@@ -2,9 +2,13 @@
 //!
 //! Contains all `handle_*` functions that process incoming UI client messages.
 
+#[cfg(feature = "oauth")]
+use super::PendingOAuthFlow;
 use super::ServerState;
 use super::connection::{send_error, send_message, send_state};
 use super::mentions::filter_index_for_cwd;
+#[cfg(feature = "oauth")]
+use super::messages::{AuthProviderEntry, OAuthStatus};
 use super::messages::{ModelEntry, SessionGroup, SessionSummary, UiClientMessage, UiServerMessage};
 use super::session::{PRIMARY_AGENT_ID, ensure_sessions_for_mode, prompt_for_mode, resolve_cwd};
 use crate::agent::core::AgentMode;
@@ -14,8 +18,15 @@ use futures_util::future;
 use querymt::LLMParams;
 use querymt::plugin::HTTPLLMProviderFactory;
 use serde_json::Value;
+#[cfg(feature = "oauth")]
+use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
+#[cfg(feature = "oauth")]
+use uuid::Uuid;
+
+#[cfg(feature = "oauth")]
+const OAUTH_FLOW_TTL_SECS: u64 = 15 * 60;
 
 fn resolve_base_url_for_provider(state: &ServerState, provider: &str) -> Option<String> {
     let cfg: &LLMParams = state.agent.provider.initial_config();
@@ -165,6 +176,15 @@ pub async fn handle_ui_message(
             content,
         } => {
             handle_elicitation_response(state, &elicitation_id, &action, content.as_ref()).await;
+        }
+        UiClientMessage::ListAuthProviders => {
+            handle_list_auth_providers(state, tx).await;
+        }
+        UiClientMessage::StartOAuthLogin { provider } => {
+            handle_start_oauth_login(state, conn_id, &provider, tx).await;
+        }
+        UiClientMessage::CompleteOAuthLogin { flow_id, response } => {
+            handle_complete_oauth_login(state, conn_id, &flow_id, &response, tx).await;
         }
         UiClientMessage::SetAgentMode { mode } => {
             handle_set_agent_mode(state, &mode, tx).await;
@@ -349,6 +369,300 @@ pub async fn handle_get_recent_models(
         Err(e) => {
             let _ = send_error(tx, format!("Failed to get recent models: {}", e)).await;
         }
+    }
+}
+
+/// Handle OAuth provider listing for dashboard auth UI.
+pub async fn handle_list_auth_providers(state: &ServerState, tx: &mpsc::Sender<String>) {
+    #[cfg(feature = "oauth")]
+    {
+        let registry = state.agent.provider.plugin_registry();
+
+        let mut seen = HashSet::new();
+        let mut providers = Vec::new();
+
+        let store = crate::auth::SecretStore::new().ok();
+
+        for cfg in &registry.config.providers {
+            if !seen.insert(cfg.name.clone()) {
+                continue;
+            }
+
+            let provider_name = cfg.name.clone();
+            let oauth_provider = match crate::auth::get_oauth_provider(&provider_name, None) {
+                Ok(provider) => provider,
+                Err(_) => continue,
+            };
+
+            let status = match store
+                .as_ref()
+                .and_then(|s| s.get_oauth_tokens(&provider_name))
+            {
+                Some(tokens) if tokens.is_expired() => OAuthStatus::Expired,
+                Some(_) => OAuthStatus::Connected,
+                None => OAuthStatus::NotAuthenticated,
+            };
+
+            providers.push(AuthProviderEntry {
+                provider: provider_name,
+                display_name: oauth_provider.display_name().to_string(),
+                status,
+            });
+        }
+
+        providers.sort_by(|a, b| a.provider.cmp(&b.provider));
+
+        let _ = send_message(tx, UiServerMessage::AuthProviders { providers }).await;
+    }
+
+    #[cfg(not(feature = "oauth"))]
+    {
+        let _ = send_message(
+            tx,
+            UiServerMessage::AuthProviders {
+                providers: Vec::new(),
+            },
+        )
+        .await;
+    }
+}
+
+/// Start OAuth login flow for a provider.
+pub async fn handle_start_oauth_login(
+    state: &ServerState,
+    conn_id: &str,
+    provider: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    #[cfg(feature = "oauth")]
+    {
+        let provider_name = provider.trim().to_lowercase();
+        if provider_name.is_empty() {
+            let _ = send_error(tx, "Provider name is required".to_string()).await;
+            return;
+        }
+
+        let registry = state.agent.provider.plugin_registry();
+        let is_configured = registry
+            .config
+            .providers
+            .iter()
+            .any(|cfg| cfg.name == provider_name.as_str());
+        if !is_configured {
+            let _ = send_error(
+                tx,
+                format!("Provider '{}' is not configured", provider_name),
+            )
+            .await;
+            return;
+        }
+
+        let mode = if provider_name == "anthropic" {
+            Some("max")
+        } else {
+            None
+        };
+
+        let oauth_provider = match crate::auth::get_oauth_provider(&provider_name, mode) {
+            Ok(provider) => provider,
+            Err(err) => {
+                let _ = send_error(tx, err.to_string()).await;
+                return;
+            }
+        };
+
+        let flow = match oauth_provider.start_flow().await {
+            Ok(flow) => flow,
+            Err(err) => {
+                let _ = send_error(
+                    tx,
+                    format!("Failed to start OAuth flow for {}: {}", provider_name, err),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let flow_id = Uuid::now_v7().to_string();
+        {
+            let mut flows = state.oauth_flows.lock().await;
+            flows.insert(
+                flow_id.clone(),
+                PendingOAuthFlow {
+                    conn_id: conn_id.to_string(),
+                    provider: provider_name.clone(),
+                    state: flow.state,
+                    verifier: flow.verifier,
+                    created_at: std::time::Instant::now(),
+                },
+            );
+        }
+
+        let _ = send_message(
+            tx,
+            UiServerMessage::OAuthFlowStarted {
+                flow_id,
+                provider: provider_name,
+                authorization_url: flow.authorization_url,
+            },
+        )
+        .await;
+    }
+
+    #[cfg(not(feature = "oauth"))]
+    {
+        let _ = send_error(tx, "OAuth support is not enabled in this build".to_string()).await;
+    }
+}
+
+/// Complete OAuth login flow using callback URL or auth code pasted by user.
+pub async fn handle_complete_oauth_login(
+    state: &ServerState,
+    conn_id: &str,
+    flow_id: &str,
+    response: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    #[cfg(feature = "oauth")]
+    {
+        let flow = {
+            let flows = state.oauth_flows.lock().await;
+            flows.get(flow_id).cloned()
+        };
+
+        let Some(flow) = flow else {
+            let _ = send_error(tx, format!("Unknown OAuth flow: {}", flow_id)).await;
+            return;
+        };
+
+        if flow.conn_id != conn_id {
+            let _ = send_error(
+                tx,
+                "OAuth flow belongs to a different connection".to_string(),
+            )
+            .await;
+            return;
+        }
+
+        if flow.created_at.elapsed().as_secs() > OAUTH_FLOW_TTL_SECS {
+            {
+                let mut flows = state.oauth_flows.lock().await;
+                flows.remove(flow_id);
+            }
+            let _ = send_message(
+                tx,
+                UiServerMessage::OAuthResult {
+                    provider: flow.provider,
+                    success: false,
+                    message: "OAuth flow expired, please start again".to_string(),
+                },
+            )
+            .await;
+            return;
+        }
+
+        let code_input = response.trim();
+        if code_input.is_empty() {
+            let _ = send_error(tx, "Authorization response is required".to_string()).await;
+            return;
+        }
+
+        let code = crate::auth::extract_code_from_query(code_input)
+            .unwrap_or_else(|| code_input.to_string());
+
+        let mode = if flow.provider == "anthropic" {
+            Some("max")
+        } else {
+            None
+        };
+        let oauth_provider = match crate::auth::get_oauth_provider(&flow.provider, mode) {
+            Ok(provider) => provider,
+            Err(err) => {
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::OAuthResult {
+                        provider: flow.provider.clone(),
+                        success: false,
+                        message: err.to_string(),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+
+        let result = async {
+            let tokens = oauth_provider
+                .exchange_code(&code, &flow.state, &flow.verifier)
+                .await
+                .map_err(|e| format!("Token exchange failed: {}", e))?;
+
+            let mut store = crate::auth::SecretStore::new()
+                .map_err(|e| format!("Failed to access secure storage: {}", e))?;
+
+            store
+                .set_oauth_tokens(oauth_provider.name(), &tokens)
+                .map_err(|e| format!("Failed to save OAuth tokens: {}", e))?;
+
+            if let Ok(Some(api_key)) = oauth_provider.create_api_key(&tokens.access_token).await
+                && let Some(key_name) = oauth_provider.api_key_name()
+                && let Err(err) = store.set(key_name, &api_key)
+            {
+                log::warn!(
+                    "Failed to persist API key for provider '{}' ({}): {}",
+                    oauth_provider.name(),
+                    key_name,
+                    err
+                );
+            }
+
+            Ok::<(), String>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                {
+                    let mut flows = state.oauth_flows.lock().await;
+                    flows.remove(flow_id);
+                }
+
+                state.agent.invalidate_provider_cache().await;
+                state.model_cache.invalidate(&()).await;
+
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::OAuthResult {
+                        provider: flow.provider.clone(),
+                        success: true,
+                        message: format!(
+                            "Successfully authenticated with {}",
+                            oauth_provider.display_name()
+                        ),
+                    },
+                )
+                .await;
+
+                handle_list_auth_providers(state, tx).await;
+                handle_list_all_models(state, true, tx).await;
+            }
+            Err(err) => {
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::OAuthResult {
+                        provider: flow.provider,
+                        success: false,
+                        message: err,
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    #[cfg(not(feature = "oauth"))]
+    {
+        let _ = send_error(tx, "OAuth support is not enabled in this build".to_string()).await;
     }
 }
 

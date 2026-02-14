@@ -38,7 +38,7 @@ use session::collect_event_sources;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 /// TTL for model cache (30 minutes)
@@ -55,6 +55,7 @@ pub struct UiServer {
     session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     workspace_manager: Arc<WorkspaceIndexManager>,
     model_cache: Cache<(), Vec<ModelEntry>>,
+    oauth_flows: Arc<Mutex<HashMap<String, PendingOAuthFlow>>>,
 }
 
 /// Shared server state for request handlers.
@@ -69,6 +70,16 @@ pub(crate) struct ServerState {
     pub session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     pub workspace_manager: Arc<WorkspaceIndexManager>,
     pub model_cache: Cache<(), Vec<ModelEntry>>,
+    pub oauth_flows: Arc<Mutex<HashMap<String, PendingOAuthFlow>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingOAuthFlow {
+    pub conn_id: String,
+    pub provider: String,
+    pub state: String,
+    pub verifier: String,
+    pub created_at: Instant,
 }
 
 /// State for a single WebSocket connection.
@@ -101,6 +112,7 @@ impl UiServer {
             session_cwds: Arc::new(Mutex::new(HashMap::new())),
             workspace_manager: agent.workspace_index_manager(),
             model_cache,
+            oauth_flows: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -116,6 +128,7 @@ impl UiServer {
             session_cwds: self.session_cwds,
             workspace_manager: self.workspace_manager,
             model_cache: self.model_cache,
+            oauth_flows: self.oauth_flows,
         };
 
         Router::new()

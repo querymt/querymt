@@ -10,6 +10,7 @@ describe('ShortcutGateway', () => {
     onOpenChange: vi.fn(),
     onStartNewSession: vi.fn(),
     onSelectTheme: vi.fn(),
+    onAuthenticateProvider: vi.fn(),
   };
 
   beforeEach(() => {
@@ -24,6 +25,7 @@ describe('ShortcutGateway', () => {
     expect(screen.getByText('Start New Session')).toBeInTheDocument();
     expect(screen.getByText('Follow New Messages')).toBeInTheDocument();
     expect(screen.getByText('Theme Selector')).toBeInTheDocument();
+    expect(screen.getByText('Authenticate Provider')).toBeInTheDocument();
     expect(screen.getByPlaceholderText(/type command/i)).toBeInTheDocument();
   });
 
@@ -87,5 +89,16 @@ describe('ShortcutGateway', () => {
     await user.keyboard('{ArrowDown}{Enter}');
 
     expect(defaultProps.onSelectTheme).toHaveBeenCalledTimes(1);
+  });
+
+  it('calls onAuthenticateProvider when clicking auth command', async () => {
+    const user = userEvent.setup();
+    render(<ShortcutGateway {...defaultProps} />);
+
+    const authItem = screen.getByText('Authenticate Provider').closest('[cmdk-item]');
+    expect(authItem).toBeTruthy();
+    await user.click(authItem!);
+
+    expect(defaultProps.onAuthenticateProvider).toHaveBeenCalledTimes(1);
   });
 });

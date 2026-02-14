@@ -13,6 +13,9 @@ import {
   RecentModelEntry,
   LlmConfigDetails,
   SessionLimits,
+  AuthProviderEntry,
+  OAuthFlowState,
+  OAuthResultState,
 } from '../types';
 
 // Callback type for file index updates
@@ -33,6 +36,9 @@ export function useUiClient() {
   const [sessionGroups, setSessionGroups] = useState<SessionGroup[]>([]);
   const [allModels, setAllModels] = useState<ModelEntry[]>([]);
   const [recentModelsByWorkspace, setRecentModelsByWorkspace] = useState<Record<string, RecentModelEntry[]>>({});
+  const [authProviders, setAuthProviders] = useState<AuthProviderEntry[]>([]);
+  const [oauthFlow, setOauthFlow] = useState<OAuthFlowState | null>(null);
+  const [oauthResult, setOauthResult] = useState<OAuthResultState | null>(null);
   const [sessionsByAgent, setSessionsByAgent] = useState<Record<string, string>>({});
   const [agentModels, setAgentModels] = useState<
     Record<string, { provider?: string; model?: string; contextLimit?: number }>
@@ -506,6 +512,27 @@ export function useUiClient() {
         setRecentModelsByWorkspace(normalized);
         break;
       }
+      case 'auth_providers':
+        setAuthProviders(msg.providers);
+        break;
+      case 'oauth_flow_started':
+        setOauthFlow({
+          flow_id: msg.flow_id,
+          provider: msg.provider,
+          authorization_url: msg.authorization_url,
+        });
+        setOauthResult(null);
+        break;
+      case 'oauth_result':
+        setOauthResult({
+          provider: msg.provider,
+          success: msg.success,
+          message: msg.message,
+        });
+        if (msg.success) {
+          setOauthFlow(null);
+        }
+        break;
       case 'llm_config': {
         const config: LlmConfigDetails = {
           configId: msg.config_id,
@@ -648,6 +675,24 @@ export function useUiClient() {
     sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
   }, []);
 
+  const requestAuthProviders = useCallback(() => {
+    sendMessage({ type: 'list_auth_providers' });
+  }, []);
+
+  const startOAuthLogin = useCallback((provider: string) => {
+    setOauthResult(null);
+    sendMessage({ type: 'start_oauth_login', provider });
+  }, []);
+
+  const completeOAuthLogin = useCallback((flowId: string, response: string) => {
+    sendMessage({ type: 'complete_oauth_login', flow_id: flowId, response });
+  }, []);
+
+  const clearOAuthState = useCallback(() => {
+    setOauthFlow(null);
+    setOauthResult(null);
+  }, []);
+
   // Register a callback for file index updates
   const setFileIndexCallback = useCallback((callback: FileIndexCallback | null) => {
     console.log('[useUiClient] Registering file index callback:', !!callback);
@@ -739,11 +784,18 @@ export function useUiClient() {
     sessionGroups,
     allModels,
     recentModelsByWorkspace,
+    authProviders,
+    oauthFlow,
+    oauthResult,
     sessionsByAgent,
     agentModels,
     loadSession,
     refreshAllModels,
     fetchRecentModels,
+    requestAuthProviders,
+    startOAuthLogin,
+    completeOAuthLogin,
+    clearOAuthState,
     setSessionModel,
     sessionAudit,
     thinkingAgentId,

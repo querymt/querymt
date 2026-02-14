@@ -361,6 +361,9 @@ export type UiServerMessage =
     }
   | { type: 'all_models_list'; models: ModelEntry[] }
   | { type: 'recent_models'; by_workspace: Record<string, RecentModelEntry[]> }
+  | { type: 'auth_providers'; providers: AuthProviderEntry[] }
+  | { type: 'oauth_flow_started'; flow_id: string; provider: string; authorization_url: string }
+  | { type: 'oauth_result'; provider: string; success: boolean; message: string }
   | { type: 'file_index'; files: FileIndexEntry[]; generated_at: number }
   | { type: 'llm_config'; config_id: number; provider: string; model: string; params?: Record<string, unknown> | null }
   | { type: 'undo_result'; success: boolean; message?: string | null; reverted_files: string[] }
@@ -377,6 +380,26 @@ export interface RecentModelEntry {
   model: string;
   last_used: string;  // ISO 8601 timestamp
   use_count: number;
+}
+
+export type OAuthStatus = 'not_authenticated' | 'expired' | 'connected';
+
+export interface AuthProviderEntry {
+  provider: string;
+  display_name: string;
+  status: OAuthStatus;
+}
+
+export interface OAuthFlowState {
+  flow_id: string;
+  provider: string;
+  authorization_url: string;
+}
+
+export interface OAuthResultState {
+  provider: string;
+  success: boolean;
+  message: string;
 }
 
 // Cached LLM config details for model config popover
@@ -398,6 +421,9 @@ export type UiClientMessage =
   | { type: 'list_all_models'; refresh?: boolean }
   | { type: 'set_session_model'; session_id: string; model_id: string }
   | { type: 'get_recent_models'; limit_per_workspace?: number }
+  | { type: 'list_auth_providers' }
+  | { type: 'start_oauth_login'; provider: string }
+  | { type: 'complete_oauth_login'; flow_id: string; response: string }
   | { type: 'get_file_index' }
   | { type: 'get_llm_config'; config_id: number }
   | { type: 'cancel_session' }
