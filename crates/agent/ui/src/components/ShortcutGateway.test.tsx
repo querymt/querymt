@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ShortcutGateway } from './ShortcutGateway';
+import { useUiStore } from '../store/uiStore';
 
 describe('ShortcutGateway', () => {
   const defaultProps = {
@@ -13,14 +14,31 @@ describe('ShortcutGateway', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
+    useUiStore.setState({ followNewMessages: true });
   });
 
   it('renders when open is true', () => {
     render(<ShortcutGateway {...defaultProps} />);
     expect(screen.getByText('Shortcut Gateway')).toBeInTheDocument();
     expect(screen.getByText('Start New Session')).toBeInTheDocument();
+    expect(screen.getByText('Follow New Messages')).toBeInTheDocument();
     expect(screen.getByText('Theme Selector')).toBeInTheDocument();
     expect(screen.getByPlaceholderText(/type command/i)).toBeInTheDocument();
+  });
+
+  it('toggles follow new messages command state and persists', async () => {
+    const user = userEvent.setup();
+    render(<ShortcutGateway {...defaultProps} />);
+
+    expect(screen.getByText('On')).toBeInTheDocument();
+    const followItem = screen.getByText('Follow New Messages').closest('[cmdk-item]');
+    expect(followItem).toBeTruthy();
+    await user.click(followItem!);
+
+    expect(useUiStore.getState().followNewMessages).toBe(false);
+    expect(localStorage.getItem('followNewMessages')).toBe('false');
+    expect(screen.getByText('Off')).toBeInTheDocument();
   });
 
   it('calls onStartNewSession when clicking start new session command', async () => {

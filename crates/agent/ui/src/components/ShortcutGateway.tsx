@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Command } from 'cmdk';
-import { Keyboard, Palette, Plus } from 'lucide-react';
+import { Keyboard, MessageSquare, Palette, Plus } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
 
 interface ShortcutGatewayProps {
@@ -18,7 +18,7 @@ export function ShortcutGateway({
 }: ShortcutGatewayProps) {
   const [search, setSearch] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
-  const { focusMainInput } = useUiStore();
+  const { focusMainInput, followNewMessages, setFollowNewMessages } = useUiStore();
   const shortcutGatewayPrefix = navigator.platform.includes('Mac') ? '⌘+X' : 'Ctrl+X';
 
   const close = () => {
@@ -101,6 +101,26 @@ export function ShortcutGateway({
                 </div>
                 <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
                   N
+                </kbd>
+              </Command.Item>
+
+              <Command.Item
+                value="follow new messages"
+                keywords={['follow', 'messages', 'scroll', 'auto']}
+                onSelect={() => setFollowNewMessages(!followNewMessages)}
+                className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
+              >
+                <div className="w-7 h-7 rounded-md border border-accent-primary/35 bg-accent-primary/10 flex items-center justify-center">
+                  <MessageSquare className="w-3.5 h-3.5 text-accent-primary" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm text-ui-primary">Follow New Messages</div>
+                  <div className="text-xs text-ui-muted">
+                    {followNewMessages ? 'Auto-scroll to newest message is enabled' : 'Auto-scroll is paused'}
+                  </div>
+                </div>
+                <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
+                  {followNewMessages ? 'On' : 'Off'}
                 </kbd>
               </Command.Item>
 
