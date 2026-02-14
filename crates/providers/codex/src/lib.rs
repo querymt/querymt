@@ -228,6 +228,7 @@ impl HTTPLLMProviderFactory for CodexFactory {
             "gpt-5.1-codex".to_string(),
             "gpt-5.1-codex-mini".to_string(),
             "gpt-5.2-codex".to_string(),
+            "gpt-5.3-codex".to_string(),
             "gpt-5.2".to_string(),
             "gpt-5.1".to_string(),
             "gpt-5-codex".to_string(),
