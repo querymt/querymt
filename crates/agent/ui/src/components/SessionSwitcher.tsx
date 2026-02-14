@@ -347,7 +347,7 @@ export function SessionSwitcher({
                 <Plus className="w-4 h-4 text-accent-primary flex-shrink-0" />
                 <span className="flex-1 text-sm text-ui-primary">New Session</span>
                 <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-muted">
-                  {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}N
+                  {navigator.platform.includes('Mac') ? '⌘+X N' : 'Ctrl+X N'}
                 </kbd>
               </Command.Item>
             </Command.Group>

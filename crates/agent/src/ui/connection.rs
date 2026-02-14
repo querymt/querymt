@@ -109,12 +109,17 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
 
     let agents = build_agent_list(state);
     let agent_mode = state.agent.get_agent_mode().as_str().to_string();
+    let default_cwd = state
+        .default_cwd
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
     let _ = send_message(
         tx,
         UiServerMessage::State {
             routing_mode,
             active_agent_id,
             active_session_id,
+            default_cwd,
             agents,
             sessions_by_agent,
             agent_mode,

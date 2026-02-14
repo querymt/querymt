@@ -324,6 +324,7 @@ export type UiServerMessage =
       routing_mode: RoutingMode;
       active_agent_id: string;
       active_session_id?: string | null;
+      default_cwd?: string | null;
       agents: UiAgentInfo[];
       sessions_by_agent: Record<string, string>;
       agent_mode: string;

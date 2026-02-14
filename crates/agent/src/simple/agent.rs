@@ -464,7 +464,11 @@ impl Agent {
 
     #[cfg(feature = "dashboard")]
     pub fn dashboard(&self) -> AgentServer {
-        AgentServer::new(self.inner.clone(), self.view_store.clone())
+        AgentServer::new(
+            self.inner.clone(),
+            self.view_store.clone(),
+            self.cwd.clone(),
+        )
     }
 
     /// Start an ACP server with the specified transport.

@@ -274,7 +274,7 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
           <p className="text-xs text-ui-muted mt-2">
             or press{' '}
             <kbd className="px-2 py-1 bg-surface-canvas border border-surface-border rounded text-accent-primary font-mono text-[10px]">
-              {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+N
+              {navigator.platform.includes('Mac') ? '⌘+X N' : 'Ctrl+X N'}
             </kbd>{' '}
             to create a session, or{' '}
             <kbd className="px-2 py-1 bg-surface-canvas border border-surface-border rounded text-accent-primary font-mono text-[10px]">

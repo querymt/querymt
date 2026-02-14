@@ -61,7 +61,7 @@ pub async fn handle_ui_message(
             send_state(state, conn_id, tx).await;
         }
         UiClientMessage::NewSession { cwd, request_id } => {
-            let cwd = resolve_cwd(cwd);
+            let cwd = resolve_cwd(cwd).or_else(|| state.default_cwd.clone());
 
             // Clear existing sessions for this connection to start fresh
             {

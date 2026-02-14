@@ -11,6 +11,7 @@ import { SessionSwitcher } from './SessionSwitcher';
 import { StatsDrawer } from './StatsDrawer';
 import { ThemeSwitcher } from './ThemeSwitcher';
 import { ShortcutGateway } from './ShortcutGateway';
+import { WorkspacePathDialog } from './WorkspacePathDialog';
 import { copyToClipboard } from '../utils/clipboard';
 import { getModeColors, getModeDisplayName } from '../utils/modeColors';
 import {
@@ -57,6 +58,10 @@ export function AppShell() {
     thinkingBySession,
     agentMode,
     cycleAgentMode,
+    workspacePathDialogOpen,
+    workspacePathDialogDefaultValue,
+    submitWorkspacePathDialog,
+    cancelWorkspacePathDialog,
   } = useUiClientContext();
   
   const navigate = useNavigate();
@@ -82,6 +87,10 @@ export function AppShell() {
   const [themeSwitcherOpen, setThemeSwitcherOpen] = useState(false);
   const prevAgentModeRef = useRef(agentMode);
   const availableThemes = useMemo(() => getDashboardThemes(), []);
+  const shortcutGatewayPrefix = useMemo(
+    () => (navigator.platform.includes('Mac') ? '⌘+X' : 'Ctrl+X'),
+    [],
+  );
   const selectedThemeLabel = useMemo(
     () => availableThemes.find((theme) => theme.id === selectedTheme)?.label ?? selectedTheme,
     [availableThemes, selectedTheme],
@@ -118,17 +127,26 @@ export function AppShell() {
 
       // Intentionally global: the gateway works even when an input is focused.
       // If this conflicts with editing workflows later, add an editable-target guard.
-      // Ctrl+X gateway for command chords (e.g., Ctrl+X T)
-      if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && normalizedKey === 'x') {
+      // Ctrl/Cmd+X gateway for command chords (e.g., Ctrl/Cmd+X T)
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && normalizedKey === 'x') {
         e.preventDefault();
         setShortcutGatewayOpen((open) => !open);
         return;
       }
 
-      if (shortcutGatewayOpen && !e.metaKey && !e.altKey && normalizedKey === 't') {
+      if (shortcutGatewayOpen && !e.altKey && !e.shiftKey && normalizedKey === 't') {
         e.preventDefault();
         setShortcutGatewayOpen(false);
         setThemeSwitcherOpen(true);
+        return;
+      }
+
+      if (shortcutGatewayOpen && !e.altKey && !e.shiftKey && normalizedKey === 'n') {
+        e.preventDefault();
+        setShortcutGatewayOpen(false);
+        if (connected && !loading) {
+          handleNewSession();
+        }
         return;
       }
 
@@ -156,13 +174,6 @@ export function AppShell() {
         setSessionSwitcherOpen(!sessionSwitcherOpen);
       }
       
-      // Cmd+N / Ctrl+N - New session
-      if ((e.metaKey || e.ctrlKey) && normalizedKey === 'n') {
-        e.preventDefault();
-        if (connected && !loading) {
-          handleNewSession();
-        }
-      }
     };
     
     window.addEventListener('keydown', handleKeyDown);
@@ -200,6 +211,12 @@ export function AppShell() {
           e.preventDefault();
           e.stopImmediatePropagation();
           setModelPickerOpen(false);
+          return;
+        }
+        if (workspacePathDialogOpen) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          cancelWorkspacePathDialog();
           return;
         }
         if (shortcutGatewayOpen) {
@@ -243,6 +260,8 @@ export function AppShell() {
     cancelSession,
     shortcutGatewayOpen,
     themeSwitcherOpen,
+    workspacePathDialogOpen,
+    cancelWorkspacePathDialog,
     setSessionSwitcherOpen,
     setModelPickerOpen,
     setShortcutGatewayOpen,
@@ -459,7 +478,7 @@ export function AppShell() {
             type="button"
             onClick={() => setThemeSwitcherOpen(true)}
             className="h-8 w-8 inline-flex items-center justify-center rounded-lg border border-surface-border bg-surface-canvas/60 transition-colors hover:border-accent-primary/40"
-            title={`Dashboard theme: ${selectedThemeLabel} (Ctrl+X then T)`}
+            title={`Dashboard theme: ${selectedThemeLabel} (${shortcutGatewayPrefix} then T)`}
             aria-label="Open theme switcher"
           >
             <Palette className="w-3.5 h-3.5 text-accent-primary" />
@@ -504,6 +523,12 @@ export function AppShell() {
       <ShortcutGateway
         open={shortcutGatewayOpen}
         onOpenChange={setShortcutGatewayOpen}
+        onStartNewSession={() => {
+          setShortcutGatewayOpen(false);
+          if (connected && !loading) {
+            handleNewSession();
+          }
+        }}
         onSelectTheme={() => {
           setShortcutGatewayOpen(false);
           setThemeSwitcherOpen(true);
@@ -516,6 +541,13 @@ export function AppShell() {
         themes={availableThemes}
         selectedTheme={selectedTheme}
         onSelectTheme={setSelectedTheme}
+      />
+
+      <WorkspacePathDialog
+        open={workspacePathDialogOpen}
+        defaultValue={workspacePathDialogDefaultValue}
+        onSubmit={submitWorkspacePathDialog}
+        onCancel={cancelWorkspacePathDialog}
       />
       
       {/* Stats Drawer - Phase 4 */}

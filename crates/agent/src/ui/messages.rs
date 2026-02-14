@@ -150,6 +150,8 @@ pub enum UiServerMessage {
         routing_mode: RoutingMode,
         active_agent_id: String,
         active_session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_cwd: Option<String>,
         agents: Vec<UiAgentInfo>,
         sessions_by_agent: HashMap<String, String>,
         agent_mode: String,

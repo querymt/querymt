@@ -156,6 +156,7 @@ async fn test_undo_handler_single_agent() -> Result<()> {
     let state = super::ServerState {
         agent: Arc::new(agent),
         view_store: storage.clone(),
+        default_cwd: None,
         event_sources: vec![],
         connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -352,6 +353,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
     let state = super::ServerState {
         agent: Arc::new(agent),
         view_store: storage.clone(),
+        default_cwd: None,
         event_sources: vec![],
         connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),

@@ -1,18 +1,25 @@
 import { useEffect, useRef, useState } from 'react';
 import { Command } from 'cmdk';
-import { Keyboard, Palette } from 'lucide-react';
+import { Keyboard, Palette, Plus } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
 
 interface ShortcutGatewayProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onStartNewSession: () => void;
   onSelectTheme: () => void;
 }
 
-export function ShortcutGateway({ open, onOpenChange, onSelectTheme }: ShortcutGatewayProps) {
+export function ShortcutGateway({
+  open,
+  onOpenChange,
+  onStartNewSession,
+  onSelectTheme,
+}: ShortcutGatewayProps) {
   const [search, setSearch] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
   const { focusMainInput } = useUiStore();
+  const shortcutGatewayPrefix = navigator.platform.includes('Mac') ? '⌘+X' : 'Ctrl+X';
 
   const close = () => {
     onOpenChange(false);
@@ -63,7 +70,7 @@ export function ShortcutGateway({ open, onOpenChange, onSelectTheme }: ShortcutG
           </div>
 
           <div className="flex items-center gap-2 px-4 py-2.5 border-b border-surface-border/40">
-            <span className="text-xs text-ui-muted font-mono">Ctrl+X</span>
+            <span className="text-xs text-ui-muted font-mono">{shortcutGatewayPrefix}</span>
             <Command.Input
               ref={inputRef}
               value={search}
@@ -78,7 +85,25 @@ export function ShortcutGateway({ open, onOpenChange, onSelectTheme }: ShortcutG
               No shortcut commands found
             </Command.Empty>
 
-            <Command.Group heading="Available Commands" className="mb-1">
+            <Command.Group className="mb-1">
+              <Command.Item
+                value="start new session"
+                keywords={['new', 'session', 'start', 'n']}
+                onSelect={() => onStartNewSession()}
+                className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
+              >
+                <div className="w-7 h-7 rounded-md border border-accent-primary/35 bg-accent-primary/10 flex items-center justify-center">
+                  <Plus className="w-3.5 h-3.5 text-accent-primary" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm text-ui-primary">Start New Session</div>
+                  <div className="text-xs text-ui-muted">Create a fresh session and jump in</div>
+                </div>
+                <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
+                  N
+                </kbd>
+              </Command.Item>
+
               <Command.Item
                 value="theme selector"
                 keywords={['theme', 'themes', 't', 'palette']}

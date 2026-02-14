@@ -9,6 +9,7 @@ use axum::{
     routing::get,
 };
 use rust_embed::RustEmbed;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(RustEmbed)]
@@ -18,17 +19,26 @@ struct Assets;
 pub struct AgentServer {
     agent: Arc<QueryMTAgent>,
     view_store: Arc<dyn ViewStore>,
+    default_cwd: Option<PathBuf>,
 }
 
 impl AgentServer {
-    pub fn new(agent: Arc<QueryMTAgent>, view_store: Arc<dyn ViewStore>) -> Self {
-        Self { agent, view_store }
+    pub fn new(
+        agent: Arc<QueryMTAgent>,
+        view_store: Arc<dyn ViewStore>,
+        default_cwd: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            agent,
+            view_store,
+            default_cwd,
+        }
     }
 
     pub async fn run(self, addr: &str) -> anyhow::Result<()> {
         let agent = self.agent;
         let acp_router = AcpServer::new(agent.clone()).router();
-        let ui_router = UiServer::new(agent, self.view_store).router();
+        let ui_router = UiServer::new(agent, self.view_store, self.default_cwd).router();
 
         let app = Router::new()
             .nest("/acp", acp_router)
