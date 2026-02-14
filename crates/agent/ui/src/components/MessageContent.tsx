@@ -1,8 +1,9 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { ComponentPropsWithoutRef, memo, useMemo } from 'react';
+import { ComponentPropsWithoutRef, ReactNode, isValidElement, memo, useMemo } from 'react';
 import { parseFileMentions } from '../utils/fileMentionParser';
 import { FileMention } from './FileMention';
+import { HighlightedCode } from './HighlightedCode';
 
 interface MessageContentProps {
   content: string;
@@ -60,6 +61,27 @@ function splitAttachments(content: string): { main: string; attachments: ParsedA
   return { main, attachments };
 }
 
+function extractCodeText(value: ReactNode): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map(extractCodeText).join('');
+  }
+  return '';
+}
+
+function extractLanguage(className: string | undefined): string | undefined {
+  if (!className) {
+    return undefined;
+  }
+  const match = className.match(/(?:^|\s)language-([^\s]+)/);
+  return match?.[1];
+}
+
 export const MessageContent = memo(function MessageContent({ content, type = 'text' }: MessageContentProps) {
   // For now, we'll use markdown for text and pre-formatted code for others
   // In the future, we can integrate @pierre/diffs for better code/diff rendering
@@ -92,18 +114,46 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
 
     // Custom markdown components with better styling (no prose bloat)
     const markdownComponents = {
-      // Code blocks with syntax highlighting
-      code(props: ComponentPropsWithoutRef<'code'> & { inline?: boolean }) {
-        const { inline, className, children, ...rest } = props;
-        const isInline = inline ?? !className;
-        return !isInline ? (
-          <pre className="my-3 bg-surface-canvas/70 border border-surface-border rounded-md p-3 overflow-x-auto font-mono text-sm">
-            <code className={className} {...rest}>
-              {children}
-            </code>
+      // Code block container with syntax highlighting and long-line containment
+      pre(props: ComponentPropsWithoutRef<'pre'>) {
+        const { children } = props;
+
+        if (isValidElement(children)) {
+          const childProps = children.props as { className?: string; children?: ReactNode };
+          const code = extractCodeText(childProps.children ?? '');
+
+          if (code.length > 0) {
+            return (
+              <div className="my-3 bg-surface-canvas/70 border border-surface-border rounded-md overflow-hidden max-w-full">
+                <HighlightedCode
+                  code={code}
+                  language={extractLanguage(childProps.className)}
+                  lineNumbers={false}
+                  maxHeight="none"
+                />
+              </div>
+            );
+          }
+        }
+
+        return (
+          <pre className="my-3 bg-surface-canvas/70 border border-surface-border rounded-md p-3 overflow-x-auto max-w-full font-mono text-sm">
+            {children}
           </pre>
-        ) : (
-          <code className="bg-surface-canvas/50 px-1.5 py-0.5 rounded text-accent-primary font-mono text-sm" {...rest}>
+        );
+      },
+      // Inline code and fenced code (react-markdown wraps fenced code in <pre>)
+      code(props: ComponentPropsWithoutRef<'code'>) {
+        const { className, children } = props;
+        const content = String(children ?? '');
+        const isBlockCode = Boolean(className) || content.includes('\n');
+
+        if (isBlockCode) {
+          return <code className={className}>{children}</code>;
+        }
+
+        return (
+          <code className="bg-surface-canvas/50 px-1.5 py-0.5 rounded text-accent-primary font-mono text-sm">
             {children}
           </code>
         );
