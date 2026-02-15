@@ -166,6 +166,7 @@ async fn test_undo_handler_single_agent() -> Result<()> {
         )),
         model_cache: moka::future::Cache::new(100),
         oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     // Setup connection state
@@ -364,6 +365,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
         )),
         model_cache: moka::future::Cache::new(100),
         oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     // Setup connection for PARENT session

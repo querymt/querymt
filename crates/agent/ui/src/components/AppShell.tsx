@@ -609,6 +609,7 @@ export function AppShell() {
         onRequestProviders={requestAuthProviders}
         onStartOAuthLogin={startOAuthLogin}
         onCompleteOAuthLogin={completeOAuthLogin}
+        onClearOAuthState={clearOAuthState}
         onDisconnectOAuth={disconnectOAuth}
       />
 

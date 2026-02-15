@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { Command } from 'cmdk';
 import { Copy, ExternalLink, KeyRound, ShieldCheck } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
@@ -13,6 +13,7 @@ interface ProviderAuthSwitcherProps {
   onRequestProviders: () => void;
   onStartOAuthLogin: (provider: string) => void;
   onCompleteOAuthLogin: (flowId: string, response: string) => void;
+  onClearOAuthState: () => void;
   onDisconnectOAuth: (provider: string) => void;
 }
 
@@ -45,6 +46,7 @@ export function ProviderAuthSwitcher({
   onRequestProviders,
   onStartOAuthLogin,
   onCompleteOAuthLogin,
+  onClearOAuthState,
   onDisconnectOAuth,
 }: ProviderAuthSwitcherProps) {
   const [search, setSearch] = useState('');
@@ -155,6 +157,7 @@ export function ProviderAuthSwitcher({
 
   const handleProviderSelect = (provider: AuthProviderEntry) => {
     if (provider.status === 'connected') {
+      onClearOAuthState();
       setSelectedConnectedProvider(provider);
       setResponseInput('');
       setIsCompleting(false);
@@ -176,8 +179,21 @@ export function ProviderAuthSwitcher({
     onDisconnectOAuth(selectedConnectedProvider.provider);
   };
 
+  const stopCommandActivationPropagation = (e: KeyboardEvent<HTMLElement>) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.stopPropagation();
+      return;
+    }
+
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      window.setTimeout(() => inputRef.current?.focus(), 0);
+    }
+  };
+
   const oauthActionFocusClasses =
     'focus-visible:outline-none focus-visible:border-accent-primary/70 focus-visible:ring-2 focus-visible:ring-accent-primary/50 focus-visible:shadow-[0_0_14px_rgba(var(--accent-primary-rgb),0.35)]';
+  const disconnectFocusClasses =
+    'focus-visible:outline-none focus-visible:border-status-warning/70 focus-visible:ring-2 focus-visible:ring-status-warning/50 focus-visible:shadow-[0_0_14px_rgba(var(--status-warning-rgb),0.35)]';
 
   return (
     <>
@@ -258,6 +274,7 @@ export function ProviderAuthSwitcher({
                 <button
                   ref={openAuthButtonRef}
                   type="button"
+                  onKeyDown={stopCommandActivationPropagation}
                   onClick={() => window.open(oauthFlow.authorization_url, '_blank', 'noopener,noreferrer')}
                   className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-accent-primary/40 text-accent-primary text-xs hover:bg-accent-primary/10 transition-all ${oauthActionFocusClasses}`}
                 >
@@ -267,6 +284,7 @@ export function ProviderAuthSwitcher({
 
                 <button
                   type="button"
+                  onKeyDown={stopCommandActivationPropagation}
                   onClick={() => {
                     void copyAuthorizationUrl();
                   }}
@@ -287,6 +305,11 @@ export function ProviderAuthSwitcher({
                   value={responseInput}
                   onChange={(e) => setResponseInput(e.target.value)}
                   onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      e.stopPropagation();
+                    }
+
                     if (e.key === 'Enter' && responseInput.trim() && !isCompleting) {
                       setIsCompleting(true);
                       onCompleteOAuthLogin(oauthFlow.flow_id, responseInput.trim());
@@ -297,6 +320,7 @@ export function ProviderAuthSwitcher({
                 />
                 <button
                   type="button"
+                  onKeyDown={stopCommandActivationPropagation}
                   disabled={!responseInput.trim() || isCompleting}
                   onClick={() => {
                     setIsCompleting(true);
@@ -327,9 +351,10 @@ export function ProviderAuthSwitcher({
                 <button
                   ref={disconnectButtonRef}
                   type="button"
+                  onKeyDown={stopCommandActivationPropagation}
                   disabled={isDisconnecting}
                   onClick={handleDisconnect}
-                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-all ${oauthActionFocusClasses} ${
+                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-all ${disconnectFocusClasses} ${
                     isDisconnecting
                       ? 'border-surface-border text-ui-muted cursor-not-allowed bg-surface-elevated/40'
                       : 'border-status-warning/45 bg-status-warning/10 text-status-warning hover:bg-status-warning/20'

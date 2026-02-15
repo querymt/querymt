@@ -40,6 +40,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 /// TTL for model cache (30 minutes)
 const MODEL_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
@@ -56,6 +57,7 @@ pub struct UiServer {
     workspace_manager: Arc<WorkspaceIndexManager>,
     model_cache: Cache<(), Vec<ModelEntry>>,
     oauth_flows: Arc<Mutex<HashMap<String, PendingOAuthFlow>>>,
+    oauth_callback_listener: Arc<Mutex<Option<ActiveOAuthCallbackListener>>>,
 }
 
 /// Shared server state for request handlers.
@@ -71,6 +73,15 @@ pub(crate) struct ServerState {
     pub workspace_manager: Arc<WorkspaceIndexManager>,
     pub model_cache: Cache<(), Vec<ModelEntry>>,
     pub oauth_flows: Arc<Mutex<HashMap<String, PendingOAuthFlow>>>,
+    pub oauth_callback_listener: Arc<Mutex<Option<ActiveOAuthCallbackListener>>>,
+}
+
+pub(crate) struct ActiveOAuthCallbackListener {
+    pub flow_id: String,
+    pub conn_id: String,
+    pub provider: String,
+    pub stop_tx: tokio::sync::oneshot::Sender<()>,
+    pub task: JoinHandle<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +124,7 @@ impl UiServer {
             workspace_manager: agent.workspace_index_manager(),
             model_cache,
             oauth_flows: Arc::new(Mutex::new(HashMap::new())),
+            oauth_callback_listener: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -129,6 +141,7 @@ impl UiServer {
             workspace_manager: self.workspace_manager,
             model_cache: self.model_cache,
             oauth_flows: self.oauth_flows,
+            oauth_callback_listener: self.oauth_callback_listener,
         };
 
         Router::new()
