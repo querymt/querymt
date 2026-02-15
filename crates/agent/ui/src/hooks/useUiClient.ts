@@ -688,6 +688,12 @@ export function useUiClient() {
     sendMessage({ type: 'complete_oauth_login', flow_id: flowId, response });
   }, []);
 
+  const disconnectOAuth = useCallback((provider: string) => {
+    setOauthFlow(null);
+    setOauthResult(null);
+    sendMessage({ type: 'disconnect_oauth', provider });
+  }, []);
+
   const clearOAuthState = useCallback(() => {
     setOauthFlow(null);
     setOauthResult(null);
@@ -795,6 +801,7 @@ export function useUiClient() {
     requestAuthProviders,
     startOAuthLogin,
     completeOAuthLogin,
+    disconnectOAuth,
     clearOAuthState,
     setSessionModel,
     sessionAudit,

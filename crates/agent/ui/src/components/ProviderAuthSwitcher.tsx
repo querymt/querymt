@@ -13,6 +13,7 @@ interface ProviderAuthSwitcherProps {
   onRequestProviders: () => void;
   onStartOAuthLogin: (provider: string) => void;
   onCompleteOAuthLogin: (flowId: string, response: string) => void;
+  onDisconnectOAuth: (provider: string) => void;
 }
 
 function statusClasses(status: AuthProviderEntry['status']): string {
@@ -44,14 +45,19 @@ export function ProviderAuthSwitcher({
   onRequestProviders,
   onStartOAuthLogin,
   onCompleteOAuthLogin,
+  onDisconnectOAuth,
 }: ProviderAuthSwitcherProps) {
   const [search, setSearch] = useState('');
   const [responseInput, setResponseInput] = useState('');
   const [isCompleting, setIsCompleting] = useState(false);
+  const [isDisconnecting, setIsDisconnecting] = useState(false);
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
+  const [selectedConnectedProvider, setSelectedConnectedProvider] = useState<AuthProviderEntry | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const callbackRef = useRef<HTMLInputElement>(null);
   const openAuthButtonRef = useRef<HTMLButtonElement>(null);
+  const disconnectButtonRef = useRef<HTMLButtonElement>(null);
+  const disconnectInFlightProviderRef = useRef<string | null>(null);
   const { focusMainInput } = useUiStore();
 
   const close = () => {
@@ -66,7 +72,10 @@ export function ProviderAuthSwitcher({
     setSearch('');
     setResponseInput('');
     setIsCompleting(false);
+    setIsDisconnecting(false);
     setCopyStatus('idle');
+    setSelectedConnectedProvider(null);
+    disconnectInFlightProviderRef.current = null;
     onRequestProviders();
     window.setTimeout(() => inputRef.current?.focus(), 0);
   }, [open, onRequestProviders]);
@@ -75,15 +84,50 @@ export function ProviderAuthSwitcher({
     if (!open || !oauthFlow) {
       return;
     }
+    setSelectedConnectedProvider(null);
     setCopyStatus('idle');
     window.setTimeout(() => openAuthButtonRef.current?.focus(), 0);
   }, [open, oauthFlow]);
 
   useEffect(() => {
-    if (oauthResult) {
-      setIsCompleting(false);
+    if (!open || oauthFlow || !selectedConnectedProvider) {
+      return;
+    }
+    window.setTimeout(() => disconnectButtonRef.current?.focus(), 0);
+  }, [open, oauthFlow, selectedConnectedProvider]);
+
+  useEffect(() => {
+    if (!oauthResult) {
+      return;
+    }
+
+    setIsCompleting(false);
+
+    if (
+      disconnectInFlightProviderRef.current &&
+      oauthResult.provider === disconnectInFlightProviderRef.current
+    ) {
+      setIsDisconnecting(false);
+      if (oauthResult.success) {
+        setSelectedConnectedProvider(null);
+        window.setTimeout(() => inputRef.current?.focus(), 0);
+      }
+      disconnectInFlightProviderRef.current = null;
     }
   }, [oauthResult]);
+
+  useEffect(() => {
+    if (!selectedConnectedProvider) {
+      return;
+    }
+
+    const nextProvider = providers.find(
+      (provider) => provider.provider === selectedConnectedProvider.provider,
+    );
+    if (!nextProvider || nextProvider.status !== 'connected') {
+      setSelectedConnectedProvider(null);
+    }
+  }, [providers, selectedConnectedProvider]);
 
   useEffect(() => {
     if (copyStatus === 'idle') {
@@ -108,6 +152,29 @@ export function ProviderAuthSwitcher({
   if (!open) {
     return null;
   }
+
+  const handleProviderSelect = (provider: AuthProviderEntry) => {
+    if (provider.status === 'connected') {
+      setSelectedConnectedProvider(provider);
+      setResponseInput('');
+      setIsCompleting(false);
+      setIsDisconnecting(false);
+      return;
+    }
+
+    setSelectedConnectedProvider(null);
+    onStartOAuthLogin(provider.provider);
+  };
+
+  const handleDisconnect = () => {
+    if (!selectedConnectedProvider || isDisconnecting) {
+      return;
+    }
+
+    setIsDisconnecting(true);
+    disconnectInFlightProviderRef.current = selectedConnectedProvider.provider;
+    onDisconnectOAuth(selectedConnectedProvider.provider);
+  };
 
   const oauthActionFocusClasses =
     'focus-visible:outline-none focus-visible:border-accent-primary/70 focus-visible:ring-2 focus-visible:ring-accent-primary/50 focus-visible:shadow-[0_0_14px_rgba(var(--accent-primary-rgb),0.35)]';
@@ -158,7 +225,7 @@ export function ProviderAuthSwitcher({
                   key={provider.provider}
                   value={`${provider.provider} ${provider.display_name}`}
                   keywords={[provider.provider, provider.display_name, provider.status]}
-                  onSelect={() => onStartOAuthLogin(provider.provider)}
+                  onSelect={() => handleProviderSelect(provider)}
                   className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
                 >
                   <div className="w-7 h-7 rounded-md border border-accent-primary/35 bg-accent-primary/10 flex items-center justify-center">
@@ -242,6 +309,33 @@ export function ProviderAuthSwitcher({
                   }`}
                 >
                   {isCompleting ? 'Completing...' : 'Complete'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {!oauthFlow && selectedConnectedProvider && (
+            <div className="border-t border-surface-border/60 bg-surface-canvas/40 px-4 py-3 space-y-3">
+              <div className="text-sm text-ui-primary">
+                Manage Connection for{' '}
+                <span className="text-accent-primary">{selectedConnectedProvider.display_name}</span>
+              </div>
+              <div className="text-xs text-ui-muted">
+                Disconnect removes stored OAuth credentials for this provider from your local keychain.
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  ref={disconnectButtonRef}
+                  type="button"
+                  disabled={isDisconnecting}
+                  onClick={handleDisconnect}
+                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-all ${oauthActionFocusClasses} ${
+                    isDisconnecting
+                      ? 'border-surface-border text-ui-muted cursor-not-allowed bg-surface-elevated/40'
+                      : 'border-status-warning/45 bg-status-warning/10 text-status-warning hover:bg-status-warning/20'
+                  }`}
+                >
+                  {isDisconnecting ? 'Disconnecting...' : 'Disconnect'}
                 </button>
               </div>
             </div>

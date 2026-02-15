@@ -424,6 +424,7 @@ export type UiClientMessage =
   | { type: 'list_auth_providers' }
   | { type: 'start_oauth_login'; provider: string }
   | { type: 'complete_oauth_login'; flow_id: string; response: string }
+  | { type: 'disconnect_oauth'; provider: string }
   | { type: 'get_file_index' }
   | { type: 'get_llm_config'; config_id: number }
   | { type: 'cancel_session' }

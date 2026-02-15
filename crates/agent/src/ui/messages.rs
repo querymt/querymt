@@ -154,15 +154,20 @@ pub enum UiClientMessage {
     /// List configured OAuth-capable providers and their auth status
     ListAuthProviders,
     /// Start OAuth login flow for provider
-    #[serde(rename = "start_oauth_login", alias = "start_o_auth_login")]
+    #[serde(rename = "start_oauth_login")]
     StartOAuthLogin {
         provider: String,
     },
     /// Complete OAuth login flow using pasted callback URL/code
-    #[serde(rename = "complete_oauth_login", alias = "complete_o_auth_login")]
+    #[serde(rename = "complete_oauth_login")]
     CompleteOAuthLogin {
         flow_id: String,
         response: String,
+    },
+    /// Disconnect OAuth credentials for provider
+    #[serde(rename = "disconnect_oauth")]
+    DisconnectOAuth {
+        provider: String,
     },
     /// Set the agent's operating mode (build/plan/review)
     SetAgentMode {
@@ -304,7 +309,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn deserializes_start_oauth_login_current_and_legacy_tags() {
+    fn deserializes_start_oauth_login_tag() {
         let current: UiClientMessage = serde_json::from_value(json!({
             "type": "start_oauth_login",
             "provider": "openai"
@@ -315,21 +320,10 @@ mod tests {
             UiClientMessage::StartOAuthLogin { provider } => assert_eq!(provider, "openai"),
             _ => panic!("expected StartOAuthLogin variant"),
         }
-
-        let legacy: UiClientMessage = serde_json::from_value(json!({
-            "type": "start_o_auth_login",
-            "provider": "openai"
-        }))
-        .expect("legacy start_o_auth_login tag should deserialize");
-
-        match legacy {
-            UiClientMessage::StartOAuthLogin { provider } => assert_eq!(provider, "openai"),
-            _ => panic!("expected StartOAuthLogin variant"),
-        }
     }
 
     #[test]
-    fn deserializes_complete_oauth_login_current_and_legacy_tags() {
+    fn deserializes_complete_oauth_login_tag() {
         let current: UiClientMessage = serde_json::from_value(json!({
             "type": "complete_oauth_login",
             "flow_id": "flow-1",
@@ -344,20 +338,19 @@ mod tests {
             }
             _ => panic!("expected CompleteOAuthLogin variant"),
         }
+    }
 
-        let legacy: UiClientMessage = serde_json::from_value(json!({
-            "type": "complete_o_auth_login",
-            "flow_id": "flow-2",
-            "response": "code"
+    #[test]
+    fn deserializes_disconnect_oauth_tag() {
+        let current: UiClientMessage = serde_json::from_value(json!({
+            "type": "disconnect_oauth",
+            "provider": "openai"
         }))
-        .expect("legacy complete_o_auth_login tag should deserialize");
+        .expect("current disconnect_oauth tag should deserialize");
 
-        match legacy {
-            UiClientMessage::CompleteOAuthLogin { flow_id, response } => {
-                assert_eq!(flow_id, "flow-2");
-                assert_eq!(response, "code");
-            }
-            _ => panic!("expected CompleteOAuthLogin variant"),
+        match current {
+            UiClientMessage::DisconnectOAuth { provider } => assert_eq!(provider, "openai"),
+            _ => panic!("expected DisconnectOAuth variant"),
         }
     }
 

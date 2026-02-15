@@ -60,6 +60,7 @@ export function AppShell() {
     requestAuthProviders,
     startOAuthLogin,
     completeOAuthLogin,
+    disconnectOAuth,
     clearOAuthState,
     setSessionModel,
     sessionGroups,
@@ -608,6 +609,7 @@ export function AppShell() {
         onRequestProviders={requestAuthProviders}
         onStartOAuthLogin={startOAuthLogin}
         onCompleteOAuthLogin={completeOAuthLogin}
+        onDisconnectOAuth={disconnectOAuth}
       />
 
       <WorkspacePathDialog

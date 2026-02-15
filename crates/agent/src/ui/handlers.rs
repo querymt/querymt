@@ -186,6 +186,9 @@ pub async fn handle_ui_message(
         UiClientMessage::CompleteOAuthLogin { flow_id, response } => {
             handle_complete_oauth_login(state, conn_id, &flow_id, &response, tx).await;
         }
+        UiClientMessage::DisconnectOAuth { provider } => {
+            handle_disconnect_oauth(state, conn_id, &provider, tx).await;
+        }
         UiClientMessage::SetAgentMode { mode } => {
             handle_set_agent_mode(state, &mode, tx).await;
         }
@@ -651,6 +654,130 @@ pub async fn handle_complete_oauth_login(
                     tx,
                     UiServerMessage::OAuthResult {
                         provider: flow.provider,
+                        success: false,
+                        message: err,
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    #[cfg(not(feature = "oauth"))]
+    {
+        let _ = send_error(tx, "OAuth support is not enabled in this build".to_string()).await;
+    }
+}
+
+/// Disconnect OAuth credentials for a provider.
+pub async fn handle_disconnect_oauth(
+    state: &ServerState,
+    conn_id: &str,
+    provider: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    #[cfg(feature = "oauth")]
+    {
+        let provider_name = provider.trim().to_lowercase();
+        if provider_name.is_empty() {
+            let _ = send_error(tx, "Provider name is required".to_string()).await;
+            return;
+        }
+
+        let registry = state.agent.provider.plugin_registry();
+        let is_configured = registry
+            .config
+            .providers
+            .iter()
+            .any(|cfg| cfg.name == provider_name.as_str());
+        if !is_configured {
+            let _ = send_error(
+                tx,
+                format!("Provider '{}' is not configured", provider_name),
+            )
+            .await;
+            return;
+        }
+
+        let mode = if provider_name == "anthropic" {
+            Some("max")
+        } else {
+            None
+        };
+
+        let oauth_provider = match crate::auth::get_oauth_provider(&provider_name, mode) {
+            Ok(provider) => provider,
+            Err(err) => {
+                let _ = send_error(tx, err.to_string()).await;
+                return;
+            }
+        };
+
+        let mut store = match crate::auth::SecretStore::new() {
+            Ok(store) => store,
+            Err(err) => {
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::OAuthResult {
+                        provider: provider_name.clone(),
+                        success: false,
+                        message: format!("Failed to access secure storage: {}", err),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+
+        let result = async {
+            if store.get_oauth_tokens(&provider_name).is_some() {
+                store
+                    .delete_oauth_tokens(&provider_name)
+                    .map_err(|e| format!("Failed to remove OAuth tokens: {}", e))?;
+            }
+
+            if let Some(api_key_name) = oauth_provider.api_key_name()
+                && store.get(api_key_name).is_some()
+            {
+                store
+                    .delete(api_key_name)
+                    .map_err(|e| format!("Failed to remove API key '{}': {}", api_key_name, e))?;
+            }
+
+            Ok::<(), String>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                {
+                    let mut flows = state.oauth_flows.lock().await;
+                    flows.retain(|_, flow| {
+                        !(flow.conn_id == conn_id && flow.provider == provider_name)
+                    });
+                }
+
+                state.agent.invalidate_provider_cache().await;
+                state.model_cache.invalidate(&()).await;
+
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::OAuthResult {
+                        provider: provider_name,
+                        success: true,
+                        message: format!("Disconnected from {}", oauth_provider.display_name()),
+                    },
+                )
+                .await;
+
+                handle_list_auth_providers(state, tx).await;
+                handle_list_all_models(state, true, tx).await;
+            }
+            Err(err) => {
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::OAuthResult {
+                        provider: provider_name,
                         success: false,
                         message: err,
                     },
