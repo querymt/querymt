@@ -57,6 +57,15 @@ struct OAuthCallbackPayload {
 }
 
 #[cfg(feature = "oauth")]
+type OAuthCallbackResult = Result<OAuthCallbackPayload, String>;
+
+#[cfg(feature = "oauth")]
+type OAuthCallbackResultSender = oneshot::Sender<OAuthCallbackResult>;
+
+#[cfg(feature = "oauth")]
+type SharedOAuthCallbackResultSender = Arc<AsyncMutex<Option<OAuthCallbackResultSender>>>;
+
+#[cfg(feature = "oauth")]
 #[derive(Debug, Deserialize)]
 struct OAuthCallbackQuery {
     code: Option<String>,
@@ -68,7 +77,7 @@ struct OAuthCallbackQuery {
 #[derive(Clone)]
 struct OAuthCallbackHttpState {
     expected_state: String,
-    result_tx: Arc<AsyncMutex<Option<oneshot::Sender<Result<OAuthCallbackPayload, String>>>>>,
+    result_tx: SharedOAuthCallbackResultSender,
 }
 
 fn resolve_base_url_for_provider(state: &ServerState, provider: &str) -> Option<String> {
@@ -828,7 +837,7 @@ async fn run_oauth_callback_listener_task(
     enum CallbackWaitResult {
         Stopped,
         Timeout,
-        Callback(Result<OAuthCallbackPayload, String>),
+        Callback(OAuthCallbackResult),
     }
 
     let wait_result = tokio::select! {
@@ -1022,10 +1031,7 @@ async fn oauth_callback_http_handler(
 }
 
 #[cfg(feature = "oauth")]
-async fn send_oauth_callback_result(
-    state: &OAuthCallbackHttpState,
-    result: Result<OAuthCallbackPayload, String>,
-) {
+async fn send_oauth_callback_result(state: &OAuthCallbackHttpState, result: OAuthCallbackResult) {
     let mut result_tx = state.result_tx.lock().await;
     if let Some(tx) = result_tx.take() {
         let _ = tx.send(result);
