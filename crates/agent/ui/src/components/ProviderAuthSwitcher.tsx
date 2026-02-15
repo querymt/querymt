@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Command } from 'cmdk';
-import { ExternalLink, KeyRound, ShieldCheck } from 'lucide-react';
+import { Copy, ExternalLink, KeyRound, ShieldCheck } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
 import type { AuthProviderEntry, OAuthFlowState, OAuthResultState } from '../types';
 
@@ -48,9 +48,10 @@ export function ProviderAuthSwitcher({
   const [search, setSearch] = useState('');
   const [responseInput, setResponseInput] = useState('');
   const [isCompleting, setIsCompleting] = useState(false);
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const inputRef = useRef<HTMLInputElement>(null);
   const callbackRef = useRef<HTMLInputElement>(null);
-  const lastOpenedFlowRef = useRef<string | null>(null);
+  const openAuthButtonRef = useRef<HTMLButtonElement>(null);
   const { focusMainInput } = useUiStore();
 
   const close = () => {
@@ -65,6 +66,7 @@ export function ProviderAuthSwitcher({
     setSearch('');
     setResponseInput('');
     setIsCompleting(false);
+    setCopyStatus('idle');
     onRequestProviders();
     window.setTimeout(() => inputRef.current?.focus(), 0);
   }, [open, onRequestProviders]);
@@ -73,13 +75,8 @@ export function ProviderAuthSwitcher({
     if (!open || !oauthFlow) {
       return;
     }
-
-    if (lastOpenedFlowRef.current !== oauthFlow.flow_id) {
-      window.open(oauthFlow.authorization_url, '_blank', 'noopener,noreferrer');
-      lastOpenedFlowRef.current = oauthFlow.flow_id;
-    }
-
-    window.setTimeout(() => callbackRef.current?.focus(), 0);
+    setCopyStatus('idle');
+    window.setTimeout(() => openAuthButtonRef.current?.focus(), 0);
   }, [open, oauthFlow]);
 
   useEffect(() => {
@@ -88,9 +85,32 @@ export function ProviderAuthSwitcher({
     }
   }, [oauthResult]);
 
+  useEffect(() => {
+    if (copyStatus === 'idle') {
+      return;
+    }
+    const timeoutId = window.setTimeout(() => setCopyStatus('idle'), 2000);
+    return () => window.clearTimeout(timeoutId);
+  }, [copyStatus]);
+
+  const copyAuthorizationUrl = async () => {
+    if (!oauthFlow) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(oauthFlow.authorization_url);
+      setCopyStatus('copied');
+    } catch {
+      setCopyStatus('error');
+    }
+  };
+
   if (!open) {
     return null;
   }
+
+  const oauthActionFocusClasses =
+    'focus-visible:outline-none focus-visible:border-accent-primary/70 focus-visible:ring-2 focus-visible:ring-accent-primary/50 focus-visible:shadow-[0_0_14px_rgba(var(--accent-primary-rgb),0.35)]';
 
   return (
     <>
@@ -164,17 +184,35 @@ export function ProviderAuthSwitcher({
                 Continue OAuth for <span className="text-accent-primary">{oauthFlow.provider}</span>
               </div>
               <div className="text-xs text-ui-muted">
-                A browser tab was opened. Approve access, then paste the callback URL or authorization code below.
+                Open the authorization page, approve access, then paste the callback URL or authorization code below.
               </div>
 
-              <button
-                type="button"
-                onClick={() => window.open(oauthFlow.authorization_url, '_blank', 'noopener,noreferrer')}
-                className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-accent-primary/40 text-accent-primary text-xs hover:bg-accent-primary/10 transition-colors"
-              >
-                <ExternalLink className="w-3.5 h-3.5" />
-                Open authorization page
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  ref={openAuthButtonRef}
+                  type="button"
+                  onClick={() => window.open(oauthFlow.authorization_url, '_blank', 'noopener,noreferrer')}
+                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-accent-primary/40 text-accent-primary text-xs hover:bg-accent-primary/10 transition-all ${oauthActionFocusClasses}`}
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  Open Authorization Page
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    void copyAuthorizationUrl();
+                  }}
+                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-accent-primary/40 text-accent-primary text-xs hover:bg-accent-primary/10 transition-all ${oauthActionFocusClasses}`}
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  {copyStatus === 'copied'
+                    ? 'Copied!'
+                    : copyStatus === 'error'
+                      ? 'Copy failed'
+                      : 'Copy Authorization URL'}
+                </button>
+              </div>
 
               <div className="flex items-center gap-2">
                 <input
@@ -197,7 +235,7 @@ export function ProviderAuthSwitcher({
                     setIsCompleting(true);
                     onCompleteOAuthLogin(oauthFlow.flow_id, responseInput.trim());
                   }}
-                  className={`px-3 py-2 rounded-lg text-xs font-medium transition-colors ${
+                  className={`px-3 py-2 rounded-lg text-xs font-medium transition-all ${oauthActionFocusClasses} ${
                     !responseInput.trim() || isCompleting
                       ? 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
                       : 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30'

@@ -154,10 +154,12 @@ pub enum UiClientMessage {
     /// List configured OAuth-capable providers and their auth status
     ListAuthProviders,
     /// Start OAuth login flow for provider
+    #[serde(rename = "start_oauth_login", alias = "start_o_auth_login")]
     StartOAuthLogin {
         provider: String,
     },
     /// Complete OAuth login flow using pasted callback URL/code
+    #[serde(rename = "complete_oauth_login", alias = "complete_o_auth_login")]
     CompleteOAuthLogin {
         flow_id: String,
         response: String,
@@ -255,12 +257,14 @@ pub enum UiServerMessage {
         providers: Vec<AuthProviderEntry>,
     },
     /// OAuth flow started; frontend should open authorization_url
+    #[serde(rename = "oauth_flow_started")]
     OAuthFlowStarted {
         flow_id: String,
         provider: String,
         authorization_url: String,
     },
     /// OAuth flow completion result
+    #[serde(rename = "oauth_result")]
     OAuthResult {
         provider: String,
         success: bool,
@@ -291,5 +295,88 @@ impl UiServerMessage {
             Self::OAuthFlowStarted { .. } => "oauth_flow_started",
             Self::OAuthResult { .. } => "oauth_result",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UiClientMessage, UiServerMessage};
+    use serde_json::json;
+
+    #[test]
+    fn deserializes_start_oauth_login_current_and_legacy_tags() {
+        let current: UiClientMessage = serde_json::from_value(json!({
+            "type": "start_oauth_login",
+            "provider": "openai"
+        }))
+        .expect("current start_oauth_login tag should deserialize");
+
+        match current {
+            UiClientMessage::StartOAuthLogin { provider } => assert_eq!(provider, "openai"),
+            _ => panic!("expected StartOAuthLogin variant"),
+        }
+
+        let legacy: UiClientMessage = serde_json::from_value(json!({
+            "type": "start_o_auth_login",
+            "provider": "openai"
+        }))
+        .expect("legacy start_o_auth_login tag should deserialize");
+
+        match legacy {
+            UiClientMessage::StartOAuthLogin { provider } => assert_eq!(provider, "openai"),
+            _ => panic!("expected StartOAuthLogin variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_complete_oauth_login_current_and_legacy_tags() {
+        let current: UiClientMessage = serde_json::from_value(json!({
+            "type": "complete_oauth_login",
+            "flow_id": "flow-1",
+            "response": "code"
+        }))
+        .expect("current complete_oauth_login tag should deserialize");
+
+        match current {
+            UiClientMessage::CompleteOAuthLogin { flow_id, response } => {
+                assert_eq!(flow_id, "flow-1");
+                assert_eq!(response, "code");
+            }
+            _ => panic!("expected CompleteOAuthLogin variant"),
+        }
+
+        let legacy: UiClientMessage = serde_json::from_value(json!({
+            "type": "complete_o_auth_login",
+            "flow_id": "flow-2",
+            "response": "code"
+        }))
+        .expect("legacy complete_o_auth_login tag should deserialize");
+
+        match legacy {
+            UiClientMessage::CompleteOAuthLogin { flow_id, response } => {
+                assert_eq!(flow_id, "flow-2");
+                assert_eq!(response, "code");
+            }
+            _ => panic!("expected CompleteOAuthLogin variant"),
+        }
+    }
+
+    #[test]
+    fn serializes_oauth_server_tags_without_extra_underscore() {
+        let flow_started = serde_json::to_value(UiServerMessage::OAuthFlowStarted {
+            flow_id: "flow-1".to_string(),
+            provider: "openai".to_string(),
+            authorization_url: "https://example.com".to_string(),
+        })
+        .expect("OAuthFlowStarted should serialize");
+        assert_eq!(flow_started["type"], "oauth_flow_started");
+
+        let result = serde_json::to_value(UiServerMessage::OAuthResult {
+            provider: "openai".to_string(),
+            success: true,
+            message: "ok".to_string(),
+        })
+        .expect("OAuthResult should serialize");
+        assert_eq!(result["type"], "oauth_result");
     }
 }
