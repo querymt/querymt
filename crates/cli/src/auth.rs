@@ -17,7 +17,7 @@ use std::time::Duration;
 /// This implementation:
 /// - Uses colored terminal output for status messages
 /// - Automatically opens the browser for authorization URLs
-/// - Supports OpenAI callback server for automatic code capture
+/// - Supports Codex callback server for automatic code capture
 /// - Falls back to manual code entry if callback server fails
 pub struct ConsoleOAuthUI;
 
@@ -48,8 +48,8 @@ impl OAuthUI for ConsoleOAuthUI {
         provider: &dyn OAuthProvider,
         flow: &OAuthFlowData,
     ) -> Result<Option<(querymt_utils::oauth::TokenSet, Option<String>)>> {
-        // Only use callback server for OpenAI and Codex
-        if provider.name() != "openai" && provider.name() != "codex" {
+        // Only use callback server for Codex
+        if provider.name() != "codex" {
             return Ok(None);
         }
 

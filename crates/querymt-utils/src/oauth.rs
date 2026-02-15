@@ -1,7 +1,7 @@
 //! OAuth authentication and token management
 //!
 //! This module provides presentation-agnostic OAuth authentication flows through the
-//! `OAuthUI` trait abstraction. It supports multiple OAuth providers (Anthropic, OpenAI, Codex)
+//! `OAuthUI` trait abstraction. It supports multiple OAuth providers (Anthropic, Codex)
 //! with automatic token refresh and secure keyring storage.
 //!
 //! # Architecture
@@ -26,7 +26,6 @@
 use crate::secret_store::SecretStore;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // Re-export types that are part of the public API
@@ -48,7 +47,7 @@ pub trait OAuthUI: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `provider_name` - The name of the provider (e.g., "anthropic", "openai")
+    /// * `provider_name` - The name of the provider (e.g., "anthropic", "codex")
     /// * `url` - The authorization URL to present
     /// * `state` - The OAuth state parameter for validation
     ///
@@ -62,7 +61,7 @@ pub trait OAuthUI: Send + Sync {
     /// Returns `Some((tokens, optional_api_key))` if the UI handled the full exchange,
     /// or `None` to fall back to `authorize()` + `provider.exchange_code()`.
     ///
-    /// This is useful for providers like OpenAI where a callback server can handle
+    /// This is useful for providers like Codex where a callback server can handle
     /// both code receipt and token exchange in one step.
     async fn authorize_and_exchange(
         &self,
@@ -88,7 +87,7 @@ pub trait OAuthUI: Send + Sync {
 /// and token refresh logic.
 #[async_trait]
 pub trait OAuthProvider: Send + Sync {
-    /// Get the provider name (e.g., "anthropic", "openai", "codex")
+    /// Get the provider name (e.g., "anthropic", "codex")
     fn name(&self) -> &str;
 
     /// Get the display name for user-facing messages
@@ -173,118 +172,6 @@ impl OAuthProvider for AnthropicProvider {
     }
 }
 
-/// OpenAI OAuth provider implementation
-pub struct OpenAIProvider {
-    client: openai_auth::OAuthClient,
-    api_key: Arc<Mutex<Option<String>>>,
-}
-
-impl Default for OpenAIProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl OpenAIProvider {
-    pub fn new() -> Self {
-        let config = openai_auth::OAuthConfig::builder()
-            .redirect_port(1455)
-            .build();
-        let client =
-            openai_auth::OAuthClient::new(config).expect("Failed to create OpenAI OAuth client");
-        Self {
-            client,
-            api_key: Arc::new(Mutex::new(None)),
-        }
-    }
-}
-
-#[async_trait]
-impl OAuthProvider for OpenAIProvider {
-    fn name(&self) -> &str {
-        "openai"
-    }
-
-    fn display_name(&self) -> &str {
-        "OpenAI"
-    }
-
-    async fn start_flow(&self) -> Result<OAuthFlowData> {
-        let flow = self.client.start_flow()?;
-
-        Ok(OAuthFlowData {
-            authorization_url: flow.authorization_url,
-            state: flow.state,
-            verifier: flow.pkce_verifier,
-        })
-    }
-
-    async fn exchange_code(&self, code: &str, _state: &str, verifier: &str) -> Result<TokenSet> {
-        let tokens = self.client.exchange_code(code, verifier).await?;
-
-        if let Some(ref id_token) = tokens.id_token {
-            match self.client.obtain_api_key(id_token).await {
-                Ok(api_key) => {
-                    if let Ok(mut slot) = self.api_key.lock() {
-                        *slot = Some(api_key);
-                    }
-                }
-                Err(err) => {
-                    log::warn!(
-                        "OpenAI OAuth: API key exchange failed ({}). Continuing with token-only OAuth flow.",
-                        err
-                    );
-                }
-            }
-        }
-
-        Ok(TokenSet {
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            expires_at: tokens.expires_at,
-        })
-    }
-
-    async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
-        let tokens = self.client.refresh_token(refresh_token).await?;
-
-        // Try to obtain API key if we have an id_token
-        if let Some(ref id_token) = tokens.id_token {
-            match self.client.obtain_api_key(id_token).await {
-                Ok(api_key) => {
-                    if let Ok(mut slot) = self.api_key.lock() {
-                        *slot = Some(api_key);
-                    }
-                }
-                Err(err) => {
-                    log::warn!(
-                        "OpenAI OAuth: API key exchange failed ({}). Try the `codex` provider if you only have OAuth access.",
-                        err
-                    );
-                }
-            }
-        }
-
-        Ok(TokenSet {
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            expires_at: tokens.expires_at,
-        })
-    }
-
-    async fn create_api_key(&self, _access_token: &str) -> Result<Option<String>> {
-        let mut api_key = None;
-        if let Ok(mut slot) = self.api_key.lock() {
-            api_key = slot.take();
-        }
-        Ok(api_key)
-    }
-
-    fn api_key_name(&self) -> Option<&str> {
-        Some("OPENAI_API_KEY")
-    }
-}
-
 /// Codex OAuth provider implementation
 ///
 /// This is intentionally separate from OpenAI so tokens are stored and looked up
@@ -364,7 +251,7 @@ impl OAuthProvider for CodexProvider {
 ///
 /// # Arguments
 ///
-/// * `provider_name` - The name of the provider (e.g., "anthropic", "openai", "codex")
+/// * `provider_name` - The name of the provider (e.g., "anthropic", "codex")
 /// * `mode` - Optional mode string for providers that support multiple modes (e.g., "max", "console" for Anthropic)
 ///
 /// # Returns
@@ -392,7 +279,6 @@ pub fn get_oauth_provider(
             };
             Ok(Box::new(AnthropicProvider::new(oauth_mode)))
         }
-        "openai" => Ok(Box::new(OpenAIProvider::new())),
         "codex" => Ok(Box::new(CodexProvider::new())),
         _ => Err(anyhow!(
             "OAuth is not supported for provider '{}'",
@@ -529,21 +415,6 @@ pub async fn get_valid_token(
     provider: &dyn OAuthProvider,
     store: &mut SecretStore,
 ) -> Result<String> {
-    // Special handling for OpenAI: prefer API key
-    if provider.name() == "openai" {
-        if let Some(token) = store.get_valid_access_token(provider.name()) {
-            return Ok(token);
-        }
-        if let Some(key_name) = provider.api_key_name()
-            && let Some(api_key) = store.get(key_name)
-        {
-            return Ok(api_key);
-        }
-        return Err(anyhow!(
-            "OpenAI API key not found; run 'qmt auth login openai' to re-authenticate"
-        ));
-    }
-
     // Try to get valid token
     if let Some(token) = store.get_valid_access_token(provider.name()) {
         return Ok(token);
@@ -578,14 +449,12 @@ pub async fn show_auth_status(
     ui: &dyn OAuthUI,
 ) -> Result<()> {
     let providers_to_check = if let Some(p) = provider_name {
+        get_oauth_provider(p, None)
+            .map_err(|_| anyhow!("OAuth is not supported for provider '{}'", p))?;
         vec![p.to_string()]
     } else {
         // List all known OAuth providers
-        vec![
-            "anthropic".to_string(),
-            "openai".to_string(),
-            "codex".to_string(),
-        ]
+        vec!["anthropic".to_string(), "codex".to_string()]
     };
 
     ui.status("OAuth Authentication Status");
@@ -797,7 +666,7 @@ pub fn extract_code_from_query(input: &str) -> Option<String> {
 ///
 /// # Arguments
 ///
-/// * `provider` - The provider name (e.g., "anthropic", "openai")
+/// * `provider` - The provider name (e.g., "anthropic", "codex")
 ///
 /// # Returns
 ///

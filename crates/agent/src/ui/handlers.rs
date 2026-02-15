@@ -589,7 +589,7 @@ async fn maybe_spawn_oauth_callback_listener(
     flow_id: String,
     provider: String,
 ) {
-    if provider != "openai" && provider != "codex" && provider != "anthropic" {
+    if provider != "codex" && provider != "anthropic" {
         return;
     }
 
