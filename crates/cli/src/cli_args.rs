@@ -133,7 +133,7 @@ pub enum Commands {
 pub enum AuthCommands {
     /// Login to a provider using OAuth
     Login {
-        /// Provider to authenticate with (e.g., "anthropic", "openai")
+        /// Provider to authenticate with (e.g., "anthropic", "codex")
         provider: String,
         /// OAuth mode (provider-specific, e.g., "max" or "console" for Anthropic)
         #[arg(long, default_value = "max")]

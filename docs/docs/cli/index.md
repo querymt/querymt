@@ -138,8 +138,8 @@ https://console.anthropic.com/oauth/authorize?...
 # Login to Anthropic via OAuth (using Console mode for API key generation)
 $ qmt auth login anthropic --mode console
 
-# Login to OpenAI via OAuth
-$ qmt auth login openai
+# Login to Codex via OAuth
+$ qmt auth login codex
 
 # Check authentication status for all providers
 $ qmt auth status
@@ -150,8 +150,8 @@ anthropic: Valid ✓
   Access token expires: 2026-02-15 14:30:00 UTC
   Refresh token available
 
-openai: Not authenticated
-  Run 'qmt auth login openai' to authenticate
+codex: Not authenticated
+  Run 'qmt auth login codex' to authenticate
 
 # Check status for a specific provider (with automatic refresh disabled)
 $ qmt auth status anthropic --no-refresh
