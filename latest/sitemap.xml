@@ -2,82 +2,82 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://docs.query.mt/latest/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/architecture/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/mcp/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/cli/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/core/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/core/builder/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/core/chaining/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/core/chat/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/core/completion/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/core/embeddings/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/core/providers/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/core/tools/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/plugins/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/plugins/configuration/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/plugins/data_structures/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/plugins/development/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/plugins/helper_macros/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/plugins/interface_spec/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/plugins/oci_plugins/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
     <url>
          <loc>https://docs.query.mt/latest/plugins/usage/</loc>
-         <lastmod>2026-02-14</lastmod>
+         <lastmod>2026-02-16</lastmod>
     </url>
 </urlset>
