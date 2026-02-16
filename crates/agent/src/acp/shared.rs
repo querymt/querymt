@@ -10,9 +10,9 @@ use crate::events::{AgentEvent, AgentEventKind};
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
 use agent_client_protocol::{
-    Content, ContentBlock, ContentChunk, Error, RequestPermissionOutcome, SessionUpdate,
-    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    Content, ContentBlock, ContentChunk, Error, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, RequestPermissionOutcome, SessionUpdate, TextContent, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol_schema::AGENT_METHOD_NAMES;
 use serde::{Deserialize, Serialize};
@@ -108,6 +108,10 @@ pub fn translate_event_to_update(event: &AgentEvent) -> Option<SessionUpdate> {
             tool_name,
             arguments,
         } => {
+            if is_todo_write_tool(tool_name) {
+                return todo_plan_from_arguments(arguments).map(SessionUpdate::Plan);
+            }
+
             let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
             Some(SessionUpdate::ToolCall(
                 ToolCall::new(
@@ -125,6 +129,10 @@ pub fn translate_event_to_update(event: &AgentEvent) -> Option<SessionUpdate> {
             result,
             is_error,
         } => {
+            if is_todo_write_tool(tool_name) {
+                return None;
+            }
+
             let status = if *is_error {
                 ToolCallStatus::Failed
             } else {
@@ -143,6 +151,57 @@ pub fn translate_event_to_update(event: &AgentEvent) -> Option<SessionUpdate> {
                     .raw_output(raw_output),
             )))
         }
+        _ => None,
+    }
+}
+
+fn is_todo_write_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "todowrite" | "mcp_todowrite")
+}
+
+fn todo_plan_from_arguments(arguments: &str) -> Option<Plan> {
+    let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let todos = parsed.get("todos")?.as_array()?;
+    let mut entries = Vec::with_capacity(todos.len());
+
+    for todo in todos {
+        let content = todo.get("content")?.as_str()?.to_string();
+        let Some(status) = todo
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .and_then(todo_status_to_plan_status)
+        else {
+            continue;
+        };
+
+        let priority = todo
+            .get("priority")
+            .and_then(serde_json::Value::as_str)
+            .and_then(todo_priority_to_plan_priority)
+            .unwrap_or(PlanEntryPriority::Medium);
+
+        entries.push(PlanEntry::new(content, priority, status));
+    }
+
+    Some(Plan::new(entries))
+}
+
+fn todo_priority_to_plan_priority(priority: &str) -> Option<PlanEntryPriority> {
+    match priority {
+        "high" => Some(PlanEntryPriority::High),
+        "medium" => Some(PlanEntryPriority::Medium),
+        "low" => Some(PlanEntryPriority::Low),
+        _ => None,
+    }
+}
+
+fn todo_status_to_plan_status(status: &str) -> Option<PlanEntryStatus> {
+    match status {
+        "pending" => Some(PlanEntryStatus::Pending),
+        "in_progress" => Some(PlanEntryStatus::InProgress),
+        "completed" => Some(PlanEntryStatus::Completed),
+        // ACP plans do not support a cancelled state; omit these entries.
+        "cancelled" => None,
         _ => None,
     }
 }
@@ -409,5 +468,121 @@ pub async fn handle_rpc_message<S: SendAgent>(
             error: Some(serde_json::to_value(e).unwrap()),
             id: req.id,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::AgentEventKind;
+
+    fn tool_start_event(tool_name: &str, arguments: serde_json::Value) -> AgentEvent {
+        AgentEvent {
+            seq: 1,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            kind: AgentEventKind::ToolCallStart {
+                tool_call_id: "tc-1".to_string(),
+                tool_name: tool_name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    fn tool_end_event(tool_name: &str) -> AgentEvent {
+        AgentEvent {
+            seq: 2,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            kind: AgentEventKind::ToolCallEnd {
+                tool_call_id: "tc-1".to_string(),
+                tool_name: tool_name.to_string(),
+                result: "{}".to_string(),
+                is_error: false,
+            },
+        }
+    }
+
+    #[test]
+    fn todo_tool_start_translates_to_plan_update() {
+        let event = tool_start_event(
+            "todowrite",
+            serde_json::json!({
+                "todos": [
+                    {"id": "a", "content": "task a", "status": "pending", "priority": "high"},
+                    {"id": "b", "content": "task b", "status": "in_progress", "priority": "medium"},
+                    {"id": "c", "content": "task c", "status": "completed", "priority": "low"}
+                ]
+            }),
+        );
+
+        let update = translate_event_to_update(&event);
+        let Some(SessionUpdate::Plan(plan)) = update else {
+            panic!("expected plan update");
+        };
+
+        assert_eq!(plan.entries.len(), 3);
+        assert_eq!(plan.entries[0].content, "task a");
+        assert_eq!(plan.entries[0].status, PlanEntryStatus::Pending);
+        assert_eq!(plan.entries[0].priority, PlanEntryPriority::High);
+    }
+
+    #[test]
+    fn cancelled_todos_are_omitted_from_plan() {
+        let event = tool_start_event(
+            "mcp_todowrite",
+            serde_json::json!({
+                "todos": [
+                    {"id": "a", "content": "task a", "status": "cancelled", "priority": "high"},
+                    {"id": "b", "content": "task b", "status": "pending", "priority": "low"}
+                ]
+            }),
+        );
+
+        let update = translate_event_to_update(&event);
+        let Some(SessionUpdate::Plan(plan)) = update else {
+            panic!("expected plan update");
+        };
+
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].content, "task b");
+        assert_eq!(plan.entries[0].status, PlanEntryStatus::Pending);
+    }
+
+    #[test]
+    fn malformed_todowrite_arguments_do_not_emit_update() {
+        let event = AgentEvent {
+            seq: 1,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            kind: AgentEventKind::ToolCallStart {
+                tool_call_id: "tc-1".to_string(),
+                tool_name: "todowrite".to_string(),
+                arguments: "{ not-json".to_string(),
+            },
+        };
+
+        assert!(translate_event_to_update(&event).is_none());
+    }
+
+    #[test]
+    fn todo_tools_do_not_emit_tool_call_end_updates() {
+        assert!(translate_event_to_update(&tool_end_event("todowrite")).is_none());
+        assert!(translate_event_to_update(&tool_end_event("mcp_todowrite")).is_none());
+    }
+
+    #[test]
+    fn non_todo_tools_still_emit_tool_call_updates() {
+        let start = tool_start_event("read_tool", serde_json::json!({"path": "src/main.rs"}));
+        let end = tool_end_event("read_tool");
+
+        assert!(matches!(
+            translate_event_to_update(&start),
+            Some(SessionUpdate::ToolCall(_))
+        ));
+        assert!(matches!(
+            translate_event_to_update(&end),
+            Some(SessionUpdate::ToolCallUpdate(_))
+        ));
     }
 }
