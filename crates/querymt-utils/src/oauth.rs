@@ -220,17 +220,22 @@ impl OAuthProvider for OpenAIProvider {
     }
 
     async fn exchange_code(&self, code: &str, _state: &str, verifier: &str) -> Result<TokenSet> {
-        // Use exchange_code_for_api_key to get tokens with API key in one call
-        let tokens = self
-            .client
-            .exchange_code_for_api_key(code, verifier)
-            .await?;
+        let tokens = self.client.exchange_code(code, verifier).await?;
 
-        // Store the API key if present
-        if let Some(ref api_key) = tokens.api_key
-            && let Ok(mut slot) = self.api_key.lock()
-        {
-            *slot = Some(api_key.clone());
+        if let Some(ref id_token) = tokens.id_token {
+            match self.client.obtain_api_key(id_token).await {
+                Ok(api_key) => {
+                    if let Ok(mut slot) = self.api_key.lock() {
+                        *slot = Some(api_key);
+                    }
+                }
+                Err(err) => {
+                    log::warn!(
+                        "OpenAI OAuth: API key exchange failed ({}). Continuing with token-only OAuth flow.",
+                        err
+                    );
+                }
+            }
         }
 
         Ok(TokenSet {
@@ -326,11 +331,8 @@ impl OAuthProvider for CodexProvider {
     }
 
     async fn exchange_code(&self, code: &str, _state: &str, verifier: &str) -> Result<TokenSet> {
-        // Codex backend uses the OAuth access token directly; we intentionally ignore any API key.
-        let tokens = self
-            .client
-            .exchange_code_for_api_key(code, verifier)
-            .await?;
+        // Codex backend uses the OAuth access token directly.
+        let tokens = self.client.exchange_code(code, verifier).await?;
 
         Ok(TokenSet {
             access_token: tokens.access_token,
@@ -698,6 +700,55 @@ pub async fn openai_callback_server(
         Ok(Err(e)) => Err(anyhow!("Callback server error: {}", e)),
         Err(_) => Err(anyhow!("Timeout waiting for OAuth callback")),
     }
+}
+
+/// Run an Anthropic OAuth callback server on localhost.
+///
+/// This helper waits for the callback, then exchanges the received authorization
+/// code for OAuth tokens. In console mode, it also attempts API key creation.
+///
+/// # Arguments
+///
+/// * `port` - The port to listen on
+/// * `state` - The OAuth state parameter for validation
+/// * `verifier` - The PKCE verifier
+/// * `mode` - Anthropic OAuth mode (`max` or `console`)
+/// * `timeout` - How long to wait for the callback
+///
+/// # Returns
+///
+/// A tuple of (TokenSet, optional API key) or an error
+pub async fn anthropic_callback_server(
+    port: u16,
+    state: &str,
+    verifier: &str,
+    mode: OAuthMode,
+    timeout: Duration,
+) -> Result<(TokenSet, Option<String>)> {
+    use anthropic_auth::run_callback_server;
+
+    // Start callback server with timeout
+    let callback_future = run_callback_server(port, state);
+
+    let callback = match tokio::time::timeout(timeout, callback_future).await {
+        Ok(Ok(callback)) => callback,
+        Ok(Err(e)) => return Err(anyhow!("Callback server error: {}", e)),
+        Err(_) => return Err(anyhow!("Timeout waiting for OAuth callback")),
+    };
+
+    let client = AnthropicOAuthClient::new(OAuthConfig::default())?;
+    let code_with_state = format!("{}#{}", callback.code, callback.state);
+    let tokens = client
+        .exchange_code(&code_with_state, state, verifier)
+        .await?;
+
+    let api_key = if matches!(mode, OAuthMode::Console) {
+        Some(client.create_api_key(&tokens.access_token).await?)
+    } else {
+        None
+    };
+
+    Ok((tokens, api_key))
 }
 
 /// Extract authorization code from query string or URL

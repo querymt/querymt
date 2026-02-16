@@ -569,6 +569,11 @@ impl QueryMTAgent {
             .map_err(|e| Error::new(-32000, e.to_string()))
     }
 
+    /// Invalidate cached provider instance so the next request rebuilds with fresh credentials.
+    pub async fn invalidate_provider_cache(&self) {
+        self.provider.clear_provider_cache().await;
+    }
+
     /// Sends a session update notification to the client.
     ///
     /// Uses the client bridge if available (ACP stdio mode), otherwise no-op.

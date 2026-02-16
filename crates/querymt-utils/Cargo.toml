@@ -25,7 +25,7 @@ opentelemetry-semantic-conventions = "0.31"
 
 # Secret store dependencies (optional, behind secret-store feature)
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native", "crypto-rust"], optional = true }
-anthropic-auth = { version = "0.1", default-features = false, features = ["async", "rustls-tls"], optional = true }
+anthropic-auth = { version = "0.1", default-features = false, features = ["async", "callback-server", "rustls-tls"], optional = true }
 serde_json = { workspace = true, optional = true }
 
 # OAuth dependencies (optional, behind oauth feature)

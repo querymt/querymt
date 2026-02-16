@@ -11,6 +11,7 @@ import { SessionSwitcher } from './SessionSwitcher';
 import { StatsDrawer } from './StatsDrawer';
 import { ThemeSwitcher } from './ThemeSwitcher';
 import { ShortcutGateway } from './ShortcutGateway';
+import { ProviderAuthSwitcher } from './ProviderAuthSwitcher';
 import { WorkspacePathDialog } from './WorkspacePathDialog';
 import { copyToClipboard } from '../utils/clipboard';
 import { getModeColors, getModeDisplayName } from '../utils/modeColors';
@@ -52,7 +53,15 @@ export function AppShell() {
     sessionsByAgent,
     allModels,
     recentModelsByWorkspace,
+    authProviders,
+    oauthFlow,
+    oauthResult,
     refreshAllModels,
+    requestAuthProviders,
+    startOAuthLogin,
+    completeOAuthLogin,
+    disconnectOAuth,
+    clearOAuthState,
     setSessionModel,
     sessionGroups,
     thinkingBySession,
@@ -85,6 +94,7 @@ export function AppShell() {
   const copyTimeoutRef = useRef<number | null>(null);
   const [shortcutGatewayOpen, setShortcutGatewayOpen] = useState(false);
   const [themeSwitcherOpen, setThemeSwitcherOpen] = useState(false);
+  const [providerAuthOpen, setProviderAuthOpen] = useState(false);
   const prevAgentModeRef = useRef(agentMode);
   const availableThemes = useMemo(() => getDashboardThemes(), []);
   const shortcutGatewayPrefix = useMemo(
@@ -150,6 +160,15 @@ export function AppShell() {
         return;
       }
 
+      if (shortcutGatewayOpen && !e.altKey && !e.shiftKey && normalizedKey === 'a') {
+        e.preventDefault();
+        setShortcutGatewayOpen(false);
+        setThemeSwitcherOpen(false);
+        setProviderAuthOpen(true);
+        requestAuthProviders();
+        return;
+      }
+
       if (shortcutGatewayOpen) {
         return;
       }
@@ -189,6 +208,8 @@ export function AppShell() {
     setModelPickerOpen,
     setShortcutGatewayOpen,
     setThemeSwitcherOpen,
+    setProviderAuthOpen,
+    requestAuthProviders,
   ]);
   
   // ESC handling: close modals first, then double-escape to cancel session
@@ -231,6 +252,12 @@ export function AppShell() {
           setThemeSwitcherOpen(false);
           return;
         }
+        if (providerAuthOpen) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          setProviderAuthOpen(false);
+          return;
+        }
         if (statsDrawerOpen) {
           e.preventDefault();
           e.stopImmediatePropagation();
@@ -260,11 +287,13 @@ export function AppShell() {
     cancelSession,
     shortcutGatewayOpen,
     themeSwitcherOpen,
+    providerAuthOpen,
     workspacePathDialogOpen,
     cancelWorkspacePathDialog,
     setSessionSwitcherOpen,
     setModelPickerOpen,
     setShortcutGatewayOpen,
+    setProviderAuthOpen,
     setStatsDrawerOpen,
   ]);
   
@@ -286,6 +315,23 @@ export function AppShell() {
   useEffect(() => {
     applyDashboardTheme(selectedTheme);
   }, [selectedTheme]);
+
+  // Refresh provider/model data after successful OAuth login.
+  useEffect(() => {
+    if (!oauthResult?.success) {
+      return;
+    }
+
+    refreshAllModels();
+    requestAuthProviders();
+  }, [oauthResult, refreshAllModels, requestAuthProviders]);
+
+  // Clear transient OAuth UI state when auth modal closes.
+  useEffect(() => {
+    if (!providerAuthOpen) {
+      clearOAuthState();
+    }
+  }, [providerAuthOpen, clearOAuthState]);
   
   // Auto-switch model when agent mode changes (if preference exists)
   useEffect(() => {
@@ -533,6 +579,12 @@ export function AppShell() {
           setShortcutGatewayOpen(false);
           setThemeSwitcherOpen(true);
         }}
+        onAuthenticateProvider={() => {
+          setShortcutGatewayOpen(false);
+          setThemeSwitcherOpen(false);
+          setProviderAuthOpen(true);
+          requestAuthProviders();
+        }}
       />
 
       <ThemeSwitcher
@@ -541,6 +593,24 @@ export function AppShell() {
         themes={availableThemes}
         selectedTheme={selectedTheme}
         onSelectTheme={setSelectedTheme}
+      />
+
+      <ProviderAuthSwitcher
+        open={providerAuthOpen}
+        onOpenChange={(open) => {
+          setProviderAuthOpen(open);
+          if (!open) {
+            clearOAuthState();
+          }
+        }}
+        providers={authProviders}
+        oauthFlow={oauthFlow}
+        oauthResult={oauthResult}
+        onRequestProviders={requestAuthProviders}
+        onStartOAuthLogin={startOAuthLogin}
+        onCompleteOAuthLogin={completeOAuthLogin}
+        onClearOAuthState={clearOAuthState}
+        onDisconnectOAuth={disconnectOAuth}
       />
 
       <WorkspacePathDialog

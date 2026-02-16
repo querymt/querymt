@@ -211,6 +211,14 @@ impl SessionProvider {
         Ok(provider)
     }
 
+    /// Clear the global provider cache.
+    ///
+    /// This forces the next provider resolution to rebuild from current config/credentials.
+    pub async fn clear_provider_cache(&self) {
+        let mut cache = self.cached_provider.write().await;
+        *cache = None;
+    }
+
     /// Get pricing information for a session's model
     ///
     /// Returns `None` if:

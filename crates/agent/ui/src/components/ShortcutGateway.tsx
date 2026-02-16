@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Command } from 'cmdk';
-import { Keyboard, MessageSquare, Palette, Plus } from 'lucide-react';
+import { Keyboard, KeyRound, MessageSquare, Palette, Plus } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
 
 interface ShortcutGatewayProps {
@@ -8,6 +8,7 @@ interface ShortcutGatewayProps {
   onOpenChange: (open: boolean) => void;
   onStartNewSession: () => void;
   onSelectTheme: () => void;
+  onAuthenticateProvider: () => void;
 }
 
 export function ShortcutGateway({
@@ -15,6 +16,7 @@ export function ShortcutGateway({
   onOpenChange,
   onStartNewSession,
   onSelectTheme,
+  onAuthenticateProvider,
 }: ShortcutGatewayProps) {
   const [search, setSearch] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
@@ -139,6 +141,24 @@ export function ShortcutGateway({
                 </div>
                 <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
                   T
+                </kbd>
+              </Command.Item>
+
+              <Command.Item
+                value="authenticate provider"
+                keywords={['auth', 'oauth', 'provider', 'login', 'a']}
+                onSelect={() => onAuthenticateProvider()}
+                className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
+              >
+                <div className="w-7 h-7 rounded-md border border-accent-primary/35 bg-accent-primary/10 flex items-center justify-center">
+                  <KeyRound className="w-3.5 h-3.5 text-accent-primary" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm text-ui-primary">Authenticate Provider</div>
+                  <div className="text-xs text-ui-muted">Sign in with OAuth and unlock provider models</div>
+                </div>
+                <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
+                  A
                 </kbd>
               </Command.Item>
             </Command.Group>

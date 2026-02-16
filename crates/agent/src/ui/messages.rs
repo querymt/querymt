@@ -43,6 +43,23 @@ pub struct RecentModelEntry {
     pub use_count: u32,
 }
 
+/// OAuth authentication status for a provider.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthStatus {
+    NotAuthenticated,
+    Expired,
+    Connected,
+}
+
+/// OAuth-capable provider entry for dashboard auth UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthProviderEntry {
+    pub provider: String,
+    pub display_name: String,
+    pub status: OAuthStatus,
+}
+
 /// Summary of a session for listing.
 #[derive(Serialize)]
 pub struct SessionSummary {
@@ -134,6 +151,24 @@ pub enum UiClientMessage {
         action: String,
         content: Option<serde_json::Value>,
     },
+    /// List configured OAuth-capable providers and their auth status
+    ListAuthProviders,
+    /// Start OAuth login flow for provider
+    #[serde(rename = "start_oauth_login")]
+    StartOAuthLogin {
+        provider: String,
+    },
+    /// Complete OAuth login flow using pasted callback URL/code
+    #[serde(rename = "complete_oauth_login")]
+    CompleteOAuthLogin {
+        flow_id: String,
+        response: String,
+    },
+    /// Disconnect OAuth credentials for provider
+    #[serde(rename = "disconnect_oauth")]
+    DisconnectOAuth {
+        provider: String,
+    },
     /// Set the agent's operating mode (build/plan/review)
     SetAgentMode {
         mode: String,
@@ -222,6 +257,24 @@ pub enum UiServerMessage {
     AgentMode {
         mode: String,
     },
+    /// OAuth-capable providers and current authentication status
+    AuthProviders {
+        providers: Vec<AuthProviderEntry>,
+    },
+    /// OAuth flow started; frontend should open authorization_url
+    #[serde(rename = "oauth_flow_started")]
+    OAuthFlowStarted {
+        flow_id: String,
+        provider: String,
+        authorization_url: String,
+    },
+    /// OAuth flow completion result
+    #[serde(rename = "oauth_result")]
+    OAuthResult {
+        provider: String,
+        success: bool,
+        message: String,
+    },
 }
 
 impl UiServerMessage {
@@ -243,6 +296,80 @@ impl UiServerMessage {
             Self::UndoResult { .. } => "undo_result",
             Self::RedoResult { .. } => "redo_result",
             Self::AgentMode { .. } => "agent_mode",
+            Self::AuthProviders { .. } => "auth_providers",
+            Self::OAuthFlowStarted { .. } => "oauth_flow_started",
+            Self::OAuthResult { .. } => "oauth_result",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UiClientMessage, UiServerMessage};
+    use serde_json::json;
+
+    #[test]
+    fn deserializes_start_oauth_login_tag() {
+        let current: UiClientMessage = serde_json::from_value(json!({
+            "type": "start_oauth_login",
+            "provider": "openai"
+        }))
+        .expect("current start_oauth_login tag should deserialize");
+
+        match current {
+            UiClientMessage::StartOAuthLogin { provider } => assert_eq!(provider, "openai"),
+            _ => panic!("expected StartOAuthLogin variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_complete_oauth_login_tag() {
+        let current: UiClientMessage = serde_json::from_value(json!({
+            "type": "complete_oauth_login",
+            "flow_id": "flow-1",
+            "response": "code"
+        }))
+        .expect("current complete_oauth_login tag should deserialize");
+
+        match current {
+            UiClientMessage::CompleteOAuthLogin { flow_id, response } => {
+                assert_eq!(flow_id, "flow-1");
+                assert_eq!(response, "code");
+            }
+            _ => panic!("expected CompleteOAuthLogin variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_disconnect_oauth_tag() {
+        let current: UiClientMessage = serde_json::from_value(json!({
+            "type": "disconnect_oauth",
+            "provider": "openai"
+        }))
+        .expect("current disconnect_oauth tag should deserialize");
+
+        match current {
+            UiClientMessage::DisconnectOAuth { provider } => assert_eq!(provider, "openai"),
+            _ => panic!("expected DisconnectOAuth variant"),
+        }
+    }
+
+    #[test]
+    fn serializes_oauth_server_tags_without_extra_underscore() {
+        let flow_started = serde_json::to_value(UiServerMessage::OAuthFlowStarted {
+            flow_id: "flow-1".to_string(),
+            provider: "openai".to_string(),
+            authorization_url: "https://example.com".to_string(),
+        })
+        .expect("OAuthFlowStarted should serialize");
+        assert_eq!(flow_started["type"], "oauth_flow_started");
+
+        let result = serde_json::to_value(UiServerMessage::OAuthResult {
+            provider: "openai".to_string(),
+            success: true,
+            message: "ok".to_string(),
+        })
+        .expect("OAuthResult should serialize");
+        assert_eq!(result["type"], "oauth_result");
     }
 }

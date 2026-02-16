@@ -38,6 +38,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
  * - file index functions: setFileIndexCallback, setFileIndexErrorCallback, requestFileIndex
  * - workspaceIndexStatus
  * - allModels, sessionsByAgent, agentModels, refreshAllModels, setSessionModel
+ * - authProviders, oauthFlow, oauthResult, requestAuthProviders, startOAuthLogin, completeOAuthLogin, disconnectOAuth
  * - llmConfigCache, requestLlmConfig
  * - sessionLimits
  * - session subscription: subscribeSession, unsubscribeSession

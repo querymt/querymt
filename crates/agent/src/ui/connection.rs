@@ -82,8 +82,17 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
         _ = receive_task => {},
     }
 
-    let mut connections = state.connections.lock().await;
-    connections.remove(&conn_id);
+    {
+        let mut connections = state.connections.lock().await;
+        connections.remove(&conn_id);
+    }
+
+    super::handlers::stop_oauth_callback_listener_for_connection(&state, &conn_id).await;
+
+    {
+        let mut oauth_flows = state.oauth_flows.lock().await;
+        oauth_flows.retain(|_, flow| flow.conn_id != conn_id);
+    }
 }
 
 /// Send current state to a client.
