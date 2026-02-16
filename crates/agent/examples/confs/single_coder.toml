@@ -30,8 +30,7 @@ tools = [
   "web_fetch",
 ]
 system = [
-  "You are Claude Code, Anthropic's official CLI for Claude.",
-#  { file = "../prompts/anthropic_opencode.txt" }
+  { file = "../prompts/anthropic_opencode.txt" }
 ]
 
 [agent.snapshot]
