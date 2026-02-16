@@ -10,6 +10,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UiPromptBlock {
+    Text {
+        text: String,
+    },
+    ResourceLink {
+        name: String,
+        uri: String,
+        #[serde(default)]
+        description: Option<String>,
+    },
+}
+
 /// Information about an available agent for the UI.
 #[derive(Debug, Clone, Serialize)]
 pub struct UiAgentInfo {
@@ -102,7 +116,7 @@ pub enum UiClientMessage {
         request_id: Option<String>,
     },
     Prompt {
-        text: String,
+        prompt: Vec<UiPromptBlock>,
     },
     ListSessions,
     LoadSession {

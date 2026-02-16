@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "You are a principal engineer coordinating specialist agents. \
                 Delegate implementation to the coder and research to the researcher.",
                 )
-                .tools(["delegate", "create_task", "read_file", "search_text"])
+                .tools(["delegate", "create_task", "read_tool", "search_text"])
         })
         // Add a coder delegate
         .delegate("coder", |d| {
@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .tools([
                     "edit",
                     "shell",
-                    "read_file",
+                    "read_tool",
                     "write_file",
                     "glob",
                     "search_text",
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "You are a research specialist. Find accurate, up-to-date \
                 information from reliable sources.",
                 )
-                .tools(["web_fetch", "read_file"])
+                .tools(["web_fetch", "read_tool"])
         })
         // Enable delegation and verification
         .with_defaults()

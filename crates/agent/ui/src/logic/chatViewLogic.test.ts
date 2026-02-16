@@ -42,9 +42,9 @@ describe('inferToolName', () => {
 
   it('returns name before colon from tool_call_id', () => {
     const event = makeEvent({
-      toolCall: { tool_call_id: 'read_file:abc123' },
+      toolCall: { tool_call_id: 'read_tool:abc123' },
     });
-    expect(inferToolName(event)).toBe('read_file');
+    expect(inferToolName(event)).toBe('read_tool');
   });
 
   it('returns undefined for tool_call_id without colon', () => {
@@ -59,10 +59,10 @@ describe('inferToolName', () => {
     const event = makeEvent({
       toolCall: {
         tool_call_id: 'someid',
-        description: 'run read_file with args',
+        description: 'run read_tool with args',
       },
     });
-    expect(inferToolName(event)).toBe('read_file');
+    expect(inferToolName(event)).toBe('read_tool');
   });
 
   it('returns undefined for description without "run" pattern', () => {
@@ -320,7 +320,7 @@ describe('buildEventRowsWithDelegations', () => {
       const events = [
         makeUserEvent('Read file'),
         makeAgentEvent('Reading...'),
-        makeToolCallEvent('read_file'),
+        makeToolCallEvent('read_tool'),
       ];
       const { rows } = buildEventRowsWithDelegations(events);
       
@@ -332,18 +332,18 @@ describe('buildEventRowsWithDelegations', () => {
     it('infers tool name from tool_call_id', () => {
       const events = [
         makeAgentEvent('Reading...'),
-        makeToolCallEvent('read_file'),
+        makeToolCallEvent('read_tool'),
       ];
       const { rows } = buildEventRowsWithDelegations(events);
       
       const toolCall = rows.find(r => r.type === 'tool_call');
-      expect(toolCall?.toolName).toBe('read_file');
+      expect(toolCall?.toolName).toBe('read_tool');
     });
 
     it('creates multiple tool calls with correct depths', () => {
       const events = [
         makeAgentEvent('Processing...'),
-        makeToolCallEvent('read_file'),
+        makeToolCallEvent('read_tool'),
         makeToolCallEvent('write_file'),
       ];
       const { rows } = buildEventRowsWithDelegations(events);
@@ -359,7 +359,7 @@ describe('buildEventRowsWithDelegations', () => {
     it('merges tool_result into matching tool_call row', () => {
       const events = [
         makeAgentEvent('Reading...'),
-        makeToolCallEvent('read_file'),
+        makeToolCallEvent('read_tool'),
       ];
       const toolCallId = events[1].toolCall?.tool_call_id!;
       events.push(makeToolResultEvent(toolCallId, { content: 'File contents' }));
@@ -391,7 +391,7 @@ describe('buildEventRowsWithDelegations', () => {
     it('handles multiple tool calls with results', () => {
       const events = [
         makeAgentEvent('Processing...'),
-        makeToolCallEvent('read_file'),
+        makeToolCallEvent('read_tool'),
       ];
       const tc1Id = events[1].toolCall?.tool_call_id!;
       events.push(makeToolCallEvent('write_file'));
@@ -703,7 +703,7 @@ describe('buildTurns', () => {
     const events = [
       makeUserEvent('Read file'),
       makeAgentEvent('Reading...'),
-      makeToolCallEvent('read_file'),
+      makeToolCallEvent('read_tool'),
     ];
     const { turns } = buildTurns(events, null);
     
@@ -827,7 +827,7 @@ describe('buildTurns', () => {
     const events = [
       makeUserEvent('Hello'),
       makeAgentEvent('Hi'),
-      makeToolCallEvent('read_file'),
+      makeToolCallEvent('read_tool'),
     ];
     const { allEventRows } = buildTurns(events, null);
     

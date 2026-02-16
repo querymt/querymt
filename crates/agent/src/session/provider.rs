@@ -2,7 +2,7 @@ use crate::model::{AgentMessage, MessagePart};
 use crate::model_heuristics::ModelDefaults;
 use crate::model_info::get_model_info;
 use crate::session::error::{SessionError, SessionResult};
-use crate::session::store::{LLMConfig, Session, SessionStore};
+use crate::session::store::{LLMConfig, Session, SessionExecutionConfig, SessionStore};
 use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;
 use querymt::providers::ModelPricing;
@@ -118,6 +118,7 @@ impl SessionProvider {
         &self,
         cwd: Option<std::path::PathBuf>,
         parent_session_id: Option<&str>,
+        execution_config: &SessionExecutionConfig,
     ) -> SessionResult<SessionHandle> {
         let fork_origin = if parent_session_id.is_some() {
             Some(crate::session::domain::ForkOrigin::Delegation)
@@ -139,6 +140,9 @@ impl SessionProvider {
             .await?;
         self.history_store
             .set_session_llm_config(&session.public_id, llm_config.id)
+            .await?;
+        self.history_store
+            .set_session_execution_config(&session.public_id, execution_config)
             .await?;
         session.llm_config_id = Some(llm_config.id);
         SessionHandle::new(Arc::new(self.clone()), session).await
@@ -278,6 +282,8 @@ pub struct SessionHandle {
     session: Session,
     /// LLM config resolved once at construction time (turn-pinned).
     llm_config: Option<LLMConfig>,
+    /// Session execution config resolved once at construction time (turn-pinned).
+    execution_config: Option<SessionExecutionConfig>,
     /// Lazily cached LLM provider for this turn.
     cached_llm_provider: tokio::sync::OnceCell<Arc<dyn LLMProvider>>,
 }
@@ -288,6 +294,7 @@ impl Clone for SessionHandle {
             provider: self.provider.clone(),
             session: self.session.clone(),
             llm_config: self.llm_config.clone(),
+            execution_config: self.execution_config.clone(),
             // Each clone gets its own OnceCell; the first `.provider()` call
             // will still hit the global cache (cheap Arc::clone on hit) so
             // this is fine — it just won't share the local cell.
@@ -304,10 +311,15 @@ impl SessionHandle {
         } else {
             None
         };
+        let execution_config = provider
+            .history_store
+            .get_session_execution_config(&session.public_id)
+            .await?;
         Ok(Self {
             provider,
             session,
             llm_config,
+            execution_config,
             cached_llm_provider: tokio::sync::OnceCell::new(),
         })
     }
@@ -320,6 +332,11 @@ impl SessionHandle {
     /// Get the LLM config captured at handle creation time (turn-pinned).
     pub fn llm_config(&self) -> Option<&LLMConfig> {
         self.llm_config.as_ref()
+    }
+
+    /// Get the session execution config captured at handle creation time (turn-pinned).
+    pub fn execution_config(&self) -> Option<&SessionExecutionConfig> {
+        self.execution_config.as_ref()
     }
 
     pub async fn provider(&self) -> SessionResult<Arc<dyn LLMProvider>> {
@@ -367,7 +384,13 @@ impl SessionHandle {
                             )
                         })
                     })
-                    .map(|m| m.to_chat_message())
+                    .map(|m| {
+                        m.to_chat_message_with_max_prompt_bytes(
+                            self.execution_config
+                                .as_ref()
+                                .and_then(|cfg| cfg.max_prompt_bytes),
+                        )
+                    })
                     .collect()
             }
             Err(err) => {

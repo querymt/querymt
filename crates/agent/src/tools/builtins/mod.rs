@@ -12,7 +12,8 @@ pub mod multiedit;
 pub mod patch_utils;
 pub mod patch_validator;
 pub mod question;
-pub mod read_file;
+pub mod read_shared;
+pub mod read_tool;
 pub mod search_text;
 pub mod semantic_edit;
 pub mod shell;
@@ -31,7 +32,7 @@ pub use ls::ListTool;
 pub use mdq::MdqTool;
 pub use multiedit::MultiEditTool;
 pub use question::QuestionTool;
-pub use read_file::ReadFileTool;
+pub use read_tool::ReadTool;
 pub use search_text::SearchTextTool;
 pub use semantic_edit::SemanticEditTool;
 pub use shell::ShellTool;
@@ -60,7 +61,7 @@ pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(MdqTool::new()),
         Arc::new(MultiEditTool::new()),
         Arc::new(QuestionTool::new()),
-        Arc::new(ReadFileTool::new()),
+        Arc::new(ReadTool::new()),
         Arc::new(SearchTextTool::new()),
         Arc::new(ShellTool::new()),
         Arc::new(TodoReadTool::new()),

@@ -30,7 +30,7 @@ pub struct VerificationSpec {
 pub enum VerificationStep {
     /// Execute a tool call and verify the result
     ToolCall {
-        /// Tool name (e.g., "shell", "read_file", "web_fetch")
+        /// Tool name (e.g., "shell", "read_tool", "web_fetch")
         tool_name: Cow<'static, str>,
 
         /// Arguments to pass to the tool (JSON)

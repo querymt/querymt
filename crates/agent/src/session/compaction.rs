@@ -3,6 +3,7 @@
 //! This module implements the AI compaction layer of the 3-layer compaction system,
 //! which generates summaries when context threshold is reached.
 
+use crate::agent::utils::render_prompt_for_llm;
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use anyhow::Result;
@@ -94,12 +95,13 @@ impl SessionCompaction {
         provider: Arc<dyn querymt::chat::ChatProvider>,
         model: &str,
         retry_config: &RetryConfig,
+        max_prompt_bytes: Option<usize>,
     ) -> Result<CompactionResult> {
         // Estimate original token count
-        let original_token_count = self.estimate_messages_tokens(messages);
+        let original_token_count = self.estimate_messages_tokens(messages, max_prompt_bytes);
 
         // Build the compaction request
-        let chat_messages = self.build_compaction_messages(messages);
+        let chat_messages = self.build_compaction_messages(messages, max_prompt_bytes);
 
         // Call LLM with retry logic
         let summary = self
@@ -119,9 +121,12 @@ impl SessionCompaction {
     fn build_compaction_messages(
         &self,
         messages: &[AgentMessage],
+        max_prompt_bytes: Option<usize>,
     ) -> Vec<querymt::chat::ChatMessage> {
-        let mut chat_messages: Vec<querymt::chat::ChatMessage> =
-            messages.iter().map(|m| m.to_chat_message()).collect();
+        let mut chat_messages: Vec<querymt::chat::ChatMessage> = messages
+            .iter()
+            .map(|m| m.to_chat_message_with_max_prompt_bytes(max_prompt_bytes))
+            .collect();
 
         // Add the compaction prompt as a user message
         chat_messages.push(querymt::chat::ChatMessage {
@@ -181,7 +186,11 @@ impl SessionCompaction {
     }
 
     /// Estimate token count for a list of messages
-    pub(crate) fn estimate_messages_tokens(&self, messages: &[AgentMessage]) -> usize {
+    pub(crate) fn estimate_messages_tokens(
+        &self,
+        messages: &[AgentMessage],
+        max_prompt_bytes: Option<usize>,
+    ) -> usize {
         messages
             .iter()
             .map(|m| {
@@ -189,6 +198,9 @@ impl SessionCompaction {
                     .iter()
                     .map(|p| match p {
                         MessagePart::Text { content } => self.estimator.estimate(content),
+                        MessagePart::Prompt { blocks } => self
+                            .estimator
+                            .estimate(&render_prompt_for_llm(blocks, max_prompt_bytes)),
                         MessagePart::ToolResult { content, .. } => self.estimator.estimate(content),
                         MessagePart::Reasoning { content, .. } => self.estimator.estimate(content),
                         MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
@@ -424,6 +436,7 @@ mod tests {
                     Arc::new(mock),
                     "test-model",
                     &RetryConfig::default(),
+                    None,
                 )
                 .await
         }
@@ -574,7 +587,7 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::simple_conversation("s1");
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages);
+        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
         assert!(tokens > 0, "Should count tokens for text messages");
     }
 
@@ -583,7 +596,7 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::conversation_with_tools("s1");
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages);
+        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
         assert!(tokens > 0, "Should count tokens for tool results");
     }
 
@@ -597,7 +610,7 @@ mod tests {
             MessageFixture::assistant_message("4", "s1", "Final response"),
         ];
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages);
+        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
         assert!(tokens > 0, "Should count tokens for all part types");
     }
 
@@ -606,7 +619,7 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages: Vec<AgentMessage> = vec![];
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages);
+        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
         assert_eq!(tokens, 0, "Empty messages should have 0 tokens");
     }
 
@@ -615,7 +628,7 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::long_conversation("s1");
 
-        let tokens = fixture.service.estimate_messages_tokens(&messages);
+        let tokens = fixture.service.estimate_messages_tokens(&messages, None);
         assert!(
             tokens > 500,
             "Long conversation should have significant token count"
@@ -627,7 +640,7 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::simple_conversation("s1");
 
-        let chat_messages = fixture.service.build_compaction_messages(&messages);
+        let chat_messages = fixture.service.build_compaction_messages(&messages, None);
 
         // Should have all original messages + compaction prompt
         assert_eq!(
@@ -652,7 +665,7 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::simple_conversation("s1");
 
-        let chat_messages = fixture.service.build_compaction_messages(&messages);
+        let chat_messages = fixture.service.build_compaction_messages(&messages, None);
 
         // Check that roles are preserved (excluding the appended prompt)
         assert_eq!(chat_messages[0].role, ChatRole::User);
@@ -696,7 +709,7 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::long_conversation("s1");
 
-        let original_tokens = fixture.service.estimate_messages_tokens(&messages);
+        let original_tokens = fixture.service.estimate_messages_tokens(&messages, None);
         let result = fixture
             .process_with_summary(&messages, "short")
             .await
@@ -740,6 +753,7 @@ mod tests {
                 mock_arc.clone(),
                 "model",
                 &RetryConfig::default(),
+                None,
             )
             .await
             .expect("should succeed after retries");
@@ -768,6 +782,7 @@ mod tests {
                 mock_arc.clone(),
                 "model",
                 &RetryConfig::default(),
+                None,
             )
             .await;
 
@@ -794,7 +809,7 @@ mod tests {
         let mock_arc = Arc::new(mock);
 
         let result = service
-            .process(&messages, mock_arc.clone(), "model", &custom_config)
+            .process(&messages, mock_arc.clone(), "model", &custom_config, None)
             .await;
 
         assert!(result.is_err());
@@ -842,7 +857,7 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::simple_conversation("s1");
 
-        let chat_messages = fixture.service.build_compaction_messages(&messages);
+        let chat_messages = fixture.service.build_compaction_messages(&messages, None);
 
         // Verify first message is the user message from conversation
         if let MessagePart::Text { content } = &messages[0].parts[0] {

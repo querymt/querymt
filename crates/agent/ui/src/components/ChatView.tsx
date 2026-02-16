@@ -18,7 +18,7 @@ import { useUiStore } from '../store/uiStore';
 import { useSessionManager } from '../hooks/useSessionManager';
 import { useFileMention } from '../hooks/useFileMention';
 import { useTodoState } from '../hooks/useTodoState';
-import { EventItem, EventRow } from '../types';
+import { EventItem, EventRow, PromptBlock } from '../types';
 import { MentionInput } from './MentionInput';
 import { ToolDetailModal } from './ToolDetailModal';
 import { TurnCard } from './TurnCard';
@@ -31,6 +31,31 @@ import { SystemLog } from './SystemLog';
 import { GlitchText } from './GlitchText';
 import { buildTurns, buildDelegationTurn, buildEventRowsWithDelegations, isRateLimitEvent, processRateLimitEvent } from '../logic/chatViewLogic';
 import { RateLimitIndicator } from './RateLimitIndicator';
+
+const FILE_MENTION_MARKUP_RE = /@\{(file|dir):([^}]+)\}/g;
+
+function buildPromptBlocksFromInput(input: string): PromptBlock[] {
+  const links = new Map<string, PromptBlock>();
+  const normalizedText = input.replace(FILE_MENTION_MARKUP_RE, (_match, _kind: string, rawPath: string) => {
+    const path = String(rawPath).trim();
+    if (!path) {
+      return '';
+    }
+    if (!links.has(path)) {
+      links.set(path, {
+        type: 'resource_link',
+        name: path,
+        uri: path,
+      });
+    }
+    return `@${path}`;
+  });
+
+  return [
+    { type: 'text', text: normalizedText },
+    ...Array.from(links.values()),
+  ];
+}
 
 export function ChatView() {
   const {
@@ -168,7 +193,7 @@ export function ChatView() {
 
     setLoading(true);
     try {
-      await sendPrompt(prompt);
+      await sendPrompt(buildPromptBlocksFromInput(prompt));
       setPrompt('');
     } catch (err) {
       followArmedRef.current = false;

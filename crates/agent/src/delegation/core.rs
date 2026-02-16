@@ -748,7 +748,7 @@ fn classify_delegation_error(error: &str) -> (&str, &str) {
         (
             "Patch Application Failure",
             "The patch could not be applied to the file.\n\
-          -> Use read_file to see the current state of the target file\n\
+          -> Use read_tool to see the current state of the target file\n\
           -> Verify the lines you want to change actually exist as shown in the file\n\
           -> Create a new patch with correct context lines matching the actual file",
         )
@@ -886,7 +886,7 @@ fn extract_tool_args_preview(tool_name: &str, args_json: &str) -> String {
     };
 
     match tool_name {
-        "write_file" | "read_file" | "delete_file" | "apply_patch" => args
+        "write_file" | "read_tool" | "delete_file" | "apply_patch" => args
             .get("path")
             .and_then(|v| v.as_str())
             .unwrap_or("")

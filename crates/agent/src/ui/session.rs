@@ -4,7 +4,7 @@
 //! and session-related state management.
 
 use super::ServerState;
-use super::messages::{RoutingMode, UiAgentInfo, UiServerMessage};
+use super::messages::{RoutingMode, UiAgentInfo, UiPromptBlock, UiServerMessage};
 use crate::agent::QueryMTAgent;
 use crate::index::{normalize_cwd, resolve_workspace_root};
 use crate::send_agent::SendAgent;
@@ -45,7 +45,7 @@ pub async fn ensure_sessions_for_mode(
 pub async fn prompt_for_mode(
     state: &ServerState,
     conn_id: &str,
-    text: &str,
+    prompt: &[UiPromptBlock],
     cwd: Option<&PathBuf>,
     tx: &mpsc::Sender<String>,
 ) -> Result<(), String> {
@@ -60,7 +60,7 @@ pub async fn prompt_for_mode(
             let prompt_blocks = super::mentions::build_prompt_blocks(
                 &state.workspace_manager,
                 session_cwd.as_ref(),
-                text,
+                prompt,
             )
             .await;
             send_prompt(agent, session_id, prompt_blocks).await?;
@@ -75,7 +75,7 @@ pub async fn prompt_for_mode(
                 let prompt_blocks = super::mentions::build_prompt_blocks(
                     &state.workspace_manager,
                     session_cwd.as_ref(),
-                    text,
+                    prompt,
                 )
                 .await;
                 send_prompt(agent, session_id, prompt_blocks).await?;

@@ -37,7 +37,7 @@ pub struct SkillMetadata {
     pub compatibility: Option<Vec<String>>,
 
     /// Optional: tool access control
-    /// Examples: ["*"], ["read_file", "write_file"], ["!shell", "!delete_file"]
+    /// Examples: ["*"], ["read_tool", "write_file"], ["!shell", "!delete_file"]
     #[serde(default, rename = "allowed-tools")]
     pub allowed_tools: Option<Vec<String>>,
 
@@ -157,14 +157,14 @@ mod tests {
             version: None,
             license: None,
             compatibility: None,
-            allowed_tools: Some(vec!["read_file".into(), "write_file".into()]),
+            allowed_tools: Some(vec!["read_tool".into(), "write_file".into()]),
             tags: None,
             author: None,
             extra: HashMap::new(),
         };
         if let ToolAccessPolicy::Whitelist(tools) = meta.tool_policy() {
             assert_eq!(tools.len(), 2);
-            assert!(tools.contains(&"read_file".to_string()));
+            assert!(tools.contains(&"read_tool".to_string()));
         } else {
             panic!("Expected whitelist");
         }

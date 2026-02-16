@@ -5,6 +5,7 @@
 //! provides the coder with context about decisions made, files to modify, patterns
 //! to follow, and implementation steps.
 
+use crate::agent::utils::{render_prompt_for_display, render_prompt_for_llm};
 use crate::config::DelegationSummaryConfig;
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::error::{SessionError, SessionResult};
@@ -138,6 +139,9 @@ impl DelegationSummarizer {
                     .iter()
                     .map(|p| match p {
                         MessagePart::Text { content } => self.estimator.estimate(content),
+                        MessagePart::Prompt { blocks } => self
+                            .estimator
+                            .estimate(&render_prompt_for_llm(blocks, None)),
                         MessagePart::ToolResult { content, .. } => self.estimator.estimate(content),
                         MessagePart::Reasoning { content, .. } => self.estimator.estimate(content),
                         MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
@@ -200,6 +204,12 @@ impl DelegationSummarizer {
                             MessagePart::Text { content } => {
                                 input.push_str(&format!("\n[Planner]: {}\n", content));
                             }
+                            MessagePart::Prompt { blocks } => {
+                                let display_content = render_prompt_for_display(blocks);
+                                if !display_content.trim().is_empty() {
+                                    input.push_str(&format!("\n[Planner]: {}\n", display_content));
+                                }
+                            }
                             MessagePart::ToolUse(tu) => {
                                 // Just the tool name + key args, not full output
                                 // Parse arguments JSON to extract meaningful info
@@ -259,17 +269,17 @@ planning conversation."#
 
     /// Extract text content from all message parts
     fn extract_text_content(msg: &AgentMessage) -> String {
-        msg.parts
-            .iter()
-            .filter_map(|part| {
-                if let MessagePart::Text { content } = part {
-                    Some(content.as_str())
-                } else {
-                    None
+        let mut rendered_parts = Vec::new();
+        for part in &msg.parts {
+            match part {
+                MessagePart::Text { content } => rendered_parts.push(content.clone()),
+                MessagePart::Prompt { blocks } => {
+                    rendered_parts.push(render_prompt_for_display(blocks));
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+                _ => {}
+            }
+        }
+        rendered_parts.join("\n")
     }
 
     /// Summarize tool arguments to just the key info

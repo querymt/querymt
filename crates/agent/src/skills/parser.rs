@@ -60,7 +60,7 @@ mod tests {
             r#"---
 name: test-skill
 description: A test skill
-allowed-tools: ["read_file"]
+allowed-tools: ["read_tool"]
 ---
 # Test Skill Content
 "#,
@@ -143,7 +143,7 @@ license: MIT
 author: Test Author
 tags: ["development", "testing"]
 compatibility: ["querymt", "claude-code"]
-allowed-tools: ["read_file", "write_file"]
+allowed-tools: ["read_tool", "write_file"]
 ---
 # Advanced Skill
 

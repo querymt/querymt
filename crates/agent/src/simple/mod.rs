@@ -13,7 +13,7 @@
 //! let agent = Agent::single()
 //!     .provider("openai", "gpt-4")
 //!     .cwd(".")
-//!     .tools(["shell", "read_file", "write_file"])
+//!     .tools(["shell", "read_tool", "write_file"])
 //!     .build()
 //!     .await?;
 //!

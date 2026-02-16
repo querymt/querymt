@@ -18,7 +18,7 @@ export interface ToolSummaryInfo {
 const TOOL_ICONS: Record<string, string> = {
   // File operations
   read: '📖',
-  read_file: '📖',
+  read_tool: '📖',
   mcp_read: '📖',
   write: '📝',
   write_file: '📝',
@@ -109,7 +109,7 @@ export function extractKeyParam(toolKind: string | undefined, rawInput: unknown)
   
   switch (normalized) {
     case 'read':
-    case 'read_file': {
+    case 'read_tool': {
       const filePath = extractFilePath(obj) || truncate(String(obj.path || obj.filePath || ''), 50);
       return appendLineRange(filePath, obj);
     }

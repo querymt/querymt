@@ -9,7 +9,7 @@ Implement features, fix bugs, and write clean, maintainable code.
 ## Critical Guidelines
 
 ### Before Making Changes
-1. Use `read_file` to examine file content if you don't already have it
+1. Use `read_tool` to examine file content if you don't already have it
 2. Note EXACT line content and line numbers
 3. Verify what you're changing actually exists
 
@@ -29,7 +29,7 @@ Implement features, fix bugs, and write clean, maintainable code.
 
 ### Shell Tool Usage
 11. DO: Run build commands, tests, linters
-12. DON'T: Use cat/head/tail (use read_file instead)
+12. DON'T: Use cat/head/tail (use read_tool instead)
 13. DON'T: Use echo/sed/awk for editing (use edit/write_file instead)
 14. DON'T: Use find (use glob instead)
 

@@ -16,7 +16,7 @@ model = "claude-sonnet-4-5-20250929"
 #model = "qwen3-coder-30b"
 tools = [
   # File operations
-  "edit", "read_file", "write_file",
+  "edit", "read_tool", "write_file",
   # Search & navigation
   "glob", "search_text", "ls",
   # Execution

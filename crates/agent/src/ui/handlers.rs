@@ -9,7 +9,9 @@ use super::connection::{send_error, send_message, send_state};
 use super::mentions::filter_index_for_cwd;
 #[cfg(feature = "oauth")]
 use super::messages::{AuthProviderEntry, OAuthStatus};
-use super::messages::{ModelEntry, SessionGroup, SessionSummary, UiClientMessage, UiServerMessage};
+use super::messages::{
+    ModelEntry, SessionGroup, SessionSummary, UiClientMessage, UiPromptBlock, UiServerMessage,
+};
 use super::session::{PRIMARY_AGENT_ID, ensure_sessions_for_mode, prompt_for_mode, resolve_cwd};
 use crate::agent::core::AgentMode;
 use crate::index::resolve_workspace_root;
@@ -155,8 +157,12 @@ pub async fn handle_ui_message(
             // Auto-refresh session list after creating new session
             handle_list_sessions(state, tx).await;
         }
-        UiClientMessage::Prompt { text } => {
-            if text.trim().is_empty() {
+        UiClientMessage::Prompt { prompt } => {
+            let has_user_text = prompt.iter().any(|block| match block {
+                UiPromptBlock::Text { text } => !text.trim().is_empty(),
+                _ => false,
+            });
+            if !has_user_text {
                 return;
             }
             // Spawn prompt execution on a separate task so the WebSocket receive
@@ -170,7 +176,7 @@ pub async fn handle_ui_message(
                 let cwd = resolve_cwd(None);
                 // Agent errors are already emitted via AgentEventKind::Error and sent through
                 // the event stream, so we don't need to call send_error() here to avoid duplicates.
-                let _ = prompt_for_mode(&state, &conn_id, &text, cwd.as_ref(), &tx).await;
+                let _ = prompt_for_mode(&state, &conn_id, &prompt, cwd.as_ref(), &tx).await;
                 // Refresh session list after prompt completes so titles are up to date
                 handle_list_sessions(&state, &tx).await;
             });

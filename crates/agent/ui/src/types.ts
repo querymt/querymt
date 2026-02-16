@@ -427,12 +427,16 @@ export interface LlmConfigDetails {
   params?: Record<string, unknown> | null;
 }
 
+export type PromptBlock =
+  | { type: 'text'; text: string }
+  | { type: 'resource_link'; name: string; uri: string; description?: string };
+
 export type UiClientMessage =
   | { type: 'init' }
   | { type: 'set_active_agent'; agent_id: string }
   | { type: 'set_routing_mode'; mode: RoutingMode }
   | { type: 'new_session'; cwd?: string | null; request_id?: string }
-  | { type: 'prompt'; text: string }
+  | { type: 'prompt'; prompt: PromptBlock[] }
   | { type: 'list_sessions' }
   | { type: 'load_session'; session_id: string }
   | { type: 'list_all_models'; refresh?: boolean }

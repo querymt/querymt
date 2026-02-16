@@ -7,13 +7,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .planner(|p| {
             p.provider("openai", "gpt-4")
                 .system("Delegate research tasks to specialists.")
-                .tools(["delegate", "read_file"])
+                .tools(["delegate", "read_tool"])
         })
         .delegate("researcher", |d| {
             d.provider("openai", "gpt-4o-mini")
                 .description("Research specialist")
                 .capabilities(["research", "web_search"])
-                .tools(["web_fetch", "read_file"])
+                .tools(["web_fetch", "read_tool"])
         })
         .with_delegation(true)
         .build()
