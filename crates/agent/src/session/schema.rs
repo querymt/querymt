@@ -210,8 +210,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             message_id TEXT NOT NULL,
             snapshot_id TEXT NOT NULL,
             backend_id TEXT NOT NULL DEFAULT 'git',
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            UNIQUE(session_id)
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
         CREATE INDEX IF NOT EXISTS idx_revert_states_session ON revert_states(session_id);

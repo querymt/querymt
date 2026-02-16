@@ -122,15 +122,24 @@ mock! {
             status: DelegationStatus,
         ) -> SessionResult<()>;
         async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()>;
-        async fn get_revert_state(
+        async fn peek_revert_state(
             &self,
             session_id: &str,
         ) -> SessionResult<Option<crate::session::domain::RevertState>>;
-        async fn set_revert_state(
+        async fn push_revert_state(
             &self,
             session_id: &str,
-            state: Option<crate::session::domain::RevertState>,
+            state: crate::session::domain::RevertState,
         ) -> SessionResult<()>;
+        async fn pop_revert_state(
+            &self,
+            session_id: &str,
+        ) -> SessionResult<Option<crate::session::domain::RevertState>>;
+        async fn list_revert_states(
+            &self,
+            session_id: &str,
+        ) -> SessionResult<Vec<crate::session::domain::RevertState>>;
+        async fn clear_revert_states(&self, session_id: &str) -> SessionResult<()>;
         async fn delete_messages_after(
             &self,
             session_id: &str,

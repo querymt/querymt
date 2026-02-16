@@ -279,18 +279,33 @@ pub trait SessionStore: Send + Sync {
 
     // Undo/Redo methods
 
-    /// Get the current revert state for a session (if any)
-    async fn get_revert_state(
+    /// Get the latest revert state frame for a session (stack top)
+    async fn peek_revert_state(
         &self,
         session_id: &str,
     ) -> SessionResult<Option<crate::session::domain::RevertState>>;
 
-    /// Set or clear the revert state for a session
-    async fn set_revert_state(
+    /// Push a revert state frame onto the session stack
+    async fn push_revert_state(
         &self,
         session_id: &str,
-        state: Option<crate::session::domain::RevertState>,
+        state: crate::session::domain::RevertState,
     ) -> SessionResult<()>;
+
+    /// Pop (remove and return) the latest revert state frame for a session
+    async fn pop_revert_state(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<crate::session::domain::RevertState>>;
+
+    /// List all revert state frames for a session ordered from oldest to newest.
+    async fn list_revert_states(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Vec<crate::session::domain::RevertState>>;
+
+    /// Clear all revert state frames for a session
+    async fn clear_revert_states(&self, session_id: &str) -> SessionResult<()>;
 
     /// Delete all messages after a given message ID in a session
     /// Returns the number of deleted messages

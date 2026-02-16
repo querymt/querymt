@@ -18,6 +18,8 @@ use uuid::Uuid;
 pub struct UndoResult {
     /// Files that were reverted
     pub reverted_files: Vec<String>,
+    /// The message ID used as the undo frontier
+    pub message_id: String,
 }
 
 /// Result of a redo operation
@@ -255,7 +257,7 @@ impl QueryMTAgent {
 
         self.provider
             .history_store()
-            .set_revert_state(session_id, Some(revert_state))
+            .push_revert_state(session_id, revert_state)
             .await
             .map_err(|e| anyhow!("Failed to store revert state: {}", e))?;
 
@@ -267,6 +269,7 @@ impl QueryMTAgent {
 
         Ok(UndoResult {
             reverted_files: all_reverted_files,
+            message_id: message_id.to_string(),
         })
     }
 
@@ -298,7 +301,7 @@ impl QueryMTAgent {
         let revert_state = self
             .provider
             .history_store()
-            .get_revert_state(session_id)
+            .peek_revert_state(session_id)
             .await
             .map_err(|e| anyhow!("Failed to get revert state: {}", e))?
             .ok_or_else(|| anyhow!("Nothing to redo"))?;
@@ -324,12 +327,12 @@ impl QueryMTAgent {
             debug!("Redo: no file changes needed");
         }
 
-        // Clear revert state
+        // Pop the frame that was just redone
         self.provider
             .history_store()
-            .set_revert_state(session_id, None)
+            .pop_revert_state(session_id)
             .await
-            .map_err(|e| anyhow!("Failed to clear revert state: {}", e))?;
+            .map_err(|e| anyhow!("Failed to update revert state: {}", e))?;
 
         Ok(RedoResult { restored: true })
     }
@@ -341,7 +344,7 @@ impl QueryMTAgent {
         let revert_state = self
             .provider
             .history_store()
-            .get_revert_state(session_id)
+            .peek_revert_state(session_id)
             .await
             .map_err(|e| anyhow!("Failed to get revert state: {}", e))?;
 
@@ -361,10 +364,10 @@ impl QueryMTAgent {
 
             debug!("Deleted {} messages after revert point", deleted);
 
-            // Clear revert state
+            // Clear all revert stack frames because a new prompt commits this timeline
             self.provider
                 .history_store()
-                .set_revert_state(session_id, None)
+                .clear_revert_states(session_id)
                 .await
                 .map_err(|e| anyhow!("Failed to clear revert state: {}", e))?;
         }

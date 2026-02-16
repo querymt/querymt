@@ -6,6 +6,7 @@
 //! - File restoration
 //! - Proper reverted files list
 
+use crate::session::backend::StorageBackend;
 use crate::test_utils::UndoTestFixture;
 use anyhow::Result;
 
@@ -40,6 +41,7 @@ async fn test_undo_single_agent_with_file_changes() -> Result<()> {
     assert_eq!(fixture.read_file("test.txt")?, "original");
     assert_eq!(result.reverted_files.len(), 1);
     assert!(result.reverted_files.contains(&"test.txt".to_string()));
+    assert_eq!(result.message_id, user_msg_id);
 
     Ok(())
 }
@@ -296,6 +298,134 @@ async fn test_redo_with_no_revert_state_fails() -> Result<()> {
     let result = fixture.agent.redo(&session_id).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("Nothing to redo"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_undo_twice_then_redo_once_restores_latest_undone_step() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+
+    fixture.write_file("test.txt", "original")?;
+
+    let session_id = fixture.create_session().await?;
+
+    // Turn 1: original -> v1
+    let user_msg_1 = fixture.add_user_message(&session_id, "Set v1").await?;
+    let (turn1_id, pre1_snapshot) = fixture.take_pre_snapshot(&session_id).await?;
+    fixture.write_file("test.txt", "v1")?;
+    fixture
+        .take_post_snapshot(&session_id, &turn1_id, &pre1_snapshot)
+        .await?;
+
+    // Turn 2: v1 -> v2
+    let user_msg_2 = fixture.add_user_message(&session_id, "Set v2").await?;
+    let (turn2_id, pre2_snapshot) = fixture.take_pre_snapshot(&session_id).await?;
+    fixture.write_file("test.txt", "v2")?;
+    fixture
+        .take_post_snapshot(&session_id, &turn2_id, &pre2_snapshot)
+        .await?;
+
+    assert_eq!(fixture.read_file("test.txt")?, "v2");
+
+    // Undo latest turn (v2 -> v1)
+    fixture.agent.undo(&session_id, &user_msg_2).await?;
+    assert_eq!(fixture.read_file("test.txt")?, "v1");
+
+    // Undo previous turn (v1 -> original)
+    fixture.agent.undo(&session_id, &user_msg_1).await?;
+    assert_eq!(fixture.read_file("test.txt")?, "original");
+
+    // Redo once should restore only the most recently undone step (original -> v1)
+    let redo_result = fixture.agent.redo(&session_id).await?;
+    assert!(redo_result.restored);
+    assert_eq!(fixture.read_file("test.txt")?, "v1");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_two_files_full_undo_redo_cycle_tracks_stack_depth() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+
+    fixture.write_file("first.txt", "first")?;
+    fixture.write_file("second.txt", "second")?;
+
+    let session_id = fixture.create_session().await?;
+
+    let revert_stack_len = || async {
+        let states = fixture
+            .storage
+            .session_store()
+            .list_revert_states(&session_id)
+            .await?;
+        Ok::<usize, anyhow::Error>(states.len())
+    };
+
+    assert_eq!(revert_stack_len().await?, 0);
+
+    // Turn 1: delete first.txt
+    let user_msg_1 = fixture
+        .add_user_message(&session_id, "delete first file")
+        .await?;
+    let (turn1_id, pre1_snapshot) = fixture.take_pre_snapshot(&session_id).await?;
+    std::fs::remove_file(fixture.worktree.path().join("first.txt"))?;
+    fixture
+        .take_post_snapshot(&session_id, &turn1_id, &pre1_snapshot)
+        .await?;
+
+    // Turn 2: delete second.txt
+    let user_msg_2 = fixture
+        .add_user_message(&session_id, "delete second file")
+        .await?;
+    let (turn2_id, pre2_snapshot) = fixture.take_pre_snapshot(&session_id).await?;
+    std::fs::remove_file(fixture.worktree.path().join("second.txt"))?;
+    fixture
+        .take_post_snapshot(&session_id, &turn2_id, &pre2_snapshot)
+        .await?;
+
+    assert!(!fixture.worktree.path().join("first.txt").exists());
+    assert!(!fixture.worktree.path().join("second.txt").exists());
+    assert_eq!(revert_stack_len().await?, 0);
+
+    // Undo second deletion: second.txt restored, first.txt still deleted
+    fixture.agent.undo(&session_id, &user_msg_2).await?;
+    assert!(!fixture.worktree.path().join("first.txt").exists());
+    assert!(fixture.worktree.path().join("second.txt").exists());
+    assert_eq!(fixture.read_file("second.txt")?, "second");
+    assert_eq!(revert_stack_len().await?, 1);
+
+    // Undo first deletion: both files restored
+    fixture.agent.undo(&session_id, &user_msg_1).await?;
+    assert!(fixture.worktree.path().join("first.txt").exists());
+    assert!(fixture.worktree.path().join("second.txt").exists());
+    assert_eq!(fixture.read_file("first.txt")?, "first");
+    assert_eq!(fixture.read_file("second.txt")?, "second");
+    assert_eq!(revert_stack_len().await?, 2);
+
+    // Redo once: re-apply first deletion only
+    fixture.agent.redo(&session_id).await?;
+    assert!(!fixture.worktree.path().join("first.txt").exists());
+    assert!(fixture.worktree.path().join("second.txt").exists());
+    assert_eq!(fixture.read_file("second.txt")?, "second");
+    assert_eq!(revert_stack_len().await?, 1);
+
+    // Redo twice: re-apply second deletion, both files deleted again
+    fixture.agent.redo(&session_id).await?;
+    assert!(!fixture.worktree.path().join("first.txt").exists());
+    assert!(!fixture.worktree.path().join("second.txt").exists());
+    assert_eq!(revert_stack_len().await?, 0);
+
+    // Third redo should fail and keep stack empty
+    let third_redo = fixture.agent.redo(&session_id).await;
+    assert!(third_redo.is_err());
+    assert!(
+        third_redo
+            .unwrap_err()
+            .to_string()
+            .contains("Nothing to redo")
+    );
+    assert_eq!(revert_stack_len().await?, 0);
 
     Ok(())
 }

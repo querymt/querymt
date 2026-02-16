@@ -318,6 +318,10 @@ export interface Turn {
   modelConfigId?: number; // LLM config ID for fetching params
 }
 
+export interface UndoStackFrame {
+  message_id: string;
+}
+
 export type UiServerMessage =
   | {
       type: 'state';
@@ -352,7 +356,13 @@ export type UiServerMessage =
       message: string;
     }
   | { type: 'session_list'; groups: SessionGroup[] }
-  | { type: 'session_loaded'; session_id: string; agent_id: string; audit: AuditView }
+  | {
+      type: 'session_loaded';
+      session_id: string;
+      agent_id: string;
+      audit: AuditView;
+      undo_stack: UndoStackFrame[];
+    }
   | {
       type: 'workspace_index_status';
       session_id: string;
@@ -366,8 +376,15 @@ export type UiServerMessage =
   | { type: 'oauth_result'; provider: string; success: boolean; message: string }
   | { type: 'file_index'; files: FileIndexEntry[]; generated_at: number }
   | { type: 'llm_config'; config_id: number; provider: string; model: string; params?: Record<string, unknown> | null }
-  | { type: 'undo_result'; success: boolean; message?: string | null; reverted_files: string[] }
-  | { type: 'redo_result'; success: boolean; message?: string | null }
+  | {
+      type: 'undo_result';
+      success: boolean;
+      message?: string | null;
+      reverted_files: string[];
+      message_id?: string | null;
+      undo_stack: UndoStackFrame[];
+    }
+  | { type: 'redo_result'; success: boolean; message?: string | null; undo_stack: UndoStackFrame[] }
   | { type: 'agent_mode'; mode: string };
 
 export interface ModelEntry {

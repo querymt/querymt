@@ -103,8 +103,8 @@ describe('useUiClient - undo/redo', () => {
     });
 
     expect(result.current.undoState).toEqual({
-      turnId: 'turn-5',
-      revertedFiles: [],
+      stack: [{ turnId: 'turn-5', messageId: 'msg-123', status: 'pending', revertedFiles: [] }],
+      frontierMessageId: 'msg-123',
     });
   });
 
@@ -121,20 +121,22 @@ describe('useUiClient - undo/redo', () => {
       result.current.sendUndo('msg-123', 'turn-5');
     });
 
-    expect(result.current.undoState?.revertedFiles).toEqual([]);
+    expect(result.current.undoState?.stack[0].revertedFiles).toEqual([]);
 
     // Simulate success response
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
         success: true,
+        message_id: 'msg-123',
         reverted_files: ['a.txt', 'b.txt'],
+        undo_stack: [{ message_id: 'msg-123' }],
       });
     });
 
     expect(result.current.undoState).toEqual({
-      turnId: 'turn-5',
-      revertedFiles: ['a.txt', 'b.txt'],
+      stack: [{ turnId: 'turn-5', messageId: 'msg-123', status: 'confirmed', revertedFiles: ['a.txt', 'b.txt'] }],
+      frontierMessageId: 'msg-123',
     });
   });
 
@@ -159,6 +161,7 @@ describe('useUiClient - undo/redo', () => {
         type: 'undo_result',
         success: false,
         error: 'Snapshot not found',
+        undo_stack: [],
       });
     });
 
@@ -182,6 +185,7 @@ describe('useUiClient - undo/redo', () => {
         type: 'undo_result',
         success: true,
         reverted_files: ['a.txt'],
+        undo_stack: [],
       });
     });
 
@@ -197,6 +201,20 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => { 
       await Promise.resolve(); 
       await Promise.resolve(); 
+    });
+
+    await act(async () => {
+      result.current.sendUndo('msg-123', 'turn-5');
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'undo_result',
+        success: true,
+        message_id: 'msg-123',
+        reverted_files: ['a.txt'],
+        undo_stack: [{ message_id: 'msg-123' }],
+      });
     });
 
     MockWebSocket.instance!.sentMessages = [];
@@ -229,6 +247,7 @@ describe('useUiClient - undo/redo', () => {
         type: 'undo_result',
         success: true,
         reverted_files: ['a.txt'],
+        undo_stack: [{ message_id: 'msg-123' }],
       });
     });
 
@@ -243,6 +262,7 @@ describe('useUiClient - undo/redo', () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'redo_result',
         success: true,
+        undo_stack: [],
       });
     });
 
@@ -267,6 +287,7 @@ describe('useUiClient - undo/redo', () => {
         type: 'undo_result',
         success: true,
         reverted_files: ['a.txt'],
+        undo_stack: [{ message_id: 'msg-123' }],
       });
     });
 
@@ -282,6 +303,7 @@ describe('useUiClient - undo/redo', () => {
         type: 'redo_result',
         success: false,
         error: 'No redo available',
+        undo_stack: [{ message_id: 'msg-123' }],
       });
     });
 
@@ -289,7 +311,227 @@ describe('useUiClient - undo/redo', () => {
     expect(result.current.undoState).toEqual(undoStateBefore);
   });
 
-  // ==================== Test Suite 3a.3: Session Switch Cleanup (Bug Fix Validation) ====================
+  it('sendRedo is ignored while undo confirmation is pending', async () => {
+    const { result } = renderHook(() => useUiClient());
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    MockWebSocket.instance!.sentMessages = [];
+
+    await act(async () => {
+      result.current.sendUndo('msg-123', 'turn-5');
+      result.current.sendRedo();
+    });
+
+    expect(MockWebSocket.instance!.sentMessages).toEqual([
+      {
+        type: 'undo',
+        message_id: 'msg-123',
+      },
+    ]);
+  });
+
+  it('sendUndo is ignored while undo confirmation is pending', async () => {
+    const { result } = renderHook(() => useUiClient());
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    MockWebSocket.instance!.sentMessages = [];
+
+    await act(async () => {
+      result.current.sendUndo('msg-123', 'turn-5');
+      result.current.sendUndo('msg-122', 'turn-4');
+    });
+
+    expect(MockWebSocket.instance!.sentMessages).toEqual([
+      {
+        type: 'undo',
+        message_id: 'msg-123',
+      },
+    ]);
+
+    expect(result.current.undoState).toEqual({
+      stack: [{ turnId: 'turn-5', messageId: 'msg-123', status: 'pending', revertedFiles: [] }],
+      frontierMessageId: 'msg-123',
+    });
+  });
+
+  it('stacked undo confirmations keep per-frame reverted files', async () => {
+    const { result } = renderHook(() => useUiClient());
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      result.current.sendUndo('msg-1', 'turn-1');
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'undo_result',
+        success: true,
+        message_id: 'msg-1',
+        reverted_files: ['old.txt'],
+        undo_stack: [{ message_id: 'msg-1' }],
+      });
+    });
+
+    await act(async () => {
+      result.current.sendUndo('msg-2', 'turn-2');
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'undo_result',
+        success: true,
+        message_id: 'msg-2',
+        reverted_files: ['new.txt'],
+        undo_stack: [{ message_id: 'msg-1' }, { message_id: 'msg-2' }],
+      });
+    });
+
+    expect(result.current.undoState?.stack).toEqual([
+      { turnId: 'turn-1', messageId: 'msg-1', status: 'confirmed', revertedFiles: ['old.txt'] },
+      { turnId: 'turn-2', messageId: 'msg-2', status: 'confirmed', revertedFiles: ['new.txt'] },
+    ]);
+    expect(result.current.undoState?.frontierMessageId).toBe('msg-2');
+  });
+
+  it('redo pops only top frame and preserves prior frame file list', async () => {
+    const { result } = renderHook(() => useUiClient());
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      result.current.sendUndo('msg-1', 'turn-1');
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'undo_result',
+        success: true,
+        message_id: 'msg-1',
+        reverted_files: ['old.txt'],
+        undo_stack: [{ message_id: 'msg-1' }],
+      });
+    });
+
+    await act(async () => {
+      result.current.sendUndo('msg-2', 'turn-2');
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'undo_result',
+        success: true,
+        message_id: 'msg-2',
+        reverted_files: ['new.txt'],
+        undo_stack: [{ message_id: 'msg-1' }, { message_id: 'msg-2' }],
+      });
+    });
+
+    await act(async () => {
+      result.current.sendRedo();
+      MockWebSocket.instance?.simulateMessage({
+        type: 'redo_result',
+        success: true,
+        undo_stack: [{ message_id: 'msg-1' }],
+      });
+    });
+
+    expect(result.current.undoState?.stack).toEqual([
+      { turnId: 'turn-1', messageId: 'msg-1', status: 'confirmed', revertedFiles: ['old.txt'] },
+    ]);
+    expect(result.current.undoState?.frontierMessageId).toBe('msg-1');
+  });
+
+  // ==================== Test Suite 3a.3: Prompt Branch Commit Cleanup ====================
+
+  it('undoState cleared on prompt_received for main session', async () => {
+    const { result } = renderHook(() => useUiClient());
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Set main session
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'state',
+        routing_mode: 'single',
+        active_agent_id: 'primary',
+        active_session_id: 'main-session',
+        agents: [],
+        sessions_by_agent: {},
+        agent_mode: 'build',
+      });
+    });
+
+    // Build stacked undo state with two frames
+    await act(async () => {
+      result.current.sendUndo('msg-1', 'turn-1');
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'undo_result',
+        success: true,
+        message_id: 'msg-1',
+        reverted_files: ['old.txt'],
+        undo_stack: [{ message_id: 'msg-1' }],
+      });
+    });
+
+    await act(async () => {
+      result.current.sendUndo('msg-2', 'turn-2');
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'undo_result',
+        success: true,
+        message_id: 'msg-2',
+        reverted_files: ['new.txt'],
+        undo_stack: [{ message_id: 'msg-1' }, { message_id: 'msg-2' }],
+      });
+    });
+
+    expect(result.current.undoState?.stack.length).toBe(2);
+
+    // A new prompt commits the branch and invalidates redo stack
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'event',
+        session_id: 'main-session',
+        agent_id: 'primary',
+        event: {
+          seq: 1,
+          timestamp: 1,
+          kind: {
+            type: 'prompt_received',
+            content: 'new prompt',
+            message_id: 'msg-new',
+          },
+        },
+      });
+    });
+
+    expect(result.current.undoState).toBeNull();
+  });
+
+  // ==================== Test Suite 3a.4: Session Switch Cleanup (Bug Fix Validation) ====================
 
   it('undoState cleared on session_created', async () => {
     const { result } = renderHook(() => useUiClient());
@@ -309,6 +551,7 @@ describe('useUiClient - undo/redo', () => {
         type: 'undo_result',
         success: true,
         reverted_files: ['a.txt'],
+        undo_stack: [{ message_id: 'msg-123' }],
       });
     });
 
@@ -345,6 +588,7 @@ describe('useUiClient - undo/redo', () => {
         type: 'undo_result',
         success: true,
         reverted_files: ['a.txt'],
+        undo_stack: [{ message_id: 'msg-123' }],
       });
     });
 
@@ -363,10 +607,47 @@ describe('useUiClient - undo/redo', () => {
           delegations: [],
           file_mentions: [],
         },
+        undo_stack: [],
       });
     });
 
-    // Bug #6 fix: undoState should be cleared
+    // Empty backend stack should clear prior local undo state
     expect(result.current.undoState).toBeNull();
+  });
+
+  it('hydrates undoState from session_loaded undo_stack', async () => {
+    const { result } = renderHook(() => useUiClient());
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'session_loaded',
+        session_id: 'session-hydrated',
+        agent_id: 'primary',
+        audit: {
+          session_id: 'session-hydrated',
+          cwd: '/test',
+          events: [],
+          delegations: [],
+          file_mentions: [],
+        },
+        undo_stack: [
+          { message_id: 'msg-1' },
+          { message_id: 'msg-2' },
+        ],
+      });
+    });
+
+    expect(result.current.undoState).toEqual({
+      stack: [
+        { turnId: 'msg-1', messageId: 'msg-1', status: 'confirmed', revertedFiles: [] },
+        { turnId: 'msg-2', messageId: 'msg-2', status: 'confirmed', revertedFiles: [] },
+      ],
+      frontierMessageId: 'msg-2',
+    });
   });
 });

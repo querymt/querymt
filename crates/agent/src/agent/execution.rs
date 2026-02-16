@@ -288,7 +288,7 @@ impl QueryMTAgent {
         if let Some(ref backend) = self.snapshot_backend
             && let Some(worktree) = runtime.cwd.as_ref()
         {
-            let turn_id = Uuid::new_v4().to_string();
+            let turn_id = Uuid::now_v7().to_string();
             match backend.track(worktree).await {
                 Ok(snapshot_id) => {
                     *runtime.turn_snapshot.lock().unwrap() =

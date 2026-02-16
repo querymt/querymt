@@ -177,6 +177,11 @@ pub enum UiClientMessage {
     GetAgentMode,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct UndoStackFrame {
+    pub message_id: String,
+}
+
 /// Messages from server to UI client.
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -217,6 +222,7 @@ pub enum UiServerMessage {
         session_id: String,
         agent_id: String,
         audit: AuditView,
+        undo_stack: Vec<UndoStackFrame>,
     },
     WorkspaceIndexStatus {
         session_id: String,
@@ -247,11 +253,14 @@ pub enum UiServerMessage {
         success: bool,
         message: Option<String>,
         reverted_files: Vec<String>,
+        message_id: Option<String>,
+        undo_stack: Vec<UndoStackFrame>,
     },
     /// Result of a redo operation
     RedoResult {
         success: bool,
         message: Option<String>,
+        undo_stack: Vec<UndoStackFrame>,
     },
     /// Current agent mode notification
     AgentMode {

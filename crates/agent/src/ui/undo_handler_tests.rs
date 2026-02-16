@@ -97,7 +97,7 @@ async fn test_undo_handler_single_agent() -> Result<()> {
 
     // Take pre-snapshot
     let pre_snapshot = snapshot_backend.track(worktree.path()).await?;
-    let turn_id = Uuid::new_v4().to_string();
+    let turn_id = Uuid::now_v7().to_string();
     storage
         .session_store()
         .add_message(
@@ -208,6 +208,12 @@ async fn test_undo_handler_single_agent() -> Result<()> {
         .expect("Should have reverted_files");
     assert_eq!(reverted_files.len(), 1);
     assert_eq!(reverted_files[0], "test.txt");
+    assert_eq!(response["message_id"], user_msg_id);
+    let undo_stack = response["undo_stack"]
+        .as_array()
+        .expect("Should have undo_stack");
+    assert_eq!(undo_stack.len(), 1);
+    assert_eq!(undo_stack[0]["message_id"], user_msg_id);
 
     // Verify file was actually reverted
     assert_eq!(
@@ -296,7 +302,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
 
     // Take snapshot in CHILD session
     let pre_snapshot = snapshot_backend.track(worktree.path()).await?;
-    let turn_id = Uuid::new_v4().to_string();
+    let turn_id = Uuid::now_v7().to_string();
     storage
         .session_store()
         .add_message(
@@ -407,6 +413,12 @@ async fn test_undo_handler_cross_session() -> Result<()> {
         .expect("Should have reverted_files");
     assert_eq!(reverted_files.len(), 1, "Should revert 1 file");
     assert_eq!(reverted_files[0], "test.txt");
+    assert_eq!(response["message_id"], user_msg_id);
+    let undo_stack = response["undo_stack"]
+        .as_array()
+        .expect("Should have undo_stack");
+    assert_eq!(undo_stack.len(), 1);
+    assert_eq!(undo_stack[0]["message_id"], user_msg_id);
 
     // Verify file was actually reverted (this is the critical test)
     assert_eq!(
