@@ -974,6 +974,42 @@ pub fn openai_list_models_request(
 }
 
 pub fn openai_parse_list_models(response: &Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
+    if !response.status().is_success() {
+        let status = response.status();
+        let status_code = status.as_u16();
+        let retry_after_secs = if status_code == 429 {
+            querymt::plugin::http::parse_retry_after(response.headers())
+        } else {
+            None
+        };
+
+        let clean_message = serde_json::from_slice::<Value>(response.body())
+            .ok()
+            .and_then(|json| {
+                json.pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "HTTP {}: {}",
+                    status_code,
+                    String::from_utf8_lossy(response.body())
+                )
+            });
+
+        return Err(match status_code {
+            401 | 403 => LLMError::AuthError(clean_message),
+            429 => LLMError::RateLimited {
+                message: clean_message,
+                retry_after_secs,
+            },
+            400 => LLMError::InvalidRequest(clean_message),
+            500 | 529 => LLMError::ProviderError(format!("Server error: {}", clean_message)),
+            _ => LLMError::ProviderError(clean_message),
+        });
+    }
+
     let resp_json: Value = serde_json::from_slice(response.body())?;
     let arr = resp_json
         .get("data")
@@ -1205,7 +1241,10 @@ pub fn parse_openai_sse_chunk(
 
 #[cfg(test)]
 mod tests {
-    use super::MultipartForm;
+    use http::Response;
+    use querymt::error::LLMError;
+
+    use super::{MultipartForm, openai_parse_list_models};
 
     #[test]
     fn multipart_form_encodes_text_and_file_parts() {
@@ -1228,5 +1267,48 @@ mod tests {
         );
         assert!(s.contains("Content-Type: audio/wav\r\n\r\nabc\r\n"));
         assert!(s.ends_with("--b--\r\n"));
+    }
+
+    #[test]
+    fn parse_list_models_returns_model_ids_for_success_payload() {
+        let response = Response::builder()
+            .status(200)
+            .body(br#"{"data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"}]}"#.to_vec())
+            .expect("response should build");
+
+        let models = openai_parse_list_models(&response).expect("model parsing should succeed");
+        assert_eq!(models, vec!["gpt-4o", "gpt-4o-mini"]);
+    }
+
+    #[test]
+    fn parse_list_models_surfaces_openai_400_message() {
+        let response = Response::builder()
+            .status(400)
+            .body(br#"{"error":{"message":"Invalid request. Please try again later."}}"#.to_vec())
+            .expect("response should build");
+
+        let err = openai_parse_list_models(&response).expect_err("400 response should error");
+        match err {
+            LLMError::InvalidRequest(message) => {
+                assert_eq!(message, "Invalid request. Please try again later.");
+            }
+            other => panic!("expected InvalidRequest, got {other}"),
+        }
+    }
+
+    #[test]
+    fn parse_list_models_maps_401_to_auth_error() {
+        let response = Response::builder()
+            .status(401)
+            .body(br#"{"error":{"message":"Invalid auth token"}}"#.to_vec())
+            .expect("response should build");
+
+        let err = openai_parse_list_models(&response).expect_err("401 response should error");
+        match err {
+            LLMError::AuthError(message) => {
+                assert_eq!(message, "Invalid auth token");
+            }
+            other => panic!("expected AuthError, got {other}"),
+        }
     }
 }
