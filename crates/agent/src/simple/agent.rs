@@ -486,7 +486,7 @@ impl Agent {
     ///     let agent = Agent::single()
     ///         .provider("anthropic", "claude-sonnet-4-20250514")
     ///         .cwd("/tmp")
-    ///         .tools(["read_file", "write_file"])
+    ///         .tools(["read_tool", "write_file"])
     ///         .build()
     ///         .await?;
     ///     

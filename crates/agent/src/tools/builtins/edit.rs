@@ -502,8 +502,8 @@ impl Tool for EditTool {
                 name: self.name().to_string(),
                 description: "Performs exact string replacements in files. \n\n\
                     Usage:\n\
-                    - You must use your `read_file` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. \n\
-                    - When editing text from read_file tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is '00001| ' (5 digits + pipe + space). Everything after '| ' is the actual file content to match. Never include any part of the line number prefix in the oldString or newString.\n\
+                    - You must use your `read_tool` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. \n\
+                    - When editing text from read_tool tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is '00001| ' (5 digits + pipe + space). Everything after '| ' is the actual file content to match. Never include any part of the line number prefix in the oldString or newString.\n\
                     - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n\
                     - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n\
                     - The edit will FAIL if `oldString` is not found in the file with an error \"oldString not found in content\".\n\

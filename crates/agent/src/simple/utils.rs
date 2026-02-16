@@ -1,5 +1,6 @@
 //! Shared utility functions for the simple API
 
+use crate::agent::utils::render_prompt_for_display;
 use crate::model::{AgentMessage, MessagePart};
 use crate::tools::CapabilityRequirement;
 use crate::tools::builtins::all_builtin_tools;
@@ -46,6 +47,7 @@ pub(super) fn latest_assistant_message(messages: &[AgentMessage]) -> Option<Stri
                 .iter()
                 .filter_map(|part| match part {
                     MessagePart::Text { content } => Some(content.clone()),
+                    MessagePart::Prompt { blocks } => Some(render_prompt_for_display(blocks)),
                     _ => None,
                 })
                 .collect::<Vec<_>>()

@@ -2,7 +2,7 @@ use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;
 use querymt_agent::session::provider::SessionProvider;
 use querymt_agent::session::sqlite_storage::SqliteStorage;
-use querymt_agent::session::store::SessionStore;
+use querymt_agent::session::store::{SessionExecutionConfig, SessionStore};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -57,8 +57,9 @@ async fn test_session_creation_includes_system_prompt() {
     let (_temp_dir, provider) = create_test_provider().await;
 
     // Create a session
+    let execution_config = SessionExecutionConfig::default();
     let session = provider
-        .create_session(None, None)
+        .create_session(None, None, &execution_config)
         .await
         .expect("create session");
     let session_id = &session.session().public_id;
@@ -156,8 +157,9 @@ async fn test_config_without_system_gets_none_in_params() {
         initial_config,
     ));
 
+    let execution_config = SessionExecutionConfig::default();
     let session = provider
-        .create_session(None, None)
+        .create_session(None, None, &execution_config)
         .await
         .expect("create session");
     let session_id = &session.session().public_id;

@@ -1,5 +1,6 @@
 //! Defines the generic storage interface for session persistence.
 
+use crate::config::{CompactionConfig, PruningConfig, RateLimitConfig, ToolOutputConfig};
 use crate::model::AgentMessage;
 use crate::session::domain::{
     Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
@@ -60,6 +61,34 @@ pub struct LLMConfig {
     pub created_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub updated_at: Option<OffsetDateTime>,
+}
+
+/// Stored session-scoped execution configuration snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionExecutionConfig {
+    pub max_steps: Option<usize>,
+    pub max_prompt_bytes: Option<usize>,
+    pub execution_timeout_secs: u64,
+    pub snapshot_policy: String,
+    pub tool_output_config: ToolOutputConfig,
+    pub pruning_config: PruningConfig,
+    pub compaction_config: CompactionConfig,
+    pub rate_limit_config: RateLimitConfig,
+}
+
+impl Default for SessionExecutionConfig {
+    fn default() -> Self {
+        Self {
+            max_steps: None,
+            max_prompt_bytes: None,
+            execution_timeout_secs: 300,
+            snapshot_policy: "none".to_string(),
+            tool_output_config: ToolOutputConfig::default(),
+            pruning_config: PruningConfig::default(),
+            compaction_config: CompactionConfig::default(),
+            rate_limit_config: RateLimitConfig::default(),
+        }
+    }
 }
 
 /// Helper to extract config values from LLMParams for storage
@@ -176,6 +205,19 @@ pub trait SessionStore: Send + Sync {
 
     /// Set the LLM configuration id for a session
     async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()>;
+
+    /// Persist the execution configuration snapshot for a session.
+    async fn set_session_execution_config(
+        &self,
+        session_id: &str,
+        config: &SessionExecutionConfig,
+    ) -> SessionResult<()>;
+
+    /// Retrieve the execution configuration snapshot for a session.
+    async fn get_session_execution_config(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<SessionExecutionConfig>>;
 
     // Phase 3 additions: Repository methods for domain entities
 

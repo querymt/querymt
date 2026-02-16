@@ -188,7 +188,7 @@ impl ToolTrait for BrowseTool {
 
     fn truncation_hint(&self) -> Option<&'static str> {
         Some(
-            "TIP: The response was truncated. If overflow storage is enabled, use search_text or read_file on the saved overflow file.",
+            "TIP: The response was truncated. If overflow storage is enabled, use search_text or read_tool on the saved overflow file.",
         )
     }
 

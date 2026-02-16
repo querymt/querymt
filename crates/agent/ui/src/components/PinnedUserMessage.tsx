@@ -15,12 +15,10 @@ export function PinnedUserMessage({
   message, 
   onJumpBack 
 }: PinnedUserMessageProps) {
-  // Strip the "Attachments:" section from the message
-  // This section is appended by the system and contains [file: ...] or [dir: ...] entries
-  const cleanMessage = message.split(/\n\s*Attachments:/)[0].trim();
-  
-  const truncatedMessage = cleanMessage.length > 150 
-    ? cleanMessage.slice(0, 150) + '...' 
+  const cleanMessage = message.trim();
+
+  const truncatedMessage = cleanMessage.length > 150
+    ? cleanMessage.slice(0, 150) + '...'
     : cleanMessage;
 
   return (

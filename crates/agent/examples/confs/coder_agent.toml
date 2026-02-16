@@ -15,7 +15,7 @@ provider = "anthropic"
 model = "claude-opus-4-5"
 #provider = "codex"
 #model = "gpt-5.2-codex"
-tools = ["delegate", "create_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "read_file", "shell"]
+tools = ["delegate", "create_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "read_tool", "shell"]
 system = [
   "You are Claude Code, Anthropic's official CLI for Claude.",
 #  { file = "../prompts/anthropic_opencode.txt" }
@@ -90,7 +90,7 @@ provider = "llama_cpp"
 model = "qwen3-coder-30b"
 description = "Specialized in implementation and code writing"
 capabilities = ["rust", "python"]
-tools = ["question", "edit", "todowrite", "todoread", "code_surgeon", "glob", "search_text", "ls", "shell", "read_file", "write_file"]
+tools = ["question", "edit", "todowrite", "todoread", "code_surgeon", "glob", "search_text", "ls", "shell", "read_tool", "write_file"]
 system = [
   { file = "../prompts/anthropic_opencode.txt" }
 ]

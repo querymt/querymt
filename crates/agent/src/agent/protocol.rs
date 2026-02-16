@@ -136,7 +136,11 @@ impl SendAgent for QueryMTAgent {
 
         let session_context = self
             .provider
-            .create_session(cwd.clone(), parent_session_id)
+            .create_session(
+                cwd.clone(),
+                parent_session_id,
+                &self.execution_config_snapshot(),
+            )
             .await
             .map_err(|e| Error::new(-32000, e.to_string()))?;
         let session_id = session_context.session().public_id.clone();

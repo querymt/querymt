@@ -2,9 +2,10 @@
 
 use agent_client_protocol::{ContentBlock, EmbeddedResourceResource, ToolCallLocation, ToolKind};
 
+const ATTACHMENTS_DISPLAY_FALLBACK: &str = "(attachments included)";
+
 /// Format only user text from prompt blocks (first Text block only).
-/// This excludes attachment content which is in subsequent Text blocks.
-/// Used for intent snapshots and session titles where we want clean user text.
+/// This excludes attachment content which is in subsequent blocks.
 pub fn format_prompt_user_text_only(blocks: &[ContentBlock]) -> String {
     blocks
         .first()
@@ -15,8 +16,24 @@ pub fn format_prompt_user_text_only(blocks: &[ContentBlock]) -> String {
         .unwrap_or_default()
 }
 
-/// Formats prompt content blocks into a single string
-pub fn format_prompt_blocks(blocks: &[ContentBlock], max_prompt_bytes: Option<usize>) -> String {
+/// Render prompt blocks for user-facing displays/events.
+///
+/// If there is no user text but attachments exist, return a placeholder.
+pub fn render_prompt_for_display(blocks: &[ContentBlock]) -> String {
+    let user_text = format_prompt_user_text_only(blocks).trim().to_string();
+    if !user_text.is_empty() {
+        return user_text;
+    }
+
+    if blocks.get(1).is_some() {
+        ATTACHMENTS_DISPLAY_FALLBACK.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Render prompt blocks for LLM context/history replay.
+pub fn render_prompt_for_llm(blocks: &[ContentBlock], max_prompt_bytes: Option<usize>) -> String {
     let mut content = String::new();
     for block in blocks {
         if !content.is_empty() {
@@ -130,4 +147,31 @@ pub fn extract_locations(args: &serde_json::Value) -> Vec<ToolCallLocation> {
         locations.push(ToolCallLocation::new(root));
     }
     locations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_prompt_user_text_only, render_prompt_for_display};
+    use agent_client_protocol::{ContentBlock, TextContent};
+
+    #[test]
+    fn render_prompt_for_display_prefers_user_text() {
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("hello".to_string())),
+            ContentBlock::Text(TextContent::new("[file: x]".to_string())),
+        ];
+
+        assert_eq!(render_prompt_for_display(&blocks), "hello");
+        assert_eq!(format_prompt_user_text_only(&blocks), "hello");
+    }
+
+    #[test]
+    fn render_prompt_for_display_uses_attachment_placeholder() {
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("".to_string())),
+            ContentBlock::Text(TextContent::new("[file: x]".to_string())),
+        ];
+
+        assert_eq!(render_prompt_for_display(&blocks), "(attachments included)");
+    }
 }

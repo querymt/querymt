@@ -50,6 +50,36 @@ name = "openai"
 path = "oci://ghcr.io/querymt/openai:latest"
 ```
 
+## Agent (`qmt-agent`)
+
+The `qmt-agent` crate (in `crates/agent`) is the high-level agent runtime for QueryMaTe.
+
+If you're new, the easiest way to try it is the `coder_agent` example at `crates/agent/examples/coder_agent.rs`.
+It loads an agent from a TOML config file and can run in two modes:
+
+- `--stdio`: runs as an ACP stdio server (great for integrations and tooling)
+- `--dashboard`: runs with a local web dashboard for interactive use
+
+### Quick start
+
+From the workspace root:
+
+```bash
+cd crates/agent
+
+# ACP stdio mode
+cargo run --example coder_agent --features dashboard -- --stdio
+
+# Dashboard mode (default http://127.0.0.1:3000)
+cargo run --example coder_agent --features dashboard -- --dashboard
+
+# Dashboard mode on a custom address
+cargo run --example coder_agent --features dashboard -- --dashboard=0.0.0.0:8080
+```
+
+By default it reads config from `examples/confs/coder_agent.toml`.
+You can also pass your own config path before the mode flag.
+
 ## Documentation
 
 For everything else, refer to [docs.query.mt](https://docs.query.mt).

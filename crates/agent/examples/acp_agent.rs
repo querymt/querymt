@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     log::info!("Agent: QueryMTAgent with full capabilities");
     log::info!("Features:");
     log::info!("  - LLM provider: Anthropic Claude");
-    log::info!("  - Built-in tools: read_file, write_file, shell");
+    log::info!("  - Built-in tools: read_tool, write_file, shell");
     log::info!("  - Session management");
     log::info!("  - Permission requests");
     log::info!("  - Session notifications");
@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
     let agent = Agent::single()
         .provider("anthropic", "claude-sonnet-4-20250514")
         .cwd("/tmp")
-        .tools(["read_file", "write_file", "shell", "list", "glob"])
+        .tools(["read_tool", "write_file", "shell", "list", "glob"])
         .build()
         .await?;
 

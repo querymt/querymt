@@ -163,9 +163,9 @@ describe('calculateStats', () => {
   describe('tool call tracking', () => {
     it('counts tool calls correctly', () => {
       const events = [
-        makeToolCallEvent('read_file'),
+        makeToolCallEvent('read_tool'),
         makeToolCallEvent('write_file'),
-        makeToolCallEvent('read_file'),
+        makeToolCallEvent('read_tool'),
       ];
       const result = calculateStats(events);
       expect(result.session.totalToolCalls).toBe(3);
@@ -173,20 +173,20 @@ describe('calculateStats', () => {
 
     it('builds tool breakdown by kind', () => {
       const events = [
-        makeToolCallEvent('read_file'),
+        makeToolCallEvent('read_tool'),
         makeToolCallEvent('write_file'),
-        makeToolCallEvent('read_file'),
+        makeToolCallEvent('read_tool'),
       ];
       const result = calculateStats(events);
       expect(result.perAgent[0].toolBreakdown).toEqual({
-        'read_file': 2,
+        'read_tool': 2,
         'write_file': 1,
       });
     });
 
     it('uses "unknown" for tool calls without kind', () => {
       const events = [
-        makeToolCallEvent('read_file'),
+        makeToolCallEvent('read_tool'),
         { ...makeToolCallEvent('x'), toolCall: { status: 'completed' } } as EventItem,
       ];
       const result = calculateStats(events);
@@ -195,7 +195,7 @@ describe('calculateStats', () => {
 
     it('counts tool results separately', () => {
       const events = [
-        makeToolCallEvent('read_file'),
+        makeToolCallEvent('read_tool'),
         makeToolResultEvent('tc-1'),
       ];
       const result = calculateStats(events);
@@ -205,7 +205,7 @@ describe('calculateStats', () => {
 
     it('tracks tools per agent independently', () => {
       const events = [
-        makeToolCallEvent('read_file', { agentId: 'agent-a' }),
+        makeToolCallEvent('read_tool', { agentId: 'agent-a' }),
         makeToolCallEvent('write_file', { agentId: 'agent-a' }),
         makeToolCallEvent('shell', { agentId: 'agent-b' }),
       ];
@@ -386,7 +386,7 @@ describe('calculateDelegationStats', () => {
 
   it('counts tool calls in delegation group', () => {
     const events = [
-      makeToolCallEvent('read_file'),
+      makeToolCallEvent('read_tool'),
       makeToolCallEvent('write_file'),
     ];
     const result = calculateDelegationStats(makeDelegationGroup(events));

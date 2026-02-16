@@ -24,7 +24,9 @@ use crate::session::repository::{
     ProgressRepository, SessionRepository, TaskRepository,
 };
 use crate::session::schema;
-use crate::session::store::{LLMConfig, Session, SessionStore, extract_llm_config_values};
+use crate::session::store::{
+    LLMConfig, Session, SessionExecutionConfig, SessionStore, extract_llm_config_values,
+};
 use async_trait::async_trait;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
@@ -547,6 +549,64 @@ impl SessionStore for SqliteStorage {
             SessionError::DatabaseError(_) => SessionError::SessionNotFound(session_id.to_string()),
             _ => e,
         })
+    }
+
+    async fn set_session_execution_config(
+        &self,
+        session_id: &str,
+        config: &SessionExecutionConfig,
+    ) -> SessionResult<()> {
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+        let config_json = serde_json::to_string(config).map_err(|e| {
+            SessionError::InvalidOperation(format!(
+                "Failed to serialize session execution config: {}",
+                e
+            ))
+        })?;
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+
+        self.run_blocking(move |conn| {
+            conn.execute(
+                "INSERT INTO session_execution_configs (session_id, config_json, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET config_json = excluded.config_json, updated_at = excluded.updated_at",
+                params![session_internal_id, config_json, now, now],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_session_execution_config(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<SessionExecutionConfig>> {
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+        self.run_blocking(move |conn| {
+            let config_json: Option<String> = conn
+                .query_row(
+                    "SELECT config_json FROM session_execution_configs WHERE session_id = ?",
+                    params![session_internal_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            match config_json {
+                Some(raw) => {
+                    let config: SessionExecutionConfig =
+                        serde_json::from_str(&raw).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                    Ok(Some(config))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
     }
 
     // Phase 3: Delegate to repository implementations
@@ -1758,6 +1818,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             DROP TABLE IF EXISTS intent_snapshots;
             DROP TABLE IF EXISTS tasks;
             DROP TABLE IF EXISTS sessions;
+            DROP TABLE IF EXISTS session_execution_configs;
             DROP TABLE IF EXISTS llm_configs;
         "#,
     )?;

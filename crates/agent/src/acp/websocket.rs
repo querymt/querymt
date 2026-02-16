@@ -74,7 +74,7 @@ struct WsServerState {
 /// let agent = Agent::single()
 ///     .provider("anthropic", "claude-sonnet-4-20250514")
 ///     .cwd("/tmp")
-///     .tools(["read_file", "write_file", "shell"])
+///     .tools(["read_tool", "write_file", "shell"])
 ///     .build()
 ///     .await?;
 ///

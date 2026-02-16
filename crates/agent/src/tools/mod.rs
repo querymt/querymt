@@ -4,7 +4,7 @@ pub mod context_impl;
 pub mod registry;
 
 pub use builtins::{
-    ApplyPatchTool, BrowseTool, CreateTaskTool, DelegateTool, DeleteFileTool, ReadFileTool,
+    ApplyPatchTool, BrowseTool, CreateTaskTool, DelegateTool, DeleteFileTool, ReadTool,
     SearchTextTool, ShellTool, WebFetchTool, WriteFileTool,
 };
 pub use context::{CapabilityRequirement, Tool, ToolContext, ToolError};

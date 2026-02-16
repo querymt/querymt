@@ -200,7 +200,7 @@ pub fn format_apply_error(error: patchkit::ApplyError, file_path: &Path) -> Stri
     match error {
         patchkit::ApplyError::Conflict(msg) => {
             format!(
-                "Patch cannot be applied to '{}':\n{}\n\nSuggestion: Use read_file to examine the current content.",
+                "Patch cannot be applied to '{}':\n{}\n\nSuggestion: Use read_tool to examine the current content.",
                 file_path.display(),
                 msg
             )

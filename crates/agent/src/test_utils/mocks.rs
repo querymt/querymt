@@ -6,7 +6,7 @@ use crate::session::domain::{
     TaskStatus,
 };
 use crate::session::error::SessionResult;
-use crate::session::store::{LLMConfig, Session, SessionStore};
+use crate::session::store::{LLMConfig, Session, SessionExecutionConfig, SessionStore};
 use async_trait::async_trait;
 use mockall::mock;
 use querymt::LLMParams;
@@ -44,6 +44,15 @@ mock! {
         async fn get_llm_config(&self, id: i64) -> SessionResult<Option<LLMConfig>>;
         async fn get_session_llm_config(&self, session_id: &str) -> SessionResult<Option<LLMConfig>>;
         async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()>;
+        async fn set_session_execution_config<'a, 'b, 'c>(
+            &'a self,
+            session_id: &'b str,
+            config: &'c SessionExecutionConfig,
+        ) -> SessionResult<()>;
+        async fn get_session_execution_config<'a, 'b>(
+            &'a self,
+            session_id: &'b str,
+        ) -> SessionResult<Option<SessionExecutionConfig>>;
         async fn set_current_intent_snapshot<'a, 'b, 'c>(
             &'a self,
             session_id: &'b str,

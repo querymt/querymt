@@ -1,154 +1,143 @@
-//! @ mention expansion for file and directory references in prompts.
+//! Prompt attachment expansion for ACP ResourceLink references.
 //!
-//! Handles parsing `@{file:path}` and `@{dir:path}` mentions, resolving them
-//! to actual files, and building content blocks with attachments.
+//! The UI sends one text block plus ResourceLink blocks for file mentions.
+//! This module resolves those links and expands text files into synthetic
+//! read-style text chunks in the same user turn.
 
+use super::messages::UiPromptBlock;
 use crate::index::{FileIndex, FileIndexEntry, WorkspaceIndexManager, resolve_workspace_root};
+use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_read_output};
 use agent_client_protocol::{ContentBlock, ImageContent, TextContent};
 use base64::Engine;
-use once_cell::sync::Lazy;
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Regex for matching file/dir mentions: @{file:path} or @{dir:path}
-pub static FILE_MENTION_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"@\{(file|dir):([^}]+)\}").unwrap());
-
-/// Build prompt content blocks from text with @ mentions expanded.
-/// Returns separate blocks: user text (first), attachments (second if any), images (remaining).
+/// Build prompt content blocks from UI prompt blocks.
+///
+/// Output layout:
+/// - First block: original user text
+/// - Then, for each unique ResourceLink path:
+///   - text or image: resolved resource payload
 pub async fn build_prompt_blocks(
     workspace_manager: &Arc<WorkspaceIndexManager>,
     cwd: Option<&PathBuf>,
-    text: &str,
+    prompt: &[UiPromptBlock],
 ) -> Vec<ContentBlock> {
+    let user_text = prompt
+        .iter()
+        .find_map(|block| match block {
+            UiPromptBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
     let Some(cwd) = cwd else {
-        return vec![ContentBlock::Text(TextContent::new(text.to_string()))];
+        return vec![ContentBlock::Text(TextContent::new(user_text))];
     };
-
-    let (user_text, attachment_text, image_blocks) =
-        expand_prompt_mentions(workspace_manager, cwd, text).await;
-    let mut blocks = Vec::new();
-
-    // Block 1: User's message with [file:...] references (clean, for intent snapshots)
-    blocks.push(ContentBlock::Text(TextContent::new(user_text)));
-
-    // Block 2: Attachment content (if any) - for LLM context only
-    if !attachment_text.is_empty() {
-        blocks.push(ContentBlock::Text(TextContent::new(format!(
-            "Attachments:\n{}",
-            attachment_text
-        ))));
-    }
-
-    // Blocks 3+: Images
-    blocks.extend(image_blocks);
-
-    blocks
-}
-
-/// Expand @ mentions in text and return separate components:
-/// - user_text: The user's message with [file:...] references (no attachment content)
-/// - attachment_text: Joined attachment content (file contents, dir listings, etc.)
-/// - image_blocks: Image content blocks
-async fn expand_prompt_mentions(
-    workspace_manager: &Arc<WorkspaceIndexManager>,
-    cwd: &Path,
-    text: &str,
-) -> (String, String, Vec<ContentBlock>) {
-    if !text.contains("@{") {
-        return (text.to_string(), String::new(), Vec::new());
-    }
 
     let root = resolve_workspace_root(cwd);
     let index_lookup = build_file_index_lookup(workspace_manager, cwd, &root).await;
-    let mut output = String::new();
-    let mut attachments = Vec::new();
-    let mut blocks = Vec::new();
-    let mut seen = HashSet::new();
-    let mut last_index = 0;
 
-    for captures in FILE_MENTION_RE.captures_iter(text) {
-        let full_match = captures.get(0).unwrap();
-        output.push_str(&text[last_index..full_match.start()]);
-        last_index = full_match.end();
+    let mut blocks = vec![ContentBlock::Text(TextContent::new(user_text))];
+    let mut seen_paths = HashSet::new();
 
-        let kind = captures.get(1).map(|m| m.as_str()).unwrap_or("file");
-        let raw_path = captures.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+    for block in prompt {
+        let UiPromptBlock::ResourceLink { uri, .. } = block else {
+            continue;
+        };
+
+        let raw_path = uri.trim();
         if raw_path.is_empty() {
-            output.push_str(full_match.as_str());
             continue;
         }
 
-        let expected_is_dir = kind == "dir";
-        if let Some(index_lookup) = &index_lookup {
-            match index_lookup.get(raw_path) {
-                Some(is_dir) if *is_dir == expected_is_dir => {}
-                _ => {
-                    output.push_str(full_match.as_str());
-                    continue;
-                }
-            }
+        let resolved_path = resolve_resource_path(cwd, &root, raw_path);
+        let Some(resolved_path) = resolved_path else {
+            continue;
+        };
+
+        let canonical_key = resolved_path.display().to_string();
+        if !seen_paths.insert(canonical_key) {
+            continue;
         }
 
-        let resolved_path = cwd.join(raw_path);
-        let resolved_path = match resolved_path.canonicalize() {
-            Ok(path) => path,
-            Err(_) => {
-                output.push_str(full_match.as_str());
+        let metadata = match std::fs::metadata(&resolved_path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+
+        if let Some(index_lookup) = &index_lookup
+            && !metadata.is_dir()
+        {
+            let normalized = normalize_for_index(raw_path);
+            if let Some(is_dir) = index_lookup.get(&normalized)
+                && *is_dir
+            {
                 continue;
             }
-        };
-        if !resolved_path.starts_with(&root) {
-            output.push_str(full_match.as_str());
-            continue;
         }
 
-        output.push_str(&format!("[{}: {}]", kind, raw_path));
-
-        let seen_key = format!("{}:{}", kind, raw_path);
-        if !seen.insert(seen_key) {
-            continue;
-        }
-
-        if expected_is_dir {
-            attachments.push(format_dir_attachment(raw_path, &resolved_path));
+        if metadata.is_dir() {
+            if let Ok(output) = render_read_output(&resolved_path, 0, DEFAULT_READ_LIMIT).await {
+                blocks.push(ContentBlock::Text(TextContent::new(format!(
+                    "[dir: {}]\n{}",
+                    resolved_path.display(),
+                    output
+                ))));
+            }
             continue;
         }
 
         let bytes = match std::fs::read(&resolved_path) {
             Ok(bytes) => bytes,
-            Err(_) => {
-                attachments.push(format!("[file: {}]\n(file could not be read)", raw_path));
-                continue;
-            }
+            Err(_) => continue,
         };
 
         if let Some(mime_type) = detect_image_mime(&bytes) {
             let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
             let image = ImageContent::new(encoded, mime_type).uri(raw_path.to_string());
             blocks.push(ContentBlock::Image(image));
-            attachments.push(format!("[file: {}]\n(image attached)", raw_path));
             continue;
         }
 
-        match String::from_utf8(bytes) {
-            Ok(content) => attachments.push(format!("[file: {}]\n```\n{}\n```", raw_path, content)),
-            Err(_) => attachments.push(format!("[file: {}]\n(binary file; not inlined)", raw_path)),
+        if String::from_utf8(bytes).is_ok() {
+            if let Ok(output) = render_read_output(&resolved_path, 0, DEFAULT_READ_LIMIT).await {
+                blocks.push(ContentBlock::Text(TextContent::new(format!(
+                    "[file: {}]\n{}",
+                    resolved_path.display(),
+                    output
+                ))));
+            }
+        } else {
+            blocks.push(ContentBlock::Text(TextContent::new(format!(
+                "[file: {}]\n(binary file; not inlined)",
+                raw_path
+            ))));
         }
     }
 
-    output.push_str(&text[last_index..]);
+    blocks
+}
 
-    // Don't append attachments to user text - return them separately
-    let attachment_content = if !attachments.is_empty() {
-        attachments.join("\n\n")
+fn resolve_resource_path(cwd: &Path, root: &Path, raw_path: &str) -> Option<PathBuf> {
+    let candidate = Path::new(raw_path);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
     } else {
-        String::new()
+        cwd.join(candidate)
     };
 
-    (output, attachment_content, blocks)
+    let resolved = joined.canonicalize().ok()?;
+    if !resolved.starts_with(root) {
+        return None;
+    }
+
+    Some(resolved)
+}
+
+fn normalize_for_index(raw_path: &str) -> String {
+    raw_path.trim_start_matches("./").to_string()
 }
 
 /// Build a lookup map from the file index for the current working directory.
@@ -169,33 +158,6 @@ async fn build_file_index_lookup(
         lookup.insert(entry.path, entry.is_dir);
     }
     Some(lookup)
-}
-
-/// Format a directory listing as an attachment string.
-fn format_dir_attachment(display_path: &str, resolved_path: &Path) -> String {
-    let mut entries = Vec::new();
-    if let Ok(read_dir) = std::fs::read_dir(resolved_path) {
-        for entry in read_dir.flatten() {
-            let file_type = entry.file_type().ok();
-            let mut name = entry.file_name().to_string_lossy().to_string();
-            if file_type.map(|ft| ft.is_dir()).unwrap_or(false) {
-                name.push('/');
-            }
-            entries.push(name);
-        }
-    }
-    entries.sort();
-
-    if entries.is_empty() {
-        return format!("[dir: {}]\n(empty directory)", display_path);
-    }
-
-    let listing = entries
-        .into_iter()
-        .map(|entry| format!("- {}", entry))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("[dir: {}]\n{}", display_path, listing)
 }
 
 /// Detect if bytes represent a supported image format.

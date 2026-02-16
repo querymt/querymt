@@ -26,7 +26,7 @@ model = "${PLANNER_MODEL:-gpt-4}"
 tools = [
     "delegate",
     "create_task",
-    "read_file",
+    "read_tool",
     "search_text",
     "github.*"  # All tools from github MCP
 ]
@@ -44,7 +44,7 @@ capabilities = ["rust", "python", "typescript"]
 tools = [
     "edit",
     "shell",
-    "read_file",
+    "read_tool",
     "write_file",
     "glob",
     "search_text"
@@ -67,7 +67,7 @@ capabilities = ["research", "web_search"]
 
 tools = [
     "web_fetch",
-    "read_file",
+    "read_tool",
     "github.search_repos",  # Specific tool from github MCP
     "github.list_issues"
 ]

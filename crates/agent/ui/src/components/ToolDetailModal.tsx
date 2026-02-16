@@ -46,7 +46,7 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
   const isEdit = toolKind === 'edit' || toolKind === 'mcp_edit';
   const isPatch = toolKind === 'apply_patch' || toolKind === 'mcp_apply_patch';
   const isShell = toolKind === 'shell' || toolKind === 'bash' || toolKind === 'mcp_bash';
-  const isRead = toolKind === 'read' || toolKind === 'read_file' || toolKind === 'mcp_read';
+  const isRead = toolKind === 'read' || toolKind === 'read_tool' || toolKind === 'mcp_read';
 
   return (
     <Dialog.Root open onOpenChange={(open) => { if (!open) onClose(); }}>

@@ -1,4 +1,6 @@
+use crate::agent::utils::render_prompt_for_llm;
 use crate::index::merkle::DiffPaths;
+use agent_client_protocol::ContentBlock;
 use querymt::{
     FunctionCall, ToolCall,
     chat::{ChatMessage, ChatRole, MessageType},
@@ -10,6 +12,9 @@ use serde::{Deserialize, Serialize};
 pub enum MessagePart {
     Text {
         content: String,
+    },
+    Prompt {
+        blocks: Vec<ContentBlock>,
     },
     Reasoning {
         content: String,
@@ -66,6 +71,7 @@ impl MessagePart {
     pub fn type_name(&self) -> &'static str {
         match self {
             MessagePart::Text { .. } => "text",
+            MessagePart::Prompt { .. } => "prompt",
             MessagePart::Reasoning { .. } => "reasoning",
             MessagePart::StepStart { .. } => "step_start",
             MessagePart::StepFinish { .. } => "step_finish",
@@ -119,6 +125,13 @@ impl AgentMessage {
     }
 
     pub fn to_chat_message(&self) -> ChatMessage {
+        self.to_chat_message_with_max_prompt_bytes(None)
+    }
+
+    pub fn to_chat_message_with_max_prompt_bytes(
+        &self,
+        max_prompt_bytes: Option<usize>,
+    ) -> ChatMessage {
         let mut content = String::new();
         let mut tool_calls = Vec::new();
         let mut tool_results = Vec::new();
@@ -126,6 +139,9 @@ impl AgentMessage {
         for part in &self.parts {
             match part {
                 MessagePart::Text { content: t } => content.push_str(t),
+                MessagePart::Prompt { blocks } => {
+                    content.push_str(&render_prompt_for_llm(blocks, max_prompt_bytes));
+                }
                 MessagePart::Reasoning { .. } => {
                     // Option: Exclude reasoning from context sent to LLM to save tokens
                 }
@@ -182,5 +198,29 @@ impl AgentMessage {
             thinking: None,
             cache: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentMessage, MessagePart};
+    use agent_client_protocol::{ContentBlock, TextContent};
+    use querymt::chat::ChatRole;
+
+    #[test]
+    fn to_chat_message_renders_prompt_blocks() {
+        let msg = AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::Prompt {
+                blocks: vec![ContentBlock::Text(TextContent::new("display".to_string()))],
+            }],
+            created_at: 0,
+            parent_message_id: None,
+        };
+
+        let chat = msg.to_chat_message();
+        assert_eq!(chat.content, "display");
     }
 }

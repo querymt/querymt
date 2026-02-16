@@ -28,9 +28,9 @@ describe('useTodoState', () => {
 
   it('returns empty state when events have no todowrite', () => {
     const events: EventItem[] = [
-      makeToolCallEvent('read_file', {
+      makeToolCallEvent('read_tool', {
         toolCall: {
-          kind: 'read_file',
+          kind: 'read_tool',
           tool_call_id: 'read:1',
           raw_input: { path: 'test.ts' },
         },

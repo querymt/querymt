@@ -9,7 +9,7 @@ use crate::index::{WorkspaceIndexManager, WorkspaceIndexManagerConfig};
 use crate::middleware::{CompositeDriver, MiddlewareDriver};
 use crate::session::compaction::SessionCompaction;
 use crate::session::provider::SessionProvider;
-use crate::session::store::{LLMConfig, SessionStore};
+use crate::session::store::{LLMConfig, SessionExecutionConfig, SessionStore};
 use crate::tools::ToolRegistry;
 use agent_client_protocol::{
     AuthMethod, ClientCapabilities, Error, Implementation, ProtocolVersion, SessionId,
@@ -233,6 +233,19 @@ impl std::fmt::Display for SnapshotPolicy {
 }
 
 impl QueryMTAgent {
+    pub(crate) fn execution_config_snapshot(&self) -> SessionExecutionConfig {
+        SessionExecutionConfig {
+            max_steps: self.max_steps,
+            max_prompt_bytes: self.max_prompt_bytes,
+            execution_timeout_secs: self.execution_timeout_secs,
+            snapshot_policy: self.snapshot_policy.to_string(),
+            tool_output_config: self.tool_output_config.clone(),
+            pruning_config: self.pruning_config.clone(),
+            compaction_config: self.compaction_config.clone(),
+            rate_limit_config: self.rate_limit_config.clone(),
+        }
+    }
+
     /// Creates a new agent instance with the specified plugin registry and session store.
     pub fn new(
         plugin_registry: Arc<PluginRegistry>,

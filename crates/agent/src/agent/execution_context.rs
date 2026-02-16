@@ -5,7 +5,7 @@ use crate::model::AgentMessage;
 use crate::session::error::SessionResult;
 use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
-use crate::session::store::LLMConfig;
+use crate::session::store::{LLMConfig, SessionExecutionConfig};
 use crate::tools::AgentToolContext;
 use std::path::Path;
 use std::sync::Arc;
@@ -65,6 +65,11 @@ impl ExecutionContext {
     /// Get the turn-pinned LLM config (provider name, model, params).
     pub fn llm_config(&self) -> Option<&LLMConfig> {
         self.session_handle.llm_config()
+    }
+
+    /// Get the turn-pinned execution config snapshot.
+    pub fn execution_config(&self) -> Option<&SessionExecutionConfig> {
+        self.session_handle.execution_config()
     }
 
     /// Create a tool execution context from this execution context

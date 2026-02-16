@@ -7,6 +7,7 @@ import {
   UiClientMessage,
   UiServerMessage,
   SessionGroup,
+  PromptBlock,
   AuditView,
   FileIndexEntry,
   ModelEntry,
@@ -743,8 +744,8 @@ export function useUiClient() {
     });
   }, [requestWorkspacePath, sessionGroups, sessionId, defaultCwd]);
 
-  const sendPrompt = useCallback(async (promptText: string) => {
-    sendMessage({ type: 'prompt', text: promptText });
+  const sendPrompt = useCallback(async (prompt: PromptBlock[]) => {
+    sendMessage({ type: 'prompt', prompt });
   }, []);
 
   const selectAgent = useCallback((agentId: string) => {

@@ -218,6 +218,10 @@ impl TestHarness {
             .returning(move |_| Ok(Some(llm_config_for_handle.clone())))
             .times(0..);
         store
+            .expect_get_session_execution_config()
+            .returning(|_| Ok(None))
+            .times(0..);
+        store
             .expect_add_message()
             .returning(|_, _| Ok(()))
             .times(0..);

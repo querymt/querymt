@@ -10,7 +10,9 @@
 use crate::agent::core::QueryMTAgent;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::transitions::ProcessingToolCallsParams;
-use crate::agent::utils::{format_prompt_blocks, format_prompt_user_text_only};
+use crate::agent::utils::{
+    format_prompt_user_text_only, render_prompt_for_display, render_prompt_for_llm,
+};
 use crate::events::{AgentEventKind, ExecutionMetrics, StopType};
 use crate::middleware::{AgentStats, ConversationContext, ExecutionState};
 use crate::model::{AgentMessage, MessagePart};
@@ -224,8 +226,8 @@ impl QueryMTAgent {
         );
 
         // 4. Store User Messages
-        // Full content for LLM and events (includes attachments)
-        let full_content = format_prompt_blocks(&req.prompt, self.max_prompt_bytes);
+        // Keep separate projections for user-visible events vs LLM replay context.
+        let display_content = render_prompt_for_display(&req.prompt);
 
         // User text only for intent snapshot (clean, no attachments)
         let user_text = format_prompt_user_text_only(&req.prompt);
@@ -243,7 +245,7 @@ impl QueryMTAgent {
         self.emit_event(
             &session_id,
             AgentEventKind::PromptReceived {
-                content: full_content.clone(),
+                content: display_content.clone(),
                 message_id: Some(message_id.clone()),
             },
         );
@@ -259,8 +261,8 @@ impl QueryMTAgent {
             id: message_id,
             session_id: session_id.clone(),
             role: ChatRole::User,
-            parts: vec![MessagePart::Text {
-                content: full_content.clone(),
+            parts: vec![MessagePart::Prompt {
+                blocks: req.prompt.clone(),
             }],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
@@ -280,7 +282,7 @@ impl QueryMTAgent {
         self.emit_event(
             &session_id,
             AgentEventKind::UserMessageStored {
-                content: full_content.clone(),
+                content: display_content.clone(),
             },
         );
 
@@ -745,6 +747,16 @@ impl QueryMTAgent {
                     .iter()
                     .map(|p| match p {
                         MessagePart::Text { content } => content.len() / 4,
+                        MessagePart::Prompt { blocks } => {
+                            render_prompt_for_llm(
+                                blocks,
+                                exec_ctx
+                                    .execution_config()
+                                    .and_then(|cfg| cfg.max_prompt_bytes),
+                            )
+                            .len()
+                                / 4
+                        }
                         MessagePart::ToolResult { content, .. } => content.len() / 4,
                         _ => 0,
                     })
@@ -784,7 +796,15 @@ impl QueryMTAgent {
         // Generate the compaction summary
         let result = self
             .compaction
-            .process(&messages, llm_provider, model, &retry_config)
+            .process(
+                &messages,
+                llm_provider,
+                model,
+                &retry_config,
+                exec_ctx
+                    .execution_config()
+                    .and_then(|cfg| cfg.max_prompt_bytes),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("Compaction failed: {}", e))?;
 
@@ -824,13 +844,18 @@ impl QueryMTAgent {
             crate::session::compaction::filter_to_effective_history(new_messages);
 
         // Convert AgentMessages to ChatMessages for the ConversationContext
+        let prompt_limit = exec_ctx
+            .execution_config()
+            .and_then(|cfg| cfg.max_prompt_bytes);
         let chat_messages: Vec<querymt::chat::ChatMessage> = filtered_messages
             .iter()
-            .map(|m| m.to_chat_message())
+            .map(|m| m.to_chat_message_with_max_prompt_bytes(prompt_limit))
             .collect();
 
         // Estimate new context token count from filtered messages
-        let new_context_tokens = self.compaction.estimate_messages_tokens(&filtered_messages);
+        let new_context_tokens = self
+            .compaction
+            .estimate_messages_tokens(&filtered_messages, prompt_limit);
 
         debug!(
             "Post-compaction context tokens updated: {} -> {} (filtered {} messages)",

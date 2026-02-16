@@ -117,6 +117,19 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 
         CREATE INDEX IF NOT EXISTS idx_llm_configs_provider_model ON llm_configs(provider, model);
 
+        -- Session execution config snapshot (runtime knobs persisted per session)
+        CREATE TABLE IF NOT EXISTS session_execution_configs (
+            id INTEGER PRIMARY KEY,
+            session_id INTEGER NOT NULL UNIQUE,
+            config_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_execution_configs_session
+            ON session_execution_configs(session_id);
+
         -- Intent snapshots - internal state tracking
         CREATE TABLE IF NOT EXISTS intent_snapshots (
             id INTEGER PRIMARY KEY,
