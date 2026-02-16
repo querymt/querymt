@@ -29,6 +29,11 @@ pub(super) fn to_absolute_path(path: PathBuf) -> Result<PathBuf> {
 }
 
 pub(super) async fn default_registry() -> Result<PluginRegistry> {
+    // Best-effort bootstrap of provider metadata used by plugin initialization paths.
+    if let Err(err) = querymt::providers::update_providers_if_stale().await {
+        log::warn!("Failed to update providers metadata cache: {}", err);
+    }
+
     let cfg_path = querymt_utils::providers::get_providers_config(None).await?;
     let mut registry = PluginRegistry::from_path(&cfg_path)
         .map_err(|e| anyhow!("Failed to load plugin registry: {}", e))?;

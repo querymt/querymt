@@ -709,7 +709,13 @@ impl OciDownloader {
                     OciDistributionError::AuthenticationFailure(err) => {
                         return Err(format!("Authentication failure: {:?}", err).into());
                     }
-                    _ => todo!("{:?}", e),
+                    _ => {
+                        return Err(format!(
+                            "Failed to pull manifest for '{}': {}",
+                            image_reference, e
+                        )
+                        .into());
+                    }
                 }
 
                 if let Some(meta) = local_metadata {

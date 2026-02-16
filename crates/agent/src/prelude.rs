@@ -21,8 +21,8 @@ pub use crate::simple::{
 
 // Config and runner APIs
 pub use crate::config::{
-    AgentSettings, Config, DelegateConfig, McpServerConfig, PlannerConfig, QuorumConfig,
-    QuorumSettings, SingleAgentConfig,
+    AgentSettings, Config, ConfigSource, DelegateConfig, McpServerConfig, PlannerConfig,
+    QuorumConfig, QuorumSettings, SingleAgentConfig,
 };
 pub use crate::runner::{
     AgentRunner, ChatRunner, ChatRunnerExt, ChatSession, ChatSessionExt, from_config,

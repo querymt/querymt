@@ -790,23 +790,47 @@ fn interpolate_toml_value(value: &mut toml::Value) -> Result<()> {
     Ok(())
 }
 
-/// Load and parse a config file
-pub async fn load_config(path: impl AsRef<Path>) -> Result<Config> {
-    let path = path.as_ref();
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .with_context(|| format!("Failed to read config file: {:?}", path))?;
+/// Source for loading agent configuration.
+#[derive(Debug, Clone)]
+pub enum ConfigSource {
+    /// Load TOML from a file path.
+    Path(PathBuf),
+    /// Load TOML directly from a string.
+    Toml(String),
+}
 
-    // Step 1: Parse TOML to strip comments and get structured data
-    let mut value: toml::Value = toml::from_str(&content)
-        .with_context(|| format!("Failed to parse TOML config file: {:?}", path))?;
+impl<T> From<T> for ConfigSource
+where
+    T: AsRef<Path>,
+{
+    fn from(value: T) -> Self {
+        Self::Path(value.as_ref().to_path_buf())
+    }
+}
 
-    // Step 2: Interpolate environment variables only in string values
-    interpolate_toml_value(&mut value)?;
+enum PromptResolution {
+    ResolveFiles { base_path: PathBuf },
+    RejectFileRefs,
+}
 
-    // Step 3: Detect config type and deserialize
-    let base_path = path.parent().unwrap_or(Path::new("."));
+fn ensure_inline_system_parts(parts: &[SystemPart], context: &str) -> Result<()> {
+    if let Some(SystemPart::File { file }) = parts
+        .iter()
+        .find(|part| matches!(part, SystemPart::File { .. }))
+    {
+        return Err(anyhow!(
+            "{context} contains unsupported file reference '{file:?}' in inline TOML config; inline prompt text directly instead"
+        ));
+    }
 
+    Ok(())
+}
+
+/// Build typed config from a parsed TOML value.
+async fn build_config_from_toml_value(
+    value: toml::Value,
+    resolution: PromptResolution,
+) -> Result<Config> {
     let config = if value.get("agent").is_some() {
         // Single agent config
         let mut config: SingleAgentConfig = value
@@ -817,8 +841,16 @@ pub async fn load_config(path: impl AsRef<Path>) -> Result<Config> {
         validate_mcp_servers(&config.mcp)?;
 
         // Step 5: Resolve system prompt file references
-        let resolved = resolve_system_parts(&config.agent.system, base_path, "agent").await?;
-        config.agent.system = resolved.into_iter().map(SystemPart::Inline).collect();
+        match &resolution {
+            PromptResolution::ResolveFiles { base_path } => {
+                let resolved =
+                    resolve_system_parts(&config.agent.system, base_path, "agent").await?;
+                config.agent.system = resolved.into_iter().map(SystemPart::Inline).collect();
+            }
+            PromptResolution::RejectFileRefs => {
+                ensure_inline_system_parts(&config.agent.system, "agent.system")?;
+            }
+        }
 
         Config::Single(config)
     } else if value.get("quorum").is_some() || value.get("planner").is_some() {
@@ -834,12 +866,25 @@ pub async fn load_config(path: impl AsRef<Path>) -> Result<Config> {
         }
 
         // Step 5: Resolve system prompt file references
-        let resolved = resolve_system_parts(&config.planner.system, base_path, "planner").await?;
-        config.planner.system = resolved.into_iter().map(SystemPart::Inline).collect();
-        for delegate in &mut config.delegates {
-            let context = format!("delegate '{}'", delegate.id);
-            let resolved = resolve_system_parts(&delegate.system, base_path, &context).await?;
-            delegate.system = resolved.into_iter().map(SystemPart::Inline).collect();
+        match &resolution {
+            PromptResolution::ResolveFiles { base_path } => {
+                let resolved =
+                    resolve_system_parts(&config.planner.system, base_path, "planner").await?;
+                config.planner.system = resolved.into_iter().map(SystemPart::Inline).collect();
+                for delegate in &mut config.delegates {
+                    let context = format!("delegate '{}'", delegate.id);
+                    let resolved =
+                        resolve_system_parts(&delegate.system, base_path, &context).await?;
+                    delegate.system = resolved.into_iter().map(SystemPart::Inline).collect();
+                }
+            }
+            PromptResolution::RejectFileRefs => {
+                ensure_inline_system_parts(&config.planner.system, "planner.system")?;
+                for delegate in &config.delegates {
+                    let context = format!("delegate '{}'.system", delegate.id);
+                    ensure_inline_system_parts(&delegate.system, &context)?;
+                }
+            }
         }
 
         Config::Multi(config)
@@ -850,6 +895,44 @@ pub async fn load_config(path: impl AsRef<Path>) -> Result<Config> {
     };
 
     Ok(config)
+}
+
+/// Load and parse config from either a file path or inline TOML content.
+pub async fn load_config(source: impl Into<ConfigSource>) -> Result<Config> {
+    match source.into() {
+        ConfigSource::Path(path) => {
+            let content = tokio::fs::read_to_string(&path)
+                .await
+                .with_context(|| format!("Failed to read config file: {:?}", path))?;
+
+            // Step 1: Parse TOML to strip comments and get structured data
+            let mut value: toml::Value = toml::from_str(&content)
+                .with_context(|| format!("Failed to parse TOML config file: {:?}", path))?;
+
+            // Step 2: Interpolate environment variables only in string values
+            interpolate_toml_value(&mut value)?;
+
+            // Step 3+: Detect config type, deserialize, validate, and resolve system prompt files
+            let base_path = path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            build_config_from_toml_value(value, PromptResolution::ResolveFiles { base_path })
+                .await
+                .with_context(|| format!("Failed to load config file: {:?}", path))
+        }
+        ConfigSource::Toml(content) => {
+            // Step 1: Parse TOML to strip comments and get structured data
+            let mut value: toml::Value =
+                toml::from_str(&content).context("Failed to parse inline TOML config")?;
+
+            // Step 2: Interpolate environment variables only in string values
+            interpolate_toml_value(&mut value)?;
+
+            // Step 3+: Detect config type, deserialize, validate; file prompt refs are rejected
+            build_config_from_toml_value(value, PromptResolution::RejectFileRefs).await
+        }
+    }
 }
 
 /// Interpolate environment variables in config content
@@ -1067,6 +1150,14 @@ mod tests {
         (dir, file)
     }
 
+    fn temp_config_path(filename: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System time before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("querymt-config-{filename}-{nanos}.toml"))
+    }
+
     #[test]
     fn test_system_absent() {
         let agent = parse_agent("");
@@ -1177,6 +1268,78 @@ mod tests {
         let parts = vec![SystemPart::File { file }];
         let result = resolve_system_parts(&parts, &dir, "test").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_load_config_inline_rejects_file_references() {
+        let inline = r#"
+[agent]
+provider = "test"
+model = "test-model"
+tools = []
+system = [{ file = "prompts/agent.md" }]
+"#;
+
+        let err = load_config(ConfigSource::Toml(inline.to_string()))
+            .await
+            .expect_err("inline TOML with file references should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("inline TOML config"));
+        assert!(msg.contains("agent.system"));
+    }
+
+    #[tokio::test]
+    async fn test_load_config_inline_accepts_inline_prompts() {
+        let inline = r#"
+[agent]
+provider = "test"
+model = "test-model"
+tools = []
+system = ["You are a test agent"]
+"#;
+
+        let cfg = load_config(ConfigSource::Toml(inline.to_string()))
+            .await
+            .expect("inline-only config should load");
+
+        match cfg {
+            Config::Single(single) => {
+                assert!(matches!(
+                    &single.agent.system[0],
+                    SystemPart::Inline(s) if s == "You are a test agent"
+                ));
+            }
+            Config::Multi(_) => panic!("expected single-agent config"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_config_path_resolves_file_references() {
+        let (prompt_dir, prompt_file) = make_temp_prompt("Prompt from file");
+        let prompt_path = prompt_dir.join(prompt_file);
+        let config_path = temp_config_path("single");
+        let config = format!(
+            "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\ntools = []\nsystem = [{{ file = \"{}\" }}]\n",
+            prompt_path.display()
+        );
+        std::fs::write(&config_path, config).expect("failed to write temp config");
+
+        let cfg = load_config(&config_path)
+            .await
+            .expect("file config should load");
+        match cfg {
+            Config::Single(single) => {
+                assert!(matches!(
+                    &single.agent.system[0],
+                    SystemPart::Inline(s) if s == "Prompt from file"
+                ));
+            }
+            Config::Multi(_) => panic!("expected single-agent config"),
+        }
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_file(&prompt_path);
+        let _ = std::fs::remove_dir_all(&prompt_dir);
     }
 
     #[test]

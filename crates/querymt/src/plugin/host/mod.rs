@@ -154,7 +154,12 @@ impl PluginRegistry {
                 .oci_downloader
                 .pull_and_extract(image_reference, None, &self.cache_path, false)
                 .await
-                .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
+                .map_err(|e| {
+                    LLMError::PluginError(format!(
+                        "Failed to fetch OCI plugin for provider '{}' from '{}': {}",
+                        provider_cfg.name, provider_cfg.path, e
+                    ))
+                })?;
             log::debug!(
                 "Discovered type '{:?}' via OCI annotation.",
                 provider_plugin.plugin_type

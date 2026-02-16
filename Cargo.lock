@@ -8300,6 +8300,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "base64 0.22.1",
+ "clap",
  "dirs",
  "env_logger",
  "fast_html2md",

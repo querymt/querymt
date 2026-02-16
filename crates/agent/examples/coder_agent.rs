@@ -14,20 +14,52 @@
 //! # Web dashboard mode
 //! cargo run --example coder_agent --features dashboard -- --dashboard
 //! cargo run --example coder_agent --features dashboard -- --dashboard=0.0.0.0:8080
+//!
+//! # Running a built binary with embedded default config
+//! ./coder_agent --dashboard
 //! ```
 
+use clap::{ArgGroup, Parser};
 use querymt_agent::prelude::*;
+use std::path::PathBuf;
 
-/// Setup logging for stdio mode - writes to stderr only to avoid corrupting stdout JSON-RPC
+const DEFAULT_DASHBOARD_ADDR: &str = "127.0.0.1:3000";
+const EMBEDDED_CONFIG: &str = include_str!("confs/single_coder.toml");
+const EMBEDDED_PROMPT: &str = include_str!("prompts/default_system.txt");
+const EMBEDDED_PROMPT_REF: &str = r#"{ file = "../prompts/default_system.txt" }"#;
+
+#[derive(Debug, Parser)]
+#[command(name = "coder_agent")]
+#[command(about = "Run QueryMT coder agent in ACP stdio mode or dashboard mode")]
+#[command(
+    after_help = "Examples:\n  coder_agent --stdio\n  coder_agent --dashboard\n  coder_agent --dashboard=0.0.0.0:8080\n  coder_agent path/to/config.toml --stdio"
+)]
+#[command(group(ArgGroup::new("mode").required(true).args(["stdio", "dashboard"])))]
+struct Cli {
+    /// Path to TOML config.
+    ///
+    /// If omitted, uses an embedded copy of `examples/confs/single_coder.toml`.
+    config_file: Option<PathBuf>,
+
+    /// Run as ACP stdio server (for subprocess spawning)
+    #[arg(long)]
+    stdio: bool,
+
+    /// Run web dashboard; optionally set bind address
+    #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_DASHBOARD_ADDR)]
+    dashboard: Option<String>,
+}
+
+/// Setup logging for stdio mode - writes to stderr only to avoid corrupting stdout JSON-RPC.
 fn setup_stdio_logging() {
     use tracing_log::LogTracer;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::{EnvFilter, Registry, fmt};
 
-    // Initialize log->tracing bridge so log:: macros from providers work
+    // Initialize log->tracing bridge so log:: macros from providers work.
     LogTracer::init().expect("Failed to set LogTracer");
 
-    // Create fmt layer that writes to STDERR only (stdout is reserved for JSON-RPC)
+    // Create fmt layer that writes to STDERR only (stdout is reserved for JSON-RPC).
     let fmt_layer = fmt::layer().with_writer(std::io::stderr).with_target(true);
 
     let filter = EnvFilter::from_default_env();
@@ -37,11 +69,15 @@ fn setup_stdio_logging() {
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 }
 
+fn embedded_single_coder_config() -> String {
+    let inline_prompt = format!("'''{}'''", EMBEDDED_PROMPT);
+    EMBEDDED_CONFIG.replace(EMBEDDED_PROMPT_REF, &inline_prompt)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse CLI args first to determine mode
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let is_stdio = args.contains(&"--stdio".to_string());
+    let cli = Cli::parse();
+    let is_stdio = cli.stdio;
 
     // Setup logging based on mode:
     // - Stdio mode: logs to stderr (stdout reserved for JSON-RPC)
@@ -52,55 +88,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         querymt_utils::telemetry::setup_telemetry("querymt-coder-agent", env!("CARGO_PKG_VERSION"));
     }
 
-    // Default config path
-    let config_path = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
-        .map(|s| s.as_str())
-        .unwrap_or("examples/confs/coder_agent.toml");
-
-    eprintln!("Loading agent from: {}", config_path);
-
-    // Load agent from config
-    let runner = from_config(config_path).await?;
+    let runner = if let Some(config_path) = &cli.config_file {
+        eprintln!("Loading agent from: {}", config_path.display());
+        from_config(config_path).await?
+    } else {
+        eprintln!("Loading agent from embedded default config: single_coder.toml");
+        let embedded_config = embedded_single_coder_config();
+        from_config(ConfigSource::Toml(embedded_config)).await?
+    };
 
     eprintln!("Agent loaded successfully!\n");
 
-    // Determine mode from CLI args
-    if args.contains(&"--stdio".to_string()) {
+    if is_stdio {
         eprintln!("Starting ACP stdio server...");
         runner.acp("stdio").await?;
-    } else if let Some(dashboard_arg) = args.iter().find(|a| a.starts_with("--dashboard")) {
-        let addr = if dashboard_arg.contains('=') {
-            dashboard_arg.split('=').nth(1).unwrap()
-        } else {
-            args.iter()
-                .position(|a| a == "--dashboard")
-                .and_then(|pos| args.get(pos + 1))
-                .map(|s| s.as_str())
-                .unwrap_or("127.0.0.1:3000")
-        };
+    } else {
+        let addr = cli.dashboard.as_deref().unwrap_or(DEFAULT_DASHBOARD_ADDR);
         eprintln!("Starting dashboard at http://{}", addr);
         runner.dashboard().run(addr).await?;
-    } else {
-        // Print usage and exit
-        eprintln!(
-            "Usage: cargo run --example coder_agent [config_file] <--stdio|--dashboard[=addr]>"
-        );
-        eprintln!();
-        eprintln!("Arguments:");
-        eprintln!(
-            "  config_file             Path to TOML config (default: examples/confs/coder_agent.toml)"
-        );
-        eprintln!("  --stdio                 Run as ACP stdio server (for subprocess spawning)");
-        eprintln!("  --dashboard[=addr]      Run web dashboard (default: 127.0.0.1:3000)");
-        eprintln!();
-        eprintln!("Examples:");
-        eprintln!("  cargo run --example coder_agent --stdio");
-        eprintln!("  cargo run --example coder_agent --dashboard");
-        eprintln!("  cargo run --example coder_agent --dashboard=0.0.0.0:8080");
-        eprintln!("  cargo run --example coder_agent my_config.toml --stdio");
-        std::process::exit(1);
     }
 
     Ok(())

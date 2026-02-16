@@ -2,7 +2,7 @@
 //!
 //! Provides a common trait for both single agents and multi-agent quorums.
 
-use crate::config::{Config, load_config};
+use crate::config::{Config, ConfigSource, load_config};
 use crate::events::AgentEvent;
 #[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
@@ -10,7 +10,6 @@ use crate::simple::{Agent, Quorum};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::path::Path;
 use tokio::sync::broadcast;
 
 /// Unified interface for chat operations
@@ -317,20 +316,32 @@ impl From<AgentRunner> for Box<dyn ChatRunner> {
     }
 }
 
-/// Load an agent or quorum from a config file
+/// Load an agent or quorum from configuration source.
 ///
 /// Automatically detects whether the config is for a single agent or multi-agent quorum.
 /// Returns an `AgentRunner` which provides access to all agent functionality including
 /// the `.acp()` method for starting ACP servers.
 ///
+/// `source` accepts either a config file path or inline TOML (`ConfigSource::Toml`).
+/// Inline TOML must contain fully inlined system prompts (no `{ file = ... }` entries).
+///
 /// # Example
 ///
 /// ```no_run
+/// use querymt_agent::config::ConfigSource;
 /// use querymt_agent::prelude::*;
 ///
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let runner = from_config("agent.toml").await?;
+///
+/// // Or from inline TOML
+/// let inline = r#"[agent]
+/// provider = \"openai\"
+/// model = \"gpt-4.1-mini\"
+/// tools = []
+/// "#;
+/// let _runner = from_config(ConfigSource::Toml(inline.to_string())).await?;
 ///
 /// // Chat functionality
 /// let response = runner.chat("Hello!").await?;
@@ -341,8 +352,8 @@ impl From<AgentRunner> for Box<dyn ChatRunner> {
 /// # Ok(())
 /// # }
 /// ```
-pub async fn from_config(path: impl AsRef<Path>) -> Result<AgentRunner> {
-    let config = load_config(path).await?;
+pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner> {
+    let config = load_config(source).await?;
 
     match config {
         Config::Single(single_config) => {

@@ -12,8 +12,6 @@
 db = "/tmp/agent.db"
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
-#provider = "llama_cpp"
-#model = "qwen3-coder-30b"
 tools = [
   # File operations
   "edit", "read_tool", "write_file",
@@ -30,7 +28,7 @@ tools = [
   "web_fetch",
 ]
 system = [
-  { file = "../prompts/anthropic_opencode.txt" }
+  { file = "../prompts/default_system.txt" }
 ]
 
 [agent.snapshot]

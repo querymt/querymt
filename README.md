@@ -80,6 +80,14 @@ cargo run --example coder_agent --features dashboard -- --dashboard=0.0.0.0:8080
 By default it reads config from `examples/confs/coder_agent.toml`.
 You can also pass your own config path before the mode flag.
 
+### macOS Silicon releases
+
+macOS Silicon users who download the `coder_agent` release binary need to clear the quarantine flag before running it:
+
+```bash
+xattr -dr com.apple.quarantine coder_agent
+```
+
 ## Documentation
 
 For everything else, refer to [docs.query.mt](https://docs.query.mt).
