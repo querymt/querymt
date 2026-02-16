@@ -773,7 +773,7 @@ impl SessionStore for SqliteStorage {
         repo.update_delegation(delegation).await
     }
 
-    async fn get_revert_state(
+    async fn peek_revert_state(
         &self,
         session_id: &str,
     ) -> SessionResult<Option<crate::session::domain::RevertState>> {
@@ -782,7 +782,7 @@ impl SessionStore for SqliteStorage {
 
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT public_id, message_id, snapshot_id, backend_id, created_at FROM revert_states WHERE session_id = ?",
+                "SELECT public_id, message_id, snapshot_id, backend_id, created_at FROM revert_states WHERE session_id = ? ORDER BY id DESC LIMIT 1",
                 params![session_internal_id],
                 |row| {
                     let public_id: String = row.get(0)?;
@@ -811,37 +811,132 @@ impl SessionStore for SqliteStorage {
         .await
     }
 
-    async fn set_revert_state(
+    async fn push_revert_state(
         &self,
         session_id: &str,
-        state: Option<crate::session::domain::RevertState>,
+        state: crate::session::domain::RevertState,
     ) -> SessionResult<()> {
         let session_internal_id = self.resolve_session_internal_id(session_id).await?;
 
         self.run_blocking(move |conn| {
-            // Always delete existing revert state for this session
+            let now = OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
+            conn.execute(
+                "INSERT INTO revert_states (public_id, session_id, message_id, snapshot_id, backend_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    state.public_id,
+                    session_internal_id,
+                    state.message_id,
+                    state.snapshot_id,
+                    state.backend_id,
+                    now,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn pop_revert_state(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<crate::session::domain::RevertState>> {
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+        let session_id_str = session_id.to_string();
+
+        self.run_blocking(move |conn| {
+            let tx = conn.transaction()?;
+            let state = tx
+                .query_row(
+                    "SELECT id, public_id, message_id, snapshot_id, backend_id, created_at FROM revert_states WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                    params![session_internal_id],
+                    |row| {
+                        let id: i64 = row.get(0)?;
+                        let public_id: String = row.get(1)?;
+                        let message_id: String = row.get(2)?;
+                        let snapshot_id: String = row.get(3)?;
+                        let backend_id: String = row.get(4)?;
+                        let created_at_str: String = row.get(5)?;
+                        let created_at = OffsetDateTime::parse(
+                            &created_at_str,
+                            &time::format_description::well_known::Rfc3339,
+                        )
+                        .unwrap_or_else(|_| OffsetDateTime::now_utc());
+
+                        Ok((
+                            id,
+                            crate::session::domain::RevertState {
+                                public_id,
+                                session_id: session_id_str.clone(),
+                                message_id,
+                                snapshot_id,
+                                backend_id,
+                                created_at,
+                            },
+                        ))
+                    },
+                )
+                .optional()?;
+
+            if let Some((id, revert_state)) = state {
+                tx.execute("DELETE FROM revert_states WHERE id = ?", params![id])?;
+                tx.commit()?;
+                Ok(Some(revert_state))
+            } else {
+                tx.commit()?;
+                Ok(None)
+            }
+        })
+        .await
+    }
+
+    async fn list_revert_states(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Vec<crate::session::domain::RevertState>> {
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+        let session_id_str = session_id.to_string();
+
+        self.run_blocking(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT public_id, message_id, snapshot_id, backend_id, created_at FROM revert_states WHERE session_id = ? ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map(params![session_internal_id], |row| {
+                let public_id: String = row.get(0)?;
+                let message_id: String = row.get(1)?;
+                let snapshot_id: String = row.get(2)?;
+                let backend_id: String = row.get(3)?;
+                let created_at_str: String = row.get(4)?;
+                let created_at = OffsetDateTime::parse(
+                    &created_at_str,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .unwrap_or_else(|_| OffsetDateTime::now_utc());
+
+                Ok(crate::session::domain::RevertState {
+                    public_id,
+                    session_id: session_id_str.clone(),
+                    message_id,
+                    snapshot_id,
+                    backend_id,
+                    created_at,
+                })
+            })?;
+
+            rows.collect::<Result<Vec<_>, rusqlite::Error>>()
+        })
+        .await
+    }
+
+    async fn clear_revert_states(&self, session_id: &str) -> SessionResult<()> {
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+
+        self.run_blocking(move |conn| {
             conn.execute(
                 "DELETE FROM revert_states WHERE session_id = ?",
                 params![session_internal_id],
             )?;
-
-            // Insert new state if provided
-            if let Some(state) = state {
-                let now = OffsetDateTime::now_utc()
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default();
-                conn.execute(
-                    "INSERT INTO revert_states (public_id, session_id, message_id, snapshot_id, backend_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    params![
-                        state.public_id,
-                        session_internal_id,
-                        state.message_id,
-                        state.snapshot_id,
-                        state.backend_id,
-                        now,
-                    ],
-                )?;
-            }
             Ok(())
         })
         .await
@@ -1654,6 +1749,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             DROP TABLE IF EXISTS message_parts;
             DROP TABLE IF EXISTS messages;
             DROP TABLE IF EXISTS events;
+            DROP TABLE IF EXISTS revert_states;
             DROP TABLE IF EXISTS delegations;
             DROP TABLE IF EXISTS artifacts;
             DROP TABLE IF EXISTS progress_entries;

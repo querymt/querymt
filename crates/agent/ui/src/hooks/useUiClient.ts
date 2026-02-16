@@ -16,11 +16,77 @@ import {
   AuthProviderEntry,
   OAuthFlowState,
   OAuthResultState,
+  UndoStackFrame,
 } from '../types';
 
 // Callback type for file index updates
 type FileIndexCallback = (files: FileIndexEntry[], generatedAt: number) => void;
 type FileIndexErrorCallback = (message: string) => void;
+
+type UndoFrame = {
+  turnId: string;
+  messageId: string;
+  status: 'pending' | 'confirmed';
+  revertedFiles: string[];
+};
+
+type UndoState = {
+  stack: UndoFrame[];
+  frontierMessageId?: string;
+} | null;
+
+function buildUndoStateFromServerStack(
+  undoStack: UndoStackFrame[],
+  previousState: UndoState,
+  revertedFilesByMessageId?: Map<string, string[]>,
+  preferredFrontierMessageId?: string
+) {
+  if (!undoStack || undoStack.length === 0) {
+    return null;
+  }
+
+  const previousStack = previousState?.stack ?? null;
+  const previousByMessageId = new Map<string, UndoFrame>();
+  for (const frame of previousStack ?? []) {
+    previousByMessageId.set(frame.messageId, frame);
+  }
+
+  const stack: UndoFrame[] = undoStack.map((frame) => {
+    const previous = previousByMessageId.get(frame.message_id);
+    const overrideFiles = revertedFilesByMessageId?.get(frame.message_id);
+    return {
+      turnId: previous?.turnId ?? frame.message_id,
+      messageId: frame.message_id,
+      status: 'confirmed',
+      revertedFiles: overrideFiles ?? previous?.revertedFiles ?? [],
+    };
+  });
+
+  const hasMessage = (messageId?: string | null) =>
+    !!messageId && stack.some((frame) => frame.messageId === messageId);
+
+  let frontierMessageId: string | undefined;
+  if (hasMessage(preferredFrontierMessageId)) {
+    frontierMessageId = preferredFrontierMessageId ?? undefined;
+  } else if (hasMessage(previousState?.frontierMessageId)) {
+    frontierMessageId = previousState?.frontierMessageId;
+  } else if (previousStack && previousStack.length > 0) {
+    for (let i = previousStack.length - 1; i >= 0; i--) {
+      const candidate = previousStack[i]?.messageId;
+      if (hasMessage(candidate)) {
+        frontierMessageId = candidate;
+        break;
+      }
+    }
+  }
+
+  const frontierFrame = stack.find((frame) => frame.messageId === frontierMessageId) ?? stack[stack.length - 1];
+
+  return {
+    stack,
+    frontierMessageId: frontierFrame.messageId,
+  };
+}
 
 export function useUiClient() {
   const [eventsBySession, setEventsBySession] = useState<Map<string, EventItem[]>>(new Map());
@@ -55,7 +121,8 @@ export function useUiClient() {
   >({});
   const [llmConfigCache, setLlmConfigCache] = useState<Record<number, LlmConfigDetails>>({});
   const [sessionLimits, setSessionLimits] = useState<SessionLimits | null>(null);
-  const [undoState, setUndoState] = useState<{ turnId: string; revertedFiles: string[] } | null>(null);
+  const [undoState, setUndoState] = useState<UndoState>(null);
+  const undoStateRef = useRef<UndoState>(null);
   const [defaultCwd, setDefaultCwd] = useState<string | null>(null);
   const [workspacePathDialogOpen, setWorkspacePathDialogOpen] = useState(false);
   const [workspacePathDialogDefaultValue, setWorkspacePathDialogDefaultValue] = useState('');
@@ -150,6 +217,7 @@ export function useUiClient() {
           setIsConversationComplete(false); // Reset conversation complete state
           setThinkingBySession(new Map()); // Clear all session thinking state
           setUndoState(null); // Clear undo state from previous session
+          undoStateRef.current = null;
           // NOTE: We intentionally do NOT clear agentModels here.
           // The model badge should continue to show the last known model
           // until we receive a provider_changed event for the new session.
@@ -264,8 +332,13 @@ export function useUiClient() {
             });
           }
         } else if (eventKind === 'prompt_received') {
-          if (msg.session_id === mainSessionId) {
+          const isCurrentMainOrActiveSession =
+            msg.session_id === mainSessionId || msg.session_id === sessionId;
+          if (isCurrentMainOrActiveSession) {
             setIsConversationComplete(false);
+            // A new prompt commits the current timeline branch; stacked redo history is no longer valid.
+            setUndoState(null);
+            undoStateRef.current = null;
           }
         } else if (eventKind === 'assistant_message_stored') {
           setThinkingBySession(prev => {
@@ -427,7 +500,12 @@ export function useUiClient() {
         setSessionId(msg.session_id);
         setMainSessionId(msg.session_id);
         setSessionAudit(msg.audit);
-        setUndoState(null); // Clear undo state from previous session
+        // Hydrate undo stack from backend so refresh/load reflects persisted state.
+        setUndoState((prev) => {
+          const next = buildUndoStateFromServerStack(msg.undo_stack, prev);
+          undoStateRef.current = next;
+          return next;
+        });
         
         // Populate eventsBySession from the audit events (for old session history)
         const translated = msg.audit.events.map((e: any) => {
@@ -551,20 +629,40 @@ export function useUiClient() {
         break;
       }
       case 'undo_result': {
+        const filesByMessageId = new Map<string, string[]>();
+        const messageIdForFiles = msg.message_id
+          ?? msg.undo_stack[msg.undo_stack.length - 1]?.message_id;
+        if (msg.success && messageIdForFiles) {
+          filesByMessageId.set(messageIdForFiles, msg.reverted_files);
+        }
+
+        setUndoState((prev) => {
+          const preferredFrontier = msg.success ? messageIdForFiles : undefined;
+          const next = buildUndoStateFromServerStack(
+            msg.undo_stack,
+            prev,
+            filesByMessageId,
+            preferredFrontier
+          );
+          undoStateRef.current = next;
+          return next;
+        });
+
         if (msg.success) {
-          // Undo succeeded - update with the actual reverted files
-          setUndoState(prev => prev ? { ...prev, revertedFiles: msg.reverted_files } : null);
           console.log('[useUiClient] Undo succeeded, reverted files:', msg.reverted_files);
         } else {
           console.error('[useUiClient] Undo failed:', msg.message);
-          setUndoState(null);
         }
         break;
       }
       case 'redo_result': {
+        setUndoState((prev) => {
+          const next = buildUndoStateFromServerStack(msg.undo_stack, prev);
+          undoStateRef.current = next;
+          return next;
+        });
+
         if (msg.success) {
-          // Redo succeeded - clear undo state
-          setUndoState(null);
           console.log('[useUiClient] Redo succeeded');
         } else {
           console.error('[useUiClient] Redo failed:', msg.message);
@@ -582,6 +680,10 @@ export function useUiClient() {
   // Keep the ref always pointing to the latest version of handleServerMessage
   // so the WebSocket onmessage handler never uses a stale closure.
   handleServerMessageRef.current = handleServerMessage;
+
+  useEffect(() => {
+    undoStateRef.current = undoState;
+  }, [undoState]);
 
   const sendMessage = (message: UiClientMessage) => {
     const socket = socketRef.current;
@@ -745,12 +847,36 @@ export function useUiClient() {
   }, []);
 
   const sendUndo = useCallback((messageId: string, turnId: string) => {
+    if (undoStateRef.current?.stack.some((frame) => frame.status === 'pending')) {
+      console.warn('[useUiClient] Undo ignored: undo confirmation pending');
+      return;
+    }
+
+    const currentUndoState = undoStateRef.current;
+    const nextUndoState = {
+      stack: [
+        ...(currentUndoState?.stack ?? []),
+        { turnId, messageId, status: 'pending' as const, revertedFiles: [] },
+      ],
+      frontierMessageId: messageId,
+    };
+
+    undoStateRef.current = nextUndoState;
     sendMessage({ type: 'undo', message_id: messageId });
-    // Temporarily set undo state with empty files - will be updated by undo_result
-    setUndoState({ turnId, revertedFiles: [] });
+    // Optimistically push pending frame; confirmation arrives via undo_result.
+    setUndoState(nextUndoState);
   }, []);
 
   const sendRedo = useCallback(() => {
+    const currentUndoState = undoStateRef.current;
+    if (!currentUndoState || currentUndoState.stack.length === 0) {
+      console.warn('[useUiClient] Redo ignored: undo stack is empty');
+      return;
+    }
+    if (currentUndoState.stack.some((frame) => frame.status === 'pending')) {
+      console.warn('[useUiClient] Redo ignored: undo confirmation pending');
+      return;
+    }
     sendMessage({ type: 'redo' });
   }, []);
 

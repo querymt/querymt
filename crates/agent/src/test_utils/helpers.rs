@@ -275,7 +275,7 @@ impl UndoTestFixture {
     /// Take a snapshot and record TurnSnapshotStart
     pub async fn take_pre_snapshot(&self, session_id: &str) -> Result<(String, String)> {
         let snapshot_id = self.backend.track(self.worktree.path()).await?;
-        let turn_id = Uuid::new_v4().to_string();
+        let turn_id = Uuid::now_v7().to_string();
 
         let msg = AgentMessage {
             id: Uuid::new_v4().to_string(),

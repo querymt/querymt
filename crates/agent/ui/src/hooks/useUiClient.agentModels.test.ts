@@ -82,6 +82,7 @@ describe('useUiClient - agentModels tracking', () => {
           delegations: [],
           file_mentions: [],
         },
+        undo_stack: [],
       });
     });
 
@@ -130,6 +131,7 @@ describe('useUiClient - agentModels tracking', () => {
           delegations: [],
           file_mentions: [],
         },
+        undo_stack: [],
       });
     });
 

@@ -26,8 +26,10 @@ export interface TurnCardProps {
   activeView?: 'chat' | 'delegations'; // Current view - only show pinned message in chat view
   onUndo?: () => void; // Callback to undo this turn
   onRedo?: () => void; // Callback to redo this turn
-  isUndone?: boolean; // This turn was undone
-  revertedFiles?: string[]; // Files that were reverted
+  isUndone?: boolean; // This turn is the top confirmed undone frame (redo available)
+  isUndoPending?: boolean; // This turn is the top undo frame waiting for backend confirmation
+  isStackedUndone?: boolean; // This turn is undone but blocked by newer undo frames
+  revertedFiles?: string[]; // Files that were reverted for the top confirmed frame
   canUndo?: boolean; // Whether undo button should be shown
 }
 
@@ -123,11 +125,15 @@ export const TurnCard = memo(function TurnCard({
   onUndo,
   onRedo,
   isUndone = false,
+  isUndoPending = false,
+  isStackedUndone = false,
   revertedFiles = [],
   canUndo = false,
 }: TurnCardProps) {
   const agentName = turn.agentId ? getAgentShortName(turn.agentId, agents) : 'Agent';
   const agentColor = turn.agentId ? getAgentColor(turn.agentId) : undefined;
+  const hasUndoOverlay = isUndone || isUndoPending || isStackedUndone;
+  const canShowUndoButton = !!onUndo && canUndo && !turn.isActive && !hasUndoOverlay;
 
   // Interleave messages and tool calls chronologically
   const interleaved = interleaveEvents(turn.agentMessages, turn.toolCalls, turn.delegations);
@@ -161,7 +167,12 @@ export const TurnCard = memo(function TurnCard({
   };
 
   return (
-    <div className="turn-card max-w-6xl mx-auto px-2 py-3 group">
+    <div
+      className={`turn-card max-w-6xl mx-auto px-2 py-3 group transition-opacity ${
+        isStackedUndone ? 'opacity-45' : 'opacity-100'
+      }`}
+      data-stacked-undone={isStackedUndone ? 'true' : 'false'}
+    >
       {/* Pinned user message (appears when scrolled past) - only in chat view */}
       {isPinned && turn.userMessage && activeView === 'chat' && (
         <PinnedUserMessage
@@ -316,19 +327,29 @@ export const TurnCard = memo(function TurnCard({
             <div className="text-sm text-ui-muted italic">Working...</div>
           ) : null}
 
-          {/* Undone state overlay */}
+          {/* Pending undo overlay (top stack frame awaiting confirmation) */}
+          {isUndoPending && !isUndone && (
+            <div className="absolute inset-0 bg-surface-canvas/90 backdrop-blur-sm rounded-lg flex items-center justify-center p-6">
+              <div className="max-w-md w-full text-center">
+                <h3 className="text-lg font-semibold text-status-warning mb-2">Undoing Changes...</h3>
+                <p className="text-sm text-ui-secondary">Waiting for filesystem snapshot restore to finish.</p>
+              </div>
+            </div>
+          )}
+
+          {/* Undone state overlay (top stack frame) */}
           {isUndone && (
             <div className="absolute inset-0 bg-surface-canvas/90 backdrop-blur-sm rounded-lg flex items-center justify-center p-6">
               <div className="max-w-md w-full space-y-4">
                 <div className="text-center">
                   <h3 className="text-lg font-semibold text-status-warning mb-2">Changes Undone</h3>
                   <p className="text-sm text-ui-secondary">
-                    {revertedFiles.length > 0 
+                    {revertedFiles.length > 0
                       ? `${revertedFiles.length} file${revertedFiles.length !== 1 ? 's' : ''} reverted`
                       : 'No filesystem changes were made in this turn'}
                   </p>
                 </div>
-                
+
                 {/* File list - only show if there are files */}
                 {revertedFiles.length > 0 && (
                   <div className="bg-surface-elevated/60 border border-surface-border/40 rounded-lg p-3 max-h-40 overflow-y-auto">
@@ -360,10 +381,19 @@ export const TurnCard = memo(function TurnCard({
               </div>
             </div>
           )}
+
+          {/* Stacked undo placeholder (older undone frames) */}
+          {isStackedUndone && !isUndone && (
+            <div className="absolute top-3 right-3 left-3 pointer-events-none">
+              <div className="px-3 py-2 rounded-md bg-status-warning/10 border border-status-warning/30 text-xs text-status-warning text-center">
+                Undone in stack. Redo newer undo first.
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Undo button - subtly visible, fully visible on hover */}
-        {canUndo && onUndo && !isUndone && !turn.isActive && (
+        {canShowUndoButton && (
           <div className="mt-2 flex justify-end opacity-60 group-hover:opacity-100 transition-opacity">
             <button
               onClick={onUndo}

@@ -275,15 +275,29 @@ export function ChatView() {
     return -1;
   }, [filteredTurns]);
 
-  // Calculate last turn with tool calls (for undo button)
-  const lastTurnWithToolCallsIndex = useMemo(() => {
-    for (let i = filteredTurns.length - 1; i >= 0; i--) {
-      if (filteredTurns[i].toolCalls.length > 0) {
+  // Calculate current undo candidate. If we already undid a turn, move left from that message frontier.
+  const undoTurnIndex = useMemo(() => {
+    const frontierMessageId = undoState?.frontierMessageId;
+    let startIndex = filteredTurns.length - 1;
+
+    if (frontierMessageId) {
+      const frontierIndex = filteredTurns.findIndex(
+        turn => turn.userMessage?.messageId === frontierMessageId
+      );
+      if (frontierIndex >= 0) {
+        startIndex = frontierIndex - 1;
+      }
+    }
+
+    for (let i = startIndex; i >= 0; i--) {
+      const turn = filteredTurns[i];
+      // Only user-initiated turns are undo-eligible.
+      if (turn.toolCalls.length > 0 && !!turn.userMessage?.messageId) {
         return i;
       }
     }
     return -1;
-  }, [filteredTurns]);
+  }, [filteredTurns, undoState?.frontierMessageId]);
 
   // Handle undo for a specific turn
   const handleUndo = useCallback((turnIndex: number) => {
@@ -664,10 +678,25 @@ export function ChatView() {
               ref={virtuosoRef}
               data={filteredTurns}
               itemContent={(index, turn) => {
-                const canUndo = index === lastTurnWithToolCallsIndex;
-                const isUndone = undoState?.turnId === turn.id;
-                const revertedFiles = isUndone ? undoState.revertedFiles : [];
-                
+                const canUndo = index === undoTurnIndex;
+                const turnMessageId = turn.userMessage?.messageId;
+                const frontierFrame = undoState?.frontierMessageId
+                  ? undoState.stack.find((frame) => frame.messageId === undoState.frontierMessageId)
+                  : undefined;
+                const effectiveFrontierFrame = frontierFrame
+                  ?? (undoState?.stack.length ? undoState.stack[undoState.stack.length - 1] : undefined);
+                const frameForTurn = turnMessageId
+                  ? undoState?.stack.find(frame => frame.messageId === turnMessageId)
+                  : undefined;
+
+                const isFrontierFrame =
+                  !!effectiveFrontierFrame && frameForTurn?.messageId === effectiveFrontierFrame.messageId;
+                const isUndoPending = isFrontierFrame && effectiveFrontierFrame?.status === 'pending';
+                const isUndone = isFrontierFrame && effectiveFrontierFrame?.status === 'confirmed';
+                const isStackedUndone =
+                  !!frameForTurn && frameForTurn.status === 'confirmed' && !isFrontierFrame;
+                const revertedFiles = isUndone ? (effectiveFrontierFrame?.revertedFiles ?? []) : [];
+
                 return (
                   <TurnCard
                     key={turn.id}
@@ -682,6 +711,8 @@ export function ChatView() {
                     activeView={activeTimelineView}
                     canUndo={canUndo}
                     isUndone={isUndone}
+                    isUndoPending={isUndoPending}
+                    isStackedUndone={isStackedUndone}
                     revertedFiles={revertedFiles}
                     onUndo={() => handleUndo(index)}
                     onRedo={handleRedo}

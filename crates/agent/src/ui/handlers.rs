@@ -336,13 +336,16 @@ pub async fn handle_load_session(
         agents.insert(session_id.to_string(), agent_id.clone());
     }
 
-    // 5. Send loaded audit view
+    // 5. Send loaded audit view and persisted undo stack for UI hydration
+    let undo_stack = load_undo_stack(state, session_id).await;
+
     let _ = send_message(
         tx,
         UiServerMessage::SessionLoaded {
             session_id: session_id.to_string(),
             agent_id,
             audit,
+            undo_stack,
         },
     )
     .await;
@@ -361,6 +364,24 @@ pub async fn handle_load_session(
         )
         .await;
     }
+}
+
+async fn load_undo_stack(
+    state: &ServerState,
+    session_id: &str,
+) -> Vec<super::messages::UndoStackFrame> {
+    state
+        .agent
+        .provider
+        .history_store()
+        .list_revert_states(session_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|frame| super::messages::UndoStackFrame {
+            message_id: frame.message_id,
+        })
+        .collect()
 }
 
 /// Handle model listing request using moka cache.
@@ -1642,23 +1663,29 @@ pub async fn handle_undo(
 
     match state.agent.undo(&session_id, message_id).await {
         Ok(result) => {
+            let undo_stack = load_undo_stack(state, &session_id).await;
             let _ = send_message(
                 tx,
                 UiServerMessage::UndoResult {
                     success: true,
                     message: None,
                     reverted_files: result.reverted_files,
+                    message_id: Some(result.message_id),
+                    undo_stack,
                 },
             )
             .await;
         }
         Err(e) => {
+            let undo_stack = load_undo_stack(state, &session_id).await;
             let _ = send_message(
                 tx,
                 UiServerMessage::UndoResult {
                     success: false,
                     message: Some(e.to_string()),
                     reverted_files: vec![],
+                    message_id: None,
+                    undo_stack,
                 },
             )
             .await;
@@ -1682,21 +1709,25 @@ pub async fn handle_redo(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<S
 
     match state.agent.redo(&session_id).await {
         Ok(_result) => {
+            let undo_stack = load_undo_stack(state, &session_id).await;
             let _ = send_message(
                 tx,
                 UiServerMessage::RedoResult {
                     success: true,
                     message: None,
+                    undo_stack,
                 },
             )
             .await;
         }
         Err(e) => {
+            let undo_stack = load_undo_stack(state, &session_id).await;
             let _ = send_message(
                 tx,
                 UiServerMessage::RedoResult {
                     success: false,
                     message: Some(e.to_string()),
+                    undo_stack,
                 },
             )
             .await;

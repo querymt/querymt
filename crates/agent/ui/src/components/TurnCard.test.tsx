@@ -341,4 +341,84 @@ describe('TurnCard', () => {
     // Can't undo an already undone turn
     expect(screen.queryByText('Undo')).not.toBeInTheDocument();
   });
+
+  it('shows stacked undo placeholder without redo action', () => {
+    const turn = makeTurn({ isActive: false });
+
+    render(
+      <TurnCard
+        {...defaultProps}
+        turn={turn}
+        isStackedUndone={true}
+        onRedo={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText('Undone in stack. Redo newer undo first.')).toBeInTheDocument();
+    expect(screen.queryByText('Redo Changes')).not.toBeInTheDocument();
+  });
+
+  it('dims turn content when stacked undone', () => {
+    const turn = makeTurn({ isActive: false });
+
+    const { container } = render(
+      <TurnCard
+        {...defaultProps}
+        turn={turn}
+        isStackedUndone={true}
+      />
+    );
+
+    const root = container.querySelector('.turn-card');
+    expect(root).toHaveAttribute('data-stacked-undone', 'true');
+    expect(root).toHaveClass('opacity-45');
+  });
+
+  it('shows pending undo overlay and hides redo action', () => {
+    const turn = makeTurn({ isActive: false });
+
+    render(
+      <TurnCard
+        {...defaultProps}
+        turn={turn}
+        isUndoPending={true}
+        onRedo={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText('Undoing Changes...')).toBeInTheDocument();
+    expect(screen.queryByText('Redo Changes')).not.toBeInTheDocument();
+  });
+
+  it('undo button hidden when turn is stacked undone', () => {
+    const turn = makeTurn({ isActive: false });
+
+    render(
+      <TurnCard
+        {...defaultProps}
+        turn={turn}
+        canUndo={true}
+        isStackedUndone={true}
+        onUndo={vi.fn()}
+      />
+    );
+
+    expect(screen.queryByText('Undo')).not.toBeInTheDocument();
+  });
+
+  it('undo button hidden when top undo is pending', () => {
+    const turn = makeTurn({ isActive: false });
+
+    render(
+      <TurnCard
+        {...defaultProps}
+        turn={turn}
+        canUndo={true}
+        isUndoPending={true}
+        onUndo={vi.fn()}
+      />
+    );
+
+    expect(screen.queryByText('Undo')).not.toBeInTheDocument();
+  });
 });
