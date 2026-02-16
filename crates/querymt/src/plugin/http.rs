@@ -66,8 +66,7 @@ pub type HTTPFactoryCtor = unsafe extern "C" fn() -> *mut dyn HTTPLLMProviderFac
 macro_rules! handle_http_error {
     ($resp:expr) => {{
         if !$resp.status().is_success() {
-            let status = $resp.status();
-            let status_code = status.as_u16();
+            let status_code = $resp.status().as_u16();
 
             if status_code == 499 {
                 return Err(LLMError::Cancelled);
@@ -80,18 +79,23 @@ macro_rules! handle_http_error {
                 None
             };
 
-            let error_text: String = String::from_utf8($resp.into_body())?;
+            let error_body = $resp.into_body();
 
             // Try to parse JSON and extract error.message for a clean message
-            let clean_message =
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&error_text) {
+            let clean_message = serde_json::from_slice::<serde_json::Value>(&error_body)
+                .ok()
+                .and_then(|json| {
                     json.pointer("/error/message")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("API returned error status: {}", status))
-                } else {
-                    format!("API returned error status: {}", status)
-                };
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "HTTP {}: {}",
+                        status_code,
+                        String::from_utf8_lossy(&error_body)
+                    )
+                });
 
             // Route to appropriate error variant based on status code
             return Err(match status_code {

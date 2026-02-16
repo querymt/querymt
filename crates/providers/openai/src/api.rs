@@ -974,41 +974,8 @@ pub fn openai_list_models_request(
 }
 
 pub fn openai_parse_list_models(response: &Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
-    if !response.status().is_success() {
-        let status = response.status();
-        let status_code = status.as_u16();
-        let retry_after_secs = if status_code == 429 {
-            querymt::plugin::http::parse_retry_after(response.headers())
-        } else {
-            None
-        };
-
-        let clean_message = serde_json::from_slice::<Value>(response.body())
-            .ok()
-            .and_then(|json| {
-                json.pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "HTTP {}: {}",
-                    status_code,
-                    String::from_utf8_lossy(response.body())
-                )
-            });
-
-        return Err(match status_code {
-            401 | 403 => LLMError::AuthError(clean_message),
-            429 => LLMError::RateLimited {
-                message: clean_message,
-                retry_after_secs,
-            },
-            400 => LLMError::InvalidRequest(clean_message),
-            500 | 529 => LLMError::ProviderError(format!("Server error: {}", clean_message)),
-            _ => LLMError::ProviderError(clean_message),
-        });
-    }
+    let error_response = response.clone();
+    handle_http_error!(error_response);
 
     let resp_json: Value = serde_json::from_slice(response.body())?;
     let arr = resp_json
