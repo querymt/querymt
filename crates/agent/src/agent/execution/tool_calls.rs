@@ -16,6 +16,7 @@ use crate::session::domain::TaskStatus;
 use log::debug;
 use querymt::chat::ChatRole;
 use std::sync::Arc;
+use tracing::{Instrument, Span, info_span, instrument};
 use uuid::Uuid;
 
 /// Execute a single tool call.
@@ -29,6 +30,18 @@ use uuid::Uuid;
 /// 6. Truncates output if needed
 /// 7. Creates snapshot diff/metadata
 /// 8. Returns the tool result
+#[instrument(
+    name = "agent.tool.execute",
+    skip(config, exec_ctx, bridge),
+    fields(
+        session_id = %exec_ctx.session_id,
+        tool_name = %call.function.name,
+        tool_call_id = %call.id,
+        tool_source = tracing::field::Empty,
+        is_error = tracing::field::Empty,
+        has_snapshot = tracing::field::Empty
+    )
+)]
 pub(super) async fn execute_tool_call(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
@@ -50,25 +63,33 @@ pub(super) async fn execute_tool_call(
     );
 
     let snapshot = if config.should_snapshot_tool(&call.function.name) {
-        config
-            .prepare_snapshot(exec_ctx.cwd())
-            .map(|(root, policy)| {
-                config.emit_event(
-                    &exec_ctx.session_id,
-                    AgentEventKind::SnapshotStart {
-                        policy: policy.to_string(),
-                    },
-                );
-                match policy {
-                    SnapshotPolicy::Diff => {
-                        let pre_tree = crate::index::merkle::MerkleTree::scan(root.as_path());
-                        SnapshotState::Diff { pre_tree, root }
+        info_span!(
+            "agent.tool.snapshot.prepare",
+            session_id = %exec_ctx.session_id,
+            tool_name = %call.function.name,
+            tool_call_id = %call.id,
+        )
+        .in_scope(|| {
+            config
+                .prepare_snapshot(exec_ctx.cwd())
+                .map(|(root, policy)| {
+                    config.emit_event(
+                        &exec_ctx.session_id,
+                        AgentEventKind::SnapshotStart {
+                            policy: policy.to_string(),
+                        },
+                    );
+                    match policy {
+                        SnapshotPolicy::Diff => {
+                            let pre_tree = crate::index::merkle::MerkleTree::scan(root.as_path());
+                            SnapshotState::Diff { pre_tree, root }
+                        }
+                        SnapshotPolicy::Metadata => SnapshotState::Metadata { root },
+                        SnapshotPolicy::None => SnapshotState::None,
                     }
-                    SnapshotPolicy::Metadata => SnapshotState::Metadata { root },
-                    SnapshotPolicy::None => SnapshotState::None,
-                }
-            })
-            .unwrap_or(SnapshotState::None)
+                })
+                .unwrap_or(SnapshotState::None)
+        })
     } else {
         SnapshotState::None
     };
@@ -120,21 +141,40 @@ pub(super) async fn execute_tool_call(
 
     let tool_context = exec_ctx.tool_context(config.agent_registry.clone(), Some(elicitation_tx));
 
-    let (raw_result_json, is_error) = if !config.is_tool_allowed(&call.function.name) {
+    let (raw_result_json, is_error, tool_source) = if !config.is_tool_allowed(&call.function.name) {
         (
             format!("Error: tool '{}' is not allowed", call.function.name),
             true,
+            "blocked",
         )
     } else if let Some(tool) = config.tool_registry.find(&call.function.name) {
-        match tool.call(args.clone(), &tool_context).await {
-            Ok(res) => (res, false),
-            Err(e) => (format!("Error: {}", e), true),
+        match tool
+            .call(args.clone(), &tool_context)
+            .instrument(info_span!(
+                "agent.tool.invoke",
+                source = "builtin",
+                tool_name = %call.function.name,
+                tool_call_id = %call.id,
+            ))
+            .await
+        {
+            Ok(res) => (res, false, "builtin"),
+            Err(e) => (format!("Error: {}", e), true, "builtin"),
         }
     } else if let Some(tool) = exec_ctx.runtime.mcp_tools.get(&call.function.name) {
         use querymt::tool_decorator::CallFunctionTool;
-        match tool.call(args.clone()).await {
-            Ok(res) => (res, false),
-            Err(e) => (format!("Error: {}", e), true),
+        match tool
+            .call(args.clone())
+            .instrument(info_span!(
+                "agent.tool.invoke",
+                source = "mcp",
+                tool_name = %call.function.name,
+                tool_call_id = %call.id,
+            ))
+            .await
+        {
+            Ok(res) => (res, false, "mcp"),
+            Err(e) => (format!("Error: {}", e), true, "mcp"),
         }
     } else if !ensure_tool_permission(
         config,
@@ -144,20 +184,36 @@ pub(super) async fn execute_tool_call(
         &args,
         bridge,
     )
+    .instrument(info_span!(
+        "agent.tool.permission_wait",
+        tool_name = %call.function.name,
+        tool_call_id = %call.id,
+        session_id = %exec_ctx.session_id,
+    ))
     .await
     .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?
     {
-        ("Error: permission denied".to_string(), true)
+        ("Error: permission denied".to_string(), true, "provider")
     } else {
         match exec_ctx
             .session_handle
             .call_tool(&call.function.name, args.clone())
+            .instrument(info_span!(
+                "agent.tool.invoke",
+                source = "provider",
+                tool_name = %call.function.name,
+                tool_call_id = %call.id,
+            ))
             .await
         {
-            Ok(res) => (res, false),
-            Err(e) => (format!("Error: {}", e), true),
+            Ok(res) => (res, false, "provider"),
+            Err(e) => (format!("Error: {}", e), true, "provider"),
         }
     };
+
+    let span = Span::current();
+    span.record("tool_source", tool_source);
+    span.record("is_error", is_error);
 
     // Apply Layer 1 truncation
     let result_json = if !is_error {
@@ -165,7 +221,7 @@ pub(super) async fn execute_tool_call(
             TruncationDirection, format_truncation_message_with_overflow, save_overflow_output,
             truncate_output,
         };
-        let tc = &config.tool_output_config;
+        let tc = &config.execution_policy.tool_output;
         let truncation = truncate_output(
             &raw_result_json,
             tc.max_lines,
@@ -212,8 +268,20 @@ pub(super) async fn execute_tool_call(
 
     let snapshot_part = match snapshot {
         SnapshotState::Diff { pre_tree, root } => {
-            let post_tree = crate::index::merkle::MerkleTree::scan(root.as_path());
-            let changed_paths = post_tree.diff_paths(&pre_tree);
+            let (post_tree, changed_paths) = info_span!(
+                "agent.tool.snapshot.diff",
+                session_id = %exec_ctx.session_id,
+                tool_name = %call.function.name,
+                tool_call_id = %call.id,
+            )
+            .in_scope(|| {
+                let post_tree = crate::index::merkle::MerkleTree::scan_with_previous(
+                    root.as_path(),
+                    Some(&pre_tree),
+                );
+                let changed_paths = post_tree.diff_paths(&pre_tree);
+                (post_tree, changed_paths)
+            });
             config.emit_event(
                 &exec_ctx.session_id,
                 AgentEventKind::SnapshotEnd {
@@ -226,7 +294,13 @@ pub(super) async fn execute_tool_call(
             })
         }
         SnapshotState::Metadata { root } => {
-            let (part, summary) = snapshot_metadata(root.as_path());
+            let (part, summary) = info_span!(
+                "agent.tool.snapshot.metadata",
+                session_id = %exec_ctx.session_id,
+                tool_name = %call.function.name,
+                tool_call_id = %call.id,
+            )
+            .in_scope(|| snapshot_metadata(root.as_path()));
             config.emit_event(
                 &exec_ctx.session_id,
                 AgentEventKind::SnapshotEnd { summary },
@@ -247,12 +321,26 @@ pub(super) async fn execute_tool_call(
         tool_result = tool_result.with_snapshot(part);
     }
 
+    Span::current().record("has_snapshot", tool_result.snapshot_part.is_some());
+
     Ok(tool_result)
 }
 
 /// Check if a tool call requires permission and request it if needed.
 ///
 /// Returns `true` if permission is granted (or not required), `false` if denied.
+#[instrument(
+    name = "agent.tool.permission",
+    skip(config, exec_ctx, args, bridge),
+    fields(
+        session_id = %exec_ctx.session_id,
+        tool_name = %tool_name,
+        tool_call_id = %tool_call_id,
+        requires_permission = tracing::field::Empty,
+        cache_hit = tracing::field::Empty,
+        granted = tracing::field::Empty
+    )
+)]
 pub(super) async fn ensure_tool_permission(
     config: &AgentConfig,
     exec_ctx: &ExecutionContext,
@@ -268,7 +356,10 @@ pub(super) async fn ensure_tool_permission(
     };
 
     let requires_permission = config.requires_permission_for_tool(tool_name);
+    Span::current().record("requires_permission", requires_permission);
     if !requires_permission {
+        Span::current().record("cache_hit", false);
+        Span::current().record("granted", true);
         return Ok(true);
     }
 
@@ -281,8 +372,11 @@ pub(super) async fn ensure_tool_permission(
     if let Ok(cache) = exec_ctx.runtime.permission_cache.lock()
         && let Some(cached) = cache.get(tool_name)
     {
+        Span::current().record("cache_hit", true);
+        Span::current().record("granted", *cached);
         return Ok(*cached);
     }
+    Span::current().record("cache_hit", false);
 
     let permission_id = Uuid::new_v4().to_string();
     config.emit_event(
@@ -309,6 +403,7 @@ pub(super) async fn ensure_tool_permission(
                 granted: true,
             },
         );
+        Span::current().record("granted", true);
         return Ok(true);
     };
 
@@ -379,6 +474,8 @@ pub(super) async fn ensure_tool_permission(
         },
     );
 
+    Span::current().record("granted", granted);
+
     Ok(granted)
 }
 
@@ -386,6 +483,15 @@ pub(super) async fn ensure_tool_permission(
 ///
 /// Returns a wait condition if the tool initiated an action that requires waiting
 /// (e.g., delegation).
+#[instrument(
+    name = "agent.tool.side_effects",
+    skip(config, result, exec_ctx),
+    fields(
+        session_id = %exec_ctx.session_id,
+        tool_call_id = %result.call_id,
+        tool_name = result.tool_name.as_deref().unwrap_or("unknown")
+    )
+)]
 pub(super) async fn record_tool_side_effects(
     config: &AgentConfig,
     result: &ToolResult,
@@ -482,6 +588,11 @@ pub(super) async fn record_tool_side_effects(
 /// 3. Records side effects (artifacts, delegations)
 /// 4. Aggregates file changes for deduplication
 /// 5. Returns either WaitingForEvent (if delegation) or BeforeLlmCall
+#[instrument(
+    name = "agent.tools.store_all_results",
+    skip(config, results, context, exec_ctx),
+    fields(session_id = %exec_ctx.session_id, result_count = results.len())
+)]
 pub(super) async fn store_all_tool_results(
     config: &AgentConfig,
     results: &Arc<[ToolResult]>,

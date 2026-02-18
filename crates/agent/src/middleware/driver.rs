@@ -214,59 +214,86 @@ impl CompositeDriver {
                 current_state_name
             );
 
-            let span = info_span!("middleware.driver", name = %driver_name, phase = %phase.name());
+            let span = info_span!(
+                "middleware.driver",
+                name = %driver_name,
+                phase = %phase.name(),
+                index = idx,
+                total = self.drivers.len(),
+                input_state = %current_state_name,
+                output_state = tracing::field::Empty,
+                terminal = tracing::field::Empty,
+            );
             current = match phase {
                 MiddlewarePhase::TurnStart => {
                     driver
                         .on_turn_start(current, runtime)
-                        .instrument(span)
+                        .instrument(span.clone())
                         .await?
                 }
                 MiddlewarePhase::StepStart => {
                     driver
                         .on_step_start(current, runtime)
-                        .instrument(span)
+                        .instrument(span.clone())
                         .await?
                 }
                 MiddlewarePhase::AfterLlm => {
                     driver
                         .on_after_llm(current, runtime)
-                        .instrument(span)
+                        .instrument(span.clone())
                         .await?
                 }
                 MiddlewarePhase::ProcessingToolCalls => {
                     driver
                         .on_processing_tool_calls(current, runtime)
-                        .instrument(span)
+                        .instrument(span.clone())
                         .await?
                 }
                 MiddlewarePhase::TurnEnd => {
                     driver
                         .on_turn_end(current, runtime)
-                        .instrument(span)
+                        .instrument(span.clone())
                         .await?
                 }
             };
 
             let new_state_name = current.name();
+            span.record("output_state", new_state_name);
             trace!(
                 "  Driver {} transitioned: {} -> {}",
                 driver_name, current_state_name, new_state_name
             );
 
-            // If state became terminal, stop processing further middleware
-            if matches!(
-                current,
-                ExecutionState::Complete
-                    | ExecutionState::Stopped { .. }
-                    | ExecutionState::Cancelled
-            ) {
+            // During TurnEnd, Complete is the expected pass-through state —
+            // middleware may transform it to BeforeLlmCall (e.g., dedup_check
+            // injecting a duplicate-code review). Only Stopped/Cancelled are
+            // truly terminal during TurnEnd.
+            let is_terminal = match phase {
+                MiddlewarePhase::TurnEnd => {
+                    matches!(
+                        current,
+                        ExecutionState::Stopped { .. } | ExecutionState::Cancelled
+                    )
+                }
+                _ => {
+                    matches!(
+                        current,
+                        ExecutionState::Complete
+                            | ExecutionState::Stopped { .. }
+                            | ExecutionState::Cancelled
+                    )
+                }
+            };
+            if is_terminal {
+                span.record("terminal", true);
                 debug!(
                     "CompositeDriver: {} produced terminal state {}, stopping pipeline",
                     driver_name, new_state_name
                 );
                 break;
             }
+
+            span.record("terminal", false);
         }
 
         let final_state_name = current.name();

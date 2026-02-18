@@ -13,7 +13,7 @@
 //! - Messages: Type-safe message structs for actor communication
 
 pub mod agent_config;
-pub mod builder;
+pub mod agent_config_builder;
 pub mod core;
 pub mod execution;
 pub mod execution_context;
@@ -29,7 +29,7 @@ pub mod undo;
 pub mod utils;
 
 // Re-export main types for convenience
-pub use builder::AgentBuilderExt;
+pub use agent_config_builder::AgentConfigBuilder;
 pub use core::{
     ClientState, DelegationContextConfig, DelegationContextTiming, SessionRuntime, SnapshotPolicy,
     ToolConfig, ToolPolicy,

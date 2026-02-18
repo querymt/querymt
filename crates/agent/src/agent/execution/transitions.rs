@@ -9,6 +9,7 @@
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
+use crate::agent::session_actor::ensure_pre_turn_snapshot_ready;
 use crate::events::{AgentEventKind, ExecutionMetrics, StopType};
 use crate::middleware::{
     ExecutionState, LlmResponse, ToolCall as MiddlewareToolCall, ToolFunction, ToolResult,
@@ -20,18 +21,24 @@ use agent_client_protocol::{ContentBlock, ContentChunk, SessionUpdate, TextConte
 use anyhow::Context as _;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
-use log::{debug, info};
+use log::{debug, info, warn};
 use querymt::ToolCall;
 use querymt::chat::{CacheHint, ChatMessage, ChatRole, FinishReason, StreamChunk};
-use querymt::plugin::extism_impl::ExtismChatResponse;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
+use tracing::{Instrument, info_span, instrument};
 use uuid::Uuid;
 
 /// Transition from BeforeLlmCall to CallLlm.
 ///
 /// This collects available tools, computes their hash, and emits a ToolsAvailable event
 /// if the tool set has changed.
+#[instrument(
+    name = "agent.transition.before_llm_call",
+    skip(config, context, exec_ctx, cancel_rx),
+    fields(session_id = %exec_ctx.session_id, steps = context.stats.steps)
+)]
 pub(super) async fn transition_before_llm_call(
     config: &AgentConfig,
     context: &Arc<crate::middleware::ConversationContext>,
@@ -103,6 +110,17 @@ pub(super) fn apply_cache_breakpoints(messages: &[ChatMessage]) -> Vec<ChatMessa
 ///
 /// This invokes the LLM (with or without tools), handles streaming for codex provider,
 /// tracks usage/costs, and emits LlmRequestStart/End events.
+#[instrument(
+    name = "agent.transition.call_llm",
+    skip(config, context, tools, cancel_rx, exec_ctx),
+    fields(
+        session_id = %exec_ctx.session_id,
+        provider = %context.provider,
+        model = %context.model,
+        message_count = context.messages.len(),
+        tool_count = tools.len()
+    )
+)]
 pub(super) async fn transition_call_llm(
     config: &AgentConfig,
     context: &Arc<crate::middleware::ConversationContext>,
@@ -131,9 +149,18 @@ pub(super) async fn transition_call_llm(
     let session_handle = &exec_ctx.session_handle;
     let messages_with_cache = apply_cache_breakpoints(&context.messages);
 
-    let response = if tools.is_empty() {
+    // Pre-allocated message_id for streaming path so that delta events and the
+    // final AssistantMessageStored share the same ID.
+    let mut streaming_message_id: Option<String> = None;
+
+    // Determine response via streaming or non-streaming path.
+    // Each arm produces the same tuple so the rest of the function is uniform.
+    let (response_content, response_thinking, tool_calls, usage, finish_reason) = if tools
+        .is_empty()
+    {
+        // No tools — always use the non-streaming simple submit path.
         let cancel_rx_clone = cancel_rx.clone();
-        super::llm_retry::call_llm_with_retry(config, session_id, cancel_rx, || {
+        let resp = super::llm_retry::call_llm_with_retry(config, session_id, cancel_rx, || {
             let messages_with_cache = &messages_with_cache;
             let mut cancel_rx_clone = cancel_rx_clone.clone();
             async move {
@@ -147,65 +174,155 @@ pub(super) async fn transition_call_llm(
                 }
             }
         })
-        .await?
+        .await?;
+
+        (
+            resp.text().unwrap_or_default(),
+            resp.thinking(),
+            resp.tool_calls().unwrap_or_default(),
+            resp.usage(),
+            resp.finish_reason(),
+        )
     } else {
         let provider = session_handle
             .provider()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to build provider: {}", e))?;
 
-        if context.provider.as_ref() == "codex" {
-            let mut stream = provider
-                .chat_stream_with_tools(&messages_with_cache, Some(tools))
-                .await
-                .map_err(|e| anyhow::anyhow!("LLM streaming request with tools failed: {}", e))?;
+        if provider.supports_streaming() {
+            // === STREAMING PATH (all capable providers) ===
+            let message_id = Uuid::new_v4().to_string();
+            streaming_message_id = Some(message_id.clone());
+
+            let mut stream =
+                super::llm_retry::create_stream_with_retry(config, session_id, cancel_rx, || {
+                    let provider = &provider;
+                    let messages_with_cache = &messages_with_cache;
+                    let tools_slice = tools.as_ref();
+                    async move {
+                        provider
+                            .chat_stream_with_tools(messages_with_cache, Some(tools_slice))
+                            .await
+                    }
+                })
+                .await?;
 
             let mut text = String::new();
-            let mut tool_calls: Vec<ToolCall> = Vec::new();
+            let mut thinking = String::new();
+            let mut stream_tool_calls: Vec<ToolCall> = Vec::new();
             let mut tool_call_ids = std::collections::HashSet::new();
             let mut usage: Option<querymt::Usage> = None;
+
+            // Batching buffers — we flush at most every 50ms or 256 chars to
+            // avoid per-token React state updates on fast local models.
+            let mut text_buffer = String::new();
+            let mut thinking_buffer = String::new();
+            let mut last_flush = Instant::now();
+            const BATCH_INTERVAL: Duration = Duration::from_millis(50);
+            const BATCH_CHARS: usize = 256;
+
+            macro_rules! flush_buffers {
+                ($reset_timer:expr) => {
+                    if !text_buffer.is_empty() {
+                        config.emit_event(
+                            session_id,
+                            AgentEventKind::AssistantContentDelta {
+                                content: text_buffer.drain(..).collect(),
+                                message_id: message_id.clone(),
+                            },
+                        );
+                    }
+                    if !thinking_buffer.is_empty() {
+                        config.emit_event(
+                            session_id,
+                            AgentEventKind::AssistantThinkingDelta {
+                                content: thinking_buffer.drain(..).collect(),
+                                message_id: message_id.clone(),
+                            },
+                        );
+                    }
+                    if $reset_timer {
+                        #[allow(unused_assignments)]
+                        {
+                            last_flush = Instant::now();
+                        }
+                    }
+                };
+            }
 
             while let Some(item) = stream.next().await {
                 if *cancel_rx.borrow() {
                     return Ok(ExecutionState::Cancelled);
                 }
 
-                match item.map_err(|e| {
-                    anyhow::anyhow!("LLM streaming request with tools failed: {}", e)
-                })? {
-                    StreamChunk::Text(delta) => text.push_str(&delta),
-                    StreamChunk::Thinking(_) => {}
+                match item.map_err(|e| anyhow::anyhow!("LLM streaming error: {}", e))? {
+                    StreamChunk::Text(delta) => {
+                        text.push_str(&delta);
+                        text_buffer.push_str(&delta);
+                    }
+                    StreamChunk::Thinking(delta) => {
+                        thinking.push_str(&delta);
+                        thinking_buffer.push_str(&delta);
+                    }
                     StreamChunk::ToolUseComplete { tool_call, .. } => {
+                        // Flush before tool use so UI sees final text before tool starts
+                        flush_buffers!(true);
                         if tool_call_ids.insert(tool_call.id.clone()) {
-                            tool_calls.push(tool_call);
+                            stream_tool_calls.push(tool_call);
                         }
                     }
-                    StreamChunk::Usage(u) => usage = Some(u),
+                    StreamChunk::Usage(u) => {
+                        // Anthropic (and potentially other providers) split usage across
+                        // multiple streaming events: `input_tokens` arrives in
+                        // `message_start`, while cumulative `output_tokens` arrives in
+                        // `message_delta`.  Taking the field-wise maximum merges both
+                        // events correctly regardless of order.
+                        usage = Some(match usage {
+                            Some(prev) => prev.merge_max(u),
+                            None => u,
+                        });
+                    }
                     StreamChunk::Done { .. } => break,
                     _ => {}
                 }
+
+                // Time- or size-based flush
+                if last_flush.elapsed() >= BATCH_INTERVAL
+                    || text_buffer.len() >= BATCH_CHARS
+                    || thinking_buffer.len() >= BATCH_CHARS
+                {
+                    flush_buffers!(true);
+                }
             }
 
-            let finish_reason = if tool_calls.is_empty() {
+            // Final flush of any remaining buffered content (no timer reset needed)
+            flush_buffers!(false);
+
+            let finish_reason = if stream_tool_calls.is_empty() {
                 Some(FinishReason::Stop)
             } else {
                 Some(FinishReason::ToolCalls)
             };
 
-            Box::new(ExtismChatResponse {
-                text: if text.is_empty() { None } else { Some(text) },
-                tool_calls: if tool_calls.is_empty() {
+            // Stash message_id in response so transition_after_llm reuses it
+            // (see LlmResponse::with_message_id)
+            // We return the id via a side-channel: we wrap it below.
+            // Use an Option wrapper: the streaming_message_id is set later.
+            (
+                text,
+                if thinking.is_empty() {
                     None
                 } else {
-                    Some(tool_calls)
+                    Some(thinking)
                 },
-                thinking: None,
+                stream_tool_calls,
                 usage,
                 finish_reason,
-            })
+            )
         } else {
+            // === NON-STREAMING FALLBACK ===
             let cancel_rx_clone = cancel_rx.clone();
-            super::llm_retry::call_llm_with_retry(config, session_id, cancel_rx, || {
+            let resp = super::llm_retry::call_llm_with_retry(config, session_id, cancel_rx, || {
                 let provider = &provider;
                 let messages_with_cache = &messages_with_cache;
                 let tools = tools.as_ref();
@@ -221,16 +338,19 @@ pub(super) async fn transition_call_llm(
                     }
                 }
             })
-            .await?
+            .await?;
+
+            (
+                resp.text().unwrap_or_default(),
+                resp.thinking(),
+                resp.tool_calls().unwrap_or_default(),
+                resp.usage(),
+                resp.finish_reason(),
+            )
         }
     };
 
-    let usage = response.usage();
-    let response_content = response.text().unwrap_or_default();
-    let tool_calls = response.tool_calls().unwrap_or_default();
-    let finish_reason = response.finish_reason();
-
-    let (request_cost, cumulative_cost) = if let Some(usage_info) = response.usage() {
+    let (request_cost, cumulative_cost) = if let Some(usage_info) = &usage {
         let pricing = session_handle.get_pricing();
         let request_cost = pricing.as_ref().and_then(|p| {
             p.calculate_cost(
@@ -258,12 +378,12 @@ pub(super) async fn transition_call_llm(
         request_cost,
     );
 
-    let context_tokens = calculate_context_tokens(response.usage().as_ref());
+    let context_tokens = calculate_context_tokens(usage.as_ref());
 
     config.emit_event(
         session_id,
         AgentEventKind::LlmRequestEnd {
-            usage: response.usage(),
+            usage: usage.clone(),
             tool_calls: tool_calls.len(),
             finish_reason,
             cost_usd: request_cost,
@@ -287,13 +407,14 @@ pub(super) async fn transition_call_llm(
         })
         .collect();
 
+    let mut llm_response = LlmResponse::new(response_content, llm_tool_calls, usage, finish_reason)
+        .with_thinking(response_thinking);
+    if let Some(mid) = streaming_message_id {
+        llm_response = llm_response.with_message_id(mid);
+    }
+
     Ok(ExecutionState::AfterLlm {
-        response: Arc::new(LlmResponse::new(
-            response_content,
-            llm_tool_calls,
-            usage,
-            finish_reason,
-        )),
+        response: Arc::new(llm_response),
         context: context.clone(),
     })
 }
@@ -302,6 +423,11 @@ pub(super) async fn transition_call_llm(
 ///
 /// This stores the assistant's response, updates statistics, sends client updates,
 /// and determines next state based on finish reason and tool calls.
+#[instrument(
+    name = "agent.transition.after_llm",
+    skip(config, response, context, exec_ctx, cancel_rx, bridge),
+    fields(session_id = %exec_ctx.session_id, has_tool_calls = response.has_tool_calls())
+)]
 pub(super) async fn transition_after_llm(
     config: &AgentConfig,
     response: &Arc<LlmResponse>,
@@ -318,6 +444,13 @@ pub(super) async fn transition_after_llm(
 
     if *cancel_rx.borrow() {
         return Ok(ExecutionState::Cancelled);
+    }
+
+    if let Err(e) = ensure_pre_turn_snapshot_ready(exec_ctx, "before_first_response").await {
+        warn!(
+            "Failed to resolve pre-turn snapshot before first response: {}",
+            e
+        );
     }
 
     let progress_description = if response.has_tool_calls() {
@@ -345,6 +478,17 @@ pub(super) async fn transition_after_llm(
     );
 
     let mut parts = Vec::new();
+
+    // Persist thinking/reasoning content before the text part
+    if let Some(thinking) = &response.thinking
+        && !thinking.is_empty()
+    {
+        parts.push(MessagePart::Reasoning {
+            content: thinking.clone(),
+            time_ms: None,
+        });
+    }
+
     if !response.content.is_empty() {
         super::bridge::send_session_update(
             bridge,
@@ -369,8 +513,15 @@ pub(super) async fn transition_after_llm(
         }));
     }
 
+    // Re-use the pre-allocated message_id from the streaming path when available,
+    // so the UI can replace the live stream accumulator with the final message.
+    let msg_id = response
+        .message_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
     let assistant_msg = AgentMessage {
-        id: Uuid::new_v4().to_string(),
+        id: msg_id,
         session_id: exec_ctx.session_id.clone(),
         role: ChatRole::Assistant,
         parts,
@@ -387,6 +538,7 @@ pub(super) async fn transition_after_llm(
         &exec_ctx.session_id,
         AgentEventKind::AssistantMessageStored {
             content: response.content.clone(),
+            thinking: response.thinking.clone(),
             message_id: Some(assistant_msg.id.clone()),
         },
     );
@@ -481,6 +633,15 @@ pub(super) async fn transition_after_llm(
 /// This executes remaining tool calls in parallel, collects results, and either:
 /// - Returns to BeforeLlmCall with results (normal flow)
 /// - Enters WaitingForEvent if a delegation was initiated
+#[instrument(
+    name = "agent.transition.processing_tool_calls",
+    skip(config, remaining_calls, results, context, exec_ctx, cancel_rx, bridge),
+    fields(
+        session_id = %exec_ctx.session_id,
+        remaining_calls = remaining_calls.len(),
+        completed_results = results.len()
+    )
+)]
 pub(super) async fn transition_processing_tool_calls(
     config: &AgentConfig,
     remaining_calls: &Arc<[MiddlewareToolCall]>,
@@ -502,7 +663,14 @@ pub(super) async fn transition_processing_tool_calls(
     }
 
     if remaining_calls.is_empty() {
-        return super::tool_calls::store_all_tool_results(config, results, context, exec_ctx).await;
+        let session_id = exec_ctx.session_id.clone();
+        return super::tool_calls::store_all_tool_results(config, results, context, exec_ctx)
+            .instrument(info_span!(
+                "agent.tools.store_results",
+                session_id = %session_id,
+                result_count = results.len()
+            ))
+            .await;
     }
 
     debug!(

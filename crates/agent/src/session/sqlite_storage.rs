@@ -1756,6 +1756,15 @@ fn evaluate_predicate(
 #[async_trait]
 impl EventObserver for SqliteStorage {
     async fn on_event(&self, event: &AgentEvent) -> Result<(), LLMError> {
+        // Streaming delta events are ephemeral — they must not be written to the
+        // event store. Only AssistantMessageStored (with accumulated content) is
+        // persisted so that replays are efficient and contain complete content.
+        match &event.kind {
+            crate::events::AgentEventKind::AssistantContentDelta { .. }
+            | crate::events::AgentEventKind::AssistantThinkingDelta { .. } => return Ok(()),
+            _ => {}
+        }
+
         self.append_event(event)
             .await
             .map_err(|e| LLMError::ProviderError(format!("Event storage failed: {}", e)))?;

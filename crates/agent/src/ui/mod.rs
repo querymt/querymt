@@ -23,7 +23,7 @@ pub use messages::{RoutingMode, UiAgentInfo};
 mod undo_handler_tests;
 
 use crate::event_bus::EventBus;
-use crate::index::WorkspaceIndexManager;
+use crate::index::WorkspaceIndexManagerActor;
 use crate::session::projection::ViewStore;
 use axum::{
     Router,
@@ -31,6 +31,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use kameo::actor::ActorRef;
 use messages::{ModelEntry, RoutingMode as MsgRoutingMode};
 use moka::future::Cache;
 use session::collect_event_sources;
@@ -53,7 +54,7 @@ pub struct UiServer {
     connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     session_agents: Arc<Mutex<HashMap<String, String>>>,
     session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
-    workspace_manager: Arc<WorkspaceIndexManager>,
+    workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
     model_cache: Cache<(), Vec<ModelEntry>>,
     oauth_flows: Arc<Mutex<HashMap<String, PendingOAuthFlow>>>,
     oauth_callback_listener: Arc<Mutex<Option<ActiveOAuthCallbackListener>>>,
@@ -69,7 +70,7 @@ pub(crate) struct ServerState {
     pub connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     pub session_agents: Arc<Mutex<HashMap<String, String>>>,
     pub session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
-    pub workspace_manager: Arc<WorkspaceIndexManager>,
+    pub workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
     pub model_cache: Cache<(), Vec<ModelEntry>>,
     pub oauth_flows: Arc<Mutex<HashMap<String, PendingOAuthFlow>>>,
     pub oauth_callback_listener: Arc<Mutex<Option<ActiveOAuthCallbackListener>>>,
@@ -120,7 +121,7 @@ impl UiServer {
             connections: Arc::new(Mutex::new(HashMap::new())),
             session_agents: Arc::new(Mutex::new(HashMap::new())),
             session_cwds: Arc::new(Mutex::new(HashMap::new())),
-            workspace_manager: agent.workspace_index_manager(),
+            workspace_manager: agent.workspace_manager_actor(),
             model_cache,
             oauth_flows: Arc::new(Mutex::new(HashMap::new())),
             oauth_callback_listener: Arc::new(Mutex::new(None)),

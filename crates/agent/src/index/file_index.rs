@@ -5,6 +5,7 @@
 
 use arc_swap::ArcSwap;
 use ignore::WalkBuilder;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::{Override, OverrideBuilder};
 use notify::{
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -200,6 +201,10 @@ impl Default for FileIndexConfig {
 /// A file system index with automatic updates via file watching.
 pub struct FileIndexWatcher {
     index: Arc<ArcSwap<Option<FileIndex>>>,
+    /// Current gitignore matcher, swapped atomically when .gitignore changes.
+    /// Kept alive here so the Arc isn't dropped; the task holds a clone.
+    #[allow(dead_code)]
+    gitignore: Arc<ArcSwap<Gitignore>>,
     root: PathBuf,
     config: FileIndexConfig,
 
@@ -232,6 +237,7 @@ impl FileIndexWatcher {
         let (changes_tx, _) = broadcast::channel(64);
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(256);
         let overrides = compile_overrides(&root, &config)?;
+        let gitignore = Arc::new(ArcSwap::from_pointee(build_gitignore(&root)));
 
         // Create the file watcher
         let watcher_config = Config::default().with_poll_interval(Duration::from_secs(2));
@@ -256,6 +262,7 @@ impl FileIndexWatcher {
         let root_clone = root.clone();
         let config_clone = config.clone();
         let overrides_clone = overrides.clone();
+        let gitignore_clone_init = gitignore.clone();
         let initial_index = tokio::task::spawn_blocking(move || {
             build_file_index(&root_clone, &config_clone, &overrides_clone)
         })
@@ -274,6 +281,7 @@ impl FileIndexWatcher {
         let root_clone = root.clone();
         let config_clone = config.clone();
         let overrides_clone = overrides.clone();
+        let gitignore_clone = gitignore_clone_init;
 
         let rebuild_handle = tokio::spawn(async move {
             let mut pending_events: Vec<Event> = Vec::new();
@@ -307,14 +315,56 @@ impl FileIndexWatcher {
                     }
                     _ = tokio::time::sleep(debounce_duration) => {
                         if !pending_events.is_empty() && last_rebuild.elapsed() >= rebuild_interval {
+                            // Check if .gitignore itself changed — if so, reload it and
+                            // always do a full rebuild since ignore rules may have changed.
+                            let gitignore_changed = pending_events.iter().any(|e| {
+                                e.paths.iter().any(|p| {
+                                    p.file_name().map(|n| n == ".gitignore").unwrap_or(false)
+                                })
+                            });
+
+                            if gitignore_changed {
+                                log::debug!(
+                                    "FileIndexWatcher: .gitignore changed, reloading patterns"
+                                );
+                                let new_gitignore = build_gitignore(&root_clone);
+                                gitignore_clone.store(Arc::new(new_gitignore));
+                            }
+
+                            // Load the current gitignore (possibly just reloaded)
+                            let current_gitignore = gitignore_clone.load();
+
                             let change_set = process_events(
                                 &pending_events,
                                 &root_clone,
                                 &overrides_clone,
+                                &current_gitignore,
                             );
                             pending_events.clear();
 
-                            if !change_set.changes.is_empty() {
+                            if gitignore_changed {
+                                // Always do a full rebuild when .gitignore changes — previously
+                                // indexed files may now be ignored, or vice versa.
+                                log::debug!(
+                                    "FileIndexWatcher: Performing full rebuild after .gitignore change"
+                                );
+                                let root = root_clone.clone();
+                                let config = config_clone.clone();
+                                let overrides = overrides_clone.clone();
+
+                                if let Ok(Ok(new_index)) = tokio::task::spawn_blocking(move || {
+                                    build_file_index(&root, &config, &overrides)
+                                }).await {
+                                    index_clone.store(Arc::new(Some(new_index.clone())));
+                                    log::debug!(
+                                        "FileIndexWatcher: Broadcasting rebuilt index with {} files after .gitignore change",
+                                        new_index.files.len()
+                                    );
+                                    let _ = index_tx_clone.send(new_index);
+                                }
+
+                                last_rebuild = std::time::Instant::now();
+                            } else if !change_set.changes.is_empty() {
                                 log::debug!(
                                     "FileIndexWatcher: Processing {} file changes",
                                     change_set.changes.len()
@@ -327,6 +377,7 @@ impl FileIndexWatcher {
                                         &root_clone,
                                         &config_clone,
                                         &overrides_clone,
+                                        &current_gitignore,
                                     );
                                     index_clone.store(Arc::new(Some(updated.clone())));
                                     log::debug!(
@@ -363,6 +414,7 @@ impl FileIndexWatcher {
 
         Ok(Self {
             index,
+            gitignore,
             root,
             config,
             index_tx,
@@ -492,7 +544,7 @@ fn build_file_index(
 }
 
 /// Process notify events into a FileChangeSet
-fn process_events(events: &[Event], root: &Path, overrides: &Override) -> FileChangeSet {
+fn process_events(events: &[Event], root: &Path, overrides: &Override, gitignore: &Gitignore) -> FileChangeSet {
     let mut changes = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
     let mut rename_from: Option<PathBuf> = None;
@@ -521,7 +573,7 @@ fn process_events(events: &[Event], root: &Path, overrides: &Override) -> FileCh
                 Err(_) => continue,
             };
 
-            if is_ignored(&relative, is_dir, overrides) {
+            if is_ignored(&relative, is_dir, overrides, gitignore) {
                 continue;
             }
 
@@ -662,8 +714,57 @@ fn normalize_ignore_pattern(pattern: &str) -> String {
     pattern.to_string()
 }
 
-fn is_ignored(relative_path: &str, is_dir: bool, overrides: &Override) -> bool {
-    overrides.matched(relative_path, is_dir).is_ignore()
+/// Build a Gitignore matcher from the .gitignore file at root.
+/// Returns an empty matcher if no .gitignore exists or parsing fails.
+fn build_gitignore(root: &Path) -> Gitignore {
+    let gitignore_path = root.join(".gitignore");
+
+    if !gitignore_path.exists() {
+        log::debug!("FileIndexWatcher: No .gitignore found at {:?}", root);
+        return Gitignore::empty();
+    }
+
+    let mut builder = GitignoreBuilder::new(root);
+    if let Some(err) = builder.add(&gitignore_path) {
+        log::warn!(
+            "FileIndexWatcher: Failed to parse .gitignore at {:?}: {}",
+            gitignore_path,
+            err
+        );
+        return Gitignore::empty();
+    }
+
+    match builder.build() {
+        Ok(gi) => {
+            log::debug!(
+                "FileIndexWatcher: Loaded {} gitignore pattern(s) from {:?}",
+                gi.num_ignores(),
+                gitignore_path
+            );
+            gi
+        }
+        Err(e) => {
+            log::warn!(
+                "FileIndexWatcher: Failed to build gitignore matcher: {}",
+                e
+            );
+            Gitignore::empty()
+        }
+    }
+}
+
+fn is_ignored(relative_path: &str, is_dir: bool, overrides: &Override, gitignore: &Gitignore) -> bool {
+    // Hardcoded overrides take priority
+    if overrides.matched(relative_path, is_dir).is_ignore() {
+        return true;
+    }
+    // Gitignore::matched() needs an absolute path so its internal strip()
+    // can remove the root prefix and leave a clean relative path for glob
+    // matching. matched_path_or_any_parents also handles directory-wide
+    // patterns (e.g. `xcuserdata/`) matching files deep inside that directory.
+    // gitignore.path() returns the directory the .gitignore lives in (= root).
+    let abs_path = gitignore.path().join(relative_path);
+    gitignore.matched_path_or_any_parents(&abs_path, is_dir).is_ignore()
 }
 
 fn apply_changes_to_index(
@@ -672,6 +773,7 @@ fn apply_changes_to_index(
     root: &Path,
     config: &FileIndexConfig,
     overrides: &Override,
+    gitignore: &Gitignore,
 ) -> FileIndex {
     let mut entries: HashMap<String, FileIndexEntry> = current
         .files
@@ -685,7 +787,7 @@ fn apply_changes_to_index(
             Err(_) => continue,
         };
 
-        if relative_path.is_empty() || is_ignored(&relative_path, change.is_dir, overrides) {
+        if relative_path.is_empty() || is_ignored(&relative_path, change.is_dir, overrides, gitignore) {
             continue;
         }
 
@@ -956,8 +1058,9 @@ mod tests {
             ("dist/bundle.js", false),
         ];
 
+        let gitignore = Gitignore::empty();
         for (path, is_dir) in test_paths {
-            let ignored = is_ignored(path, is_dir, &overrides);
+            let ignored = is_ignored(path, is_dir, &overrides, &gitignore);
             println!(
                 "Path: {:<40} is_dir={:<5} ignored={}",
                 path, is_dir, ignored
@@ -991,6 +1094,7 @@ mod tests {
 
         let config = FileIndexConfig::default();
         let overrides = compile_overrides(root, &config).unwrap();
+        let gitignore = Gitignore::empty();
 
         // Simulate file events
         let mut target_event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)));
@@ -1003,7 +1107,7 @@ mod tests {
 
         let events = vec![target_event, src_event];
 
-        let change_set = process_events(&events, root, &overrides);
+        let change_set = process_events(&events, root, &overrides, &gitignore);
 
         println!("Total changes processed: {}", change_set.changes.len());
         for change in &change_set.changes {
@@ -1058,6 +1162,7 @@ mod tests {
             };
 
             let overrides = compile_overrides(root, &config).unwrap();
+            let gitignore = Gitignore::empty();
 
             let test_paths = vec![
                 "target/debug/.fingerprint/lib.rs",
@@ -1066,7 +1171,7 @@ mod tests {
             ];
 
             for path in test_paths {
-                let ignored = is_ignored(path, false, &overrides);
+                let ignored = is_ignored(path, false, &overrides, &gitignore);
                 println!("  {} -> ignored={}", path, ignored);
             }
         }
@@ -1126,8 +1231,9 @@ mod tests {
             ("README.md", false, false),
         ];
 
+        let gitignore = Gitignore::empty();
         for (path, is_dir, should_be_ignored) in test_paths {
-            let ignored = is_ignored(path, is_dir, &overrides);
+            let ignored = is_ignored(path, is_dir, &overrides, &gitignore);
             println!(
                 "Path: {:<40} is_dir={:<5} ignored={:<5} (expected: {})",
                 path, is_dir, ignored, should_be_ignored
@@ -1271,6 +1377,7 @@ mod tests {
 
         let config = FileIndexConfig::default();
         let overrides = compile_overrides(root, &config).unwrap();
+        let gitignore = Gitignore::empty();
 
         // Test all CreateKind variants
         let create_variants = vec![
@@ -1286,7 +1393,7 @@ mod tests {
             let mut event = Event::new(EventKind::Create(create_kind));
             event.paths.push(root.join("test.txt"));
 
-            let change_set = process_events(&[event], root, &overrides);
+            let change_set = process_events(&[event], root, &overrides, &gitignore);
 
             assert_eq!(
                 change_set.changes.len(),
@@ -1323,6 +1430,7 @@ mod tests {
 
         let config = FileIndexConfig::default();
         let overrides = compile_overrides(root, &config).unwrap();
+        let gitignore = Gitignore::empty();
 
         // Test all RemoveKind variants
         let remove_variants = vec![
@@ -1338,7 +1446,7 @@ mod tests {
             let mut event = Event::new(EventKind::Remove(remove_kind));
             event.paths.push(root.join("deleted.txt"));
 
-            let change_set = process_events(&[event], root, &overrides);
+            let change_set = process_events(&[event], root, &overrides, &gitignore);
 
             assert_eq!(
                 change_set.changes.len(),
@@ -1373,11 +1481,12 @@ mod tests {
 
         let config = FileIndexConfig::default();
         let overrides = compile_overrides(root, &config).unwrap();
+        let gitignore = Gitignore::empty();
 
         // Test CreateKind::Folder
         let mut folder_create = Event::new(EventKind::Create(CreateKind::Folder));
         folder_create.paths.push(root.join("test_dir"));
-        let change_set = process_events(&[folder_create], root, &overrides);
+        let change_set = process_events(&[folder_create], root, &overrides, &gitignore);
         assert!(
             change_set.changes[0].is_dir,
             "CreateKind::Folder should set is_dir=true"
@@ -1387,7 +1496,7 @@ mod tests {
         // Test CreateKind::File
         let mut file_create = Event::new(EventKind::Create(CreateKind::File));
         file_create.paths.push(root.join("test_file.txt"));
-        let change_set = process_events(&[file_create], root, &overrides);
+        let change_set = process_events(&[file_create], root, &overrides, &gitignore);
         assert!(
             !change_set.changes[0].is_dir,
             "CreateKind::File should set is_dir=false"
@@ -1397,7 +1506,7 @@ mod tests {
         // Test RemoveKind::Folder
         let mut folder_remove = Event::new(EventKind::Remove(RemoveKind::Folder));
         folder_remove.paths.push(root.join("test_dir"));
-        let change_set = process_events(&[folder_remove], root, &overrides);
+        let change_set = process_events(&[folder_remove], root, &overrides, &gitignore);
         assert!(
             change_set.changes[0].is_dir,
             "RemoveKind::Folder should set is_dir=true"
@@ -1407,7 +1516,7 @@ mod tests {
         // Test RemoveKind::File
         let mut file_remove = Event::new(EventKind::Remove(RemoveKind::File));
         file_remove.paths.push(root.join("test_file.txt"));
-        let change_set = process_events(&[file_remove], root, &overrides);
+        let change_set = process_events(&[file_remove], root, &overrides, &gitignore);
         assert!(
             !change_set.changes[0].is_dir,
             "RemoveKind::File should set is_dir=false"
@@ -1417,7 +1526,7 @@ mod tests {
         // Test CreateKind::Any falls back to filesystem check
         let mut any_create = Event::new(EventKind::Create(CreateKind::Any));
         any_create.paths.push(root.join("test_dir"));
-        let change_set = process_events(&[any_create], root, &overrides);
+        let change_set = process_events(&[any_create], root, &overrides, &gitignore);
         assert!(
             change_set.changes[0].is_dir,
             "CreateKind::Any should detect directory from filesystem"
@@ -1440,6 +1549,7 @@ mod tests {
 
         let config = FileIndexConfig::default();
         let overrides = compile_overrides(root, &config).unwrap();
+        let gitignore = Gitignore::empty();
 
         // Test Case 1: RenameMode::Any for a file that EXISTS (destination of rename)
         println!("Test Case 1: RenameMode::Any for existing file (destination)");
@@ -1449,7 +1559,7 @@ mod tests {
         let mut event_exists = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)));
         event_exists.paths.push(existing_file.clone());
 
-        let change_set = process_events(&[event_exists], root, &overrides);
+        let change_set = process_events(&[event_exists], root, &overrides, &gitignore);
 
         assert_eq!(
             change_set.changes.len(),
@@ -1472,7 +1582,7 @@ mod tests {
         let mut event_not_exists = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)));
         event_not_exists.paths.push(non_existing_file.clone());
 
-        let change_set = process_events(&[event_not_exists], root, &overrides);
+        let change_set = process_events(&[event_not_exists], root, &overrides, &gitignore);
 
         assert_eq!(
             change_set.changes.len(),
@@ -1508,7 +1618,7 @@ mod tests {
         fs::rename(&source_path, &dest_path).unwrap();
 
         // Process both events (as FSEvents would send them)
-        let change_set = process_events(&[source_event, dest_event], root, &overrides);
+        let change_set = process_events(&[source_event, dest_event], root, &overrides, &gitignore);
 
         // Should get 2 changes: one Removed (source), one Created (dest)
         assert_eq!(
@@ -1556,6 +1666,7 @@ mod tests {
 
         let config = FileIndexConfig::default();
         let overrides = compile_overrides(root, &config).unwrap();
+        let gitignore = Gitignore::empty();
 
         // Test with existing file
         let existing_file = root.join("test.txt");
@@ -1564,7 +1675,7 @@ mod tests {
         let mut event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Other)));
         event.paths.push(existing_file.clone());
 
-        let change_set = process_events(&[event], root, &overrides);
+        let change_set = process_events(&[event], root, &overrides, &gitignore);
 
         assert_eq!(
             change_set.changes.len(),
@@ -1578,6 +1689,89 @@ mod tests {
         );
 
         println!("  ✓ RenameMode::Other correctly handled\n");
+    }
+
+    /// Test that .gitignore patterns (including anchored patterns like /.build) are
+    /// respected by process_events via the Gitignore matcher.
+    #[test]
+    fn test_gitignore_patterns_respected_in_process_events() {
+        use notify::event::CreateKind;
+        use notify::{Event, EventKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        println!("\n=== Testing .gitignore Pattern Filtering in process_events ===\n");
+
+        // Write a .gitignore with an anchored pattern (leading / = root-only)
+        fs::write(root.join(".gitignore"), "/.build\n/Packages\nxcuserdata/\n").unwrap();
+
+        // Create the directories so is_dir detection works for Any events
+        fs::create_dir(root.join(".build")).unwrap();
+        fs::create_dir_all(root.join(".build/arm64-apple-macosx/debug")).unwrap();
+        fs::create_dir_all(root.join("xcuserdata/foo.xcuserdatad")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.swift"), "").unwrap();
+
+        let config = FileIndexConfig::default();
+        let overrides = compile_overrides(root, &config).unwrap();
+        let gitignore = build_gitignore(root);
+
+        println!(
+            "Loaded {} gitignore ignore pattern(s)",
+            gitignore.num_ignores()
+        );
+
+        // Events that should be ignored via .gitignore
+        let mut build_event = Event::new(EventKind::Create(CreateKind::File));
+        build_event
+            .paths
+            .push(root.join(".build/arm64-apple-macosx/debug/GRPC.build/foo.d"));
+
+        let mut xcuserdata_event = Event::new(EventKind::Create(CreateKind::File));
+        xcuserdata_event
+            .paths
+            .push(root.join("xcuserdata/foo.xcuserdatad/UserInterfaceState.xcuserstate"));
+
+        // Event that should NOT be ignored
+        let mut src_event = Event::new(EventKind::Create(CreateKind::File));
+        src_event.paths.push(root.join("src/main.swift"));
+
+        let events = vec![build_event, xcuserdata_event, src_event];
+        let change_set = process_events(&events, root, &overrides, &gitignore);
+
+        println!("Changes after filtering:");
+        for change in &change_set.changes {
+            println!("  - {:?}", change.path.strip_prefix(root).unwrap());
+        }
+
+        // .build/** and xcuserdata/** should be filtered by .gitignore
+        let has_build = change_set
+            .changes
+            .iter()
+            .any(|c| c.path.to_string_lossy().contains(".build"));
+        let has_xcuserdata = change_set
+            .changes
+            .iter()
+            .any(|c| c.path.to_string_lossy().contains("xcuserdata"));
+
+        assert!(
+            !has_build,
+            ".build/ events should be filtered by .gitignore /.build pattern"
+        );
+        assert!(
+            !has_xcuserdata,
+            "xcuserdata/ events should be filtered by .gitignore xcuserdata/ pattern"
+        );
+
+        // src/main.swift should pass through
+        let has_src = change_set
+            .changes
+            .iter()
+            .any(|c| c.path.to_string_lossy().contains("src/main.swift"));
+        assert!(has_src, "src/main.swift should NOT be filtered");
+
+        println!("\n.gitignore patterns correctly filter events in process_events");
     }
 
     /// Integration test: Verify file move is detected and index is updated

@@ -198,7 +198,10 @@ pub async fn ensure_session(
         .await;
 
         tokio::spawn(async move {
-            let status = match manager.get_or_create(root.clone()).await {
+            let status = match manager
+                .ask(crate::index::GetOrCreate { root: root.clone() })
+                .await
+            {
                 Ok(_) => {
                     // Subscribe to file index updates for this workspace
                     super::connection::subscribe_to_file_index(

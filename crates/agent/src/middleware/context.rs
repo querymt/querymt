@@ -266,8 +266,8 @@ impl MiddlewareFactory for ContextFactory {
             return Err(anyhow::anyhow!("Middleware disabled"));
         }
 
-        // Read auto_compact from agent config's compaction_config
-        let auto_compact = agent_config.compaction_config.auto;
+        // Read auto_compact from agent config's execution policy
+        let auto_compact = agent_config.execution_policy.compaction.auto;
 
         let context_config = ContextConfig {
             warn_at_percent: cfg.warn_at_percent,

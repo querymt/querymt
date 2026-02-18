@@ -56,5 +56,5 @@ pub use crate::tools::Tool;
 // ACP Server
 pub use crate::acp::AcpTransport;
 
-// Builder trait (for advanced use)
-pub use crate::agent::AgentBuilderExt;
+// Builder (for advanced use)
+pub use crate::agent::AgentConfigBuilder;

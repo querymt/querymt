@@ -15,7 +15,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! qmt-agent = { version = "0.1", features = ["oauth"] }
+//! querymt-agent = { version = "0.1", features = ["oauth"] }
 //! ```
 //!
 //! The OAuth tokens are automatically used when building providers:

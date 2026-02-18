@@ -104,11 +104,16 @@ export function ChatView() {
     rateLimitBySession,
     setRateLimitState,
     clearRateLimitState,
+    compactingBySession,
+    setCompactingState,
     setMainInputRef,
   } = useUiStore();
   
   // Get rate limit state for current session
   const rateLimitState = sessionId ? rateLimitBySession.get(sessionId) : undefined;
+
+  // Get live compaction state for current session
+  const compactingState = sessionId ? compactingBySession.get(sessionId) : undefined;
   
   // Session-scoped thinking state (replaces global thinkingAgentId)
   const sessionThinkingAgentId = useMemo(() => {
@@ -182,6 +187,32 @@ export function ChatView() {
       }
     };
   }, [sessionId, clearRateLimitState]);
+
+  // Process compaction events to drive the live compacting indicator
+  useEffect(() => {
+    if (!sessionId) return;
+    const latestEvent = events[events.length - 1];
+    if (!latestEvent) return;
+    if (latestEvent.compactionTokenEstimate !== undefined && latestEvent.content === 'Context compaction started') {
+      // compaction_start: show live indicator
+      setCompactingState(sessionId, {
+        tokenEstimate: latestEvent.compactionTokenEstimate,
+        startedAt: latestEvent.timestamp,
+      });
+    } else if (latestEvent.compactionSummary !== undefined) {
+      // compaction_end: clear live indicator (compaction card will appear via turn data)
+      setCompactingState(sessionId, null);
+    }
+  }, [events, sessionId, setCompactingState]);
+
+  // Clear compaction state when switching sessions
+  useEffect(() => {
+    return () => {
+      if (sessionId) {
+        setCompactingState(sessionId, null);
+      }
+    };
+  }, [sessionId, setCompactingState]);
 
   // Keyboard shortcuts (Ctrl+X chords, double Esc, etc. moved to AppShell)
 
@@ -260,7 +291,11 @@ export function ChatView() {
     return result;
   }, [events, eventsBySession, mainSessionId, sessionThinkingAgentId]);
   const systemEvents = useMemo(
-    () => events.filter((event: EventItem) => event.type === 'system'),
+    () => events.filter((event: EventItem) =>
+      event.type === 'system' &&
+      !event.compactionTokenEstimate &&  // exclude compaction_start
+      !event.compactionSummary           // exclude compaction_end
+    ),
     [events]
   );
   const [systemClearIndex, setSystemClearIndex] = useState(0);
@@ -704,6 +739,7 @@ export function ChatView() {
               data={filteredTurns}
               itemContent={(index, turn) => {
                 const canUndo = index === undoTurnIndex;
+                const isLastTurn = index === filteredTurns.length - 1;
                 const turnMessageId = turn.userMessage?.messageId;
                 const frontierFrame = undoState?.frontierMessageId
                   ? undoState.stack.find((frame) => frame.messageId === undoState.frontierMessageId)
@@ -741,6 +777,8 @@ export function ChatView() {
                     revertedFiles={revertedFiles}
                     onUndo={() => handleUndo(index)}
                     onRedo={handleRedo}
+                    isCompacting={isLastTurn && !!compactingState}
+                    compactingTokenEstimate={isLastTurn ? compactingState?.tokenEstimate : undefined}
                   />
                 );
               }}

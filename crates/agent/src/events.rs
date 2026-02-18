@@ -92,7 +92,21 @@ pub enum AgentEventKind {
     AssistantMessageStored {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
+    },
+    /// Streaming text delta emitted per token/chunk during streaming.
+    /// Ephemeral — must not be persisted to the event store.
+    AssistantContentDelta {
+        content: String,
+        message_id: String,
+    },
+    /// Streaming thinking/reasoning delta emitted during streaming.
+    /// Ephemeral — must not be persisted to the event store.
+    AssistantThinkingDelta {
+        content: String,
+        message_id: String,
     },
     LlmRequestStart {
         message_count: usize,

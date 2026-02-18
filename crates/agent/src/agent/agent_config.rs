@@ -7,16 +7,17 @@
 use crate::agent::core::{
     AgentMode, DelegationContextConfig, SnapshotPolicy, ToolConfig, ToolPolicy,
 };
-use crate::config::{CompactionConfig, PruningConfig, RateLimitConfig, ToolOutputConfig};
+use crate::config::RuntimeExecutionPolicy;
 use crate::delegation::AgentRegistry;
 use crate::event_bus::EventBus;
-use crate::index::WorkspaceIndexManager;
+use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::{CompositeDriver, MiddlewareDriver};
 use crate::session::compaction::SessionCompaction;
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionExecutionConfig;
 use crate::tools::ToolRegistry;
 use agent_client_protocol::AuthMethod;
+use kameo::actor::ActorRef;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -32,7 +33,7 @@ pub struct AgentConfig {
     pub provider: Arc<SessionProvider>,
     pub event_bus: Arc<EventBus>,
     pub agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
-    pub workspace_index_manager: Arc<WorkspaceIndexManager>,
+    pub workspace_manager_actor: ActorRef<WorkspaceIndexManagerActor>,
 
     // ── Defaults (used when spawning new sessions) ───────────────
     /// Shared live reference to the default agent mode.
@@ -50,11 +51,9 @@ pub struct AgentConfig {
     pub mutating_tools: HashSet<String>,
     pub max_prompt_bytes: Option<usize>,
     pub execution_timeout_secs: u64,
-    pub tool_output_config: ToolOutputConfig,
-    pub pruning_config: PruningConfig,
-    pub compaction_config: CompactionConfig,
+    /// Grouped execution policy: tool output, pruning, compaction, rate limit.
+    pub execution_policy: RuntimeExecutionPolicy,
     pub compaction: SessionCompaction,
-    pub rate_limit_config: RateLimitConfig,
     pub snapshot_backend: Option<Arc<dyn crate::snapshot::SnapshotBackend>>,
     pub snapshot_gc_config: crate::snapshot::GcConfig,
     pub delegation_context_config: DelegationContextConfig,
@@ -149,9 +148,9 @@ impl AgentConfig {
         Arc::new(self.tool_registry.clone())
     }
 
-    /// Access the workspace index manager.
-    pub fn workspace_index_manager(&self) -> Arc<WorkspaceIndexManager> {
-        self.workspace_index_manager.clone()
+    /// Access the workspace manager actor ref.
+    pub fn workspace_manager_actor(&self) -> ActorRef<WorkspaceIndexManagerActor> {
+        self.workspace_manager_actor.clone()
     }
 
     /// Access the pending elicitations map.
@@ -276,10 +275,10 @@ impl AgentConfig {
             max_prompt_bytes: self.max_prompt_bytes,
             execution_timeout_secs: self.execution_timeout_secs,
             snapshot_policy: self.snapshot_policy.to_string(),
-            tool_output_config: self.tool_output_config.clone(),
-            pruning_config: self.pruning_config.clone(),
-            compaction_config: self.compaction_config.clone(),
-            rate_limit_config: self.rate_limit_config.clone(),
+            tool_output_config: self.execution_policy.tool_output.clone(),
+            pruning_config: self.execution_policy.pruning.clone(),
+            compaction_config: self.execution_policy.compaction.clone(),
+            rate_limit_config: self.execution_policy.rate_limit.clone(),
         }
     }
 

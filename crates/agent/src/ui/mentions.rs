@@ -5,13 +5,15 @@
 //! read-style text chunks in the same user turn.
 
 use super::messages::UiPromptBlock;
-use crate::index::{FileIndex, FileIndexEntry, WorkspaceIndexManager, resolve_workspace_root};
+use crate::index::{
+    FileIndex, FileIndexEntry, GetOrCreate, WorkspaceIndexManagerActor, resolve_workspace_root,
+};
 use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_read_output};
 use agent_client_protocol::{ContentBlock, ImageContent, TextContent};
 use base64::Engine;
+use kameo::actor::ActorRef;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// Build prompt content blocks from UI prompt blocks.
 ///
@@ -20,7 +22,7 @@ use std::sync::Arc;
 /// - Then, for each unique ResourceLink path:
 ///   - text or image: resolved resource payload
 pub async fn build_prompt_blocks(
-    workspace_manager: &Arc<WorkspaceIndexManager>,
+    workspace_manager: &ActorRef<WorkspaceIndexManagerActor>,
     cwd: Option<&PathBuf>,
     prompt: &[UiPromptBlock],
 ) -> Vec<ContentBlock> {
@@ -142,15 +144,17 @@ fn normalize_for_index(raw_path: &str) -> String {
 
 /// Build a lookup map from the file index for the current working directory.
 async fn build_file_index_lookup(
-    workspace_manager: &Arc<WorkspaceIndexManager>,
+    workspace_manager: &ActorRef<WorkspaceIndexManagerActor>,
     cwd: &Path,
     root: &Path,
 ) -> Option<HashMap<String, bool>> {
-    let workspace = workspace_manager
-        .get_or_create(root.to_path_buf())
+    let handle = workspace_manager
+        .ask(GetOrCreate {
+            root: root.to_path_buf(),
+        })
         .await
         .ok()?;
-    let index = workspace.file_index()?;
+    let index = handle.file_index()?;
     let relative_cwd = cwd.strip_prefix(root).ok()?;
     let entries = filter_index_for_cwd(&index, relative_cwd);
     let mut lookup = HashMap::new();

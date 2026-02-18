@@ -28,9 +28,9 @@ pub(super) async fn run_pruning(
         .map_err(|e| anyhow::anyhow!("Failed to get agent history: {}", e))?;
 
     let prune_config = crate::session::pruning::PruneConfig {
-        protect_tokens: config.pruning_config.protect_tokens,
-        minimum_tokens: config.pruning_config.minimum_tokens,
-        protected_tools: config.pruning_config.protected_tools.clone(),
+        protect_tokens: config.execution_policy.pruning.protect_tokens,
+        minimum_tokens: config.execution_policy.pruning.minimum_tokens,
+        protected_tools: config.execution_policy.pruning.protected_tools.clone(),
     };
 
     let estimator = crate::session::pruning::SimpleTokenEstimator;
@@ -113,15 +113,16 @@ pub(super) async fn run_ai_compaction(
         .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
 
     let model = config
-        .compaction_config
+        .execution_policy
+        .compaction
         .model
         .as_ref()
         .unwrap_or(&llm_config.model);
 
     let retry_config = crate::session::compaction::RetryConfig {
-        max_retries: config.compaction_config.retry.max_retries,
-        initial_backoff_ms: config.compaction_config.retry.initial_backoff_ms,
-        backoff_multiplier: config.compaction_config.retry.backoff_multiplier,
+        max_retries: config.execution_policy.compaction.retry.max_retries,
+        initial_backoff_ms: config.execution_policy.compaction.retry.initial_backoff_ms,
+        backoff_multiplier: config.execution_policy.compaction.retry.backoff_multiplier,
     };
 
     let result = config

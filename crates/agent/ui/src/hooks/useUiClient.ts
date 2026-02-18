@@ -422,17 +422,89 @@ export function useUiClient() {
         translated.sessionId = msg.session_id;
         translated.seq = msg.event.seq;
 
-        setEventsBySession(prev => {
-          const next = new Map(prev);
-          const existing = next.get(msg.session_id) ?? [];
-          // Dedup: skip if we already have this seq
-          if (existing.length > 0 && translated.seq != null) {
-            const lastSeq = existing[existing.length - 1].seq ?? -1;
-            if (translated.seq <= lastSeq) return prev;
-          }
-          next.set(msg.session_id, [...existing, translated]);
-          return next;
-        });
+        // === STREAMING DELTA MERGE LOGIC ===
+        // Delta events are merged in-place into a single live accumulator rather
+        // than appended as separate list items. This keeps the event list clean
+        // and avoids per-token React re-renders of the full list.
+        if (
+          eventKind === 'assistant_content_delta' ||
+          eventKind === 'assistant_thinking_delta'
+        ) {
+          const messageId = msg.event?.kind?.message_id;
+          setEventsBySession(prev => {
+            const next = new Map(prev);
+            const existing = next.get(msg.session_id) ?? [];
+            // Find the existing live accumulator for this message_id
+            const liveIdx = [...existing].reverse().findIndex(
+              e => e.streamMessageId === messageId && e.isStreamDelta
+            );
+            const realLiveIdx = liveIdx >= 0 ? existing.length - 1 - liveIdx : -1;
+
+            if (realLiveIdx >= 0) {
+              const updated = [...existing];
+              const live = updated[realLiveIdx];
+              if (eventKind === 'assistant_thinking_delta') {
+                updated[realLiveIdx] = {
+                  ...live,
+                  thinking: (live.thinking ?? '') + (translated.thinking ?? ''),
+                };
+              } else {
+                updated[realLiveIdx] = {
+                  ...live,
+                  content: live.content + translated.content,
+                };
+              }
+              next.set(msg.session_id, updated);
+            } else {
+              // First delta for this message — create the live accumulator entry
+              next.set(msg.session_id, [...existing, translated]);
+            }
+            return next;
+          });
+          // Don't fall through to the normal append path
+          break;
+        }
+
+        // === ASSISTANT MESSAGE STORED — replace live accumulator with final message ===
+        if (eventKind === 'assistant_message_stored') {
+          const messageId = msg.event?.kind?.message_id;
+          setEventsBySession(prev => {
+            const next = new Map(prev);
+            const existing = next.get(msg.session_id) ?? [];
+            // Find the live accumulator event for this message_id
+            const liveIdx = [...existing].reverse().findIndex(
+              e => e.streamMessageId === messageId && e.isStreamDelta
+            );
+            const realLiveIdx = liveIdx >= 0 ? existing.length - 1 - liveIdx : -1;
+
+            if (realLiveIdx >= 0) {
+              // Swap live accumulator → final message
+              const updated = [...existing];
+              updated[realLiveIdx] = translated;
+              next.set(msg.session_id, updated);
+            } else {
+              // Non-streaming provider: just append
+              const lastSeq = existing.length > 0 ? (existing[existing.length - 1].seq ?? -1) : -1;
+              if (translated.seq == null || translated.seq > lastSeq) {
+                next.set(msg.session_id, [...existing, translated]);
+              }
+            }
+            return next;
+          });
+          // Still fall through so thinking-state logic below fires
+        } else {
+          setEventsBySession(prev => {
+            const next = new Map(prev);
+            const existing = next.get(msg.session_id) ?? [];
+            // Dedup: skip if we already have this seq
+            if (existing.length > 0 && translated.seq != null) {
+              const lastSeq = existing[existing.length - 1].seq ?? -1;
+              if (translated.seq <= lastSeq) return prev;
+            }
+            next.set(msg.session_id, [...existing, translated]);
+            return next;
+          });
+        }
 
         // Provider/limits updates - only for main session
         if (msg.session_id === mainSessionId) {
@@ -1035,9 +1107,41 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       seq: seq,
       type: 'agent',
       content: event.kind?.content ?? '',
+      thinking: event.kind?.thinking,
       timestamp,
       isMessage: true,
       messageId: event.kind?.message_id,
+      // streamMessageId matches message_id so UI can find and replace the live accumulator
+      streamMessageId: event.kind?.message_id,
+    };
+  }
+
+  if (kind === 'assistant_content_delta') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'agent',
+      content: event.kind?.content ?? '',
+      timestamp,
+      isStreamDelta: true,
+      isThinkingDelta: false,
+      streamMessageId: event.kind?.message_id,
+    };
+  }
+
+  if (kind === 'assistant_thinking_delta') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'agent',
+      content: '',
+      thinking: event.kind?.content ?? '',
+      timestamp,
+      isStreamDelta: true,
+      isThinkingDelta: true,
+      streamMessageId: event.kind?.message_id,
     };
   }
 
@@ -1136,6 +1240,31 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
         requestedSchema: event.kind?.requested_schema,
         source: event.kind?.source ?? 'unknown',
       },
+    };
+  }
+
+  if (kind === 'compaction_start') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'system',
+      content: 'Context compaction started',
+      timestamp,
+      compactionTokenEstimate: event.kind?.token_estimate,
+    };
+  }
+
+  if (kind === 'compaction_end') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'system',
+      content: 'Context compacted',
+      timestamp,
+      compactionSummary: event.kind?.summary,
+      compactionSummaryLen: event.kind?.summary_len,
     };
   }
 

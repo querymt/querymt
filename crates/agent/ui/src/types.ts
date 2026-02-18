@@ -104,6 +104,16 @@ export interface EventItem {
   rateLimitAttempt?: number;
   rateLimitMaxAttempts?: number;
   rateLimitResume?: boolean;  // true for rate_limit_resume event
+  // Compaction event fields
+  compactionTokenEstimate?: number;   // From compaction_start: original context token count
+  compactionSummary?: string;         // From compaction_end: the AI-generated summary
+  compactionSummaryLen?: number;      // From compaction_end: summary length in chars
+  // Thinking/reasoning content (present on final assistant_message_stored if model emitted reasoning)
+  thinking?: string;
+  // Streaming delta fields (set on assistant_content_delta and assistant_thinking_delta events)
+  isStreamDelta?: boolean;    // True while this is a live streaming accumulator
+  isThinkingDelta?: boolean;  // True if accumulating thinking deltas (no text yet)
+  streamMessageId?: string;   // Links delta events to the final message_id for replacement
 }
 
 export interface RateLimitState {
@@ -199,7 +209,9 @@ export interface AgentEvent {
 // AgentEventKind union type
 export type AgentEventKind =
   | { type: 'prompt_received'; content: string }
-  | { type: 'assistant_message_stored'; content: string }
+  | { type: 'assistant_message_stored'; content: string; thinking?: string; message_id?: string }
+  | { type: 'assistant_content_delta'; content: string; message_id: string }   // streaming text delta
+  | { type: 'assistant_thinking_delta'; content: string; message_id: string }  // streaming thinking delta
   | { type: 'tool_call_start'; tool_call_id: string; tool_name: string; arguments?: string }
   | { type: 'tool_call_end'; tool_call_id: string; tool_name: string; result?: string; is_error?: boolean }
   | { type: 'error'; message: string }
@@ -302,6 +314,14 @@ export interface DelegationGroupInfo {
   endTime?: number;
 }
 
+// Compaction data attached to a turn
+export interface TurnCompaction {
+  tokenEstimate: number;  // Original context token count before compaction
+  summary: string;        // The AI-generated compaction summary
+  summaryLen: number;     // Summary length in chars
+  timestamp: number;      // When compaction completed
+}
+
 // Turn-based grouping for conversation display
 export interface Turn {
   id: string;
@@ -316,6 +336,8 @@ export interface Turn {
   // Model info for this turn (from most recent provider_changed before/during turn)
   modelLabel?: string; // "provider / model" format
   modelConfigId?: number; // LLM config ID for fetching params
+  /** Compaction that occurred after this turn (between this turn and the next) */
+  compaction?: TurnCompaction;
 }
 
 export interface UndoStackFrame {

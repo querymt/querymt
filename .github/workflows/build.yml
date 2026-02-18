@@ -41,14 +41,14 @@ jobs:
             binary: coder_agent
             bin_name: coder_agent
             archive_ext: tar.gz
-            cargo_package: qmt-agent
+            cargo_package: querymt-agent
             cargo_features: oauth,dashboard
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             binary: coder_agent
             bin_name: coder_agent
             archive_ext: tar.gz
-            cargo_package: qmt-agent
+            cargo_package: querymt-agent
             cargo_features: oauth,dashboard
 
           # ─── macOS ─────────────────────────────────────────────────────────
@@ -67,14 +67,14 @@ jobs:
             binary: coder_agent
             bin_name: coder_agent
             archive_ext: tar.gz
-            cargo_package: qmt-agent
+            cargo_package: querymt-agent
             cargo_features: oauth,dashboard
           - os: macos-14
             target: aarch64-apple-darwin
             binary: coder_agent
             bin_name: coder_agent
             archive_ext: tar.gz
-            cargo_package: qmt-agent
+            cargo_package: querymt-agent
             cargo_features: oauth,dashboard
 
           # ─── Windows (Static CRT) ────────────────────────────────────────
@@ -95,7 +95,7 @@ jobs:
             binary: coder_agent
             bin_name: coder_agent.exe
             archive_ext: zip
-            cargo_package: qmt-agent
+            cargo_package: querymt-agent
             cargo_features: oauth,dashboard
             rust_flags: "-C target-feature=+crt-static"
           - os: windows-latest
@@ -103,7 +103,7 @@ jobs:
             binary: coder_agent
             bin_name: coder_agent.exe
             archive_ext: zip
-            cargo_package: qmt-agent
+            cargo_package: querymt-agent
             cargo_features: oauth,dashboard
             rust_flags: "-C target-feature=+crt-static"
 

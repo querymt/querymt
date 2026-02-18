@@ -5,11 +5,11 @@ use crate::agent::core::{
 };
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
-use crate::config::{PruningConfig, RateLimitConfig, ToolOutputConfig};
+use crate::config::RuntimeExecutionPolicy;
 use crate::delegation::{AgentInfo, DefaultAgentRegistry, DelegationOrchestrator};
 use crate::event_bus::EventBus;
 use crate::events::StopType;
-use crate::index::{WorkspaceIndexManager, WorkspaceIndexManagerConfig};
+use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
 use crate::middleware::{
     AgentStats, ConversationContext, DelegationGuardMiddleware, ExecutionState, LlmResponse,
     MiddlewareDriver,
@@ -287,9 +287,9 @@ impl TestHarness {
             provider: provider_context,
             event_bus: event_bus.clone(),
             agent_registry: agent_registry.clone(),
-            workspace_index_manager: Arc::new(WorkspaceIndexManager::new(
+            workspace_manager_actor: WorkspaceIndexManagerActor::new(
                 WorkspaceIndexManagerConfig::default(),
-            )),
+            ),
             default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
             tool_config: ToolConfig {
                 policy: ToolPolicy::ProviderOnly,
@@ -304,11 +304,8 @@ impl TestHarness {
             mutating_tools: HashSet::new(),
             max_prompt_bytes: None,
             execution_timeout_secs: 300,
-            tool_output_config: ToolOutputConfig::default(),
-            pruning_config: PruningConfig::default(),
-            compaction_config: crate::config::CompactionConfig::default(),
+            execution_policy: RuntimeExecutionPolicy::default(),
             compaction: crate::session::compaction::SessionCompaction::new(),
-            rate_limit_config: RateLimitConfig::default(),
             snapshot_backend: None,
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
             delegation_context_config: DelegationContextConfig {
@@ -318,12 +315,9 @@ impl TestHarness {
             pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
         });
 
-        // Create a KameoSendAgent wrapping a SessionRegistry for delegation
-        let kameo_registry = Arc::new(Mutex::new(crate::agent::SessionRegistry::new(
-            config.clone(),
-        )));
+        // Create an AgentHandle for delegation (wraps its own SessionRegistry)
         let delegator: Arc<dyn SendAgent> =
-            Arc::new(crate::send_agent::KameoSendAgent::new(kameo_registry));
+            Arc::new(crate::agent::AgentHandle::from_config(config.clone()));
 
         let orchestrator = Arc::new(DelegationOrchestrator::new(
             delegator,
@@ -336,18 +330,12 @@ impl TestHarness {
         config.add_observer(orchestrator);
 
         // Create a SessionRuntime for the execution context
-        let session_runtime = Arc::new(crate::agent::core::SessionRuntime {
-            cwd: None,
-            _mcp_services: HashMap::new(),
-            mcp_tools: HashMap::new(),
-            mcp_tool_defs: Vec::new(),
-            permission_cache: StdMutex::new(HashMap::new()),
-            current_tools_hash: StdMutex::new(None),
-            function_index: Arc::new(tokio::sync::OnceCell::new()),
-            turn_snapshot: StdMutex::new(None),
-            turn_diffs: StdMutex::new(Default::default()),
-            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
+        let session_runtime = crate::agent::core::SessionRuntime::new(
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+        );
 
         let session_id = "sess-test".to_string();
         let exec_ctx = ExecutionContext::new(session_id, session_runtime, runtime_context, context);

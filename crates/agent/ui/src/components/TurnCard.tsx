@@ -3,12 +3,13 @@
  */
 
 import { useRef, useEffect, useState, memo } from 'react';
-import { Turn, UiAgentInfo, EventRow, DelegationGroupInfo, LlmConfigDetails } from '../types';
+import { Turn, UiAgentInfo, EventRow, DelegationGroupInfo, LlmConfigDetails, TurnCompaction } from '../types';
 import { MessageContent } from './MessageContent';
 import { ActivitySection } from './ActivitySection';
 import { PinnedUserMessage } from './PinnedUserMessage';
 import { ModelConfigPopover } from './ModelConfigPopover';
 import { ElicitationCard } from './ElicitationCard';
+import { CompactionCard, CompactingIndicator } from './CompactionCard';
 import { getAgentShortName } from '../utils/agentNames';
 import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
@@ -31,6 +32,8 @@ export interface TurnCardProps {
   isStackedUndone?: boolean; // This turn is undone but blocked by newer undo frames
   revertedFiles?: string[]; // Files that were reverted for the top confirmed frame
   canUndo?: boolean; // Whether undo button should be shown
+  isCompacting?: boolean; // Compaction is currently running after this turn
+  compactingTokenEstimate?: number; // Estimated tokens being compacted (for live indicator)
 }
 
 // Interleaved event item types
@@ -45,51 +48,69 @@ interface InterleavedActivity {
   delegations: DelegationGroupInfo[];
 }
 
-type InterleavedItem = InterleavedMessage | InterleavedActivity;
+interface InterleavedCompaction {
+  type: 'compaction';
+  compaction: TurnCompaction;
+}
+
+type InterleavedItem = InterleavedMessage | InterleavedActivity | InterleavedCompaction;
 
 /**
- * Interleave agent messages and tool calls chronologically
+ * Interleave agent messages, tool calls, and an optional compaction chronologically
  */
 function interleaveEvents(
   messages: EventRow[],
   toolCalls: EventRow[],
-  delegations: DelegationGroupInfo[]
+  delegations: DelegationGroupInfo[],
+  compaction?: TurnCompaction
 ): InterleavedItem[] {
   // Combine all events with type tags
-  const combined: Array<{ event: EventRow; isMessage: boolean }> = [
-    ...messages.map(e => ({ event: e, isMessage: true })),
-    ...toolCalls.map(e => ({ event: e, isMessage: false })),
+  type CombinedItem =
+    | { kind: 'message'; event: EventRow }
+    | { kind: 'tool'; event: EventRow }
+    | { kind: 'compaction'; compaction: TurnCompaction };
+
+  const combined: CombinedItem[] = [
+    ...messages.map(e => ({ kind: 'message' as const, event: e })),
+    ...toolCalls.map(e => ({ kind: 'tool' as const, event: e })),
+    ...(compaction ? [{ kind: 'compaction' as const, compaction }] : []),
   ];
 
   // Sort by timestamp
-  combined.sort((a, b) => a.event.timestamp - b.event.timestamp);
+  combined.sort((a, b) => {
+    const ta = a.kind === 'compaction' ? a.compaction.timestamp : a.event.timestamp;
+    const tb = b.kind === 'compaction' ? b.compaction.timestamp : b.event.timestamp;
+    return ta - tb;
+  });
 
-  // Group consecutive tool calls into activity blocks
+  // Group consecutive tool calls into activity blocks; insert compaction inline
   const result: InterleavedItem[] = [];
   let currentActivityBlock: EventRow[] = [];
   let currentActivityDelegations: DelegationGroupInfo[] = [];
 
-  for (const item of combined) {
-    if (item.isMessage) {
-      // Flush any pending activity block
-      if (currentActivityBlock.length > 0) {
-        result.push({
-          type: 'activity',
-          events: currentActivityBlock,
-          delegations: currentActivityDelegations,
-        });
-        currentActivityBlock = [];
-        currentActivityDelegations = [];
-      }
-      // Add message
+  const flushActivity = () => {
+    if (currentActivityBlock.length > 0) {
       result.push({
-        type: 'message',
-        event: item.event,
+        type: 'activity',
+        events: currentActivityBlock,
+        delegations: currentActivityDelegations,
       });
+      currentActivityBlock = [];
+      currentActivityDelegations = [];
+    }
+  };
+
+  for (const item of combined) {
+    if (item.kind === 'compaction') {
+      flushActivity();
+      result.push({ type: 'compaction', compaction: item.compaction });
+    } else if (item.kind === 'message') {
+      flushActivity();
+      result.push({ type: 'message', event: item.event });
     } else {
-      // Add to activity block
+      // tool — add to activity block
       currentActivityBlock.push(item.event);
-      
+
       // Find matching delegation for this tool call
       if (item.event.isDelegateToolCall && item.event.delegationGroupId) {
         const delegation = delegations.find(d => d.id === item.event.delegationGroupId);
@@ -100,14 +121,7 @@ function interleaveEvents(
     }
   }
 
-  // Flush final activity block
-  if (currentActivityBlock.length > 0) {
-    result.push({
-      type: 'activity',
-      events: currentActivityBlock,
-      delegations: currentActivityDelegations,
-    });
-  }
+  flushActivity();
 
   return result;
 }
@@ -129,14 +143,21 @@ export const TurnCard = memo(function TurnCard({
   isStackedUndone = false,
   revertedFiles = [],
   canUndo = false,
+  isCompacting = false,
+  compactingTokenEstimate,
 }: TurnCardProps) {
   const agentName = turn.agentId ? getAgentShortName(turn.agentId, agents) : 'Agent';
   const agentColor = turn.agentId ? getAgentColor(turn.agentId) : undefined;
   const hasUndoOverlay = isUndone || isUndoPending || isStackedUndone;
   const canShowUndoButton = !!onUndo && canUndo && !turn.isActive && !hasUndoOverlay;
 
-  // Interleave messages and tool calls chronologically
-  const interleaved = interleaveEvents(turn.agentMessages, turn.toolCalls, turn.delegations);
+  // Interleave messages, tool calls, and compaction chronologically
+  const interleaved = interleaveEvents(
+    turn.agentMessages,
+    turn.toolCalls,
+    turn.delegations,
+    isCompacting ? undefined : turn.compaction, // compaction goes inline once complete
+  );
 
   // Track pinned state for last user message
   const userMessageRef = useRef<HTMLDivElement>(null);
@@ -300,8 +321,42 @@ export const TurnCard = memo(function TurnCard({
                           <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-accent-primary" />
                         )}
                       </button>
+
+                      {/* Thinking block — collapsed by default, open while actively streaming */}
+                      {item.event.thinking && !item.event.isStreamDelta && (
+                        <details
+                          open={turn.isActive || undefined}
+                          className="mb-2 group/thinking"
+                        >
+                          <summary className="cursor-pointer select-none text-xs text-ui-muted/60 uppercase tracking-widest mb-1 list-none flex items-center gap-1.5">
+                            <span className="inline-block w-2 h-2 rounded-full bg-accent-tertiary/50" />
+                            Thinking
+                          </summary>
+                          <div className="text-sm text-ui-muted/70 bg-surface-canvas/30 rounded px-3 py-2 border-l-2 border-accent-tertiary/30 mt-1">
+                            <MessageContent content={item.event.thinking} />
+                          </div>
+                        </details>
+                      )}
+
+                      {/* Live thinking accumulator (thinking streaming in, no final text yet) */}
+                      {item.event.isStreamDelta && item.event.isThinkingDelta && item.event.thinking && (
+                        <div className="text-sm text-ui-muted/70 bg-surface-canvas/30 rounded px-3 py-2 border-l-2 border-accent-tertiary/30 mb-2">
+                          <MessageContent content={item.event.thinking} />
+                        </div>
+                      )}
+
                       <MessageContent content={item.event.content} />
                     </div>
+                  );
+                } else if (item.type === 'compaction') {
+                  return (
+                    <CompactionCard
+                      key={`compaction-${item.compaction.timestamp}`}
+                      tokenEstimate={item.compaction.tokenEstimate}
+                      summary={item.compaction.summary}
+                      summaryLen={item.compaction.summaryLen}
+                      timestamp={item.compaction.timestamp}
+                    />
                   );
                 } else {
                   return (
@@ -404,6 +459,11 @@ export const TurnCard = memo(function TurnCard({
               <span>Undo</span>
             </button>
           </div>
+        )}
+
+        {/* Live compacting indicator - shown while compaction is running (always at the end) */}
+        {isCompacting && (
+          <CompactingIndicator tokenEstimate={compactingTokenEstimate} />
         )}
       </div>
     </div>

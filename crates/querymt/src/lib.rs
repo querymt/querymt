@@ -204,6 +204,7 @@ pub struct FunctionCall {
 pub struct Usage {
     /// Number of input tokens.
     #[serde(
+        default,
         alias = "prompt_tokens",     // OpenAI, xAI, DeepSeek, Mistral, OpenRouter, Alibaba
         alias = "input_tokens",      // Anthropic
         alias = "prompt_eval_count", // Ollama
@@ -212,6 +213,7 @@ pub struct Usage {
     pub input_tokens: u32,
     /// Number of output tokens.
     #[serde(
+        default,
         alias = "completion_tokens",   // OpenAI, xAI, DeepSeek, Mistral, OpenRouter, Alibaba
         alias = "output_tokens",       // Anthropic
         alias = "eval_count",          // Ollama
@@ -230,6 +232,87 @@ pub struct Usage {
     /// Tokens used to create a new cache entry.
     #[serde(default, alias = "cache_creation_input_tokens")]
     pub cache_write: u32,
+}
+
+impl Usage {
+    /// Merge two `Usage` values by taking the field-wise maximum.
+    ///
+    /// This is the correct strategy when a provider splits usage across multiple
+    /// streaming events (e.g. Anthropic sends `input_tokens` in `message_start`
+    /// and cumulative `output_tokens` in `message_delta`).  Taking the max of
+    /// each field preserves whichever event carried the authoritative value for
+    /// that field.
+    pub fn merge_max(self, other: Usage) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens.max(other.input_tokens),
+            output_tokens: self.output_tokens.max(other.output_tokens),
+            reasoning_tokens: self.reasoning_tokens.max(other.reasoning_tokens),
+            cache_read: self.cache_read.max(other.cache_read),
+            cache_write: self.cache_write.max(other.cache_write),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_max_combines_split_anthropic_usage() {
+        // Simulates Anthropic's two-event streaming usage:
+        //   message_start  → input_tokens present, output_tokens is a placeholder (1)
+        //   message_delta  → input_tokens absent (0 by serde default), output_tokens is final
+        let from_message_start = Usage {
+            input_tokens: 25,
+            output_tokens: 1,
+            cache_read: 100,
+            cache_write: 50,
+            reasoning_tokens: 0,
+        };
+        let from_message_delta = Usage {
+            input_tokens: 0,   // absent in JSON, defaults to 0
+            output_tokens: 15, // cumulative final value
+            cache_read: 0,
+            cache_write: 0,
+            reasoning_tokens: 0,
+        };
+
+        let merged = from_message_start.merge_max(from_message_delta);
+
+        assert_eq!(merged.input_tokens, 25); // preserved from message_start
+        assert_eq!(merged.output_tokens, 15); // taken from message_delta (cumulative)
+        assert_eq!(merged.cache_read, 100); // preserved from message_start
+        assert_eq!(merged.cache_write, 50); // preserved from message_start
+        assert_eq!(merged.reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn test_merge_max_single_event_is_identity() {
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read: 5,
+            cache_write: 3,
+            reasoning_tokens: 7,
+        };
+        let merged = usage.clone().merge_max(Usage::default());
+        assert_eq!(merged, usage);
+    }
+
+    #[test]
+    fn test_merge_max_is_commutative_when_fields_dont_overlap() {
+        let a = Usage {
+            input_tokens: 25,
+            output_tokens: 1,
+            ..Usage::default()
+        };
+        let b = Usage {
+            input_tokens: 0,
+            output_tokens: 15,
+            ..Usage::default()
+        };
+        assert_eq!(a.clone().merge_max(b.clone()), b.merge_max(a));
+    }
 }
 
 // NOTE: We need this part to be a macro instead two separate function for specific implementations

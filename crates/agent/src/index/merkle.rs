@@ -2,6 +2,7 @@ use crate::hash::RapidHash;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Represents the file paths that changed between two snapshots
@@ -56,11 +57,23 @@ impl DiffPaths {
 pub struct MerkleTree {
     pub root_hash: RapidHash,
     pub entries: HashMap<PathBuf, RapidHash>,
+    pub metadata: HashMap<PathBuf, FileFingerprint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileFingerprint {
+    pub size: u64,
+    pub modified_ns: u128,
 }
 
 impl MerkleTree {
     pub fn scan(root: &Path) -> Self {
+        Self::scan_with_previous(root, None)
+    }
+
+    pub fn scan_with_previous(root: &Path, previous: Option<&MerkleTree>) -> Self {
         let mut entries = HashMap::new();
+        let mut metadata = HashMap::new();
         let mut combined = Vec::new(); // For computing deterministic root hash
 
         // Collect paths first to sort them (deterministic order)
@@ -76,28 +89,81 @@ impl MerkleTree {
         {
             match result {
                 Ok(entry) => {
-                    if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                        paths.push(entry.into_path());
+                    if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                        && let Ok(file_meta) = entry.metadata()
+                    {
+                        let modified_ns = file_meta
+                            .modified()
+                            .ok()
+                            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|duration| duration.as_nanos())
+                            .unwrap_or(0);
+                        paths.push((
+                            entry.into_path(),
+                            FileFingerprint {
+                                size: file_meta.len(),
+                                modified_ns,
+                            },
+                        ));
                     }
                 }
                 Err(_) => continue,
             }
         }
-        paths.sort();
+        paths.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for path in paths {
-            if let Ok(content) = std::fs::read(&path) {
-                let hash = RapidHash::new(&content);
-                // Accumulate path + hash bytes for root hash computation
-                combined.extend_from_slice(path.to_string_lossy().as_bytes());
-                combined.extend_from_slice(&hash.as_u64().to_le_bytes());
-                entries.insert(path, hash);
-            }
+        let mut file_buf = Vec::new();
+
+        for (path, file_meta) in paths {
+            let hash = if let Some(previous_tree) = previous {
+                if let (Some(prev_meta), Some(prev_hash)) = (
+                    previous_tree.metadata.get(&path),
+                    previous_tree.entries.get(&path),
+                ) {
+                    if prev_meta == &file_meta {
+                        *prev_hash
+                    } else if let Ok(mut file) = std::fs::File::open(&path) {
+                        file_buf.clear();
+                        if file.read_to_end(&mut file_buf).is_ok() {
+                            RapidHash::new(&file_buf)
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                } else if let Ok(mut file) = std::fs::File::open(&path) {
+                    file_buf.clear();
+                    if file.read_to_end(&mut file_buf).is_ok() {
+                        RapidHash::new(&file_buf)
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            } else if let Ok(mut file) = std::fs::File::open(&path) {
+                file_buf.clear();
+                if file.read_to_end(&mut file_buf).is_ok() {
+                    RapidHash::new(&file_buf)
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+
+            // Accumulate path + hash bytes for root hash computation
+            combined.extend_from_slice(path.to_string_lossy().as_bytes());
+            combined.extend_from_slice(&hash.as_u64().to_le_bytes());
+            metadata.insert(path.clone(), file_meta);
+            entries.insert(path, hash);
         }
 
         Self {
             root_hash: RapidHash::new(&combined),
             entries,
+            metadata,
         }
     }
 
@@ -141,5 +207,42 @@ impl MerkleTree {
             modified,
             removed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MerkleTree;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn scan_with_previous_detects_changes() {
+        let dir = TempDir::new().expect("tempdir");
+        let file = dir.path().join("a.txt");
+
+        fs::write(&file, "one").expect("write one");
+        let pre = MerkleTree::scan(dir.path());
+
+        fs::write(&file, "two").expect("write two");
+        let post = MerkleTree::scan_with_previous(dir.path(), Some(&pre));
+        let diff = post.diff_paths(&pre);
+
+        assert_eq!(diff.modified.len(), 1);
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn scan_with_previous_handles_unchanged_files() {
+        let dir = TempDir::new().expect("tempdir");
+        let file = dir.path().join("same.txt");
+
+        fs::write(&file, "constant").expect("write constant");
+        let pre = MerkleTree::scan(dir.path());
+        let post = MerkleTree::scan_with_previous(dir.path(), Some(&pre));
+        let diff = post.diff_paths(&pre);
+
+        assert!(diff.is_empty());
     }
 }

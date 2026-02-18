@@ -158,9 +158,13 @@ pub(crate) async fn undo_impl(
             if let MessagePart::TurnSnapshotPatch { snapshot_id, .. } = part {
                 debug!("Undo: fallback restore to snapshot {}", snapshot_id);
                 let current_snapshot = backend.track(worktree).await?;
-                let changed = backend.diff(worktree, &current_snapshot, snapshot_id).await?;
+                let changed = backend
+                    .diff(worktree, &current_snapshot, snapshot_id)
+                    .await?;
                 if !changed.is_empty() {
-                    backend.restore_paths(worktree, snapshot_id, &changed).await?;
+                    backend
+                        .restore_paths(worktree, snapshot_id, &changed)
+                        .await?;
                     all_reverted_files
                         .extend(changed.iter().map(|p| p.to_string_lossy().to_string()));
                 }

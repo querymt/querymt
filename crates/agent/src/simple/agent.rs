@@ -8,12 +8,9 @@ use crate::acp::AcpTransport;
 use crate::acp::stdio::serve_stdio;
 use crate::acp::websocket::serve_websocket;
 use crate::agent::AgentHandle;
-use crate::agent::builder::AgentBuilderExt;
-use crate::agent::core::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
-use crate::config::{
-    CompactionConfig, MiddlewareEntry, PruningConfig, RateLimitConfig, SingleAgentConfig,
-    SkillsConfig, SnapshotBackendConfig, ToolOutputConfig,
-};
+use crate::agent::agent_config_builder::AgentConfigBuilder;
+use crate::agent::core::{SnapshotPolicy, ToolPolicy};
+use crate::config::{ExecutionPolicy, MiddlewareEntry, SingleAgentConfig, SkillsConfig};
 use crate::events::AgentEvent;
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
 use crate::runner::{ChatRunner, ChatSession};
@@ -40,13 +37,11 @@ pub struct AgentBuilder {
     pub(super) cwd: Option<PathBuf>,
     pub(super) snapshot_policy: SnapshotPolicy,
     pub(super) db_path: Option<PathBuf>,
+    assume_mutating: Option<bool>,
+    mutating_tools: Option<Vec<String>>,
     middleware_factories: Vec<MiddlewareFactory>,
     middleware_entries: Vec<MiddlewareEntry>,
-    tool_output_config: Option<ToolOutputConfig>,
-    pruning_config: Option<PruningConfig>,
-    compaction_config: Option<CompactionConfig>,
-    snapshot_backend_config: Option<SnapshotBackendConfig>,
-    rate_limit_config: Option<RateLimitConfig>,
+    execution: Option<ExecutionPolicy>,
     skills_config: Option<SkillsConfig>,
 }
 
@@ -64,13 +59,11 @@ impl AgentBuilder {
             cwd: None,
             snapshot_policy: SnapshotPolicy::Diff,
             db_path: None,
+            assume_mutating: None,
+            mutating_tools: None,
             middleware_factories: Vec::new(),
             middleware_entries: Vec::new(),
-            tool_output_config: None,
-            pruning_config: None,
-            compaction_config: None,
-            snapshot_backend_config: None,
-            rate_limit_config: None,
+            execution: None,
             skills_config: None,
         }
     }
@@ -126,8 +119,10 @@ impl AgentBuilder {
     }
 
     /// Configure rate limit retry behavior
-    pub fn rate_limit_config(mut self, config: RateLimitConfig) -> Self {
-        self.rate_limit_config = Some(config);
+    pub fn rate_limit_config(mut self, config: crate::config::RateLimitConfig) -> Self {
+        self.execution
+            .get_or_insert_with(ExecutionPolicy::default)
+            .rate_limit = config;
         self
     }
 
@@ -188,13 +183,23 @@ impl AgentBuilder {
             .llm_config
             .ok_or_else(|| anyhow!("LLM configuration is required (call .provider() first)"))?;
 
-        let registry = Arc::new(default_registry().await?);
+        let plugin_registry = Arc::new(default_registry().await?);
         let backend =
             SqliteStorage::connect(self.db_path.unwrap_or_else(|| PathBuf::from(":memory:")))
                 .await?;
-        let mut agent = QueryMTAgent::new(registry, backend.session_store(), llm_config)
-            .with_snapshot_policy(snapshot_policy);
-        agent.add_observer(backend.event_observer());
+
+        let mut builder =
+            AgentConfigBuilder::new(plugin_registry, backend.session_store(), llm_config)
+                .with_snapshot_policy(snapshot_policy);
+
+        if let Some(assume_mutating) = self.assume_mutating {
+            builder = builder.with_assume_mutating(assume_mutating);
+        }
+        if let Some(mutating_tools) = self.mutating_tools {
+            builder = builder.with_mutating_tools(mutating_tools);
+        }
+
+        builder.add_observer(backend.event_observer());
 
         // Initialize skills system if enabled
         if let Some(skills_config) = self.skills_config {
@@ -202,41 +207,32 @@ impl AgentBuilder {
                 use crate::skills::{SkillRegistry, SkillTool, default_search_paths};
                 use std::sync::Mutex;
 
-                // Determine project root for skill discovery
                 let project_root = cwd.as_deref().unwrap_or_else(|| std::path::Path::new("."));
-
-                // Build search paths from defaults + config
                 let mut search_paths = default_search_paths(project_root);
-
-                // Add custom configured paths with highest priority
                 for custom_path in &skills_config.paths {
                     search_paths.push(crate::skills::types::SkillSource::Configured(
                         custom_path.clone(),
                     ));
                 }
 
-                // Create registry and discover skills
                 let mut skill_registry = SkillRegistry::new();
                 match skill_registry
                     .load_from_sources(&search_paths, skills_config.include_external)
                 {
                     Ok(count) => {
                         if count > 0 {
-                            // Get compatible skill names for logging
                             let compatible_skills =
                                 skill_registry.compatible_with(&skills_config.agent_id);
                             let compatible_names: Vec<_> = compatible_skills
                                 .iter()
                                 .map(|s| s.metadata.name.clone())
                                 .collect();
-
                             log::info!(
                                 "Skills system initialized: {} skills discovered, {} compatible with agent '{}'",
                                 count,
                                 compatible_names.len(),
                                 skills_config.agent_id
                             );
-
                             if !compatible_names.is_empty() {
                                 log::debug!("Compatible skills: {}", compatible_names.join(", "));
                             }
@@ -255,81 +251,42 @@ impl AgentBuilder {
                     }
                 }
 
-                // Always register the skill tool, even if no skills are discovered yet
-                // This allows the agent to use the tool, and skills can be added later
                 let registry_arc = Arc::new(Mutex::new(skill_registry));
                 let skill_tool = SkillTool::new(
                     registry_arc,
                     Some(skills_config.agent_id.clone()),
                     Arc::new(skills_config.permissions.clone()),
                 );
-
-                agent
-                    .tool_registry
-                    .lock()
-                    .unwrap()
-                    .add(Arc::new(skill_tool));
+                builder.tool_registry_mut().add(Arc::new(skill_tool));
             } else {
                 log::debug!("Skills system disabled in configuration");
             }
         }
 
         if !self.tools.is_empty() {
-            agent = agent
+            builder = builder
                 .with_tool_policy(ToolPolicy::BuiltInOnly)
                 .with_allowed_tools(self.tools.clone());
         }
 
-        // Thread through config fields that were previously silently dropped
-        if let Some(config) = self.tool_output_config {
-            agent = agent.with_tool_output_config(config);
-        }
-        if let Some(config) = self.pruning_config {
-            agent = agent.with_pruning_config(config);
-        }
-        if let Some(config) = self.compaction_config {
-            agent = agent.with_compaction_config(config);
-        }
-        if let Some(config) = self.rate_limit_config {
-            agent = agent.with_rate_limit_config(config);
-        }
-
-        // Handle snapshot backend from config
-        if let Some(snapshot_config) = self.snapshot_backend_config {
-            match snapshot_config.backend.as_str() {
+        if let Some(exec) = self.execution {
+            use crate::config::RuntimeExecutionPolicy;
+            builder = builder.with_execution_policy(RuntimeExecutionPolicy::from(&exec));
+            match exec.snapshot.backend.as_str() {
                 "git" => {
                     use crate::snapshot::git::GitSnapshotBackend;
-                    agent = agent.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+                    builder = builder.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
                 }
-                "none" | "" => {
-                    // No backend - leave as default
-                }
+                "none" | "" => {}
                 other => {
                     log::warn!("Unknown snapshot backend '{}', ignoring", other);
                 }
             }
         }
 
-        // Build AgentConfig first without middleware
-        let config = agent.agent_config();
-
-        // Build a temporary AgentHandle for middleware factories
-        // The registry will be rebuilt later with the final middleware list
-        let temp_registry = agent.kameo_registry();
-        let temp_handle = Arc::new(AgentHandle {
-            config: config.clone(),
-            registry: temp_registry.clone(),
-            client_state: agent.client_state.clone(),
-            client: agent.client.clone(),
-            bridge: agent.bridge.clone(),
-            default_mode: std::sync::Mutex::new(
-                agent
-                    .default_mode
-                    .lock()
-                    .map(|m| *m)
-                    .unwrap_or(crate::agent::core::AgentMode::Build),
-            ),
-        });
+        // Build initial config for middleware factories (temporary handle)
+        let initial_config = Arc::new(builder.build());
+        let temp_handle = Arc::new(AgentHandle::from_config(initial_config.clone()));
 
         // Apply middleware factories - each factory receives the handle
         let mut middleware_drivers: Vec<Arc<dyn MiddlewareDriver>> = Vec::new();
@@ -340,12 +297,12 @@ impl AgentBuilder {
 
         // Apply config-based middleware entries
         for entry in &self.middleware_entries {
-            match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &config) {
+            match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &initial_config)
+            {
                 Ok(middleware) => {
                     middleware_drivers.push(middleware);
                 }
                 Err(e) => {
-                    // Skip if middleware is disabled, otherwise fail
                     let msg = e.to_string();
                     if !msg.contains("disabled") {
                         return Err(anyhow!(
@@ -359,67 +316,44 @@ impl AgentBuilder {
         }
 
         // Auto-add ContextMiddleware if compaction.auto is true and user didn't provide one
-        if agent.compaction_config.auto {
+        if initial_config.execution_policy.compaction.auto {
             let already_has = middleware_drivers
                 .iter()
                 .any(|d| d.name() == "ContextMiddleware");
             if !already_has {
                 log::info!("Auto-enabling ContextMiddleware for compaction");
-                let context_middleware = crate::middleware::ContextMiddleware::new(
+                middleware_drivers.push(Arc::new(crate::middleware::ContextMiddleware::new(
                     crate::middleware::ContextConfig::default().auto_compact(true),
-                );
-                middleware_drivers.push(Arc::new(context_middleware));
+                )));
             }
         }
 
-        // Build final AgentConfig with all middleware
+        // Build final AgentConfig with all middleware appended
         let final_config = Arc::new(crate::agent::AgentConfig {
-            provider: config.provider.clone(),
-            event_bus: config.event_bus.clone(),
-            agent_registry: config.agent_registry.clone(),
-            workspace_index_manager: config.workspace_index_manager.clone(),
-            default_mode: config.default_mode.clone(),
-            tool_config: config.tool_config.clone(),
-            tool_registry: config.tool_registry.clone(),
+            provider: initial_config.provider.clone(),
+            event_bus: initial_config.event_bus.clone(),
+            agent_registry: initial_config.agent_registry.clone(),
+            workspace_manager_actor: initial_config.workspace_manager_actor.clone(),
+            default_mode: initial_config.default_mode.clone(),
+            tool_config: initial_config.tool_config.clone(),
+            tool_registry: initial_config.tool_registry.clone(),
             middleware_drivers,
-            auth_methods: config.auth_methods.clone(),
-            max_steps: config.max_steps,
-            snapshot_policy: config.snapshot_policy,
-            assume_mutating: config.assume_mutating,
-            mutating_tools: config.mutating_tools.clone(),
-            max_prompt_bytes: config.max_prompt_bytes,
-            execution_timeout_secs: config.execution_timeout_secs,
-            tool_output_config: config.tool_output_config.clone(),
-            pruning_config: config.pruning_config.clone(),
-            compaction_config: config.compaction_config.clone(),
-            compaction: config.compaction.clone(),
-            rate_limit_config: config.rate_limit_config.clone(),
-            snapshot_backend: config.snapshot_backend.clone(),
-            snapshot_gc_config: config.snapshot_gc_config.clone(),
-            delegation_context_config: config.delegation_context_config.clone(),
-            pending_elicitations: config.pending_elicitations.clone(),
+            auth_methods: initial_config.auth_methods.clone(),
+            max_steps: initial_config.max_steps,
+            snapshot_policy: initial_config.snapshot_policy,
+            assume_mutating: initial_config.assume_mutating,
+            mutating_tools: initial_config.mutating_tools.clone(),
+            max_prompt_bytes: initial_config.max_prompt_bytes,
+            execution_timeout_secs: initial_config.execution_timeout_secs,
+            execution_policy: initial_config.execution_policy.clone(),
+            compaction: initial_config.compaction.clone(),
+            snapshot_backend: initial_config.snapshot_backend.clone(),
+            snapshot_gc_config: initial_config.snapshot_gc_config.clone(),
+            delegation_context_config: initial_config.delegation_context_config.clone(),
+            pending_elicitations: initial_config.pending_elicitations.clone(),
         });
 
-        // Build final registry with the final config
-        let final_registry = Arc::new(tokio::sync::Mutex::new(crate::agent::SessionRegistry::new(
-            final_config.clone(),
-        )));
-
-        // Build final AgentHandle
-        let handle = Arc::new(AgentHandle {
-            config: final_config,
-            registry: final_registry,
-            client_state: agent.client_state.clone(),
-            client: agent.client.clone(),
-            bridge: agent.bridge.clone(),
-            default_mode: std::sync::Mutex::new(
-                agent
-                    .default_mode
-                    .lock()
-                    .map(|m| *m)
-                    .unwrap_or(crate::agent::core::AgentMode::Build),
-            ),
-        });
+        let handle = Arc::new(AgentHandle::from_config(final_config));
 
         let view_store = backend
             .view_store()
@@ -660,6 +594,8 @@ impl Agent {
         if let Some(db) = config.agent.db {
             builder.db_path = Some(db);
         }
+        builder.assume_mutating = Some(config.agent.assume_mutating);
+        builder.mutating_tools = Some(config.agent.mutating_tools);
 
         // Apply middleware from config
         if !config.middleware.is_empty() {
@@ -667,11 +603,7 @@ impl Agent {
         }
 
         // Thread through config fields that were previously silently dropped
-        builder.tool_output_config = Some(config.agent.tool_output);
-        builder.pruning_config = Some(config.agent.pruning);
-        builder.compaction_config = Some(config.agent.compaction);
-        builder.snapshot_backend_config = Some(config.agent.snapshot);
-        builder.rate_limit_config = Some(config.agent.rate_limit);
+        builder.execution = Some(config.agent.execution);
         builder.skills_config = Some(config.agent.skills);
 
         builder.build().await

@@ -103,6 +103,17 @@ pub fn translate_event_to_update(event: &AgentEvent) -> Option<SessionUpdate> {
                 ContentBlock::Text(TextContent::new(content.clone())),
             )))
         }
+        // Streaming text deltas: forward to ACP clients so they also benefit from streaming.
+        AgentEventKind::AssistantContentDelta { content, .. } => {
+            if content.is_empty() {
+                return None;
+            }
+            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                ContentBlock::Text(TextContent::new(content.clone())),
+            )))
+        }
+        // Thinking/reasoning deltas: ACP has no thinking content type yet — drop.
+        AgentEventKind::AssistantThinkingDelta { .. } => None,
         AgentEventKind::ToolCallStart {
             tool_call_id,
             tool_name,
@@ -272,25 +283,14 @@ pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<EventBus>> {
     let registry = agent.agent_registry();
     for info in registry.list_agents() {
         if let Some(instance) = registry.get_agent_instance(&info.id) {
-            // Try downcasting to AgentHandle (new path)
+            // Downcast to AgentHandle to get its event bus
             if let Some(bus) = instance
                 .as_any()
                 .downcast_ref::<AgentHandle>()
                 .map(|agent| agent.event_bus())
+                && seen.insert(Arc::as_ptr(&bus) as usize)
             {
-                if seen.insert(Arc::as_ptr(&bus) as usize) {
-                    sources.push(bus);
-                }
-            }
-            // Try downcasting to KameoSendAgent (kameo path)
-            else if let Some(kameo_agent) = instance
-                .as_any()
-                .downcast_ref::<crate::send_agent::KameoSendAgent>()
-            {
-                let bus = kameo_agent.event_bus();
-                if seen.insert(Arc::as_ptr(&bus) as usize) {
-                    sources.push(bus);
-                }
+                sources.push(bus);
             }
         }
     }

@@ -27,6 +27,7 @@ use log::{debug, info, trace, warn};
 use querymt::chat::ChatRole;
 use std::sync::Arc;
 use tokio::sync::watch;
+use tracing::{Instrument, info_span, instrument};
 
 /// Outcome of a single execution cycle
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,11 @@ use crate::agent::agent_config::AgentConfig;
 ///
 /// `session_mode` is the per-session `AgentMode` captured at turn start.
 /// It is injected into every `ConversationContext` so middleware can read it.
+#[instrument(
+    name = "agent.execution.turn",
+    skip(config, exec_ctx, cancel_rx, bridge),
+    fields(session_id = %exec_ctx.session_id, mode = %session_mode)
+)]
 pub(crate) async fn execute_cycle_state_machine(
     config: &AgentConfig,
     exec_ctx: &mut ExecutionContext,
@@ -71,7 +77,12 @@ pub(crate) async fn execute_cycle_state_machine(
     );
 
     let messages: Arc<[querymt::chat::ChatMessage]> =
-        Arc::from(exec_ctx.session_handle.history().await.into_boxed_slice());
+        async { Arc::from(exec_ctx.session_handle.history().await.into_boxed_slice()) }
+            .instrument(info_span!(
+                "agent.execution.history_load",
+                session_id = %exec_ctx.session_id
+            ))
+            .await;
 
     info!(
         "Session {}: history loaded, {} messages",
@@ -116,6 +127,10 @@ pub(crate) async fn execute_cycle_state_machine(
 
     state = driver
         .run_turn_start(state, Some(&exec_ctx.runtime))
+        .instrument(info_span!(
+            "agent.execution.middleware.turn_start",
+            session_id = %exec_ctx.session_id
+        ))
         .await
         .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
 
@@ -145,6 +160,10 @@ pub(crate) async fn execute_cycle_state_machine(
             ExecutionState::BeforeLlmCall { .. } => {
                 let state = driver
                     .run_step_start(state, Some(&exec_ctx.runtime))
+                    .instrument(info_span!(
+                        "agent.execution.middleware.step_start",
+                        session_id = %exec_ctx.session_id
+                    ))
                     .await
                     .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
 
@@ -175,6 +194,10 @@ pub(crate) async fn execute_cycle_state_machine(
             ExecutionState::AfterLlm { .. } => {
                 let state = driver
                     .run_after_llm(state, Some(&exec_ctx.runtime))
+                    .instrument(info_span!(
+                        "agent.execution.middleware.after_llm",
+                        session_id = %exec_ctx.session_id
+                    ))
                     .await
                     .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
                 match state {
@@ -199,6 +222,10 @@ pub(crate) async fn execute_cycle_state_machine(
             ExecutionState::ProcessingToolCalls { .. } => {
                 let state = driver
                     .run_processing_tool_calls(state, Some(&exec_ctx.runtime))
+                    .instrument(info_span!(
+                        "agent.execution.middleware.processing_tool_calls",
+                        session_id = %exec_ctx.session_id
+                    ))
                     .await
                     .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
                 match state {
@@ -240,6 +267,10 @@ pub(crate) async fn execute_cycle_state_machine(
             ExecutionState::Complete => {
                 let turn_end_state = driver
                     .run_turn_end(ExecutionState::Complete, Some(&exec_ctx.runtime))
+                    .instrument(info_span!(
+                        "agent.execution.middleware.turn_end",
+                        session_id = %exec_ctx.session_id
+                    ))
                     .await
                     .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
 
@@ -248,7 +279,7 @@ pub(crate) async fn execute_cycle_state_machine(
                     ExecutionState::Complete => {
                         debug!("State machine reached Complete state");
 
-                        if config.pruning_config.enabled
+                        if config.execution_policy.pruning.enabled
                             && let Err(e) = maintenance::run_pruning(config, exec_ctx).await
                         {
                             warn!("Pruning failed: {}", e);
@@ -275,7 +306,9 @@ pub(crate) async fn execute_cycle_state_machine(
             } => {
                 info!("State machine stopped: {} ({:?})", message, stop_type);
 
-                if stop_type == StopType::ContextThreshold && config.compaction_config.auto {
+                if stop_type == StopType::ContextThreshold
+                    && config.execution_policy.compaction.auto
+                {
                     info!("Context threshold reached, triggering AI compaction");
 
                     match maintenance::run_ai_compaction(config, exec_ctx, &state).await {

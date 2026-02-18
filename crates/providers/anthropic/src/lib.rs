@@ -3,6 +3,7 @@
 //! This module provides integration with Anthropic's Claude models through their API.
 
 use std::collections::HashMap;
+use std::sync::Mutex as StdMutex;
 
 use regex::Regex;
 
@@ -122,6 +123,27 @@ pub struct Anthropic {
     #[serde(skip)]
     #[schemars(skip)]
     pub key_resolver: Option<Arc<dyn ApiKeyResolver>>,
+    /// Per-request accumulator for streaming tool-use blocks.
+    ///
+    /// Keyed by the SSE `index` field.  Entries are inserted on
+    /// `content_block_start` (type `tool_use`) and removed (with a
+    /// `ToolUseComplete` chunk emitted) on `content_block_stop`.
+    #[serde(skip, default = "Anthropic::default_tool_state_buffer")]
+    #[schemars(skip)]
+    pub(crate) tool_state_buffer: Arc<StdMutex<HashMap<usize, AnthropicToolUseState>>>,
+}
+
+/// Per-block accumulator used while streaming tool-use content.
+///
+/// Anthropic's SSE protocol emits tool arguments as a sequence of
+/// `input_json_delta` events followed by a `content_block_stop`.  We
+/// accumulate the partial JSON here and emit a `ToolUseComplete` chunk
+/// when the block closes.
+#[derive(Debug, Default)]
+struct AnthropicToolUseState {
+    id: String,
+    name: String,
+    arguments_buffer: String,
 }
 
 /// Anthropic-specific tool format that matches their API structure
@@ -395,6 +417,17 @@ struct AnthropicStreamResponse {
     content_block: Option<AnthropicStreamContentBlock>,
     /// Delta for content_block_delta and message_delta events
     delta: Option<AnthropicDelta>,
+    /// Usage information (present on message_delta events; only output_tokens is populated)
+    usage: Option<Usage>,
+    /// Nested message object (present on message_start events)
+    message: Option<AnthropicStreamMessage>,
+}
+
+/// Nested message object within an Anthropic `message_start` SSE event.
+#[derive(Deserialize, Debug)]
+struct AnthropicStreamMessage {
+    /// Usage information present in the initial message_start event.
+    usage: Option<Usage>,
 }
 
 /// Content block within an Anthropic streaming content_block_start event.
@@ -537,6 +570,10 @@ impl ChatResponse for AnthropicCompleteResponse {
 impl Anthropic {
     fn default_base_url() -> Url {
         Url::parse("https://api.anthropic.com/v1/").unwrap()
+    }
+
+    fn default_tool_state_buffer() -> Arc<StdMutex<HashMap<usize, AnthropicToolUseState>>> {
+        Arc::new(StdMutex::new(HashMap::new()))
     }
 
     /// Returns the current API key, using the resolver if available.
@@ -912,6 +949,11 @@ impl HTTPChatProvider for Anthropic {
                     })?;
 
                 match stream_resp.response_type.as_str() {
+                    "message_start" => {
+                        if let Some(usage) = stream_resp.message.and_then(|m| m.usage) {
+                            chunks.push(querymt::chat::StreamChunk::Usage(usage));
+                        }
+                    }
                     "content_block_start" => {
                         if let (Some(index), Some(block)) =
                             (stream_resp.index, stream_resp.content_block)
@@ -924,9 +966,23 @@ impl HTTPChatProvider for Anthropic {
                             } else {
                                 name
                             };
+                            let id = block.id.unwrap_or_default();
+
+                            // Insert accumulator entry for this block index
+                            if let Ok(mut buf) = self.tool_state_buffer.lock() {
+                                buf.insert(
+                                    index,
+                                    AnthropicToolUseState {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        arguments_buffer: String::new(),
+                                    },
+                                );
+                            }
+
                             chunks.push(querymt::chat::StreamChunk::ToolUseStart {
                                 index,
-                                id: block.id.unwrap_or_default(),
+                                id,
                                 name,
                             });
                         }
@@ -938,6 +994,13 @@ impl HTTPChatProvider for Anthropic {
                             } else if let Some(thinking) = delta.thinking {
                                 chunks.push(querymt::chat::StreamChunk::Thinking(thinking));
                             } else if let Some(partial_json) = delta.partial_json {
+                                // Accumulate into the state buffer
+                                if let Ok(mut buf) = self.tool_state_buffer.lock()
+                                    && let Some(state) = buf.get_mut(&index)
+                                {
+                                    state.arguments_buffer.push_str(&partial_json);
+                                }
+
                                 chunks.push(querymt::chat::StreamChunk::ToolUseInputDelta {
                                     index,
                                     partial_json,
@@ -945,11 +1008,35 @@ impl HTTPChatProvider for Anthropic {
                             }
                         }
                     }
+                    "content_block_stop" => {
+                        // If this block was a tool-use block, emit ToolUseComplete with
+                        // the fully assembled arguments.
+                        if let Some(index) = stream_resp.index
+                            && let Ok(mut buf) = self.tool_state_buffer.lock()
+                            && let Some(state) = buf.remove(&index)
+                        {
+                            chunks.push(querymt::chat::StreamChunk::ToolUseComplete {
+                                index,
+                                tool_call: querymt::ToolCall {
+                                    id: state.id,
+                                    call_type: "function".to_string(),
+                                    function: querymt::FunctionCall {
+                                        name: state.name,
+                                        arguments: state.arguments_buffer,
+                                    },
+                                },
+                            });
+                        }
+                    }
                     "message_delta" => {
                         if let Some(delta) = stream_resp.delta
                             && let Some(stop_reason) = delta.stop_reason
                         {
                             chunks.push(querymt::chat::StreamChunk::Done { stop_reason });
+                        }
+
+                        if let Some(usage) = stream_resp.usage {
+                            chunks.push(querymt::chat::StreamChunk::Usage(usage));
                         }
                     }
                     _ => {}
@@ -1014,10 +1101,10 @@ mod factory;
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_oauth_token_detection() {
-        let anthropic = Anthropic {
-            api_key: "sk-ant-oat01-abc123".to_string(),
+    /// Build a minimal `Anthropic` instance for use in unit tests.
+    fn test_anthropic(api_key: &str) -> Anthropic {
+        Anthropic {
+            api_key: api_key.to_string(),
             auth_type: None,
             model: "claude-3-7-sonnet-20250219".to_string(),
             max_tokens: 100,
@@ -1031,75 +1118,34 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             thinking_budget_tokens: None,
-        };
+            key_resolver: None,
+            tool_state_buffer: Anthropic::default_tool_state_buffer(),
+        }
+    }
 
+    #[test]
+    fn test_oauth_token_detection() {
+        let anthropic = test_anthropic("sk-ant-oat01-abc123");
         assert_eq!(anthropic.determine_auth_type(), AuthType::OAuth);
     }
 
     #[test]
     fn test_api_key_detection() {
-        let anthropic = Anthropic {
-            api_key: "sk-ant-api03-xyz789".to_string(),
-            auth_type: None,
-            model: "claude-3-7-sonnet-20250219".to_string(),
-            max_tokens: 100,
-            temperature: Some(1.0),
-            timeout_seconds: None,
-            system: None,
-            stream: None,
-            top_p: None,
-            top_k: None,
-            tools: None,
-            tool_choice: None,
-            reasoning: None,
-            thinking_budget_tokens: None,
-        };
-
+        let anthropic = test_anthropic("sk-ant-api03-xyz789");
         assert_eq!(anthropic.determine_auth_type(), AuthType::ApiKey);
     }
 
     #[test]
     fn test_explicit_auth_type_override() {
         // Even with an oat token, explicit auth_type should take precedence
-        let anthropic = Anthropic {
-            api_key: "sk-ant-oat01-abc123".to_string(),
-            auth_type: Some(AuthType::ApiKey), // Explicitly set to API key
-            model: "claude-3-7-sonnet-20250219".to_string(),
-            max_tokens: 100,
-            temperature: Some(1.0),
-            timeout_seconds: None,
-            system: None,
-            stream: None,
-            top_p: None,
-            top_k: None,
-            tools: None,
-            tool_choice: None,
-            reasoning: None,
-            thinking_budget_tokens: None,
-        };
-
+        let mut anthropic = test_anthropic("sk-ant-oat01-abc123");
+        anthropic.auth_type = Some(AuthType::ApiKey);
         assert_eq!(anthropic.determine_auth_type(), AuthType::ApiKey);
     }
 
     #[test]
     fn test_fallback_to_api_key_for_unknown_format() {
-        let anthropic = Anthropic {
-            api_key: "sk-ant-unknown-format".to_string(),
-            auth_type: None,
-            model: "claude-3-7-sonnet-20250219".to_string(),
-            max_tokens: 100,
-            temperature: Some(1.0),
-            timeout_seconds: None,
-            system: None,
-            stream: None,
-            top_p: None,
-            top_k: None,
-            tools: None,
-            tool_choice: None,
-            reasoning: None,
-            thinking_budget_tokens: None,
-        };
-
+        let anthropic = test_anthropic("sk-ant-unknown-format");
         // Should default to API key and print warning
         assert_eq!(anthropic.determine_auth_type(), AuthType::ApiKey);
     }
@@ -1107,42 +1153,10 @@ mod tests {
     #[test]
     fn test_version_number_flexibility() {
         // Test with different version numbers
-        let anthropic_oat99 = Anthropic {
-            api_key: "sk-ant-oat99-future".to_string(),
-            auth_type: None,
-            model: "claude-3-7-sonnet-20250219".to_string(),
-            max_tokens: 100,
-            temperature: Some(1.0),
-            timeout_seconds: None,
-            system: None,
-            stream: None,
-            top_p: None,
-            top_k: None,
-            tools: None,
-            tool_choice: None,
-            reasoning: None,
-            thinking_budget_tokens: None,
-        };
-
+        let anthropic_oat99 = test_anthropic("sk-ant-oat99-future");
         assert_eq!(anthropic_oat99.determine_auth_type(), AuthType::OAuth);
 
-        let anthropic_api15 = Anthropic {
-            api_key: "sk-ant-api15-future".to_string(),
-            auth_type: None,
-            model: "claude-3-7-sonnet-20250219".to_string(),
-            max_tokens: 100,
-            temperature: Some(1.0),
-            timeout_seconds: None,
-            system: None,
-            stream: None,
-            top_p: None,
-            top_k: None,
-            tools: None,
-            tool_choice: None,
-            reasoning: None,
-            thinking_budget_tokens: None,
-        };
-
+        let anthropic_api15 = test_anthropic("sk-ant-api15-future");
         assert_eq!(anthropic_api15.determine_auth_type(), AuthType::ApiKey);
     }
 
@@ -1315,63 +1329,37 @@ mod tests {
 
     #[test]
     fn test_sanitize_system_prompt_oauth_text() {
-        let anthropic = Anthropic {
-            api_key: "sk-ant-oat01-abc123".to_string(),
-            auth_type: None,
-            model: "claude-3-7-sonnet-20250219".to_string(),
-            max_tokens: 100,
-            temperature: None,
-            timeout_seconds: None,
-            system: Some(AnthropicSystemPrompt::Text(
-                "You are QueryMT assistant.".to_string(),
-            )),
-            stream: None,
-            top_p: None,
-            top_k: None,
-            tools: None,
-            tool_choice: None,
-            reasoning: None,
-            thinking_budget_tokens: None,
-        };
+        let mut anthropic = test_anthropic("sk-ant-oat01-abc123");
+        anthropic.temperature = None;
+        anthropic.system = Some(AnthropicSystemPrompt::Text(
+            "You are QueryMT assistant.".to_string(),
+        ));
         let sanitized = anthropic.sanitize_system_prompt();
         assert_eq!(
             sanitized,
             Some(AnthropicSystemPrompt::Text(
-                "You are Claude assistant.".to_string()
+                "You are Claude Code assistant.".to_string()
             ))
         );
     }
 
     #[test]
     fn test_sanitize_system_prompt_oauth_blocks() {
-        let anthropic = Anthropic {
-            api_key: "sk-ant-oat01-abc123".to_string(),
-            auth_type: None,
-            model: "claude-3-7-sonnet-20250219".to_string(),
-            max_tokens: 100,
-            temperature: None,
-            timeout_seconds: None,
-            system: Some(AnthropicSystemPrompt::Blocks(vec![TextBlockParam {
-                block_type: "text".to_string(),
-                text: "You are QueryMT assistant.".to_string(),
-                cache_control: Some(CacheControlEphemeral {
-                    control_type: "ephemeral".to_string(),
-                    ttl: None,
-                }),
-                citations: None,
-            }])),
-            stream: None,
-            top_p: None,
-            top_k: None,
-            tools: None,
-            tool_choice: None,
-            reasoning: None,
-            thinking_budget_tokens: None,
-        };
+        let mut anthropic = test_anthropic("sk-ant-oat01-abc123");
+        anthropic.temperature = None;
+        anthropic.system = Some(AnthropicSystemPrompt::Blocks(vec![TextBlockParam {
+            block_type: "text".to_string(),
+            text: "You are QueryMT assistant.".to_string(),
+            cache_control: Some(CacheControlEphemeral {
+                control_type: "ephemeral".to_string(),
+                ttl: None,
+            }),
+            citations: None,
+        }]));
         let sanitized = anthropic.sanitize_system_prompt();
         match sanitized {
             Some(AnthropicSystemPrompt::Blocks(blocks)) => {
-                assert_eq!(blocks[0].text, "You are Claude assistant.");
+                assert_eq!(blocks[0].text, "You are Claude Code assistant.");
                 // cache_control should be preserved
                 assert!(blocks[0].cache_control.is_some());
             }
@@ -1409,5 +1397,269 @@ mod tests {
 
         // Note: Extra fields like "cache_creation" and "service_tier" are
         // silently ignored during deserialization as they're not part of Usage struct
+    }
+
+    /// Feed a sequence of raw SSE lines through `parse_chat_stream_chunk` and
+    /// collect all emitted `StreamChunk`s.
+    fn collect_chunks(anthropic: &Anthropic, lines: &[&str]) -> Vec<querymt::chat::StreamChunk> {
+        let mut out = Vec::new();
+        for line in lines {
+            let bytes = line.as_bytes();
+            let parsed = anthropic.parse_chat_stream_chunk(bytes).unwrap();
+            out.extend(parsed);
+        }
+        out
+    }
+
+    #[test]
+    fn test_streaming_tool_call_assembled() {
+        // Simulate the Anthropic SSE events for a single tool call streamed across
+        // multiple chunks:
+        //   content_block_start  → ToolUseStart
+        //   content_block_delta  → ToolUseInputDelta (×2)
+        //   content_block_stop   → ToolUseComplete  (with assembled JSON)
+        //   message_delta        → Done
+        let anthropic = test_anthropic("sk-ant-api03-test");
+
+        let lines = [
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"read_file"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"foo.txt\"}"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}"#,
+        ];
+
+        let chunks = collect_chunks(&anthropic, &lines);
+
+        // ToolUseStart
+        assert!(
+            matches!(
+                &chunks[0],
+                querymt::chat::StreamChunk::ToolUseStart { index: 0, id, name }
+                if id == "toolu_01" && name == "read_file"
+            ),
+            "expected ToolUseStart, got {:?}",
+            chunks[0]
+        );
+
+        // Two ToolUseInputDelta chunks
+        assert!(
+            matches!(
+                &chunks[1],
+                querymt::chat::StreamChunk::ToolUseInputDelta { index: 0, partial_json }
+                if partial_json == r#"{"path":"#
+            ),
+            "expected first ToolUseInputDelta, got {:?}",
+            chunks[1]
+        );
+        assert!(
+            matches!(
+                &chunks[2],
+                querymt::chat::StreamChunk::ToolUseInputDelta { index: 0, partial_json }
+                if partial_json == r#""foo.txt"}"#
+            ),
+            "expected second ToolUseInputDelta, got {:?}",
+            chunks[2]
+        );
+
+        // ToolUseComplete with fully assembled arguments
+        match &chunks[3] {
+            querymt::chat::StreamChunk::ToolUseComplete { index, tool_call } => {
+                assert_eq!(*index, 0);
+                assert_eq!(tool_call.id, "toolu_01");
+                assert_eq!(tool_call.function.name, "read_file");
+                assert_eq!(tool_call.function.arguments, r#"{"path":"foo.txt"}"#);
+            }
+            other => panic!("expected ToolUseComplete, got {:?}", other),
+        }
+
+        // Done
+        assert!(
+            matches!(
+                &chunks[4],
+                querymt::chat::StreamChunk::Done { stop_reason }
+                if stop_reason == "tool_use"
+            ),
+            "expected Done, got {:?}",
+            chunks[4]
+        );
+
+        // State buffer should be empty after the stream completes
+        assert!(
+            anthropic.tool_state_buffer.lock().unwrap().is_empty(),
+            "tool_state_buffer should be empty after content_block_stop"
+        );
+    }
+
+    #[test]
+    fn test_streaming_multiple_tool_calls() {
+        // Two tool calls at indices 0 and 1 (parallel tool calls)
+        let anthropic = test_anthropic("sk-ant-api03-test");
+
+        let lines = [
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"read_file"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.txt\"}"}}"#,
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_02","name":"write_file"}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"b.txt\"}"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}"#,
+        ];
+
+        let chunks = collect_chunks(&anthropic, &lines);
+
+        let complete_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c, querymt::chat::StreamChunk::ToolUseComplete { .. }))
+            .collect();
+
+        assert_eq!(
+            complete_chunks.len(),
+            2,
+            "expected 2 ToolUseComplete chunks"
+        );
+
+        // Verify each complete chunk has the right tool
+        let names: std::collections::HashSet<&str> = complete_chunks
+            .iter()
+            .filter_map(|c| {
+                if let querymt::chat::StreamChunk::ToolUseComplete { tool_call, .. } = c {
+                    Some(tool_call.function.name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(names.contains("read_file"));
+        assert!(names.contains("write_file"));
+
+        // Buffer should be drained
+        assert!(anthropic.tool_state_buffer.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_streaming_message_start_usage() {
+        // Full "Hello" response from the example in the Anthropic docs.
+        // message_start carries input_tokens; message_delta carries output_tokens.
+        let anthropic = test_anthropic("sk-ant-api03-test");
+
+        let lines = [
+            r#"data: {"type":"message_start","message":{"id":"msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY","type":"message","role":"assistant","content":[],"model":"claude-opus-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"ping"}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"!"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":15}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ];
+
+        let chunks = collect_chunks(&anthropic, &lines);
+
+        // First chunk must be Usage from message_start (input_tokens)
+        match &chunks[0] {
+            querymt::chat::StreamChunk::Usage(u) => {
+                assert_eq!(u.input_tokens, 25);
+                assert_eq!(u.output_tokens, 1);
+            }
+            other => panic!("expected Usage from message_start, got {:?}", other),
+        }
+
+        // Exactly two Usage chunks total: one from message_start, one from message_delta
+        let usage_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c, querymt::chat::StreamChunk::Usage(_)))
+            .collect();
+        assert_eq!(usage_chunks.len(), 2, "expected 2 Usage chunks");
+
+        // The second Usage chunk comes from message_delta and carries output_tokens
+        match usage_chunks[1] {
+            querymt::chat::StreamChunk::Usage(u) => {
+                assert_eq!(u.output_tokens, 15);
+            }
+            other => panic!("expected second Usage from message_delta, got {:?}", other),
+        }
+
+        // Text chunks should have been emitted
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| {
+                if let querymt::chat::StreamChunk::Text(t) = c {
+                    Some(t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(text, "Hello!");
+    }
+
+    #[test]
+    fn test_streaming_usage_merge_max_gives_correct_totals() {
+        // Verifies that applying Usage::merge_max across the two Usage chunks
+        // emitted by the Anthropic provider yields the correct final totals.
+        // This mirrors what transitions.rs now does for every streaming response.
+        let anthropic = test_anthropic("sk-ant-api03-test");
+
+        let lines = [
+            r#"data: {"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-opus-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":15}}"#,
+        ];
+
+        let chunks = collect_chunks(&anthropic, &lines);
+
+        // Collect all Usage chunks and fold them with merge_max (same logic as transitions.rs)
+        let merged = chunks.iter().fold(None::<Usage>, |acc, chunk| {
+            if let querymt::chat::StreamChunk::Usage(u) = chunk {
+                Some(match acc {
+                    Some(prev) => prev.merge_max(u.clone()),
+                    None => u.clone(),
+                })
+            } else {
+                acc
+            }
+        });
+
+        let merged = merged.expect("at least one Usage chunk expected");
+        assert_eq!(
+            merged.input_tokens, 25,
+            "input_tokens must come from message_start"
+        );
+        assert_eq!(
+            merged.output_tokens, 15,
+            "output_tokens must be the cumulative value from message_delta"
+        );
+        assert_eq!(merged.cache_read, 0);
+        assert_eq!(merged.cache_write, 0);
+    }
+
+    #[test]
+    fn test_streaming_text_only_no_tool_complete() {
+        // Pure text response — no ToolUseComplete should be emitted
+        let anthropic = test_anthropic("sk-ant-api03-test");
+
+        let lines = [
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello!"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}"#,
+        ];
+
+        let chunks = collect_chunks(&anthropic, &lines);
+
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| matches!(c, querymt::chat::StreamChunk::ToolUseComplete { .. })),
+            "no ToolUseComplete expected for a text-only response"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| matches!(c, querymt::chat::StreamChunk::Text(t) if t == "Hello!")),
+            "expected a Text chunk"
+        );
+        assert!(anthropic.tool_state_buffer.lock().unwrap().is_empty());
     }
 }
