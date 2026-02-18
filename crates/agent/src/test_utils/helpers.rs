@@ -1,8 +1,8 @@
 //! Helper functions for creating test fixtures
 
-use crate::agent::builder::AgentBuilderExt;
-use crate::agent::core::{AgentMode, QueryMTAgent, SnapshotPolicy};
 use crate::agent::AgentHandle;
+use crate::agent::agent_config_builder::AgentConfigBuilder;
+use crate::agent::core::SnapshotPolicy;
 use crate::middleware::{AgentStats, ConversationContext, ToolCall, ToolFunction};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::backend::StorageBackend;
@@ -185,26 +185,13 @@ impl UndoTestFixture {
         let backend = GitSnapshotBackend::with_snapshot_base(snapshot_base_path.clone());
         let backend_arc = Arc::new(backend);
 
-        let agent = QueryMTAgent::new(registry, storage.session_store(), llm)
+        let builder = AgentConfigBuilder::new(registry, storage.session_store(), llm)
             .with_snapshot_policy(SnapshotPolicy::Diff)
             .with_snapshot_backend(backend_arc.clone());
+        builder.add_observer(storage.event_observer());
 
-        agent.add_observer(storage.event_observer());
-
-        let handle = AgentHandle {
-            config: agent.agent_config(),
-            registry: agent.kameo_registry(),
-            client_state: agent.client_state.clone(),
-            client: agent.client.clone(),
-            bridge: agent.bridge.clone(),
-            default_mode: std::sync::Mutex::new(
-                agent
-                    .default_mode
-                    .lock()
-                    .map(|m| *m)
-                    .unwrap_or(AgentMode::Build),
-            ),
-        };
+        let config = Arc::new(builder.build());
+        let handle = AgentHandle::from_config(config);
 
         Ok(Self {
             worktree,
@@ -254,18 +241,12 @@ impl UndoTestFixture {
         use crate::agent::session_actor::SessionActor;
         use kameo::actor::Spawn;
 
-        let runtime = Arc::new(crate::agent::core::SessionRuntime {
-            cwd: Some(self.worktree.path().to_path_buf()),
-            _mcp_services: std::collections::HashMap::new(),
-            mcp_tools: std::collections::HashMap::new(),
-            mcp_tool_defs: vec![],
-            permission_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            current_tools_hash: std::sync::Mutex::new(None),
-            function_index: Arc::new(tokio::sync::OnceCell::new()),
-            turn_snapshot: std::sync::Mutex::new(None),
-            turn_diffs: std::sync::Mutex::new(Default::default()),
-            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
+        let runtime = crate::agent::core::SessionRuntime::new(
+            Some(self.worktree.path().to_path_buf()),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            vec![],
+        );
 
         let actor = SessionActor::new(self.handle.config.clone(), session_id.to_string(), runtime);
         let actor_ref = SessionActor::spawn(actor);

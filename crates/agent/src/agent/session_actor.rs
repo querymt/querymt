@@ -22,10 +22,11 @@ use agent_client_protocol::{
 use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::reply::DelegatedReply;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use querymt::chat::ChatRole;
 use std::sync::Arc;
 use tokio::sync::watch;
+use tracing::{Instrument, info_span, instrument};
 use uuid::Uuid;
 
 /// Per-session actor. Each session gets its own actor with isolated state.
@@ -665,6 +666,11 @@ impl Message<Prompt> for SessionActor {
 ///
 /// This function gathers all needed state upfront and runs the full execution cycle.
 /// It does NOT access the actor — everything is passed as parameters.
+#[instrument(
+    name = "agent.prompt.execute",
+    skip(req, runtime, config, cancel_rx, bridge),
+    fields(session_id = %session_id, mode = %mode)
+)]
 async fn execute_prompt_detached(
     req: agent_client_protocol::PromptRequest,
     session_id: String,
@@ -818,47 +824,49 @@ async fn execute_prompt_detached(
         session_id
     );
 
-    // Pre-turn snapshot for undo/redo
+    // Pre-turn snapshot for undo/redo (off critical path)
     if let Some(ref backend) = config.snapshot_backend
         && let Some(worktree) = runtime.cwd.as_ref()
     {
         let turn_id = Uuid::new_v4().to_string();
-        debug!(
-            "Session {}: pre-turn snapshot: calling backend.track()",
-            session_id
-        );
-        match backend.track(worktree).await {
-            Ok(snapshot_id) => {
-                debug!(
-                    "Session {}: pre-turn snapshot ok: {}",
-                    session_id, snapshot_id
-                );
-                *runtime.turn_snapshot.lock().unwrap() =
-                    Some((turn_id.clone(), snapshot_id.clone()));
+        let backend = Arc::clone(backend);
+        let worktree = worktree.to_path_buf();
+        let worktree_display = worktree.display().to_string();
+        let session_id_for_task = session_id.clone();
+        let turn_id_for_task = turn_id.clone();
 
-                let start_part = MessagePart::TurnSnapshotStart {
-                    turn_id: turn_id.clone(),
-                    snapshot_id: snapshot_id.clone(),
-                };
-                let snapshot_msg = AgentMessage {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.clone(),
-                    role: ChatRole::Assistant,
-                    parts: vec![start_part],
-                    created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
-                    parent_message_id: None,
-                };
-                if let Err(e) = exec_ctx.add_message(snapshot_msg).await {
-                    warn!("Failed to store turn snapshot start: {}", e);
+        let task = tokio::spawn(
+            async move {
+                let started = std::time::Instant::now();
+                let snapshot_result = backend.track(&worktree).await.map_err(|e| e.to_string());
+                let elapsed = started.elapsed();
+                match &snapshot_result {
+                    Ok(snapshot_id) => info!(
+                        "Session {}: pre-turn snapshot ready in {:?} (turn_id={}, snapshot_id={})",
+                        session_id_for_task, elapsed, turn_id_for_task, snapshot_id
+                    ),
+                    Err(err) => warn!(
+                        "Session {}: pre-turn snapshot failed in {:?} (turn_id={}): {}",
+                        session_id_for_task, elapsed, turn_id_for_task, err
+                    ),
                 }
+                (turn_id_for_task, snapshot_result)
             }
-            Err(e) => warn!("Pre-turn snapshot failed: {}", e),
-        }
+            .instrument(info_span!(
+                "agent.snapshot.pre_turn.track",
+                session_id = %session_id,
+                turn_id = %turn_id,
+                worktree = %worktree_display
+            )),
+        );
+
+        *runtime.pre_turn_snapshot_task.lock().unwrap() = Some(task);
     } else {
         debug!(
             "Session {}: no snapshot backend, skipping pre-turn snapshot",
             session_id
         );
+        *runtime.pre_turn_snapshot_task.lock().unwrap() = None;
     }
 
     debug!(
@@ -892,6 +900,13 @@ async fn execute_prompt_detached(
     if let Some(ref backend) = config.snapshot_backend
         && let Some(worktree) = runtime.cwd.as_ref()
     {
+        if let Err(e) = ensure_pre_turn_snapshot_ready(&mut exec_ctx, "post_turn_snapshot").await {
+            warn!(
+                "Failed to resolve pre-turn snapshot before post-turn processing: {}",
+                e
+            );
+        }
+
         let turn_snapshot_data = runtime.turn_snapshot.lock().unwrap().take();
         if let Some((turn_id, pre_snapshot_id)) = turn_snapshot_data {
             match backend.track(worktree).await {
@@ -956,6 +971,66 @@ async fn execute_prompt_detached(
     }
 }
 
+#[instrument(
+    name = "agent.snapshot.pre_turn.ensure",
+    skip(exec_ctx),
+    fields(session_id = %exec_ctx.session_id, reason = reason)
+)]
+pub(crate) async fn ensure_pre_turn_snapshot_ready(
+    exec_ctx: &mut ExecutionContext,
+    reason: &'static str,
+) -> Result<(), Error> {
+    let pending_task = exec_ctx
+        .runtime
+        .pre_turn_snapshot_task
+        .lock()
+        .unwrap()
+        .take();
+    let Some(task) = pending_task else {
+        return Ok(());
+    };
+
+    let span = info_span!(
+        "agent.snapshot.pre_turn.resolve",
+        session_id = %exec_ctx.session_id,
+        reason = reason
+    );
+
+    match task.instrument(span).await {
+        Ok((turn_id, Ok(snapshot_id))) => {
+            *exec_ctx.runtime.turn_snapshot.lock().unwrap() =
+                Some((turn_id.clone(), snapshot_id.clone()));
+
+            let start_part = MessagePart::TurnSnapshotStart {
+                turn_id,
+                snapshot_id,
+            };
+            let snapshot_msg = AgentMessage {
+                id: Uuid::new_v4().to_string(),
+                session_id: exec_ctx.session_id.clone(),
+                role: ChatRole::Assistant,
+                parts: vec![start_part],
+                created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                parent_message_id: None,
+            };
+            exec_ctx.add_message(snapshot_msg).await.map_err(|e| {
+                Error::new(
+                    -32000,
+                    format!("Failed to store turn snapshot start: {}", e),
+                )
+            })?;
+        }
+        Ok((_turn_id, Err(err))) => {
+            warn!("Pre-turn snapshot task finished with error: {}", err);
+        }
+        Err(join_err) => {
+            warn!("Pre-turn snapshot task join failed: {}", join_err);
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::sync::watch;
@@ -1010,26 +1085,6 @@ mod tests {
         prompt_running = false;
         cancel_tx.send(false).ok();
         assert!(!prompt_running);
-        assert!(!*cancel_tx.borrow());
-    }
-
-    /// A non-cancelled busy session now queues new prompts instead of rejecting.
-    #[test]
-    fn busy_session_without_cancel_queues_new_prompt() {
-        let (cancel_tx, _rx) = watch::channel(false);
-        let prompt_running = true;
-
-        // Mirrors the Prompt handler logic after switching to queueing behavior.
-        let allow_new_prompt = if prompt_running {
-            true
-        } else {
-            true
-        };
-
-        assert!(
-            allow_new_prompt,
-            "A busy, non-cancelled session should queue new prompts rather than reject"
-        );
         assert!(!*cancel_tx.borrow());
     }
 }

@@ -223,7 +223,7 @@ impl SharedLlmProvider {
 #[async_trait]
 impl querymt::chat::ChatProvider for SharedLlmProvider {
     fn supports_streaming(&self) -> bool {
-        self.inner.blocking_lock().supports_streaming()
+        false
     }
 
     async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {

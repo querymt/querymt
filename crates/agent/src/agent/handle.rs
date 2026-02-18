@@ -11,7 +11,7 @@ use crate::agent::session_registry::SessionRegistry;
 use crate::delegation::AgentRegistry;
 use crate::event_bus::EventBus;
 use crate::events::{AgentEvent, EventObserver};
-use crate::index::WorkspaceIndexManager;
+use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::CompositeDriver;
 use crate::send_agent::SendAgent;
 use crate::session::store::LLMConfig;
@@ -25,6 +25,7 @@ use agent_client_protocol::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use kameo::actor::ActorRef;
 use querymt::LLMParams;
 use std::any::Any;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -48,6 +49,22 @@ pub struct AgentHandle {
 }
 
 impl AgentHandle {
+    /// Construct an `AgentHandle` from a shared `AgentConfig`.
+    ///
+    /// This is the canonical way to create an `AgentHandle` after building
+    /// an `AgentConfig` via `AgentConfigBuilder::build()`.
+    pub fn from_config(config: Arc<AgentConfig>) -> Self {
+        let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
+        Self {
+            config,
+            registry,
+            client_state: Arc::new(StdMutex::new(None)),
+            client: Arc::new(StdMutex::new(None)),
+            bridge: Arc::new(StdMutex::new(None)),
+            default_mode: StdMutex::new(crate::agent::core::AgentMode::Build),
+        }
+    }
+
     /// Subscribes to agent events.
     pub fn subscribe_events(&self) -> broadcast::Receiver<AgentEvent> {
         self.config.event_bus.subscribe()
@@ -78,9 +95,9 @@ impl AgentHandle {
         self.config.pending_elicitations()
     }
 
-    /// Access the workspace index manager.
-    pub fn workspace_index_manager(&self) -> Arc<WorkspaceIndexManager> {
-        self.config.workspace_index_manager()
+    /// Access the workspace manager actor ref.
+    pub fn workspace_manager_actor(&self) -> ActorRef<WorkspaceIndexManagerActor> {
+        self.config.workspace_manager_actor()
     }
 
     /// Sets the client for protocol communication.

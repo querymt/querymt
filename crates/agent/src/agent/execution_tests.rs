@@ -5,11 +5,11 @@ use crate::agent::core::{
 };
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
-use crate::config::{PruningConfig, RateLimitConfig, ToolOutputConfig};
+use crate::config::RuntimeExecutionPolicy;
 use crate::delegation::DefaultAgentRegistry;
 use crate::event_bus::EventBus;
 use crate::events::AgentEventKind;
-use crate::index::{WorkspaceIndexManager, WorkspaceIndexManagerConfig};
+use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
 use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::SessionStore;
@@ -152,9 +152,9 @@ impl TestHarness {
             provider: provider_context,
             event_bus: Arc::new(EventBus::new()),
             agent_registry: Arc::new(DefaultAgentRegistry::new()),
-            workspace_index_manager: Arc::new(WorkspaceIndexManager::new(
+            workspace_manager_actor: WorkspaceIndexManagerActor::new(
                 WorkspaceIndexManagerConfig::default(),
-            )),
+            ),
             default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
             tool_config: ToolConfig {
                 policy: ToolPolicy::ProviderOnly,
@@ -169,11 +169,8 @@ impl TestHarness {
             mutating_tools: HashSet::new(),
             max_prompt_bytes: None,
             execution_timeout_secs: 300,
-            tool_output_config: ToolOutputConfig::default(),
-            pruning_config: PruningConfig::default(),
-            compaction_config: crate::config::CompactionConfig::default(),
+            execution_policy: RuntimeExecutionPolicy::default(),
             compaction: crate::session::compaction::SessionCompaction::new(),
-            rate_limit_config: RateLimitConfig::default(),
             snapshot_backend: None,
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
             delegation_context_config: DelegationContextConfig {
@@ -191,8 +188,9 @@ impl TestHarness {
             mcp_tool_defs: Vec::new(),
             permission_cache: StdMutex::new(HashMap::new()),
             current_tools_hash: StdMutex::new(None),
-            function_index: Arc::new(tokio::sync::OnceCell::new()),
+            workspace_handle: Arc::new(tokio::sync::OnceCell::new()),
             turn_snapshot: StdMutex::new(None),
+            pre_turn_snapshot_task: StdMutex::new(None),
             turn_diffs: StdMutex::new(Default::default()),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         });
@@ -434,7 +432,7 @@ async fn test_middleware_stops_execution() {
         provider: old_config.provider.clone(),
         event_bus: old_config.event_bus.clone(),
         agent_registry: old_config.agent_registry.clone(),
-        workspace_index_manager: old_config.workspace_index_manager.clone(),
+        workspace_manager_actor: old_config.workspace_manager_actor.clone(),
         default_mode: old_config.default_mode.clone(),
         tool_config: old_config.tool_config.clone(),
         tool_registry: old_config.tool_registry.clone(),
@@ -446,11 +444,8 @@ async fn test_middleware_stops_execution() {
         mutating_tools: old_config.mutating_tools.clone(),
         max_prompt_bytes: old_config.max_prompt_bytes,
         execution_timeout_secs: old_config.execution_timeout_secs,
-        tool_output_config: old_config.tool_output_config.clone(),
-        pruning_config: old_config.pruning_config.clone(),
-        compaction_config: old_config.compaction_config.clone(),
+        execution_policy: old_config.execution_policy.clone(),
         compaction: old_config.compaction.clone(),
-        rate_limit_config: old_config.rate_limit_config.clone(),
         snapshot_backend: old_config.snapshot_backend.clone(),
         snapshot_gc_config: old_config.snapshot_gc_config.clone(),
         delegation_context_config: old_config.delegation_context_config.clone(),

@@ -1487,8 +1487,12 @@ pub async fn handle_get_file_index(state: &ServerState, conn_id: &str, tx: &mpsc
 
     let root = resolve_workspace_root(&cwd);
 
-    let workspace = match state.workspace_manager.get_or_create(root.clone()).await {
-        Ok(workspace) => workspace,
+    let workspace = match state
+        .workspace_manager
+        .ask(crate::index::GetOrCreate { root: root.clone() })
+        .await
+    {
+        Ok(handle) => handle,
         Err(err) => {
             let _ = send_error(tx, format!("Workspace index error: {}", err)).await;
             return;

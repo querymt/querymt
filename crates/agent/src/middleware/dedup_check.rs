@@ -32,7 +32,8 @@
 
 use crate::event_bus::EventBus;
 use crate::events::AgentEventKind;
-use crate::index::{DiffPaths, FunctionIndex, IndexedFunctionEntry, SimilarFunctionMatch};
+use crate::index::workspace_actor::{FindSimilarToCode, RemoveFile, UpdateFile};
+use crate::index::{DiffPaths, IndexedFunctionEntry, SimilarFunctionMatch, WorkspaceHandle};
 use crate::middleware::factory::MiddlewareFactory;
 use crate::middleware::{
     ConversationContext, ExecutionState, MiddlewareDriver, Result, ToolResult,
@@ -44,7 +45,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tracing::instrument;
 
 /// Location of a function in source code
@@ -202,7 +203,7 @@ impl DedupCheckMiddleware {
     /// Check for duplicate code in changed files
     #[instrument(
         name = "middleware.dedup_check.analyze",
-        skip(self, function_index, changed_paths),
+        skip(self, workspace, changed_paths),
         fields(
             files_to_check = tracing::field::Empty,
             warnings_generated = tracing::field::Empty
@@ -210,7 +211,7 @@ impl DedupCheckMiddleware {
     )]
     async fn check_for_duplicates(
         &self,
-        function_index: &RwLock<FunctionIndex>,
+        workspace: &WorkspaceHandle,
         changed_paths: &DiffPaths,
     ) -> Vec<DuplicateWarning> {
         let mut warnings = Vec::new();
@@ -226,26 +227,75 @@ impl DedupCheckMiddleware {
             return warnings;
         }
 
-        // Read each file and check for duplicates
-        let index = function_index.read().await;
+        log::debug!(
+            "DedupCheckMiddleware: checking {} file(s) for duplicates: {:?}",
+            files_to_check.len(),
+            files_to_check
+        );
 
         for file_path in files_to_check {
             // Read file content
             let source = match std::fs::read_to_string(file_path) {
                 Ok(s) => s,
-                Err(_) => continue,
+                Err(e) => {
+                    log::debug!(
+                        "DedupCheckMiddleware: failed to read {:?}: {}",
+                        file_path,
+                        e
+                    );
+                    continue;
+                }
             };
 
-            // Find similar functions
-            let results = index.find_similar_to_code(file_path, &source);
+            // Find similar functions via actor message
+            let results = workspace
+                .actor
+                .ask(FindSimilarToCode {
+                    file_path: file_path.to_path_buf(),
+                    source,
+                })
+                .await
+                .unwrap_or_default();
+
+            log::debug!(
+                "DedupCheckMiddleware: {:?} — {} function(s) with candidate matches",
+                file_path,
+                results.len()
+            );
 
             for (entry, matches) in results {
+                log::debug!(
+                    "DedupCheckMiddleware: function '{}' ({:?}:{}-{}) has {} candidate(s) \
+                    (threshold={:.3})",
+                    entry.name,
+                    entry.file_path,
+                    entry.start_line,
+                    entry.end_line,
+                    matches.len(),
+                    self.threshold
+                );
+
                 // Filter matches by threshold
-                let filtered_matches: Vec<SimilarMatch> = matches
-                    .iter()
-                    .filter(|m| m.similarity >= self.threshold)
-                    .map(SimilarMatch::from)
-                    .collect();
+                let mut filtered_matches: Vec<SimilarMatch> = Vec::new();
+                for m in &matches {
+                    log::debug!(
+                        "DedupCheckMiddleware:   candidate '{}' in {:?}:{}-{} similarity={:.4} \
+                        ({})",
+                        m.function.name,
+                        m.function.file_path,
+                        m.function.start_line,
+                        m.function.end_line,
+                        m.similarity,
+                        if m.similarity >= self.threshold {
+                            "PASS"
+                        } else {
+                            "below threshold"
+                        }
+                    );
+                    if m.similarity >= self.threshold {
+                        filtered_matches.push(SimilarMatch::from(m));
+                    }
+                }
 
                 if !filtered_matches.is_empty() {
                     warnings.push(DuplicateWarning {
@@ -356,29 +406,34 @@ impl DedupCheckMiddleware {
     /// Update the function index with newly changed files
     #[instrument(
         name = "middleware.dedup_check.update_index",
-        skip(self, function_index, changed_paths),
+        skip(self, workspace, changed_paths),
         fields(
             files_removed = %changed_paths.removed.len(),
             files_updated = tracing::field::Empty
         )
     )]
-    async fn update_index(
-        &self,
-        function_index: &RwLock<FunctionIndex>,
-        changed_paths: &DiffPaths,
-    ) {
-        let mut index = function_index.write().await;
-
+    async fn update_index(&self, workspace: &WorkspaceHandle, changed_paths: &DiffPaths) {
         // Remove deleted files
         for path in &changed_paths.removed {
-            index.remove_file(path);
+            let _ = workspace
+                .actor
+                .tell(RemoveFile {
+                    file_path: path.clone(),
+                })
+                .await;
         }
 
         // Update added/modified files
         let mut files_updated = 0usize;
         for path in changed_paths.changed_files() {
             if let Ok(source) = std::fs::read_to_string(path) {
-                index.update_file(path, &source);
+                let _ = workspace
+                    .actor
+                    .tell(UpdateFile {
+                        file_path: path.to_path_buf(),
+                        source,
+                    })
+                    .await;
                 files_updated += 1;
             }
         }
@@ -418,19 +473,30 @@ impl MiddlewareDriver for DedupCheckMiddleware {
         state: ExecutionState,
         runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
     ) -> Result<ExecutionState> {
+        log::debug!(
+            "DedupCheckMiddleware: on_turn_end called, state={}",
+            state.name()
+        );
+
         if !self.enabled {
+            log::debug!("DedupCheckMiddleware: skipping — disabled");
             tracing::Span::current().record("output_state", state.name());
             return Ok(state);
         }
 
         // Only run on Complete state
         if !matches!(state, ExecutionState::Complete) {
+            log::debug!(
+                "DedupCheckMiddleware: skipping — state is {} (not Complete)",
+                state.name()
+            );
             tracing::Span::current().record("output_state", state.name());
             return Ok(state);
         }
 
         // Guard: only review once per turn
         if self.already_reviewed_this_turn.swap(true, Ordering::SeqCst) {
+            log::debug!("DedupCheckMiddleware: skipping — already reviewed this turn");
             tracing::Span::current().record("output_state", "Complete");
             return Ok(state);
         }
@@ -438,18 +504,24 @@ impl MiddlewareDriver for DedupCheckMiddleware {
         // Get the last context for building BeforeLlmCall state
         let last_context = self.last_context.lock().await.clone();
         let Some(context) = last_context else {
+            log::debug!("DedupCheckMiddleware: skipping — no last_context captured");
             tracing::Span::current().record("output_state", "Complete");
             return Ok(state);
         };
 
         // Get function_index and turn_diffs from the runtime parameter
         let Some(runtime) = runtime else {
+            log::debug!("DedupCheckMiddleware: skipping — no runtime provided");
             tracing::Span::current().record("output_state", "Complete");
             return Ok(state);
         };
 
-        let function_index = runtime.function_index.get().cloned();
-        let Some(function_index) = function_index else {
+        let workspace = runtime.workspace_handle.get().cloned();
+        let Some(workspace) = workspace else {
+            log::debug!(
+                "DedupCheckMiddleware: skipping — workspace index not ready yet \
+                (index is still initializing in the background)"
+            );
             tracing::Span::current().record("output_state", "Complete");
             return Ok(state);
         };
@@ -462,6 +534,7 @@ impl MiddlewareDriver for DedupCheckMiddleware {
         });
 
         let Some(turn_diffs) = turn_diffs else {
+            log::debug!("DedupCheckMiddleware: skipping — turn_diffs mutex poisoned");
             tracing::Span::current().record("files_checked", 0usize);
             tracing::Span::current().record("duplicates_found", 0usize);
             tracing::Span::current().record("review_injected", false);
@@ -470,6 +543,7 @@ impl MiddlewareDriver for DedupCheckMiddleware {
         };
 
         if turn_diffs.is_empty() {
+            log::debug!("DedupCheckMiddleware: skipping — no file changes in this turn");
             tracing::Span::current().record("files_checked", 0usize);
             tracing::Span::current().record("duplicates_found", 0usize);
             tracing::Span::current().record("review_injected", false);
@@ -482,9 +556,7 @@ impl MiddlewareDriver for DedupCheckMiddleware {
         tracing::Span::current().record("files_checked", files_checked);
 
         // Check for duplicates
-        let mut warnings = self
-            .check_for_duplicates(&function_index, &turn_diffs)
-            .await;
+        let mut warnings = self.check_for_duplicates(&workspace, &turn_diffs).await;
 
         // Filter out moved functions
         warnings = self.filter_moved_functions(warnings, &turn_diffs);
@@ -493,7 +565,7 @@ impl MiddlewareDriver for DedupCheckMiddleware {
         tracing::Span::current().record("duplicates_found", warnings.len());
 
         // Update the index with new/modified functions
-        self.update_index(&function_index, &turn_diffs).await;
+        self.update_index(&workspace, &turn_diffs).await;
 
         // If duplicates found after filtering, inject review message
         if !warnings.is_empty() {

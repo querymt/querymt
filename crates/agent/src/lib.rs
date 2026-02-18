@@ -43,4 +43,3 @@ pub use quorum::{AgentQuorum, AgentQuorumBuilder, AgentQuorumError, DelegateAgen
 
 // Re-export kameo actor types
 pub use agent::{AgentConfig, SessionActor, SessionRegistry};
-pub use send_agent::KameoSendAgent;

@@ -3,8 +3,8 @@
 //! These tests validate the complete flow from UI handler through to file restoration.
 //! They simulate what happens when a user clicks "undo" in the dashboard.
 
-use crate::agent::builder::AgentBuilderExt;
-use crate::agent::core::{QueryMTAgent, SnapshotPolicy};
+use crate::agent::agent_config_builder::AgentConfigBuilder;
+use crate::agent::core::{SessionRuntime, SnapshotPolicy};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
@@ -45,13 +45,17 @@ async fn test_undo_handler_single_agent() -> Result<()> {
         snapshot_base.path().to_path_buf(),
     ));
 
-    let agent = QueryMTAgent::new(
+    let builder = AgentConfigBuilder::new(
         Arc::new(registry),
         storage.session_store(),
         LLMParams::new().provider("mock").model("mock"),
     )
     .with_snapshot_policy(SnapshotPolicy::Diff)
     .with_snapshot_backend(snapshot_backend.clone());
+    builder.add_observer(storage.event_observer());
+
+    let config = Arc::new(builder.build());
+    let handle = Arc::new(crate::agent::AgentHandle::from_config(config.clone()));
 
     // Create session with cwd
     let session = storage
@@ -62,24 +66,19 @@ async fn test_undo_handler_single_agent() -> Result<()> {
 
     // Spawn a SessionActor for undo to work (routes through kameo)
     {
-        let runtime = Arc::new(crate::agent::core::SessionRuntime {
-            cwd: Some(worktree.path().to_path_buf()),
-            _mcp_services: std::collections::HashMap::new(),
-            mcp_tools: std::collections::HashMap::new(),
-            mcp_tool_defs: vec![],
-            permission_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            current_tools_hash: std::sync::Mutex::new(None),
-            function_index: Arc::new(tokio::sync::OnceCell::new()),
-            turn_snapshot: std::sync::Mutex::new(None),
-            turn_diffs: std::sync::Mutex::new(Default::default()),
-            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
-        let config = agent.agent_config();
-        let actor =
-            crate::agent::session_actor::SessionActor::new(config, session_id.clone(), runtime);
+        let runtime = SessionRuntime::new(
+            Some(worktree.path().to_path_buf()),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            vec![],
+        );
+        let actor = crate::agent::session_actor::SessionActor::new(
+            config.clone(),
+            session_id.clone(),
+            runtime,
+        );
         let actor_ref = kameo::actor::Spawn::spawn(actor);
-        let registry = agent.kameo_registry();
-        let mut registry = registry.lock().await;
+        let mut registry = handle.registry.lock().await;
         registry.insert(session_id.clone(), actor_ref);
     }
 
@@ -158,21 +157,6 @@ async fn test_undo_handler_single_agent() -> Result<()> {
     );
 
     // Create UI server state
-    let handle = Arc::new(crate::agent::AgentHandle {
-        config: agent.agent_config(),
-        registry: agent.kameo_registry(),
-        client_state: agent.client_state.clone(),
-        client: agent.client.clone(),
-        bridge: agent.bridge.clone(),
-        default_mode: std::sync::Mutex::new(
-            agent
-                .default_mode
-                .lock()
-                .map(|m| *m)
-                .unwrap_or(crate::agent::core::AgentMode::Build),
-        ),
-    });
-
     let state = super::ServerState {
         agent: handle,
         view_store: storage.clone(),
@@ -181,9 +165,9 @@ async fn test_undo_handler_single_agent() -> Result<()> {
         connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        workspace_manager: Arc::new(crate::index::WorkspaceIndexManager::new(
+        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
             crate::index::WorkspaceIndexManagerConfig::default(),
-        )),
+        ),
         model_cache: moka::future::Cache::new(100),
         oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
@@ -257,13 +241,17 @@ async fn test_undo_handler_cross_session() -> Result<()> {
         snapshot_base.path().to_path_buf(),
     ));
 
-    let agent = QueryMTAgent::new(
+    let builder = AgentConfigBuilder::new(
         Arc::new(registry),
         storage.session_store(),
         LLMParams::new().provider("mock").model("mock"),
     )
     .with_snapshot_policy(SnapshotPolicy::Diff)
     .with_snapshot_backend(snapshot_backend.clone());
+    builder.add_observer(storage.event_observer());
+
+    let config = Arc::new(builder.build());
+    let handle = Arc::new(crate::agent::AgentHandle::from_config(config.clone()));
 
     // Create parent and child sessions
     let parent = storage
@@ -284,21 +272,13 @@ async fn test_undo_handler_cross_session() -> Result<()> {
 
     // Spawn SessionActors for undo to work (routes through kameo)
     {
-        let runtime = Arc::new(crate::agent::core::SessionRuntime {
-            cwd: Some(worktree.path().to_path_buf()),
-            _mcp_services: std::collections::HashMap::new(),
-            mcp_tools: std::collections::HashMap::new(),
-            mcp_tool_defs: vec![],
-            permission_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            current_tools_hash: std::sync::Mutex::new(None),
-            function_index: Arc::new(tokio::sync::OnceCell::new()),
-            turn_snapshot: std::sync::Mutex::new(None),
-            turn_diffs: std::sync::Mutex::new(Default::default()),
-            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
-        let config = agent.agent_config();
-        let registry = agent.kameo_registry();
-        let mut registry = registry.lock().await;
+        let runtime = SessionRuntime::new(
+            Some(worktree.path().to_path_buf()),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            vec![],
+        );
+        let mut registry = handle.registry.lock().await;
 
         let parent_actor = crate::agent::session_actor::SessionActor::new(
             config.clone(),
@@ -307,8 +287,11 @@ async fn test_undo_handler_cross_session() -> Result<()> {
         );
         registry.insert(parent_id.clone(), kameo::actor::Spawn::spawn(parent_actor));
 
-        let child_actor =
-            crate::agent::session_actor::SessionActor::new(config, child_id.clone(), runtime);
+        let child_actor = crate::agent::session_actor::SessionActor::new(
+            config.clone(),
+            child_id.clone(),
+            runtime,
+        );
         registry.insert(child_id.clone(), kameo::actor::Spawn::spawn(child_actor));
     }
 
@@ -389,21 +372,6 @@ async fn test_undo_handler_cross_session() -> Result<()> {
     );
 
     // Create UI server state
-    let handle = Arc::new(crate::agent::AgentHandle {
-        config: agent.agent_config(),
-        registry: agent.kameo_registry(),
-        client_state: agent.client_state.clone(),
-        client: agent.client.clone(),
-        bridge: agent.bridge.clone(),
-        default_mode: std::sync::Mutex::new(
-            agent
-                .default_mode
-                .lock()
-                .map(|m| *m)
-                .unwrap_or(crate::agent::core::AgentMode::Build),
-        ),
-    });
-
     let state = super::ServerState {
         agent: handle,
         view_store: storage.clone(),
@@ -412,9 +380,9 @@ async fn test_undo_handler_cross_session() -> Result<()> {
         connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        workspace_manager: Arc::new(crate::index::WorkspaceIndexManager::new(
+        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
             crate::index::WorkspaceIndexManagerConfig::default(),
-        )),
+        ),
         model_cache: moka::future::Cache::new(100),
         oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),

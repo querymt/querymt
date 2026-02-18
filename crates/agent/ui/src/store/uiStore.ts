@@ -103,6 +103,10 @@ export interface UiState {
   setRateLimitState: (sessionId: string, state: RateLimitState | null) => void;
   updateRemainingTime: (sessionId: string) => void;
   clearRateLimitState: (sessionId: string) => void;
+
+  // Live compaction state per session (set on compaction_start, cleared on compaction_end)
+  compactingBySession: Map<string, { tokenEstimate: number; startedAt: number }>;
+  setCompactingState: (sessionId: string, state: { tokenEstimate: number; startedAt: number } | null) => void;
   
   // Per-session timer state cache
   sessionTimerCache: Map<string, SessionTimerState>;
@@ -139,6 +143,7 @@ export const useUiStore = create<UiState>((set, get) => ({
   modeModelPreferences: {},
   selectedTheme: DEFAULT_DASHBOARD_THEME_ID,
   rateLimitBySession: new Map(),
+  compactingBySession: new Map(),
   sessionTimerCache: new Map(),
   
   // Actions
@@ -273,7 +278,18 @@ export const useUiStore = create<UiState>((set, get) => ({
     updated.delete(sessionId);
     return { rateLimitBySession: updated };
   }),
-  
+
+  // Compaction state actions
+  setCompactingState: (sessionId, state) => set((prev) => {
+    const updated = new Map(prev.compactingBySession);
+    if (state === null) {
+      updated.delete(sessionId);
+    } else {
+      updated.set(sessionId, state);
+    }
+    return { compactingBySession: updated };
+  }),
+
   // Timer state actions
   saveSessionTimer: (sessionId, state) => set((prev) => {
     const updated = new Map(prev.sessionTimerCache);

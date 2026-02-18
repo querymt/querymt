@@ -111,18 +111,7 @@ impl SessionRegistry {
             .map_err(|e| Error::new(-32000, e.to_string()))?;
         }
 
-        let runtime = Arc::new(SessionRuntime {
-            cwd: cwd.clone(),
-            _mcp_services: mcp_services,
-            mcp_tools,
-            mcp_tool_defs,
-            permission_cache: std::sync::Mutex::new(HashMap::new()),
-            current_tools_hash: std::sync::Mutex::new(None),
-            function_index: Arc::new(tokio::sync::OnceCell::new()),
-            turn_snapshot: std::sync::Mutex::new(None),
-            turn_diffs: std::sync::Mutex::new(Default::default()),
-            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
+        let runtime = SessionRuntime::new(cwd.clone(), mcp_services, mcp_tools, mcp_tool_defs);
 
         // Spawn the session actor
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone());
@@ -156,14 +145,13 @@ impl SessionRegistry {
 
         // Background: initialize workspace index
         if let Some(cwd_path) = cwd.clone() {
-            let manager = self.config.workspace_index_manager.clone();
+            let manager_actor = self.config.workspace_manager_actor.clone();
             let runtime_clone = runtime.clone();
             tokio::spawn(async move {
                 let root = crate::index::resolve_workspace_root(&cwd_path);
-                match manager.get_or_create(root).await {
-                    Ok(workspace) => {
-                        let index_handle = workspace.function_index_handle();
-                        let _ = runtime_clone.function_index.set(index_handle);
+                match manager_actor.ask(crate::index::GetOrCreate { root }).await {
+                    Ok(handle) => {
+                        let _ = runtime_clone.workspace_handle.set(handle);
                     }
                     Err(e) => log::warn!("Failed to initialize workspace index: {}", e),
                 }
@@ -228,18 +216,7 @@ impl SessionRegistry {
         )
         .await?;
 
-        let runtime = Arc::new(SessionRuntime {
-            cwd,
-            _mcp_services: mcp_services,
-            mcp_tools,
-            mcp_tool_defs,
-            permission_cache: std::sync::Mutex::new(HashMap::new()),
-            current_tools_hash: std::sync::Mutex::new(None),
-            function_index: Arc::new(tokio::sync::OnceCell::new()),
-            turn_snapshot: std::sync::Mutex::new(None),
-            turn_diffs: std::sync::Mutex::new(Default::default()),
-            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
+        let runtime = SessionRuntime::new(cwd, mcp_services, mcp_tools, mcp_tool_defs);
 
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime);
         let actor_ref = SessionActor::spawn(actor);
@@ -367,18 +344,7 @@ impl SessionRegistry {
         )
         .await?;
 
-        let runtime = Arc::new(SessionRuntime {
-            cwd,
-            _mcp_services: mcp_services,
-            mcp_tools,
-            mcp_tool_defs,
-            permission_cache: std::sync::Mutex::new(HashMap::new()),
-            current_tools_hash: std::sync::Mutex::new(None),
-            function_index: Arc::new(tokio::sync::OnceCell::new()),
-            turn_snapshot: std::sync::Mutex::new(None),
-            turn_diffs: std::sync::Mutex::new(Default::default()),
-            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
+        let runtime = SessionRuntime::new(cwd, mcp_services, mcp_tools, mcp_tool_defs);
 
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime);
         let actor_ref = SessionActor::spawn(actor);

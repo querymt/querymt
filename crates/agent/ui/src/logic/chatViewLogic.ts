@@ -5,7 +5,7 @@
  * These functions are pure, side-effect free, and fully testable.
  */
 
-import { EventItem, EventRow, DelegationGroupInfo, Turn, RateLimitState } from '../types';
+import { EventItem, EventRow, DelegationGroupInfo, Turn, RateLimitState, TurnCompaction } from '../types';
 
 // Model timeline entry
 export interface ModelTimelineEntry {
@@ -60,6 +60,21 @@ export function buildTurns(events: EventItem[], sessionThinkingAgentId: string |
   hasMultipleModels: boolean;
   delegations: DelegationGroupInfo[];
 } {
+  // Pre-scan for compaction_end events (type: 'system' with compactionSummary set).
+  // These are not routed through buildEventRowsWithDelegations (system events are skipped),
+  // so we handle them here and attach them to the preceding turn by timestamp.
+  const compactionEndEvents: Array<{ timestamp: number; compaction: TurnCompaction }> = events
+    .filter(e => e.type === 'system' && e.compactionSummary)
+    .map(e => ({
+      timestamp: e.timestamp,
+      compaction: {
+        tokenEstimate: e.compactionTokenEstimate ?? 0,
+        summary: e.compactionSummary!,
+        summaryLen: e.compactionSummaryLen ?? e.compactionSummary!.length,
+        timestamp: e.timestamp,
+      },
+    }));
+
   // First, build event rows with delegation grouping (from previous implementation)
   const { rows, delegationGroups } = buildEventRowsWithDelegations(events);
   
@@ -104,8 +119,8 @@ export function buildTurns(events: EventItem[], sessionThinkingAgentId: string |
         modelConfigId: activeModel?.configId,
       };
     } else if (currentTurn) {
-      // Add to current turn (only real messages, not internal events)
-      if (row.type === 'agent' && row.isMessage) {
+      // Add to current turn (real messages + live streaming accumulators)
+      if (row.type === 'agent' && (row.isMessage || row.isStreamDelta)) {
         currentTurn.agentMessages.push(row);
         if (!currentTurn.agentId && row.agentId) {
           currentTurn.agentId = row.agentId;
@@ -132,8 +147,8 @@ export function buildTurns(events: EventItem[], sessionThinkingAgentId: string |
         currentTurn.modelLabel = `${row.provider} / ${row.model}`;
         currentTurn.modelConfigId = row.configId;
       }
-    } else if (row.type === 'agent' && row.isMessage) {
-      // No current turn (agent-initiated message)
+    } else if (row.type === 'agent' && (row.isMessage || row.isStreamDelta)) {
+      // No current turn (agent-initiated message or live streaming accumulator)
       // Get active model at turn start
       const activeModel = getActiveModelAt(modelTimeline, row.timestamp);
       
@@ -158,6 +173,22 @@ export function buildTurns(events: EventItem[], sessionThinkingAgentId: string |
   if (currentTurn) {
     currentTurn.isActive = sessionThinkingAgentId !== null;
     turns.push(currentTurn);
+  }
+
+  // Attach compaction data to turns: for each compaction_end event, find the last
+  // turn whose startTime is before the compaction timestamp and attach to it.
+  for (const { timestamp, compaction } of compactionEndEvents) {
+    // Walk turns in reverse to find the most recent turn before this compaction
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (turns[i].startTime <= timestamp) {
+        // Only attach the first (earliest-timestamp) compaction for this turn;
+        // multiple compactions per turn are extremely unlikely but handled safely.
+        if (!turns[i].compaction) {
+          turns[i] = { ...turns[i], compaction };
+        }
+        break;
+      }
+    }
   }
 
   return {

@@ -270,12 +270,14 @@ pub async fn subscribe_to_file_index(
     workspace_root: std::path::PathBuf,
 ) {
     // Get the workspace and subscribe to its file index updates
-    let workspace = match state
+    let handle = match state
         .workspace_manager
-        .get_or_create(workspace_root.clone())
+        .ask(crate::index::GetOrCreate {
+            root: workspace_root.clone(),
+        })
         .await
     {
-        Ok(workspace) => workspace,
+        Ok(handle) => handle,
         Err(err) => {
             log::error!(
                 "Failed to get workspace for file index subscription: {}",
@@ -285,7 +287,7 @@ pub async fn subscribe_to_file_index(
         }
     };
 
-    let mut index_rx = workspace.file_watcher().subscribe_index();
+    let mut index_rx = handle.file_watcher.subscribe_index();
 
     // Update connection state to track which workspace we're subscribed to
     {
@@ -305,7 +307,7 @@ pub async fn subscribe_to_file_index(
     // When subscribing to a broadcast channel, we only receive FUTURE messages.
     // If the workspace already existed (cached), the initial index was sent before we subscribed.
     // This ensures new subscribers get the current state immediately.
-    if let Some(current_index) = workspace.file_index() {
+    if let Some(current_index) = handle.file_index() {
         // Get current session's cwd to filter the index
         let cwd = {
             let connections = state.connections.lock().await;

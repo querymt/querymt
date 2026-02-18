@@ -65,7 +65,7 @@
         ];
 
         agentUi = pkgs.buildNpmPackage {
-          pname = "qmt-agent-ui";
+          pname = "querymt-agent-ui";
           version = agentCargoToml.package.version;
           src = ./crates/agent/ui;
           npmDepsHash = "sha256-EHiEmsoECK9+O56+zgbrfSR5hriFXYnS0VIZ0FMQY54=";
@@ -81,8 +81,8 @@
         packages = {
           agent-ui = agentUi;
 
-          qmt-agent = pkgs.rustPlatform.buildRustPackage {
-            pname = "qmt-agent";
+          querymt-agent = pkgs.rustPlatform.buildRustPackage {
+            pname = "querymt-agent";
             version = agentCargoToml.package.version;
             src = ./.;
             cargoLock = {
@@ -91,7 +91,7 @@
             };
             cargoBuildFlags = [
               "-p"
-              "qmt-agent"
+              "querymt-agent"
               "--example"
               "coder_agent"
               "--features"
@@ -118,7 +118,7 @@
             installPhase = ''
               runHook preInstall
               mkdir -p $out/bin
-              install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/examples/coder_agent $out/bin/qmt-agent
+              install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/examples/coder_agent $out/bin/querymt-agent
               runHook postInstall
             '';
           };
@@ -164,9 +164,9 @@
         };
 
         apps = {
-          qmt-agent = {
+          querymt-agent = {
             type = "app";
-            program = "${self.packages.${system}.qmt-agent}/bin/qmt-agent";
+            program = "${self.packages.${system}.querymt-agent}/bin/querymt-agent";
           };
           qmt = {
             type = "app";
