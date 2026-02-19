@@ -5,6 +5,7 @@
 import { useState } from 'react';
 import { ChevronDown, ChevronRight, Loader } from 'lucide-react';
 import { EventRow, DelegationGroupInfo, UiAgentInfo } from '../types';
+import { isDelegationAwaitingInput } from '../logic/chatViewLogic';
 import { ToolSummary } from './ToolSummary';
 import { DelegationSummaryCard } from './DelegationSummaryCard';
 
@@ -92,6 +93,9 @@ export function ActivitySection({
             const delegationGroup = isDelegate && toolEvent.delegationGroupId
               ? delegations.find(d => d.id === toolEvent.delegationGroupId)
               : undefined;
+            const isAwaitingInput = delegationGroup
+              ? isDelegationAwaitingInput(delegationGroup)
+              : false;
 
             return (
               <div key={toolEvent.id}>
@@ -99,6 +103,7 @@ export function ActivitySection({
                   event={toolEvent}
                   onClick={() => onToolClick(toolEvent)}
                   isDelegate={isDelegate}
+                  isAwaitingInput={isAwaitingInput}
                   onDelegateClick={delegationGroup ? () => onDelegateClick(delegationGroup.id) : undefined}
                 />
 

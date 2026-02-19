@@ -16,6 +16,7 @@ import {
   hasMultipleModels,
   buildTurns,
   buildDelegationTurn,
+  isDelegationAwaitingInput,
   buildEventRowsWithDelegations,
   inferToolName,
 } from './chatViewLogic';
@@ -983,6 +984,86 @@ describe('buildDelegationTurn', () => {
     const turn = buildDelegationTurn(group);
     
     expect(turn.agentId).toBe('fallback-agent');
+  });
+});
+
+describe('isDelegationAwaitingInput', () => {
+  beforeEach(() => {
+    resetFixtureCounter();
+  });
+
+  const elicitationData = {
+    elicitationId: 'elic-1',
+    sessionId: 'sess-1',
+    message: 'Need approval',
+    requestedSchema: {},
+    source: 'builtin:shell_guard',
+  };
+
+  it('returns true when in_progress and latest event is elicitation', () => {
+    const events = [
+      makeAgentEvent('Delegated work', { agentId: 'specialist' }),
+      makeToolCallEvent('question', {
+        agentId: 'specialist',
+        elicitationData,
+      }),
+    ];
+
+    const { rows } = buildEventRowsWithDelegations(events);
+    const group = {
+      id: 'del-1',
+      delegateToolCallId: 'delegate:123',
+      delegateEvent: rows[0],
+      events: rows,
+      status: 'in_progress' as const,
+      startTime: 1000,
+    };
+
+    expect(isDelegationAwaitingInput(group)).toBe(true);
+  });
+
+  it('returns false when delegation is completed', () => {
+    const events = [
+      makeToolCallEvent('question', {
+        agentId: 'specialist',
+        elicitationData,
+      }),
+    ];
+
+    const { rows } = buildEventRowsWithDelegations(events);
+    const group = {
+      id: 'del-1',
+      delegateToolCallId: 'delegate:123',
+      delegateEvent: rows[0],
+      events: rows,
+      status: 'completed' as const,
+      startTime: 1000,
+      endTime: 1200,
+    };
+
+    expect(isDelegationAwaitingInput(group)).toBe(false);
+  });
+
+  it('returns false when newer non-elicitation activity exists', () => {
+    const events = [
+      makeToolCallEvent('question', {
+        agentId: 'specialist',
+        elicitationData,
+      }),
+      makeToolCallEvent('shell', { agentId: 'specialist' }),
+    ];
+
+    const { rows } = buildEventRowsWithDelegations(events);
+    const group = {
+      id: 'del-1',
+      delegateToolCallId: 'delegate:123',
+      delegateEvent: rows[0],
+      events: rows,
+      status: 'in_progress' as const,
+      startTime: 1000,
+    };
+
+    expect(isDelegationAwaitingInput(group)).toBe(false);
   });
 });
 

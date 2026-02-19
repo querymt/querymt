@@ -432,8 +432,23 @@ pub async fn handle_rpc_message<S: SendAgent>(
                                 content: params.content,
                             };
 
-                            let mut pending = pending_elicitations.lock().await;
-                            if let Some(tx) = pending.remove(&params.elicitation_id) {
+                            let mut tx = {
+                                let mut pending = pending_elicitations.lock().await;
+                                pending.remove(&params.elicitation_id)
+                            };
+
+                            if tx.is_none()
+                                && let Some(query_agent) =
+                                    agent.as_any().downcast_ref::<QueryMTAgent>()
+                            {
+                                tx = crate::elicitation::take_pending_elicitation_sender(
+                                    query_agent,
+                                    &params.elicitation_id,
+                                )
+                                .await;
+                            }
+
+                            if let Some(tx) = tx {
                                 let _ = tx.send(response);
                                 Ok(serde_json::Value::Null)
                             } else {
@@ -474,7 +489,18 @@ pub async fn handle_rpc_message<S: SendAgent>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::builder::AgentBuilderExt;
+    use crate::delegation::{AgentInfo, DefaultAgentRegistry};
+    use crate::elicitation::ElicitationAction;
     use crate::events::AgentEventKind;
+    use crate::session::backend::StorageBackend;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use crate::test_utils::empty_plugin_registry;
+    use querymt::LLMParams;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tokio::sync::oneshot;
 
     fn tool_start_event(tool_name: &str, arguments: serde_json::Value) -> AgentEvent {
         AgentEvent {
@@ -584,5 +610,83 @@ mod tests {
             translate_event_to_update(&end),
             Some(SessionUpdate::ToolCallUpdate(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn elicitation_result_routes_to_delegate_pending_map() {
+        let (planner_registry, _planner_cfg_dir) = empty_plugin_registry().unwrap();
+        let planner_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let planner = QueryMTAgent::new(
+            Arc::new(planner_registry),
+            planner_storage.session_store(),
+            LLMParams::new().provider("mock").model("mock"),
+        );
+
+        let (delegate_registry, _delegate_cfg_dir) = empty_plugin_registry().unwrap();
+        let delegate_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let delegate = Arc::new(QueryMTAgent::new(
+            Arc::new(delegate_registry),
+            delegate_storage.session_store(),
+            LLMParams::new().provider("mock").model("mock"),
+        ));
+
+        let mut registry = DefaultAgentRegistry::new();
+        registry.register(
+            AgentInfo {
+                id: "coder".to_string(),
+                name: "Coder".to_string(),
+                description: "Delegate".to_string(),
+                capabilities: vec![],
+                required_capabilities: vec![],
+                meta: None,
+            },
+            delegate.clone(),
+        );
+        let planner = planner.with_agent_registry(Arc::new(registry));
+
+        let elicitation_id = "delegate-elicitation-rpc".to_string();
+        let (tx, rx) = oneshot::channel();
+        delegate
+            .pending_elicitations()
+            .lock()
+            .await
+            .insert(elicitation_id.clone(), tx);
+
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations = planner.pending_elicitations();
+
+        let response = handle_rpc_message(
+            &planner,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-1",
+            RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "elicitation_result".to_string(),
+                params: serde_json::json!({
+                    "elicitation_id": elicitation_id,
+                    "action": "accept",
+                    "content": {"selection": "allow_once"}
+                }),
+                id: serde_json::json!(1),
+            },
+        )
+        .await;
+
+        assert!(
+            response.error.is_none(),
+            "rpc should succeed: {:?}",
+            response.error
+        );
+        let delivered = rx
+            .await
+            .expect("delegate elicitation should receive response");
+        assert_eq!(delivered.action, ElicitationAction::Accept);
+        assert_eq!(
+            delivered.content,
+            Some(serde_json::json!({"selection": "allow_once"}))
+        );
     }
 }
