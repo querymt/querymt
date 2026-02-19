@@ -230,34 +230,42 @@ export function StatsDrawer({
                   <div className="text-[10px] uppercase tracking-wider text-ui-muted mb-1">
                     Cost
                   </div>
-                  <div className="text-2xl font-mono font-semibold text-accent-primary">
-                    {formatCost(session.totalCostUsd)}
-                    {session.limits?.max_cost_usd && (
-                      <span className="text-sm text-ui-muted">
-                        /{formatCost(session.limits.max_cost_usd)}
-                      </span>
-                    )}
-                  </div>
-                  {session.limits?.max_cost_usd && (
+                  {session.hasCostData ? (
                     <>
-                      <div className="mt-2 w-full bg-surface-canvas rounded-full h-1.5 overflow-hidden">
-                        <div
-                          className="h-full bg-gradient-to-r from-status-success to-status-warning transition-all"
-                          style={{
-                            width: formatPercentage(
+                      <div className="text-2xl font-mono font-semibold text-accent-primary">
+                        {formatCost(session.totalCostUsd)}
+                        {session.limits?.max_cost_usd && (
+                          <span className="text-sm text-ui-muted">
+                            /{formatCost(session.limits.max_cost_usd)}
+                          </span>
+                        )}
+                      </div>
+                      {session.limits?.max_cost_usd && (
+                        <>
+                          <div className="mt-2 w-full bg-surface-canvas rounded-full h-1.5 overflow-hidden">
+                            <div
+                              className="h-full bg-gradient-to-r from-status-success to-status-warning transition-all"
+                              style={{
+                                width: formatPercentage(
+                                  session.totalCostUsd,
+                                  session.limits.max_cost_usd
+                                ),
+                              }}
+                            />
+                          </div>
+                          <div className="mt-1 text-[10px] text-ui-muted">
+                            {formatPercentage(
                               session.totalCostUsd,
                               session.limits.max_cost_usd
-                            ),
-                          }}
-                        />
-                      </div>
-                      <div className="mt-1 text-[10px] text-ui-muted">
-                        {formatPercentage(
-                          session.totalCostUsd,
-                          session.limits.max_cost_usd
-                        )} of limit
-                      </div>
+                            )} of limit
+                          </div>
+                        </>
+                      )}
                     </>
+                  ) : (
+                    <div className="text-lg font-mono text-ui-muted">
+                      N/A
+                    </div>
                   )}
                 </div>
               </div>
@@ -324,7 +332,7 @@ export function StatsDrawer({
                             </div>
                             <div className="flex items-center gap-4 text-xs text-ui-muted">
                               <span>ctx:{formatTokensAbbrev(agentStats.currentContextTokens)}</span>
-                              <span>{formatCost(agentStats.costUsd)}</span>
+                              {session.hasCostData && <span>{formatCost(agentStats.costUsd)}</span>}
                               <span>🔧{agentStats.toolCallCount}</span>
                               <span>{formatDuration(agentElapsed)}</span>
                             </div>

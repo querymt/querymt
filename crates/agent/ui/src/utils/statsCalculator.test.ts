@@ -71,6 +71,25 @@ describe('calculateStats', () => {
       expect(result.session.totalCostUsd).toBeCloseTo(0.30); // Uses cumulative
     });
 
+    it('sets hasCostData=true when events have costUsd', () => {
+      const events = [
+        makeAgentEvent('response 1', { costUsd: 0.10 }),
+      ];
+      const result = calculateStats(events);
+      expect(result.session.hasCostData).toBe(true);
+    });
+
+    it('sets hasCostData=false when no events have costUsd (OAuth)', () => {
+      const events = [
+        makeAgentEvent('response 1'),
+        makeAgentEvent('response 2'),
+        makeToolCallEvent('read_tool'),
+      ];
+      const result = calculateStats(events);
+      expect(result.session.hasCostData).toBe(false);
+      expect(result.session.totalCostUsd).toBe(0);
+    });
+
     it('falls back to sum of costUsd when cumulativeCostUsd not available', () => {
       const events = [
         makeAgentEvent('response 1', { costUsd: 0.10 }),

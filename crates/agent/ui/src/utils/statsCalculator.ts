@@ -9,6 +9,7 @@ export function calculateStats(events: EventItem[], sessionLimits?: SessionLimit
   let totalToolCalls = 0;
   let latestCumulativeCost: number | undefined;
   let sessionStartTimestamp: number | undefined;
+  let hasCostData = false;
   
   for (const event of events) {
     if (event.type === 'system') {
@@ -71,6 +72,7 @@ export function calculateStats(events: EventItem[], sessionLimits?: SessionLimit
     }
     
     if (event.costUsd !== undefined) {
+      hasCostData = true;
       stats.costUsd += event.costUsd;
       totalCostUsd += event.costUsd;
     }
@@ -100,6 +102,7 @@ export function calculateStats(events: EventItem[], sessionLimits?: SessionLimit
   
   const session: SessionStats = {
     totalCostUsd: sessionTotalCost,
+    hasCostData,
     totalMessages,
     totalToolCalls,
     startTimestamp: sessionStartTimestamp,

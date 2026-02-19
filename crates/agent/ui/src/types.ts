@@ -182,6 +182,9 @@ export interface AgentStats {
 // Session-level statistics
 export interface SessionStats {
   totalCostUsd: number;
+  /** True when at least one event carried a non-null costUsd value.
+   *  False for OAuth sessions where the backend omits cost data. */
+  hasCostData: boolean;
   totalMessages: number;
   totalToolCalls: number;
   startTimestamp?: number;     // First event timestamp (for live timer calculation)
