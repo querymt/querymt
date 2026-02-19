@@ -136,15 +136,37 @@ impl SemanticEditTool {
             "imports" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Imports)),
             "class" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Class)),
             "function" | "def" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Def)),
+            "async-def" => Box::new(python::CompiledQuery::from(python::PreparedQuery::AsyncDef)),
+            "methods" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Methods)),
+            "class-methods" => Box::new(python::CompiledQuery::from(
+                python::PreparedQuery::ClassMethods,
+            )),
+            "static-methods" => Box::new(python::CompiledQuery::from(
+                python::PreparedQuery::StaticMethods,
+            )),
             "function-calls" => Box::new(python::CompiledQuery::from(
                 python::PreparedQuery::FunctionCalls,
             )),
             "function-names" => Box::new(python::CompiledQuery::from(
                 python::PreparedQuery::FunctionNames,
             )),
+            "with" => Box::new(python::CompiledQuery::from(python::PreparedQuery::With)),
+            "try" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Try)),
+            "lambda" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Lambda)),
+            "globals" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Globals)),
+            "variable-identifiers" => Box::new(python::CompiledQuery::from(
+                python::PreparedQuery::VariableIdentifiers,
+            )),
+            "types" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Types)),
+            "identifiers" => Box::new(python::CompiledQuery::from(
+                python::PreparedQuery::Identifiers,
+            )),
             s => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported Python scope: {}. Must be one of: comments, strings, doc-strings, imports, class, function, function-calls, function-names",
+                    "Unsupported Python scope: {}. Must be one of: async-def, class, class-methods, \
+comments, doc-strings, function, function-calls, function-names, globals, \
+identifiers, imports, lambda, methods, static-methods, strings, try, types, \
+variable-identifiers, with",
                     s
                 )));
             }
@@ -183,8 +205,39 @@ impl SemanticEditTool {
                     TreeSitterRegex(regex),
                 )))
             }
-            ("fn" | "function", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Fn)),
+            ("fn" | "function", None) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Fn))
+            }
+            ("fn" | "function", Some(pattern)) => {
+                let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
+                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                })?;
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::FnNamed(
+                    TreeSitterRegex(regex),
+                )))
+            }
+            ("impl-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ImplFn)),
+            ("priv-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PrivFn)),
+            ("pub-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubFn)),
+            ("pub-crate-fn", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubCrateFn))
+            }
+            ("pub-self-fn", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubSelfFn))
+            }
+            ("pub-super-fn", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubSuperFn))
+            }
+            ("async-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::AsyncFn)),
+            ("const-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ConstFn)),
+            ("unsafe-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::UnsafeFn)),
+            ("extern-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ExternFn)),
+            ("test-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::TestFn)),
             ("impl", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Impl)),
+            ("impl-type", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ImplType)),
+            ("impl-trait", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ImplTrait))
+            }
             ("trait", None) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Trait)),
             ("trait", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
@@ -194,15 +247,64 @@ impl SemanticEditTool {
                     TreeSitterRegex(regex),
                 )))
             }
+            ("mod", None) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Mod)),
+            ("mod", Some(pattern)) => {
+                let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
+                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                })?;
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ModNamed(
+                    TreeSitterRegex(regex),
+                )))
+            }
+            ("mod-tests", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ModTests)),
+            ("priv-struct", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PrivStruct))
+            }
+            ("pub-struct", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubStruct))
+            }
+            ("pub-crate-struct", _) => Box::new(rust::CompiledQuery::from(
+                rust::PreparedQuery::PubCrateStruct,
+            )),
+            ("pub-self-struct", _) => Box::new(rust::CompiledQuery::from(
+                rust::PreparedQuery::PubSelfStruct,
+            )),
+            ("pub-super-struct", _) => Box::new(rust::CompiledQuery::from(
+                rust::PreparedQuery::PubSuperStruct,
+            )),
+            ("priv-enum", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PrivEnum)),
+            ("pub-crate-enum", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubCrateEnum))
+            }
+            ("pub-self-enum", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubSelfEnum))
+            }
+            ("pub-super-enum", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubSuperEnum))
+            }
+            ("enum-variant", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::EnumVariant))
+            }
             ("attribute", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Attribute)),
             ("unsafe", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Unsafe)),
             ("pub-enum", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubEnum)),
+            ("type-def", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::TypeDef)),
             ("type-identifier", _) => Box::new(rust::CompiledQuery::from(
                 rust::PreparedQuery::TypeIdentifier,
             )),
+            ("identifier", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Identifier))
+            }
+            ("closure", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Closure)),
             (s, _) => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported Rust scope: {}. Must be one of: comments, strings, doc-comments, uses, struct, enum, function, impl, trait, attribute, unsafe, pub-enum, type-identifier",
+                    "Unsupported Rust scope: {}. Must be one of: async-fn, attribute, closure, \
+comments, const-fn, doc-comments, enum, enum-variant, extern-fn, fn, \
+identifier, impl, impl-fn, impl-trait, impl-type, mod, mod-tests, priv-enum, \
+priv-fn, priv-struct, pub-crate-enum, pub-crate-fn, pub-crate-struct, pub-enum, \
+pub-fn, pub-self-enum, pub-self-fn, pub-self-struct, pub-struct, pub-super-enum, \
+pub-super-fn, pub-super-struct, strings, struct, test-fn, trait, type-def, \
+type-identifier, unsafe, unsafe-fn, uses",
                     s
                 )));
             }
@@ -229,7 +331,17 @@ impl SemanticEditTool {
                     TreeSitterRegex(regex),
                 )))
             }
-            ("function" | "func", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Func)),
+            ("function" | "func", None) => {
+                Box::new(go::CompiledQuery::from(go::PreparedQuery::Func))
+            }
+            ("function" | "func", Some(pattern)) => {
+                let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
+                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                })?;
+                Box::new(go::CompiledQuery::from(go::PreparedQuery::FuncNamed(
+                    TreeSitterRegex(regex),
+                )))
+            }
             ("interface", None) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Interface)),
             ("interface", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
@@ -239,9 +351,28 @@ impl SemanticEditTool {
                     TreeSitterRegex(regex),
                 )))
             }
+            ("const", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Const)),
+            ("var", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Var)),
+            ("method", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Method)),
+            ("free-func", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::FreeFunc)),
+            ("init-func", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::InitFunc)),
+            ("expression", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Expression)),
+            ("type-def", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::TypeDef)),
+            ("type-alias", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::TypeAlias)),
+            ("type-params", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::TypeParams)),
+            ("defer", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Defer)),
+            ("select", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Select)),
+            ("go", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Go)),
+            ("switch", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Switch)),
+            ("labeled", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Labeled)),
+            ("goto", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Goto)),
+            ("struct-tags", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::StructTags)),
             (s, _) => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported Go scope: {}. Must be one of: comments, strings, imports, struct, function, interface",
+                    "Unsupported Go scope: {}. Must be one of: comments, const, defer, expression, \
+free-func, func, go, goto, imports, init-func, interface, labeled, method, \
+select, strings, struct, struct-tags, switch, type-alias, type-def, type-params, \
+var",
                     s
                 )));
             }
@@ -271,12 +402,57 @@ impl SemanticEditTool {
             "function" => Box::new(typescript::CompiledQuery::from(
                 typescript::PreparedQuery::Function,
             )),
+            "async-function" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::AsyncFunction,
+            )),
+            "sync-function" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::SyncFunction,
+            )),
+            "method" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Method,
+            )),
+            "constructor" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Constructor,
+            )),
             "interface" => Box::new(typescript::CompiledQuery::from(
                 typescript::PreparedQuery::Interface,
             )),
+            "enum" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Enum,
+            )),
+            "try-catch" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::TryCatch,
+            )),
+            "var-decl" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::VarDecl,
+            )),
+            "let" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Let,
+            )),
+            "const" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Const,
+            )),
+            "var" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Var,
+            )),
+            "type-params" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::TypeParams,
+            )),
+            "type-alias" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::TypeAlias,
+            )),
+            "namespace" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Namespace,
+            )),
+            "export" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Export,
+            )),
             s => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported TypeScript scope: {}. Must be one of: comments, strings, imports, class, function, interface",
+                    "Unsupported TypeScript scope: {}. Must be one of: async-function, class, \
+comments, const, constructor, enum, export, function, imports, interface, let, \
+method, namespace, strings, sync-function, try-catch, type-alias, type-params, \
+var, var-decl",
                     s
                 )));
             }
@@ -293,11 +469,28 @@ impl SemanticEditTool {
         let query: Box<dyn Scoper> = match scope {
             "comments" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Comments)),
             "strings" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Strings)),
-            "function" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Function)),
+            "includes" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Includes)),
+            "type-def" => Box::new(c::CompiledQuery::from(c::PreparedQuery::TypeDef)),
+            "enum" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Enum)),
             "struct" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Struct)),
+            "union" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Union)),
+            "variable" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Variable)),
+            "function" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Function)),
+            "function-def" => Box::new(c::CompiledQuery::from(c::PreparedQuery::FunctionDef)),
+            "function-decl" => Box::new(c::CompiledQuery::from(c::PreparedQuery::FunctionDecl)),
+            "switch" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Switch)),
+            "if" => Box::new(c::CompiledQuery::from(c::PreparedQuery::If)),
+            "for" => Box::new(c::CompiledQuery::from(c::PreparedQuery::For)),
+            "while" => Box::new(c::CompiledQuery::from(c::PreparedQuery::While)),
+            "do" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Do)),
+            "identifier" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Identifier)),
+            "declaration" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Declaration)),
+            "call-expression" => Box::new(c::CompiledQuery::from(c::PreparedQuery::CallExpression)),
             s => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported C scope: {}. Must be one of: comments, strings, function, struct",
+                    "Unsupported C scope: {}. Must be one of: call-expression, comments, \
+declaration, do, enum, for, function, function-decl, function-def, identifier, \
+if, includes, strings, struct, switch, type-def, union, variable, while",
                     s
                 )));
             }
@@ -314,13 +507,38 @@ impl SemanticEditTool {
         let query: Box<dyn Scoper> = match scope {
             "comments" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Comments)),
             "strings" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Strings)),
+            "usings" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Usings)),
+            "struct" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Struct)),
+            "enum" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Enum)),
+            "interface" => Box::new(csharp::CompiledQuery::from(
+                csharp::PreparedQuery::Interface,
+            )),
             "class" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Class)),
             "function" | "method" => {
                 Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Method))
             }
+            "constructor" => Box::new(csharp::CompiledQuery::from(
+                csharp::PreparedQuery::Constructor,
+            )),
+            "destructor" => Box::new(csharp::CompiledQuery::from(
+                csharp::PreparedQuery::Destructor,
+            )),
+            "field" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Field)),
+            "property" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Property)),
+            "variable-declaration" => Box::new(csharp::CompiledQuery::from(
+                csharp::PreparedQuery::VariableDeclaration,
+            )),
+            "attribute" => Box::new(csharp::CompiledQuery::from(
+                csharp::PreparedQuery::Attribute,
+            )),
+            "identifier" => Box::new(csharp::CompiledQuery::from(
+                csharp::PreparedQuery::Identifier,
+            )),
             s => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported C# scope: {}. Must be one of: comments, strings, class, function",
+                    "Unsupported C# scope: {}. Must be one of: attribute, class, comments, \
+constructor, destructor, enum, field, function, identifier, interface, property, \
+strings, struct, usings, variable-declaration",
                     s
                 )));
             }
@@ -331,17 +549,47 @@ impl SemanticEditTool {
 
     fn apply_hcl_scope<'a>(
         scope: &str,
-        _scope_pattern: Option<&str>,
+        scope_pattern: Option<&str>,
         builder: &mut ScopedViewBuilder<'a>,
     ) -> Result<(), ToolError> {
-        let query: Box<dyn Scoper> = match scope {
-            "comments" => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Comments)),
-            "strings" => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Strings)),
-            "resource" => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Resource)),
-            "variable" => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Variable)),
-            s => {
+        let query: Box<dyn Scoper> = match (scope, scope_pattern) {
+            ("comments", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Comments)),
+            ("strings", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Strings)),
+            ("variable", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Variable)),
+            ("resource", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Resource)),
+            ("data", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Data)),
+            ("output", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Output)),
+            ("provider", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Provider)),
+            ("required-providers", None) => Box::new(hcl::CompiledQuery::from(
+                hcl::PreparedQuery::RequiredProviders,
+            )),
+            ("required-providers", Some(pattern)) => {
+                let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
+                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                })?;
+                Box::new(hcl::CompiledQuery::from(
+                    hcl::PreparedQuery::RequiredProvidersNamed(TreeSitterRegex(regex)),
+                ))
+            }
+            ("terraform", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Terraform)),
+            ("locals", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Locals)),
+            ("module", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Module)),
+            ("variables", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Variables)),
+            ("resource-names", _) => {
+                Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::ResourceNames))
+            }
+            ("resource-types", _) => {
+                Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::ResourceTypes))
+            }
+            ("data-names", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::DataNames)),
+            ("data-sources", _) => {
+                Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::DataSources))
+            }
+            (s, _) => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported HCL scope: {}. Must be one of: comments, strings, resource, variable",
+                    "Unsupported HCL scope: {}. Must be one of: comments, data, data-names, \
+data-sources, locals, module, output, provider, required-providers, \
+resource, resource-names, resource-types, strings, terraform, variable, variables",
                     s
                 )));
             }
@@ -510,13 +758,34 @@ EXAMPLES:
 - Find unsafe blocks: {language: "rust", scope: "unsafe"}
 
 SCOPES BY LANGUAGE:
-Python: comments, strings, doc-strings, imports, class, function, function-calls, function-names
-Rust: comments, strings, doc-comments, uses, struct, enum, function, impl, trait, attribute, unsafe, pub-enum, type-identifier
-Go: comments, strings, imports, struct, function, interface
-TypeScript: comments, strings, imports, class, function, interface
-C: comments, strings, function, struct
-C#: comments, strings, class, function
-HCL: comments, strings, resource, variable
+Python: async-def, class, class-methods, comments, doc-strings, function,
+  function-calls, function-names, globals, identifiers, imports, lambda,
+  methods, static-methods, strings, try, types, variable-identifiers, with
+Rust: async-fn, attribute, closure, comments, const-fn, doc-comments, enum,
+  enum-variant, extern-fn, fn, identifier, impl, impl-fn, impl-trait, impl-type,
+  mod, mod-tests, priv-enum, priv-fn, priv-struct, pub-crate-enum, pub-crate-fn,
+  pub-crate-struct, pub-enum, pub-fn, pub-self-enum, pub-self-fn, pub-self-struct,
+  pub-struct, pub-super-enum, pub-super-fn, pub-super-struct, strings, struct,
+  test-fn, trait, type-def, type-identifier, unsafe, unsafe-fn, uses
+Go: comments, const, defer, expression, free-func, func, go, goto, imports,
+  init-func, interface, labeled, method, select, strings, struct, struct-tags,
+  switch, type-alias, type-def, type-params, var
+TypeScript: async-function, class, comments, const, constructor, enum, export,
+  function, imports, interface, let, method, namespace, strings, sync-function,
+  try-catch, type-alias, type-params, var, var-decl
+C: call-expression, comments, declaration, do, enum, for, function, function-decl,
+  function-def, identifier, if, includes, strings, struct, switch, type-def,
+  union, variable, while
+C#: attribute, class, comments, constructor, destructor, enum, field, function,
+  identifier, interface, property, strings, struct, usings, variable-declaration
+HCL: comments, data, data-names, data-sources, locals, module, output, provider,
+  required-providers, resource, resource-names, resource-types, strings, terraform,
+  variable, variables
+
+scope_pattern (regex on name) supported for:
+  Rust: fn/function, mod, struct, enum, trait
+  Go: func/function, interface, struct
+  HCL: required-providers
 
 Walks directories recursively, respects .gitignore. Set path to limit scope.
 Transform mode modifies files in-place."#.to_string(),
@@ -538,7 +807,7 @@ Transform mode modifies files in-place."#.to_string(),
                         },
                         "scope_pattern": {
                             "type": "string",
-                            "description": "Optional regex pattern to filter scoped items by name. Only supported for some scopes in Rust/Go (struct, enum, trait, interface)."
+                            "description": "Optional regex pattern to filter scoped items by name. Only supported for some scopes in Rust/Go (struct, enum, trait, interface) and HCL (required-providers)."
                         },
                         "pattern": {
                             "type": "string",
