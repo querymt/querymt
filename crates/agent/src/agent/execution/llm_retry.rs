@@ -10,7 +10,7 @@ use querymt::chat::StreamChunk;
 use querymt::error::LLMError;
 use std::future::Future;
 use std::pin::Pin;
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::{Span, instrument};
 
 /// Call an LLM with automatic retry on rate limit errors.
@@ -19,13 +19,13 @@ use tracing::{Span, instrument};
 /// when rate limit errors are detected. It respects cancellation via the `cancel_rx` channel.
 #[instrument(
     name = "agent.llm.call_with_retry",
-    skip(config, cancel_rx, call_fn),
+    skip(config, cancel_token, call_fn),
     fields(session_id = %session_id, attempt = tracing::field::Empty, rate_limited = tracing::field::Empty)
 )]
 pub(super) async fn call_llm_with_retry<F, Fut>(
     config: &AgentConfig,
     session_id: &str,
-    cancel_rx: &watch::Receiver<bool>,
+    cancel_token: &CancellationToken,
     mut call_fn: F,
 ) -> Result<Box<dyn querymt::chat::ChatResponse>, anyhow::Error>
 where
@@ -39,7 +39,7 @@ where
     loop {
         attempt += 1;
 
-        if *cancel_rx.borrow() {
+        if cancel_token.is_cancelled() {
             return Err(anyhow::anyhow!("Cancelled"));
         }
 
@@ -78,7 +78,7 @@ where
                         },
                     );
 
-                    let cancelled = wait_with_cancellation(wait_secs, cancel_rx).await;
+                    let cancelled = wait_with_cancellation(wait_secs, cancel_token).await;
                     if cancelled {
                         debug!(
                             "Rate limit wait cancelled for session {} during attempt {}",
@@ -130,16 +130,14 @@ fn calculate_rate_limit_wait(
 /// Wait for a duration with support for cancellation.
 ///
 /// Returns `true` if cancelled, `false` if the wait completed normally.
-#[instrument(name = "agent.llm.rate_limit_wait", skip(cancel_rx), fields(wait_secs = wait_secs))]
-async fn wait_with_cancellation(wait_secs: u64, cancel_rx: &watch::Receiver<bool>) -> bool {
-    let mut cancel_rx = cancel_rx.clone();
-
+#[instrument(name = "agent.llm.rate_limit_wait", skip(cancel_token), fields(wait_secs = wait_secs))]
+async fn wait_with_cancellation(wait_secs: u64, cancel_token: &CancellationToken) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(std::time::Duration::from_secs(wait_secs)) => {
             false
         }
-        _ = cancel_rx.changed() => {
-            *cancel_rx.borrow()
+        _ = cancel_token.cancelled() => {
+            true
         }
     }
 }
@@ -165,7 +163,7 @@ fn extract_rate_limit_info(error: &LLMError) -> Option<(String, Option<u64>)> {
 pub(super) async fn create_stream_with_retry<F, Fut>(
     config: &AgentConfig,
     session_id: &str,
-    cancel_rx: &watch::Receiver<bool>,
+    cancel_token: &CancellationToken,
     create_stream: F,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, anyhow::Error>
 where
@@ -183,7 +181,7 @@ where
     loop {
         attempt += 1;
 
-        if *cancel_rx.borrow() {
+        if cancel_token.is_cancelled() {
             return Err(anyhow::anyhow!("Cancelled"));
         }
 
@@ -219,7 +217,7 @@ where
                         },
                     );
 
-                    let cancelled = wait_with_cancellation(wait_secs, cancel_rx).await;
+                    let cancelled = wait_with_cancellation(wait_secs, cancel_token).await;
                     if cancelled {
                         return Err(anyhow::anyhow!("Cancelled during rate limit wait"));
                     }
@@ -240,7 +238,7 @@ where
                         "Session {} transient stream error on attempt {}, retrying in {}s: {}",
                         session_id, attempt, delay_secs, e
                     );
-                    let cancelled = wait_with_cancellation(delay_secs, cancel_rx).await;
+                    let cancelled = wait_with_cancellation(delay_secs, cancel_token).await;
                     if cancelled {
                         return Err(anyhow::anyhow!("Cancelled during retry wait"));
                     }

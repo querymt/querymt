@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Capability requirements that tools may need
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -67,6 +68,15 @@ pub trait ToolContext: Send + Sync {
 
     /// Access to tool-specific context extensions
     fn as_any(&self) -> &dyn Any;
+
+    /// A cancellation token that is cancelled when the session is cancelled.
+    ///
+    /// Tools should poll this to abort long-running work cooperatively. The
+    /// default returns a token that is never cancelled (no-op for tools that
+    /// don't need it).
+    fn cancellation_token(&self) -> CancellationToken {
+        CancellationToken::new()
+    }
 
     /// Ask the user a structured question and wait for a response.
     /// Returns the selected answer labels, or an error if the question cannot be delivered.

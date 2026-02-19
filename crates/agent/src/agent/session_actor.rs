@@ -25,7 +25,7 @@ use kameo::reply::DelegatedReply;
 use log::{debug, info, warn};
 use querymt::chat::ChatRole;
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, instrument};
 use uuid::Uuid;
 
@@ -44,7 +44,9 @@ pub struct SessionActor {
     pub(crate) tool_config: ToolConfig,
 
     // ── Cancellation ─────────────────────────────────────────────
-    pub(crate) cancel_tx: watch::Sender<bool>,
+    /// Cancelled when a `Cancel` message is received; replaced with a fresh
+    /// token at the start of each new `Prompt` so the next turn starts clean.
+    pub(crate) cancel_token: CancellationToken,    
 
     // ── Client bridge (for SessionUpdate notifications) ──────────
     pub(crate) bridge: Option<ClientBridgeSender>,
@@ -63,15 +65,13 @@ impl SessionActor {
             .lock()
             .map(|m| *m)
             .unwrap_or(AgentMode::Build);
-        let (cancel_tx, _) = watch::channel(false);
-
         Self {
             config,
             session_id,
             runtime,
             mode,
             tool_config,
-            cancel_tx,
+            cancel_token: CancellationToken::new(),
             bridge: None,
             prompt_running: false,
         }
@@ -126,24 +126,18 @@ impl SessionActor {
 // ── Cancel ───────────────────────────────────────────────────────────────
 //
 // Cancellation flow:
-// 1. Cancel message sets cancel_tx to true
-// 2. Detached prompt task sees the flag and exits early
-// 3. PromptFinished message resets both prompt_running and cancel_tx
-// 4. Session is ready to accept new prompts
-//
-// Note: The cancel flag is also reset in Prompt handler as a safety measure,
-// ensuring recovery even if PromptFinished delivery fails.
+// 1. Cancel message cancels cancel_token — always reaches the running task because
+//    the Prompt handler no longer replaces the token while a task is live.
+// 2. Detached prompt task observes cancel_token.is_cancelled() and exits early.
+// 3. PromptFinished resets cancel_token to a fresh one and clears prompt_running.
+// 4. Session is ready to accept new prompts.
 
 impl Message<Cancel> for SessionActor {
     type Reply = ();
 
     async fn handle(&mut self, _msg: Cancel, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        debug!(
-            "Session {}: Cancel received, setting cancel_tx=true",
-            self.session_id
-        );
-        // Use send_modify to ensure cancellation signal is set even when there are no receivers
-        self.cancel_tx.send_modify(|v| *v = true);
+        debug!("Session {}: Cancel received", self.session_id);
+        self.cancel_token.cancel();
         self.config
             .emit_event(&self.session_id, AgentEventKind::Cancelled);
     }
@@ -160,16 +154,14 @@ impl Message<PromptFinished> for SessionActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.prompt_running = false;
+        // Reset the token so the next turn starts with a clean (uncancelled) token.
+        // This is the only place we replace cancel_token; the Prompt handler no longer
+        // does so, which guarantees Cancel always reaches the currently-running task.
+        self.cancel_token = CancellationToken::new();
         debug!(
-            "Session {} PromptFinished: prompt_running=false, resetting cancel_tx",
+            "Session {} PromptFinished: prompt_running=false, cancel_token reset",
             self.session_id
         );
-        // Reset cancel flag to ensure session can accept new prompts after cancellation.
-        // This is critical: without this reset, a cancelled session would remain
-        // permanently stuck with cancel_tx=true, causing all future prompts to be
-        // immediately cancelled.
-        // Use send_modify to ensure the value is set even when there are no receivers.
-        self.cancel_tx.send_modify(|v| *v = false);
     }
 }
 
@@ -592,14 +584,14 @@ impl Message<Prompt> for SessionActor {
             // Allow new prompts through even while one is running.
             // execution_permit still serializes actual turn execution, so this
             // behaves like queueing instead of fail-fast rejection.
-            if *self.cancel_tx.borrow() {
+            if self.cancel_token.is_cancelled() {
                 debug!(
-                    "Session {}: prompt_running=true, cancel=true → allowing new prompt through",
+                    "Session {}: prompt_running=true, cancelled=true → allowing new prompt through",
                     self.session_id
                 );
             } else {
                 debug!(
-                    "Session {}: prompt_running=true, cancel=false → queueing behind running prompt",
+                    "Session {}: prompt_running=true, cancelled=false → queueing behind running prompt",
                     self.session_id
                 );
             }
@@ -612,23 +604,29 @@ impl Message<Prompt> for SessionActor {
 
         self.prompt_running = true;
 
-        // Reset cancel flag. Use send_modify instead of send to ensure the value
-        // is updated even when there are no active receivers (which can happen
-        // between when the old task's cancel_rx is moved into the spawned future
-        // and when the new task subscribes).
-        self.cancel_tx.send_modify(|v| *v = false);
-
-        debug!(
-            "Session {}: set prompt_running=true, cancel_tx reset to false, cancel_rx.borrow()={}",
-            self.session_id,
-            *self.cancel_tx.borrow()
-        );
+        // Only create a fresh token when the previous one was already cancelled
+        // (i.e. the user cancelled the last turn and is now starting a new one).
+        // When no task is running yet, or a task is running and hasn't been
+        // cancelled, we keep the existing token so that a Cancel message arriving
+        // between two Prompt messages still reaches the running task.
+        if self.cancel_token.is_cancelled() {
+            self.cancel_token = CancellationToken::new();
+            debug!(
+                "Session {}: set prompt_running=true, fresh cancel_token created (previous was cancelled)",
+                self.session_id
+            );
+        } else {
+            debug!(
+                "Session {}: set prompt_running=true, reusing existing cancel_token",
+                self.session_id
+            );
+        }
 
         // Capture everything needed for the detached task
         let config = self.config.clone();
         let session_id = self.session_id.clone();
         let runtime = self.runtime.clone();
-        let cancel_rx = self.cancel_tx.subscribe();
+        let cancel_token = self.cancel_token.clone();
         let bridge = self.bridge.clone();
         let mode = self.mode;
         let actor_ref = ctx.actor_ref().clone();
@@ -639,7 +637,7 @@ impl Message<Prompt> for SessionActor {
                 session_id.clone(),
                 runtime,
                 config,
-                cancel_rx,
+                cancel_token,
                 bridge,
                 mode,
             )
@@ -668,7 +666,7 @@ impl Message<Prompt> for SessionActor {
 /// It does NOT access the actor — everything is passed as parameters.
 #[instrument(
     name = "agent.prompt.execute",
-    skip(req, runtime, config, cancel_rx, bridge),
+    skip(req, runtime, config, cancel_token, bridge),
     fields(session_id = %session_id, mode = %mode)
 )]
 async fn execute_prompt_detached(
@@ -676,7 +674,7 @@ async fn execute_prompt_detached(
     session_id: String,
     runtime: Arc<SessionRuntime>,
     config: Arc<AgentConfig>,
-    cancel_rx: watch::Receiver<bool>,
+    cancel_token: CancellationToken,
     bridge: Option<ClientBridgeSender>,
     mode: AgentMode,
 ) -> Result<PromptResponse, Error> {
@@ -746,13 +744,15 @@ async fn execute_prompt_detached(
         warn!("Failed to clean up revert state: {}", e);
     }
 
-    // Create execution context
+    // Create execution context — attach the cancellation token so it propagates
+    // into individual tool calls for cooperative cancellation.
     let mut exec_ctx = ExecutionContext::new(
         session_id.clone(),
         runtime.clone(),
         runtime_context,
         session_handle,
-    );
+    )
+    .with_cancellation_token(cancel_token);
 
     // 4. Store User Messages
     // Keep separate projections for user-visible events vs LLM replay context.
@@ -870,16 +870,15 @@ async fn execute_prompt_detached(
     }
 
     debug!(
-        "Session {}: entering execute_cycle_state_machine, cancel_rx={}",
+        "Session {}: entering execute_cycle_state_machine, cancelled={}",
         session_id,
-        *cancel_rx.borrow()
+        exec_ctx.cancellation_token.is_cancelled()
     );
 
     // Execute Agent Loop using State Machine
     let result = crate::agent::execution::execute_cycle_state_machine(
         &config,
         &mut exec_ctx,
-        cancel_rx,
         bridge.clone(),
         mode,
     )
@@ -1033,38 +1032,40 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
 
     /// Simulates the cancel-then-resume scenario:
     ///
-    /// 1. Prompt starts       → prompt_running=true, cancel=false
-    /// 2. Cancel arrives       → cancel=true (old task still winding down)
-    /// 3. New prompt arrives   → cancel=true + prompt_running=true
-    ///    → The Prompt handler should let it through because cancel was requested
-    /// 4. Old task finishes    → PromptFinished resets prompt_running and cancel
+    /// 1. Prompt starts       → prompt_running=true, token shared with running task
+    /// 2. Cancel arrives      → token cancelled (reaches the running task)
+    /// 3. New prompt arrives  → token.is_cancelled() → fresh token created for new turn
+    /// 4. Old task finishes   → PromptFinished resets prompt_running + token
     ///
     /// The new prompt's detached task waits on the execution_permit semaphore
     /// (held by the old task) so no two prompts run concurrently.
     #[test]
     fn cancel_flag_allows_new_prompt_while_old_task_winds_down() {
-        let (cancel_tx, _rx) = watch::channel(false);
-        // Step 1: Prompt starts
-        let mut prompt_running = true;
-        cancel_tx.send(false).ok();
-        assert!(prompt_running);
-        assert!(!*cancel_tx.borrow());
+        let mut cancel_token = CancellationToken::new();
 
-        // Step 2: Cancel arrives
-        cancel_tx.send(true).unwrap();
-        assert!(*cancel_tx.borrow());
-        // prompt_running is still true because PromptFinished hasn't arrived
+        // Step 1: Prompt starts — give the running task a clone of the token.
+        let mut prompt_running = true;
+        let _running_task_token = cancel_token.clone(); // simulates the spawned task's handle
+        assert!(prompt_running);
+        assert!(!cancel_token.is_cancelled());
+
+        // Step 2: Cancel arrives — cancels the shared token, which the running task holds.
+        cancel_token.cancel();
+        assert!(cancel_token.is_cancelled());
+        assert!(
+            _running_task_token.is_cancelled(),
+            "Cancel must reach the running task's token clone"
+        );
+        // prompt_running is still true because PromptFinished hasn't arrived yet.
 
         // Step 3: New prompt arrives while old task winds down.
-        // This is the key check that was broken before — we must NOT reject
-        // with "session busy" when the session was cancelled.
+        // The Prompt handler creates a fresh token only because the previous one is cancelled.
         let allow_new_prompt = if prompt_running {
-            // Mirrors the Prompt handler logic
-            *cancel_tx.borrow() // cancel was requested → allow it
+            cancel_token.is_cancelled() // cancelled → allow new prompt
         } else {
             true
         };
@@ -1073,18 +1074,48 @@ mod tests {
             "A cancelled session must accept new prompts even before PromptFinished arrives"
         );
 
-        // New prompt resets cancel and creates a fresh subscriber
-        cancel_tx.send(false).ok();
-        let rx_new = cancel_tx.subscribe();
+        if cancel_token.is_cancelled() {
+            cancel_token = CancellationToken::new();
+        }
         assert!(
-            !*rx_new.borrow(),
-            "New prompt's cancel_rx should start clean"
+            !cancel_token.is_cancelled(),
+            "New prompt's cancel_token should start clean"
         );
 
-        // Step 4: Old task's PromptFinished arrives (late, idempotent)
+        // Step 4: PromptFinished arrives — resets prompt_running.
+        // In the real actor the token is also reset here, but for this
+        // scenario it was already reset in Step 3 (cancelled path).
         prompt_running = false;
-        cancel_tx.send(false).ok();
         assert!(!prompt_running);
-        assert!(!*cancel_tx.borrow());
+        assert!(!cancel_token.is_cancelled());
+    }
+
+    /// Verifies the non-cancelled path: a second Prompt arriving while the first
+    /// task is still running must NOT replace the cancel token, so Cancel still
+    /// reaches the first task.
+    #[test]
+    fn cancel_reaches_running_task_when_second_prompt_queued() {
+        let mut cancel_token = CancellationToken::new();
+
+        // Step 1: First prompt starts.
+        let running_task_token = cancel_token.clone();
+        assert!(!cancel_token.is_cancelled());
+
+        // Step 2: Second prompt arrives while first is still running.
+        // Because the token is NOT cancelled, the Prompt handler keeps the existing token.
+        let should_replace = cancel_token.is_cancelled();
+        assert!(!should_replace, "Must not replace token while task is alive");
+        // token unchanged — running task still holds the same token.
+
+        // Step 3: Cancel arrives.
+        cancel_token.cancel();
+        assert!(
+            running_task_token.is_cancelled(),
+            "Cancel must reach the first task even after a second Prompt was queued"
+        );
+
+        // Step 4: PromptFinished — reset token for the next clean turn.
+        cancel_token = CancellationToken::new();
+        assert!(!cancel_token.is_cancelled(), "Token reset after PromptFinished");
     }
 }

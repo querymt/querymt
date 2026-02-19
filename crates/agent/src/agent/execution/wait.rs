@@ -12,7 +12,6 @@ use crate::model::{AgentMessage, MessagePart};
 use log::debug;
 use querymt::chat::ChatRole;
 use std::sync::Arc;
-use tokio::sync::watch;
 use uuid::Uuid;
 
 /// Handle the WaitingForEvent state transition.
@@ -25,7 +24,6 @@ pub(super) async fn transition_waiting_for_event(
     wait: &WaitCondition,
     context: &Arc<crate::middleware::ConversationContext>,
     exec_ctx: &ExecutionContext,
-    cancel_rx: &mut watch::Receiver<bool>,
     event_rx: &mut tokio::sync::broadcast::Receiver<crate::events::AgentEvent>,
 ) -> Result<ExecutionState, anyhow::Error> {
     debug!(
@@ -33,16 +31,14 @@ pub(super) async fn transition_waiting_for_event(
         exec_ctx.session_id, wait.reason
     );
 
-    if *cancel_rx.borrow() {
+    if exec_ctx.cancellation_token.is_cancelled() {
         return Ok(ExecutionState::Cancelled);
     }
 
     loop {
         tokio::select! {
-            _ = cancel_rx.changed() => {
-                if *cancel_rx.borrow() {
-                    return Ok(ExecutionState::Cancelled);
-                }
+            _ = exec_ctx.cancellation_token.cancelled() => {
+                return Ok(ExecutionState::Cancelled);
             }
             event = event_rx.recv() => {
                 let event = match event {

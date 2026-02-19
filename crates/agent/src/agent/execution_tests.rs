@@ -28,7 +28,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::TempDir;
-use tokio::sync::{Mutex, oneshot, watch};
+use tokio::sync::{Mutex, oneshot};
 
 // Mock implementations moved to crate::test_utils::mocks
 
@@ -211,11 +211,10 @@ impl TestHarness {
         }
     }
 
-    async fn run(&mut self, cancel_rx: watch::Receiver<bool>) -> CycleOutcome {
+    async fn run(&mut self) -> CycleOutcome {
         crate::agent::execution::execute_cycle_state_machine(
             &self.config,
             &mut self.exec_ctx,
-            cancel_rx,
             None,
             crate::agent::core::AgentMode::Build,
         )
@@ -244,8 +243,7 @@ async fn test_simple_completion_no_tools() {
         .return_const(None)
         .times(0..);
 
-    let (_tx, rx) = watch::channel(false);
-    let outcome = harness.run(rx).await;
+    let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
 }
@@ -281,8 +279,7 @@ async fn test_provider_tools_passed_to_llm() {
             Ok(Box::new(MockChatResponse::text_only("done")))
         });
 
-    let (_tx, rx) = watch::channel(false);
-    let outcome = harness.run(rx).await;
+    let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
 }
@@ -325,8 +322,7 @@ async fn test_single_tool_call_cycle() {
         .return_const(None)
         .times(0..);
 
-    let (_tx, rx) = watch::channel(false);
-    let outcome = harness.run(rx).await;
+    let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
 }
@@ -372,8 +368,7 @@ async fn test_multiple_tool_calls_batch() {
         .return_const(None)
         .times(0..);
 
-    let (_tx, rx) = watch::channel(false);
-    let outcome = harness.run(rx).await;
+    let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
 }
@@ -388,8 +383,8 @@ async fn test_cancel_before_llm_call() {
         .return_const(None)
         .times(0..);
 
-    let (_tx, rx) = watch::channel(true);
-    let outcome = harness.run(rx).await;
+    harness.exec_ctx.cancellation_token.cancel();
+    let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Cancelled);
 }
@@ -410,11 +405,9 @@ async fn test_llm_error_returns_err() {
         .return_const(None)
         .times(0..);
 
-    let (_tx, rx) = watch::channel(false);
     let result = crate::agent::execution::execute_cycle_state_machine(
         &harness.config,
         &mut harness.exec_ctx,
-        rx,
         None,
         crate::agent::core::AgentMode::Build,
     )
@@ -458,8 +451,7 @@ async fn test_middleware_stops_execution() {
         .return_const(None)
         .times(0..);
 
-    let (_tx, rx) = watch::channel(false);
-    let outcome = harness.run(rx).await;
+    let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Stopped(StopReason::EndTurn));
 }
@@ -502,8 +494,7 @@ async fn test_tool_error_continues() {
         .return_const(None)
         .times(0..);
 
-    let (_tx, rx) = watch::channel(false);
-    let outcome = harness.run(rx).await;
+    let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
 }
@@ -564,8 +555,7 @@ async fn test_waiting_for_event_delegation() {
         );
     });
 
-    let (_tx, rx) = watch::channel(false);
-    let outcome = harness.run(rx).await;
+    let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
 }

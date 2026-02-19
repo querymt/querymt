@@ -18,6 +18,7 @@ impl MiddlewarePresets {
             })),
             Arc::new(ContextMiddleware::new(ContextConfig {
                 warn_at_percent: 80,
+                compact_at_percent: 85,
                 auto_compact: true,
                 context_source: ModelInfoSource::FromSession,
                 fallback_max_tokens: 32_000,
@@ -36,6 +37,7 @@ impl MiddlewarePresets {
             })),
             Arc::new(ContextMiddleware::new(ContextConfig {
                 warn_at_percent: 70,
+                compact_at_percent: 85,
                 auto_compact: true,
                 context_source: ModelInfoSource::FromSession,
                 fallback_max_tokens: 16_000,
@@ -72,6 +74,7 @@ impl MiddlewarePresets {
             })),
             Arc::new(ContextMiddleware::new(ContextConfig {
                 warn_at_percent: 80,
+                compact_at_percent: 85,
                 auto_compact: true,
                 context_source: model_info_source,
                 fallback_max_tokens: context_limit,

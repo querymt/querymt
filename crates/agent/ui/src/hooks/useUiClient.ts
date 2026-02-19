@@ -341,23 +341,6 @@ export function useUiClient() {
             setUndoState(null);
             undoStateRef.current = null;
           }
-        } else if (eventKind === 'assistant_message_stored') {
-          setThinkingBySession(prev => {
-            const next = new Map(prev);
-            const sessionAgents = new Set(next.get(msg.session_id) ?? []);
-            sessionAgents.delete(msg.agent_id);
-            if (sessionAgents.size === 0) {
-              next.delete(msg.session_id);
-            } else {
-              next.set(msg.session_id, sessionAgents);
-            }
-            return next;
-          });
-          setThinkingAgentIds(prev => {
-            const next = new Set(prev);
-            next.delete(msg.agent_id);
-            return next;
-          });
         } else if (eventKind === 'error') {
           setThinkingBySession(prev => {
             const next = new Map(prev);

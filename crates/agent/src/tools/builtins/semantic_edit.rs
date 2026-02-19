@@ -1,6 +1,7 @@
 //! Semantic edit tool for AST-aware source code search and transformation
 
 use async_trait::async_trait;
+use glob::glob;
 use ignore::WalkBuilder;
 use indexmap::IndexMap;
 use querymt::chat::{FunctionTool, Tool};
@@ -10,9 +11,10 @@ use srgn::RegexPattern;
 use srgn::find::Find;
 use srgn::scoping::Scoper;
 use srgn::scoping::langs::{TreeSitterRegex, c, csharp, go, hcl, python, rust, typescript};
+use srgn::scoping::literal::Literal;
 use srgn::scoping::regex::Regex;
 use srgn::scoping::view::ScopedViewBuilder;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 
@@ -68,6 +70,29 @@ struct TransformResults {
     files_searched: usize,
 }
 
+/// A parsed scope entry: the scope name and an optional name-filter regex (from `~` syntax).
+struct ScopeEntry {
+    name: String,
+    pattern: Option<String>,
+}
+
+impl ScopeEntry {
+    /// Parse `"struct~[tT]est"` into `ScopeEntry { name: "struct", pattern: Some("[tT]est") }`.
+    fn parse(s: &str) -> Self {
+        if let Some(idx) = s.find('~') {
+            Self {
+                name: s[..idx].to_string(),
+                pattern: Some(s[idx + 1..].to_string()),
+            }
+        } else {
+            Self {
+                name: s.to_string(),
+                pattern: None,
+            }
+        }
+    }
+}
+
 pub struct SemanticEditTool;
 
 impl Default for SemanticEditTool {
@@ -100,20 +125,21 @@ impl SemanticEditTool {
         }
     }
 
-    /// Apply language scope to the builder
+    /// Apply a single language scope entry (with optional `~` name filter) to the builder.
     fn apply_language_scope<'a>(
         language: &str,
-        scope: &str,
-        scope_pattern: Option<&str>,
+        entry: &ScopeEntry,
         builder: &mut ScopedViewBuilder<'a>,
     ) -> Result<(), ToolError> {
+        let scope = entry.name.as_str();
+        let scope_pattern = entry.pattern.as_deref();
         match language {
-            "python" => Self::apply_python_scope(scope, scope_pattern, builder),
+            "python" => Self::apply_python_scope(scope, builder),
             "rust" => Self::apply_rust_scope(scope, scope_pattern, builder),
             "go" => Self::apply_go_scope(scope, scope_pattern, builder),
-            "typescript" => Self::apply_typescript_scope(scope, scope_pattern, builder),
-            "c" => Self::apply_c_scope(scope, scope_pattern, builder),
-            "csharp" => Self::apply_csharp_scope(scope, scope_pattern, builder),
+            "typescript" => Self::apply_typescript_scope(scope, builder),
+            "c" => Self::apply_c_scope(scope, builder),
+            "csharp" => Self::apply_csharp_scope(scope, builder),
             "hcl" => Self::apply_hcl_scope(scope, scope_pattern, builder),
             _ => Err(ToolError::InvalidRequest(format!(
                 "Unsupported language: {}. Must be one of: python, rust, go, typescript, c, csharp, hcl",
@@ -124,7 +150,6 @@ impl SemanticEditTool {
 
     fn apply_python_scope<'a>(
         scope: &str,
-        _scope_pattern: Option<&str>, // Python doesn't support named patterns in srgn
         builder: &mut ScopedViewBuilder<'a>,
     ) -> Result<(), ToolError> {
         let query: Box<dyn Scoper> = match scope {
@@ -190,7 +215,7 @@ variable-identifiers, with",
             ("struct", None) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Struct)),
             ("struct", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(rust::CompiledQuery::from(rust::PreparedQuery::StructNamed(
                     TreeSitterRegex(regex),
@@ -199,7 +224,7 @@ variable-identifiers, with",
             ("enum", None) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Enum)),
             ("enum", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(rust::CompiledQuery::from(rust::PreparedQuery::EnumNamed(
                     TreeSitterRegex(regex),
@@ -210,7 +235,7 @@ variable-identifiers, with",
             }
             ("fn" | "function", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(rust::CompiledQuery::from(rust::PreparedQuery::FnNamed(
                     TreeSitterRegex(regex),
@@ -241,7 +266,7 @@ variable-identifiers, with",
             ("trait", None) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Trait)),
             ("trait", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(rust::CompiledQuery::from(rust::PreparedQuery::TraitNamed(
                     TreeSitterRegex(regex),
@@ -250,7 +275,7 @@ variable-identifiers, with",
             ("mod", None) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Mod)),
             ("mod", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ModNamed(
                     TreeSitterRegex(regex),
@@ -325,7 +350,7 @@ type-identifier, unsafe, unsafe-fn, uses",
             ("struct", None) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Struct)),
             ("struct", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(go::CompiledQuery::from(go::PreparedQuery::StructNamed(
                     TreeSitterRegex(regex),
@@ -336,7 +361,7 @@ type-identifier, unsafe, unsafe-fn, uses",
             }
             ("function" | "func", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(go::CompiledQuery::from(go::PreparedQuery::FuncNamed(
                     TreeSitterRegex(regex),
@@ -345,7 +370,7 @@ type-identifier, unsafe, unsafe-fn, uses",
             ("interface", None) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Interface)),
             ("interface", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(go::CompiledQuery::from(go::PreparedQuery::InterfaceNamed(
                     TreeSitterRegex(regex),
@@ -383,7 +408,6 @@ var",
 
     fn apply_typescript_scope<'a>(
         scope: &str,
-        _scope_pattern: Option<&str>,
         builder: &mut ScopedViewBuilder<'a>,
     ) -> Result<(), ToolError> {
         let query: Box<dyn Scoper> = match scope {
@@ -463,7 +487,6 @@ var, var-decl",
 
     fn apply_c_scope<'a>(
         scope: &str,
-        _scope_pattern: Option<&str>,
         builder: &mut ScopedViewBuilder<'a>,
     ) -> Result<(), ToolError> {
         let query: Box<dyn Scoper> = match scope {
@@ -501,7 +524,6 @@ if, includes, strings, struct, switch, type-def, union, variable, while",
 
     fn apply_csharp_scope<'a>(
         scope: &str,
-        _scope_pattern: Option<&str>,
         builder: &mut ScopedViewBuilder<'a>,
     ) -> Result<(), ToolError> {
         let query: Box<dyn Scoper> = match scope {
@@ -565,7 +587,7 @@ strings, struct, usings, variable-declaration",
             )),
             ("required-providers", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(hcl::CompiledQuery::from(
                     hcl::PreparedQuery::RequiredProvidersNamed(TreeSitterRegex(regex)),
@@ -636,9 +658,9 @@ resource, resource-names, resource-types, strings, terraform, variable, variable
     async fn process_file(
         file_path: &Path,
         language: &str,
-        scope: &str,
-        scope_pattern: Option<&str>,
+        scopes: &[ScopeEntry],
         pattern: Option<&str>,
+        literal_string: bool,
         replacement: Option<&str>,
         action: Option<&str>,
     ) -> Result<(Vec<Match>, bool), ToolError> {
@@ -652,15 +674,25 @@ resource, resource-names, resource-types, strings, terraform, variable, variable
         // Build scoped view
         let mut builder = ScopedViewBuilder::new(&content);
 
-        // Apply language scope
-        Self::apply_language_scope(language, scope, scope_pattern, &mut builder)?;
+        // Apply each language scope in order (AND / intersection semantics)
+        for entry in scopes {
+            Self::apply_language_scope(language, entry, &mut builder)?;
+        }
 
-        // Apply regex pattern scope if specified
+        // Apply pattern scope if specified
         if let Some(pattern_str) = pattern {
-            let regex_pattern = RegexPattern::new(pattern_str)
-                .map_err(|e| ToolError::InvalidRequest(format!("Invalid regex pattern: {}", e)))?;
-            let scoper = Regex::new(regex_pattern);
-            builder.explode(&scoper);
+            if literal_string {
+                let scoper = Literal::try_from(pattern_str.to_string()).map_err(|e| {
+                    ToolError::InvalidRequest(format!("Invalid literal pattern: {}", e))
+                })?;
+                builder.explode(&scoper);
+            } else {
+                let regex_pattern = RegexPattern::new(pattern_str).map_err(|e| {
+                    ToolError::InvalidRequest(format!("Invalid regex pattern: {}", e))
+                })?;
+                let scoper = Regex::new(regex_pattern);
+                builder.explode(&scoper);
+            }
         }
 
         // Build the view
@@ -702,9 +734,16 @@ resource, resource-names, resource-types, strings, terraform, variable, variable
                     "normalize" => {
                         view.normalize();
                     }
+                    "symbols" => {
+                        view.symbols();
+                    }
+                    "symbols-invert" => {
+                        view.invert_symbols();
+                    }
                     _ => {
                         return Err(ToolError::InvalidRequest(format!(
-                            "Unknown action: {}. Must be one of: delete, squeeze, upper, lower, titlecase, normalize",
+                            "Unknown action: {}. Must be one of: delete, squeeze, upper, lower, \
+titlecase, normalize, symbols, symbols-invert",
                             act
                         )));
                     }
@@ -734,6 +773,58 @@ resource, resource-names, resource-types, strings, terraform, variable, variable
             Ok((Vec::new(), changes_made))
         }
     }
+
+    /// Collect all files to process from a glob string relative to cwd.
+    /// Plain paths (no wildcards) are resolved normally: a directory is walked,
+    /// a file is returned directly.
+    fn collect_files(
+        glob_str: &str,
+        cwd: &Path,
+        language: &str,
+        hidden: bool,
+        gitignored: bool,
+    ) -> Result<Vec<PathBuf>, ToolError> {
+        let has_wildcard = glob_str.contains(['*', '?', '[']);
+
+        if has_wildcard {
+            // Expand glob relative to cwd
+            let pattern = cwd.join(glob_str);
+            let pattern_str = pattern.to_string_lossy();
+            let paths = glob(&pattern_str)
+                .map_err(|e| ToolError::InvalidRequest(format!("Invalid glob pattern: {}", e)))?
+                .filter_map(|res| res.ok())
+                .filter(|p| p.is_file() && Self::is_valid_for_language(p, language))
+                .collect();
+            Ok(paths)
+        } else {
+            // Treat as plain path
+            let path = cwd.join(glob_str);
+            let metadata = std::fs::metadata(&path).map_err(|e| {
+                ToolError::InvalidRequest(format!("Invalid path '{}': {}", glob_str, e))
+            })?;
+
+            if metadata.is_file() {
+                if Self::is_valid_for_language(&path, language) {
+                    Ok(vec![path])
+                } else {
+                    Ok(vec![])
+                }
+            } else {
+                // Walk directory
+                let walker = WalkBuilder::new(&path)
+                    .hidden(!hidden)
+                    .git_ignore(!gitignored)
+                    .build();
+
+                let files = walker
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.into_path())
+                    .filter(|p| p.is_file() && Self::is_valid_for_language(p, language))
+                    .collect();
+                Ok(files)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -753,9 +844,14 @@ REQUIRES: language + scope (this is for semantic operations, not plain regex)
 
 EXAMPLES:
 - Find TODOs in comments: {language: "rust", scope: "comments", pattern: "TODO"}
-- Delete all docstrings: {language: "python", scope: "doc-strings", action: "delete"}  
+- Delete all docstrings: {language: "python", scope: "doc-strings", action: "delete"}
 - Rename in functions only: {language: "go", scope: "function", pattern: "oldName", replacement: "newName"}
 - Find unsafe blocks: {language: "rust", scope: "unsafe"}
+- AND two scopes (type-identifiers inside pub enums): {language: "rust", scope: ["pub-enum", "type-identifier"], pattern: "Subgenre"}
+- Named scope filter with ~: {language: "go", scope: "struct~[tT]est"} or as array: {language: "rust", scope: ["pub-enum", "type-identifier~Subgenre"]}
+- Literal string search (special chars): {language: "python", scope: "strings", pattern: "a.b[0]", literal_string: true}
+- Convert ASCII symbols to Unicode: {language: "rust", scope: "doc-comments", action: "symbols"}
+- Revert Unicode symbols to ASCII: {language: "rust", scope: "strings", action: "symbols-invert"}
 
 SCOPES BY LANGUAGE:
 Python: async-def, class, class-methods, comments, doc-strings, function,
@@ -782,13 +878,12 @@ HCL: comments, data, data-names, data-sources, locals, module, output, provider,
   required-providers, resource, resource-names, resource-types, strings, terraform,
   variable, variables
 
-scope_pattern (regex on name) supported for:
-  Rust: fn/function, mod, struct, enum, trait
-  Go: func/function, interface, struct
-  HCL: required-providers
+scope supports ~ for name filtering (Rust: fn/struct/enum/trait/mod; Go: func/struct/interface; HCL: required-providers):
+  e.g. "struct~Config" matches only structs named Config
+  e.g. "fn~^handle_" matches only functions whose name starts with handle_
+Multiple scopes are ANDed (intersection): each narrows the previous result.
 
-Walks directories recursively, respects .gitignore. Set path to limit scope.
-Transform mode modifies files in-place."#.to_string(),
+Walks directories recursively, respects .gitignore. Set glob to limit which files are processed."#.to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -798,20 +893,30 @@ Transform mode modifies files in-place."#.to_string(),
                             "enum": ["python", "rust", "go", "typescript", "c", "csharp", "hcl"]
                         },
                         "scope": {
-                            "type": "string",
-                            "description": "Tree-sitter node type to scope to. Available scopes depend on language."
+                            "oneOf": [
+                                {
+                                    "type": "string",
+                                    "description": "Single scope. Use 'name~pattern' to filter by name (e.g. 'struct~Config')."
+                                },
+                                {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Multiple scopes ANDed together (each narrows the previous). Each entry may use 'name~pattern' syntax."
+                                }
+                            ],
+                            "description": "Tree-sitter scope(s) to narrow to. String or array of strings. Multiple scopes are intersected left-to-right."
                         },
-                        "path": {
+                        "glob": {
                             "type": "string",
-                            "description": "File or directory to process. If omitted, processes entire workspace."
-                        },
-                        "scope_pattern": {
-                            "type": "string",
-                            "description": "Optional regex pattern to filter scoped items by name. Only supported for some scopes in Rust/Go (struct, enum, trait, interface) and HCL (required-providers)."
+                            "description": "Glob pattern for files to process (e.g. \"src/**/*.py\", \"tests/\", \"main.rs\"). If omitted, processes entire workspace."
                         },
                         "pattern": {
                             "type": "string",
-                            "description": "Regex pattern to match within the scope. In search mode, defines what to find. In transform mode, defines what to replace/transform."
+                            "description": "Pattern to match within the scope. Regex by default; set literal_string: true for exact string matching."
+                        },
+                        "literal_string": {
+                            "type": "boolean",
+                            "description": "Treat pattern as a literal string instead of regex. Useful when pattern contains special regex characters like . [ ] ( ) *. Default: false."
                         },
                         "replacement": {
                             "type": "string",
@@ -819,16 +924,16 @@ Transform mode modifies files in-place."#.to_string(),
                         },
                         "action": {
                             "type": "string",
-                            "description": "Action to perform on matched content. Specifying this enables TRANSFORM MODE. If both replacement and action are given, replacement is applied first.",
-                            "enum": ["delete", "squeeze", "upper", "lower", "titlecase", "normalize"]
+                            "description": "Action to perform on matched content. Enables TRANSFORM MODE. If both replacement and action are given, replacement is applied first.",
+                            "enum": ["delete", "squeeze", "upper", "lower", "titlecase", "normalize", "symbols", "symbols-invert"]
                         },
                         "hidden": {
                             "type": "boolean",
-                            "description": "Include hidden files and directories. Default: false"
+                            "description": "Include hidden files and directories when walking. Default: false"
                         },
                         "gitignored": {
                             "type": "boolean",
-                            "description": "Include .gitignore'd files and directories. Default: false"
+                            "description": "Include .gitignore'd files and directories when walking. Default: false"
                         }
                     },
                     "required": ["language", "scope"]
@@ -848,14 +953,33 @@ Transform mode modifies files in-place."#.to_string(),
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidRequest("language is required".to_string()))?;
 
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidRequest("scope is required".to_string()))?;
+        // Parse scope: accept string or array, each entry may use ~ syntax
+        let scopes: Vec<ScopeEntry> = match args.get("scope") {
+            Some(Value::String(s)) => vec![ScopeEntry::parse(s)],
+            Some(Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(ScopeEntry::parse)
+                .collect(),
+            _ => {
+                return Err(ToolError::InvalidRequest(
+                    "scope is required (string or array of strings)".to_string(),
+                ));
+            }
+        };
+
+        if scopes.is_empty() {
+            return Err(ToolError::InvalidRequest(
+                "scope must not be empty".to_string(),
+            ));
+        }
 
         // Extract optional parameters
-        let scope_pattern = args.get("scope_pattern").and_then(Value::as_str);
         let pattern = args.get("pattern").and_then(Value::as_str);
+        let literal_string = args
+            .get("literal_string")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let replacement = args.get("replacement").and_then(Value::as_str);
         let action = args.get("action").and_then(Value::as_str);
         let hidden = args.get("hidden").and_then(Value::as_bool).unwrap_or(false);
@@ -867,97 +991,53 @@ Transform mode modifies files in-place."#.to_string(),
         // Determine mode
         let is_search_mode = replacement.is_none() && action.is_none();
 
-        // Resolve path (default to current working directory)
-        let path = if let Some(path_str) = args.get("path").and_then(Value::as_str) {
-            context.resolve_path(path_str)?
+        // Resolve working directory
+        let cwd = context
+            .cwd()
+            .ok_or_else(|| ToolError::InvalidRequest("No working directory set".to_string()))?
+            .to_path_buf();
+
+        // Collect files to process
+        let files: Vec<PathBuf> = if let Some(glob_str) = args.get("glob").and_then(Value::as_str) {
+            Self::collect_files(glob_str, &cwd, language, hidden, gitignored)?
         } else {
-            context
-                .cwd()
-                .ok_or_else(|| {
-                    ToolError::InvalidRequest(
-                        "No working directory set and no path specified".to_string(),
-                    )
-                })?
-                .to_path_buf()
-        };
-
-        // Check if path is a file or directory
-        let metadata: std::fs::Metadata = tokio::fs::metadata(&path)
-            .await
-            .map_err(|e| ToolError::InvalidRequest(format!("Invalid path: {}", e)))?;
-
-        let mut all_matches = Vec::new();
-        let mut modified_files = Vec::new();
-        let mut files_searched = 0;
-
-        if metadata.is_file() {
-            // Process single file
-            if Self::is_valid_for_language(&path, language) {
-                files_searched += 1;
-                let (matches, modified) = Self::process_file(
-                    &path,
-                    language,
-                    scope,
-                    scope_pattern,
-                    pattern,
-                    replacement,
-                    action,
-                )
-                .await?;
-
-                all_matches.extend(matches);
-                if modified {
-                    modified_files.push(path.to_string_lossy().to_string());
-                }
-            }
-        } else {
-            // Walk directory
-            let walker = WalkBuilder::new(&path)
+            // No glob: walk cwd
+            let walker = WalkBuilder::new(&cwd)
                 .hidden(!hidden)
                 .git_ignore(!gitignored)
                 .build();
 
-            for entry in walker {
-                let entry = entry.map_err(|e| {
-                    ToolError::ProviderError(format!("Error walking directory: {}", e))
-                })?;
+            walker
+                .filter_map(|e| e.ok())
+                .map(|e| e.into_path())
+                .filter(|p| p.is_file() && Self::is_valid_for_language(p, language))
+                .collect()
+        };
 
-                let entry_path = entry.path();
+        let mut all_matches = Vec::new();
+        let mut modified_files = Vec::new();
+        let files_searched = files.len();
 
-                // Skip if not a file
-                if !entry_path.is_file() {
-                    continue;
-                }
-
-                // Skip if not valid for this language
-                if !Self::is_valid_for_language(entry_path, language) {
-                    continue;
-                }
-
-                files_searched += 1;
-
-                // Process file
-                match Self::process_file(
-                    entry_path,
-                    language,
-                    scope,
-                    scope_pattern,
-                    pattern,
-                    replacement,
-                    action,
-                )
-                .await
-                {
-                    Ok((matches, modified)) => {
-                        all_matches.extend(matches);
-                        if modified {
-                            modified_files.push(entry_path.to_string_lossy().to_string());
-                        }
+        for file_path in &files {
+            match Self::process_file(
+                file_path,
+                language,
+                &scopes,
+                pattern,
+                literal_string,
+                replacement,
+                action,
+            )
+            .await
+            {
+                Ok((matches, modified)) => {
+                    all_matches.extend(matches);
+                    if modified {
+                        modified_files.push(file_path.to_string_lossy().to_string());
                     }
-                    Err(e) => {
-                        // Log error but continue processing other files
-                        eprintln!("Error processing {}: {}", entry_path.display(), e);
-                    }
+                }
+                Err(e) => {
+                    eprintln!("Error processing {}: {}", file_path.display(), e);
                 }
             }
         }
@@ -985,7 +1065,7 @@ Transform mode modifies files in-place."#.to_string(),
             // Convert to relative paths
             for m in &mut all_matches {
                 let rel_path = Path::new(&m.file)
-                    .strip_prefix(&path)
+                    .strip_prefix(&cwd)
                     .unwrap_or(Path::new(&m.file))
                     .display()
                     .to_string();
@@ -1007,7 +1087,7 @@ Transform mode modifies files in-place."#.to_string(),
                 .into_iter()
                 .map(|f| {
                     Path::new(&f)
-                        .strip_prefix(&path)
+                        .strip_prefix(&cwd)
                         .unwrap_or(Path::new(&f))
                         .display()
                         .to_string()
@@ -1051,26 +1131,21 @@ def foo():
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            "path": file_path.to_str().unwrap(),
+            "glob": file_path.to_str().unwrap(),
             "language": "python",
             "scope": "comments",
             "pattern": "TODO"
         });
 
         let result = tool.call(args, &context).await.unwrap();
-
-        // Parse as generic JSON to check the serialized format
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed["mode"], "search");
         assert_eq!(parsed["total_matches"], 1);
         assert_eq!(parsed["files_searched"], 1);
 
-        // Check that results is an object with file paths as keys
         let results = parsed["results"].as_object().unwrap();
         assert_eq!(results.len(), 1);
-
-        // Get the first (and only) file's matches
         let file_matches = results.values().next().unwrap().as_str().unwrap();
         assert!(file_matches.contains("TODO"));
     }
@@ -1081,7 +1156,6 @@ def foo():
         let context =
             AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
 
-        // Create multiple Python files
         let code1 = "# TODO: first\ndef foo():\n    pass\n";
         let code2 = "# TODO: second\ndef bar():\n    pass\n";
 
@@ -1094,7 +1168,6 @@ def foo():
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            "path": temp_dir.path().to_str().unwrap(),
             "language": "python",
             "scope": "comments",
             "pattern": "TODO"
@@ -1125,7 +1198,7 @@ def foo():
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            "path": file_path.to_str().unwrap(),
+            "glob": file_path.to_str().unwrap(),
             "language": "python",
             "scope": "comments",
             "action": "delete"
@@ -1137,7 +1210,6 @@ def foo():
         assert_eq!(parsed.mode, "transform");
         assert_eq!(parsed.total_files_modified, 1);
 
-        // Verify file was actually modified
         let modified_content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert!(!modified_content.contains("This is a comment"));
         assert!(!modified_content.contains("Another comment"));
@@ -1160,7 +1232,7 @@ other = 123
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            "path": file_path.to_str().unwrap(),
+            "glob": file_path.to_str().unwrap(),
             "language": "python",
             "scope": "strings",
             "pattern": "World",
@@ -1173,7 +1245,6 @@ other = 123
         assert_eq!(parsed.mode, "transform");
         assert_eq!(parsed.total_files_modified, 1);
 
-        // Verify file was actually modified
         let modified_content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert!(modified_content.contains("Hello Universe"));
     }
@@ -1184,7 +1255,6 @@ other = 123
         let context =
             AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
 
-        // Create Python and non-Python files
         tokio::fs::write(temp_dir.path().join("test.py"), "# TODO\n")
             .await
             .unwrap();
@@ -1194,7 +1264,6 @@ other = 123
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            "path": temp_dir.path().to_str().unwrap(),
             "language": "python",
             "scope": "comments",
             "pattern": "TODO"
@@ -1203,7 +1272,6 @@ other = 123
         let result = tool.call(args, &context).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-        // Should only process the .py file
         assert_eq!(parsed["files_searched"], 1);
     }
 
@@ -1220,7 +1288,6 @@ other = 123
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            // No path specified - should use workspace root
             "language": "python",
             "scope": "comments",
             "pattern": "TODO"
@@ -1245,20 +1312,229 @@ other = 123
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            "path": file_path.to_str().unwrap(),
+            "glob": file_path.to_str().unwrap(),
             "language": "python",
-            "scope": "comments",  // No comments in this file
+            "scope": "comments",
             "action": "delete"
         });
 
-        // Should succeed but not modify anything
         let result = tool.call(args, &context).await.unwrap();
         let parsed: TransformResults = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed.total_files_modified, 0);
 
-        // Verify file wasn't modified
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, code);
+    }
+
+    #[tokio::test]
+    async fn test_glob_pattern_filters_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        // Create src/ and tests/ subdirs
+        tokio::fs::create_dir(temp_dir.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir(temp_dir.path().join("tests"))
+            .await
+            .unwrap();
+
+        tokio::fs::write(temp_dir.path().join("src/main.py"), "# TODO src\n")
+            .await
+            .unwrap();
+        tokio::fs::write(temp_dir.path().join("tests/test_main.py"), "# TODO test\n")
+            .await
+            .unwrap();
+
+        let tool = SemanticEditTool::new();
+
+        // Glob targeting only src/
+        let args = json!({
+            "language": "python",
+            "scope": "comments",
+            "pattern": "TODO",
+            "glob": "src/**/*.py"
+        });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(parsed["files_searched"], 1);
+        assert_eq!(parsed["total_matches"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_literal_string_matches_exactly() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        // "a.b" with literal_string=false would match "a<any char>b" via regex
+        // "a.b" with literal_string=true should only match the exact string "a.b"
+        let code = r#"
+x = "a.b"
+y = "axb"
+z = "a.b.c"
+"#;
+
+        let file_path = temp_dir.path().join("test.py");
+        tokio::fs::write(&file_path, code).await.unwrap();
+
+        let tool = SemanticEditTool::new();
+        let args = json!({
+            "glob": file_path.to_str().unwrap(),
+            "language": "python",
+            "scope": "strings",
+            "pattern": "a.b",
+            "literal_string": true
+        });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        // Should match "a.b" inside the two strings that contain it, not "axb"
+        let results_obj = parsed["results"].as_object().unwrap();
+        let matches_text = results_obj.values().next().unwrap().as_str().unwrap();
+        assert!(!matches_text.contains("axb"));
+    }
+
+    #[tokio::test]
+    async fn test_multi_scope_intersection() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        // Rust: search for "Subgenre" only within pub-enum bodies, not elsewhere
+        let code = r#"
+pub enum Genre {
+    Rock(Subgenre),
+    Jazz,
+}
+
+const MOST_POPULAR_SUBGENRE: Subgenre = Subgenre::Something;
+
+pub struct Musician {
+    genres: Vec<Subgenre>,
+}
+"#;
+
+        let file_path = temp_dir.path().join("test.rs");
+        tokio::fs::write(&file_path, code).await.unwrap();
+
+        let tool = SemanticEditTool::new();
+        let args = json!({
+            "glob": file_path.to_str().unwrap(),
+            "language": "rust",
+            "scope": ["pub-enum", "type-identifier"],
+            "pattern": "Subgenre"
+        });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        // Should only find Subgenre inside the pub enum, not in the const or struct
+        assert_eq!(parsed["mode"], "search");
+        let total = parsed["total_matches"].as_u64().unwrap();
+        assert!(total >= 1, "expected at least one match inside pub-enum");
+    }
+
+    #[tokio::test]
+    async fn test_tilde_scope_pattern() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let code = r#"
+pub struct Config {
+    pub value: u32,
+}
+
+pub struct Handler {
+    pub name: String,
+}
+"#;
+
+        let file_path = temp_dir.path().join("test.rs");
+        tokio::fs::write(&file_path, code).await.unwrap();
+
+        let tool = SemanticEditTool::new();
+        // Only match structs named "Config"
+        let args = json!({
+            "glob": file_path.to_str().unwrap(),
+            "language": "rust",
+            "scope": "struct~Config"
+        });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(parsed["mode"], "search");
+        // Should only surface Config struct content, not Handler
+        if let Some(results) = parsed["results"].as_object()
+            && let Some(matches) = results.values().next().and_then(|v| v.as_str())
+        {
+            assert!(matches.contains("Config") || matches.contains("value"));
+            assert!(!matches.contains("Handler") && !matches.contains("name: String"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_symbols_action() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let code = "x = \"a != b\"\n";
+        let file_path = temp_dir.path().join("test.py");
+        tokio::fs::write(&file_path, code).await.unwrap();
+
+        let tool = SemanticEditTool::new();
+        let args = json!({
+            "glob": file_path.to_str().unwrap(),
+            "language": "python",
+            "scope": "strings",
+            "action": "symbols"
+        });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let parsed: TransformResults = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.mode, "transform");
+
+        let modified = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert!(
+            modified.contains('≠'),
+            "expected != to become ≠, got: {modified}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_symbols_invert_action() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let code = "x = \"a ≠ b\"\n";
+        let file_path = temp_dir.path().join("test.py");
+        tokio::fs::write(&file_path, code).await.unwrap();
+
+        let tool = SemanticEditTool::new();
+        let args = json!({
+            "glob": file_path.to_str().unwrap(),
+            "language": "python",
+            "scope": "strings",
+            "action": "symbols-invert"
+        });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let parsed: TransformResults = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.mode, "transform");
+
+        let modified = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert!(
+            modified.contains("!="),
+            "expected ≠ to become !=, got: {modified}"
+        );
     }
 }

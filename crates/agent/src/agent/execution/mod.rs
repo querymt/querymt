@@ -26,7 +26,6 @@ use agent_client_protocol::StopReason;
 use log::{debug, info, trace, warn};
 use querymt::chat::ChatRole;
 use std::sync::Arc;
-use tokio::sync::watch;
 use tracing::{Instrument, info_span, instrument};
 
 /// Outcome of a single execution cycle
@@ -53,13 +52,12 @@ use crate::agent::agent_config::AgentConfig;
 /// It is injected into every `ConversationContext` so middleware can read it.
 #[instrument(
     name = "agent.execution.turn",
-    skip(config, exec_ctx, cancel_rx, bridge),
+    skip(config, exec_ctx, bridge),
     fields(session_id = %exec_ctx.session_id, mode = %session_mode)
 )]
 pub(crate) async fn execute_cycle_state_machine(
     config: &AgentConfig,
     exec_ctx: &mut ExecutionContext,
-    mut cancel_rx: watch::Receiver<bool>,
     bridge: Option<ClientBridgeSender>,
     session_mode: crate::agent::core::AgentMode,
 ) -> Result<CycleOutcome, anyhow::Error> {
@@ -71,9 +69,9 @@ pub(crate) async fn execute_cycle_state_machine(
     let driver = config.create_driver();
 
     info!(
-        "Session {}: state machine loading history, cancel_rx={}",
+        "Session {}: state machine loading history, cancelled={}",
         exec_ctx.session_id,
-        *cancel_rx.borrow()
+        exec_ctx.cancellation_token.is_cancelled()
     );
 
     let messages: Arc<[querymt::chat::ChatMessage]> =
@@ -135,18 +133,15 @@ pub(crate) async fn execute_cycle_state_machine(
         .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
 
     info!(
-        "Session {}: run_turn_start done, state={}, cancel_rx={}",
+        "Session {}: run_turn_start done, state={}, cancelled={}",
         exec_ctx.session_id,
         state.name(),
-        *cancel_rx.borrow()
+        exec_ctx.cancellation_token.is_cancelled()
     );
 
     loop {
-        if *cancel_rx.borrow() {
-            info!(
-                "Session {}: CANCELLED at loop top (cancel_rx=true)",
-                exec_ctx.session_id
-            );
+        if exec_ctx.cancellation_token.is_cancelled() {
+            info!("Session {}: CANCELLED at loop top", exec_ctx.session_id);
             return Ok(CycleOutcome::Cancelled);
         }
 
@@ -171,13 +166,8 @@ pub(crate) async fn execute_cycle_state_machine(
                     ExecutionState::BeforeLlmCall {
                         context: ref conv_context,
                     } => {
-                        transitions::transition_before_llm_call(
-                            config,
-                            conv_context,
-                            exec_ctx,
-                            &cancel_rx,
-                        )
-                        .await?
+                        transitions::transition_before_llm_call(config, conv_context, exec_ctx)
+                            .await?
                     }
                     other => other,
                 }
@@ -186,10 +176,7 @@ pub(crate) async fn execute_cycle_state_machine(
             ExecutionState::CallLlm {
                 ref context,
                 ref tools,
-            } => {
-                transitions::transition_call_llm(config, context, tools, &cancel_rx, exec_ctx)
-                    .await?
-            }
+            } => transitions::transition_call_llm(config, context, tools, exec_ctx).await?,
 
             ExecutionState::AfterLlm { .. } => {
                 let state = driver
@@ -210,7 +197,6 @@ pub(crate) async fn execute_cycle_state_machine(
                             response,
                             context,
                             exec_ctx,
-                            &cancel_rx,
                             bridge.as_ref(),
                         )
                         .await?
@@ -240,7 +226,6 @@ pub(crate) async fn execute_cycle_state_machine(
                             results,
                             context,
                             exec_ctx,
-                            &cancel_rx,
                             bridge.as_ref(),
                         )
                         .await?
@@ -253,15 +238,8 @@ pub(crate) async fn execute_cycle_state_machine(
                 ref context,
                 ref wait,
             } => {
-                wait::transition_waiting_for_event(
-                    config,
-                    wait,
-                    context,
-                    exec_ctx,
-                    &mut cancel_rx,
-                    &mut event_rx,
-                )
-                .await?
+                wait::transition_waiting_for_event(config, wait, context, exec_ctx, &mut event_rx)
+                    .await?
             }
 
             ExecutionState::Complete => {

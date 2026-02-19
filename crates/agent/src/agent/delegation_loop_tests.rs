@@ -349,11 +349,9 @@ impl TestHarness {
     }
 
     async fn run(&mut self) -> CycleOutcome {
-        let (_tx, rx) = tokio::sync::watch::channel(false);
         crate::agent::execution::execute_cycle_state_machine(
             &self.config,
             &mut self.exec_ctx,
-            rx,
             None,
             crate::agent::core::AgentMode::Build,
         )

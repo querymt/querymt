@@ -9,6 +9,7 @@ use crate::session::store::{LLMConfig, SessionExecutionConfig};
 use crate::tools::AgentToolContext;
 use std::path::Path;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Bundles all execution state needed for a single agent run.
 ///
@@ -34,6 +35,11 @@ pub(crate) struct ExecutionContext {
     /// Turn-pinned session handle. Created once per `run_prompt` and reused
     /// throughout execution — avoids repeated DB lookups for session/config.
     pub session_handle: SessionHandle,
+
+    /// Cancellation token for this execution. Cancelled when the session receives
+    /// a cancel signal. Propagated into tool contexts so individual tools can
+    /// abort long-running work cooperatively.
+    pub cancellation_token: CancellationToken,
 }
 
 impl ExecutionContext {
@@ -49,7 +55,14 @@ impl ExecutionContext {
             runtime,
             state,
             session_handle,
+            cancellation_token: CancellationToken::new(),
         }
+    }
+
+    /// Attach a cancellation token, replacing the default no-op token.
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = token;
+        self
     }
 
     /// Get the current working directory, if set
@@ -76,6 +89,7 @@ impl ExecutionContext {
     ///
     /// This centralizes the construction of `AgentToolContext` from the execution state,
     /// extracting the necessary fields (session_id, cwd, agent_registry) in one place.
+    /// The cancellation token is propagated so tools can abort long-running work.
     pub fn tool_context(
         &self,
         agent_registry: Arc<dyn crate::delegation::AgentRegistry>,
@@ -87,5 +101,6 @@ impl ExecutionContext {
             Some(agent_registry),
             elicitation_tx,
         )
+        .with_cancellation_token(self.cancellation_token.clone())
     }
 }

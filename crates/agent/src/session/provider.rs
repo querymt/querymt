@@ -454,11 +454,12 @@ impl SessionHandle {
     /// resolver attached — OAuth providers always do, static-key providers
     /// never do. This avoids threading a boolean through the provider stack.
     pub fn get_pricing(&self) -> Option<ModelPricing> {
-        if let Some(provider) = self.cached_llm_provider.get() {
-            if provider.key_resolver().is_some() {
-                return None;
-            }
+        if let Some(provider) = self.cached_llm_provider.get()
+            && provider.key_resolver().is_some()
+        {
+            return None;
         }
+
         self.llm_config
             .as_ref()
             .and_then(|config| get_model_info(&config.provider, &config.model))
