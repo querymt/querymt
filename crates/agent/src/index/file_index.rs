@@ -544,7 +544,12 @@ fn build_file_index(
 }
 
 /// Process notify events into a FileChangeSet
-fn process_events(events: &[Event], root: &Path, overrides: &Override, gitignore: &Gitignore) -> FileChangeSet {
+fn process_events(
+    events: &[Event],
+    root: &Path,
+    overrides: &Override,
+    gitignore: &Gitignore,
+) -> FileChangeSet {
     let mut changes = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
     let mut rename_from: Option<PathBuf> = None;
@@ -744,16 +749,18 @@ fn build_gitignore(root: &Path) -> Gitignore {
             gi
         }
         Err(e) => {
-            log::warn!(
-                "FileIndexWatcher: Failed to build gitignore matcher: {}",
-                e
-            );
+            log::warn!("FileIndexWatcher: Failed to build gitignore matcher: {}", e);
             Gitignore::empty()
         }
     }
 }
 
-fn is_ignored(relative_path: &str, is_dir: bool, overrides: &Override, gitignore: &Gitignore) -> bool {
+fn is_ignored(
+    relative_path: &str,
+    is_dir: bool,
+    overrides: &Override,
+    gitignore: &Gitignore,
+) -> bool {
     // Hardcoded overrides take priority
     if overrides.matched(relative_path, is_dir).is_ignore() {
         return true;
@@ -764,7 +771,9 @@ fn is_ignored(relative_path: &str, is_dir: bool, overrides: &Override, gitignore
     // patterns (e.g. `xcuserdata/`) matching files deep inside that directory.
     // gitignore.path() returns the directory the .gitignore lives in (= root).
     let abs_path = gitignore.path().join(relative_path);
-    gitignore.matched_path_or_any_parents(&abs_path, is_dir).is_ignore()
+    gitignore
+        .matched_path_or_any_parents(&abs_path, is_dir)
+        .is_ignore()
 }
 
 fn apply_changes_to_index(
@@ -787,7 +796,9 @@ fn apply_changes_to_index(
             Err(_) => continue,
         };
 
-        if relative_path.is_empty() || is_ignored(&relative_path, change.is_dir, overrides, gitignore) {
+        if relative_path.is_empty()
+            || is_ignored(&relative_path, change.is_dir, overrides, gitignore)
+        {
             continue;
         }
 
