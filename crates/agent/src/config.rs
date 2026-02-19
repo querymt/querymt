@@ -381,6 +381,62 @@ impl Default for SnapshotBackendConfig {
 // End Snapshot Backend Configuration
 // ============================================================================
 
+// ============================================================================
+// ExecutionPolicy — groups the 5 execution-policy configs shared across
+// AgentSettings, PlannerConfig, and DelegateConfig.
+// ============================================================================
+
+/// Execution-policy configuration shared across agent, planner, and delegate
+/// config structs.
+///
+/// In TOML this appears as a `[*.execution]` nested table, e.g.:
+/// ```toml
+/// [agent.execution.tool_output]
+/// max_lines = 2000
+///
+/// [agent.execution.compaction]
+/// auto = true
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ExecutionPolicy {
+    /// Tool output truncation settings (Layer 1)
+    pub tool_output: ToolOutputConfig,
+    /// Pruning settings — runs after every turn (Layer 2)
+    pub pruning: PruningConfig,
+    /// AI compaction settings — runs on context overflow (Layer 3)
+    pub compaction: CompactionConfig,
+    /// Snapshot backend for undo/redo support
+    pub snapshot: SnapshotBackendConfig,
+    /// Rate limit retry configuration
+    pub rate_limit: RateLimitConfig,
+}
+
+/// Runtime execution policy — the 4 configs that survive to `AgentConfig`
+/// (excludes `SnapshotBackendConfig` which is consumed at build time).
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeExecutionPolicy {
+    pub tool_output: ToolOutputConfig,
+    pub pruning: PruningConfig,
+    pub compaction: CompactionConfig,
+    pub rate_limit: RateLimitConfig,
+}
+
+impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
+    fn from(ep: &ExecutionPolicy) -> Self {
+        Self {
+            tool_output: ep.tool_output.clone(),
+            pruning: ep.pruning.clone(),
+            compaction: ep.compaction.clone(),
+            rate_limit: ep.rate_limit.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// End ExecutionPolicy
+// ============================================================================
+
 /// A single part of a system prompt, either an inline string or a file reference.
 ///
 /// In TOML configs, the `system` field accepts a mixed array of strings and
@@ -510,24 +566,22 @@ pub struct AgentSettings {
     pub system: Vec<SystemPart>,
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
-    /// Tool output truncation settings (Layer 1)
+    /// Whether to treat unknown tools as mutating.
+    #[serde(default = "default_assume_mutating")]
+    pub assume_mutating: bool,
+    /// Explicit allowlist of mutating tools.
     #[serde(default)]
-    pub tool_output: ToolOutputConfig,
-    /// Pruning settings - runs after every turn (Layer 2)
+    pub mutating_tools: Vec<String>,
+    /// Execution policy (tool output, pruning, compaction, snapshot, rate limit)
     #[serde(default)]
-    pub pruning: PruningConfig,
-    /// AI compaction settings - runs on context overflow (Layer 3)
-    #[serde(default)]
-    pub compaction: CompactionConfig,
-    /// Snapshot backend for undo/redo support
-    #[serde(default)]
-    pub snapshot: SnapshotBackendConfig,
-    /// Rate limit retry configuration
-    #[serde(default)]
-    pub rate_limit: RateLimitConfig,
+    pub execution: ExecutionPolicy,
     /// Skills system configuration
     #[serde(default)]
     pub skills: SkillsConfig,
+}
+
+fn default_assume_mutating() -> bool {
+    true
 }
 
 /// Multi-agent quorum configuration
@@ -581,16 +635,9 @@ pub struct PlannerConfig {
     pub parameters: Option<HashMap<String, Value>>,
     #[serde(default)]
     pub middleware: Vec<MiddlewareEntry>,
+    /// Execution policy (tool output, pruning, compaction, snapshot, rate limit)
     #[serde(default)]
-    pub tool_output: ToolOutputConfig,
-    #[serde(default)]
-    pub pruning: PruningConfig,
-    #[serde(default)]
-    pub compaction: CompactionConfig,
-    #[serde(default)]
-    pub snapshot: SnapshotBackendConfig,
-    #[serde(default)]
-    pub rate_limit: RateLimitConfig,
+    pub execution: ExecutionPolicy,
 }
 
 /// Delegate agent configuration
@@ -614,16 +661,9 @@ pub struct DelegateConfig {
     pub mcp: Vec<McpServerConfig>,
     #[serde(default)]
     pub middleware: Vec<MiddlewareEntry>,
+    /// Execution policy (tool output, pruning, compaction, snapshot, rate limit)
     #[serde(default)]
-    pub tool_output: ToolOutputConfig,
-    #[serde(default)]
-    pub pruning: PruningConfig,
-    #[serde(default)]
-    pub compaction: CompactionConfig,
-    #[serde(default)]
-    pub snapshot: SnapshotBackendConfig,
-    #[serde(default)]
-    pub rate_limit: RateLimitConfig,
+    pub execution: ExecutionPolicy,
 }
 
 /// MCP server configuration
@@ -1162,6 +1202,17 @@ mod tests {
     fn test_system_absent() {
         let agent = parse_agent("");
         assert!(agent.system.is_empty());
+        assert!(agent.assume_mutating);
+        assert!(agent.mutating_tools.is_empty());
+    }
+
+    #[test]
+    fn test_mutating_tool_settings_parse() {
+        let agent = parse_agent(
+            "assume_mutating = false\nmutating_tools = [\"edit\", \"write_file\", \"shell\"]",
+        );
+        assert!(!agent.assume_mutating);
+        assert_eq!(agent.mutating_tools, vec!["edit", "write_file", "shell"]);
     }
 
     #[test]

@@ -1,10 +1,7 @@
 //! Agent configuration types for the simple builder API
 
 use super::utils::infer_required_capabilities;
-use crate::config::{
-    CompactionConfig, MiddlewareEntry, PruningConfig, RateLimitConfig, SnapshotBackendConfig,
-    ToolOutputConfig,
-};
+use crate::config::{ExecutionPolicy, MiddlewareEntry};
 use crate::tools::CapabilityRequirement;
 use querymt::LLMParams;
 use serde_json::Value;
@@ -19,11 +16,7 @@ pub(super) struct AgentConfig {
     pub description: Option<String>,
     pub required_capabilities: Vec<CapabilityRequirement>,
     pub middleware: Vec<MiddlewareEntry>,
-    pub tool_output: ToolOutputConfig,
-    pub pruning: PruningConfig,
-    pub compaction: CompactionConfig,
-    pub snapshot: SnapshotBackendConfig,
-    pub rate_limit: RateLimitConfig,
+    pub execution: ExecutionPolicy,
 }
 
 impl AgentConfig {
@@ -36,11 +29,7 @@ impl AgentConfig {
             description: None,
             required_capabilities: Vec::new(),
             middleware: Vec::new(),
-            tool_output: ToolOutputConfig::default(),
-            pruning: PruningConfig::default(),
-            compaction: CompactionConfig::default(),
-            snapshot: SnapshotBackendConfig::default(),
-            rate_limit: RateLimitConfig::default(),
+            execution: ExecutionPolicy::default(),
         }
     }
 }

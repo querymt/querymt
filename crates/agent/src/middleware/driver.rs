@@ -1,3 +1,4 @@
+use crate::agent::core::SessionRuntime;
 use crate::events::SessionLimits;
 use crate::middleware::{ExecutionState, Result};
 use async_trait::async_trait;
@@ -6,32 +7,56 @@ use std::sync::Arc;
 use tracing::{Instrument, info_span, instrument};
 
 /// Trait for middleware that runs at specific lifecycle phases
+///
+/// Methods now receive an optional `SessionRuntime` reference to access
+/// per-session state like function_index and turn_diffs. This eliminates
+/// the need for middleware to maintain their own session_runtime maps.
 #[async_trait]
 pub trait MiddlewareDriver: Send + Sync {
     /// Runs once at the start of a user turn
-    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Ok(state)
     }
 
     /// Runs before each LLM call (including tool-loop continuations)
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Ok(state)
     }
 
     /// Runs after receiving the LLM response
-    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_after_llm(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Ok(state)
     }
 
     /// Runs while processing multiple tool calls
-    async fn on_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_processing_tool_calls(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Ok(state)
     }
 
     /// Runs once when the turn is about to complete (state is Complete).
     /// Middleware can transform Complete → BeforeLlmCall to request corrections
     /// (e.g., post-turn code review for duplicate detection).
-    async fn on_turn_end(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_end(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         Ok(state)
     }
 
@@ -67,25 +92,49 @@ impl CompositeDriver {
         self.drivers.len()
     }
 
-    pub async fn run_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
-        self.run_phase(state, MiddlewarePhase::TurnStart).await
-    }
-
-    pub async fn run_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
-        self.run_phase(state, MiddlewarePhase::StepStart).await
-    }
-
-    pub async fn run_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
-        self.run_phase(state, MiddlewarePhase::AfterLlm).await
-    }
-
-    pub async fn run_processing_tool_calls(&self, state: ExecutionState) -> Result<ExecutionState> {
-        self.run_phase(state, MiddlewarePhase::ProcessingToolCalls)
+    pub async fn run_turn_start(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.run_phase(state, runtime, MiddlewarePhase::TurnStart)
             .await
     }
 
-    pub async fn run_turn_end(&self, state: ExecutionState) -> Result<ExecutionState> {
-        self.run_phase(state, MiddlewarePhase::TurnEnd).await
+    pub async fn run_step_start(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.run_phase(state, runtime, MiddlewarePhase::StepStart)
+            .await
+    }
+
+    pub async fn run_after_llm(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.run_phase(state, runtime, MiddlewarePhase::AfterLlm)
+            .await
+    }
+
+    pub async fn run_processing_tool_calls(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.run_phase(state, runtime, MiddlewarePhase::ProcessingToolCalls)
+            .await
+    }
+
+    pub async fn run_turn_end(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.run_phase(state, runtime, MiddlewarePhase::TurnEnd)
+            .await
     }
 
     pub fn reset(&self) {
@@ -129,7 +178,7 @@ impl CompositeDriver {
 
     #[instrument(
         name = "middleware.phase",
-        skip(self, state),
+        skip(self, state, runtime),
         fields(
             phase = %phase.name(),
             input_state = %state.name(),
@@ -140,6 +189,7 @@ impl CompositeDriver {
     async fn run_phase(
         &self,
         state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
         phase: MiddlewarePhase,
     ) -> Result<ExecutionState> {
         let state_name = state.name();
@@ -164,43 +214,86 @@ impl CompositeDriver {
                 current_state_name
             );
 
-            let span = info_span!("middleware.driver", name = %driver_name, phase = %phase.name());
+            let span = info_span!(
+                "middleware.driver",
+                name = %driver_name,
+                phase = %phase.name(),
+                index = idx,
+                total = self.drivers.len(),
+                input_state = %current_state_name,
+                output_state = tracing::field::Empty,
+                terminal = tracing::field::Empty,
+            );
             current = match phase {
                 MiddlewarePhase::TurnStart => {
-                    driver.on_turn_start(current).instrument(span).await?
-                }
-                MiddlewarePhase::StepStart => {
-                    driver.on_step_start(current).instrument(span).await?
-                }
-                MiddlewarePhase::AfterLlm => driver.on_after_llm(current).instrument(span).await?,
-                MiddlewarePhase::ProcessingToolCalls => {
                     driver
-                        .on_processing_tool_calls(current)
-                        .instrument(span)
+                        .on_turn_start(current, runtime)
+                        .instrument(span.clone())
                         .await?
                 }
-                MiddlewarePhase::TurnEnd => driver.on_turn_end(current).instrument(span).await?,
+                MiddlewarePhase::StepStart => {
+                    driver
+                        .on_step_start(current, runtime)
+                        .instrument(span.clone())
+                        .await?
+                }
+                MiddlewarePhase::AfterLlm => {
+                    driver
+                        .on_after_llm(current, runtime)
+                        .instrument(span.clone())
+                        .await?
+                }
+                MiddlewarePhase::ProcessingToolCalls => {
+                    driver
+                        .on_processing_tool_calls(current, runtime)
+                        .instrument(span.clone())
+                        .await?
+                }
+                MiddlewarePhase::TurnEnd => {
+                    driver
+                        .on_turn_end(current, runtime)
+                        .instrument(span.clone())
+                        .await?
+                }
             };
 
             let new_state_name = current.name();
+            span.record("output_state", new_state_name);
             trace!(
                 "  Driver {} transitioned: {} -> {}",
                 driver_name, current_state_name, new_state_name
             );
 
-            // If state became terminal, stop processing further middleware
-            if matches!(
-                current,
-                ExecutionState::Complete
-                    | ExecutionState::Stopped { .. }
-                    | ExecutionState::Cancelled
-            ) {
+            // During TurnEnd, Complete is the expected pass-through state —
+            // middleware may transform it to BeforeLlmCall (e.g., dedup_check
+            // injecting a duplicate-code review). Only Stopped/Cancelled are
+            // truly terminal during TurnEnd.
+            let is_terminal = match phase {
+                MiddlewarePhase::TurnEnd => {
+                    matches!(
+                        current,
+                        ExecutionState::Stopped { .. } | ExecutionState::Cancelled
+                    )
+                }
+                _ => {
+                    matches!(
+                        current,
+                        ExecutionState::Complete
+                            | ExecutionState::Stopped { .. }
+                            | ExecutionState::Cancelled
+                    )
+                }
+            };
+            if is_terminal {
+                span.record("terminal", true);
                 debug!(
                     "CompositeDriver: {} produced terminal state {}, stopping pipeline",
                     driver_name, new_state_name
                 );
                 break;
             }
+
+            span.record("terminal", false);
         }
 
         let final_state_name = current.name();
@@ -252,7 +345,11 @@ mod tests {
 
     #[async_trait]
     impl MiddlewareDriver for TestDriver {
-        async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+        async fn on_turn_start(
+            &self,
+            state: ExecutionState,
+            _runtime: Option<&Arc<SessionRuntime>>,
+        ) -> Result<ExecutionState> {
             if self.should_stop {
                 Ok(ExecutionState::Stopped {
                     message: "test stop".into(),
@@ -291,10 +388,11 @@ mod tests {
             stats: Arc::new(AgentStats::default()),
             provider: "mock".into(),
             model: "mock-model".into(),
+            session_mode: crate::agent::core::AgentMode::Build,
         });
 
         let state = ExecutionState::BeforeLlmCall { context };
-        let result = composite.run_turn_start(state).await.unwrap();
+        let result = composite.run_turn_start(state, None).await.unwrap();
 
         assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
     }
@@ -323,10 +421,11 @@ mod tests {
             stats: Arc::new(AgentStats::default()),
             provider: "mock".into(),
             model: "mock-model".into(),
+            session_mode: crate::agent::core::AgentMode::Build,
         });
 
         let state = ExecutionState::BeforeLlmCall { context };
-        let result = composite.run_turn_start(state).await.unwrap();
+        let result = composite.run_turn_start(state, None).await.unwrap();
 
         // Should stop at the second driver and not run third
         assert!(matches!(result, ExecutionState::Stopped { .. }));

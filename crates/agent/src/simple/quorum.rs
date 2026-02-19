@@ -6,10 +6,13 @@ use super::utils::{
     build_llm_config, default_registry, infer_required_capabilities, latest_assistant_message,
     to_absolute_path,
 };
-use crate::agent::builder::AgentBuilderExt;
-use crate::agent::core::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
+use crate::agent::AgentHandle;
+use crate::agent::agent_config_builder::AgentConfigBuilder;
+use crate::agent::core::SnapshotPolicy;
+use crate::agent::core::ToolPolicy;
 use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
 use crate::delegation::AgentInfo;
+use crate::event_bus::EventBus;
 use crate::events::AgentEvent;
 use crate::middleware::MIDDLEWARE_REGISTRY;
 use crate::quorum::AgentQuorum;
@@ -18,6 +21,7 @@ use crate::send_agent::SendAgent;
 #[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
 use crate::session::projection::ViewStore;
+use crate::session::store::SessionStore;
 use crate::snapshot::GitSnapshotBackend;
 use crate::tools::CapabilityRequirement;
 use crate::tools::builtins::all_builtin_tools;
@@ -155,51 +159,34 @@ impl QuorumBuilder {
             let llm_config = build_llm_config(&delegate)?;
             let tools = delegate.tools.clone();
             let middleware_entries = delegate.middleware.clone();
-            let tool_output_config = delegate.tool_output.clone();
-            let pruning_config = delegate.pruning.clone();
-            let compaction_config = delegate.compaction.clone();
-            let snapshot_backend_config = delegate.snapshot.clone();
-            let rate_limit_config = delegate.rate_limit.clone();
+            let exec = delegate.execution.clone();
             let registry = registry.clone();
             let snapshot_policy_for_delegate = self.snapshot_policy;
-            let _cwd_for_delegate = cwd.clone();
             builder = builder.add_delegate_agent(agent_info, move |store, event_bus| {
-                let mut agent = QueryMTAgent::new(registry.clone(), store, llm_config.clone())
-                    .with_event_bus(event_bus)
-                    .with_tool_policy(ToolPolicy::BuiltInOnly)
-                    .with_snapshot_policy(snapshot_policy_for_delegate);
+                use crate::config::RuntimeExecutionPolicy;
+                let mut b =
+                    AgentConfigBuilder::new(registry.clone(), store.clone(), llm_config.clone())
+                        .with_event_bus(event_bus.clone())
+                        .with_tool_policy(ToolPolicy::BuiltInOnly)
+                        .with_snapshot_policy(snapshot_policy_for_delegate);
 
-                // Set snapshot backend if snapshot policy is enabled
                 if snapshot_policy_for_delegate != SnapshotPolicy::None {
-                    agent = agent.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+                    b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
                 }
 
                 if !tools.is_empty() {
-                    agent = agent.with_allowed_tools(tools.clone());
+                    b = b.with_allowed_tools(tools.clone());
                 }
 
-                // Set compaction config BEFORE applying middleware so factory can read it
-                agent = agent
-                    .with_tool_output_config(tool_output_config)
-                    .with_pruning_config(pruning_config)
-                    .with_compaction_config(compaction_config.clone())
-                    .with_rate_limit_config(rate_limit_config);
+                let auto_compact = exec.compaction.auto;
+                b = b.with_execution_policy(RuntimeExecutionPolicy::from(&exec));
+                apply_middleware_from_config(&mut b, &middleware_entries, auto_compact);
 
-                // Apply middleware from config (after compaction_config is set)
-                apply_middleware_from_config(
-                    &mut agent,
-                    &middleware_entries,
-                    compaction_config.auto,
-                );
-
-                // Handle snapshot backend from config (can override the policy-based one above)
-                match snapshot_backend_config.backend.as_str() {
+                match exec.snapshot.backend.as_str() {
                     "git" => {
-                        agent = agent.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+                        b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
                     }
-                    "none" | "" => {
-                        // Explicitly disable snapshot backend or use default
-                    }
+                    "none" | "" => {}
                     other => {
                         log::warn!(
                             "Unknown snapshot backend '{}' for delegate, ignoring",
@@ -208,64 +195,54 @@ impl QuorumBuilder {
                     }
                 }
 
-                Arc::new(agent)
+                let config = Arc::new(b.build());
+                Arc::new(AgentHandle::from_config(config)) as Arc<dyn SendAgent>
             });
         }
 
         let planner_llm = build_llm_config(&planner_config)?;
         let planner_tools = planner_config.tools.clone();
         let planner_middleware = planner_config.middleware.clone();
-        let planner_tool_output = planner_config.tool_output.clone();
-        let planner_pruning = planner_config.pruning.clone();
-        let planner_compaction = planner_config.compaction.clone();
-        let planner_snapshot = planner_config.snapshot.clone();
-        let planner_rate_limit = planner_config.rate_limit.clone();
+        let planner_exec = planner_config.execution.clone();
         let registry_for_planner = registry.clone();
         let snapshot_policy_for_planner = self.snapshot_policy;
-        let _cwd_for_planner = cwd.clone();
         builder = builder.with_planner(move |store, event_bus, agent_registry| {
-            let mut agent =
-                QueryMTAgent::new(registry_for_planner.clone(), store, planner_llm.clone())
-                    .with_event_bus(event_bus)
-                    .with_agent_registry(agent_registry)
-                    .with_snapshot_policy(snapshot_policy_for_planner);
+            use crate::config::RuntimeExecutionPolicy;
+            let mut b = AgentConfigBuilder::new(
+                registry_for_planner.clone(),
+                store.clone(),
+                planner_llm.clone(),
+            )
+            .with_event_bus(event_bus.clone())
+            .with_agent_registry(agent_registry)
+            .with_snapshot_policy(snapshot_policy_for_planner);
 
-            // Set snapshot root and backend if snapshot policy is enabled and cwd is available
-            // Set snapshot backend if snapshot policy is enabled
             if snapshot_policy_for_planner != SnapshotPolicy::None {
-                agent = agent.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+                b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
             }
 
             if !planner_tools.is_empty() {
-                agent = agent
+                b = b
                     .with_tool_policy(ToolPolicy::BuiltInOnly)
                     .with_allowed_tools(planner_tools.clone());
             }
 
-            // Set compaction config BEFORE applying middleware so factory can read it
-            agent = agent
-                .with_tool_output_config(planner_tool_output)
-                .with_pruning_config(planner_pruning)
-                .with_compaction_config(planner_compaction.clone())
-                .with_rate_limit_config(planner_rate_limit);
+            let auto_compact = planner_exec.compaction.auto;
+            b = b.with_execution_policy(RuntimeExecutionPolicy::from(&planner_exec));
+            apply_middleware_from_config(&mut b, &planner_middleware, auto_compact);
 
-            // Apply middleware from config (after compaction_config is set)
-            apply_middleware_from_config(&mut agent, &planner_middleware, planner_compaction.auto);
-
-            // Handle snapshot backend from config (can override the policy-based one above)
-            match planner_snapshot.backend.as_str() {
+            match planner_exec.snapshot.backend.as_str() {
                 "git" => {
-                    agent = agent.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+                    b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
                 }
-                "none" | "" => {
-                    // Explicitly disable snapshot backend or use default
-                }
+                "none" | "" => {}
                 other => {
                     log::warn!("Unknown snapshot backend '{}' for planner, ignoring", other);
                 }
             }
 
-            Arc::new(agent)
+            let config = Arc::new(b.build());
+            Arc::new(AgentHandle::from_config(config)) as Arc<dyn SendAgent>
         });
 
         builder = builder
@@ -303,9 +280,19 @@ impl QuorumBuilder {
 
         let quorum = builder.build().map_err(|e| anyhow!(e.to_string()))?;
         let view_store = quorum.view_store();
+
+        // Extract planner handle for dashboard use
+        let planner = quorum.planner();
+        let planner_handle = planner
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .ok_or_else(|| anyhow!("Planner is not an AgentHandle"))?;
+        let planner_handle = Arc::new(AgentHandle::from_config(planner_handle.config.clone()));
+
         Ok(Quorum {
             inner: quorum,
             view_store,
+            planner_handle,
             planner_session_id: Arc::new(Mutex::new(None)),
             cwd,
             callbacks: Arc::new(EventCallbacksState::new(None)),
@@ -317,6 +304,8 @@ pub struct Quorum {
     inner: AgentQuorum,
     #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
     view_store: Arc<dyn ViewStore>,
+    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
+    planner_handle: Arc<AgentHandle>,
     planner_session_id: Arc<Mutex<Option<String>>>,
     cwd: Option<PathBuf>,
     callbacks: Arc<EventCallbacksState>,
@@ -334,9 +323,9 @@ impl Quorum {
             .prompt(request)
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
-        let history = planner
-            .provider
-            .history_store()
+        let history = self
+            .inner
+            .store()
             .get_history(&session_id)
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
@@ -347,17 +336,21 @@ impl Quorum {
         &self.inner
     }
 
-    pub fn planner(&self) -> Arc<QueryMTAgent> {
+    pub fn planner(&self) -> Arc<dyn SendAgent> {
         self.inner.planner()
     }
 
-    pub fn delegate(&self, id: &str) -> Option<Arc<QueryMTAgent>> {
+    pub fn delegate(&self, id: &str) -> Option<Arc<dyn SendAgent>> {
         self.inner.delegate(id)
     }
 
     #[cfg(feature = "dashboard")]
     pub fn dashboard(&self) -> AgentServer {
-        AgentServer::new(self.planner(), self.view_store.clone(), self.cwd.clone())
+        AgentServer::new(
+            self.planner_handle.clone(),
+            self.view_store.clone(),
+            self.cwd.clone(),
+        )
     }
 
     /// Start an ACP server with the specified transport.
@@ -381,7 +374,7 @@ impl Quorum {
     /// ```
     pub async fn acp(&self, transport: &str) -> Result<()> {
         match transport {
-            "stdio" => crate::acp::serve_stdio(self.planner())
+            "stdio" => crate::acp::serve_stdio(self.planner_handle.clone())
                 .await
                 .map_err(|e| anyhow!("ACP stdio error: {}", e)),
             addr if addr.contains(':') => Err(anyhow!(
@@ -488,12 +481,8 @@ impl Quorum {
         // Copy middleware config for planner
         planner_config.middleware = config.planner.middleware;
 
-        // Copy compaction/pruning/tool_output/snapshot/rate_limit configs for planner
-        planner_config.tool_output = config.planner.tool_output;
-        planner_config.pruning = config.planner.pruning;
-        planner_config.compaction = config.planner.compaction;
-        planner_config.snapshot = config.planner.snapshot;
-        planner_config.rate_limit = config.planner.rate_limit;
+        // Copy execution policy for planner
+        planner_config.execution = config.planner.execution;
 
         builder.planner_config = Some(planner_config);
 
@@ -540,12 +529,8 @@ impl Quorum {
             // Copy middleware config for this delegate
             delegate_config.middleware = delegate.middleware;
 
-            // Copy compaction/pruning/tool_output/snapshot/rate_limit configs for this delegate
-            delegate_config.tool_output = delegate.tool_output;
-            delegate_config.pruning = delegate.pruning;
-            delegate_config.compaction = delegate.compaction;
-            delegate_config.snapshot = delegate.snapshot;
-            delegate_config.rate_limit = delegate.rate_limit;
+            // Copy execution policy for this delegate
+            delegate_config.execution = delegate.execution;
 
             builder.delegates.push(delegate_config);
         }
@@ -564,42 +549,48 @@ impl ChatRunner for Quorum {
 
     async fn chat_session(&self) -> Result<Box<dyn ChatSession>> {
         let session_id = self.create_new_planner_session().await?;
-        let session = QuorumSession::new(self.inner.planner(), session_id, self.cwd.clone());
+        let session = QuorumSession::new(
+            self.inner.planner(),
+            self.inner.event_bus(),
+            self.inner.store(),
+            session_id,
+            self.cwd.clone(),
+        );
         Ok(Box::new(session))
     }
 
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
-        self.inner.planner().subscribe_events()
+        self.inner.event_bus().subscribe()
     }
 
     fn on_tool_call_boxed(&self, callback: Box<dyn Fn(String, Value) + Send + Sync>) {
         self.callbacks.on_tool_call(callback);
         self.callbacks
-            .ensure_listener(self.inner.planner().subscribe_events());
+            .ensure_listener(self.inner.event_bus().subscribe());
     }
 
     fn on_tool_complete_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_tool_complete(callback);
         self.callbacks
-            .ensure_listener(self.inner.planner().subscribe_events());
+            .ensure_listener(self.inner.event_bus().subscribe());
     }
 
     fn on_message_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_message(callback);
         self.callbacks
-            .ensure_listener(self.inner.planner().subscribe_events());
+            .ensure_listener(self.inner.event_bus().subscribe());
     }
 
     fn on_delegation_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_delegation(callback);
         self.callbacks
-            .ensure_listener(self.inner.planner().subscribe_events());
+            .ensure_listener(self.inner.event_bus().subscribe());
     }
 
     fn on_error_boxed(&self, callback: Box<dyn Fn(String) + Send + Sync>) {
         self.callbacks.on_error(callback);
         self.callbacks
-            .ensure_listener(self.inner.planner().subscribe_events());
+            .ensure_listener(self.inner.event_bus().subscribe());
     }
 
     #[cfg(feature = "dashboard")]
@@ -610,20 +601,30 @@ impl ChatRunner for Quorum {
 
 /// A session for interacting with a Quorum's planner agent
 pub struct QuorumSession {
-    planner: Arc<QueryMTAgent>,
+    planner: Arc<dyn SendAgent>,
     session_id: String,
     callbacks: Arc<EventCallbacksState>,
+    event_bus: Arc<EventBus>,
+    store: Arc<dyn SessionStore>,
     #[allow(dead_code)]
     cwd: Option<PathBuf>,
 }
 
 impl QuorumSession {
-    fn new(planner: Arc<QueryMTAgent>, session_id: String, cwd: Option<PathBuf>) -> Self {
+    fn new(
+        planner: Arc<dyn SendAgent>,
+        event_bus: Arc<EventBus>,
+        store: Arc<dyn SessionStore>,
+        session_id: String,
+        cwd: Option<PathBuf>,
+    ) -> Self {
         let callbacks = Arc::new(EventCallbacksState::new(Some(session_id.clone())));
         Self {
             planner,
             session_id,
             callbacks,
+            event_bus,
+            store,
             cwd,
         }
     }
@@ -645,9 +646,7 @@ impl ChatSession for QuorumSession {
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
         let history = self
-            .planner
-            .provider
-            .history_store()
+            .store
             .get_history(&self.session_id)
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
@@ -656,26 +655,22 @@ impl ChatSession for QuorumSession {
 
     fn on_tool_call_boxed(&self, callback: Box<dyn Fn(String, Value) + Send + Sync>) {
         self.callbacks.on_tool_call(callback);
-        self.callbacks
-            .ensure_listener(self.planner.subscribe_events());
+        self.callbacks.ensure_listener(self.event_bus.subscribe());
     }
 
     fn on_tool_complete_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_tool_complete(callback);
-        self.callbacks
-            .ensure_listener(self.planner.subscribe_events());
+        self.callbacks.ensure_listener(self.event_bus.subscribe());
     }
 
     fn on_message_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_message(callback);
-        self.callbacks
-            .ensure_listener(self.planner.subscribe_events());
+        self.callbacks.ensure_listener(self.event_bus.subscribe());
     }
 
     fn on_error_boxed(&self, callback: Box<dyn Fn(String) + Send + Sync>) {
         self.callbacks.on_error(callback);
-        self.callbacks
-            .ensure_listener(self.planner.subscribe_events());
+        self.callbacks.ensure_listener(self.event_bus.subscribe());
     }
 }
 
@@ -693,19 +688,72 @@ fn parse_snapshot_policy(policy: Option<String>) -> Result<SnapshotPolicy> {
     }
 }
 
-/// Helper to apply middleware from config entries to an agent
+/// Helper to apply middleware from config entries to a builder.
+///
+/// `factory_config` is a snapshot of the config built so far (before middleware
+/// are appended). Middleware factories only need `compaction_config` and
+/// `event_bus` from it.
 fn apply_middleware_from_config(
-    agent: &mut QueryMTAgent,
+    builder: &mut AgentConfigBuilder,
     entries: &[MiddlewareEntry],
     auto_compact: bool,
 ) {
+    // Build a lightweight AgentConfig snapshot that factory closures can read.
+    // We do this by constructing a minimal config with just the fields that
+    // factories actually consult (compaction_config, event_bus).
+    use crate::agent::agent_config::AgentConfig;
+    use crate::agent::core::{
+        DelegationContextConfig, DelegationContextTiming, SnapshotPolicy, ToolConfig,
+    };
+    use crate::config::RuntimeExecutionPolicy;
+    use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
+    use crate::session::compaction::SessionCompaction;
+    use crate::tools::ToolRegistry;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    // Build a minimal ephemeral policy with the real compaction config so that
+    // middleware factories that inspect compaction settings see correct values.
+    let ephemeral_policy = RuntimeExecutionPolicy {
+        compaction: builder.compaction_config().clone(),
+        ..Default::default()
+    };
+
+    let factory_config = Arc::new(AgentConfig {
+        provider: builder.provider().clone(),
+        event_bus: builder.event_bus(),
+        agent_registry: builder.agent_registry(),
+        workspace_manager_actor: WorkspaceIndexManagerActor::new(
+            WorkspaceIndexManagerConfig::default(),
+        ),
+        default_mode: Arc::new(std::sync::Mutex::new(crate::agent::core::AgentMode::Build)),
+        tool_config: ToolConfig::default(),
+        tool_registry: ToolRegistry::new(),
+        middleware_drivers: Vec::new(),
+        auth_methods: Vec::new(),
+        max_steps: None,
+        snapshot_policy: SnapshotPolicy::None,
+        assume_mutating: true,
+        mutating_tools: HashSet::new(),
+        max_prompt_bytes: None,
+        execution_timeout_secs: 300,
+        execution_policy: ephemeral_policy,
+        compaction: SessionCompaction::new(),
+        snapshot_backend: None,
+        snapshot_gc_config: crate::snapshot::GcConfig::default(),
+        delegation_context_config: DelegationContextConfig {
+            timing: DelegationContextTiming::FirstTurnOnly,
+            auto_inject: true,
+        },
+        pending_elicitations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+    });
+
     for entry in entries {
-        match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, agent) {
+        match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &factory_config) {
             Ok(middleware) => {
-                agent.middleware_drivers.lock().unwrap().push(middleware);
+                builder.push_middleware(middleware);
             }
             Err(e) => {
-                // Skip if middleware is disabled, otherwise log warning
                 let msg = e.to_string();
                 if !msg.contains("disabled") {
                     log::warn!(
@@ -718,17 +766,11 @@ fn apply_middleware_from_config(
         }
     }
 
-    // Auto-add ContextMiddleware if compaction.auto is true and user didn't provide one
     if auto_compact {
-        let mut drivers = agent.middleware_drivers.lock().unwrap();
-        let already_has = drivers.iter().any(|d| d.name() == "ContextMiddleware");
-        if !already_has {
-            log::info!("Auto-enabling ContextMiddleware for compaction");
-            let context_middleware = crate::middleware::ContextMiddleware::new(
-                crate::middleware::ContextConfig::default().auto_compact(true),
-            );
-            drivers.push(Arc::new(context_middleware));
-        }
+        log::info!("Auto-enabling ContextMiddleware for compaction");
+        builder.push_middleware(Arc::new(crate::middleware::ContextMiddleware::new(
+            crate::middleware::ContextConfig::default().auto_compact(true),
+        )));
     }
 }
 

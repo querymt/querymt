@@ -104,6 +104,10 @@ pub struct ConversationContext {
     pub provider: Arc<str>,
     /// Current model for the session (for dynamic model info lookup)
     pub model: Arc<str>,
+    /// Per-session agent mode (Build, Plan, Review).
+    /// Used by `AgentModeMiddleware` to inject mode-specific reminders.
+    /// Defaults to `Build` for backward compatibility.
+    pub session_mode: crate::agent::core::AgentMode,
 }
 
 impl ConversationContext {
@@ -120,6 +124,7 @@ impl ConversationContext {
             stats,
             provider,
             model,
+            session_mode: crate::agent::core::AgentMode::Build,
         }
     }
 
@@ -151,7 +156,14 @@ impl ConversationContext {
             stats: self.stats.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
+            session_mode: self.session_mode,
         }
+    }
+
+    /// Set the per-session mode on this context (builder-style).
+    pub fn with_session_mode(mut self, mode: crate::agent::core::AgentMode) -> Self {
+        self.session_mode = mode;
+        self
     }
 
     /// Returns true if this is the first user turn
@@ -164,9 +176,15 @@ impl ConversationContext {
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub content: String,
+    /// Accumulated thinking/reasoning content from streaming, if any.
+    pub thinking: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<querymt::Usage>,
     pub finish_reason: Option<FinishReason>,
+    /// Pre-allocated message UUID from the streaming path.
+    /// When set, `transition_after_llm` will use this ID so the final
+    /// `AssistantMessageStored` event matches the delta events already sent to the UI.
+    pub message_id: Option<String>,
 }
 
 impl LlmResponse {
@@ -178,10 +196,24 @@ impl LlmResponse {
     ) -> Self {
         Self {
             content,
+            thinking: None,
             tool_calls,
             usage,
             finish_reason,
+            message_id: None,
         }
+    }
+
+    /// Set the pre-allocated message ID (builder-style).
+    pub fn with_message_id(mut self, id: String) -> Self {
+        self.message_id = Some(id);
+        self
+    }
+
+    /// Set the accumulated thinking content (builder-style).
+    pub fn with_thinking(mut self, thinking: Option<String>) -> Self {
+        self.thinking = thinking;
+        self
     }
 
     pub fn has_tool_calls(&self) -> bool {

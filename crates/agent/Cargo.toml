@@ -1,5 +1,5 @@
 [package]
-name = "qmt-agent"
+name = "querymt-agent"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -23,6 +23,7 @@ querymt = { path = "../querymt", default-features = false, features = ["extism_h
 querymt-utils = { path = "../querymt-utils", features = ["providers"] }
 agent-client-protocol = { version = "0.9", features = ["unstable"] }
 agent-client-protocol-schema = { version = "0.10", features = ["unstable"]}
+kameo = "0.19"
 async-trait.workspace = true
 anyhow = "1.0"
 thiserror = "2.0"
@@ -81,6 +82,9 @@ dirs.workspace = true
 similarity-core = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
 similarity-rs = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
 similarity-py = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
+
+# Rust AST parsing for rich structural fingerprinting during function indexing
+syn = { version = "2", features = ["full", "visit"] }
 
 [lib]
 name = "querymt_agent"

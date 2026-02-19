@@ -52,6 +52,61 @@ pub(crate) fn build_messages_json_for_tools(
     messages::messages_to_json(cfg, messages)
 }
 
+/// Apply chat template without tools, but with thinking support enabled.
+///
+/// Uses `apply_chat_template_oaicompat` (the same OAI-compat path as the tool-aware
+/// template) so that the model's Jinja template can emit `<think>` blocks and the
+/// returned `ChatTemplateResult` carries a properly initialised streaming parser.
+/// The caller can then use `result.streaming_state_oaicompat()` to get a state machine
+/// that routes `reasoning_content` deltas to `StreamChunk::Thinking` and `content`
+/// deltas to `StreamChunk::Text`, without any manual tag parsing.
+pub(crate) fn apply_template_for_thinking(
+    model: &Arc<LlamaModel>,
+    cfg: &LlamaCppConfig,
+    messages: &[ChatMessage],
+) -> Result<ChatTemplateResult, LLMError> {
+    let messages_json = build_messages_json_for_tools(cfg, messages)?;
+
+    log::debug!(
+        "Applying chat template for thinking with {} messages",
+        messages.len()
+    );
+
+    let template = model
+        .chat_template(cfg.chat_template.as_deref())
+        .or_else(|_| LlamaChatTemplate::new("chatml"))
+        .map_err(|e| LLMError::ProviderError(format!("Failed to get chat template: {}", e)))?;
+
+    let params = OpenAIChatTemplateParams {
+        messages_json: &messages_json,
+        tools_json: None,
+        tool_choice: None,
+        json_schema: None,
+        grammar: None,
+        reasoning_format: None,
+        chat_template_kwargs: None,
+        add_generation_prompt: true,
+        use_jinja: true,
+        parallel_tool_calls: false,
+        enable_thinking: cfg.enable_thinking.unwrap_or(true),
+        add_bos: false,
+        add_eos: false,
+        parse_tool_calls: false,
+    };
+
+    let result = model
+        .apply_chat_template_oaicompat(&template, &params)
+        .map_err(|e| LLMError::ProviderError(format!("Failed to apply chat template: {}", e)))?;
+
+    log::debug!(
+        "Template applied (thinking): prompt_len={}, thinking_forced_open={}",
+        result.prompt.len(),
+        result.thinking_forced_open,
+    );
+
+    Ok(result)
+}
+
 /// Apply chat template with tools to generate prompt and grammar.
 pub(crate) fn apply_template_with_tools(
     model: &Arc<LlamaModel>,

@@ -92,7 +92,21 @@ pub enum AgentEventKind {
     AssistantMessageStored {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
+    },
+    /// Streaming text delta emitted per token/chunk during streaming.
+    /// Ephemeral — must not be persisted to the event store.
+    AssistantContentDelta {
+        content: String,
+        message_id: String,
+    },
+    /// Streaming thinking/reasoning delta emitted during streaming.
+    /// Ephemeral — must not be persisted to the event store.
+    AssistantThinkingDelta {
+        content: String,
+        message_id: String,
     },
     LlmRequestStart {
         message_count: usize,
@@ -256,6 +270,10 @@ pub enum AgentEventKind {
     ModeChanged {
         mode: String,
         previous_mode: String,
+    },
+    /// Emitted when a session's mode changes (per-session mode in actor model)
+    SessionModeChanged {
+        mode: crate::agent::core::AgentMode,
     },
     /// LLM request was rate limited, execution is paused and waiting
     RateLimited {

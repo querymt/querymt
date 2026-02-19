@@ -54,6 +54,7 @@ pub struct CompactionResult {
 }
 
 /// Service for generating AI-powered conversation summaries
+#[derive(Clone)]
 pub struct SessionCompaction {
     estimator: Arc<dyn TokenEstimator>,
 }

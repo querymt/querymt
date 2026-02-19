@@ -3,13 +3,13 @@ use crate::config::{DEFAULT_MAX_TOKENS, LlamaCppConfig, LlamaCppLogMode};
 use crate::context::estimate_context_memory;
 use crate::generation::{
     build_prompt, build_prompt_candidates, build_prompt_with, build_raw_prompt, generate,
-    generate_streaming,
+    generate_streaming, generate_streaming_with_thinking,
 };
 use crate::memory::MemoryEstimate;
 use crate::response::LlamaCppChatResponse;
 use crate::tools::{
-    apply_template_with_tools, generate_streaming_with_tools, generate_with_tools,
-    parse_tool_response,
+    apply_template_for_thinking, apply_template_with_tools, generate_streaming_with_tools,
+    generate_with_tools, parse_tool_response,
 };
 use async_trait::async_trait;
 use futures::Stream;
@@ -268,12 +268,45 @@ impl ChatProvider for LlamaCppProvider {
             }
         }
 
-        // Fall back to standard streaming without tools
-        let prompts = build_prompt_candidates(&self.model, &self.cfg, messages)?;
+        // No-tool streaming: try the OAI-compat path first so that
+        // `reasoning_content` deltas from thinking models are routed to
+        // `StreamChunk::Thinking` rather than being emitted raw as Text.
+        // Fall back to the plain `generate_streaming` path if the template
+        // call fails (e.g. model does not support the oaicompat API).
+        let thinking_template = apply_template_for_thinking(&self.model, &self.cfg, messages).ok();
+        let prompts = if thinking_template.is_none() {
+            build_prompt_candidates(&self.model, &self.cfg, messages)?
+        } else {
+            vec![]
+        };
         let cfg = self.cfg.clone();
         let model = Arc::clone(&self.model);
 
         thread::spawn(move || {
+            // OAI-compat thinking path
+            if let Some(template_result) = thinking_template {
+                match generate_streaming_with_thinking(
+                    &model,
+                    &cfg,
+                    &template_result,
+                    max_tokens,
+                    None,
+                    &tx,
+                ) {
+                    Ok(usage) => {
+                        let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
+                        let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Done {
+                            stop_reason: "end_turn".to_string(),
+                        }));
+                    }
+                    Err(err) => {
+                        let _ = tx.unbounded_send(Err(err));
+                    }
+                }
+                return;
+            }
+
+            // Fallback: raw token streaming (no thinking extraction)
             let mut final_usage = None;
             for (idx, prompt) in prompts.iter().enumerate() {
                 match generate_streaming(&model, &cfg, prompt, max_tokens, None, &tx) {

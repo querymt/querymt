@@ -30,7 +30,7 @@ impl BrowseTool {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(TIMEOUT)
-            .user_agent("qmt-agent-browse/0.1") // NOTE: Proper user agent?
+            .user_agent("querymt-agent-browse/0.1") // NOTE: Proper user agent?
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build browse HTTP client");

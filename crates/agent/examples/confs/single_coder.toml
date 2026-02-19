@@ -12,6 +12,8 @@
 db = "/tmp/agent.db"
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
+assume_mutating = false
+mutating_tools = ["edit", "write_file", "shell"]
 tools = [
   # File operations
   "edit", "read_tool", "write_file",
@@ -31,20 +33,20 @@ system = [
   { file = "../prompts/default_system.txt" }
 ]
 
-[agent.snapshot]
+[agent.execution.snapshot]
 backend = "git"
 
 # Compaction: tool output truncation (Layer 1)
-[agent.tool_output]
+[agent.execution.tool_output]
 max_lines = 2000
 max_bytes = 51200
 
 # Compaction: pruning after every turn (Layer 2)
-[agent.pruning]
+[agent.execution.pruning]
 protect_tokens = 40000
 
 # Compaction: AI summary on context overflow (Layer 3)
-[agent.compaction]
+[agent.execution.compaction]
 auto = true
 
 #[agent.parameters]
@@ -120,7 +122,7 @@ max_steps = 200
 max_turns = 50
 
 # Context management with auto-compaction
-# Note: auto_compact is controlled by [agent.compaction].auto
+# Note: auto_compact is controlled by [agent.execution.compaction].auto
 [[middleware]]
 type = "context"
 warn_at_percent = 80

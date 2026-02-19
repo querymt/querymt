@@ -35,6 +35,7 @@ fn main() {
             session_id: "example-session-123".to_string(),
             kind: AgentEventKind::AssistantMessageStored {
                 content: "I'll look up the current stock price for you.".to_string(),
+                thinking: None,
                 message_id: None,
             },
         },
@@ -89,6 +90,7 @@ fn main() {
             session_id: "example-session-123".to_string(),
             kind: AgentEventKind::AssistantMessageStored {
                 content: "The current price of Alphabet (GOOGL) is $142.50.".to_string(),
+                thinking: None,
                 message_id: None,
             },
         },

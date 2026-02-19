@@ -20,7 +20,7 @@ impl Default for WebFetchTool {
 impl WebFetchTool {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
-            .user_agent("qmt-agent-web-fetch/0.1")
+            .user_agent("querymt-agent-web-fetch/0.1")
             .build()
             .unwrap();
         Self { client }

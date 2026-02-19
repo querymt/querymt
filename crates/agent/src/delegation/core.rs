@@ -1,9 +1,10 @@
-use crate::agent::QueryMTAgent;
+use crate::event_bus::EventBus;
 use crate::events::{AgentEvent, AgentEventKind, EventObserver};
 use crate::model::MessagePart;
 use crate::send_agent::SendAgent;
 use crate::session::domain::{Delegation, DelegationStatus, ForkOrigin, ForkPointType};
 use crate::session::store::SessionStore;
+use crate::tools::ToolRegistry;
 use crate::verification::VerificationSpec;
 use crate::verification::service::{VerificationContext, VerificationService};
 use agent_client_protocol::{
@@ -87,9 +88,11 @@ impl DelegationOrchestratorConfig {
 }
 
 pub struct DelegationOrchestrator {
-    delegator: Arc<QueryMTAgent>,
+    delegator: Arc<dyn SendAgent>,
+    event_bus: Arc<EventBus>,
     store: Arc<dyn SessionStore>,
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
+    tool_registry: Arc<ToolRegistry>,
     config: DelegationOrchestratorConfig,
     /// Maps delegation_id -> (parent_session_id, cancellation_token, join_handle)
     active_delegations: ActiveDelegations,
@@ -99,21 +102,26 @@ pub struct DelegationOrchestrator {
 
 impl DelegationOrchestrator {
     pub fn new(
-        delegator: Arc<QueryMTAgent>,
+        delegator: Arc<dyn SendAgent>,
+        event_bus: Arc<EventBus>,
         store: Arc<dyn SessionStore>,
         agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
+        tool_registry: Arc<ToolRegistry>,
         cwd: Option<PathBuf>,
     ) -> Self {
         Self {
             delegator,
+            event_bus,
             store,
             agent_registry,
+            tool_registry,
             config: DelegationOrchestratorConfig::new(cwd),
             active_delegations: Arc::new(Mutex::new(HashMap::new())),
             delegation_summarizer: None,
         }
     }
 
+    /// Legacy constructor for backward compatibility with QueryMTAgent.
     pub fn with_result_injection(mut self, enabled: bool) -> Self {
         self.config.inject_results = enabled;
         self
@@ -139,8 +147,10 @@ impl EventObserver for DelegationOrchestrator {
         match &event.kind {
             AgentEventKind::DelegationRequested { delegation } => {
                 let delegator = self.delegator.clone();
+                let event_bus = self.event_bus.clone();
                 let store = self.store.clone();
                 let agent_registry = self.agent_registry.clone();
+                let tool_registry = self.tool_registry.clone();
                 let config = self.config.clone();
                 let delegation_summarizer = self.delegation_summarizer.clone();
                 let parent_session_id = event.session_id.clone();
@@ -157,8 +167,10 @@ impl EventObserver for DelegationOrchestrator {
                 let handle = tokio::spawn(async move {
                     let ctx = DelegationContext {
                         delegator,
+                        event_bus,
                         store,
                         agent_registry,
+                        tool_registry,
                         config,
                         active_delegations: active_delegations_for_spawn,
                         delegation_summarizer,
@@ -217,9 +229,11 @@ impl EventObserver for DelegationOrchestrator {
 
 /// Context structure to group delegation handler parameters
 struct DelegationContext {
-    delegator: Arc<QueryMTAgent>,
+    delegator: Arc<dyn SendAgent>,
+    event_bus: Arc<EventBus>,
     store: Arc<dyn SessionStore>,
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
+    tool_registry: Arc<ToolRegistry>,
     config: DelegationOrchestratorConfig,
     active_delegations: ActiveDelegations,
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
@@ -289,6 +303,7 @@ async fn handle_delegation(
             delegation.target_agent_id
         );
         fail_delegation(
+            &ctx.event_bus,
             &ctx.delegator,
             &ctx.store,
             &ctx.config,
@@ -307,6 +322,7 @@ async fn handle_delegation(
         let error_message = format!("Unknown agent ID: {}", delegation.target_agent_id);
         warn!("{}", error_message);
         fail_delegation(
+            &ctx.event_bus,
             &ctx.delegator,
             &ctx.store,
             &ctx.config,
@@ -334,6 +350,7 @@ async fn handle_delegation(
         Err(e) => {
             let error_message = format!("Failed to initialize agent: {}", e);
             fail_delegation(
+                &ctx.event_bus,
                 &ctx.delegator,
                 &ctx.store,
                 &ctx.config,
@@ -350,6 +367,7 @@ async fn handle_delegation(
         let error_message =
             "Delegated agent requires authentication, which is not yet supported".to_string();
         fail_delegation(
+            &ctx.event_bus,
             &ctx.delegator,
             &ctx.store,
             &ctx.config,
@@ -364,7 +382,6 @@ async fn handle_delegation(
     let delegate_session = match &ctx.config.cwd {
         Some(cwd) => {
             let mut req = NewSessionRequest::new(cwd.clone());
-            // Pass parent_session_id via meta so it gets set in the session record
             req.meta = Some(serde_json::Map::from_iter([(
                 "parent_session_id".to_string(),
                 serde_json::Value::String(parent_session_id.clone()),
@@ -374,6 +391,7 @@ async fn handle_delegation(
                 Err(e) => {
                     let error_message = format!("Failed to create session: {}", e);
                     fail_delegation(
+                        &ctx.event_bus,
                         &ctx.delegator,
                         &ctx.store,
                         &ctx.config,
@@ -388,7 +406,6 @@ async fn handle_delegation(
         }
         None => {
             let mut req = NewSessionRequest::new(PathBuf::new());
-            // Pass parent_session_id via meta so it gets set in the session record
             req.meta = Some(serde_json::Map::from_iter([(
                 "parent_session_id".to_string(),
                 serde_json::Value::String(parent_session_id.clone()),
@@ -398,6 +415,7 @@ async fn handle_delegation(
                 Err(e) => {
                     let error_message = format!("Failed to create session: {}", e);
                     fail_delegation(
+                        &ctx.event_bus,
                         &ctx.delegator,
                         &ctx.store,
                         &ctx.config,
@@ -412,7 +430,7 @@ async fn handle_delegation(
         }
     };
 
-    ctx.delegator.emit_event(
+    ctx.event_bus.publish(
         &parent_session_id,
         AgentEventKind::SessionForked {
             parent_session_id: parent_session_id.clone(),
@@ -427,13 +445,7 @@ async fn handle_delegation(
 
     // ──── Generate and inject planning summary ────
     let _planning_summary = if let Some(ref summarizer) = ctx.delegation_summarizer {
-        match ctx
-            .delegator
-            .provider
-            .history_store()
-            .get_history(&parent_session_id)
-            .await
-        {
+        match ctx.store.get_history(&parent_session_id).await {
             Ok(history) => {
                 match summarizer.summarize(&history, &delegation.objective).await {
                     Ok(summary) => {
@@ -503,7 +515,7 @@ async fn handle_delegation(
                 warn!("Failed to update delegation status to Cancelled: {}", e);
             }
 
-            ctx.delegator.emit_event(
+            ctx.event_bus.publish(
                 &parent_session_id,
                 AgentEventKind::DelegationCancelled {
                     delegation_id: delegation_id.clone(),
@@ -525,7 +537,7 @@ async fn handle_delegation(
                 match VerificationSpecBuilder::from_delegation(&delegation) {
                     Some(verification_spec) => {
                         // Create verification service using the delegator's tool registry
-                        let agent_tool_registry = ctx.delegator.tool_registry();
+                        let agent_tool_registry = ctx.tool_registry.clone();
                         let service = VerificationService::new(agent_tool_registry.clone());
                         let verification_context = VerificationContext {
                             session_id: parent_session_id.clone(),
@@ -560,6 +572,7 @@ async fn handle_delegation(
                     "Verification failed: The changes did not pass the specified verification checks."
                         .to_string();
                 fail_delegation(
+                    &ctx.event_bus,
                     &ctx.delegator,
                     &ctx.store,
                     &ctx.config,
@@ -590,7 +603,7 @@ async fn handle_delegation(
                 warn!("Failed to persist delegation completion: {}", e);
             }
 
-            ctx.delegator.emit_event(
+            ctx.event_bus.publish(
                 &parent_session_id,
                 AgentEventKind::DelegationCompleted {
                     delegation_id: delegation.public_id.clone(),
@@ -615,6 +628,7 @@ async fn handle_delegation(
         Some(Err(e)) => {
             let error_message = format!("Delegation failed: {}", e);
             fail_delegation(
+                &ctx.event_bus,
                 &ctx.delegator,
                 &ctx.store,
                 &ctx.config,
@@ -635,7 +649,8 @@ async fn handle_delegation(
 }
 
 async fn fail_delegation(
-    delegator: &Arc<QueryMTAgent>,
+    event_bus: &Arc<EventBus>,
+    delegator: &Arc<dyn SendAgent>,
     store: &Arc<dyn SessionStore>,
     config: &DelegationOrchestratorConfig,
     parent_session_id: &str,
@@ -650,7 +665,7 @@ async fn fail_delegation(
         warn!("Failed to persist delegation failure: {}", e);
     }
 
-    delegator.emit_event(
+    event_bus.publish(
         parent_session_id,
         AgentEventKind::DelegationFailed {
             delegation_id: delegation_id.to_string(),
@@ -703,7 +718,7 @@ pub(crate) fn format_delegation_failure_message(delegation_id: &str, error: &str
 }
 
 async fn inject_results(
-    delegator: &Arc<QueryMTAgent>,
+    delegator: &Arc<dyn SendAgent>,
     session_id: &str,
     delegation_id: &str,
     summary: &str,
@@ -711,7 +726,7 @@ async fn inject_results(
     let message = format_delegation_completion_message(delegation_id, summary);
 
     if let Err(e) = delegator
-        .run_prompt(PromptRequest::new(
+        .prompt(PromptRequest::new(
             session_id.to_string(),
             vec![ContentBlock::Text(TextContent::new(message))],
         ))
@@ -722,7 +737,7 @@ async fn inject_results(
 }
 
 async fn inject_failure(
-    delegator: &Arc<QueryMTAgent>,
+    delegator: &Arc<dyn SendAgent>,
     session_id: &str,
     delegation_id: &str,
     error: &str,
@@ -730,7 +745,7 @@ async fn inject_failure(
     let message = format_delegation_failure_message(delegation_id, error);
 
     if let Err(e) = delegator
-        .run_prompt(PromptRequest::new(
+        .prompt(PromptRequest::new(
             session_id.to_string(),
             vec![ContentBlock::Text(TextContent::new(message))],
         ))

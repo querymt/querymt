@@ -22,9 +22,8 @@ pub use messages::{RoutingMode, UiAgentInfo};
 #[cfg(test)]
 mod undo_handler_tests;
 
-use crate::agent::QueryMTAgent;
 use crate::event_bus::EventBus;
-use crate::index::WorkspaceIndexManager;
+use crate::index::WorkspaceIndexManagerActor;
 use crate::session::projection::ViewStore;
 use axum::{
     Router,
@@ -32,6 +31,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use kameo::actor::ActorRef;
 use messages::{ModelEntry, RoutingMode as MsgRoutingMode};
 use moka::future::Cache;
 use session::collect_event_sources;
@@ -47,14 +47,14 @@ const MODEL_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// UI WebSocket server.
 pub struct UiServer {
-    agent: Arc<QueryMTAgent>,
+    agent: Arc<crate::agent::AgentHandle>,
     view_store: Arc<dyn ViewStore>,
     default_cwd: Option<PathBuf>,
     event_sources: Vec<Arc<EventBus>>,
     connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     session_agents: Arc<Mutex<HashMap<String, String>>>,
     session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
-    workspace_manager: Arc<WorkspaceIndexManager>,
+    workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
     model_cache: Cache<(), Vec<ModelEntry>>,
     oauth_flows: Arc<Mutex<HashMap<String, PendingOAuthFlow>>>,
     oauth_callback_listener: Arc<Mutex<Option<ActiveOAuthCallbackListener>>>,
@@ -63,14 +63,14 @@ pub struct UiServer {
 /// Shared server state for request handlers.
 #[derive(Clone)]
 pub(crate) struct ServerState {
-    pub agent: Arc<QueryMTAgent>,
+    pub agent: Arc<crate::agent::AgentHandle>,
     pub view_store: Arc<dyn ViewStore>,
     pub default_cwd: Option<PathBuf>,
     pub event_sources: Vec<Arc<EventBus>>,
     pub connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     pub session_agents: Arc<Mutex<HashMap<String, String>>>,
     pub session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
-    pub workspace_manager: Arc<WorkspaceIndexManager>,
+    pub workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
     pub model_cache: Cache<(), Vec<ModelEntry>>,
     pub oauth_flows: Arc<Mutex<HashMap<String, PendingOAuthFlow>>>,
     pub oauth_callback_listener: Arc<Mutex<Option<ActiveOAuthCallbackListener>>>,
@@ -106,7 +106,7 @@ pub(crate) struct ConnectionState {
 impl UiServer {
     /// Create a new UI server.
     pub fn new(
-        agent: Arc<QueryMTAgent>,
+        agent: Arc<crate::agent::AgentHandle>,
         view_store: Arc<dyn ViewStore>,
         default_cwd: Option<PathBuf>,
     ) -> Self {
@@ -121,7 +121,7 @@ impl UiServer {
             connections: Arc::new(Mutex::new(HashMap::new())),
             session_agents: Arc::new(Mutex::new(HashMap::new())),
             session_cwds: Arc::new(Mutex::new(HashMap::new())),
-            workspace_manager: agent.workspace_index_manager(),
+            workspace_manager: agent.workspace_manager_actor(),
             model_cache,
             oauth_flows: Arc::new(Mutex::new(HashMap::new())),
             oauth_callback_listener: Arc::new(Mutex::new(None)),

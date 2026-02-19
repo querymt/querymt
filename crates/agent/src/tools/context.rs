@@ -190,7 +190,7 @@ pub trait Tool: Send + Sync {
     /// * `None` - Use only the standard truncation message (default)
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// fn truncation_hint(&self) -> Option<&'static str> {
     ///     Some("TIP: Use search_text to find specific content in the full output.")
     /// }

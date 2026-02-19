@@ -29,7 +29,7 @@ pub use crate::runner::{
 };
 
 // Core agent types
-pub use crate::agent::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
+pub use crate::agent::{AgentHandle, SnapshotPolicy, ToolPolicy};
 pub use crate::quorum::{AgentQuorum, DelegateAgent};
 
 // Events
@@ -56,5 +56,5 @@ pub use crate::tools::Tool;
 // ACP Server
 pub use crate::acp::AcpTransport;
 
-// Builder trait (for advanced use)
-pub use crate::agent::AgentBuilderExt;
+// Builder (for advanced use)
+pub use crate::agent::AgentConfigBuilder;

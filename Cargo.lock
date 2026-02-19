@@ -2471,6 +2471,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1435fa1053d8b2fbbe9be7e97eca7f33d37b28409959813daefc1446a14247f1"
 
 [[package]]
+name = "downcast-rs"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
+
+[[package]]
 name = "dtoa"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5555,6 +5561,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "kameo"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c4af7638c67029fd6821d02813c3913c803784648725d4df4082c9b91d7cbb1"
+dependencies = [
+ "downcast-rs",
+ "dyn-clone",
+ "futures",
+ "kameo_macros",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kameo_macros"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a13c324e2d8c8e126e63e66087448b4267e263e6cb8770c56d10a9d0d279d9e2"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
+]
+
+[[package]]
 name = "keyring"
 version = "3.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8290,72 +8323,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "qmt-agent"
-version = "0.1.0"
-dependencies = [
- "agent-client-protocol",
- "agent-client-protocol-schema",
- "anyhow",
- "arc-swap",
- "async-trait",
- "axum 0.7.9",
- "base64 0.22.1",
- "clap",
- "dirs",
- "env_logger",
- "fast_html2md",
- "futures-util",
- "gitpatch",
- "gix",
- "glob",
- "gray_matter",
- "grep",
- "grep-regex",
- "grep-searcher",
- "ignore",
- "indexmap 2.13.0",
- "infer",
- "log",
- "mdq",
- "mime_guess",
- "mockall",
- "moka",
- "notify",
- "once_cell",
- "patchkit",
- "pathdiff",
- "querymt",
- "querymt-utils",
- "rapidhash",
- "rayon",
- "regex",
- "reqwest 0.12.28",
- "rmcp",
- "rusqlite",
- "rust-embed",
- "serde",
- "serde_json",
- "similar",
- "similarity-core",
- "similarity-py",
- "similarity-rs",
- "srgn",
- "strsim 0.11.1",
- "tempfile",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "toml 0.9.11+spec-1.1.0",
- "tower-http 0.5.2",
- "tracing",
- "tracing-log",
- "tracing-subscriber",
- "uuid 1.20.0",
-]
-
-[[package]]
 name = "qmt-alibaba"
 version = "0.1.0"
 dependencies = [
@@ -8617,6 +8584,74 @@ dependencies = [
  "url",
  "uuid 1.20.0",
  "which 8.0.0",
+]
+
+[[package]]
+name = "querymt-agent"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "agent-client-protocol-schema",
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "axum 0.7.9",
+ "base64 0.22.1",
+ "clap",
+ "dirs",
+ "env_logger",
+ "fast_html2md",
+ "futures-util",
+ "gitpatch",
+ "gix",
+ "glob",
+ "gray_matter",
+ "grep",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "indexmap 2.13.0",
+ "infer",
+ "kameo",
+ "log",
+ "mdq",
+ "mime_guess",
+ "mockall",
+ "moka",
+ "notify",
+ "once_cell",
+ "patchkit",
+ "pathdiff",
+ "querymt",
+ "querymt-utils",
+ "rapidhash",
+ "rayon",
+ "regex",
+ "reqwest 0.12.28",
+ "rmcp",
+ "rusqlite",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "similar",
+ "similarity-core",
+ "similarity-py",
+ "similarity-rs",
+ "srgn",
+ "strsim 0.11.1",
+ "syn 2.0.114",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "toml 0.9.11+spec-1.1.0",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+ "uuid 1.20.0",
 ]
 
 [[package]]
@@ -11290,6 +11325,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 

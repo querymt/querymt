@@ -3,6 +3,8 @@
 //! Manages WebSocket lifecycle, message send/receive loops, and forwarding
 //! agent events to connected clients.
 
+use crate::agent::core::AgentMode;
+
 use super::messages::{RoutingMode, UiClientMessage, UiServerMessage};
 use super::session::{PRIMARY_AGENT_ID, build_agent_list};
 use super::{ConnectionState, ServerState};
@@ -117,11 +119,41 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
     };
 
     let agents = build_agent_list(state);
-    let agent_mode = state.agent.get_agent_mode().as_str().to_string();
     let default_cwd = state
         .default_cwd
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
+
+    // Try to get mode from active session actor, fall back to default_mode
+    let agent_mode = if let Some(ref session_id) = active_session_id {
+        let registry = state.agent.registry.lock().await;
+        if let Some(actor_ref) = registry.get(session_id) {
+            match actor_ref.ask(crate::agent::messages::GetMode).await {
+                Ok(m) => m,
+                Err(_) => state
+                    .agent
+                    .default_mode
+                    .lock()
+                    .map(|guard| *guard)
+                    .unwrap_or(AgentMode::Build),
+            }
+        } else {
+            state
+                .agent
+                .default_mode
+                .lock()
+                .map(|guard| *guard)
+                .unwrap_or(AgentMode::Build)
+        }
+    } else {
+        state
+            .agent
+            .default_mode
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or(AgentMode::Build)
+    };
+
     let _ = send_message(
         tx,
         UiServerMessage::State {
@@ -131,7 +163,7 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
             default_cwd,
             agents,
             sessions_by_agent,
-            agent_mode,
+            agent_mode: agent_mode.as_str().to_string(),
         },
     )
     .await;
@@ -238,12 +270,14 @@ pub async fn subscribe_to_file_index(
     workspace_root: std::path::PathBuf,
 ) {
     // Get the workspace and subscribe to its file index updates
-    let workspace = match state
+    let handle = match state
         .workspace_manager
-        .get_or_create(workspace_root.clone())
+        .ask(crate::index::GetOrCreate {
+            root: workspace_root.clone(),
+        })
         .await
     {
-        Ok(workspace) => workspace,
+        Ok(handle) => handle,
         Err(err) => {
             log::error!(
                 "Failed to get workspace for file index subscription: {}",
@@ -253,7 +287,7 @@ pub async fn subscribe_to_file_index(
         }
     };
 
-    let mut index_rx = workspace.file_watcher().subscribe_index();
+    let mut index_rx = handle.file_watcher.subscribe_index();
 
     // Update connection state to track which workspace we're subscribed to
     {
@@ -273,7 +307,7 @@ pub async fn subscribe_to_file_index(
     // When subscribing to a broadcast channel, we only receive FUTURE messages.
     // If the workspace already existed (cached), the initial index was sent before we subscribed.
     // This ensures new subscribers get the current state immediately.
-    if let Some(current_index) = workspace.file_index() {
+    if let Some(current_index) = handle.file_index() {
         // Get current session's cwd to filter the index
         let cwd = {
             let connections = state.connections.lock().await;
