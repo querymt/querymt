@@ -3,7 +3,7 @@
  */
 
 import { memo, useState, useMemo } from 'react';
-import { Loader, CheckCircle, XCircle, ChevronRight, ChevronDown, Eye } from 'lucide-react';
+import { Loader, CheckCircle, XCircle, ChevronRight, ChevronDown, Eye, Pause } from 'lucide-react';
 import { PatchDiff } from '@pierre/diffs/react';
 import { generateToolSummary } from '../utils/toolSummary';
 import { EventItem } from '../types';
@@ -14,10 +14,17 @@ export interface ToolSummaryProps {
   event: EventItem & { mergedResult?: EventItem };
   onClick: () => void;
   isDelegate?: boolean;
+  isAwaitingInput?: boolean;
   onDelegateClick?: () => void;
 }
 
-export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegate, onDelegateClick }: ToolSummaryProps) {
+export const ToolSummary = memo(function ToolSummary({
+  event,
+  onClick,
+  isDelegate,
+  isAwaitingInput,
+  onDelegateClick,
+}: ToolSummaryProps) {
   const selectedTheme = useUiStore((state) => state.selectedTheme);
   const diffTheme = getDiffThemeForDashboard(selectedTheme);
   const diffThemeType = getDashboardThemeVariant(selectedTheme);
@@ -135,6 +142,14 @@ export const ToolSummary = memo(function ToolSummary({ event, onClick, isDelegat
             previewData.exitCode === 0 ? 'text-status-success' : 'text-status-warning'
           }`}>
             exit {previewData.exitCode}
+          </span>
+        )}
+
+        {/* Delegation awaiting-input badge */}
+        {isDelegate && isAwaitingInput && (
+          <span className="flex-shrink-0 inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded bg-status-warning/10 border border-status-warning/35 text-status-warning">
+            <Pause className="w-3 h-3" />
+            awaiting input
           </span>
         )}
 

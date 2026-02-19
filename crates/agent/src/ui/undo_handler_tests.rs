@@ -5,6 +5,8 @@
 
 use crate::agent::builder::AgentBuilderExt;
 use crate::agent::core::{QueryMTAgent, SnapshotPolicy};
+use crate::delegation::{AgentInfo, DefaultAgentRegistry};
+use crate::elicitation::ElicitationAction;
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
@@ -12,7 +14,7 @@ use crate::session::sqlite_storage::SqliteStorage;
 use crate::snapshot::backend::SnapshotBackend;
 use crate::snapshot::git::GitSnapshotBackend;
 use crate::test_utils::empty_plugin_registry;
-use crate::ui::handlers::handle_undo;
+use crate::ui::handlers::{handle_elicitation_response, handle_undo};
 use anyhow::Result;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
@@ -425,6 +427,83 @@ async fn test_undo_handler_cross_session() -> Result<()> {
         fs::read_to_string(worktree.path().join("test.txt"))?,
         "original",
         "File should be reverted even though changes were in child session"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_elicitation_response_routes_to_delegate_pending_map() -> Result<()> {
+    let (planner_registry, _planner_cfg_dir) = empty_plugin_registry()?;
+    let planner_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
+    let planner = QueryMTAgent::new(
+        Arc::new(planner_registry),
+        planner_storage.session_store(),
+        LLMParams::new().provider("mock").model("mock"),
+    );
+
+    let (delegate_registry, _delegate_cfg_dir) = empty_plugin_registry()?;
+    let delegate_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
+    let delegate = Arc::new(QueryMTAgent::new(
+        Arc::new(delegate_registry),
+        delegate_storage.session_store(),
+        LLMParams::new().provider("mock").model("mock"),
+    ));
+
+    let mut registry = DefaultAgentRegistry::new();
+    registry.register(
+        AgentInfo {
+            id: "coder".to_string(),
+            name: "Coder".to_string(),
+            description: "Delegate agent".to_string(),
+            capabilities: vec![],
+            required_capabilities: vec![],
+            meta: None,
+        },
+        delegate.clone(),
+    );
+
+    let planner = planner.with_agent_registry(Arc::new(registry));
+
+    let state = super::ServerState {
+        agent: Arc::new(planner),
+        view_store: planner_storage,
+        default_cwd: None,
+        event_sources: vec![],
+        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        workspace_manager: Arc::new(crate::index::WorkspaceIndexManager::new(
+            crate::index::WorkspaceIndexManagerConfig::default(),
+        )),
+        model_cache: moka::future::Cache::new(100),
+        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
+    };
+
+    let elicitation_id = "delegate-elicitation-42".to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    delegate
+        .pending_elicitations()
+        .lock()
+        .await
+        .insert(elicitation_id.clone(), tx);
+
+    handle_elicitation_response(
+        &state,
+        &elicitation_id,
+        "accept",
+        Some(&serde_json::json!({"selection": "allow_once"})),
+    )
+    .await;
+
+    let response = rx
+        .await
+        .expect("delegate elicitation response should be delivered");
+    assert_eq!(response.action, ElicitationAction::Accept);
+    assert_eq!(
+        response.content,
+        Some(serde_json::json!({"selection": "allow_once"}))
     );
 
     Ok(())

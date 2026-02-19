@@ -5,6 +5,7 @@ import { X, Copy, Check, Cpu, Wrench, DollarSign } from 'lucide-react';
 import { DelegationGroupInfo, EventRow, UiAgentInfo, LlmConfigDetails } from '../types';
 import { MessageContent } from './MessageContent';
 import { ToolSummary } from './ToolSummary';
+import { ElicitationCard } from './ElicitationCard';
 import { ModelConfigPopover } from './ModelConfigPopover';
 import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
@@ -229,11 +230,15 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
               visibleEvents.map((event) => {
                 if (event.type === 'tool_call') {
                   return (
-                    <ToolSummary
-                      key={event.id}
-                      event={event}
-                      onClick={() => onToolClick(event)}
-                    />
+                    <div key={event.id} className="space-y-2">
+                      <ToolSummary
+                        event={event}
+                        onClick={() => onToolClick(event)}
+                      />
+                      {event.elicitationData && (
+                        <ElicitationCard data={event.elicitationData} />
+                      )}
+                    </div>
                   );
                 }
                 if (event.type === 'agent' && event.isMessage) {
