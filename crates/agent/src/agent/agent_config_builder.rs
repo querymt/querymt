@@ -10,7 +10,8 @@ use crate::agent::core::{
     ToolConfig, ToolPolicy,
 };
 use crate::config::{
-    CompactionConfig, PruningConfig, RateLimitConfig, RuntimeExecutionPolicy, ToolOutputConfig,
+    CompactionConfig, McpServerConfig, PruningConfig, RateLimitConfig, RuntimeExecutionPolicy,
+    ToolOutputConfig,
 };
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_bus::EventBus;
@@ -58,6 +59,7 @@ pub struct AgentConfigBuilder {
     snapshot_backend: Option<Arc<dyn crate::snapshot::SnapshotBackend>>,
     snapshot_gc_config: crate::snapshot::GcConfig,
     pending_elicitations: crate::elicitation::PendingElicitationMap,
+    mcp_servers: Vec<McpServerConfig>,
 }
 
 impl AgentConfigBuilder {
@@ -100,6 +102,7 @@ impl AgentConfigBuilder {
             snapshot_backend: None,
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
             pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -127,6 +130,7 @@ impl AgentConfigBuilder {
             snapshot_gc_config: self.snapshot_gc_config,
             delegation_context_config: self.delegation_context_config,
             pending_elicitations: self.pending_elicitations,
+            mcp_servers: self.mcp_servers,
         }
     }
 
@@ -312,6 +316,14 @@ impl AgentConfigBuilder {
         self
     }
 
+    // ── MCP servers ───────────────────────────────────────────────────────
+
+    /// Sets the MCP servers to attach to every new session (from TOML `[[mcp]]` config).
+    pub fn with_mcp_servers(mut self, servers: Vec<McpServerConfig>) -> Self {
+        self.mcp_servers = servers;
+        self
+    }
+
     // ── Tools ─────────────────────────────────────────────────────────────
 
     /// Sets the tool policy.
@@ -475,5 +487,245 @@ impl AgentConfigBuilder {
     /// Borrow the `delegation_context_config` (used when building DelegationMiddleware).
     pub fn delegation_context_config(&self) -> &DelegationContextConfig {
         &self.delegation_context_config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::core::{AgentMode, SnapshotPolicy, ToolPolicy};
+    use crate::config::PruningConfig;
+    use crate::session::backend::StorageBackend;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use crate::test_utils::helpers::empty_plugin_registry;
+    use querymt::LLMParams;
+    use std::sync::Arc;
+
+    async fn make_builder() -> (AgentConfigBuilder, tempfile::TempDir) {
+        let (registry, temp_dir) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let llm = LLMParams::new().provider("mock").model("mock-model");
+        let builder = AgentConfigBuilder::new(Arc::new(registry), storage.session_store(), llm);
+        (builder, temp_dir)
+    }
+
+    // ── Defaults ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn default_mode_is_build() {
+        let (builder, _td) = make_builder().await;
+        assert_eq!(builder.default_mode_value(), AgentMode::Build);
+    }
+
+    #[tokio::test]
+    async fn default_tool_registry_has_builtin_tools() {
+        let (builder, _td) = make_builder().await;
+        let config = builder.build();
+        // Built-in tools should include at minimum "shell", "read_tool", etc.
+        let names: Vec<_> = config
+            .tool_registry
+            .definitions()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        assert!(!names.is_empty(), "default tool registry should have tools");
+    }
+
+    // ── Builder setters ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn with_agent_mode_overrides_default() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_agent_mode(AgentMode::Plan);
+        assert_eq!(builder.default_mode_value(), AgentMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn with_max_steps_sets_value() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_max_steps(42);
+        let config = builder.build();
+        assert_eq!(config.max_steps, Some(42));
+    }
+
+    #[tokio::test]
+    async fn with_max_prompt_bytes_sets_value() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_max_prompt_bytes(8192);
+        let config = builder.build();
+        assert_eq!(config.max_prompt_bytes, Some(8192));
+    }
+
+    #[tokio::test]
+    async fn with_snapshot_policy_sets_value() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_snapshot_policy(SnapshotPolicy::Diff);
+        let config = builder.build();
+        assert_eq!(config.snapshot_policy, SnapshotPolicy::Diff);
+    }
+
+    #[tokio::test]
+    async fn with_assume_mutating_false() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_assume_mutating(false);
+        let config = builder.build();
+        assert!(!config.assume_mutating);
+    }
+
+    #[tokio::test]
+    async fn with_tool_policy_changes_policy() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_tool_policy(ToolPolicy::BuiltInOnly);
+        let config = builder.build();
+        assert_eq!(config.tool_config.policy, ToolPolicy::BuiltInOnly);
+    }
+
+    #[tokio::test]
+    async fn with_allowed_tools_sets_allowlist() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_allowed_tools(["shell", "read_tool"]);
+        let config = builder.build();
+        let allowlist = config.tool_config.allowlist.unwrap();
+        assert!(allowlist.contains("shell"));
+        assert!(allowlist.contains("read_tool"));
+        assert!(!allowlist.contains("delete_file"));
+    }
+
+    #[tokio::test]
+    async fn with_denied_tools_sets_denylist() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_denied_tools(["shell".to_string(), "delete_file".to_string()]);
+        let config = builder.build();
+        assert!(config.tool_config.denylist.contains("shell"));
+        assert!(config.tool_config.denylist.contains("delete_file"));
+    }
+
+    #[tokio::test]
+    async fn with_compaction_enabled_sets_defaults() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_compaction_enabled();
+        let config = builder.build();
+        // Should have a non-default compaction config
+        let _ = config.execution_policy.compaction;
+        let _ = config.execution_policy.pruning;
+        // Just confirm build succeeds
+    }
+
+    #[tokio::test]
+    async fn with_pruning_config_sets_value() {
+        let (builder, _td) = make_builder().await;
+        let pruning = PruningConfig::default();
+        let builder = builder.with_pruning_config(pruning);
+        let config = builder.build();
+        let _ = config.execution_policy.pruning;
+    }
+
+    #[tokio::test]
+    async fn with_mutating_tools_sets_set() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_mutating_tools(["my_tool".to_string()]);
+        let config = builder.build();
+        assert!(config.mutating_tools.contains("my_tool"));
+    }
+
+    // ── build() produces valid AgentConfig ──────────────────────────────────
+
+    #[tokio::test]
+    async fn build_produces_valid_config_with_defaults() {
+        let (builder, _td) = make_builder().await;
+        let config = builder.build();
+        // Default execution timeout
+        assert_eq!(config.execution_timeout_secs, 300);
+        // Default: no max steps
+        assert!(config.max_steps.is_none());
+        // Default: no max prompt bytes
+        assert!(config.max_prompt_bytes.is_none());
+        // Default: snapshot disabled
+        assert_eq!(config.snapshot_policy, SnapshotPolicy::None);
+    }
+
+    #[tokio::test]
+    async fn event_bus_accessor_works() {
+        let (builder, _td) = make_builder().await;
+        let bus = builder.event_bus();
+        // Just verify we get an Arc back
+        let _ = Arc::strong_count(&bus);
+    }
+
+    #[tokio::test]
+    async fn provider_accessor_works() {
+        let (builder, _td) = make_builder().await;
+        let _provider = builder.provider();
+    }
+
+    // ── Middleware integration ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn with_middleware_adds_to_chain() {
+        use crate::middleware::{LimitsConfig, LimitsMiddleware};
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_middleware(LimitsMiddleware::new(LimitsConfig::default()));
+        let config = builder.build();
+        assert_eq!(config.middleware_drivers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_middlewares_adds_multiple() {
+        use crate::middleware::{LimitsConfig, LimitsMiddleware};
+        let (builder, _td) = make_builder().await;
+        let drivers: Vec<Arc<dyn MiddlewareDriver>> = vec![
+            Arc::new(LimitsMiddleware::new(LimitsConfig::default())),
+            Arc::new(LimitsMiddleware::new(LimitsConfig::default())),
+        ];
+        let builder = builder.with_middlewares(drivers);
+        let config = builder.build();
+        assert_eq!(config.middleware_drivers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_driver_from_config_with_max_steps() {
+        let (builder, _td) = make_builder().await;
+        let builder = builder.with_max_steps(50);
+        let config = builder.build();
+        let _driver = config.create_driver();
+    }
+
+    // ── MCP servers ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn with_mcp_servers_stores_and_builds() {
+        let (builder, _td) = make_builder().await;
+        let servers = vec![
+            McpServerConfig::Http {
+                name: "test-server".to_string(),
+                url: "https://mcp.example.com/mcp".to_string(),
+                headers: std::collections::HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer token".to_string(),
+                )]),
+            },
+            McpServerConfig::Stdio {
+                name: "local-server".to_string(),
+                command: "npx".to_string(),
+                args: vec!["-y".to_string(), "@example/mcp-server".to_string()],
+                env: std::collections::HashMap::new(),
+            },
+        ];
+        let builder = builder.with_mcp_servers(servers);
+        let config = builder.build();
+        assert_eq!(config.mcp_servers.len(), 2);
+        assert!(
+            matches!(&config.mcp_servers[0], McpServerConfig::Http { name, .. } if name == "test-server")
+        );
+        assert!(
+            matches!(&config.mcp_servers[1], McpServerConfig::Stdio { name, .. } if name == "local-server")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_servers_empty_by_default() {
+        let (builder, _td) = make_builder().await;
+        let config = builder.build();
+        assert!(config.mcp_servers.is_empty());
     }
 }

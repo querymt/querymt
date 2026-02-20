@@ -178,6 +178,7 @@ impl TestHarness {
                 auto_inject: true,
             },
             pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
+            mcp_servers: Vec::new(),
         });
 
         // Create a SessionRuntime for the execution context
@@ -200,6 +201,7 @@ impl TestHarness {
             session_runtime,
             runtime_context,
             context,
+            crate::agent::core::ToolConfig::default(),
         );
 
         Self {
@@ -443,6 +445,7 @@ async fn test_middleware_stops_execution() {
         snapshot_gc_config: old_config.snapshot_gc_config.clone(),
         delegation_context_config: old_config.delegation_context_config.clone(),
         pending_elicitations: old_config.pending_elicitations.clone(),
+        mcp_servers: old_config.mcp_servers.clone(),
     });
     harness
         .provider_mut()

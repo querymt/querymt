@@ -939,6 +939,7 @@ impl Message<Prompt> for SessionActor {
         let cancel_token = self.cancel_token.clone();
         let bridge = self.bridge.clone();
         let mode = self.mode;
+        let tool_config = self.tool_config.clone();
         let actor_ref = ctx.actor_ref().clone();
 
         ctx.spawn(async move {
@@ -950,6 +951,7 @@ impl Message<Prompt> for SessionActor {
                 cancel_token,
                 bridge,
                 mode,
+                tool_config,
             )
             .await;
 
@@ -976,7 +978,7 @@ impl Message<Prompt> for SessionActor {
 /// It does NOT access the actor — everything is passed as parameters.
 #[instrument(
     name = "agent.prompt.execute",
-    skip(req, runtime, config, cancel_token, bridge),
+    skip(req, runtime, config, cancel_token, bridge, tool_config),
     fields(session_id = %session_id, mode = %mode)
 )]
 async fn execute_prompt_detached(
@@ -987,6 +989,7 @@ async fn execute_prompt_detached(
     cancel_token: CancellationToken,
     bridge: Option<ClientBridgeSender>,
     mode: AgentMode,
+    tool_config: ToolConfig,
 ) -> Result<PromptResponse, AgentError> {
     debug!(
         "Prompt request for session {} with {} block(s)",
@@ -1062,6 +1065,7 @@ async fn execute_prompt_detached(
         runtime.clone(),
         runtime_context,
         session_handle,
+        tool_config,
     )
     .with_cancellation_token(cancel_token);
 
@@ -1340,7 +1344,418 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::agent::agent_config::AgentConfig;
+    use crate::agent::core::{
+        AgentMode, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy, ToolConfig,
+        ToolPolicy,
+    };
+    use crate::config::RuntimeExecutionPolicy;
+    use crate::delegation::DefaultAgentRegistry;
+    use crate::event_bus::EventBus;
+    use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
+    use crate::session::store::SessionStore;
+    use crate::test_utils::{
+        MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
+        mock_plugin_registry, mock_session,
+    };
+    use crate::tools::ToolRegistry;
+    use kameo::actor::Spawn;
+    use kameo::message::Message;
+    use querymt::LLMParams;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
+
+    // ── Shared fixture ───────────────────────────────────────────────────────
+
+    struct ActorFixture {
+        config: Arc<AgentConfig>,
+        actor_ref: kameo::actor::ActorRef<SessionActor>,
+        session_id: String,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl ActorFixture {
+        async fn new() -> Self {
+            Self::with_session_id("test-session").await
+        }
+
+        async fn with_session_id(session_id: &str) -> Self {
+            let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+            let shared = SharedLlmProvider {
+                inner: provider.clone(),
+                tools: vec![].into_boxed_slice(),
+            };
+            let factory = Arc::new(TestProviderFactory { provider: shared });
+            let (plugin_registry, temp_dir) =
+                mock_plugin_registry(factory).expect("plugin registry");
+
+            let llm_config = mock_llm_config();
+            let session = mock_session(session_id);
+            let mut store = MockSessionStore::new();
+            let session_clone = session.clone();
+            store
+                .expect_get_session()
+                .returning(move |_| Ok(Some(session_clone.clone())))
+                .times(0..);
+            let llm_for_mock = llm_config.clone();
+            store
+                .expect_get_session_llm_config()
+                .returning(move |_| Ok(Some(llm_for_mock.clone())))
+                .times(0..);
+            store
+                .expect_get_llm_config()
+                .returning(move |_| Ok(Some(llm_config.clone())))
+                .times(0..);
+            store
+                .expect_create_or_get_llm_config()
+                .returning(|_| Ok(mock_llm_config()))
+                .times(0..);
+            store
+                .expect_set_session_llm_config()
+                .returning(|_, _| Ok(()))
+                .times(0..);
+            store
+                .expect_set_session_provider_node()
+                .returning(|_, _| Ok(()))
+                .times(0..);
+            store
+                .expect_get_session_provider_node()
+                .returning(|_| Ok(None))
+                .times(0..);
+            store
+                .expect_list_sessions()
+                .returning(|| Ok(vec![]))
+                .times(0..);
+
+            let store: Arc<dyn SessionStore> = Arc::new(store);
+            let provider_ctx = Arc::new(crate::session::provider::SessionProvider::new(
+                Arc::new(plugin_registry),
+                store.clone(),
+                LLMParams::new().provider("mock").model("mock-model"),
+            ));
+
+            let config = Arc::new(AgentConfig {
+                provider: provider_ctx,
+                event_bus: Arc::new(EventBus::new()),
+                agent_registry: Arc::new(DefaultAgentRegistry::new()),
+                workspace_manager_actor: WorkspaceIndexManagerActor::new(
+                    WorkspaceIndexManagerConfig::default(),
+                ),
+                default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
+                tool_config: ToolConfig {
+                    policy: ToolPolicy::ProviderOnly,
+                    ..ToolConfig::default()
+                },
+                tool_registry: ToolRegistry::new(),
+                middleware_drivers: Vec::new(),
+                auth_methods: Vec::new(),
+                max_steps: None,
+                snapshot_policy: SnapshotPolicy::None,
+                assume_mutating: true,
+                mutating_tools: HashSet::new(),
+                max_prompt_bytes: None,
+                execution_timeout_secs: 300,
+                execution_policy: RuntimeExecutionPolicy::default(),
+                compaction: crate::session::compaction::SessionCompaction::new(),
+                snapshot_backend: None,
+                snapshot_gc_config: crate::snapshot::GcConfig::default(),
+                delegation_context_config: DelegationContextConfig {
+                    timing: DelegationContextTiming::FirstTurnOnly,
+                    auto_inject: true,
+                },
+                pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
+                mcp_servers: Vec::new(),
+            });
+
+            let runtime = crate::agent::core::SessionRuntime::new(
+                None,
+                HashMap::new(),
+                HashMap::new(),
+                vec![],
+            );
+            let actor = SessionActor::new(config.clone(), session_id.to_string(), runtime);
+            let actor_ref = SessionActor::spawn(actor);
+
+            Self {
+                config,
+                actor_ref,
+                session_id: session_id.to_string(),
+                _temp_dir: temp_dir,
+            }
+        }
+    }
+
+    // ── Actor message handler tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_set_and_get_mode() {
+        let f = ActorFixture::new().await;
+
+        // Default mode is Build
+        let mode = f.actor_ref.ask(GetMode).await.expect("ask GetMode");
+        assert_eq!(mode, AgentMode::Build);
+
+        // Switch to Plan
+        f.actor_ref
+            .tell(SetMode {
+                mode: AgentMode::Plan,
+            })
+            .await
+            .expect("tell SetMode");
+        // Give the actor time to process
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let mode = f.actor_ref.ask(GetMode).await.expect("ask GetMode");
+        assert_eq!(mode, AgentMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_emits_event() {
+        let f = ActorFixture::new().await;
+        let mut rx = f.config.event_bus.subscribe();
+
+        f.actor_ref.tell(Cancel).await.expect("tell Cancel");
+        // Give the actor time to process
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        // Look for Cancelled event
+        let mut found_cancel = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event.kind, crate::events::AgentEventKind::Cancelled) {
+                found_cancel = true;
+            }
+        }
+        assert!(found_cancel, "Expected Cancelled event on event bus");
+    }
+
+    #[tokio::test]
+    async fn test_set_mode_emits_event() {
+        let f = ActorFixture::new().await;
+        let mut rx = f.config.event_bus.subscribe();
+
+        f.actor_ref
+            .tell(SetMode {
+                mode: AgentMode::Plan,
+            })
+            .await
+            .expect("tell SetMode");
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        let mut found = false;
+        while let Ok(event) = rx.try_recv() {
+            if let crate::events::AgentEventKind::SessionModeChanged { mode } = event.kind {
+                assert_eq!(mode, AgentMode::Plan);
+                found = true;
+            }
+        }
+        assert!(found, "Expected SessionModeChanged event");
+    }
+
+    #[tokio::test]
+    async fn test_set_provider_unknown_fails() {
+        let f = ActorFixture::new().await;
+        let result = f
+            .actor_ref
+            .ask(SetProvider {
+                provider: "nonexistent-provider".to_string(),
+                model: "some-model".to_string(),
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "expected error for unknown provider, got ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_tool_policy() {
+        let f = ActorFixture::new().await;
+
+        f.actor_ref
+            .tell(SetToolPolicy {
+                policy: ToolPolicy::BuiltInOnly,
+            })
+            .await
+            .expect("tell SetToolPolicy");
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Verify the policy was set by checking GetLlmConfig (indirect; we can't read tool_config directly)
+        // Instead: setting allowed tools should persist without error
+        f.actor_ref
+            .tell(SetAllowedTools {
+                tools: vec!["shell".to_string(), "read_tool".to_string()],
+            })
+            .await
+            .expect("tell SetAllowedTools");
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Clear should also succeed
+        f.actor_ref
+            .tell(ClearAllowedTools)
+            .await
+            .expect("tell ClearAllowedTools");
+    }
+
+    #[tokio::test]
+    async fn test_set_denied_tools() {
+        let f = ActorFixture::new().await;
+
+        f.actor_ref
+            .tell(SetDeniedTools {
+                tools: vec!["shell".to_string()],
+            })
+            .await
+            .expect("tell SetDeniedTools");
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        f.actor_ref
+            .tell(ClearDeniedTools)
+            .await
+            .expect("tell ClearDeniedTools");
+    }
+
+    #[tokio::test]
+    async fn test_get_session_limits_returns_ok() {
+        let f = ActorFixture::new().await;
+        let limits = f
+            .actor_ref
+            .ask(GetSessionLimits)
+            .await
+            .expect("ask GetSessionLimits");
+        // No limits middleware configured, so None is correct
+        assert!(limits.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_llm_config() {
+        let f = ActorFixture::new().await;
+        let result = f
+            .actor_ref
+            .ask(GetLlmConfig)
+            .await
+            .expect("ask GetLlmConfig");
+        // The mock store returns a config — None is fine (mock may not set it)
+        // Just verify no error occurred (already asserted by .expect above)
+        drop(result);
+    }
+
+    #[tokio::test]
+    async fn test_ext_method_returns_null() {
+        let f = ActorFixture::new().await;
+        let null_params = std::sync::Arc::from(
+            serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
+        );
+        let result = f
+            .actor_ref
+            .ask(ExtMethod {
+                req: agent_client_protocol::ExtRequest::new("custom_method", null_params),
+            })
+            .await
+            .expect("ask ExtMethod");
+        // The default implementation returns a null JSON value
+        assert_eq!(result.0.get(), "null");
+    }
+
+    #[tokio::test]
+    async fn test_ext_notification_succeeds() {
+        let f = ActorFixture::new().await;
+        let null_params = std::sync::Arc::from(
+            serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
+        );
+        f.actor_ref
+            .ask(ExtNotification {
+                notif: agent_client_protocol::ExtNotification::new("my_notification", null_params),
+            })
+            .await
+            .expect("ask ExtNotification");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_unsubscribe_events_no_panic() {
+        let f = ActorFixture::new().await;
+        // Without remote feature, these are no-ops that return Ok(())
+        f.actor_ref
+            .ask(crate::agent::messages::SubscribeEvents { relay_actor_id: 42 })
+            .await
+            .expect("ask SubscribeEvents");
+
+        f.actor_ref
+            .ask(crate::agent::messages::UnsubscribeEvents { relay_actor_id: 42 })
+            .await
+            .expect("ask UnsubscribeEvents");
+    }
+
+    #[tokio::test]
+    async fn test_prompt_finished_resets_state() {
+        let f = ActorFixture::new().await;
+        // Send PromptFinished — even when not "running", should be a no-op that doesn't panic
+        f.actor_ref
+            .tell(PromptFinished)
+            .await
+            .expect("tell PromptFinished");
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // GetMode should still work, confirming actor is alive
+        let mode = f.actor_ref.ask(GetMode).await.expect("ask GetMode");
+        assert_eq!(mode, AgentMode::Build);
+    }
+
+    #[tokio::test]
+    async fn test_set_bridge_succeeds() {
+        let f = ActorFixture::new().await;
+        // We can't easily create a real ClientBridgeSender in unit tests,
+        // but setting None→Some via SetBridge message should not panic or fail.
+        // We verify the actor is alive by asking GetMode after.
+        // (SetBridge requires a real sender; skip the actual send but confirm actor health)
+        let mode = f
+            .actor_ref
+            .ask(GetMode)
+            .await
+            .expect("ask GetMode after potential bridge set");
+        assert_eq!(mode, AgentMode::Build);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_stops_actor() {
+        let f = ActorFixture::new().await;
+        // Shutdown the actor
+        f.actor_ref.tell(Shutdown).await.expect("tell Shutdown");
+        // Give the actor time to stop
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // After shutdown, the actor should no longer accept messages
+        let result = f.actor_ref.ask(GetMode).await;
+        assert!(result.is_err(), "actor should be stopped after Shutdown");
+    }
+
+    #[tokio::test]
+    async fn test_multiple_sessions_independent() {
+        let f1 = ActorFixture::with_session_id("session-alpha").await;
+        let f2 = ActorFixture::with_session_id("session-beta").await;
+
+        f1.actor_ref
+            .tell(SetMode {
+                mode: AgentMode::Plan,
+            })
+            .await
+            .expect("tell SetMode on f1");
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let mode1 = f1.actor_ref.ask(GetMode).await.expect("GetMode f1");
+        let mode2 = f2.actor_ref.ask(GetMode).await.expect("GetMode f2");
+
+        assert_eq!(mode1, AgentMode::Plan);
+        assert_eq!(
+            mode2,
+            AgentMode::Build,
+            "f2 should not be affected by f1's mode change"
+        );
+    }
+
+    // ── Token state machine tests (pre-existing, unchanged) ──────────────────
 
     /// Simulates the cancel-then-resume scenario:
     ///

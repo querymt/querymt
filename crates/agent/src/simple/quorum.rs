@@ -807,6 +807,7 @@ fn apply_middleware_from_config(
             auto_inject: true,
         },
         pending_elicitations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        mcp_servers: Vec::new(),
     });
 
     for entry in entries {

@@ -315,6 +315,7 @@ impl TestHarness {
                 auto_inject: true,
             },
             pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
+            mcp_servers: Vec::new(),
         });
 
         // Create an AgentHandle for delegation (wraps its own SessionRegistry)
@@ -340,7 +341,13 @@ impl TestHarness {
         );
 
         let session_id = "sess-test".to_string();
-        let exec_ctx = ExecutionContext::new(session_id, session_runtime, runtime_context, context);
+        let exec_ctx = ExecutionContext::new(
+            session_id,
+            session_runtime,
+            runtime_context,
+            context,
+            crate::agent::core::ToolConfig::default(),
+        );
 
         Self {
             config,

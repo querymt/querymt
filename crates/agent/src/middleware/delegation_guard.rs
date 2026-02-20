@@ -228,3 +228,192 @@ impl MiddlewareDriver for DelegationGuardMiddleware {
         "DelegationGuardMiddleware"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hash::RapidHash;
+    use crate::session::domain::{Delegation, DelegationStatus};
+    use crate::test_utils::mocks::MockSessionStore;
+    use time::OffsetDateTime;
+
+    fn make_guard(store: Arc<dyn SessionStore>) -> DelegationGuardMiddleware {
+        DelegationGuardMiddleware::new(store)
+    }
+
+    #[test]
+    fn new_sets_default_config() {
+        let mut mock = MockSessionStore::new();
+        // We need to keep the mock minimal
+        mock.expect_list_delegations().returning(|_| Ok(vec![]));
+        let guard = make_guard(Arc::new(mock));
+        // Verify defaults by calling with_max_retries
+        let guard2 = DelegationGuardMiddleware::new({
+            let mut m = MockSessionStore::new();
+            m.expect_list_delegations().returning(|_| Ok(vec![]));
+            Arc::new(m) as Arc<dyn SessionStore>
+        });
+        assert_eq!(guard2.max_retries, 3);
+        assert_eq!(guard2.duplicate_window_secs, 5);
+        let _ = guard;
+    }
+
+    #[test]
+    fn with_max_retries_sets_value() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_list_delegations().returning(|_| Ok(vec![]));
+        let guard = make_guard(Arc::new(mock)).with_max_retries(10);
+        assert_eq!(guard.max_retries, 10);
+    }
+
+    #[test]
+    fn with_duplicate_window_secs_sets_value() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_list_delegations().returning(|_| Ok(vec![]));
+        let guard = make_guard(Arc::new(mock)).with_duplicate_window_secs(30);
+        assert_eq!(guard.duplicate_window_secs, 30);
+    }
+
+    #[test]
+    fn name_returns_string() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_list_delegations().returning(|_| Ok(vec![]));
+        let guard = make_guard(Arc::new(mock));
+        assert_eq!(guard.name(), "DelegationGuardMiddleware");
+    }
+
+    #[test]
+    fn reset_does_not_panic() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_list_delegations().returning(|_| Ok(vec![]));
+        let guard = make_guard(Arc::new(mock));
+        guard.reset(); // Should not panic
+    }
+
+    #[tokio::test]
+    async fn check_delegation_allowed_no_delegations_returns_none() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_list_delegations().returning(|_| Ok(vec![]));
+        let guard = make_guard(Arc::new(mock));
+        let hash = RapidHash::new(b"objective");
+        let result = guard
+            .check_delegation_allowed("sess-1", &hash, "agent-1")
+            .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_delegation_allowed_blocks_running_duplicate() {
+        let objective = "do the thing";
+        let hash = RapidHash::new(objective.as_bytes());
+        let hash_clone = hash.clone();
+
+        let delegation = Delegation {
+            id: 1,
+            public_id: "del-1".to_string(),
+            session_id: 1,
+            task_id: None,
+            target_agent_id: "agent-x".to_string(),
+            objective: objective.to_string(),
+            objective_hash: hash_clone,
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            planning_summary: None,
+            status: DelegationStatus::Running,
+            retry_count: 0,
+            created_at: OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+
+        let mut mock = MockSessionStore::new();
+        mock.expect_list_delegations()
+            .returning(move |_| Ok(vec![delegation.clone()]));
+        let guard = make_guard(Arc::new(mock));
+
+        let result = guard
+            .check_delegation_allowed("sess-1", &hash, "agent-x")
+            .await;
+        assert!(result.is_some());
+        let msg = result.unwrap();
+        assert!(msg.contains("DUPLICATE DELEGATION BLOCKED") || msg.contains("in progress"));
+    }
+
+    #[tokio::test]
+    async fn check_delegation_allowed_blocks_when_max_retries_exceeded() {
+        let objective = "repeated task";
+        let hash = RapidHash::new(objective.as_bytes());
+        let hash_clone = hash.clone();
+
+        let delegation = Delegation {
+            id: 1,
+            public_id: "del-failed".to_string(),
+            session_id: 1,
+            task_id: None,
+            target_agent_id: "agent-y".to_string(),
+            objective: objective.to_string(),
+            objective_hash: hash_clone,
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            planning_summary: None,
+            status: DelegationStatus::Failed,
+            retry_count: 5, // exceeds default max of 3
+            created_at: OffsetDateTime::now_utc(),
+            completed_at: Some(OffsetDateTime::now_utc() - time::Duration::seconds(60)),
+        };
+
+        let mut mock = MockSessionStore::new();
+        mock.expect_list_delegations()
+            .returning(move |_| Ok(vec![delegation.clone()]));
+        let guard = make_guard(Arc::new(mock));
+
+        let result = guard
+            .check_delegation_allowed("sess-1", &hash, "agent-y")
+            .await;
+        assert!(result.is_some());
+        let msg = result.unwrap();
+        assert!(msg.contains("MAX RETRIES EXCEEDED") || msg.contains("retries"));
+    }
+
+    #[tokio::test]
+    async fn check_delegation_allowed_permits_completed_delegation() {
+        let objective = "completed task";
+        let hash = RapidHash::new(objective.as_bytes());
+        let hash_clone = hash.clone();
+
+        let delegation = Delegation {
+            id: 1,
+            public_id: "del-done".to_string(),
+            session_id: 1,
+            task_id: None,
+            target_agent_id: "agent-z".to_string(),
+            objective: objective.to_string(),
+            objective_hash: hash_clone,
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            planning_summary: None,
+            status: DelegationStatus::Complete, // completed is fine
+            retry_count: 0,
+            created_at: OffsetDateTime::now_utc(),
+            completed_at: Some(OffsetDateTime::now_utc()),
+        };
+
+        let mut mock = MockSessionStore::new();
+        mock.expect_list_delegations()
+            .returning(move |_| Ok(vec![delegation.clone()]));
+        let guard = make_guard(Arc::new(mock));
+
+        let result = guard
+            .check_delegation_allowed("sess-1", &hash, "agent-z")
+            .await;
+        assert!(
+            result.is_none(),
+            "Completed delegation should allow new delegation"
+        );
+    }
+}

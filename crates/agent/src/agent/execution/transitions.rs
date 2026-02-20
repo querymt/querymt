@@ -58,7 +58,11 @@ pub(super) async fn transition_before_llm_call(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to build provider: {}", e))?;
 
-    let tools = config.collect_tools(provider, Some(exec_ctx.runtime.as_ref()));
+    let tools = config.collect_tools(
+        provider,
+        Some(exec_ctx.runtime.as_ref()),
+        Some(&exec_ctx.tool_config),
+    );
 
     let tools_json =
         serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
@@ -784,4 +788,120 @@ pub(super) async fn transition_processing_tool_calls(
     }
 
     Ok(next_state)
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  Tests
+// ══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use querymt::chat::{ChatMessage, ChatRole, MessageType};
+
+    fn make_message(role: ChatRole, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            message_type: MessageType::Text,
+            content: content.to_string(),
+            thinking: None,
+            cache: None,
+        }
+    }
+
+    // ── apply_cache_breakpoints ───────────────────────────────────────────────
+
+    #[test]
+    fn test_cache_breakpoints_empty_slice() {
+        let result = apply_cache_breakpoints(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_cache_breakpoints_single_message_gets_cache_hint() {
+        let msgs = vec![make_message(ChatRole::User, "hello")];
+        let result = apply_cache_breakpoints(&msgs);
+        assert_eq!(result.len(), 1);
+        // With len < 2, the guard `len >= 2` is false — no cache hint applied
+        assert!(
+            result[0].cache.is_none(),
+            "single message should NOT get cache hint (len < 2)"
+        );
+    }
+
+    #[test]
+    fn test_cache_breakpoints_two_messages_both_cached() {
+        let msgs = vec![
+            make_message(ChatRole::User, "msg-0"),
+            make_message(ChatRole::Assistant, "msg-1"),
+        ];
+        let result = apply_cache_breakpoints(&msgs);
+        assert_eq!(result.len(), 2);
+        // Both are within last 2, so both get cache hints
+        assert!(result[0].cache.is_some(), "msg-0 should be cached");
+        assert!(result[1].cache.is_some(), "msg-1 should be cached");
+    }
+
+    #[test]
+    fn test_cache_breakpoints_three_messages_last_two_cached() {
+        let msgs = vec![
+            make_message(ChatRole::User, "msg-0"),
+            make_message(ChatRole::Assistant, "msg-1"),
+            make_message(ChatRole::User, "msg-2"),
+        ];
+        let result = apply_cache_breakpoints(&msgs);
+        assert_eq!(result.len(), 3);
+        assert!(
+            result[0].cache.is_none(),
+            "first message should NOT be cached"
+        );
+        assert!(result[1].cache.is_some(), "second-to-last should be cached");
+        assert!(result[2].cache.is_some(), "last should be cached");
+    }
+
+    #[test]
+    fn test_cache_breakpoints_five_messages_only_last_two_cached() {
+        let msgs: Vec<ChatMessage> = (0..5)
+            .map(|i| make_message(ChatRole::User, &format!("msg-{i}")))
+            .collect();
+        let result = apply_cache_breakpoints(&msgs);
+        assert_eq!(result.len(), 5);
+        for i in 0..3 {
+            assert!(
+                result[i].cache.is_none(),
+                "msg-{i} should NOT have cache hint"
+            );
+        }
+        assert!(result[3].cache.is_some(), "msg-3 should be cached");
+        assert!(result[4].cache.is_some(), "msg-4 should be cached");
+    }
+
+    #[test]
+    fn test_cache_breakpoints_preserves_content() {
+        let msgs = vec![
+            make_message(ChatRole::User, "important content"),
+            make_message(ChatRole::Assistant, "response text"),
+            make_message(ChatRole::User, "follow-up"),
+        ];
+        let result = apply_cache_breakpoints(&msgs);
+        assert_eq!(result[0].content, "important content");
+        assert_eq!(result[1].content, "response text");
+        assert_eq!(result[2].content, "follow-up");
+    }
+
+    #[test]
+    fn test_cache_breakpoints_cache_hint_is_ephemeral() {
+        // With 2 messages the last one should get an Ephemeral hint
+        let msgs = vec![
+            make_message(ChatRole::User, "test"),
+            make_message(ChatRole::Assistant, "reply"),
+        ];
+        let result = apply_cache_breakpoints(&msgs);
+        match &result[1].cache {
+            Some(CacheHint::Ephemeral { ttl_seconds }) => {
+                assert!(ttl_seconds.is_none(), "ttl should be None");
+            }
+            other => panic!("expected Ephemeral cache hint, got: {:?}", other),
+        }
+    }
 }

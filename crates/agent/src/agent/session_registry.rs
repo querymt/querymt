@@ -9,8 +9,8 @@ use crate::agent::remote::SessionActorRef;
 use crate::agent::session_actor::SessionActor;
 use crate::error::AgentError;
 use agent_client_protocol::{
-    Error, ListSessionsRequest, ListSessionsResponse, NewSessionRequest, NewSessionResponse,
-    SessionInfo,
+    Error, ListSessionsRequest, ListSessionsResponse, McpServer, NewSessionRequest,
+    NewSessionResponse, SessionInfo,
 };
 use kameo::actor::Spawn;
 use std::collections::HashMap;
@@ -28,6 +28,39 @@ impl SessionRegistry {
             config,
             sessions: HashMap::new(),
         }
+    }
+
+    /// Merge MCP servers from the agent config with any client-supplied servers.
+    ///
+    /// Config servers act as defaults; client-supplied servers with the same name
+    /// take precedence (client wins).
+    fn merged_mcp_servers(&self, req_servers: &[McpServer]) -> Vec<McpServer> {
+        // Start with config servers converted to ACP format.
+        let mut merged: Vec<McpServer> =
+            self.config.mcp_servers.iter().map(|s| s.to_acp()).collect();
+
+        // For each client-supplied server, replace any config server with the same
+        // name or append it if not present.
+        for req_server in req_servers {
+            let req_name = match req_server {
+                McpServer::Stdio(s) => s.name.as_str(),
+                McpServer::Http(s) => s.name.as_str(),
+                McpServer::Sse(s) => s.name.as_str(),
+                _ => continue,
+            };
+            if let Some(pos) = merged.iter().position(|s| match s {
+                McpServer::Stdio(cs) => cs.name == req_name,
+                McpServer::Http(cs) => cs.name == req_name,
+                McpServer::Sse(cs) => cs.name == req_name,
+                _ => false,
+            }) {
+                merged[pos] = req_server.clone();
+            } else {
+                merged.push(req_server.clone());
+            }
+        }
+
+        merged
     }
 
     /// Get a reference to the session actor for routing.
@@ -187,9 +220,10 @@ impl SessionRegistry {
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
         let session_id = session_context.session().public_id.clone();
 
-        // Build MCP state
+        // Build MCP state: merge config-level MCP servers with any client-supplied ones.
+        let merged_mcp = self.merged_mcp_servers(&req.mcp_servers);
         let (mcp_services, mcp_tools, mcp_tool_defs) = crate::agent::protocol::build_mcp_state(
-            &req.mcp_servers,
+            &merged_mcp,
             self.config.pending_elicitations(),
             self.config.event_bus.clone(),
             session_id.clone(),
@@ -312,8 +346,9 @@ impl SessionRegistry {
             Some(req.cwd.clone())
         };
 
+        let merged_mcp = self.merged_mcp_servers(&req.mcp_servers);
         let (mcp_services, mcp_tools, mcp_tool_defs) = crate::agent::protocol::build_mcp_state(
-            &req.mcp_servers,
+            &merged_mcp,
             self.config.pending_elicitations(),
             self.config.event_bus.clone(),
             session_id.clone(),
@@ -441,8 +476,9 @@ impl SessionRegistry {
             Some(req.cwd.clone())
         };
 
+        let merged_mcp = self.merged_mcp_servers(&req.mcp_servers);
         let (mcp_services, mcp_tools, mcp_tool_defs) = crate::agent::protocol::build_mcp_state(
-            &req.mcp_servers,
+            &merged_mcp,
             self.config.pending_elicitations(),
             self.config.event_bus.clone(),
             session_id.clone(),
@@ -517,5 +553,418 @@ impl SessionRegistry {
         };
 
         Ok(ListSessionsResponse::new(paginated).next_cursor(next_cursor))
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  Tests
+// ══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::agent_config::AgentConfig;
+    use crate::agent::core::{
+        AgentMode, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy, ToolConfig,
+        ToolPolicy,
+    };
+    use crate::agent::session_actor::SessionActor;
+    use crate::config::RuntimeExecutionPolicy;
+    use crate::delegation::DefaultAgentRegistry;
+    use crate::event_bus::EventBus;
+    use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
+    use crate::session::store::SessionStore;
+    use crate::test_utils::{
+        MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
+        mock_plugin_registry, mock_session,
+    };
+    use crate::tools::ToolRegistry;
+    use kameo::actor::Spawn;
+    use querymt::LLMParams;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    // ── Fixture ──────────────────────────────────────────────────────────────
+
+    struct RegistryFixture {
+        registry: SessionRegistry,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl RegistryFixture {
+        async fn new() -> Self {
+            let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+            let shared = SharedLlmProvider {
+                inner: provider.clone(),
+                tools: vec![].into_boxed_slice(),
+            };
+            let factory = Arc::new(TestProviderFactory { provider: shared });
+            let (plugin_registry, temp_dir) =
+                mock_plugin_registry(factory).expect("plugin registry");
+
+            let mut store = MockSessionStore::new();
+            let llm_config = mock_llm_config();
+            let session = mock_session("test-session");
+            store
+                .expect_get_session()
+                .returning(move |_| Ok(Some(session.clone())))
+                .times(0..);
+            store
+                .expect_get_session_llm_config()
+                .returning(move |_| Ok(Some(llm_config.clone())))
+                .times(0..);
+            store
+                .expect_list_sessions()
+                .returning(|| Ok(vec![]))
+                .times(0..);
+
+            let store: Arc<dyn SessionStore> = Arc::new(store);
+            let provider_ctx = Arc::new(crate::session::provider::SessionProvider::new(
+                Arc::new(plugin_registry),
+                store.clone(),
+                LLMParams::new().provider("mock").model("mock-model"),
+            ));
+
+            let config = Arc::new(AgentConfig {
+                provider: provider_ctx,
+                event_bus: Arc::new(EventBus::new()),
+                agent_registry: Arc::new(DefaultAgentRegistry::new()),
+                workspace_manager_actor: WorkspaceIndexManagerActor::new(
+                    WorkspaceIndexManagerConfig::default(),
+                ),
+                default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
+                tool_config: ToolConfig {
+                    policy: ToolPolicy::ProviderOnly,
+                    ..ToolConfig::default()
+                },
+                tool_registry: ToolRegistry::new(),
+                middleware_drivers: Vec::new(),
+                auth_methods: Vec::new(),
+                max_steps: None,
+                snapshot_policy: SnapshotPolicy::None,
+                assume_mutating: true,
+                mutating_tools: HashSet::new(),
+                max_prompt_bytes: None,
+                execution_timeout_secs: 300,
+                execution_policy: RuntimeExecutionPolicy::default(),
+                compaction: crate::session::compaction::SessionCompaction::new(),
+                snapshot_backend: None,
+                snapshot_gc_config: crate::snapshot::GcConfig::default(),
+                delegation_context_config: DelegationContextConfig {
+                    timing: DelegationContextTiming::FirstTurnOnly,
+                    auto_inject: true,
+                },
+                pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
+                mcp_servers: Vec::new(),
+            });
+
+            Self {
+                registry: SessionRegistry::new(config),
+                _temp_dir: temp_dir,
+            }
+        }
+
+        fn spawn_actor(&self) -> kameo::actor::ActorRef<SessionActor> {
+            let runtime = crate::agent::core::SessionRuntime::new(
+                None,
+                HashMap::new(),
+                HashMap::new(),
+                vec![],
+            );
+            let actor = SessionActor::new(
+                self.registry.config.clone(),
+                "test-session".to_string(),
+                runtime,
+            );
+            SessionActor::spawn(actor)
+        }
+    }
+
+    // ── Unit tests ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_new_registry_is_empty() {
+        let f = RegistryFixture::new().await;
+        assert!(f.registry.is_empty());
+        assert_eq!(f.registry.len(), 0);
+        assert!(f.registry.session_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_session_returns_none() {
+        let f = RegistryFixture::new().await;
+        assert!(f.registry.get("no-such-session").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_insert_and_get_session() {
+        let mut f = RegistryFixture::new().await;
+        let actor_ref = f.spawn_actor();
+        f.registry.insert("sess-1".to_string(), actor_ref);
+
+        assert!(!f.registry.is_empty());
+        assert_eq!(f.registry.len(), 1);
+        assert!(f.registry.get("sess-1").is_some());
+        assert!(f.registry.get("sess-2").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_insert_multiple_sessions() {
+        let mut f = RegistryFixture::new().await;
+        for i in 0..5 {
+            let actor_ref = f.spawn_actor();
+            f.registry.insert(format!("sess-{i}"), actor_ref);
+        }
+        assert_eq!(f.registry.len(), 5);
+        let ids = f.registry.session_ids();
+        assert_eq!(ids.len(), 5);
+        for i in 0..5 {
+            assert!(ids.contains(&format!("sess-{i}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_existing_session() {
+        let mut f = RegistryFixture::new().await;
+        let actor_ref = f.spawn_actor();
+        f.registry.insert("sess-1".to_string(), actor_ref);
+        assert_eq!(f.registry.len(), 1);
+
+        let removed = f.registry.remove("sess-1");
+        assert!(removed.is_some());
+        assert!(f.registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent_session_returns_none() {
+        let mut f = RegistryFixture::new().await;
+        let removed = f.registry.remove("no-such-session");
+        assert!(removed.is_none());
+        assert!(f.registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_existing_session_id() {
+        let mut f = RegistryFixture::new().await;
+        let a1 = f.spawn_actor();
+        let a2 = f.spawn_actor();
+        f.registry.insert("sess-1".to_string(), a1);
+        f.registry.insert("sess-1".to_string(), a2);
+        // Still one entry, not two
+        assert_eq!(f.registry.len(), 1);
+        assert!(f.registry.get("sess-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_session_ids_reflects_inserts_and_removes() {
+        let mut f = RegistryFixture::new().await;
+        let a1 = f.spawn_actor();
+        let a2 = f.spawn_actor();
+        f.registry.insert("alpha".to_string(), a1);
+        f.registry.insert("beta".to_string(), a2);
+
+        let ids = f.registry.session_ids();
+        assert!(ids.contains(&"alpha".to_string()));
+        assert!(ids.contains(&"beta".to_string()));
+
+        f.registry.remove("alpha");
+        let ids = f.registry.session_ids();
+        assert!(!ids.contains(&"alpha".to_string()));
+        assert!(ids.contains(&"beta".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_empty_store() {
+        let f = RegistryFixture::new().await;
+        let req = ListSessionsRequest::new();
+        let resp = f.registry.list_sessions(req).await.expect("list_sessions");
+        assert!(resp.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fork_session_empty_history_fails() {
+        let mut f = RegistryFixture::new().await;
+
+        // Override: get_history returns empty vec, get_session returns Some
+        let mut store2 = MockSessionStore::new();
+        let session = mock_session("source-session");
+        store2
+            .expect_get_session()
+            .returning(move |_| Ok(Some(session.clone())))
+            .times(0..);
+        store2
+            .expect_get_history()
+            .returning(|_| Ok(vec![]))
+            .times(0..);
+        store2
+            .expect_get_session_llm_config()
+            .returning(|_| Ok(None))
+            .times(0..);
+        store2
+            .expect_list_sessions()
+            .returning(|| Ok(vec![]))
+            .times(0..);
+
+        let store2: Arc<dyn SessionStore> = Arc::new(store2);
+        let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+        let shared = SharedLlmProvider {
+            inner: provider,
+            tools: vec![].into_boxed_slice(),
+        };
+        let factory = Arc::new(TestProviderFactory { provider: shared });
+        let (plugin_registry, _temp) = mock_plugin_registry(factory).expect("registry");
+        let provider_ctx = Arc::new(crate::session::provider::SessionProvider::new(
+            Arc::new(plugin_registry),
+            store2.clone(),
+            LLMParams::new().provider("mock").model("mock-model"),
+        ));
+        let config = Arc::new(AgentConfig {
+            provider: provider_ctx,
+            event_bus: Arc::new(EventBus::new()),
+            agent_registry: Arc::new(DefaultAgentRegistry::new()),
+            workspace_manager_actor: WorkspaceIndexManagerActor::new(
+                WorkspaceIndexManagerConfig::default(),
+            ),
+            default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
+            tool_config: ToolConfig::default(),
+            tool_registry: ToolRegistry::new(),
+            middleware_drivers: Vec::new(),
+            auth_methods: Vec::new(),
+            max_steps: None,
+            snapshot_policy: SnapshotPolicy::None,
+            assume_mutating: true,
+            mutating_tools: HashSet::new(),
+            max_prompt_bytes: None,
+            execution_timeout_secs: 300,
+            execution_policy: RuntimeExecutionPolicy::default(),
+            compaction: crate::session::compaction::SessionCompaction::new(),
+            snapshot_backend: None,
+            snapshot_gc_config: crate::snapshot::GcConfig::default(),
+            delegation_context_config: DelegationContextConfig {
+                timing: DelegationContextTiming::FirstTurnOnly,
+                auto_inject: true,
+            },
+            pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
+            mcp_servers: Vec::new(),
+        });
+        let registry = SessionRegistry::new(config);
+
+        let req = agent_client_protocol::ForkSessionRequest::new(
+            agent_client_protocol::SessionId::from("source-session".to_string()),
+            std::path::PathBuf::from("/tmp"),
+        );
+        let result = registry.fork_session(req).await;
+        // Should fail with EmptySessionFork since history is empty
+        assert!(result.is_err(), "expected error for empty session fork");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("empty")
+                || err.code == agent_client_protocol::ErrorCode::InternalError,
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // ── merged_mcp_servers tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn merged_mcp_servers_no_config_no_request() {
+        let f = RegistryFixture::new().await;
+        let merged = f.registry.merged_mcp_servers(&[]);
+        assert!(merged.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merged_mcp_servers_config_only() {
+        let mut f = RegistryFixture::new().await;
+        // Inject an MCP server via config
+        Arc::get_mut(&mut f.registry.config)
+            .expect("single owner")
+            .mcp_servers
+            .push(crate::config::McpServerConfig::Http {
+                name: "config-server".to_string(),
+                url: "https://mcp.example.com/mcp".to_string(),
+                headers: std::collections::HashMap::new(),
+            });
+
+        let merged = f.registry.merged_mcp_servers(&[]);
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(&merged[0], McpServer::Http(s) if s.name == "config-server"));
+    }
+
+    #[tokio::test]
+    async fn merged_mcp_servers_request_only() {
+        let f = RegistryFixture::new().await;
+        let req_server = agent_client_protocol::McpServerHttp::new(
+            "req-server".to_string(),
+            "https://req.example.com/mcp".to_string(),
+        );
+        let req_servers = vec![McpServer::Http(req_server)];
+
+        let merged = f.registry.merged_mcp_servers(&req_servers);
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(&merged[0], McpServer::Http(s) if s.name == "req-server"));
+    }
+
+    #[tokio::test]
+    async fn merged_mcp_servers_request_overrides_config_by_name() {
+        let mut f = RegistryFixture::new().await;
+        Arc::get_mut(&mut f.registry.config)
+            .expect("single owner")
+            .mcp_servers
+            .push(crate::config::McpServerConfig::Http {
+                name: "shared-name".to_string(),
+                url: "https://config.example.com/mcp".to_string(),
+                headers: std::collections::HashMap::new(),
+            });
+
+        // Request provides a different URL for the same name — should win.
+        let req_server = agent_client_protocol::McpServerHttp::new(
+            "shared-name".to_string(),
+            "https://override.example.com/mcp".to_string(),
+        );
+        let req_servers = vec![McpServer::Http(req_server)];
+
+        let merged = f.registry.merged_mcp_servers(&req_servers);
+        // Still one entry, not two
+        assert_eq!(merged.len(), 1);
+        assert!(
+            matches!(&merged[0], McpServer::Http(s) if s.url == "https://override.example.com/mcp"),
+            "expected the request server to override the config server"
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_mcp_servers_both_different_names() {
+        let mut f = RegistryFixture::new().await;
+        Arc::get_mut(&mut f.registry.config)
+            .expect("single owner")
+            .mcp_servers
+            .push(crate::config::McpServerConfig::Http {
+                name: "config-server".to_string(),
+                url: "https://config.example.com/mcp".to_string(),
+                headers: std::collections::HashMap::new(),
+            });
+
+        let req_server = agent_client_protocol::McpServerHttp::new(
+            "req-server".to_string(),
+            "https://req.example.com/mcp".to_string(),
+        );
+        let req_servers = vec![McpServer::Http(req_server)];
+
+        let merged = f.registry.merged_mcp_servers(&req_servers);
+        assert_eq!(merged.len(), 2);
+        let names: Vec<&str> = merged
+            .iter()
+            .map(|s| match s {
+                McpServer::Http(h) => h.name.as_str(),
+                McpServer::Stdio(s) => s.name.as_str(),
+                McpServer::Sse(s) => s.name.as_str(),
+                _ => "unknown",
+            })
+            .collect();
+        assert!(names.contains(&"config-server"));
+        assert!(names.contains(&"req-server"));
     }
 }

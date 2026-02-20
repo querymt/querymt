@@ -55,3 +55,7 @@ pub use projection::{
 // Phase 3: Runtime integration
 pub mod runtime;
 pub use runtime::{RuntimeContext, SessionForkHelper};
+
+// Tests
+#[cfg(test)]
+mod repo_tests;

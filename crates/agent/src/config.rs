@@ -1704,4 +1704,84 @@ system = ["You are a test agent"]
                 .contains("DEFINITELY_MISSING_VAR")
         );
     }
+
+    // ── MCP config tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_single_agent_config_parses_mcp_section() {
+        let toml = r#"
+[agent]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+tools = ["context7.*"]
+
+[[mcp]]
+name = "context7"
+transport = "http"
+url = "https://mcp.context7.com/mcp"
+"#;
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[allow(dead_code)]
+            agent: AgentSettings,
+            #[serde(default)]
+            mcp: Vec<McpServerConfig>,
+        }
+        let parsed: Wrapper = toml::from_str(toml).expect("TOML should parse");
+        assert_eq!(parsed.mcp.len(), 1);
+        assert!(
+            matches!(&parsed.mcp[0], McpServerConfig::Http { name, url, .. } if name == "context7" && url == "https://mcp.context7.com/mcp")
+        );
+    }
+
+    #[test]
+    fn test_mcp_http_headers_parsed() {
+        let toml = r#"
+[agent]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+tools = ["context7.*"]
+
+[[mcp]]
+name = "context7"
+transport = "http"
+url = "https://mcp.context7.com/mcp"
+[mcp.headers]
+CONTEXT7_API_KEY = "my-api-key"
+"#;
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[allow(dead_code)]
+            agent: AgentSettings,
+            #[serde(default)]
+            mcp: Vec<McpServerConfig>,
+        }
+        #[allow(dead_code)]
+        let parsed: Wrapper = toml::from_str(toml).expect("TOML should parse");
+        assert_eq!(parsed.mcp.len(), 1);
+        if let McpServerConfig::Http { headers, .. } = &parsed.mcp[0] {
+            assert_eq!(
+                headers.get("CONTEXT7_API_KEY").map(String::as_str),
+                Some("my-api-key")
+            );
+        } else {
+            panic!("Expected Http server config");
+        }
+    }
+
+    #[test]
+    fn test_mcp_env_var_interpolation_uses_braces_syntax() {
+        unsafe {
+            std::env::set_var("MCP_TEST_API_KEY", "secret-key-123");
+        }
+        // ${VAR} syntax should be interpolated
+        let toml_with_braces = r#"provider = "${MCP_TEST_API_KEY}""#;
+        let result = interpolate_env_vars(toml_with_braces).unwrap();
+        assert_eq!(result, r#"provider = "secret-key-123""#);
+
+        // $VAR syntax (no braces) should NOT be interpolated — literal string
+        let toml_without_braces = r#"provider = "$MCP_TEST_API_KEY""#;
+        let result = interpolate_env_vars(toml_without_braces).unwrap();
+        assert_eq!(result, r#"provider = "$MCP_TEST_API_KEY""#);
+    }
 }

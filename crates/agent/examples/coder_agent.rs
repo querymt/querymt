@@ -158,6 +158,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mesh.register_actor(node_manager_ref, "node_manager").await;
                 eprintln!("RemoteNodeManager registered in kameo DHT as 'node_manager'");
 
+                // Spawn ProviderHostActor so that remote peers can proxy LLM
+                // calls through this node's provider registry when the session's
+                // provider_node points here.
+                {
+                    use querymt_agent::agent::remote::ProviderHostActor;
+                    let provider_host = ProviderHostActor::new(agent_handle.config.clone());
+                    let provider_host_ref = ProviderHostActor::spawn(provider_host);
+                    let hostname = std::env::var("HOSTNAME")
+                        .ok()
+                        .filter(|h| !h.is_empty())
+                        .or_else(|| {
+                            std::process::Command::new("hostname")
+                                .output()
+                                .ok()
+                                .and_then(|o| String::from_utf8(o.stdout).ok())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let dht_name = format!("provider_host::{}", hostname);
+                    mesh.register_actor(provider_host_ref, dht_name.clone())
+                        .await;
+                    eprintln!("ProviderHostActor registered in kameo DHT as '{dht_name}'");
+                }
+
                 // Store the MeshHandle on AgentHandle so list_remote_nodes,
                 // create_remote_session, and attach_remote_session can use it.
                 agent_handle.set_mesh(mesh);

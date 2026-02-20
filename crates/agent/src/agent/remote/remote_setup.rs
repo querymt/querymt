@@ -283,7 +283,7 @@ fn get_hostname() -> String {
 ///
 /// `initialize()` and `new_session()` are no-ops — the remote session is
 /// created lazily on the first `prompt()` call.
-struct RemoteAgentStub {
+pub(crate) struct RemoteAgentStub {
     peer_label: String,
     agent_id: String,
     mesh: MeshHandle,
@@ -299,6 +299,15 @@ impl RemoteAgentStub {
             mesh,
             session: Mutex::new(None),
         }
+    }
+
+    /// Test-only constructor exposed so that `remote_agent_stub_tests` can
+    /// construct a stub without going through the full `setup_mesh_from_config`
+    /// path (which requires a real TOML config and cannot be called twice per
+    /// process because of the `bootstrap_mesh` one-shot constraint).
+    #[cfg(test)]
+    pub(crate) fn new_for_test(peer_label: String, agent_id: String, mesh: MeshHandle) -> Self {
+        Self::new(peer_label, agent_id, mesh)
     }
 
     /// Create a remote session and return (session_id, SessionActorRef::Remote).

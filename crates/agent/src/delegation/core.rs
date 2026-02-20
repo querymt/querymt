@@ -959,3 +959,259 @@ impl AgentRegistry for DefaultAgentRegistry {
         self.agents.get(id).map(|entry| entry.instance.clone())
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+//  Tests
+// ══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::{
+        AuthenticateRequest, AuthenticateResponse, CancelNotification, Error, ExtNotification,
+        ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
+        InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+        LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+        ProtocolVersion, ResumeSessionRequest, ResumeSessionResponse, SetSessionModelRequest,
+        SetSessionModelResponse,
+    };
+    use async_trait::async_trait;
+
+    // ── Minimal stub SendAgent ───────────────────────────────────────────────
+
+    struct StubAgent {
+        name: String,
+    }
+
+    impl StubAgent {
+        fn new(name: &str) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl SendAgent for StubAgent {
+        async fn initialize(&self, _req: InitializeRequest) -> Result<InitializeResponse, Error> {
+            Ok(InitializeResponse::new(ProtocolVersion::LATEST))
+        }
+
+        async fn authenticate(
+            &self,
+            _req: AuthenticateRequest,
+        ) -> Result<AuthenticateResponse, Error> {
+            Ok(AuthenticateResponse::new())
+        }
+
+        async fn new_session(&self, _req: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+            Ok(NewSessionResponse::new(format!("{}-session", self.name)))
+        }
+
+        async fn prompt(&self, _req: PromptRequest) -> Result<PromptResponse, Error> {
+            Ok(PromptResponse::new(
+                agent_client_protocol::StopReason::EndTurn,
+            ))
+        }
+
+        async fn cancel(&self, _notif: CancelNotification) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn load_session(
+            &self,
+            _req: LoadSessionRequest,
+        ) -> Result<LoadSessionResponse, Error> {
+            Ok(LoadSessionResponse::new())
+        }
+
+        async fn list_sessions(
+            &self,
+            _req: ListSessionsRequest,
+        ) -> Result<ListSessionsResponse, Error> {
+            Ok(ListSessionsResponse::new(vec![]))
+        }
+
+        async fn fork_session(
+            &self,
+            _req: ForkSessionRequest,
+        ) -> Result<ForkSessionResponse, Error> {
+            Ok(ForkSessionResponse::new("fork"))
+        }
+
+        async fn resume_session(
+            &self,
+            _req: ResumeSessionRequest,
+        ) -> Result<ResumeSessionResponse, Error> {
+            Ok(ResumeSessionResponse::new())
+        }
+
+        async fn set_session_model(
+            &self,
+            _req: SetSessionModelRequest,
+        ) -> Result<SetSessionModelResponse, Error> {
+            Ok(SetSessionModelResponse::new())
+        }
+
+        async fn ext_method(&self, _req: ExtRequest) -> Result<ExtResponse, Error> {
+            let raw = serde_json::value::RawValue::from_string("null".to_string())
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            Ok(ExtResponse::new(Arc::from(raw)))
+        }
+
+        async fn ext_notification(&self, _notif: ExtNotification) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn make_agent_info(id: &str) -> AgentInfo {
+        AgentInfo {
+            id: id.to_string(),
+            name: format!("Agent {id}"),
+            description: format!("Description for {id}"),
+            capabilities: vec!["coding".to_string()],
+            required_capabilities: vec![],
+            meta: None,
+        }
+    }
+
+    // ── DefaultAgentRegistry tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_new_registry_is_empty() {
+        let registry = DefaultAgentRegistry::new();
+        assert!(registry.list_agents().is_empty());
+        assert!(registry.get_agent("any").is_none());
+        assert!(registry.get_agent_instance("any").is_none());
+    }
+
+    #[test]
+    fn test_register_and_list_agent() {
+        let mut registry = DefaultAgentRegistry::new();
+        let info = make_agent_info("agent-1");
+        let agent = StubAgent::new("agent-1");
+        registry.register(info, agent);
+
+        let agents = registry.list_agents();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, "agent-1");
+        assert_eq!(agents[0].name, "Agent agent-1");
+    }
+
+    #[test]
+    fn test_get_agent_by_id() {
+        let mut registry = DefaultAgentRegistry::new();
+        registry.register(make_agent_info("alpha"), StubAgent::new("alpha"));
+        registry.register(make_agent_info("beta"), StubAgent::new("beta"));
+
+        let alpha = registry.get_agent("alpha");
+        assert!(alpha.is_some());
+        assert_eq!(alpha.unwrap().id, "alpha");
+
+        let beta = registry.get_agent("beta");
+        assert!(beta.is_some());
+        assert_eq!(beta.unwrap().id, "beta");
+
+        assert!(registry.get_agent("gamma").is_none());
+    }
+
+    #[test]
+    fn test_get_agent_instance() {
+        let mut registry = DefaultAgentRegistry::new();
+        registry.register(make_agent_info("worker"), StubAgent::new("worker"));
+
+        assert!(registry.get_agent_instance("worker").is_some());
+        assert!(registry.get_agent_instance("missing").is_none());
+    }
+
+    #[test]
+    fn test_register_multiple_agents() {
+        let mut registry = DefaultAgentRegistry::new();
+        for i in 0..5 {
+            registry.register(
+                make_agent_info(&format!("agent-{i}")),
+                StubAgent::new(&format!("agent-{i}")),
+            );
+        }
+        assert_eq!(registry.list_agents().len(), 5);
+    }
+
+    #[test]
+    fn test_register_overwrites_same_id() {
+        let mut registry = DefaultAgentRegistry::new();
+        let mut info1 = make_agent_info("x");
+        info1.description = "first".to_string();
+        let mut info2 = make_agent_info("x");
+        info2.description = "second".to_string();
+
+        registry.register(info1, StubAgent::new("x"));
+        registry.register(info2, StubAgent::new("x"));
+
+        // Still only one entry
+        assert_eq!(registry.list_agents().len(), 1);
+        let got = registry.get_agent("x").unwrap();
+        assert_eq!(got.description, "second");
+    }
+
+    // ── AgentInfo serialization ──────────────────────────────────────────────
+
+    #[test]
+    fn test_agent_info_serde_round_trip() {
+        let info = AgentInfo {
+            id: "coder".to_string(),
+            name: "Coder Agent".to_string(),
+            description: "Writes code".to_string(),
+            capabilities: vec!["rust".to_string(), "python".to_string()],
+            required_capabilities: vec![],
+            meta: Some(serde_json::json!({"version": 2})),
+        };
+
+        let json = serde_json::to_string(&info).expect("serialize AgentInfo");
+        let restored: AgentInfo = serde_json::from_str(&json).expect("deserialize AgentInfo");
+        assert_eq!(restored.id, info.id);
+        assert_eq!(restored.name, info.name);
+        assert_eq!(restored.capabilities, info.capabilities);
+        assert!(restored.meta.is_some());
+    }
+
+    #[test]
+    fn test_agent_info_meta_none_omitted_in_json() {
+        let info = AgentInfo {
+            id: "minimal".to_string(),
+            name: "Minimal".to_string(),
+            description: "No meta".to_string(),
+            capabilities: vec![],
+            required_capabilities: vec![],
+            meta: None,
+        };
+
+        let json = serde_json::to_string(&info).expect("serialize");
+        // _meta field should be absent when None
+        assert!(
+            !json.contains("_meta"),
+            "meta=None should be omitted from JSON"
+        );
+    }
+
+    // ── DelegationOrchestratorConfig ─────────────────────────────────────────
+
+    #[test]
+    fn test_orchestrator_config_defaults() {
+        let config = DelegationOrchestratorConfig::new(None);
+        assert!(!config.inject_results);
+        assert!(!config.run_verification);
+        assert!(config.cwd.is_none());
+    }
+
+    #[test]
+    fn test_orchestrator_config_with_cwd() {
+        use std::path::PathBuf;
+        let path = PathBuf::from("/workspace");
+        let config = DelegationOrchestratorConfig::new(Some(path.clone()));
+        assert_eq!(config.cwd, Some(path));
+    }
+}

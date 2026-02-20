@@ -274,17 +274,17 @@ impl LLMProvider for MeshChatProvider {}
 ///
 /// # Implementation note
 ///
-/// This function queries `RemoteNodeManager`s via `ListAvailableModels`.  Since
-/// there is no direct way to retrieve the hostname from a `RemoteActorRef`, we
-/// scan `ProviderHostActor` DHT names sequentially after confirming the provider
-/// is available on some peer.  The explicit `provider_node` path (Case 1) is the
-/// primary flow; this best-effort scan only runs when `provider_node` is `None`.
+/// This function queries each `RemoteNodeManager` via `ListAvailableModels` +
+/// `GetNodeInfo`. Both calls are made to the same peer so we obtain the real
+/// hostname without any DHT name-reverse-lookup.  The explicit `provider_node`
+/// path (Case 1) is the primary flow; this best-effort scan only runs when
+/// `provider_node` is `None`.
 pub(crate) async fn find_provider_on_mesh(
     mesh: &MeshHandle,
     provider_name: &str,
 ) -> Option<String> {
-    use crate::agent::remote::ListAvailableModels;
-    use crate::agent::remote::node_manager::RemoteNodeManager;
+    use crate::agent::remote::node_manager::{GetNodeInfo, RemoteNodeManager};
+    use crate::agent::remote::{ListAvailableModels, NodeInfo};
 
     let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>("node_manager");
 
@@ -297,55 +297,41 @@ pub(crate) async fn find_provider_on_mesh(
             }
         };
 
-        // ask() flattens Result<Result<T,E>, _> → Result<T, RemoteSendError<E>>
-        match node_ref
+        // Ask for available models first (cheaper filter).
+        let models = match node_ref
             .ask::<ListAvailableModels>(&ListAvailableModels)
             .await
         {
-            Ok(models) => {
-                if models.iter().any(|m| m.provider == provider_name) {
-                    // Found a peer with this provider.  We need to return a hostname so
-                    // the caller can look up `"provider_host::{hostname}"`.  Since we
-                    // can't cheaply extract the hostname from a `RemoteActorRef`, we
-                    // emit a best-effort scan of the known provider_host DHT entries.
-                    // For the common case of a single remote GPU node this resolves
-                    // immediately.  A production deployment should prefer the explicit
-                    // `provider_node` path (Case 1) to avoid this scan.
-                    log::debug!(
-                        "find_provider_on_mesh: provider '{}' found on a mesh peer; \
-                         scanning provider_host:: entries",
-                        provider_name
-                    );
-
-                    // Scan the provider_host DHT namespace to find the matching entry.
-                    let mut host_stream =
-                        mesh.lookup_all_actors::<ProviderHostActor>("provider_host");
-                    while let Some(host_result) = host_stream.next().await {
-                        // We can't get the registration name back from a RemoteActorRef,
-                        // but the first reachable ProviderHostActor on a peer that has
-                        // the provider is our best match.
-                        if let Ok(_host_ref) = host_result {
-                            // Return the provider_name as a placeholder hostname signal.
-                            // The MeshChatProvider will use `"provider_host::{provider_name}"`
-                            // — this will only work when the DHT registration happens to
-                            // match. For Phase 4 the explicit path is preferred; this path
-                            // is a best-effort hint for single-peer meshes.
-                            return Some(provider_name.to_string());
-                        }
-                    }
-
-                    // Couldn't resolve a hostname — return None and let the caller error.
-                    log::debug!(
-                        "find_provider_on_mesh: could not resolve hostname for '{}' provider",
-                        provider_name
-                    );
-                    return None;
-                }
-            }
+            Ok(m) => m,
             Err(e) => {
-                log::debug!("find_provider_on_mesh: ask failed: {}", e);
+                log::debug!("find_provider_on_mesh: ListAvailableModels failed: {}", e);
+                continue;
             }
+        };
+
+        if !models.iter().any(|m| m.provider == provider_name) {
+            continue;
         }
+
+        // This peer has the provider — ask for its hostname.
+        let node_info: NodeInfo = match node_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
+            Ok(info) => info,
+            Err(e) => {
+                log::debug!(
+                    "find_provider_on_mesh: GetNodeInfo failed for peer with provider '{}': {}",
+                    provider_name,
+                    e
+                );
+                continue;
+            }
+        };
+
+        log::info!(
+            "find_provider_on_mesh: provider '{}' found on mesh peer '{}' (mesh fallback)",
+            provider_name,
+            node_info.hostname
+        );
+        return Some(node_info.hostname);
     }
 
     None

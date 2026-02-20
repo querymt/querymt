@@ -249,23 +249,23 @@ impl MeshHandle {
 /// DHT operations, and a source of [`PeerEvent`] broadcasts.
 pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError> {
     use futures_util::StreamExt as _;
+    use kameo::remote;
     use libp2p::{
         SwarmBuilder, mdns, noise,
         swarm::{NetworkBehaviour, SwarmEvent},
         tcp, yamux,
     };
-    use kameo::remote;
 
     let listen_addr = config.listen.as_deref().unwrap_or("/ip4/0.0.0.0/tcp/0");
 
     // Validate bootstrap_peers addresses up-front so we fail fast.
     for peer_addr in &config.bootstrap_peers {
-        peer_addr.parse::<libp2p::Multiaddr>().map_err(|e| {
-            MeshError::InvalidBootstrapAddr {
+        peer_addr
+            .parse::<libp2p::Multiaddr>()
+            .map_err(|e| MeshError::InvalidBootstrapAddr {
                 addr: peer_addr.clone(),
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
     }
 
     // Broadcast channel for peer lifecycle events.
@@ -321,14 +321,12 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         .map_err(|e| MeshError::SwarmError(e.to_string()))?;
 
     swarm
-        .listen_on(
-            listen_addr
-                .parse()
-                .map_err(|e: libp2p::multiaddr::Error| MeshError::InvalidListenAddr {
-                    addr: listen_addr.to_string(),
-                    reason: e.to_string(),
-                })?,
-        )
+        .listen_on(listen_addr.parse().map_err(|e: libp2p::multiaddr::Error| {
+            MeshError::InvalidListenAddr {
+                addr: listen_addr.to_string(),
+                reason: e.to_string(),
+            }
+        })?)
         .map_err(|e| MeshError::SwarmError(e.to_string()))?;
 
     let local_peer_id = *swarm.local_peer_id();
@@ -337,9 +335,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
     tokio::spawn(async move {
         loop {
             match swarm.select_next_some().await {
-                SwarmEvent::Behaviour(MeshBehaviourEvent::Mdns(mdns::Event::Discovered(
-                    list,
-                ))) => {
+                SwarmEvent::Behaviour(MeshBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                     // A single peer may be reported multiple times in the list
                     // (once per transport address, e.g. TCP + QUIC).  Register
                     // all addresses but emit only one PeerEvent per unique peer
@@ -387,8 +383,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         }
     });
 
-    if matches!(&config.discovery, MeshDiscovery::Kademlia { bootstrap } if !bootstrap.is_empty())
-    {
+    if matches!(&config.discovery, MeshDiscovery::Kademlia { bootstrap } if !bootstrap.is_empty()) {
         if let MeshDiscovery::Kademlia { bootstrap } = &config.discovery {
             for addr in bootstrap {
                 log::info!("Kademlia bootstrap peer: {}", addr);

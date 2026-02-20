@@ -34,6 +34,32 @@ mod remote_actor_impl;
 #[cfg(test)]
 mod tests;
 
+// ── Test modules (remote feature) ────────────────────────────────────────────
+
+#[cfg(all(test, feature = "remote"))]
+mod test_helpers;
+
+#[cfg(all(test, feature = "remote"))]
+mod provider_host_tests;
+
+#[cfg(all(test, feature = "remote"))]
+mod mesh_provider_tests;
+
+#[cfg(all(test, feature = "remote"))]
+mod remote_agent_stub_tests;
+
+#[cfg(all(test, feature = "remote"))]
+mod session_actor_ref_remote_tests;
+
+#[cfg(all(test, feature = "remote"))]
+mod event_relay_mesh_tests;
+
+#[cfg(all(test, feature = "remote"))]
+mod integration_tests;
+
+#[cfg(all(test, feature = "remote"))]
+mod provider_routing_tests;
+
 pub use actor_ref::SessionActorRef;
 pub use event_forwarder::EventForwarder;
 pub use event_relay::{EventRelayActor, RelayedEvent};

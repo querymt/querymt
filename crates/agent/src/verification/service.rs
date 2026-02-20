@@ -320,3 +320,360 @@ impl ToolContext for VerificationToolContext {
         self
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+//  Tests
+// ══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::ToolRegistry;
+    use crate::verification::{
+        Expectation, VerificationSpec, VerificationStep, VerificationStrategy,
+    };
+    use std::borrow::Cow;
+    use std::path::PathBuf;
+
+    fn make_context(cwd: Option<PathBuf>) -> VerificationContext {
+        VerificationContext {
+            session_id: "test-session".to_string(),
+            task_id: None,
+            delegation_id: None,
+            cwd,
+            tool_registry: Arc::new(ToolRegistry::new()),
+        }
+    }
+
+    fn make_service() -> VerificationService {
+        VerificationService::new(Arc::new(ToolRegistry::new()))
+    }
+
+    // ── VerificationContext construction ────────────────────────────────────
+
+    #[test]
+    fn test_context_construction() {
+        let ctx = make_context(None);
+        assert_eq!(ctx.session_id, "test-session");
+        assert!(ctx.task_id.is_none());
+        assert!(ctx.delegation_id.is_none());
+        assert!(ctx.cwd.is_none());
+    }
+
+    #[test]
+    fn test_context_with_all_fields() {
+        let ctx = VerificationContext {
+            session_id: "s1".to_string(),
+            task_id: Some("t1".to_string()),
+            delegation_id: Some("d1".to_string()),
+            cwd: Some(PathBuf::from("/workspace")),
+            tool_registry: Arc::new(ToolRegistry::new()),
+        };
+        assert_eq!(ctx.task_id.as_deref(), Some("t1"));
+        assert_eq!(ctx.delegation_id.as_deref(), Some("d1"));
+        assert_eq!(
+            ctx.cwd.as_deref(),
+            Some(PathBuf::from("/workspace").as_path())
+        );
+    }
+
+    // ── VerificationService — empty spec ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_verify_empty_spec_returns_ok() {
+        let service = make_service();
+        let spec = VerificationSpec {
+            description: "empty".to_string(),
+            steps: vec![],
+            strategy: VerificationStrategy::All,
+        };
+        let ctx = make_context(None);
+        let result = service.verify(&spec, &ctx).await;
+        assert!(result.is_ok(), "empty spec should always pass");
+    }
+
+    // ── VerificationService — unknown tool ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_verify_unknown_tool_fails() {
+        let service = make_service();
+        let spec = VerificationSpec {
+            description: "tool test".to_string(),
+            steps: vec![VerificationStep::ToolCall {
+                tool_name: Cow::Borrowed("nonexistent_tool"),
+                arguments: serde_json::json!({}),
+                expectation: Expectation::Success,
+                error_message: None,
+            }],
+            strategy: VerificationStrategy::All,
+        };
+        let ctx = make_context(None);
+        let result = service.verify(&spec, &ctx).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // verify_all wraps all inner errors as StepFailed; the message contains the unknown tool name
+        assert!(
+            matches!(
+                err,
+                crate::verification::VerificationError::StepFailed { .. }
+            ),
+            "expected StepFailed, got: {:?}",
+            err
+        );
+        assert!(
+            err.to_string().contains("nonexistent_tool") || err.to_string().contains("Unknown"),
+            "expected error to mention the tool, got: {:?}",
+            err
+        );
+    }
+
+    // ── VerificationService — file assertions ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_file_assertion_missing_file_when_expected_absent_passes() {
+        let service = make_service();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let non_existent = tmp.path().join("does-not-exist.txt");
+
+        let spec = VerificationSpec {
+            description: "file absent".to_string(),
+            steps: vec![VerificationStep::FileAssertion {
+                path: non_existent,
+                exists: false,
+                contains: None,
+                matches_regex: None,
+            }],
+            strategy: VerificationStrategy::All,
+        };
+        let ctx = make_context(Some(tmp.path().to_path_buf()));
+        let result = service.verify(&spec, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "file absent check should pass when file missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_assertion_existing_file_passes() {
+        let service = make_service();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file_path = tmp.path().join("hello.txt");
+        std::fs::write(&file_path, "hello world").unwrap();
+
+        let spec = VerificationSpec {
+            description: "file exists".to_string(),
+            steps: vec![VerificationStep::FileAssertion {
+                path: file_path.clone(),
+                exists: true,
+                contains: None,
+                matches_regex: None,
+            }],
+            strategy: VerificationStrategy::All,
+        };
+        let ctx = make_context(Some(tmp.path().to_path_buf()));
+        let result = service.verify(&spec, &ctx).await;
+        assert!(result.is_ok(), "existing file should pass existence check");
+    }
+
+    #[tokio::test]
+    async fn test_file_assertion_content_check_passes() {
+        let service = make_service();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file_path = tmp.path().join("readme.md");
+        std::fs::write(&file_path, "Hello, world!\nThis is a test.").unwrap();
+
+        let spec = VerificationSpec {
+            description: "content check".to_string(),
+            steps: vec![VerificationStep::FileAssertion {
+                path: file_path,
+                exists: true,
+                contains: Some("Hello, world!".to_string()),
+                matches_regex: None,
+            }],
+            strategy: VerificationStrategy::All,
+        };
+        let ctx = make_context(Some(tmp.path().to_path_buf()));
+        let result = service.verify(&spec, &ctx).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_file_assertion_content_not_found_fails() {
+        let service = make_service();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file_path = tmp.path().join("readme.md");
+        std::fs::write(&file_path, "nothing here").unwrap();
+
+        let spec = VerificationSpec {
+            description: "content missing".to_string(),
+            steps: vec![VerificationStep::FileAssertion {
+                path: file_path,
+                exists: true,
+                contains: Some("expected text not present".to_string()),
+                matches_regex: None,
+            }],
+            strategy: VerificationStrategy::All,
+        };
+        let ctx = make_context(Some(tmp.path().to_path_buf()));
+        let result = service.verify(&spec, &ctx).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_file_assertion_file_missing_when_expected_exists_fails() {
+        let service = make_service();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent = tmp.path().join("missing.txt");
+
+        let spec = VerificationSpec {
+            description: "expected to exist".to_string(),
+            steps: vec![VerificationStep::FileAssertion {
+                path: absent,
+                exists: true,
+                contains: None,
+                matches_regex: None,
+            }],
+            strategy: VerificationStrategy::All,
+        };
+        let ctx = make_context(Some(tmp.path().to_path_buf()));
+        let result = service.verify(&spec, &ctx).await;
+        assert!(result.is_err());
+    }
+
+    // ── Strategy tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_strategy_any_one_passing_step_succeeds() {
+        let service = make_service();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let exists = tmp.path().join("exists.txt");
+        std::fs::write(&exists, "data").unwrap();
+        let absent = tmp.path().join("absent.txt");
+
+        // Step 0 checks for absent file (expected to exist → fails)
+        // Step 1 checks for existing file (expected to exist → passes)
+        // Strategy::Any → overall pass
+        let spec = VerificationSpec {
+            description: "any strategy".to_string(),
+            steps: vec![
+                VerificationStep::FileAssertion {
+                    path: absent,
+                    exists: true, // will fail
+                    contains: None,
+                    matches_regex: None,
+                },
+                VerificationStep::FileAssertion {
+                    path: exists,
+                    exists: true, // will pass
+                    contains: None,
+                    matches_regex: None,
+                },
+            ],
+            strategy: VerificationStrategy::Any,
+        };
+        let ctx = make_context(Some(tmp.path().to_path_buf()));
+        let result = service.verify(&spec, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "Any strategy should pass when at least one step passes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strategy_any_all_failing_returns_error() {
+        let service = make_service();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent1 = tmp.path().join("a.txt");
+        let absent2 = tmp.path().join("b.txt");
+
+        let spec = VerificationSpec {
+            description: "all fail".to_string(),
+            steps: vec![
+                VerificationStep::FileAssertion {
+                    path: absent1,
+                    exists: true,
+                    contains: None,
+                    matches_regex: None,
+                },
+                VerificationStep::FileAssertion {
+                    path: absent2,
+                    exists: true,
+                    contains: None,
+                    matches_regex: None,
+                },
+            ],
+            strategy: VerificationStrategy::Any,
+        };
+        let ctx = make_context(Some(tmp.path().to_path_buf()));
+        let result = service.verify(&spec, &ctx).await;
+        assert!(
+            result.is_err(),
+            "Any strategy should fail when all steps fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strategy_until_failure_stops_at_first_error() {
+        let service = make_service();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let exists = tmp.path().join("real.txt");
+        std::fs::write(&exists, "ok").unwrap();
+        let absent = tmp.path().join("missing.txt");
+
+        // Step 0 passes, step 1 fails → UntilFailure stops at step 1
+        let spec = VerificationSpec {
+            description: "until failure".to_string(),
+            steps: vec![
+                VerificationStep::FileAssertion {
+                    path: exists,
+                    exists: true,
+                    contains: None,
+                    matches_regex: None,
+                },
+                VerificationStep::FileAssertion {
+                    path: absent,
+                    exists: true, // will fail
+                    contains: None,
+                    matches_regex: None,
+                },
+            ],
+            strategy: VerificationStrategy::UntilFailure,
+        };
+        let ctx = make_context(Some(tmp.path().to_path_buf()));
+        let result = service.verify(&spec, &ctx).await;
+        assert!(
+            result.is_err(),
+            "UntilFailure should fail when a step fails"
+        );
+    }
+
+    // ── check_expectation (via verify_step → file assertions) ────────────────
+
+    #[tokio::test]
+    async fn test_wait_for_returns_not_implemented() {
+        let service = make_service();
+        let spec = VerificationSpec {
+            description: "wait for".to_string(),
+            steps: vec![VerificationStep::WaitFor {
+                poll_interval_ms: 100,
+                timeout_ms: 500,
+                condition: Box::new(VerificationStep::FileAssertion {
+                    path: PathBuf::from("/tmp/fake"),
+                    exists: true,
+                    contains: None,
+                    matches_regex: None,
+                }),
+            }],
+            strategy: VerificationStrategy::All,
+        };
+        let ctx = make_context(None);
+        let result = service.verify(&spec, &ctx).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not yet implemented"),
+            "expected 'not yet implemented', got: {}",
+            msg
+        );
+    }
+}

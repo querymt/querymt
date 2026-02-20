@@ -28,6 +28,7 @@ tools = [
   # Code intelligence
 #  "semantic_edit",
   "web_fetch",
+  "context7.*",
 ]
 system = [
   { file = "../prompts/default_system.txt" }
@@ -134,3 +135,9 @@ fallback_max_tokens = 128000
 type = "dedup_check"
 threshold = 0.85
 min_lines = 10
+
+[[mcp]]
+name = "context7"
+transport = "http"
+url = "https://mcp.context7.com/mcp"
+headers = { CONTEXT7_API_KEY = "${CONTEXT7_API_KEY}" }

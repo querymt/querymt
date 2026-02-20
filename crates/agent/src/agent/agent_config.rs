@@ -7,7 +7,7 @@
 use crate::agent::core::{
     AgentMode, DelegationContextConfig, SnapshotPolicy, ToolConfig, ToolPolicy,
 };
-use crate::config::RuntimeExecutionPolicy;
+use crate::config::{McpServerConfig, RuntimeExecutionPolicy};
 use crate::delegation::AgentRegistry;
 use crate::event_bus::EventBus;
 use crate::index::WorkspaceIndexManagerActor;
@@ -43,6 +43,11 @@ pub struct AgentConfig {
     pub tool_registry: ToolRegistry,
     pub middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
     pub auth_methods: Vec<AuthMethod>,
+
+    // ── MCP servers (from TOML config, applied to every session) ────────
+    /// MCP servers defined in the TOML `[[mcp]]` section.
+    /// These are merged into every `NewSessionRequest` automatically.
+    pub mcp_servers: Vec<McpServerConfig>,
 
     // ── Execution config ─────────────────────────────────────────
     pub max_steps: Option<usize>,
@@ -232,13 +237,20 @@ impl AgentConfig {
     }
 
     /// Collects available tools based on current configuration.
+    ///
+    /// `tool_config_override` is the per-session tool configuration captured at the
+    /// start of a turn (from `SessionActor.tool_config`). When `Some`, it takes
+    /// precedence over the global `AgentConfig.tool_config`, allowing runtime
+    /// mutations via `SetAllowedTools` / `SetDeniedTools` / `SetToolPolicy` to
+    /// take effect. When `None`, falls back to the global config.
     pub fn collect_tools(
         &self,
         provider: Arc<dyn querymt::LLMProvider>,
         runtime: Option<&crate::agent::core::SessionRuntime>,
+        tool_config_override: Option<&crate::agent::core::ToolConfig>,
     ) -> Vec<querymt::chat::Tool> {
         let mut tools = Vec::new();
-        let config = &self.tool_config;
+        let config = tool_config_override.unwrap_or(&self.tool_config);
 
         match config.policy {
             ToolPolicy::BuiltInOnly => {
@@ -257,16 +269,43 @@ impl AgentConfig {
             }
         }
 
-        if let (Some(runtime), ToolPolicy::ProviderOnly | ToolPolicy::BuiltInAndProvider) =
-            (runtime, config.policy)
-        {
-            tools.extend(runtime.mcp_tool_defs.iter().cloned());
-        }
+        // Collect MCP tools (always when a runtime is present, regardless of
+        // policy, because the policy was already chosen with MCP in mind in
+        // builder_from_config).
+        let mcp_tool_defs: Vec<querymt::chat::Tool> =
+            if let (Some(runtime), ToolPolicy::ProviderOnly | ToolPolicy::BuiltInAndProvider) =
+                (runtime, config.policy)
+            {
+                runtime.mcp_tool_defs.iter().cloned().collect()
+            } else {
+                vec![]
+            };
 
-        tools
+        // Filter built-in / provider tools with the basic allowlist check.
+        let mut filtered: Vec<querymt::chat::Tool> = tools
             .into_iter()
             .filter(|tool| crate::agent::tools::is_tool_allowed_with(config, &tool.function.name))
-            .collect()
+            .collect();
+
+        // Filter MCP tools with the server-name-aware check so that
+        // "servername.*" wildcard entries in the allowlist are honoured.
+        if let Some(runtime) = runtime {
+            for tool_def in mcp_tool_defs {
+                let server_name = runtime
+                    .mcp_tools
+                    .get(&tool_def.function.name)
+                    .map(|a| a.server_name());
+                if crate::agent::tools::is_mcp_tool_allowed_with(
+                    config,
+                    &tool_def.function.name,
+                    server_name,
+                ) {
+                    filtered.push(tool_def);
+                }
+            }
+        }
+
+        filtered
     }
 
     pub fn execution_config_snapshot(&self) -> SessionExecutionConfig {
@@ -284,5 +323,181 @@ impl AgentConfig {
 
     pub async fn invalidate_provider_cache(&self) {
         self.provider.clear_provider_cache().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::agent::core::ToolPolicy;
+    use crate::session::backend::StorageBackend;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use crate::test_utils::helpers::empty_plugin_registry;
+    use querymt::LLMParams;
+    use std::sync::Arc;
+
+    async fn make_config() -> (Arc<AgentConfig>, tempfile::TempDir) {
+        use crate::session::backend::StorageBackend;
+        let (registry, temp_dir) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let llm = LLMParams::new().provider("mock").model("mock-model");
+        let config = Arc::new(
+            AgentConfigBuilder::new(Arc::new(registry), storage.session_store(), llm).build(),
+        );
+        (config, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn is_tool_allowed_defaults_all_allowed() {
+        let (config, _td) = make_config().await;
+        assert!(config.is_tool_allowed("shell"));
+        assert!(config.is_tool_allowed("read_tool"));
+        assert!(config.is_tool_allowed("unknown_tool"));
+    }
+
+    #[tokio::test]
+    async fn is_tool_allowed_with_denylist() {
+        let (registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let llm = LLMParams::new().provider("mock").model("mock");
+        let config = Arc::new(
+            AgentConfigBuilder::new(Arc::new(registry), storage.session_store(), llm)
+                .with_denied_tools(["shell".to_string()])
+                .build(),
+        );
+        assert!(!config.is_tool_allowed("shell"));
+        assert!(config.is_tool_allowed("read_tool"));
+    }
+
+    #[tokio::test]
+    async fn is_tool_allowed_with_allowlist() {
+        let (registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let llm = LLMParams::new().provider("mock").model("mock");
+        let config = Arc::new(
+            AgentConfigBuilder::new(Arc::new(registry), storage.session_store(), llm)
+                .with_allowed_tools(["read_tool", "shell"])
+                .build(),
+        );
+        assert!(config.is_tool_allowed("read_tool"));
+        assert!(config.is_tool_allowed("shell"));
+        assert!(!config.is_tool_allowed("delete_file"));
+    }
+
+    #[tokio::test]
+    async fn tool_config_snapshot_returns_current_config() {
+        let (config, _td) = make_config().await;
+        let snapshot = config.tool_config_snapshot();
+        // Default ToolPolicy is BuiltInAndProvider (see #[default] in core.rs)
+        assert_eq!(snapshot.policy, ToolPolicy::BuiltInAndProvider);
+    }
+
+    #[tokio::test]
+    async fn event_bus_returns_shared_instance() {
+        let (config, _td) = make_config().await;
+        let bus1 = config.event_bus();
+        let bus2 = config.event_bus();
+        assert!(Arc::ptr_eq(&bus1, &bus2));
+    }
+
+    #[tokio::test]
+    async fn subscribe_events_returns_receiver() {
+        let (config, _td) = make_config().await;
+        let _rx = config.subscribe_events();
+    }
+
+    #[tokio::test]
+    async fn agent_registry_returns_instance() {
+        let (config, _td) = make_config().await;
+        let registry = config.agent_registry();
+        let agents = registry.list_agents();
+        // Default empty registry
+        assert!(agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_delegation_meta_empty_registry_returns_none() {
+        let (config, _td) = make_config().await;
+        let meta = config.build_delegation_meta();
+        assert!(meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn requires_permission_for_tool_edit_tools() {
+        let (config, _td) = make_config().await;
+        // write_file and apply_patch → ToolKind::Edit, delete_file → Delete, shell → Execute
+        assert!(config.requires_permission_for_tool("write_file"));
+        assert!(config.requires_permission_for_tool("apply_patch"));
+        assert!(config.requires_permission_for_tool("delete_file"));
+        assert!(config.requires_permission_for_tool("shell"));
+        // read-only tools do NOT require permission
+        assert!(!config.requires_permission_for_tool("search_text"));
+    }
+
+    #[tokio::test]
+    async fn should_snapshot_tool_defaults_mutating_all() {
+        let (config, _td) = make_config().await;
+        // Default assume_mutating=true means all tools trigger snapshot
+        assert!(config.should_snapshot_tool("read_tool"));
+        assert!(config.should_snapshot_tool("shell"));
+    }
+
+    #[tokio::test]
+    async fn execution_config_snapshot_has_defaults() {
+        let (config, _td) = make_config().await;
+        let snapshot = config.execution_config_snapshot();
+        assert_eq!(snapshot.execution_timeout_secs, 300);
+        assert!(snapshot.max_steps.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_driver_with_no_steps() {
+        let (config, _td) = make_config().await;
+        let _driver = config.create_driver();
+    }
+
+    #[tokio::test]
+    async fn create_driver_with_max_steps() {
+        let (registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let llm = LLMParams::new().provider("mock").model("mock");
+        let config = Arc::new(
+            AgentConfigBuilder::new(Arc::new(registry), storage.session_store(), llm)
+                .with_max_steps(100)
+                .build(),
+        );
+        let _driver = config.create_driver();
+        let limits = config.get_session_limits();
+        assert!(limits.is_some());
+    }
+
+    #[tokio::test]
+    async fn prepare_snapshot_no_cwd_returns_none() {
+        let (config, _td) = make_config().await;
+        let result = config.prepare_snapshot(None);
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_snapshot_policy_none_returns_none_even_with_cwd() {
+        let (config, _td) = make_config().await;
+        let result = config.prepare_snapshot(Some(std::path::Path::new("/tmp")));
+        // Default policy is None
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_manager_actor_returns_ref() {
+        let (config, _td) = make_config().await;
+        let _actor = config.workspace_manager_actor();
+    }
+
+    #[tokio::test]
+    async fn pending_elicitations_returns_map() {
+        let (config, _td) = make_config().await;
+        let map = config.pending_elicitations();
+        let locked = map.try_lock().unwrap();
+        assert!(locked.is_empty());
     }
 }

@@ -12,7 +12,7 @@ use querymt::{
     error::LLMError,
 };
 use serde_json::{Map, Value};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::RwLock;
 
 fn prune_config_by_schema(cfg: &Value, schema: &Value) -> Value {
@@ -55,8 +55,13 @@ fn pruned_top_level_keys(before: &Value, after: &Value) -> Vec<String> {
     removed
 }
 
-/// Type alias for the provider cache: (config_id, provider) pair
-type ProviderCache = Arc<RwLock<Option<(i64, Arc<dyn LLMProvider>)>>>;
+/// Type alias for the provider cache: (config_id, provider_node, provider) tuple.
+///
+/// `provider_node` is stored separately from `llm_configs` (in the `sessions`
+/// table) so the same `config_id` can resolve to different providers depending
+/// on which mesh node owns the session.  Including it in the key ensures we
+/// rebuild when it changes.
+type ProviderCache = Arc<RwLock<Option<(i64, Option<String>, Arc<dyn LLMProvider>)>>>;
 
 /// A wrapper around a `SessionStore` that resolves providers dynamically.
 ///
@@ -86,8 +91,12 @@ pub struct SessionProvider {
     /// Optional mesh handle — present when this node participates in a kameo mesh.
     /// Passed through to `build_provider_from_config` to enable `MeshChatProvider`
     /// routing and mesh-fallback discovery.
+    ///
+    /// Wrapped in `Arc<StdMutex<...>>` so the mesh can be injected *after* the
+    /// `Arc<SessionProvider>` is already shared (e.g. via `AgentHandle::set_mesh`
+    /// which is called after `AgentConfigBuilder::build()`).
     #[cfg(feature = "remote")]
-    mesh: Option<crate::agent::remote::MeshHandle>,
+    mesh: Arc<StdMutex<Option<crate::agent::remote::MeshHandle>>>,
 }
 
 impl SessionProvider {
@@ -102,19 +111,35 @@ impl SessionProvider {
             initial_config,
             cached_provider: Arc::new(RwLock::new(None)),
             #[cfg(feature = "remote")]
-            mesh: None,
+            mesh: Arc::new(StdMutex::new(None)),
         }
     }
 
-    /// Attach a mesh handle so this `SessionProvider` can route cross-node provider calls.
+    /// Attach a mesh handle at construction time (consuming builder).
     ///
-    /// Called during mesh bootstrap before sessions are created. The handle is
-    /// threaded through `build_provider_from_config` so providers on remote nodes
-    /// are reachable via `MeshChatProvider`.
+    /// Use this when the mesh is available before the `SessionProvider` is
+    /// wrapped in an `Arc`. For late injection (mesh bootstrapped after
+    /// `Arc<SessionProvider>` is shared), use `set_mesh` instead.
     #[cfg(feature = "remote")]
-    pub fn with_mesh(mut self, mesh: Option<crate::agent::remote::MeshHandle>) -> Self {
-        self.mesh = mesh;
+    pub fn with_mesh(self, mesh: Option<crate::agent::remote::MeshHandle>) -> Self {
+        *self.mesh.lock().unwrap_or_else(|e| e.into_inner()) = mesh;
         self
+    }
+
+    /// Inject or replace the mesh handle after construction.
+    ///
+    /// Because `mesh` is wrapped in `Arc<StdMutex<...>>`, this works even when
+    /// the `SessionProvider` is already shared behind an `Arc`. All clones of
+    /// this `SessionProvider` share the same `Arc` and therefore see the update
+    /// immediately — no restart or rebuild is required.
+    ///
+    /// Called by `AgentHandle::set_mesh` so that sessions created by a
+    /// `RemoteNodeManager` (which holds `Arc<AgentConfig>` with this provider)
+    /// can route LLM calls through the mesh even though the mesh was bootstrapped
+    /// after the config was built.
+    #[cfg(feature = "remote")]
+    pub fn set_mesh(&self, mesh: Option<crate::agent::remote::MeshHandle>) {
+        *self.mesh.lock().unwrap_or_else(|e| e.into_inner()) = mesh;
     }
 
     /// Fetch an existing session by ID
@@ -190,29 +215,51 @@ impl SessionProvider {
                 SessionError::InvalidOperation("Session has no LLM config".to_string())
             })?;
 
-        // Check cache first - fast path for same config
+        // `parse_llm_config_row` always returns `provider_node: None` because
+        // provider_node lives in the `sessions` table, not `llm_configs`.
+        // Read it separately so mesh routing (Case 1 in build_provider_from_config)
+        // is actually triggered for remote sessions.
+        #[cfg(feature = "remote")]
+        let provider_node: Option<String> = self
+            .history_store
+            .get_session_provider_node(session_id)
+            .await
+            .unwrap_or(None);
+        #[cfg(not(feature = "remote"))]
+        let provider_node: Option<String> = None;
+
+        // Check cache first - fast path for same config + provider_node
         {
             let cache = self.cached_provider.read().await;
-            if let Some((cached_config_id, cached_provider)) = cache.as_ref()
+            if let Some((cached_config_id, cached_provider_node, cached_provider)) = cache.as_ref()
                 && *cached_config_id == config.id
+                && cached_provider_node.as_deref() == provider_node.as_deref()
             {
                 log::trace!(
-                    "Provider cache hit for config_id={} ({}:{})",
+                    "Provider cache hit for config_id={} ({}:{}) provider_node={:?}",
                     config.id,
                     config.provider,
-                    config.model
+                    config.model,
+                    provider_node,
                 );
                 return Ok(Arc::clone(cached_provider));
             }
         }
 
-        // Cache miss or config changed - build new provider
+        // Cache miss or config/provider_node changed - build new provider
         log::debug!(
-            "Provider cache miss for config_id={} ({}:{}), building new provider",
+            "Provider cache miss for config_id={} ({}:{}) provider_node={:?}, building new provider",
             config.id,
             config.provider,
-            config.model
+            config.model,
+            provider_node,
         );
+
+        // Read the mesh handle outside of any async context — StdMutex must not
+        // be held across await points.
+        #[cfg(feature = "remote")]
+        let mesh_handle: Option<crate::agent::remote::MeshHandle> =
+            self.mesh.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         let provider = build_provider_from_config(
             &self.plugin_registry,
@@ -221,17 +268,17 @@ impl SessionProvider {
             config.params.as_ref(),
             None,
             #[cfg(feature = "remote")]
-            config.provider_node.as_deref(),
+            provider_node.as_deref(),
             #[cfg(feature = "remote")]
-            self.mesh.as_ref(),
+            mesh_handle.as_ref(),
         )
         .await?;
 
-        // Update cache - this will drop the old provider if config changed
-        // For GPU models (llama_cpp), this frees VRAM before loading the new model
+        // Update cache - this will drop the old provider if config changed.
+        // For GPU models (llama_cpp), this frees VRAM before loading the new model.
         {
             let mut cache = self.cached_provider.write().await;
-            *cache = Some((config.id, Arc::clone(&provider)));
+            *cache = Some((config.id, provider_node, Arc::clone(&provider)));
         }
 
         Ok(provider)
@@ -282,8 +329,9 @@ impl Clone for SessionProvider {
             history_store: Arc::clone(&self.history_store),
             initial_config: self.initial_config.clone(),
             cached_provider: Arc::clone(&self.cached_provider),
+            // Share the same Arc so all clones see set_mesh() updates.
             #[cfg(feature = "remote")]
-            mesh: self.mesh.clone(),
+            mesh: Arc::clone(&self.mesh),
         }
     }
 }
@@ -577,28 +625,29 @@ pub async fn build_provider_from_config(
     // ── Case 1: Explicit remote node requested ─────────────────────────────────
     #[cfg(feature = "remote")]
     if let Some(node) = provider_node
-        && node != "local" {
-            let mesh = mesh_handle.ok_or_else(|| {
-                SessionError::InvalidOperation(format!(
-                    "provider_node='{}' specified but no mesh handle available",
-                    node
-                ))
-            })?;
-            log::debug!(
-                "build_provider_from_config: routing {}/{} to mesh node '{}'",
+        && node != "local"
+    {
+        let mesh = mesh_handle.ok_or_else(|| {
+            SessionError::InvalidOperation(format!(
+                "provider_node='{}' specified but no mesh handle available",
+                node
+            ))
+        })?;
+        log::debug!(
+            "build_provider_from_config: routing {}/{} to mesh node '{}'",
+            provider_name,
+            model,
+            node
+        );
+        return Ok(Arc::new(
+            crate::agent::remote::mesh_provider::MeshChatProvider::new(
+                mesh,
+                node,
                 provider_name,
                 model,
-                node
-            );
-            return Ok(Arc::new(
-                crate::agent::remote::mesh_provider::MeshChatProvider::new(
-                    mesh,
-                    node,
-                    provider_name,
-                    model,
-                ),
-            ));
-        }
+            ),
+        ));
+    }
 
     // ── Case 2: Try local provider (existing logic) ────────────────────────────
     let factory = plugin_registry.get(provider_name).await;

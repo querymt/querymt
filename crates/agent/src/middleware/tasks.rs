@@ -290,3 +290,94 @@ impl MiddlewareDriver for DuplicateToolCallMiddleware {
         "DuplicateToolCallMiddleware"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::mocks::MockSessionStore;
+
+    // ── TaskAutoCompletionMiddleware ─────────────────────────────────────────
+
+    #[test]
+    fn task_auto_completion_name() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_get_session().never();
+        let m = TaskAutoCompletionMiddleware::new(Arc::new(mock));
+        assert_eq!(m.name(), "TaskAutoCompletionMiddleware");
+    }
+
+    #[test]
+    fn task_auto_completion_reset_does_not_panic() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_get_session().never();
+        let m = TaskAutoCompletionMiddleware::new(Arc::new(mock));
+        m.reset();
+    }
+
+    // ── DuplicateToolCallMiddleware ──────────────────────────────────────────
+
+    #[test]
+    fn duplicate_tool_call_name() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_get_history().never();
+        let m = DuplicateToolCallMiddleware::new(Arc::new(mock));
+        assert_eq!(m.name(), "DuplicateToolCallMiddleware");
+    }
+
+    #[test]
+    fn duplicate_tool_call_reset_clears_cache() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_get_history().never();
+        let m = DuplicateToolCallMiddleware::new(Arc::new(mock));
+        // Add something to last_check to test clearing
+        {
+            let mut cache = m.last_check.lock().unwrap();
+            cache.insert("sess-1".to_string(), 5);
+        }
+        m.reset();
+        let cache = m.last_check.lock().unwrap();
+        assert!(cache.is_empty(), "reset() should clear the cache");
+    }
+
+    #[tokio::test]
+    async fn task_auto_completion_passes_through_non_after_llm_state() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_get_session().never();
+        let m = TaskAutoCompletionMiddleware::new(Arc::new(mock));
+
+        use crate::middleware::{AgentStats, ConversationContext, ExecutionState};
+        let ctx = Arc::new(ConversationContext::new(
+            "sess-1".into(),
+            Arc::from([]),
+            Arc::new(AgentStats::default()),
+            "mock".into(),
+            "mock-model".into(),
+        ));
+        let state = ExecutionState::BeforeLlmCall { context: ctx };
+        let result = m.on_after_llm(state, None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_call_passes_through_non_before_llm_state() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_get_history().never();
+        let m = DuplicateToolCallMiddleware::new(Arc::new(mock));
+
+        use crate::middleware::{AgentStats, ConversationContext, ExecutionState, LlmResponse};
+        let ctx = Arc::new(ConversationContext::new(
+            "sess-1".into(),
+            Arc::from([]),
+            Arc::new(AgentStats::default()),
+            "mock".into(),
+            "mock-model".into(),
+        ));
+        let response = Arc::new(LlmResponse::new("hi".to_string(), vec![], None, None));
+        let state = ExecutionState::AfterLlm {
+            response,
+            context: ctx,
+        };
+        let result = m.on_step_start(state, None).await;
+        assert!(result.is_ok());
+    }
+}

@@ -10,7 +10,9 @@ use crate::acp::websocket::serve_websocket;
 use crate::agent::AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::{SnapshotPolicy, ToolPolicy};
-use crate::config::{ExecutionPolicy, MiddlewareEntry, SingleAgentConfig, SkillsConfig};
+use crate::config::{
+    ExecutionPolicy, McpServerConfig, MiddlewareEntry, SingleAgentConfig, SkillsConfig,
+};
 use crate::events::AgentEvent;
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
 use crate::runner::{ChatRunner, ChatSession};
@@ -43,6 +45,8 @@ pub struct AgentBuilder {
     middleware_entries: Vec<MiddlewareEntry>,
     execution: Option<ExecutionPolicy>,
     skills_config: Option<SkillsConfig>,
+    /// MCP servers from TOML `[[mcp]]` config, attached to every new session.
+    mcp_servers: Vec<McpServerConfig>,
     /// Optional pre-built agent registry (Phase 7: injected by `from_single_config_with_registry`).
     pub(super) agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
 }
@@ -67,6 +71,7 @@ impl AgentBuilder {
             middleware_entries: Vec::new(),
             execution: None,
             skills_config: None,
+            mcp_servers: Vec::new(),
             agent_registry: None,
         }
     }
@@ -272,9 +277,21 @@ impl AgentBuilder {
         }
 
         if !self.tools.is_empty() {
+            // Use BuiltInAndProvider when MCP servers are also configured so
+            // that MCP tool definitions reach the LLM.  With BuiltInOnly the
+            // collect_tools() gate strips them out entirely.
+            let policy = if !self.mcp_servers.is_empty() {
+                ToolPolicy::BuiltInAndProvider
+            } else {
+                ToolPolicy::BuiltInOnly
+            };
             builder = builder
-                .with_tool_policy(ToolPolicy::BuiltInOnly)
+                .with_tool_policy(policy)
                 .with_allowed_tools(self.tools.clone());
+        }
+
+        if !self.mcp_servers.is_empty() {
+            builder = builder.with_mcp_servers(self.mcp_servers.clone());
         }
 
         if let Some(exec) = self.execution {
@@ -359,6 +376,7 @@ impl AgentBuilder {
             snapshot_gc_config: initial_config.snapshot_gc_config.clone(),
             delegation_context_config: initial_config.delegation_context_config.clone(),
             pending_elicitations: initial_config.pending_elicitations.clone(),
+            mcp_servers: initial_config.mcp_servers.clone(),
         });
 
         let handle = Arc::new(AgentHandle::from_config(final_config));
@@ -658,6 +676,11 @@ impl Agent {
         // Thread through config fields that were previously silently dropped
         builder.execution = Some(config.agent.execution);
         builder.skills_config = Some(config.agent.skills);
+
+        // Wire MCP servers from TOML `[[mcp]]` config.
+        if !config.mcp.is_empty() {
+            builder.mcp_servers = config.mcp;
+        }
 
         Ok(builder)
     }

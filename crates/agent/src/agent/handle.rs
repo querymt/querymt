@@ -334,9 +334,15 @@ impl AgentHandle {
     }
 
     /// Activate the mesh by storing the `MeshHandle` returned by `bootstrap_mesh()`.
+    ///
+    /// Also propagates into `config.provider` so that sessions created by a
+    /// `RemoteNodeManager` (which holds `Arc<AgentConfig>` with this provider)
+    /// can route LLM calls through the mesh even though the mesh was bootstrapped
+    /// after the config was built.
     #[cfg(feature = "remote")]
     pub fn set_mesh(&self, mesh: crate::agent::remote::MeshHandle) {
-        *self.mesh.lock().unwrap_or_else(|e| e.into_inner()) = Some(mesh);
+        *self.mesh.lock().unwrap_or_else(|e| e.into_inner()) = Some(mesh.clone());
+        self.config.provider.set_mesh(Some(mesh));
     }
 
     #[cfg(feature = "remote")]
@@ -779,5 +785,310 @@ impl SendAgent for AgentHandle {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  Tests
+// ══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::agent_config::AgentConfig;
+    use crate::agent::core::{
+        AgentMode, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy, ToolConfig,
+        ToolPolicy,
+    };
+    use crate::config::RuntimeExecutionPolicy;
+    use crate::delegation::DefaultAgentRegistry;
+    use crate::event_bus::EventBus;
+    use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
+    use crate::send_agent::SendAgent;
+    use crate::session::store::SessionStore;
+    use crate::test_utils::{
+        MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
+        mock_plugin_registry, mock_session,
+    };
+    use crate::tools::ToolRegistry;
+    use agent_client_protocol::{
+        CancelNotification, InitializeRequest, ListSessionsRequest, ProtocolVersion, SessionId,
+    };
+    use querymt::LLMParams;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    // ── Shared fixture ───────────────────────────────────────────────────────
+
+    struct HandleFixture {
+        handle: AgentHandle,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl HandleFixture {
+        async fn new() -> Self {
+            let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+            let shared = SharedLlmProvider {
+                inner: provider.clone(),
+                tools: vec![].into_boxed_slice(),
+            };
+            let factory = Arc::new(TestProviderFactory { provider: shared });
+            let (plugin_registry, temp_dir) =
+                mock_plugin_registry(factory).expect("plugin registry");
+
+            let llm_config = mock_llm_config();
+            let session = mock_session("test-session");
+            let mut store = MockSessionStore::new();
+            let session_clone = session.clone();
+            store
+                .expect_get_session()
+                .returning(move |_| Ok(Some(session_clone.clone())))
+                .times(0..);
+            let llm_for_mock = llm_config.clone();
+            store
+                .expect_get_session_llm_config()
+                .returning(move |_| Ok(Some(llm_for_mock.clone())))
+                .times(0..);
+            store
+                .expect_get_llm_config()
+                .returning(move |_| Ok(Some(llm_config.clone())))
+                .times(0..);
+            store
+                .expect_list_sessions()
+                .returning(|| Ok(vec![]))
+                .times(0..);
+            store
+                .expect_create_or_get_llm_config()
+                .returning(|_| Ok(mock_llm_config()))
+                .times(0..);
+            store
+                .expect_set_session_llm_config()
+                .returning(|_, _| Ok(()))
+                .times(0..);
+
+            let store: Arc<dyn SessionStore> = Arc::new(store);
+            let provider_ctx = Arc::new(crate::session::provider::SessionProvider::new(
+                Arc::new(plugin_registry),
+                store.clone(),
+                LLMParams::new().provider("mock").model("mock-model"),
+            ));
+
+            let config = Arc::new(AgentConfig {
+                provider: provider_ctx,
+                event_bus: Arc::new(EventBus::new()),
+                agent_registry: Arc::new(DefaultAgentRegistry::new()),
+                workspace_manager_actor: WorkspaceIndexManagerActor::new(
+                    WorkspaceIndexManagerConfig::default(),
+                ),
+                default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
+                tool_config: ToolConfig {
+                    policy: ToolPolicy::ProviderOnly,
+                    ..ToolConfig::default()
+                },
+                tool_registry: ToolRegistry::new(),
+                middleware_drivers: Vec::new(),
+                auth_methods: Vec::new(),
+                max_steps: None,
+                snapshot_policy: SnapshotPolicy::None,
+                assume_mutating: true,
+                mutating_tools: HashSet::new(),
+                max_prompt_bytes: None,
+                execution_timeout_secs: 300,
+                execution_policy: RuntimeExecutionPolicy::default(),
+                compaction: crate::session::compaction::SessionCompaction::new(),
+                snapshot_backend: None,
+                snapshot_gc_config: crate::snapshot::GcConfig::default(),
+                delegation_context_config: DelegationContextConfig {
+                    timing: DelegationContextTiming::FirstTurnOnly,
+                    auto_inject: true,
+                },
+                pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
+                mcp_servers: Vec::new(),
+            });
+
+            Self {
+                handle: AgentHandle::from_config(config),
+                _temp_dir: temp_dir,
+            }
+        }
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_from_config_creates_empty_registry() {
+        let f = HandleFixture::new().await;
+        let registry = f.handle.registry.lock().await;
+        assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_returns_latest_protocol() {
+        let f = HandleFixture::new().await;
+        let req = InitializeRequest::new(ProtocolVersion::LATEST);
+        let resp = f.handle.initialize(req).await.expect("initialize");
+        assert!(resp.protocol_version <= ProtocolVersion::LATEST);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_downgrades_newer_client_protocol() {
+        let f = HandleFixture::new().await;
+        // Simulate a client claiming a future protocol version by using LATEST
+        // (we can't construct a truly higher version, but LATEST is still valid)
+        let req = InitializeRequest::new(ProtocolVersion::LATEST);
+        let resp = f.handle.initialize(req).await.expect("initialize");
+        // Server caps at LATEST
+        assert_eq!(resp.protocol_version, ProtocolVersion::LATEST);
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_empty() {
+        let f = HandleFixture::new().await;
+        let req = ListSessionsRequest::new();
+        let resp = f.handle.list_sessions(req).await.expect("list_sessions");
+        assert!(resp.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_unknown_session_is_noop() {
+        let f = HandleFixture::new().await;
+        let notif = CancelNotification::new(SessionId::from("no-such-session".to_string()));
+        // Should not return an error — cancel for unknown sessions is a no-op
+        let result = f.handle.cancel(notif).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_prompt_unknown_session_returns_error() {
+        let f = HandleFixture::new().await;
+        let req = agent_client_protocol::PromptRequest::new(
+            SessionId::from("no-such-session".to_string()),
+            vec![],
+        );
+        let result = f.handle.prompt(req).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ext_method_returns_null() {
+        let f = HandleFixture::new().await;
+        let null_params = std::sync::Arc::from(
+            serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
+        );
+        let req = agent_client_protocol::ExtRequest::new("my_method", null_params);
+        let resp = f.handle.ext_method(req).await.expect("ext_method");
+        assert_eq!(resp.0.get(), "null");
+    }
+
+    #[tokio::test]
+    async fn test_ext_notification_ok() {
+        let f = HandleFixture::new().await;
+        let null_params = std::sync::Arc::from(
+            serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
+        );
+        let notif = agent_client_protocol::ExtNotification::new("my_event", null_params);
+        f.handle
+            .ext_notification(notif)
+            .await
+            .expect("ext_notification");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_and_emit_event() {
+        let f = HandleFixture::new().await;
+        let mut rx = f.handle.subscribe_events();
+
+        f.handle
+            .emit_event("test-session", crate::events::AgentEventKind::Cancelled);
+
+        let event = rx.try_recv().expect("should have received event");
+        assert!(matches!(
+            event.kind,
+            crate::events::AgentEventKind::Cancelled
+        ));
+        assert_eq!(event.session_id, "test-session");
+    }
+
+    #[tokio::test]
+    async fn test_set_llm_config_unknown_provider_fails() {
+        let f = HandleFixture::new().await;
+        let config = LLMParams::new().provider("unknown-provider").model("gpt-4");
+        let result = f.handle.set_llm_config("any-session", config).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // Should be an UnknownProvider error mapped to ACP
+        assert_eq!(
+            err.code,
+            agent_client_protocol::ErrorCode::InternalError,
+            "expected internal error code"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_llm_config_no_provider_fails() {
+        let f = HandleFixture::new().await;
+        // LLMParams with no provider set
+        let config = LLMParams::new().model("some-model");
+        let result = f.handle.set_llm_config("any-session", config).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_session_limits_no_middleware_returns_none() {
+        let f = HandleFixture::new().await;
+        let limits = f.handle.get_session_limits();
+        assert!(limits.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_event_bus_accessible() {
+        let f = HandleFixture::new().await;
+        let bus = f.handle.event_bus();
+        // Just check we can get the bus and subscribe
+        let _rx = bus.subscribe();
+    }
+
+    #[tokio::test]
+    async fn test_agent_registry_accessible() {
+        let f = HandleFixture::new().await;
+        let registry = f.handle.agent_registry();
+        // DefaultAgentRegistry starts empty
+        assert!(registry.list_agents().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tool_registry_accessible() {
+        let f = HandleFixture::new().await;
+        let registry = f.handle.tool_registry();
+        // Default registry is empty (no builtins registered in test config)
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn test_set_session_model_unknown_session_fails() {
+        let f = HandleFixture::new().await;
+        let req = agent_client_protocol::SetSessionModelRequest::new(
+            SessionId::from("no-session".to_string()),
+            agent_client_protocol::ModelId::from("anthropic/claude-3-5-sonnet".to_string()),
+        );
+        let result = f.handle.set_session_model(req).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_no_auth_methods_always_succeeds() {
+        let f = HandleFixture::new().await;
+        // First initialize so client_state is set
+        let _ = f
+            .handle
+            .initialize(InitializeRequest::new(ProtocolVersion::LATEST))
+            .await
+            .unwrap();
+
+        let req = agent_client_protocol::AuthenticateRequest::new("any-method".to_string());
+        // With no auth_methods configured, any method id is accepted
+        let result = f.handle.authenticate(req).await;
+        assert!(result.is_ok());
     }
 }

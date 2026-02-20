@@ -40,9 +40,10 @@ pub async fn build_prompt_blocks(
 
     // Remote sessions: proxy all file operations through the mesh.
     if let Some(sr) = session_ref
-        && sr.is_remote() {
-            return build_remote_prompt_blocks(sr, cwd, user_text, prompt).await;
-        }
+        && sr.is_remote()
+    {
+        return build_remote_prompt_blocks(sr, cwd, user_text, prompt).await;
+    }
 
     let Some(cwd) = cwd else {
         return vec![ContentBlock::Text(TextContent::new(user_text))];

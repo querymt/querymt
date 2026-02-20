@@ -141,7 +141,20 @@ pub(super) async fn execute_tool_call(
 
     let tool_context = exec_ctx.tool_context(config.agent_registry.clone(), Some(elicitation_tx));
 
-    let (raw_result_json, is_error, tool_source) = if !config.is_tool_allowed(&call.function.name) {
+    // Check tool permission using the per-session tool config so that runtime
+    // mutations (SetAllowedTools / SetDeniedTools) are respected. Also look up
+    // the MCP server name so that "servername.*" wildcard entries in the
+    // allowlist correctly permit MCP tools (e.g. "context7.*" → "resolve-library-id").
+    let mcp_server_name: Option<String> = exec_ctx
+        .runtime
+        .mcp_tools
+        .get(&call.function.name)
+        .map(|a| a.server_name().to_owned());
+    let (raw_result_json, is_error, tool_source) = if !crate::agent::tools::is_mcp_tool_allowed_with(
+        &exec_ctx.tool_config,
+        &call.function.name,
+        mcp_server_name.as_deref(),
+    ) {
         (
             format!("Error: tool '{}' is not allowed", call.function.name),
             true,

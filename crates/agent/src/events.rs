@@ -267,8 +267,10 @@ pub enum AgentEventKind {
     },
     /// Emitted when duplicate/similar code is detected in newly written code
     DuplicateCodeDetected {
-        /// List of duplicate code warnings
+        /// Compacted list of duplicate code warnings (body_text stripped, matches capped)
         warnings: Vec<crate::middleware::dedup_check::DuplicateWarning>,
+        /// Path to the full overflow report file (if written), readable via read_file
+        overflow_path: Option<String>,
     },
     /// Emitted when the agent's operating mode changes at runtime
     ModeChanged {
