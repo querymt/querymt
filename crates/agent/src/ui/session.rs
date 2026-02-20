@@ -57,10 +57,15 @@ pub async fn prompt_for_mode(
             let agent = agent_for_id(state, &agent_id)
                 .ok_or_else(|| format!("Unknown agent: {}", agent_id))?;
             let session_cwd = session_cwd_for(state, &session_id).await.or(cwd.cloned());
+            let session_ref = {
+                let registry = state.agent.registry.lock().await;
+                registry.get(&session_id).cloned()
+            };
             let prompt_blocks = super::mentions::build_prompt_blocks(
                 &state.workspace_manager,
                 session_cwd.as_ref(),
                 prompt,
+                session_ref.as_ref(),
             )
             .await;
             send_prompt(agent, session_id, prompt_blocks).await?;
@@ -72,10 +77,15 @@ pub async fn prompt_for_mode(
                 let agent = agent_for_id(state, &agent_id)
                     .ok_or_else(|| format!("Unknown agent: {}", agent_id))?;
                 let session_cwd = session_cwd_for(state, &session_id).await.or(cwd.cloned());
+                let session_ref = {
+                    let registry = state.agent.registry.lock().await;
+                    registry.get(&session_id).cloned()
+                };
                 let prompt_blocks = super::mentions::build_prompt_blocks(
                     &state.workspace_manager,
                     session_cwd.as_ref(),
                     prompt,
+                    session_ref.as_ref(),
                 )
                 .await;
                 send_prompt(agent, session_id, prompt_blocks).await?;

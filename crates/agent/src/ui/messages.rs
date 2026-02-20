@@ -46,6 +46,9 @@ pub enum RoutingMode {
 pub struct ModelEntry {
     pub provider: String,
     pub model: String,
+    /// Node label where this provider lives. `None` = local node, `Some(hostname)` = remote mesh node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 /// Recent model usage entry from event history.
@@ -89,6 +92,21 @@ pub struct SessionSummary {
     pub fork_origin: Option<String>,
     /// Whether this session has child sessions
     pub has_children: bool,
+    /// Node label where this session lives. "local" for local sessions,
+    /// peer hostname/label for remote sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+}
+
+/// Information about a remote node discovered in the kameo mesh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteNodeInfo {
+    /// Human-readable label / hostname
+    pub label: String,
+    /// Node capabilities
+    pub capabilities: Vec<String>,
+    /// Number of active sessions on the node
+    pub active_sessions: usize,
 }
 
 /// Group of sessions by working directory.
@@ -129,6 +147,9 @@ pub enum UiClientMessage {
     SetSessionModel {
         session_id: String,
         model_id: String,
+        /// Optional mesh node label that owns the provider. `None` = local.
+        #[serde(default)]
+        node: Option<String>,
     },
     /// Get recent models from event history
     GetRecentModels {
@@ -189,6 +210,30 @@ pub enum UiClientMessage {
     },
     /// Get the current agent mode
     GetAgentMode,
+    /// List remote nodes discovered in the kameo mesh
+    ListRemoteNodes,
+    /// List sessions on a specific remote node
+    ListRemoteSessions {
+        /// Node label/hostname identifying the target node
+        node: String,
+    },
+    /// Create a new session on a specific remote node
+    CreateRemoteSession {
+        /// Node label/hostname identifying the target node
+        node: String,
+        /// Working directory on the remote machine (optional)
+        cwd: Option<String>,
+        /// Client-generated request ID for correlating the response
+        #[serde(default)]
+        request_id: Option<String>,
+    },
+    /// Attach an existing remote session to the local dashboard
+    AttachRemoteSession {
+        /// Node label/hostname identifying the target node
+        node: String,
+        /// Session ID to attach
+        session_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -298,6 +343,17 @@ pub enum UiServerMessage {
         success: bool,
         message: String,
     },
+    /// List of remote nodes discovered in the kameo mesh
+    RemoteNodes {
+        nodes: Vec<RemoteNodeInfo>,
+    },
+    /// Sessions available on a specific remote node
+    RemoteSessions {
+        /// Node label/hostname
+        node: String,
+        /// Sessions on that node
+        sessions: Vec<crate::agent::remote::RemoteSessionInfo>,
+    },
 }
 
 impl UiServerMessage {
@@ -322,6 +378,8 @@ impl UiServerMessage {
             Self::AuthProviders { .. } => "auth_providers",
             Self::OAuthFlowStarted { .. } => "oauth_flow_started",
             Self::OAuthResult { .. } => "oauth_result",
+            Self::RemoteNodes { .. } => "remote_nodes",
+            Self::RemoteSessions { .. } => "remote_sessions",
         }
     }
 }

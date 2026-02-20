@@ -18,12 +18,18 @@ oauth = ["querymt-utils/oauth"]
 # This mirrors the CLI's `dbus-secret-service` feature, but is wired through the agent crate.
 dbus-secret-service = ["oauth", "querymt-utils/dbus-secret-service"]
 
+# Enables kameo remote actor support for cross-machine session management.
+# Adds libp2p-based P2P networking, mDNS peer discovery, and Kademlia DHT
+# for distributed actor registry. SessionActorRef gains a Remote variant.
+remote = ["kameo/remote", "dep:libp2p"]
+
 [dependencies]
 querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
 querymt-utils = { path = "../querymt-utils", features = ["providers"] }
 agent-client-protocol = { version = "0.9", features = ["unstable"] }
 agent-client-protocol-schema = { version = "0.10", features = ["unstable"]}
 kameo = "0.19"
+libp2p = { version = "0.56", optional = true, default-features = false }
 async-trait.workspace = true
 anyhow = "1.0"
 thiserror = "2.0"

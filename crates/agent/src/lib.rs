@@ -1,3 +1,4 @@
+pub mod error;
 pub mod prelude;
 pub mod simple;
 
@@ -35,6 +36,9 @@ pub mod verification;
 
 #[cfg(test)]
 pub mod test_utils;
+
+// Re-export top-level error type
+pub use error::AgentError;
 
 // Re-export main agent types for backward compatibility
 pub use agent::{AgentHandle, DelegationContextConfig, DelegationContextTiming};

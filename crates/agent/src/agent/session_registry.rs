@@ -5,19 +5,21 @@
 
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SessionRuntime;
+use crate::agent::remote::SessionActorRef;
 use crate::agent::session_actor::SessionActor;
+use crate::error::AgentError;
 use agent_client_protocol::{
     Error, ListSessionsRequest, ListSessionsResponse, NewSessionRequest, NewSessionResponse,
     SessionInfo,
 };
-use kameo::actor::{ActorRef, Spawn};
+use kameo::actor::Spawn;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Manages session actors. Lives on the server layer.
 pub struct SessionRegistry {
     pub config: Arc<AgentConfig>,
-    sessions: HashMap<String, ActorRef<SessionActor>>,
+    sessions: HashMap<String, SessionActorRef>,
 }
 
 impl SessionRegistry {
@@ -29,17 +31,20 @@ impl SessionRegistry {
     }
 
     /// Get a reference to the session actor for routing.
-    pub fn get(&self, session_id: &str) -> Option<&ActorRef<SessionActor>> {
+    pub fn get(&self, session_id: &str) -> Option<&SessionActorRef> {
         self.sessions.get(session_id)
     }
 
     /// Insert a pre-spawned session actor into the registry.
-    pub fn insert(&mut self, session_id: String, actor_ref: ActorRef<SessionActor>) {
-        self.sessions.insert(session_id, actor_ref);
+    ///
+    /// Accepts anything that converts into a `SessionActorRef`, including
+    /// a bare `ActorRef<SessionActor>` (via the `From` impl).
+    pub fn insert(&mut self, session_id: String, actor_ref: impl Into<SessionActorRef>) {
+        self.sessions.insert(session_id, actor_ref.into());
     }
 
     /// Remove a session actor from the registry.
-    pub fn remove(&mut self, session_id: &str) -> Option<ActorRef<SessionActor>> {
+    pub fn remove(&mut self, session_id: &str) -> Option<SessionActorRef> {
         self.sessions.remove(session_id)
     }
 
@@ -55,6 +60,96 @@ impl SessionRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
+    }
+
+    /// Attach a remote session to this registry.
+    ///
+    /// Wraps the remote actor ref in a `SessionActorRef::Remote`, spawns a local
+    /// `EventRelayActor`, registers it in the swarm (via `into_remote_ref`), and
+    /// sends `SubscribeEvents` to the remote `SessionActor` so events stream back.
+    ///
+    /// # Event relay
+    ///
+    /// The `EventRelayActor` is spawned locally and its `ActorId` is sent to the
+    /// remote session via `SubscribeEvents`. The remote handler constructs a
+    /// `RemoteActorRef<EventRelayActor>` from that id (requires swarm to be
+    /// bootstrapped — Phase 6). Until then the relay is spawned but the
+    /// `SubscribeEvents` call returns Ok without installing the forwarder.
+    ///
+    /// # Returns
+    ///
+    /// The `SessionActorRef::Remote` for the attached session.
+    #[cfg(feature = "remote")]
+    pub async fn attach_remote_session(
+        &mut self,
+        session_id: String,
+        remote_ref: kameo::actor::RemoteActorRef<SessionActor>,
+        peer_label: String,
+        mesh: Option<crate::agent::remote::MeshHandle>,
+    ) -> SessionActorRef {
+        log::debug!(
+            "attach_remote_session: called for session_id={} peer='{}' \
+             (registry currently has {} session(s))",
+            session_id,
+            peer_label,
+            self.sessions.len(),
+        );
+        use crate::agent::remote::{EventRelayActor, SessionActorRef};
+        use kameo::actor::Spawn;
+
+        // 1. Wrap in SessionActorRef::Remote
+        let session_ref = SessionActorRef::Remote {
+            actor_ref: remote_ref,
+            peer_label: peer_label.clone(),
+        };
+
+        // 2. Spawn a local EventRelayActor for this session.
+        //    It republishes remote events on the local event bus.
+        let relay_actor = EventRelayActor::new(self.config.event_bus.clone(), peer_label.clone());
+        let relay_ref = EventRelayActor::spawn(relay_actor);
+        let relay_id = relay_ref.id().sequence_id();
+
+        // 3. Register the relay in REMOTE_REGISTRY + DHT so the remote
+        //    SessionActor can look it up by name and install an EventForwarder.
+        let mesh_active = mesh.is_some();
+        if let Some(ref mesh) = mesh {
+            mesh.register_actor(relay_ref.clone(), format!("event_relay::{}", session_id))
+                .await;
+        } else {
+            log::debug!(
+                "attach_remote_session: no mesh, DHT registration skipped for relay (session {})",
+                session_id
+            );
+        }
+
+        // 4. Send SubscribeEvents to the remote session.
+        //    The remote SubscribeEvents handler uses mesh.lookup_actor to find
+        //    the relay and install an EventForwarder on its EventBus.
+        if let Err(e) = session_ref.subscribe_events(relay_id).await {
+            log::warn!(
+                "attach_remote_session: SubscribeEvents failed for {} (event relay may not be active): {}",
+                session_id,
+                e
+            );
+        }
+
+        // 5. Insert into registry
+        self.sessions
+            .insert(session_id.clone(), session_ref.clone());
+
+        log::info!(
+            "Attached remote session {} from {} (relay_actor_id={}, event relay {})",
+            session_id,
+            peer_label,
+            relay_id,
+            if mesh_active {
+                "active"
+            } else {
+                "pending mesh bootstrap"
+            }
+        );
+
+        session_ref
     }
 
     /// Create a new session: build runtime, spawn SessionActor, return session_id.
@@ -89,7 +184,7 @@ impl SessionRegistry {
                 &self.config.execution_config_snapshot(),
             )
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
         let session_id = session_context.session().public_id.clone();
 
         // Build MCP state
@@ -108,7 +203,7 @@ impl SessionRegistry {
                 &session_id,
             )
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
         }
 
         let runtime = SessionRuntime::new(cwd.clone(), mcp_services, mcp_tools, mcp_tool_defs);
@@ -116,7 +211,7 @@ impl SessionRegistry {
         // Spawn the session actor
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone());
         let actor_ref = SessionActor::spawn(actor);
-        self.sessions.insert(session_id.clone(), actor_ref);
+        self.sessions.insert(session_id.clone(), actor_ref.into());
 
         self.config
             .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
@@ -139,23 +234,32 @@ impl SessionRegistry {
                     model: llm_config.model.clone(),
                     config_id: llm_config.id,
                     context_limit,
+                    provider_node: None,
                 },
             );
         }
 
-        // Background: initialize workspace index
-        if let Some(cwd_path) = cwd.clone() {
-            let manager_actor = self.config.workspace_manager_actor.clone();
-            let runtime_clone = runtime.clone();
-            tokio::spawn(async move {
-                let root = crate::index::resolve_workspace_root(&cwd_path);
-                match manager_actor.ask(crate::index::GetOrCreate { root }).await {
-                    Ok(handle) => {
-                        let _ = runtime_clone.workspace_handle.set(handle);
+        // Background: initialize workspace index (only if the path exists on this machine)
+        if let Some(ref cwd_path) = cwd {
+            if cwd_path.exists() {
+                let manager_actor = self.config.workspace_manager_actor.clone();
+                let runtime_clone = runtime.clone();
+                let cwd_owned = cwd_path.clone();
+                tokio::spawn(async move {
+                    let root = crate::index::resolve_workspace_root(&cwd_owned);
+                    match manager_actor.ask(crate::index::GetOrCreate { root }).await {
+                        Ok(handle) => {
+                            let _ = runtime_clone.workspace_handle.set(handle);
+                        }
+                        Err(e) => log::warn!("Failed to initialize workspace index: {}", e),
                     }
-                    Err(e) => log::warn!("Failed to initialize workspace index: {}", e),
-                }
-            });
+                });
+            } else {
+                log::debug!(
+                    "SessionRegistry: cwd {:?} does not exist, skipping workspace index",
+                    cwd_path
+                );
+            }
         }
 
         // Emit SessionConfigured
@@ -188,7 +292,7 @@ impl SessionRegistry {
             .history_store()
             .get_session(&session_id)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
             .ok_or_else(|| {
                 Error::invalid_params().data(serde_json::json!({
                     "message": "session not found",
@@ -220,7 +324,7 @@ impl SessionRegistry {
 
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime);
         let actor_ref = SessionActor::spawn(actor);
-        self.sessions.insert(session_id.clone(), actor_ref);
+        self.sessions.insert(session_id.clone(), actor_ref.into());
 
         // Stream full history to client
         // TODO: Implement full-fidelity history streaming with SessionUpdate notifications
@@ -246,6 +350,7 @@ impl SessionRegistry {
                     model: llm_config.model.clone(),
                     config_id: llm_config.id,
                     context_limit,
+                    provider_node: None,
                 },
             );
         }
@@ -266,7 +371,7 @@ impl SessionRegistry {
             .history_store()
             .get_session(&source_session_id)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
             .ok_or_else(|| {
                 Error::invalid_params().data(serde_json::json!({
                     "message": "source session not found",
@@ -280,12 +385,12 @@ impl SessionRegistry {
             .history_store()
             .get_history(&source_session_id)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         let target_message_id = history
             .last()
             .map(|msg| msg.id.clone())
-            .ok_or_else(|| Error::new(-32000, "cannot fork empty session"))?;
+            .ok_or_else(|| Error::from(AgentError::EmptySessionFork))?;
 
         let new_session_id = self
             .config
@@ -297,7 +402,7 @@ impl SessionRegistry {
                 crate::session::domain::ForkOrigin::User,
             )
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         Ok(agent_client_protocol::ForkSessionResponse::new(
             new_session_id,
@@ -316,7 +421,7 @@ impl SessionRegistry {
             .history_store()
             .get_session(&session_id)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
             .ok_or_else(|| {
                 Error::invalid_params().data(serde_json::json!({
                     "message": "session not found",
@@ -348,7 +453,7 @@ impl SessionRegistry {
 
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime);
         let actor_ref = SessionActor::spawn(actor);
-        self.sessions.insert(session_id.clone(), actor_ref);
+        self.sessions.insert(session_id.clone(), actor_ref.into());
 
         self.config
             .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
@@ -367,7 +472,7 @@ impl SessionRegistry {
             .history_store()
             .list_sessions()
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         let session_infos: Vec<SessionInfo> = sessions
             .into_iter()

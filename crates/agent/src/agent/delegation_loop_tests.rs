@@ -91,7 +91,9 @@ impl SendAgent for StubDelegateAgent {
         let behavior = self.behavior.lock().unwrap().clone();
         match behavior {
             DelegateBehavior::AlwaysOk => Ok(PromptResponse::new(StopReason::EndTurn)),
-            DelegateBehavior::AlwaysFail => Err(Error::new(-32000, "Invalid patch: line mismatch")),
+            DelegateBehavior::AlwaysFail => Err(Error::from(crate::error::AgentError::Internal(
+                "Invalid patch: line mismatch".to_string(),
+            ))),
         }
     }
 
@@ -141,7 +143,7 @@ impl SendAgent for StubDelegateAgent {
         _req: agent_client_protocol::ExtRequest,
     ) -> Result<agent_client_protocol::ExtResponse, Error> {
         let raw_value = serde_json::value::RawValue::from_string("null".to_string())
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
         Ok(agent_client_protocol::ExtResponse::new(Arc::from(
             raw_value,
         )))

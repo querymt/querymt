@@ -548,3 +548,300 @@ impl ATIF {
         serde_json::to_value(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::AgentEventKind;
+
+    // ── ATIF struct serialization ──────────────────────────────────────────
+
+    #[test]
+    fn atif_serialization_matches_schema() {
+        let atif = ATIF {
+            schema_version: "ATIF-v1.5".to_string(),
+            session_id: "sess-test".to_string(),
+            agent: AtifAgent {
+                name: "querymt".to_string(),
+                version: "0.1.0".to_string(),
+                model_name: Some("gpt-4".to_string()),
+                tool_definitions: None,
+                extra: None,
+            },
+            steps: vec![],
+            notes: Some("test notes".to_string()),
+            final_metrics: None,
+            continued_trajectory_ref: None,
+            extra: None,
+        };
+
+        let json = serde_json::to_value(&atif).unwrap();
+        assert_eq!(json["schema_version"], "ATIF-v1.5");
+        assert_eq!(json["session_id"], "sess-test");
+        assert_eq!(json["agent"]["name"], "querymt");
+        assert_eq!(json["agent"]["version"], "0.1.0");
+        assert_eq!(json["agent"]["model_name"], "gpt-4");
+        assert_eq!(json["notes"], "test notes");
+    }
+
+    #[test]
+    fn atif_from_empty_events_produces_valid_atif() {
+        let events: Vec<AgentEvent> = vec![];
+        let options = AtifExportOptions::default();
+        let builder = ATIFBuilder::new("sess-empty".to_string(), &options);
+
+        let mut builder_mut = builder;
+        builder_mut.process_events(&events);
+        let atif = builder_mut.build();
+
+        assert_eq!(atif.session_id, "sess-empty");
+        assert_eq!(atif.agent.name, "querymt");
+        assert!(atif.steps.is_empty());
+    }
+
+    #[test]
+    fn atif_from_events_with_tool_calls_produces_correct_steps() {
+        let events = vec![
+            AgentEvent {
+                seq: 1,
+                timestamp: 1234567890,
+                session_id: "sess-1".to_string(),
+                kind: AgentEventKind::PromptReceived {
+                    content: "test prompt".to_string(),
+                    message_id: None,
+                },
+            },
+            AgentEvent {
+                seq: 2,
+                timestamp: 1234567891,
+                session_id: "sess-1".to_string(),
+                kind: AgentEventKind::LlmRequestStart { message_count: 1 },
+            },
+            AgentEvent {
+                seq: 3,
+                timestamp: 1234567892,
+                session_id: "sess-1".to_string(),
+                kind: AgentEventKind::ToolCallStart {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "read_file".to_string(),
+                    arguments: r#"{"path":"test.txt"}"#.to_string(),
+                },
+            },
+            AgentEvent {
+                seq: 4,
+                timestamp: 1234567893,
+                session_id: "sess-1".to_string(),
+                kind: AgentEventKind::LlmRequestEnd {
+                    usage: None,
+                    tool_calls: 1,
+                    finish_reason: None,
+                    cost_usd: None,
+                    cumulative_cost_usd: None,
+                    context_tokens: 100,
+                    metrics: crate::events::ExecutionMetrics { steps: 1, turns: 1 },
+                },
+            },
+        ];
+
+        let options = AtifExportOptions::default();
+        let mut builder = ATIFBuilder::new("sess-1".to_string(), &options);
+        builder.process_events(&events);
+        let atif = builder.build();
+
+        // Should have user step + agent step
+        assert_eq!(atif.steps.len(), 2);
+        assert_eq!(atif.steps[0].source, AtifSource::User);
+        assert_eq!(atif.steps[1].source, AtifSource::Agent);
+    }
+
+    #[test]
+    fn atif_tool_definition_type_field_renamed() {
+        let tool_def = AtifToolDefinition {
+            type_field: "function".to_string(),
+            function: AtifFunctionDef {
+                name: "test_tool".to_string(),
+                description: "A test tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        };
+
+        let json = serde_json::to_value(&tool_def).unwrap();
+        assert_eq!(json["type"], "function");
+        assert_eq!(json["function"]["name"], "test_tool");
+    }
+
+    #[test]
+    fn atif_final_metrics_optional_fields() {
+        let metrics = AtifFinalMetrics {
+            total_prompt_tokens: Some(100),
+            total_completion_tokens: Some(50),
+            total_cached_tokens: None,
+            total_cost_usd: Some(0.01),
+            total_steps: Some(5),
+            extra: None,
+        };
+
+        let json = serde_json::to_value(&metrics).unwrap();
+        assert_eq!(json["total_prompt_tokens"], 100);
+        assert_eq!(json["total_completion_tokens"], 50);
+        assert!(json.get("total_cached_tokens").is_none());
+        assert_eq!(json["total_cost_usd"], 0.01);
+        assert_eq!(json["total_steps"], 5);
+    }
+
+    #[test]
+    fn atif_source_serializes_as_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&AtifSource::System).unwrap(),
+            r#""system""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AtifSource::User).unwrap(),
+            r#""user""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AtifSource::Agent).unwrap(),
+            r#""agent""#
+        );
+    }
+
+    #[test]
+    fn atif_step_with_tool_calls_and_observation() {
+        let step = AtifStep {
+            step_id: 1,
+            timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            source: AtifSource::Agent,
+            model_name: Some("gpt-4".to_string()),
+            reasoning_effort: None,
+            message: "Calling tool".to_string(),
+            reasoning_content: None,
+            tool_calls: Some(vec![AtifToolCall {
+                tool_call_id: "call-1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "test.txt"}),
+            }]),
+            observation: Some(AtifObservation {
+                results: vec![AtifObservationResult {
+                    source_call_id: Some("call-1".to_string()),
+                    content: Some("file contents".to_string()),
+                    subagent_trajectory_ref: None,
+                }],
+            }),
+            metrics: None,
+            extra: None,
+        };
+
+        let json = serde_json::to_value(&step).unwrap();
+        assert_eq!(json["step_id"], 1);
+        assert_eq!(json["source"], "agent");
+        assert!(json["tool_calls"].is_array());
+        assert!(json["observation"].is_object());
+    }
+
+    #[test]
+    fn atif_builder_with_tool_definitions() {
+        let options = AtifExportOptions::default();
+        let builder = ATIFBuilder::new("sess-1".to_string(), &options);
+
+        let tools = vec![querymt::chat::Tool {
+            tool_type: "function".to_string(),
+            function: querymt::chat::FunctionTool {
+                name: "test_tool".to_string(),
+                description: "Test".to_string(),
+                parameters: serde_json::json!({}),
+            },
+        }];
+
+        let builder = builder.with_tool_definitions(tools);
+        let atif = builder.build();
+
+        assert!(atif.agent.tool_definitions.is_some());
+        assert_eq!(atif.agent.tool_definitions.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn atif_to_json_produces_valid_json_string() {
+        let atif = ATIF {
+            schema_version: "ATIF-v1.5".to_string(),
+            session_id: "sess-json".to_string(),
+            agent: AtifAgent {
+                name: "querymt".to_string(),
+                version: "0.1.0".to_string(),
+                model_name: None,
+                tool_definitions: None,
+                extra: None,
+            },
+            steps: vec![],
+            notes: None,
+            final_metrics: None,
+            continued_trajectory_ref: None,
+            extra: None,
+        };
+
+        let json_str = atif.to_json().unwrap();
+        assert!(json_str.contains("ATIF-v1.5"));
+        assert!(json_str.contains("sess-json"));
+
+        // Verify it's valid JSON by parsing it back
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["schema_version"], "ATIF-v1.5");
+    }
+
+    #[test]
+    fn atif_builder_custom_agent_name_and_version() {
+        let options = AtifExportOptions {
+            agent_name: Some("custom-agent".to_string()),
+            agent_version: Some("2.0.0".to_string()),
+            notes: Some("custom notes".to_string()),
+        };
+
+        let builder = ATIFBuilder::new("sess-custom".to_string(), &options);
+        let atif = builder.build();
+
+        assert_eq!(atif.agent.name, "custom-agent");
+        assert_eq!(atif.agent.version, "2.0.0");
+        assert_eq!(atif.notes, Some("custom notes".to_string()));
+    }
+
+    #[test]
+    fn atif_metrics_accumulation() {
+        let events = vec![
+            AgentEvent {
+                seq: 1,
+                timestamp: 1234567890,
+                session_id: "sess-1".to_string(),
+                kind: AgentEventKind::LlmRequestStart { message_count: 1 },
+            },
+            AgentEvent {
+                seq: 2,
+                timestamp: 1234567891,
+                session_id: "sess-1".to_string(),
+                kind: AgentEventKind::LlmRequestEnd {
+                    usage: Some(querymt::Usage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        reasoning_tokens: 0,
+                        cache_read: 0,
+                        cache_write: 0,
+                    }),
+                    tool_calls: 0,
+                    finish_reason: None,
+                    cost_usd: Some(0.01),
+                    cumulative_cost_usd: Some(0.01),
+                    context_tokens: 150,
+                    metrics: crate::events::ExecutionMetrics { steps: 1, turns: 1 },
+                },
+            },
+        ];
+
+        let options = AtifExportOptions::default();
+        let mut builder = ATIFBuilder::new("sess-1".to_string(), &options);
+        builder.process_events(&events);
+        let atif = builder.build();
+
+        let metrics = atif.final_metrics.unwrap();
+        assert_eq!(metrics.total_prompt_tokens, Some(100));
+        assert_eq!(metrics.total_completion_tokens, Some(50));
+        assert_eq!(metrics.total_cost_usd, Some(0.01));
+    }
+}

@@ -216,7 +216,7 @@ impl AgentConfig {
             .history_store()
             .get_llm_config(config_id)
             .await
-            .map_err(|e| agent_client_protocol::Error::new(-32000, e.to_string()))
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))
     }
 
     /// Get a session by ID from the store.
@@ -228,7 +228,7 @@ impl AgentConfig {
             .history_store()
             .get_session(session_id)
             .await
-            .map_err(|e| agent_client_protocol::Error::new(-32000, e.to_string()))
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))
     }
 
     /// Collects available tools based on current configuration.

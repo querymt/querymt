@@ -14,7 +14,7 @@ interface HeaderStatsBarProps {
   events: EventItem[];
   globalElapsedMs: number;
   isSessionActive: boolean;
-  agentModels: Record<string, { provider?: string; model?: string; contextLimit?: number }>;
+  agentModels: Record<string, { provider?: string; model?: string; contextLimit?: number; node?: string }>;
   sessionLimits?: SessionLimits | null;
   onClick?: () => void;
 }

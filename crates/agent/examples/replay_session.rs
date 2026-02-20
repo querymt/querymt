@@ -298,6 +298,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &llm_config.model,
             Some(&params),
             None, // No API key override
+            #[cfg(feature = "remote")]
+            None, // provider_node: local
+            #[cfg(feature = "remote")]
+            None, // mesh_handle: not available in example
         )
         .await?;
 

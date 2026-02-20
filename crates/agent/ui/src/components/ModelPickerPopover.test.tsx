@@ -95,7 +95,8 @@ describe('ModelPickerPopover', () => {
 
     expect(defaultProps.onSetSessionModel).toHaveBeenCalledWith(
       'session-1',
-      'anthropic/claude-3-sonnet'
+      'anthropic/claude-3-sonnet',
+      undefined
     );
     expect(defaultProps.onOpenChange).toHaveBeenCalledWith(false);
   });
@@ -198,7 +199,8 @@ describe('ModelPickerPopover', () => {
       // Should call with the correct model ID (without the "recent:" prefix)
       expect(defaultProps.onSetSessionModel).toHaveBeenCalledWith(
         'session-1',
-        'openai/gpt-4'
+        'openai/gpt-4',
+        undefined
       );
     });
 
@@ -219,7 +221,8 @@ describe('ModelPickerPopover', () => {
       // Should call with the correct model ID
       expect(defaultProps.onSetSessionModel).toHaveBeenCalledWith(
         'session-1',
-        'anthropic/claude-3-sonnet'
+        'anthropic/claude-3-sonnet',
+        undefined
       );
     });
 

@@ -21,11 +21,13 @@ interface ModelPickerPopoverProps {
   allModels: ModelEntry[];
   currentProvider?: string;
   currentModel?: string;
+  /** Mesh node running the current provider, if any. Absent for local providers. */
+  currentNode?: string;
   currentWorkspace: string | null;
   recentModelsByWorkspace: Record<string, RecentModelEntry[]>;
   agentMode: string;
   onRefresh: () => void;
-  onSetSessionModel: (sessionId: string, modelId: string) => void;
+  onSetSessionModel: (sessionId: string, modelId: string, node?: string) => void;
 }
 
 const TARGET_ACTIVE = 'active';
@@ -40,25 +42,45 @@ const normalizeValue = (value: string) =>
   value.startsWith(RECENT_PREFIX) ? value.slice(RECENT_PREFIX.length) : value;
 
 interface GroupedModels {
+  /** Display heading — "provider" for local, "provider (node)" for remote */
+  heading: string;
   provider: string;
+  node?: string;
   models: string[];
 }
 
 const localeCompare = new Intl.Collator(undefined, { sensitivity: 'base' }).compare;
 
+/** Build a unique group key that separates local vs. remote providers. */
+function groupKey(entry: ModelEntry): string {
+  return entry.node ? `${entry.provider}@${entry.node}` : entry.provider;
+}
+
 function groupByProvider(models: ModelEntry[]): GroupedModels[] {
-  const map = new Map<string, string[]>();
+  const hasRemote = models.some((m) => m.node);
+  const map = new Map<string, GroupedModels>();
   for (const entry of models) {
-    const existing = map.get(entry.provider) ?? [];
-    existing.push(entry.model);
-    map.set(entry.provider, existing);
+    const key = groupKey(entry);
+    if (!map.has(key)) {
+      // When remote models exist, annotate local groups with "(local)" and
+      // remote groups with "(node)" so the user can distinguish them.
+      const heading = entry.node
+        ? `${entry.provider} (${entry.node})`
+        : hasRemote
+          ? `${entry.provider} (local)`
+          : entry.provider;
+      map.set(key, { heading, provider: entry.provider, node: entry.node, models: [] });
+    }
+    map.get(key)!.models.push(entry.model);
   }
-  return Array.from(map.entries())
-    .sort(([a], [b]) => localeCompare(a, b))
-    .map(([provider, models]) => ({
-      provider,
-      models: [...models].sort(localeCompare),
-    }));
+  return Array.from(map.values())
+    .sort((a, b) => localeCompare(a.heading, b.heading))
+    .map((g) => ({ ...g, models: [...g.models].sort(localeCompare) }));
+}
+
+/** Build the cmdk item value for a model entry: "provider/model" or "provider@node/model". */
+function itemValue(provider: string, model: string, node?: string): string {
+  return node ? `${provider}@${node}/${model}` : `${provider}/${model}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -77,6 +99,7 @@ export function ModelPickerPopover({
   allModels,
   currentProvider,
   currentModel,
+  currentNode,
   currentWorkspace,
   recentModelsByWorkspace,
   agentMode,
@@ -96,11 +119,15 @@ export function ModelPickerPopover({
 
   const grouped = useMemo(() => groupByProvider(allModels), [allModels]);
 
-  // Build a lookup map so we can resolve provider from the cmdk value
+  // Build a lookup map so we can resolve provider/model/node from the cmdk value
   const modelMap = useMemo(() => {
-    const m = new Map<string, { provider: string; model: string }>();
+    const m = new Map<string, { provider: string; model: string; node?: string }>();
     for (const entry of allModels) {
-      m.set(`${entry.provider}/${entry.model}`, { provider: entry.provider, model: entry.model });
+      m.set(itemValue(entry.provider, entry.model, entry.node), {
+        provider: entry.provider,
+        model: entry.model,
+        node: entry.node,
+      });
     }
     return m;
   }, [allModels]);
@@ -111,9 +138,10 @@ export function ModelPickerPopover({
     const recent = recentModelsByWorkspace[key] || [];
     
     // Filter to only show models that are currently available and limit to 5
+    // Recent models are always local (no node field) — they come from local event history
     return recent
       .filter(entry => 
-        allModels.some(m => m.provider === entry.provider && m.model === entry.model)
+        allModels.some(m => m.provider === entry.provider && m.model === entry.model && !m.node)
       )
       .slice(0, 5);
   }, [currentWorkspace, recentModelsByWorkspace, allModels]);
@@ -153,10 +181,13 @@ export function ModelPickerPopover({
       }
 
       if (sessionIds.size === 0) return;
-      sessionIds.forEach((id) => onSetSessionModel(id, modelId));
+      // Pass node along so the backend can route to the correct provider host
+      sessionIds.forEach((id) => onSetSessionModel(id, modelId, entry.node));
       
-      // Save the model preference for the current agent mode
-      setModeModelPreference(agentMode, entry.provider, entry.model);
+      // Save the model preference for the current agent mode (local models only)
+      if (!entry.node) {
+        setModeModelPreference(agentMode, entry.provider, entry.model);
+      }
       
       // Backend will automatically record model usage and refresh recent models
       
@@ -177,6 +208,10 @@ export function ModelPickerPopover({
       ? `${currentProvider} / ${currentModel}`
       : 'Select model';
 
+  const triggerTitle = currentProvider && currentModel
+    ? `${currentProvider} / ${currentModel}${currentNode ? ` on ${currentNode}` : ''} (${navigator.platform.includes('Mac') ? '⌘⇧M' : 'Ctrl+Shift+M'} to open)`
+    : `Select model (${navigator.platform.includes('Mac') ? '⌘⇧M' : 'Ctrl+Shift+M'})`;
+
   /* ---- render ---- */
 
   return (
@@ -184,12 +219,15 @@ export function ModelPickerPopover({
       <Popover.Trigger asChild>
         <button
           type="button"
-          className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-surface-border bg-surface-canvas/60 text-xs text-ui-secondary hover:border-accent-primary/60 hover:text-accent-primary transition-colors max-w-[280px]"
-          title={currentProvider && currentModel 
-            ? `${currentProvider} / ${currentModel} (${navigator.platform.includes('Mac') ? '⌘⇧M' : 'Ctrl+Shift+M'} to open)` 
-            : `Select model (${navigator.platform.includes('Mac') ? '⌘⇧M' : 'Ctrl+Shift+M'})`}
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-surface-border bg-surface-canvas/60 text-xs text-ui-secondary hover:border-accent-primary/60 hover:text-accent-primary transition-colors max-w-[320px]"
+          title={triggerTitle}
         >
           <span className="truncate">{triggerLabel}</span>
+          {currentNode && (
+            <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
+              {currentNode}
+            </span>
+          )}
           <ChevronDown
             className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`}
           />
@@ -296,16 +334,16 @@ export function ModelPickerPopover({
                       className="mb-2 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-accent-primary [&_[cmdk-group-heading]]:bg-surface-canvas/95"
                     >
                       {recentModels.map((entry) => {
-                        const itemValue = `${entry.provider}/${entry.model}`;
+                        const val = itemValue(entry.provider, entry.model);
                         const isCurrent =
                           currentProvider === entry.provider && currentModel === entry.model;
 
                         return (
                           <Command.Item
-                            key={`recent-${itemValue}`}
-                            value={`${RECENT_PREFIX}${itemValue}`}
+                            key={`recent-${val}`}
+                            value={`${RECENT_PREFIX}${val}`}
                             keywords={[entry.provider, entry.model]}
-                            onSelect={(val) => switchModel(val)}
+                            onSelect={(v) => switchModel(v)}
                             className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-ui-secondary data-[selected=true]:bg-accent-primary/20 data-[selected=true]:text-accent-primary data-[selected=true]:border data-[selected=true]:border-accent-primary/40 hover:bg-surface-elevated/60 cursor-pointer"
                           >
                             <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-accent-primary transition-opacity" />
@@ -328,28 +366,37 @@ export function ModelPickerPopover({
                     <div className="h-px bg-surface-border/40 my-2" />
                   )}
 
-                  {/* Provider-grouped models */}
+                  {/* Provider-grouped models (local + remote) */}
                   {grouped.map((group) => (
                     <Command.Group
-                      key={group.provider}
-                      heading={group.provider}
+                      key={group.heading}
+                      heading={group.heading}
                       className="mb-1 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-ui-muted [&_[cmdk-group-heading]]:bg-surface-canvas/95"
                     >
                       {group.models.map((model) => {
-                        const itemValue = `${group.provider}/${model}`;
+                        const val = itemValue(group.provider, model, group.node);
                         const isCurrent =
                           currentProvider === group.provider && currentModel === model;
 
                         return (
                           <Command.Item
-                            key={itemValue}
-                            value={itemValue}
-                            keywords={[group.provider, model]}
-                            onSelect={(val) => switchModel(val)}
+                            key={val}
+                            value={val}
+                            keywords={[group.provider, model, ...(group.node ? [group.node] : [])]}
+                            onSelect={(v) => switchModel(v)}
                             className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-ui-secondary data-[selected=true]:bg-accent-primary/20 data-[selected=true]:text-accent-primary data-[selected=true]:border data-[selected=true]:border-accent-primary/40 hover:bg-surface-elevated/60 cursor-pointer"
                           >
                             <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-accent-primary transition-opacity" />
                             <span className="flex-1 truncate">{model}</span>
+                            {group.node ? (
+                              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                                {group.node}
+                              </span>
+                            ) : (
+                              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                                local
+                              </span>
+                            )}
                             {isCurrent && (
                               <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-accent-tertiary/20 text-accent-tertiary border border-accent-tertiary/30">
                                 current
@@ -368,11 +415,22 @@ export function ModelPickerPopover({
           {/* Footer with switch button */}
           <div className="px-3 py-2 border-t border-surface-border/60 bg-surface-elevated/30">
             <div className="flex items-center justify-between gap-3">
-              <div className="text-[10px] text-ui-muted truncate flex-1">
+              <div className="text-[10px] text-ui-muted truncate flex-1 flex items-center gap-1.5">
                 {selectedEntry ? (
-                  <span className="text-ui-secondary">
-                    {selectedEntry.provider} / {selectedEntry.model}
-                  </span>
+                  <>
+                    <span className="text-ui-secondary">
+                      {selectedEntry.provider} / {selectedEntry.model}
+                    </span>
+                    {selectedEntry.node ? (
+                      <span className="px-1 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                        {selectedEntry.node}
+                      </span>
+                    ) : (
+                      <span className="px-1 py-0.5 rounded text-[9px] uppercase tracking-wider bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                        local
+                      </span>
+                    )}
+                  </>
                 ) : (
                   'Select a model above'
                 )}

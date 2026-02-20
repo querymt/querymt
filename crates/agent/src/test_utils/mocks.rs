@@ -44,6 +44,15 @@ mock! {
         async fn get_llm_config(&self, id: i64) -> SessionResult<Option<LLMConfig>>;
         async fn get_session_llm_config(&self, session_id: &str) -> SessionResult<Option<LLMConfig>>;
         async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()>;
+        async fn set_session_provider_node<'a, 'b, 'c>(
+            &'a self,
+            session_id: &'b str,
+            provider_node: Option<&'c str>,
+        ) -> SessionResult<()>;
+        async fn get_session_provider_node<'a, 'b>(
+            &'a self,
+            session_id: &'b str,
+        ) -> SessionResult<Option<String>>;
         async fn set_session_execution_config<'a, 'b, 'c>(
             &'a self,
             session_id: &'b str,

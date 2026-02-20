@@ -61,6 +61,11 @@ pub struct LLMConfig {
     pub created_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub updated_at: Option<OffsetDateTime>,
+    /// Mesh node label that owns this provider. `None` = local node.
+    /// Stored as `"_node"` key in the `params` JSON blob so no schema migration is needed.
+    /// The leading underscore signals it is an internal routing field, not a provider param.
+    #[serde(skip)]
+    pub provider_node: Option<String>,
 }
 
 /// Stored session-scoped execution configuration snapshot.
@@ -205,6 +210,16 @@ pub trait SessionStore: Send + Sync {
 
     /// Set the LLM configuration id for a session
     async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()>;
+
+    /// Set the provider node for a session (None = local, Some = remote mesh node).
+    async fn set_session_provider_node(
+        &self,
+        session_id: &str,
+        provider_node: Option<&str>,
+    ) -> SessionResult<()>;
+
+    /// Get the provider node for a session.
+    async fn get_session_provider_node(&self, session_id: &str) -> SessionResult<Option<String>>;
 
     /// Persist the execution configuration snapshot for a session.
     async fn set_session_execution_config(

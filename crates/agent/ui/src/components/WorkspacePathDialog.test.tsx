@@ -29,7 +29,7 @@ describe('WorkspacePathDialog', () => {
     await user.type(input, '/tmp/new-workspace');
     await user.click(screen.getByRole('button', { name: 'Start Session' }));
 
-    expect(onSubmit).toHaveBeenCalledWith('/tmp/new-workspace');
+    expect(onSubmit).toHaveBeenCalledWith('/tmp/new-workspace', null);
   });
 
   it('calls onCancel when cancel button is clicked', async () => {

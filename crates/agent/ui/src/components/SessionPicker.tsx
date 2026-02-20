@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react';
 import * as Collapsible from '@radix-ui/react-collapsible';
 import { SessionGroup, SessionSummary } from '../types';
 import { GlitchText } from './GlitchText';
-import { ChevronDown, ChevronRight, Search, Plus, Clock, GitBranch } from 'lucide-react';
+import { ChevronDown, ChevronRight, Search, Plus, Clock, GitBranch, Globe } from 'lucide-react';
 import { useThinkingSessionIds } from '../hooks/useThinkingSessionIds';
 
 interface SessionPickerProps {
@@ -157,6 +157,12 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
             {isDelegation && (
               <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30">
                 delegated
+              </span>
+            )}
+            {session.node && (
+              <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 bg-accent-secondary/20 text-accent-secondary rounded border border-accent-secondary/30">
+                <Globe className="w-2.5 h-2.5" />
+                {session.node}
               </span>
             )}
           </div>

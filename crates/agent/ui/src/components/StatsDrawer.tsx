@@ -24,7 +24,7 @@ interface StatsDrawerProps {
   globalElapsedMs: number;
   agentElapsedMs: Map<string, number>;
   isSessionActive: boolean;
-  agentModels: Record<string, { provider?: string; model?: string; contextLimit?: number }>;
+  agentModels: Record<string, { provider?: string; model?: string; contextLimit?: number; node?: string }>;
   sessionLimits?: SessionLimits | null;
   todoStats?: TodoStats | null;
   hasTodos?: boolean;

@@ -71,6 +71,7 @@ export function AppShell() {
     workspacePathDialogDefaultValue,
     submitWorkspacePathDialog,
     cancelWorkspacePathDialog,
+    remoteNodes,
   } = useUiClientContext();
   
   const navigate = useNavigate();
@@ -512,6 +513,7 @@ export function AppShell() {
             allModels={allModels}
             currentProvider={agentModels[activeAgentId]?.provider}
             currentModel={agentModels[activeAgentId]?.model}
+            currentNode={agentModels[activeAgentId]?.node}
             currentWorkspace={currentWorkspace}
             recentModelsByWorkspace={recentModelsByWorkspace}
             agentMode={agentMode}
@@ -616,6 +618,7 @@ export function AppShell() {
       <WorkspacePathDialog
         open={workspacePathDialogOpen}
         defaultValue={workspacePathDialogDefaultValue}
+        remoteNodes={remoteNodes}
         onSubmit={submitWorkspacePathDialog}
         onCancel={cancelWorkspacePathDialog}
       />

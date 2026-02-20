@@ -1,4 +1,5 @@
 //! Agent Client Protocol helper functions for MCP server management
+use crate::error::AgentError;
 use agent_client_protocol::{Error, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
 use log::warn;
 use querymt::tool_decorator::CallFunctionTool;
@@ -50,7 +51,7 @@ pub(crate) async fn build_mcp_state(
         let tool_list = peer
             .list_all_tools()
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         for tool in tool_list {
             let adapter = querymt::mcp::adapter::McpToolAdapter::try_new(
@@ -58,7 +59,7 @@ pub(crate) async fn build_mcp_state(
                 peer.clone(),
                 server_name.clone(),
             )
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
             let name = adapter.descriptor().function.name.clone();
             if tools.contains_key(&name) {
                 warn!("Duplicate MCP tool '{}', keeping first instance", name);
@@ -101,8 +102,8 @@ async fn start_mcp_server(
                 .stderr(std::process::Stdio::inherit())
                 .stdout(std::process::Stdio::piped())
                 .stdin(std::process::Stdio::piped());
-            let transport =
-                TokioChildProcess::new(cmd).map_err(|e| Error::new(-32000, e.to_string()))?;
+            let transport = TokioChildProcess::new(cmd)
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
             let handler = crate::elicitation::ElicitationHandler::new(
                 pending_elicitations.clone(),
                 event_bus.clone(),
@@ -111,7 +112,10 @@ async fn start_mcp_server(
             );
             let running: RunningService<RoleClient, crate::elicitation::ElicitationHandler> =
                 serve_client(handler, transport).await.map_err(|e| {
-                    Error::new(-32000, format!("failed to start MCP stdio server: {}", e))
+                    Error::from(AgentError::McpServerFailed {
+                        transport: "stdio".to_string(),
+                        reason: e.to_string(),
+                    })
                 })?;
             Ok((name, running))
         }
@@ -122,7 +126,7 @@ async fn start_mcp_server(
             let client = reqwest::ClientBuilder::new()
                 .default_headers(headers_to_map(&headers)?)
                 .build()
-                .map_err(|e| Error::new(-32000, e.to_string()))?;
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
             let transport = StreamableHttpClientTransport::with_client(
                 client,
                 StreamableHttpClientTransportConfig::with_uri(url),
@@ -134,7 +138,10 @@ async fn start_mcp_server(
                 session_id.clone(),
             );
             let running = serve_client(handler, transport).await.map_err(|e| {
-                Error::new(-32000, format!("failed to start MCP http server: {}", e))
+                Error::from(AgentError::McpServerFailed {
+                    transport: "http".to_string(),
+                    reason: e.to_string(),
+                })
             })?;
             Ok((name, running))
         }
@@ -145,7 +152,7 @@ async fn start_mcp_server(
             let client = reqwest::ClientBuilder::new()
                 .default_headers(headers_to_map(&headers)?)
                 .build()
-                .map_err(|e| Error::new(-32000, e.to_string()))?;
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
             let transport = SseClientTransport::start_with_client(
                 client,
                 SseClientConfig {
@@ -154,7 +161,12 @@ async fn start_mcp_server(
                 },
             )
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| {
+                Error::from(AgentError::McpServerFailed {
+                    transport: "sse".to_string(),
+                    reason: e.to_string(),
+                })
+            })?;
             let handler = crate::elicitation::ElicitationHandler::new(
                 pending_elicitations,
                 event_bus,
@@ -162,7 +174,10 @@ async fn start_mcp_server(
                 session_id,
             );
             let running = serve_client(handler, transport).await.map_err(|e| {
-                Error::new(-32000, format!("failed to start MCP sse server: {}", e))
+                Error::from(AgentError::McpServerFailed {
+                    transport: "sse".to_string(),
+                    reason: e.to_string(),
+                })
             })?;
             Ok((name, running))
         }

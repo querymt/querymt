@@ -60,6 +60,10 @@ impl DelegationSummarizer {
             &config.model,
             Some(&params),
             config.api_key.as_deref(),
+            #[cfg(feature = "remote")]
+            None, // provider_node: summarizer always uses local provider
+            #[cfg(feature = "remote")]
+            None, // mesh_handle: not needed for summarizer
         )
         .await?;
 
@@ -310,4 +314,94 @@ planning conversation."#
             s
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── summarize_tool_args ────────────────────────────────────────────────
+
+    #[test]
+    fn summarize_tool_args_extracts_path() {
+        let args = serde_json::json!({
+            "path": "src/main.rs",
+            "other": "ignored"
+        });
+        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        assert_eq!(summary, "src/main.rs");
+    }
+
+    #[test]
+    fn summarize_tool_args_extracts_pattern() {
+        let args = serde_json::json!({
+            "pattern": "*.rs",
+            "other": "ignored"
+        });
+        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        assert_eq!(summary, "*.rs");
+    }
+
+    #[test]
+    fn summarize_tool_args_extracts_file_path() {
+        let args = serde_json::json!({
+            "filePath": "test.txt",
+            "other": "ignored"
+        });
+        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        assert_eq!(summary, "test.txt");
+    }
+
+    #[test]
+    fn summarize_tool_args_extracts_command() {
+        let args = serde_json::json!({
+            "command": "cargo build",
+            "other": "ignored"
+        });
+        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        assert_eq!(summary, "cargo build");
+    }
+
+    #[test]
+    fn summarize_tool_args_truncates_long_command() {
+        let long_cmd = "a".repeat(150);
+        let args = serde_json::json!({
+            "command": long_cmd
+        });
+        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        assert_eq!(summary.len(), 103); // 100 chars + "..."
+        assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn summarize_tool_args_fallback_to_json() {
+        let args = serde_json::json!({
+            "unknown_field": "value",
+            "another": 123
+        });
+        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        // Should be JSON representation
+        assert!(summary.contains("unknown_field"));
+        assert!(summary.contains("value"));
+    }
+
+    #[test]
+    fn summarize_tool_args_truncates_long_json() {
+        let mut obj = serde_json::Map::new();
+        for i in 0..50 {
+            obj.insert(format!("field_{}", i), serde_json::json!("long_value"));
+        }
+        let args = serde_json::Value::Object(obj);
+        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        assert_eq!(summary.len(), 203); // 200 chars + "..."
+        assert!(summary.ends_with("..."));
+    }
+
+    // NOTE: Tests for compaction_as_summary, extract_text_content, and prepare_input
+    // require proper AgentMessage construction with all required fields (id, session_id,
+    // created_at, parent_message_id). These are better suited as integration tests
+    // with proper test fixtures.
+    //
+    // The pure logic tests above (summarize_tool_args) cover the critical functionality
+    // that doesn't require complex setup.
 }

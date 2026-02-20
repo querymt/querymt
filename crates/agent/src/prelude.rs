@@ -13,6 +13,9 @@
 //! # }
 //! ```
 //!
+// Error types
+pub use crate::error::AgentError;
+
 // High-level APIs
 pub use crate::simple::{
     Agent, AgentBuilder, AgentSession, DelegateConfigBuilder, PlannerConfigBuilder, Quorum,

@@ -43,6 +43,8 @@ pub struct AgentBuilder {
     middleware_entries: Vec<MiddlewareEntry>,
     execution: Option<ExecutionPolicy>,
     skills_config: Option<SkillsConfig>,
+    /// Optional pre-built agent registry (Phase 7: injected by `from_single_config_with_registry`).
+    pub(super) agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
 }
 
 impl Default for AgentBuilder {
@@ -65,6 +67,7 @@ impl AgentBuilder {
             middleware_entries: Vec::new(),
             execution: None,
             skills_config: None,
+            agent_registry: None,
         }
     }
 
@@ -191,6 +194,11 @@ impl AgentBuilder {
         let mut builder =
             AgentConfigBuilder::new(plugin_registry, backend.session_store(), llm_config)
                 .with_snapshot_policy(snapshot_policy);
+
+        // Phase 7: inject pre-populated agent registry (remote agents from config).
+        if let Some(registry) = self.agent_registry {
+            builder = builder.with_agent_registry(registry);
+        }
 
         if let Some(assume_mutating) = self.assume_mutating {
             builder = builder.with_assume_mutating(assume_mutating);
@@ -387,6 +395,15 @@ impl Agent {
         QuorumBuilder::new()
     }
 
+    /// Access the underlying `AgentHandle` for advanced configuration.
+    ///
+    /// The handle provides access to the session registry, event bus, and agent config.
+    /// Use this when you need to interact with sessions directly or integrate with
+    /// the kameo mesh (e.g., bootstrapping `RemoteNodeManager`).
+    pub fn handle(&self) -> Arc<AgentHandle> {
+        self.inner.clone()
+    }
+
     pub async fn chat(&self, prompt: &str) -> Result<String> {
         let session_id = self.ensure_default_session().await?;
         self.chat_with_session(&session_id, prompt).await
@@ -571,6 +588,37 @@ impl Agent {
 
     /// Build an Agent from a single agent config
     pub async fn from_single_config(config: SingleAgentConfig) -> Result<Self> {
+        let builder = Self::builder_from_config(config, None)?;
+        builder.build().await
+    }
+
+    /// Build an Agent from a single agent config, optionally injecting a pre-populated
+    /// agent registry (Phase 7: for remote agents discovered from `[[remote_agents]]`).
+    ///
+    /// When `initial_registry` is `Some`, it is used as the agent registry instead of the
+    /// default empty `DefaultAgentRegistry`.  When `mesh` is `Some`, the `MeshHandle` is
+    /// stored on the resulting `AgentHandle` via `set_mesh()`.
+    #[cfg(feature = "remote")]
+    pub async fn from_single_config_with_registry(
+        config: SingleAgentConfig,
+        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+        mesh: Option<crate::agent::remote::MeshHandle>,
+    ) -> Result<Self> {
+        let builder = Self::builder_from_config(config, initial_registry)?;
+        let agent = builder.build().await?;
+
+        if let Some(mesh) = mesh {
+            agent.inner.set_mesh(mesh);
+        }
+
+        Ok(agent)
+    }
+
+    /// Shared helper: configure an `AgentBuilder` from a `SingleAgentConfig`.
+    fn builder_from_config(
+        config: SingleAgentConfig,
+        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+    ) -> Result<AgentBuilder> {
         let mut builder = AgentBuilder::new()
             .provider(config.agent.provider, config.agent.model)
             .tools(config.agent.tools);
@@ -597,6 +645,11 @@ impl Agent {
         builder.assume_mutating = Some(config.agent.assume_mutating);
         builder.mutating_tools = Some(config.agent.mutating_tools);
 
+        // Inject pre-populated registry (Phase 7).
+        if let Some(registry) = initial_registry {
+            builder.agent_registry = Some(registry);
+        }
+
         // Apply middleware from config
         if !config.middleware.is_empty() {
             builder = builder.middleware_from_config(config.middleware);
@@ -606,7 +659,7 @@ impl Agent {
         builder.execution = Some(config.agent.execution);
         builder.skills_config = Some(config.agent.skills);
 
-        builder.build().await
+        Ok(builder)
     }
 }
 

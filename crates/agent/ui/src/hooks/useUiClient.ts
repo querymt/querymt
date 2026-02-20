@@ -18,6 +18,7 @@ import {
   OAuthFlowState,
   OAuthResultState,
   UndoStackFrame,
+  RemoteNodeInfo,
 } from '../types';
 
 // Callback type for file index updates
@@ -108,7 +109,7 @@ export function useUiClient() {
   const [oauthResult, setOauthResult] = useState<OAuthResultState | null>(null);
   const [sessionsByAgent, setSessionsByAgent] = useState<Record<string, string>>({});
   const [agentModels, setAgentModels] = useState<
-    Record<string, { provider?: string; model?: string; contextLimit?: number }>
+    Record<string, { provider?: string; model?: string; contextLimit?: number; node?: string }>
   >({});
   const [sessionAudit, setSessionAudit] = useState<AuditView | null>(null);
   const [thinkingAgentIds, setThinkingAgentIds] = useState<Set<string>>(new Set());
@@ -124,6 +125,7 @@ export function useUiClient() {
   const [sessionLimits, setSessionLimits] = useState<SessionLimits | null>(null);
   const [undoState, setUndoState] = useState<UndoState>(null);
   const undoStateRef = useRef<UndoState>(null);
+  const [remoteNodes, setRemoteNodes] = useState<RemoteNodeInfo[]>([]);
   const [defaultCwd, setDefaultCwd] = useState<string | null>(null);
   const [workspacePathDialogOpen, setWorkspacePathDialogOpen] = useState(false);
   const [workspacePathDialogDefaultValue, setWorkspacePathDialogDefaultValue] = useState('');
@@ -132,7 +134,7 @@ export function useUiClient() {
   const fileIndexErrorCallbackRef = useRef<FileIndexErrorCallback | null>(null);
   const llmConfigCallbacksRef = useRef<Map<number, (config: LlmConfigDetails) => void>>(new Map());
   const pendingRequestsRef = useRef<Map<string, (sessionId: string) => void>>(new Map());
-  const workspacePathDialogResolverRef = useRef<((value: string | null) => void) | null>(null);
+  const workspacePathDialogResolverRef = useRef<((value: { cwd: string; node: string | null } | null) => void) | null>(null);
   const sessionCreatingRef = useRef(false);
 
   // Derive main session events for backward compatibility
@@ -159,6 +161,7 @@ export function useUiClient() {
       sendMessage({ type: 'init' });
       sendMessage({ type: 'list_all_models', refresh: false });
       sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
+      sendMessage({ type: 'list_remote_nodes' });
     };
 
     socket.onclose = () => {
@@ -263,6 +266,7 @@ export function useUiClient() {
                 provider: lastProvider.provider,
                 model: lastProvider.model,
                 contextLimit: lastProvider.contextLimit,
+                node: lastProvider.providerNode,
               },
             }));
           }
@@ -506,6 +510,7 @@ export function useUiClient() {
                 provider: msg.event?.kind?.provider,
                 model: msg.event?.kind?.model,
                 contextLimit: msg.event?.kind?.context_limit,
+                node: msg.event?.kind?.provider_node ?? undefined,
               },
             }));
           }
@@ -593,6 +598,7 @@ export function useUiClient() {
               provider: lastProvider.provider,
               model: lastProvider.model,
               contextLimit: lastProvider.contextLimit,
+              node: lastProvider.providerNode,
             },
           });
         } else {
@@ -728,6 +734,14 @@ export function useUiClient() {
       case 'agent_mode':
         setAgentModeState(msg.mode);
         break;
+      case 'remote_nodes':
+        setRemoteNodes(msg.nodes);
+        break;
+      case 'remote_sessions':
+        // Currently used for on-demand node session listing;
+        // data is handled by the caller via callback if needed.
+        console.log('[useUiClient] remote_sessions for node:', msg.node, msg.sessions);
+        break;
       default:
         break;
     }
@@ -752,17 +766,17 @@ export function useUiClient() {
   const requestWorkspacePath = useCallback((defaultValue: string) => {
     setWorkspacePathDialogDefaultValue(defaultValue);
     setWorkspacePathDialogOpen(true);
-    return new Promise<string | null>((resolve) => {
+    return new Promise<{ cwd: string; node: string | null } | null>((resolve) => {
       workspacePathDialogResolverRef.current = resolve;
     });
   }, []);
 
-  const submitWorkspacePathDialog = useCallback((value: string) => {
+  const submitWorkspacePathDialog = useCallback((value: string, node: string | null = null) => {
     const resolver = workspacePathDialogResolverRef.current;
     workspacePathDialogResolverRef.current = null;
     setWorkspacePathDialogOpen(false);
     if (resolver) {
-      resolver(value);
+      resolver({ cwd: value, node });
     }
   }, []);
 
@@ -778,17 +792,32 @@ export function useUiClient() {
   const newSession = useCallback(async (): Promise<string> => {
     const currentWorkspace = findCurrentWorkspace(sessionGroups, sessionId);
     const initialWorkspace = currentWorkspace ?? (sessionId ? '' : defaultCwd ?? '');
-    const input = await requestWorkspacePath(initialWorkspace);
-    if (input === null) {
+    const result = await requestWorkspacePath(initialWorkspace);
+    if (result === null) {
       throw new Error('Session creation cancelled');
     }
-    const cwd = input.trim() || initialWorkspace.trim();
+    const cwd = result.cwd.trim() || initialWorkspace.trim();
+    const node = result.node;
     const requestId = uuidv7();
     
     // Signal that session creation is in progress to prevent route sync interference.
     // Cleared by useSessionRoute once URL and state are in sync.
     sessionCreatingRef.current = true;
     
+    if (node) {
+      // Remote session: send create_remote_session with request_id.
+      // The backend responds with SessionCreated (same as local).
+      return new Promise((resolve) => {
+        pendingRequestsRef.current.set(requestId, resolve);
+        sendMessage({
+          type: 'create_remote_session',
+          node,
+          cwd: cwd.length > 0 ? cwd : null,
+          request_id: requestId,
+        });
+      });
+    }
+
     return new Promise((resolve) => {
       pendingRequestsRef.current.set(requestId, resolve);
       sendMessage({ 
@@ -821,12 +850,14 @@ export function useUiClient() {
     sendMessage({ type: 'list_all_models', refresh: true });
   }, []);
 
-  const setSessionModel = useCallback((sessionId: string, modelId: string) => {
-    sendMessage({ type: 'set_session_model', session_id: sessionId, model_id: modelId });
-    // Refresh recent models after a short delay
-    setTimeout(() => {
-      sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
-    }, 500);
+  const setSessionModel = useCallback((sessionId: string, modelId: string, node?: string) => {
+    sendMessage({ type: 'set_session_model', session_id: sessionId, model_id: modelId, node });
+    // Refresh recent models after a short delay (only for local providers)
+    if (!node) {
+      setTimeout(() => {
+        sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
+      }, 500);
+    }
   }, []);
 
   const fetchRecentModels = useCallback(() => {
@@ -876,6 +907,11 @@ export function useUiClient() {
   // Cancel the active session
   const cancelSession = useCallback(() => {
     sendMessage({ type: 'cancel_session' });
+  }, []);
+
+  // Refresh the list of remote nodes from the mesh
+  const listRemoteNodes = useCallback(() => {
+    sendMessage({ type: 'list_remote_nodes' });
   }, []);
 
   // Request LLM config by ID (returns cached if available, otherwise fetches)
@@ -1014,6 +1050,8 @@ export function useUiClient() {
     availableModes,
     setAgentMode,
     cycleAgentMode,
+    remoteNodes,
+    listRemoteNodes,
   };
 }
 
@@ -1205,6 +1243,7 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       model: event.kind?.model,
       contextLimit: event.kind?.context_limit,
       configId: event.kind?.config_id,
+      providerNode: event.kind?.provider_node ?? undefined,
     };
   }
 

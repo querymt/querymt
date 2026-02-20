@@ -9,15 +9,15 @@ use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig};
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::messages::*;
-use crate::agent::undo::{RedoResult, UndoResult};
+use crate::agent::undo::{RedoResult, UndoError, UndoResult};
 use crate::agent::utils::{format_prompt_user_text_only, render_prompt_for_display};
+use crate::error::AgentError;
 use crate::events::{AgentEventKind, SessionLimits};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::LLMConfig;
 use agent_client_protocol::{
-    ContentChunk, Error, ExtResponse, PromptResponse, SessionUpdate, SetSessionModelResponse,
-    StopReason,
+    ContentChunk, ExtResponse, PromptResponse, SessionUpdate, SetSessionModelResponse, StopReason,
 };
 use kameo::Actor;
 use kameo::message::{Context, Message};
@@ -46,13 +46,20 @@ pub struct SessionActor {
     // ── Cancellation ─────────────────────────────────────────────
     /// Cancelled when a `Cancel` message is received; replaced with a fresh
     /// token at the start of each new `Prompt` so the next turn starts clean.
-    pub(crate) cancel_token: CancellationToken,    
+    pub(crate) cancel_token: CancellationToken,
 
     // ── Client bridge (for SessionUpdate notifications) ──────────
     pub(crate) bridge: Option<ClientBridgeSender>,
 
     // ── Execution tracking ───────────────────────────────────────
     pub(crate) prompt_running: bool,
+
+    // ── Mesh (remote sessions only) ──────────────────────────────
+    /// Present when this actor was spawned on a mesh node via
+    /// `RemoteNodeManager`. Used by `SubscribeEvents` to look up the
+    /// remote `EventRelayActor` in the Kademlia DHT.
+    #[cfg(feature = "remote")]
+    pub(crate) mesh: Option<crate::agent::remote::MeshHandle>,
 }
 
 impl SessionActor {
@@ -74,7 +81,19 @@ impl SessionActor {
             cancel_token: CancellationToken::new(),
             bridge: None,
             prompt_running: false,
+            #[cfg(feature = "remote")]
+            mesh: None,
         }
+    }
+
+    /// Attach a [`MeshHandle`] to this actor (builder pattern, for remote sessions).
+    ///
+    /// Called by `RemoteNodeManager` after `new()` so the `SubscribeEvents`
+    /// handler can reach the Kademlia DHT without querying global state.
+    #[cfg(feature = "remote")]
+    pub fn with_mesh(mut self, mesh: Option<crate::agent::remote::MeshHandle>) -> Self {
+        self.mesh = mesh;
+        self
     }
 
     /// Sends a session update notification to the client.
@@ -196,7 +215,7 @@ impl Message<GetMode> for SessionActor {
 // ── SetProvider ──────────────────────────────────────────────────────────
 
 impl Message<SetProvider> for SessionActor {
-    type Reply = Result<(), Error>;
+    type Reply = Result<(), AgentError>;
 
     async fn handle(
         &mut self,
@@ -217,7 +236,7 @@ impl Message<SetProvider> for SessionActor {
 // ── SetLlmConfig ─────────────────────────────────────────────────────────
 
 impl Message<SetLlmConfig> for SessionActor {
-    type Reply = Result<(), Error>;
+    type Reply = Result<(), AgentError>;
 
     async fn handle(
         &mut self,
@@ -229,11 +248,11 @@ impl Message<SetLlmConfig> for SessionActor {
 }
 
 impl SessionActor {
-    async fn set_llm_config_impl(&self, config: querymt::LLMParams) -> Result<(), Error> {
+    async fn set_llm_config_impl(&self, config: querymt::LLMParams) -> Result<(), AgentError> {
         let provider_name = config
             .provider
             .as_ref()
-            .ok_or_else(|| Error::new(-32000, "Provider is required in config".to_string()))?;
+            .ok_or(AgentError::ProviderRequired)?;
 
         if self
             .config
@@ -243,10 +262,9 @@ impl SessionActor {
             .await
             .is_none()
         {
-            return Err(Error::new(
-                -32000,
-                format!("Unknown provider: {}", provider_name),
-            ));
+            return Err(AgentError::UnknownProvider {
+                name: provider_name.clone(),
+            });
         }
 
         let llm_config = self
@@ -255,14 +273,14 @@ impl SessionActor {
             .history_store()
             .create_or_get_llm_config(&config)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
 
         self.config
             .provider
             .history_store()
             .set_session_llm_config(&self.session_id, llm_config.id)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
 
         let context_limit =
             crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
@@ -275,6 +293,7 @@ impl SessionActor {
                 model: llm_config.model.clone(),
                 config_id: llm_config.id,
                 context_limit,
+                provider_node: None,
             },
         );
         Ok(())
@@ -284,7 +303,7 @@ impl SessionActor {
 // ── SetSessionModel ──────────────────────────────────────────────────────
 
 impl Message<SetSessionModel> for SessionActor {
-    type Reply = Result<SetSessionModelResponse, Error>;
+    type Reply = Result<SetSessionModelResponse, AgentError>;
 
     async fn handle(
         &mut self,
@@ -300,12 +319,9 @@ impl Message<SetSessionModel> for SessionActor {
             .history_store()
             .get_session(&session_id)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?
-            .ok_or_else(|| {
-                Error::invalid_params().data(serde_json::json!({
-                    "message": "session not found",
-                    "session_id": session_id,
-                }))
+            .map_err(|e| AgentError::Internal(e.to_string()))?
+            .ok_or_else(|| AgentError::SessionNotFound {
+                session_id: session_id.clone(),
             })?;
 
         let model_id = msg.req.model_id.to_string();
@@ -321,7 +337,7 @@ impl Message<SetSessionModel> for SessionActor {
                 .history_store()
                 .get_session_llm_config(&session_id)
                 .await
-                .map_err(|e| Error::new(-32000, e.to_string()))?;
+                .map_err(|e| AgentError::Internal(e.to_string()))?;
             let provider = current_config
                 .map(|c| c.provider)
                 .unwrap_or_else(|| "anthropic".to_string());
@@ -342,14 +358,25 @@ impl Message<SetSessionModel> for SessionActor {
             .history_store()
             .create_or_get_llm_config(&llm_config_input)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
 
         self.config
             .provider
             .history_store()
             .set_session_llm_config(&session_id, llm_config.id)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
+
+        // Persist the provider_node so the session knows where to route LLM calls.
+        if let Err(e) = self
+            .config
+            .provider
+            .history_store()
+            .set_session_provider_node(&session_id, msg.provider_node.as_deref())
+            .await
+        {
+            log::warn!("SetSessionModel: failed to persist provider_node: {}", e);
+        }
 
         let context_limit =
             crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
@@ -362,6 +389,7 @@ impl Message<SetSessionModel> for SessionActor {
                 model: llm_config.model.clone(),
                 config_id: llm_config.id,
                 context_limit,
+                provider_node: msg.provider_node.clone(),
             },
         );
 
@@ -446,7 +474,7 @@ impl Message<GetSessionLimits> for SessionActor {
 }
 
 impl Message<GetLlmConfig> for SessionActor {
-    type Reply = Result<Option<LLMConfig>, Error>;
+    type Reply = Result<Option<LLMConfig>, AgentError>;
 
     async fn handle(
         &mut self,
@@ -458,27 +486,27 @@ impl Message<GetLlmConfig> for SessionActor {
             .history_store()
             .get_session_llm_config(&self.session_id)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))
+            .map_err(|e| AgentError::Internal(e.to_string()))
     }
 }
 
 // ── Undo / Redo ──────────────────────────────────────────────────────────
 
 impl Message<Undo> for SessionActor {
-    type Reply = Result<UndoResult, anyhow::Error>;
+    type Reply = Result<UndoResult, UndoError>;
 
     async fn handle(&mut self, msg: Undo, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let backend = self
             .config
             .snapshot_backend
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No snapshot backend configured"))?;
+            .ok_or(UndoError::NoSnapshotBackend)?;
 
         let worktree = self
             .runtime
             .cwd
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No working directory configured"))?
+            .ok_or(UndoError::NoWorkingDirectory)?
             .to_path_buf();
 
         // Delegate to free function using our owned state
@@ -494,20 +522,20 @@ impl Message<Undo> for SessionActor {
 }
 
 impl Message<Redo> for SessionActor {
-    type Reply = Result<RedoResult, anyhow::Error>;
+    type Reply = Result<RedoResult, UndoError>;
 
     async fn handle(&mut self, _msg: Redo, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let backend = self
             .config
             .snapshot_backend
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No snapshot backend configured"))?;
+            .ok_or(UndoError::NoSnapshotBackend)?;
 
         let worktree = self
             .runtime
             .cwd
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No working directory configured"))?
+            .ok_or(UndoError::NoWorkingDirectory)?
             .to_path_buf();
 
         crate::agent::undo::redo_impl(
@@ -523,7 +551,7 @@ impl Message<Redo> for SessionActor {
 // ── Extensions ───────────────────────────────────────────────────────────
 
 impl Message<ExtMethod> for SessionActor {
-    type Reply = Result<ExtResponse, Error>;
+    type Reply = Result<ExtResponse, AgentError>;
 
     async fn handle(
         &mut self,
@@ -531,13 +559,13 @@ impl Message<ExtMethod> for SessionActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let raw_value = serde_json::value::RawValue::from_string("null".to_string())
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| AgentError::Serialization(e.to_string()))?;
         Ok(ExtResponse::new(Arc::from(raw_value)))
     }
 }
 
 impl Message<ExtNotification> for SessionActor {
-    type Reply = Result<(), Error>;
+    type Reply = Result<(), AgentError>;
 
     async fn handle(
         &mut self,
@@ -574,10 +602,292 @@ impl Message<Shutdown> for SessionActor {
     }
 }
 
+// ── Remote-ready messages ────────────────────────────────────────────────
+
+/// Get the full message history for this session.
+///
+/// Reads from the local `SessionStore`. When called remotely, the result
+/// is serialized and sent back over the kameo mesh.
+impl Message<crate::agent::messages::GetHistory> for SessionActor {
+    type Reply = Result<Vec<AgentMessage>, AgentError>;
+
+    async fn handle(
+        &mut self,
+        _msg: crate::agent::messages::GetHistory,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.config
+            .provider
+            .history_store()
+            .get_history(&self.session_id)
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))
+    }
+}
+
+/// Subscribe a remote event relay to this session's events.
+///
+/// Phase 6: When the kameo swarm is bootstrapped, this handler:
+/// 1. Resolves `relay_actor_id` → `RemoteActorRef<EventRelayActor>` via swarm
+/// 2. Wraps it in an `EventForwarder`
+/// 3. Registers the forwarder on the local `EventBus`
+///
+/// Without a swarm (swarm not bootstrapped), it logs and returns Ok so the
+/// message round-trips correctly for local tests and Phase 4 stub behaviour.
+impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
+    type Reply = Result<(), AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: crate::agent::messages::SubscribeEvents,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        #[cfg(feature = "remote")]
+        {
+            use crate::agent::remote::event_forwarder::EventForwarder;
+            use crate::agent::remote::event_relay::EventRelayActor;
+
+            if let Some(ref mesh) = self.mesh {
+                let relay_name = format!("event_relay::{}", self.session_id);
+                match mesh
+                    .lookup_actor::<EventRelayActor>(relay_name.clone())
+                    .await
+                {
+                    Ok(Some(relay_ref)) => {
+                        let forwarder = std::sync::Arc::new(EventForwarder::new(
+                            relay_ref,
+                            format!("session:{}", self.session_id),
+                        ));
+                        self.config.event_bus.add_observer(forwarder);
+                        let observer_count = self.config.event_bus.observer_count();
+                        log::debug!(
+                            "Session {}: SubscribeEvents — EventForwarder registered for relay '{}'; \
+                             total observers on bus now: {}",
+                            self.session_id,
+                            relay_name,
+                            observer_count
+                        );
+                    }
+                    Ok(None) => {
+                        warn!(
+                            "Session {}: SubscribeEvents — no relay actor found under '{}' in DHT yet",
+                            self.session_id, relay_name
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Session {}: SubscribeEvents relay lookup failed: {} (continuing without relay)",
+                            self.session_id, e
+                        );
+                    }
+                }
+            } else {
+                info!(
+                    "Session {}: SubscribeEvents relay_actor_id={} — no mesh, event relay skipped",
+                    self.session_id, msg.relay_actor_id
+                );
+            }
+        }
+
+        #[cfg(not(feature = "remote"))]
+        {
+            info!(
+                "Session {}: SubscribeEvents relay_actor_id={} (remote feature not enabled)",
+                self.session_id, msg.relay_actor_id
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Unsubscribe a previously registered event relay.
+///
+/// Phase 6: Removes the `EventForwarder` registered for `relay_actor_id` from
+/// the event bus. Without a swarm, this is a no-op (nothing was registered).
+impl Message<crate::agent::messages::UnsubscribeEvents> for SessionActor {
+    type Reply = Result<(), AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: crate::agent::messages::UnsubscribeEvents,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        info!(
+            "Session {}: UnsubscribeEvents relay_actor_id={}",
+            self.session_id, msg.relay_actor_id
+        );
+        // EventBus does not currently support removing individual observers by ID.
+        // When observer removal is needed, track the Arc<EventForwarder> on self
+        // and call event_bus.remove_observer() if/when that API is added.
+        Ok(())
+    }
+}
+
+/// Set planning context on a delegate session.
+///
+/// Appends the parent session's planning summary to this session's
+/// system prompt. Used by the delegation orchestrator to inject context
+/// without requiring direct access to the session's `SessionStore`.
+impl Message<crate::agent::messages::SetPlanningContext> for SessionActor {
+    type Reply = Result<(), AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: crate::agent::messages::SetPlanningContext,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        info!(
+            "Session {}: SetPlanningContext ({} bytes)",
+            self.session_id,
+            msg.summary.len()
+        );
+
+        // Get current system prompt and append the planning summary
+        let mut system_prompt = self.get_session_system_prompt().await;
+        system_prompt.push(msg.summary);
+
+        // Rebuild the LLM config with the updated system prompt
+        let current_config = self
+            .config
+            .provider
+            .history_store()
+            .get_session_llm_config(&self.session_id)
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
+
+        if let Some(current) = current_config {
+            let mut llm_params = querymt::LLMParams::new()
+                .provider(&current.provider)
+                .model(&current.model);
+            for part in &system_prompt {
+                llm_params = llm_params.system(part.clone());
+            }
+
+            let new_config = self
+                .config
+                .provider
+                .history_store()
+                .create_or_get_llm_config(&llm_params)
+                .await
+                .map_err(|e| AgentError::Internal(e.to_string()))?;
+
+            self.config
+                .provider
+                .history_store()
+                .set_session_llm_config(&self.session_id, new_config.id)
+                .await
+                .map_err(|e| AgentError::Internal(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+}
+
+// ── File Proxy ───────────────────────────────────────────────────────────
+
+impl Message<crate::agent::messages::GetFileIndex> for SessionActor {
+    type Reply = Result<
+        crate::agent::file_proxy::GetFileIndexResponse,
+        crate::agent::file_proxy::FileProxyError,
+    >;
+
+    async fn handle(
+        &mut self,
+        _msg: crate::agent::messages::GetFileIndex,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        use crate::agent::file_proxy::{FileProxyError, GetFileIndexResponse};
+
+        let handle = self
+            .runtime
+            .workspace_handle
+            .get()
+            .ok_or(FileProxyError::IndexNotReady)?;
+        let index = handle.file_index().ok_or(FileProxyError::IndexNotReady)?;
+        Ok(GetFileIndexResponse {
+            files: index.files.clone(),
+            generated_at: index.generated_at,
+            workspace_root: index.root.display().to_string(),
+        })
+    }
+}
+
+impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
+    type Reply = Result<
+        crate::agent::file_proxy::ReadRemoteFileResponse,
+        crate::agent::file_proxy::FileProxyError,
+    >;
+
+    async fn handle(
+        &mut self,
+        msg: crate::agent::messages::ReadRemoteFile,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        use crate::agent::file_proxy::{FileProxyError, ReadRemoteFileResponse};
+        use crate::tools::builtins::read_shared::{detect_image_mime, render_read_output};
+        use base64::Engine as _;
+
+        let cwd = self
+            .runtime
+            .cwd
+            .as_ref()
+            .ok_or(FileProxyError::NoWorkingDirectory)?;
+
+        let path = std::path::Path::new(&msg.path);
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+
+        let resolved = joined
+            .canonicalize()
+            .map_err(|e| FileProxyError::PathResolution(e.to_string()))?;
+
+        let root = crate::index::resolve_workspace_root(cwd);
+        if !resolved.starts_with(&root) {
+            return Err(FileProxyError::PathOutsideWorkspace(
+                resolved.display().to_string(),
+            ));
+        }
+
+        let metadata =
+            std::fs::metadata(&resolved).map_err(|e| FileProxyError::ReadError(e.to_string()))?;
+
+        if metadata.is_dir() {
+            let output = render_read_output(&resolved, msg.offset, msg.limit)
+                .await
+                .map_err(FileProxyError::ReadError)?;
+            return Ok(ReadRemoteFileResponse::Text(output));
+        }
+
+        let bytes =
+            std::fs::read(&resolved).map_err(|e| FileProxyError::ReadError(e.to_string()))?;
+
+        if let Some(mime_type) = detect_image_mime(&bytes) {
+            let base64_data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return Ok(ReadRemoteFileResponse::Image {
+                mime_type: (*mime_type).to_string(),
+                base64_data,
+            });
+        }
+
+        if String::from_utf8(bytes).is_ok() {
+            let output = render_read_output(&resolved, msg.offset, msg.limit)
+                .await
+                .map_err(FileProxyError::ReadError)?;
+            Ok(ReadRemoteFileResponse::Text(output))
+        } else {
+            Ok(ReadRemoteFileResponse::Binary)
+        }
+    }
+}
+
 // ── Prompt (the big one) ─────────────────────────────────────────────────
 
 impl Message<Prompt> for SessionActor {
-    type Reply = DelegatedReply<Result<PromptResponse, Error>>;
+    type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
 
     async fn handle(&mut self, msg: Prompt, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         if self.prompt_running {
@@ -677,7 +987,7 @@ async fn execute_prompt_detached(
     cancel_token: CancellationToken,
     bridge: Option<ClientBridgeSender>,
     mode: AgentMode,
-) -> Result<PromptResponse, Error> {
+) -> Result<PromptResponse, AgentError> {
     debug!(
         "Prompt request for session {} with {} block(s)",
         session_id,
@@ -692,7 +1002,7 @@ async fn execute_prompt_detached(
     .await
     {
         Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return Err(Error::new(-32000, "Session semaphore closed")),
+        Ok(Err(_)) => return Err(AgentError::SessionSemaphoreClosed),
         Err(_) => {
             debug!(
                 "Session {} is busy, waiting for previous operation to complete...",
@@ -707,14 +1017,15 @@ async fn execute_prompt_detached(
             let timeout_duration = std::time::Duration::from_secs(config.execution_timeout_secs);
             match tokio::time::timeout(timeout_duration, runtime.execution_permit.acquire()).await {
                 Ok(Ok(permit)) => permit,
-                Ok(Err(_)) => return Err(Error::new(-32000, "Session semaphore closed")),
+                Ok(Err(_)) => return Err(AgentError::SessionSemaphoreClosed),
                 Err(_) => {
-                    return Err(Error::new(-32002, "Session execution timeout").data(
-                        serde_json::json!({
-                            "sessionId": session_id,
-                            "timeoutSecs": config.execution_timeout_secs,
-                        }),
-                    ));
+                    // TODO(agent-error): structured .data() payload lost — restore when AgentError supports structured data
+                    return Err(AgentError::SessionTimeout {
+                        details: format!(
+                            "session_id={}, timeout={}s",
+                            session_id, config.execution_timeout_secs
+                        ),
+                    });
                 }
             }
         }
@@ -725,17 +1036,17 @@ async fn execute_prompt_detached(
         .provider
         .with_session(&session_id)
         .await
-        .map_err(|e| Error::new(-32000, e.to_string()))?;
+        .map_err(|e| AgentError::Internal(e.to_string()))?;
 
     // Create and load RuntimeContext
     let mut runtime_context =
         RuntimeContext::new(config.provider.history_store(), session_id.clone())
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
     runtime_context
         .load_working_context()
         .await
-        .map_err(|e| Error::new(-32000, e.to_string()))?;
+        .map_err(|e| AgentError::Internal(e.to_string()))?;
 
     // Clean up revert state if a new prompt is sent while in reverted state
     if let Err(e) =
@@ -789,7 +1100,7 @@ async fn execute_prompt_detached(
         .state
         .update_intent_snapshot(user_text, None, None)
         .await
-        .map_err(|e| Error::new(-32000, e.to_string()))?;
+        .map_err(|e| AgentError::Internal(e.to_string()))?;
 
     let agent_msg = AgentMessage {
         id: message_id,
@@ -809,7 +1120,7 @@ async fn execute_prompt_detached(
                 message: e.to_string(),
             },
         );
-        return Err(Error::new(-32000, e.to_string()));
+        return Err(AgentError::Internal(e.to_string()));
     }
 
     config.emit_event(
@@ -965,7 +1276,7 @@ async fn execute_prompt_detached(
                     message: e.to_string(),
                 },
             );
-            Err(Error::new(-32000, e.to_string()))
+            Err(AgentError::Internal(e.to_string()))
         }
     }
 }
@@ -978,7 +1289,7 @@ async fn execute_prompt_detached(
 pub(crate) async fn ensure_pre_turn_snapshot_ready(
     exec_ctx: &mut ExecutionContext,
     reason: &'static str,
-) -> Result<(), Error> {
+) -> Result<(), AgentError> {
     let pending_task = exec_ctx
         .runtime
         .pre_turn_snapshot_task
@@ -1013,10 +1324,7 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
                 parent_message_id: None,
             };
             exec_ctx.add_message(snapshot_msg).await.map_err(|e| {
-                Error::new(
-                    -32000,
-                    format!("Failed to store turn snapshot start: {}", e),
-                )
+                AgentError::Internal(format!("Failed to store turn snapshot start: {}", e))
             })?;
         }
         Ok((_turn_id, Err(err))) => {
@@ -1104,7 +1412,10 @@ mod tests {
         // Step 2: Second prompt arrives while first is still running.
         // Because the token is NOT cancelled, the Prompt handler keeps the existing token.
         let should_replace = cancel_token.is_cancelled();
-        assert!(!should_replace, "Must not replace token while task is alive");
+        assert!(
+            !should_replace,
+            "Must not replace token while task is alive"
+        );
         // token unchanged — running task still holds the same token.
 
         // Step 3: Cancel arrives.
@@ -1116,6 +1427,9 @@ mod tests {
 
         // Step 4: PromptFinished — reset token for the next clean turn.
         cancel_token = CancellationToken::new();
-        assert!(!cancel_token.is_cancelled(), "Token reset after PromptFinished");
+        assert!(
+            !cancel_token.is_cancelled(),
+            "Token reset after PromptFinished"
+        );
     }
 }

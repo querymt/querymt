@@ -494,6 +494,7 @@ impl SessionStore for SqliteStorage {
                     &time::format_description::well_known::Rfc3339,
                 )
                 .ok(),
+                provider_node: None,
             })
         })
         .await
@@ -549,6 +550,46 @@ impl SessionStore for SqliteStorage {
             SessionError::DatabaseError(_) => SessionError::SessionNotFound(session_id.to_string()),
             _ => e,
         })
+    }
+
+    async fn set_session_provider_node(
+        &self,
+        session_id: &str,
+        provider_node: Option<&str>,
+    ) -> SessionResult<()> {
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+        let provider_node_owned = provider_node.map(|s| s.to_string());
+        self.run_blocking(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET provider_node = ?, updated_at = ? WHERE id = ?",
+                params![
+                    provider_node_owned,
+                    OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default(),
+                    session_internal_id
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_session_provider_node(&self, session_id: &str) -> SessionResult<Option<String>> {
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
+        self.run_blocking(move |conn| {
+            let result: rusqlite::Result<Option<String>> = conn.query_row(
+                "SELECT provider_node FROM sessions WHERE id = ?",
+                params![session_internal_id],
+                |row| row.get(0),
+            );
+            match result {
+                Ok(val) => Ok(val),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+        .await
     }
 
     async fn set_session_execution_config(
@@ -1804,6 +1845,7 @@ fn parse_llm_config_row(row: &rusqlite::Row<'_>) -> Result<LLMConfig, rusqlite::
         updated_at: row.get::<_, Option<String>>(6)?.and_then(|s| {
             OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).ok()
         }),
+        provider_node: None,
     })
 }
 

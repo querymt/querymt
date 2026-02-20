@@ -89,6 +89,8 @@ export interface EventItem {
   provider?: string;
   model?: string;
   configId?: number;  // LLM config ID from provider_changed events
+  /** Mesh node that owns the provider (from provider_changed events). Absent for local providers. */
+  providerNode?: string;
   // Execution metrics from llm_request_end events
   metrics?: ExecutionMetrics;
   // Middleware stopped event data
@@ -146,6 +148,8 @@ export interface SessionSummary {
   parent_session_id?: string;
   fork_origin?: string;
   has_children?: boolean;
+  /** Node label where this session lives. Absent or undefined for local sessions. */
+  node?: string;
 }
 
 export interface SessionGroup {
@@ -410,11 +414,15 @@ export type UiServerMessage =
       undo_stack: UndoStackFrame[];
     }
   | { type: 'redo_result'; success: boolean; message?: string | null; undo_stack: UndoStackFrame[] }
-  | { type: 'agent_mode'; mode: string };
+  | { type: 'agent_mode'; mode: string }
+  | { type: 'remote_nodes'; nodes: RemoteNodeInfo[] }
+  | { type: 'remote_sessions'; node: string; sessions: RemoteSessionInfo[] };
 
 export interface ModelEntry {
   provider: string;
   model: string;
+  /** Node label where this provider lives. Absent for local models, set for remote mesh nodes. */
+  node?: string;
 }
 
 export interface RecentModelEntry {
@@ -452,6 +460,21 @@ export interface LlmConfigDetails {
   params?: Record<string, unknown> | null;
 }
 
+// Remote node/session types for mesh-based multi-node support
+export interface RemoteNodeInfo {
+  label: string;
+  capabilities: string[];
+  active_sessions: number;
+}
+
+export interface RemoteSessionInfo {
+  session_id: string;
+  actor_id: number;
+  cwd?: string;
+  created_at: number;
+  title?: string;
+}
+
 export type PromptBlock =
   | { type: 'text'; text: string }
   | { type: 'resource_link'; name: string; uri: string; description?: string };
@@ -465,7 +488,7 @@ export type UiClientMessage =
   | { type: 'list_sessions' }
   | { type: 'load_session'; session_id: string }
   | { type: 'list_all_models'; refresh?: boolean }
-  | { type: 'set_session_model'; session_id: string; model_id: string }
+  | { type: 'set_session_model'; session_id: string; model_id: string; node?: string }
   | { type: 'get_recent_models'; limit_per_workspace?: number }
   | { type: 'list_auth_providers' }
   | { type: 'start_oauth_login'; provider: string }
@@ -480,4 +503,8 @@ export type UiClientMessage =
   | { type: 'unsubscribe_session'; session_id: string }
   | { type: 'elicitation_response'; elicitation_id: string; action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> }
   | { type: 'set_agent_mode'; mode: string }
-  | { type: 'get_agent_mode' };
+  | { type: 'get_agent_mode' }
+  | { type: 'list_remote_nodes' }
+  | { type: 'list_remote_sessions'; node: string }
+  | { type: 'create_remote_session'; node: string; cwd?: string | null; request_id?: string }
+  | { type: 'attach_remote_session'; node: string; session_id: string };

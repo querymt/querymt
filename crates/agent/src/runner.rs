@@ -269,6 +269,21 @@ impl AgentRunner {
         self
     }
 
+    /// Access the underlying `AgentHandle` for advanced use cases.
+    ///
+    /// For `Single` runners, this is the agent's handle.
+    /// For `Multi` (quorum) runners, this is the planner's handle.
+    ///
+    /// The handle provides direct access to the session registry, event bus,
+    /// and agent config — useful for integrating with the kameo mesh
+    /// (e.g., bootstrapping `RemoteNodeManager` with `--mesh`).
+    pub fn handle(&self) -> std::sync::Arc<crate::agent::AgentHandle> {
+        match self {
+            AgentRunner::Single(agent) => agent.handle(),
+            AgentRunner::Multi(quorum) => quorum.handle(),
+        }
+    }
+
     /// Get a reference to the inner Agent if this is a Single runner
     pub fn as_agent(&self) -> Option<&Agent> {
         match self {
@@ -325,6 +340,29 @@ impl From<AgentRunner> for Box<dyn ChatRunner> {
 /// `source` accepts either a config file path or inline TOML (`ConfigSource::Toml`).
 /// Inline TOML must contain fully inlined system prompts (no `{ file = ... }` entries).
 ///
+/// ## Phase 7: Config-Driven Mesh Bootstrap
+///
+/// When the `remote` feature is enabled and the TOML config contains:
+///
+/// ```toml
+/// [mesh]
+/// enabled = true
+/// listen = "/ip4/0.0.0.0/tcp/9000"
+/// discovery = "mdns"
+///
+/// [[remote_agents]]
+/// id = "gpu-coder"
+/// name = "GPU Coder"
+/// peer = "dev-gpu"
+/// capabilities = ["shell", "gpu"]
+/// ```
+///
+/// `from_config` will automatically:
+/// 1. Bootstrap the kameo libp2p swarm.
+/// 2. Register this node as a `RemoteNodeManager` in the DHT.
+/// 3. Pre-populate the agent registry with `AgentInfo` for each `[[remote_agents]]` entry,
+///    backed by a `RemoteAgentStub` that routes delegation calls via the mesh.
+///
 /// # Example
 ///
 /// ```no_run
@@ -357,10 +395,86 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
 
     match config {
         Config::Single(single_config) => {
+            // Phase 7: bootstrap mesh from config if enabled (remote feature only).
+            #[cfg(feature = "remote")]
+            if single_config.mesh.enabled {
+                use crate::agent::remote::remote_setup::setup_mesh_from_config;
+                use std::sync::Arc;
+
+                log::info!("Phase 7: mesh.enabled = true in config, bootstrapping mesh...");
+                match setup_mesh_from_config(
+                    &single_config.mesh,
+                    &single_config.remote_agents,
+                    None, // RemoteNodeManager will be spawned by coder_agent or caller
+                    None, // ProviderHostActor will be spawned after AgentConfig is built
+                )
+                .await
+                {
+                    Ok(result) => {
+                        use crate::delegation::AgentRegistry as _;
+                        log::info!(
+                            "Phase 7: mesh bootstrapped, {} remote agent(s) registered",
+                            result.registry.list_agents().len()
+                        );
+                        let agent = Agent::from_single_config_with_registry(
+                            single_config,
+                            Some(Arc::new(result.registry)),
+                            Some(result.mesh),
+                        )
+                        .await?;
+                        return Ok(AgentRunner::Single(agent));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Phase 7: mesh bootstrap failed: {}; continuing without mesh",
+                            e
+                        );
+                    }
+                }
+            }
+
             let agent = Agent::from_single_config(single_config).await?;
             Ok(AgentRunner::Single(agent))
         }
         Config::Multi(quorum_config) => {
+            // Phase 7: bootstrap mesh from config if enabled (remote feature only).
+            #[cfg(feature = "remote")]
+            if quorum_config.mesh.enabled {
+                use crate::agent::remote::remote_setup::setup_mesh_from_config;
+                use std::sync::Arc;
+
+                log::info!("Phase 7: mesh.enabled = true in config, bootstrapping mesh...");
+                match setup_mesh_from_config(
+                    &quorum_config.mesh,
+                    &quorum_config.remote_agents,
+                    None,
+                    None, // ProviderHostActor will be spawned after AgentConfig is built
+                )
+                .await
+                {
+                    Ok(result) => {
+                        use crate::delegation::AgentRegistry;
+                        log::info!(
+                            "Phase 7: mesh bootstrapped, {} remote agent(s) registered",
+                            result.registry.list_agents().len()
+                        );
+                        let quorum = Quorum::from_quorum_config_with_registry(
+                            quorum_config,
+                            Some(Arc::new(result.registry)),
+                            Some(result.mesh),
+                        )
+                        .await?;
+                        return Ok(AgentRunner::Multi(quorum));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Phase 7: mesh bootstrap failed: {}; continuing without mesh",
+                            e
+                        );
+                    }
+                }
+            }
+
             let quorum = Quorum::from_quorum_config(quorum_config).await?;
             Ok(AgentRunner::Multi(quorum))
         }

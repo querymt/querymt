@@ -131,3 +131,179 @@ impl ClientHandler for ElicitationHandler {
         ClientInfo::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ElicitationAction -> rmcp::model::ElicitationAction ───────────────
+
+    #[test]
+    fn elicitation_action_accept_converts_to_rmcp_accept() {
+        let action = ElicitationAction::Accept;
+        let rmcp_action: rmcp::model::ElicitationAction = action.into();
+        assert_eq!(rmcp_action, rmcp::model::ElicitationAction::Accept);
+    }
+
+    #[test]
+    fn elicitation_action_decline_converts_to_rmcp_decline() {
+        let action = ElicitationAction::Decline;
+        let rmcp_action: rmcp::model::ElicitationAction = action.into();
+        assert_eq!(rmcp_action, rmcp::model::ElicitationAction::Decline);
+    }
+
+    #[test]
+    fn elicitation_action_cancel_converts_to_rmcp_cancel() {
+        let action = ElicitationAction::Cancel;
+        let rmcp_action: rmcp::model::ElicitationAction = action.into();
+        assert_eq!(rmcp_action, rmcp::model::ElicitationAction::Cancel);
+    }
+
+    // ── rmcp::model::ElicitationAction -> ElicitationAction ───────────────
+
+    #[test]
+    fn rmcp_accept_converts_to_elicitation_action_accept() {
+        let rmcp_action = rmcp::model::ElicitationAction::Accept;
+        let action: ElicitationAction = rmcp_action.into();
+        assert_eq!(action, ElicitationAction::Accept);
+    }
+
+    #[test]
+    fn rmcp_decline_converts_to_elicitation_action_decline() {
+        let rmcp_action = rmcp::model::ElicitationAction::Decline;
+        let action: ElicitationAction = rmcp_action.into();
+        assert_eq!(action, ElicitationAction::Decline);
+    }
+
+    #[test]
+    fn rmcp_cancel_converts_to_elicitation_action_cancel() {
+        let rmcp_action = rmcp::model::ElicitationAction::Cancel;
+        let action: ElicitationAction = rmcp_action.into();
+        assert_eq!(action, ElicitationAction::Cancel);
+    }
+
+    // ── ElicitationAction serde round-trip ─────────────────────────────────
+
+    #[test]
+    fn elicitation_action_accept_serializes_as_lowercase() {
+        let action = ElicitationAction::Accept;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, r#""accept""#);
+    }
+
+    #[test]
+    fn elicitation_action_decline_serializes_as_lowercase() {
+        let action = ElicitationAction::Decline;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, r#""decline""#);
+    }
+
+    #[test]
+    fn elicitation_action_cancel_serializes_as_lowercase() {
+        let action = ElicitationAction::Cancel;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, r#""cancel""#);
+    }
+
+    #[test]
+    fn elicitation_action_deserializes_from_lowercase() {
+        let json = r#""accept""#;
+        let action: ElicitationAction = serde_json::from_str(json).unwrap();
+        assert_eq!(action, ElicitationAction::Accept);
+
+        let json = r#""decline""#;
+        let action: ElicitationAction = serde_json::from_str(json).unwrap();
+        assert_eq!(action, ElicitationAction::Decline);
+
+        let json = r#""cancel""#;
+        let action: ElicitationAction = serde_json::from_str(json).unwrap();
+        assert_eq!(action, ElicitationAction::Cancel);
+    }
+
+    #[test]
+    fn all_elicitation_actions_round_trip() {
+        let actions = vec![
+            ElicitationAction::Accept,
+            ElicitationAction::Decline,
+            ElicitationAction::Cancel,
+        ];
+
+        for original in actions {
+            let json = serde_json::to_string(&original).unwrap();
+            let restored: ElicitationAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(original, restored);
+        }
+    }
+
+    // ── ElicitationResponse construction ───────────────────────────────────
+
+    #[test]
+    fn elicitation_response_with_content() {
+        let response = ElicitationResponse {
+            action: ElicitationAction::Accept,
+            content: Some(serde_json::json!({"answer": "yes"})),
+        };
+        assert_eq!(response.action, ElicitationAction::Accept);
+        assert!(response.content.is_some());
+        assert_eq!(response.content.unwrap()["answer"], "yes");
+    }
+
+    #[test]
+    fn elicitation_response_without_content() {
+        let response = ElicitationResponse {
+            action: ElicitationAction::Cancel,
+            content: None,
+        };
+        assert_eq!(response.action, ElicitationAction::Cancel);
+        assert!(response.content.is_none());
+    }
+
+    // ── PendingElicitationMap insert/remove lifecycle ──────────────────────
+
+    #[tokio::test]
+    async fn pending_elicitation_map_insert_and_retrieve() {
+        let map: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+
+        {
+            let mut pending = map.lock().await;
+            pending.insert("elicit-1".to_string(), tx);
+        }
+
+        let has_entry = {
+            let pending = map.lock().await;
+            pending.contains_key("elicit-1")
+        };
+
+        assert!(has_entry);
+    }
+
+    #[tokio::test]
+    async fn pending_elicitation_map_remove_on_response() {
+        let map: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+
+        {
+            let mut pending = map.lock().await;
+            pending.insert("elicit-2".to_string(), tx);
+        }
+
+        // Simulate response
+        let tx = {
+            let mut pending = map.lock().await;
+            pending.remove("elicit-2")
+        };
+
+        assert!(tx.is_some());
+
+        let response = ElicitationResponse {
+            action: ElicitationAction::Accept,
+            content: Some(serde_json::json!({"data": "test"})),
+        };
+
+        tx.unwrap().send(response).unwrap();
+
+        let received = rx.await.unwrap();
+        assert_eq!(received.action, ElicitationAction::Accept);
+    }
+}

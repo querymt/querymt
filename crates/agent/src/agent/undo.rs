@@ -5,14 +5,58 @@
 //! made after a specific message. Redo restores the pre-undo state.
 
 use crate::model::MessagePart;
-use anyhow::{Result, anyhow};
 use log::{debug, info, warn};
 use std::path::PathBuf;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+/// Errors that can occur during undo/redo operations.
+///
+/// This type is `Serialize + Deserialize` so it can be sent as a kameo remote
+/// message reply across the mesh when undo/redo is invoked on a remote session.
+#[derive(Debug, Clone, thiserror::Error, serde::Serialize, serde::Deserialize)]
+pub enum UndoError {
+    /// No snapshot backend has been configured for this agent.
+    #[error("No snapshot backend configured")]
+    NoSnapshotBackend,
+
+    /// The session has no working directory set.
+    #[error("No working directory configured")]
+    NoWorkingDirectory,
+
+    /// An error occurred in the underlying snapshot store (git backend).
+    #[error("Snapshot error: {0}")]
+    Snapshot(String),
+
+    /// An error occurred reading from or writing to the session store.
+    #[error("Session store error: {0}")]
+    Store(String),
+
+    /// The requested message ID was not found in session history.
+    #[error("Message not found: {0}")]
+    MessageNotFound(String),
+
+    /// There is no undo state to redo (redo stack is empty).
+    #[error("Nothing to redo")]
+    NothingToRedo,
+
+    /// The kameo actor message could not be delivered or the reply failed.
+    #[error("Actor send error: {0}")]
+    ActorSend(String),
+
+    /// Catch-all for unexpected errors.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<crate::snapshot::SnapshotError> for UndoError {
+    fn from(e: crate::snapshot::SnapshotError) -> Self {
+        UndoError::Snapshot(e.to_string())
+    }
+}
+
 /// Result of an undo operation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UndoResult {
     /// Files that were reverted
     pub reverted_files: Vec<String>,
@@ -21,7 +65,7 @@ pub struct UndoResult {
 }
 
 /// Result of a redo operation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RedoResult {
     /// Whether the redo was successful
     pub restored: bool,
@@ -40,7 +84,7 @@ pub(crate) async fn undo_impl(
     session_id: &str,
     message_id: &str,
     worktree: &std::path::Path,
-) -> Result<UndoResult> {
+) -> Result<UndoResult, UndoError> {
     // 1. Snapshot current state for redo
     let pre_revert_snapshot = backend.track(worktree).await?;
 
@@ -49,13 +93,13 @@ pub(crate) async fn undo_impl(
         .history_store()
         .get_history(session_id)
         .await
-        .map_err(|e| anyhow!("Failed to get history: {}", e))?;
+        .map_err(|e| UndoError::Store(format!("Failed to get history: {}", e)))?;
 
     // 3. Find the target message index
     let target_idx = history
         .iter()
         .position(|m| m.id == message_id)
-        .ok_or_else(|| anyhow!("Message not found: {}", message_id))?;
+        .ok_or_else(|| UndoError::MessageNotFound(message_id.to_string()))?;
 
     // 4. Get child sessions
     let child_sessions = provider
@@ -187,7 +231,7 @@ pub(crate) async fn undo_impl(
         .history_store()
         .push_revert_state(session_id, revert_state)
         .await
-        .map_err(|e| anyhow!("Failed to store revert state: {}", e))?;
+        .map_err(|e| UndoError::Store(format!("Failed to store revert state: {}", e)))?;
 
     info!(
         "Undo: reverted {} files for session {}",
@@ -207,13 +251,13 @@ pub(crate) async fn redo_impl(
     provider: &crate::session::provider::SessionProvider,
     session_id: &str,
     worktree: &std::path::Path,
-) -> Result<RedoResult> {
+) -> Result<RedoResult, UndoError> {
     let revert_state = provider
         .history_store()
         .peek_revert_state(session_id)
         .await
-        .map_err(|e| anyhow!("Failed to get revert state: {}", e))?
-        .ok_or_else(|| anyhow!("Nothing to redo"))?;
+        .map_err(|e| UndoError::Store(format!("Failed to get revert state: {}", e)))?
+        .ok_or(UndoError::NothingToRedo)?;
 
     let current_snapshot = backend.track(worktree).await?;
     let changed = backend
@@ -230,7 +274,7 @@ pub(crate) async fn redo_impl(
         .history_store()
         .pop_revert_state(session_id)
         .await
-        .map_err(|e| anyhow!("Failed to update revert state: {}", e))?;
+        .map_err(|e| UndoError::Store(format!("Failed to update revert state: {}", e)))?;
 
     Ok(RedoResult { restored: true })
 }
@@ -239,12 +283,12 @@ pub(crate) async fn redo_impl(
 pub(crate) async fn cleanup_revert_on_prompt(
     provider: &crate::session::provider::SessionProvider,
     session_id: &str,
-) -> Result<()> {
+) -> Result<(), UndoError> {
     let revert_state = provider
         .history_store()
         .peek_revert_state(session_id)
         .await
-        .map_err(|e| anyhow!("Failed to get revert state: {}", e))?;
+        .map_err(|e| UndoError::Store(format!("Failed to get revert state: {}", e)))?;
 
     if let Some(revert_state) = revert_state {
         info!(
@@ -256,7 +300,7 @@ pub(crate) async fn cleanup_revert_on_prompt(
             .history_store()
             .delete_messages_after(session_id, &revert_state.message_id)
             .await
-            .map_err(|e| anyhow!("Failed to delete messages: {}", e))?;
+            .map_err(|e| UndoError::Store(format!("Failed to delete messages: {}", e)))?;
 
         debug!("Deleted {} messages after revert point", deleted);
 
@@ -264,7 +308,7 @@ pub(crate) async fn cleanup_revert_on_prompt(
             .history_store()
             .clear_revert_states(session_id)
             .await
-            .map_err(|e| anyhow!("Failed to clear revert state: {}", e))?;
+            .map_err(|e| UndoError::Store(format!("Failed to clear revert state: {}", e)))?;
     }
 
     Ok(())

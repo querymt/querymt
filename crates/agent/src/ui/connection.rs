@@ -35,6 +35,8 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
     }
 
     spawn_event_forwarders(state.clone(), conn_id.clone(), tx.clone());
+    #[cfg(feature = "remote")]
+    spawn_peer_event_watcher(state.clone(), tx.clone());
     send_state(&state, &conn_id, &tx).await;
 
     let send_task = tokio::spawn(async move {
@@ -127,8 +129,8 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
     // Try to get mode from active session actor, fall back to default_mode
     let agent_mode = if let Some(ref session_id) = active_session_id {
         let registry = state.agent.registry.lock().await;
-        if let Some(actor_ref) = registry.get(session_id) {
-            match actor_ref.ask(crate::agent::messages::GetMode).await {
+        if let Some(session_ref) = registry.get(session_id) {
+            match session_ref.get_mode().await {
                 Ok(m) => m,
                 Err(_) => state
                     .agent
@@ -257,6 +259,174 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
             }
         });
     }
+}
+
+/// Spawn a task that watches for mDNS peer discovery / expiry events and pushes
+/// an updated `remote_nodes` list to this WebSocket client whenever the mesh
+/// topology changes.
+///
+/// This replaces polling: the kameo swarm event loop emits a `PeerEvent` the
+/// instant mDNS fires, and we react immediately by re-querying the DHT and
+/// pushing the fresh node list to the client.
+#[cfg(feature = "remote")]
+pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
+    use super::messages::RemoteNodeInfo;
+    use crate::agent::remote::PeerEvent;
+
+    let Some(mesh) = state.agent.mesh() else {
+        return;
+    };
+
+    let mut rx = mesh.subscribe_peer_events();
+
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if tx.is_closed() {
+                        break;
+                    }
+
+                    // On Expired we can push the update immediately because
+                    // the node is gone and the DHT doesn't need time to settle.
+                    // On Discovered we use a retry loop: the remote node needs
+                    // time to bootstrap and register its actors in the DHT, so
+                    // we poll with exponential back-off rather than a fixed sleep.
+                    let needs_retry = match event {
+                        PeerEvent::Discovered(peer_id) => {
+                            log::debug!(
+                                "spawn_peer_event_watcher: peer discovered {peer_id}, will poll until actor is visible"
+                            );
+                            true
+                        }
+                        PeerEvent::Expired(peer_id) => {
+                            log::debug!(
+                                "spawn_peer_event_watcher: peer expired {peer_id}, refreshing remote nodes"
+                            );
+                            false
+                        }
+                    };
+
+                    if tx.is_closed() {
+                        break;
+                    }
+
+                    if needs_retry {
+                        // Exponential back-off: 500 ms, 1 s, 2 s, 4 s, 8 s.
+                        // We stop as soon as the newly discovered peer shows up
+                        // in list_remote_nodes(), giving up after ~15 s total.
+                        const DELAYS_MS: &[u64] = &[500, 1_000, 2_000, 4_000, 8_000];
+                        let mut pushed = false;
+                        for &delay_ms in DELAYS_MS {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+
+                            if tx.is_closed() {
+                                break;
+                            }
+
+                            let nodes = state.agent.list_remote_nodes().await;
+                            let msg = UiServerMessage::RemoteNodes {
+                                nodes: nodes
+                                    .iter()
+                                    .map(|n| RemoteNodeInfo {
+                                        label: n.hostname.clone(),
+                                        capabilities: n.capabilities.clone(),
+                                        active_sessions: n.active_sessions,
+                                    })
+                                    .collect(),
+                            };
+
+                            if send_message(&tx, msg).await.is_err() {
+                                break;
+                            }
+
+                            // Stop retrying once we can see at least one remote node
+                            // — the UI has been updated and the peer is reachable.
+                            if !nodes.is_empty() {
+                                pushed = true;
+                                break;
+                            }
+
+                            log::debug!(
+                                "spawn_peer_event_watcher: no remote nodes yet, retrying in {}ms",
+                                delay_ms * 2
+                            );
+                        }
+
+                        if !pushed {
+                            log::warn!(
+                                "spawn_peer_event_watcher: peer discovered but no remote nodes \
+                                 visible after all retries — peer may not have registered its actors yet"
+                            );
+                        }
+                    } else {
+                        // Expired: push the updated (node-removed) list immediately.
+                        let nodes = state.agent.list_remote_nodes().await;
+                        let msg = UiServerMessage::RemoteNodes {
+                            nodes: nodes
+                                .into_iter()
+                                .map(|n| RemoteNodeInfo {
+                                    label: n.hostname,
+                                    capabilities: n.capabilities,
+                                    active_sessions: n.active_sessions,
+                                })
+                                .collect(),
+                        };
+
+                        if send_message(&tx, msg).await.is_err() {
+                            break;
+                        }
+
+                        // Schedule a delayed re-check to catch any stale DHT
+                        // records that resolved between the immediate push and
+                        // the DHT eventually purging the expired peer.
+                        let state_delayed = state.clone();
+                        let tx_delayed = tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            if tx_delayed.is_closed() {
+                                return;
+                            }
+                            let nodes = state_delayed.agent.list_remote_nodes().await;
+                            let msg = UiServerMessage::RemoteNodes {
+                                nodes: nodes
+                                    .into_iter()
+                                    .map(|n| RemoteNodeInfo {
+                                        label: n.hostname,
+                                        capabilities: n.capabilities,
+                                        active_sessions: n.active_sessions,
+                                    })
+                                    .collect(),
+                            };
+                            let _ = send_message(&tx_delayed, msg).await;
+                        });
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // We missed some events — re-query immediately to catch up.
+                    log::warn!("spawn_peer_event_watcher: lagged by {n} events, re-querying");
+                    let nodes = state.agent.list_remote_nodes().await;
+                    let msg = UiServerMessage::RemoteNodes {
+                        nodes: nodes
+                            .into_iter()
+                            .map(|n| RemoteNodeInfo {
+                                label: n.hostname,
+                                capabilities: n.capabilities,
+                                active_sessions: n.active_sessions,
+                            })
+                            .collect(),
+                    };
+                    if send_message(&tx, msg).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    // The swarm is shutting down — nothing to do.
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Subscribe to file index updates for a workspace and forward them to the WebSocket client.

@@ -106,6 +106,11 @@ pub struct AgentQuorumBuilder {
     delegation_enabled: bool,
     verification_enabled: bool,
     delegation_summarizer: Option<Arc<crate::delegation::DelegationSummarizer>>,
+    /// Pre-registered agents to merge into the registry before building (Phase 7).
+    ///
+    /// These are inserted into the `DefaultAgentRegistry` *before* the local delegates,
+    /// so local delegates with the same ID will override remote ones.
+    preregistered: Vec<(AgentInfo, Arc<dyn SendAgent>)>,
 }
 
 impl AgentQuorumBuilder {
@@ -120,7 +125,17 @@ impl AgentQuorumBuilder {
             delegation_enabled: true,
             verification_enabled: false,
             delegation_summarizer: None,
+            preregistered: Vec::new(),
         }
+    }
+
+    /// Pre-register an agent into the delegation registry (Phase 7: remote agents).
+    ///
+    /// Pre-registered entries are inserted before local delegates; local delegates
+    /// with the same ID will override them.
+    pub fn preregister_agent(mut self, info: AgentInfo, instance: Arc<dyn SendAgent>) -> Self {
+        self.preregistered.push((info, instance));
+        self
     }
 
     /// Create builder from a storage backend (registers event observer automatically).
@@ -139,6 +154,7 @@ impl AgentQuorumBuilder {
             delegation_enabled: true,
             verification_enabled: false,
             delegation_summarizer: None,
+            preregistered: Vec::new(),
         }
     }
 
@@ -209,6 +225,16 @@ impl AgentQuorumBuilder {
 
         let mut registry = DefaultAgentRegistry::new();
         let mut delegates = Vec::with_capacity(self.delegate_factories.len());
+
+        // Phase 7: insert pre-registered agents (e.g. remote agents) first so that
+        // local delegates with the same ID can override them.
+        for (info, agent) in self.preregistered {
+            log::debug!(
+                "AgentQuorumBuilder: pre-registering agent '{}' (remote/config-driven)",
+                info.id
+            );
+            registry.register(info, agent);
+        }
 
         for (info, factory) in self.delegate_factories {
             let agent = factory(self.store.clone(), self.event_bus.clone());

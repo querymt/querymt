@@ -510,6 +510,122 @@ async fn resolve_system_parts(
     Ok(resolved)
 }
 
+// ============================================================================
+// Mesh & Remote Agent Configuration (Phase 7)
+// ============================================================================
+
+/// A single peer that this node should connect to in the mesh.
+///
+/// In TOML:
+/// ```toml
+/// [[mesh.peers]]
+/// name = "dev-gpu"
+/// addr = "/ip4/192.168.1.100/tcp/9000"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshPeerConfig {
+    /// Human-readable label (referenced by `[[remote_agents]]`).
+    pub name: String,
+    /// libp2p multiaddr of the peer, e.g. `"/ip4/192.168.1.100/tcp/9000"`.
+    pub addr: String,
+}
+
+/// Discovery strategy for the libp2p swarm.
+///
+/// In TOML: `discovery = "mdns"` | `"kademlia"` | `"none"`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshDiscoveryConfig {
+    /// Zero-config local-network discovery (mDNS multicast).
+    #[default]
+    Mdns,
+    /// Distributed discovery using the Kademlia DHT (for cross-subnet).
+    Kademlia,
+    /// No automatic discovery — peers are added only via `[[mesh.peers]]`.
+    None,
+}
+
+fn default_mesh_listen() -> Option<String> {
+    Some("/ip4/0.0.0.0/tcp/9000".to_string())
+}
+
+/// Configuration for the kameo libp2p mesh.
+///
+/// In TOML:
+/// ```toml
+/// [mesh]
+/// enabled = true
+/// listen = "/ip4/0.0.0.0/tcp/9000"
+/// discovery = "mdns"
+///
+/// [[mesh.peers]]
+/// name = "dev-gpu"
+/// addr = "/ip4/192.168.1.100/tcp/9000"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshTomlConfig {
+    /// Whether to start the mesh swarm at startup.  Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Multiaddr to listen on.  Default: `"/ip4/0.0.0.0/tcp/9000"`.
+    #[serde(default = "default_mesh_listen")]
+    pub listen: Option<String>,
+
+    /// Peer discovery strategy.  Default: `"mdns"`.
+    #[serde(default)]
+    pub discovery: MeshDiscoveryConfig,
+
+    /// Explicit peers to connect to at startup.
+    #[serde(default)]
+    pub peers: Vec<MeshPeerConfig>,
+}
+
+impl Default for MeshTomlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_mesh_listen(),
+            discovery: MeshDiscoveryConfig::default(),
+            peers: Vec::new(),
+        }
+    }
+}
+
+/// A remote agent that lives on another mesh node.
+///
+/// In TOML:
+/// ```toml
+/// [[remote_agents]]
+/// id = "gpu-coder"
+/// name = "GPU Coder"
+/// description = "Coder running on GPU server"
+/// peer = "dev-gpu"            # references [[mesh.peers]] name
+/// capabilities = ["shell", "filesystem", "gpu"]
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAgentConfig {
+    /// Unique agent identifier (used in delegation target).
+    pub id: String,
+    /// Human-readable display name.
+    pub name: String,
+    /// Short description shown in the planner's delegation context.
+    #[serde(default)]
+    pub description: String,
+    /// Name of the peer in `[[mesh.peers]]` that runs this agent.
+    pub peer: String,
+    /// Capability tags (e.g., `["gpu", "shell"]`).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+// ============================================================================
+// End Mesh & Remote Agent Configuration
+// ============================================================================
+
 /// Top-level config discriminator
 #[derive(Debug)]
 pub enum Config {
@@ -526,6 +642,12 @@ pub struct SingleAgentConfig {
     pub mcp: Vec<McpServerConfig>,
     #[serde(default)]
     pub middleware: Vec<MiddlewareEntry>,
+    /// Optional kameo mesh configuration (Phase 7).
+    #[serde(default)]
+    pub mesh: MeshTomlConfig,
+    /// Remote agents registered in the mesh (Phase 7).
+    #[serde(default, rename = "remote_agents")]
+    pub remote_agents: Vec<RemoteAgentConfig>,
 }
 
 /// Raw middleware entry from TOML config
@@ -594,6 +716,12 @@ pub struct QuorumConfig {
     pub planner: PlannerConfig,
     #[serde(default)]
     pub delegates: Vec<DelegateConfig>,
+    /// Optional kameo mesh configuration (Phase 7).
+    #[serde(default)]
+    pub mesh: MeshTomlConfig,
+    /// Remote agents registered in the mesh (Phase 7).
+    #[serde(default, rename = "remote_agents")]
+    pub remote_agents: Vec<RemoteAgentConfig>,
 }
 
 /// Quorum-level settings

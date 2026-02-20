@@ -26,7 +26,7 @@ tools = [
   # User interaction
   "question",
   # Code intelligence
-  "semantic_edit",
+#  "semantic_edit",
   "web_fetch",
 ]
 system = [
@@ -126,6 +126,7 @@ max_turns = 50
 [[middleware]]
 type = "context"
 warn_at_percent = 80
+compact_at_percent = 90
 fallback_max_tokens = 128000
 
 # Detect when code is similar to existing code

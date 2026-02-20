@@ -4,8 +4,9 @@
 //! `$HOME/.qmt/snapshots/<hash>/` where `<hash>` is derived from the
 //! worktree path. This keeps the user's project directory untouched.
 
-use super::backend::{GcConfig, GcResult, SnapshotBackend, SnapshotId};
-use anyhow::{Context, Result, anyhow};
+use super::backend::{
+    GcConfig, GcResult, SnapshotBackend, SnapshotError, SnapshotId, SnapshotResult,
+};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::fs;
@@ -35,7 +36,7 @@ impl GitSnapshotBackend {
     }
 
     /// Compute the snapshot repository directory for a given worktree
-    fn snapshot_dir(&self, worktree: &Path) -> Result<PathBuf> {
+    fn snapshot_dir(&self, worktree: &Path) -> SnapshotResult<PathBuf> {
         let canonical = worktree
             .canonicalize()
             .unwrap_or_else(|_| worktree.to_path_buf());
@@ -46,7 +47,8 @@ impl GitSnapshotBackend {
             return Ok(base.join(format!("{:016x}", hash.as_u64())));
         }
 
-        let cache_dir = dirs::cache_dir().context("HOME directory must be set")?;
+        let cache_dir = dirs::cache_dir()
+            .ok_or_else(|| SnapshotError::Filesystem("HOME directory must be set".to_string()))?;
         Ok(cache_dir
             .join("querymt")
             .join("snapshots")
@@ -57,26 +59,35 @@ impl GitSnapshotBackend {
     ///
     /// We use a bare repo with `core.worktree` pointing to the project directory.
     /// This keeps the project directory pristine (no .git folder).
-    fn open_or_init(&self, worktree: &Path) -> Result<gix::Repository> {
+    fn open_or_init(&self, worktree: &Path) -> SnapshotResult<gix::Repository> {
         let git_dir = self.snapshot_dir(worktree)?;
 
         if git_dir.join("HEAD").exists() {
             // Open existing repository
-            let repo = gix::open(&git_dir).context("Failed to open snapshot repository")?;
-            Ok(repo)
+            gix::open(&git_dir).map_err(|e| {
+                SnapshotError::Repository(format!("Failed to open snapshot repository: {}", e))
+            })
         } else {
             // Initialize new bare repository
-            fs::create_dir_all(&git_dir).context("Failed to create snapshot directory")?;
+            fs::create_dir_all(&git_dir).map_err(|e| {
+                SnapshotError::Filesystem(format!("Failed to create snapshot directory: {}", e))
+            })?;
 
-            let _repo =
-                gix::init_bare(&git_dir).context("Failed to initialize snapshot repository")?;
+            gix::init_bare(&git_dir).map_err(|e| {
+                SnapshotError::Repository(format!(
+                    "Failed to initialize snapshot repository: {}",
+                    e
+                ))
+            })?;
 
             // Write worktree path as metadata file
             fs::write(
                 git_dir.join("WORKTREE_PATH"),
                 worktree.to_string_lossy().as_bytes(),
             )
-            .context("Failed to write worktree metadata")?;
+            .map_err(|e| {
+                SnapshotError::Filesystem(format!("Failed to write worktree metadata: {}", e))
+            })?;
 
             // Set core.worktree and user identity in git config
             let config_path = git_dir.join("config");
@@ -85,14 +96,17 @@ impl GitSnapshotBackend {
                 "\n[core]\n\tworktree = {}\n[user]\n\tname = qmt-snapshot\n\temail = snapshot@qmt.local\n",
                 worktree.display()
             );
-            fs::write(&config_path, format!("{}{}", config_content, extra))
-                .context("Failed to write git config")?;
+            fs::write(&config_path, format!("{}{}", config_content, extra)).map_err(|e| {
+                SnapshotError::Filesystem(format!("Failed to write git config: {}", e))
+            })?;
 
             // Re-open the repo so it picks up our config changes
-            let repo = gix::open(&git_dir)
-                .context("Failed to re-open snapshot repository after config")?;
-
-            Ok(repo)
+            gix::open(&git_dir).map_err(|e| {
+                SnapshotError::Repository(format!(
+                    "Failed to re-open snapshot repository after config: {}",
+                    e
+                ))
+            })
         }
     }
 
@@ -102,7 +116,7 @@ impl GitSnapshotBackend {
     fn build_tree_from_entries(
         repo: &gix::Repository,
         entries: &[(String, gix::ObjectId, bool)],
-    ) -> Result<gix::ObjectId> {
+    ) -> SnapshotResult<gix::ObjectId> {
         // Group entries by top-level directory component
         let mut blobs: Vec<(String, gix::ObjectId, bool)> = Vec::new();
         let mut subdirs: BTreeMap<String, Vec<(String, gix::ObjectId, bool)>> = BTreeMap::new();
@@ -155,9 +169,9 @@ impl GitSnapshotBackend {
             entries: tree_entries,
         };
 
-        let tree_id = repo
-            .write_object(&tree)
-            .context("Failed to write tree object")?;
+        let tree_id = repo.write_object(&tree).map_err(|e| {
+            SnapshotError::Repository(format!("Failed to write tree object: {}", e))
+        })?;
 
         Ok(tree_id.detach())
     }
@@ -169,7 +183,7 @@ impl GitSnapshotBackend {
     /// 2. Writing each file as a blob
     /// 3. Building a tree from those blobs
     /// 4. Creating a commit pointing to that tree
-    fn create_snapshot(&self, worktree: &Path, message: &str) -> Result<SnapshotId> {
+    fn create_snapshot(&self, worktree: &Path, message: &str) -> SnapshotResult<SnapshotId> {
         let repo = self.open_or_init(worktree)?;
 
         // Collect all files from the worktree
@@ -182,15 +196,17 @@ impl GitSnapshotBackend {
             .git_exclude(false)
             .build()
         {
-            let entry = entry.context("Failed to walk directory")?;
+            let entry = entry.map_err(|e| {
+                SnapshotError::Filesystem(format!("Failed to walk directory: {}", e))
+            })?;
             if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
                 continue;
             }
 
             let path = entry.path();
-            let rel_path = path
-                .strip_prefix(worktree)
-                .context("Failed to compute relative path")?;
+            let rel_path = path.strip_prefix(worktree).map_err(|e| {
+                SnapshotError::Filesystem(format!("Failed to compute relative path: {}", e))
+            })?;
 
             // Skip hidden directories like .git
             let rel_str = rel_path.to_string_lossy();
@@ -199,10 +215,11 @@ impl GitSnapshotBackend {
             }
 
             // Read file and create blob
-            let content = fs::read(path).context("Failed to read file")?;
+            let content = fs::read(path)
+                .map_err(|e| SnapshotError::Filesystem(format!("Failed to read file: {}", e)))?;
             let oid = repo
                 .write_blob(&content)
-                .context("Failed to write blob")?
+                .map_err(|e| SnapshotError::Repository(format!("Failed to write blob: {}", e)))?
                 .detach();
 
             // Check if executable
@@ -235,31 +252,38 @@ impl GitSnapshotBackend {
         // (we set user.name and user.email in the git config during init)
         let commit_id = repo
             .commit("HEAD", message, tree_id, parent_ids)
-            .context("Failed to create commit")?;
+            .map_err(|e| SnapshotError::Repository(format!("Failed to create commit: {}", e)))?;
 
         Ok(commit_id.detach().to_string())
     }
 
     /// Get diff between two commits by comparing their trees using `diff_tree_to_tree`
-    fn diff_commits(repo: &gix::Repository, from: &str, to: &str) -> Result<Vec<PathBuf>> {
-        let from_id =
-            gix::ObjectId::from_hex(from.as_bytes()).context("Invalid 'from' commit ID")?;
-        let to_id = gix::ObjectId::from_hex(to.as_bytes()).context("Invalid 'to' commit ID")?;
+    fn diff_commits(repo: &gix::Repository, from: &str, to: &str) -> SnapshotResult<Vec<PathBuf>> {
+        let from_id = gix::ObjectId::from_hex(from.as_bytes())
+            .map_err(|_| SnapshotError::InvalidSnapshotId(from.to_string()))?;
+        let to_id = gix::ObjectId::from_hex(to.as_bytes())
+            .map_err(|_| SnapshotError::InvalidSnapshotId(to.to_string()))?;
 
         let from_commit = repo
             .find_commit(from_id)
-            .context("Failed to find 'from' commit")?;
+            .map_err(|e| SnapshotError::NotFound(format!("'from' commit {}: {}", from, e)))?;
         let to_commit = repo
             .find_commit(to_id)
-            .context("Failed to find 'to' commit")?;
+            .map_err(|e| SnapshotError::NotFound(format!("'to' commit {}: {}", to, e)))?;
 
-        let from_tree = from_commit.tree().context("Failed to get 'from' tree")?;
-        let to_tree = to_commit.tree().context("Failed to get 'to' tree")?;
+        let from_tree = from_commit
+            .tree()
+            .map_err(|e| SnapshotError::Repository(format!("Failed to get 'from' tree: {}", e)))?;
+        let to_tree = to_commit
+            .tree()
+            .map_err(|e| SnapshotError::Repository(format!("Failed to get 'to' tree: {}", e)))?;
 
         // Use Repository::diff_tree_to_tree for convenience
         let changes = repo
             .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
-            .context("Failed to compute tree diff")?;
+            .map_err(|e| {
+                SnapshotError::Repository(format!("Failed to compute tree diff: {}", e))
+            })?;
 
         let mut changed_files = Vec::new();
         for change in &changes {
@@ -278,30 +302,41 @@ impl GitSnapshotBackend {
         worktree: &Path,
         commit_sha: &str,
         paths: &[PathBuf],
-    ) -> Result<()> {
-        let commit_id =
-            gix::ObjectId::from_hex(commit_sha.as_bytes()).context("Invalid commit ID")?;
+    ) -> SnapshotResult<()> {
+        let commit_id = gix::ObjectId::from_hex(commit_sha.as_bytes())
+            .map_err(|_| SnapshotError::InvalidSnapshotId(commit_sha.to_string()))?;
         let commit = repo
             .find_commit(commit_id)
-            .context("Failed to find commit")?;
-        let tree = commit.tree().context("Failed to get tree")?;
+            .map_err(|e| SnapshotError::NotFound(format!("commit {}: {}", commit_sha, e)))?;
+        let tree = commit
+            .tree()
+            .map_err(|e| SnapshotError::Repository(format!("Failed to get tree: {}", e)))?;
 
         for path in paths {
-            let entry = tree
-                .lookup_entry_by_path(path)
-                .context("Failed to look up tree entry")?;
+            let entry = tree.lookup_entry_by_path(path).map_err(|e| {
+                SnapshotError::Repository(format!("Failed to look up tree entry: {}", e))
+            })?;
 
             if let Some(entry) = entry {
-                let object = entry.object().context("Failed to get blob object")?;
+                let object = entry.object().map_err(|e| {
+                    SnapshotError::Repository(format!("Failed to get blob object: {}", e))
+                })?;
                 let data = object.data.clone();
                 let full_path = worktree.join(path);
 
                 // Create parent directories if needed
                 if let Some(parent) = full_path.parent() {
-                    fs::create_dir_all(parent).context("Failed to create parent directory")?;
+                    fs::create_dir_all(parent).map_err(|e| {
+                        SnapshotError::Filesystem(format!(
+                            "Failed to create parent directory: {}",
+                            e
+                        ))
+                    })?;
                 }
 
-                fs::write(&full_path, &data).context("Failed to write file")?;
+                fs::write(&full_path, &data).map_err(|e| {
+                    SnapshotError::Filesystem(format!("Failed to write file: {}", e))
+                })?;
             } else {
                 // File doesn't exist in this snapshot - remove it if it exists
                 let full_path = worktree.join(path);
@@ -315,13 +350,19 @@ impl GitSnapshotBackend {
     }
 
     /// Restore entire worktree from a commit
-    fn checkout_all(repo: &gix::Repository, worktree: &Path, commit_sha: &str) -> Result<()> {
-        let commit_id =
-            gix::ObjectId::from_hex(commit_sha.as_bytes()).context("Invalid commit ID")?;
+    fn checkout_all(
+        repo: &gix::Repository,
+        worktree: &Path,
+        commit_sha: &str,
+    ) -> SnapshotResult<()> {
+        let commit_id = gix::ObjectId::from_hex(commit_sha.as_bytes())
+            .map_err(|_| SnapshotError::InvalidSnapshotId(commit_sha.to_string()))?;
         let commit = repo
             .find_commit(commit_id)
-            .context("Failed to find commit")?;
-        let tree = commit.tree().context("Failed to get tree")?;
+            .map_err(|e| SnapshotError::NotFound(format!("commit {}: {}", commit_sha, e)))?;
+        let tree = commit
+            .tree()
+            .map_err(|e| SnapshotError::Repository(format!("Failed to get tree: {}", e)))?;
 
         // Collect all files from the tree recursively
         Self::restore_tree_recursive(repo, worktree, &tree, &PathBuf::new())?;
@@ -336,25 +377,30 @@ impl GitSnapshotBackend {
         worktree: &Path,
         tree: &gix::Tree<'_>,
         prefix: &Path,
-    ) -> Result<()> {
+    ) -> SnapshotResult<()> {
         for entry_result in tree.iter() {
-            let entry_ref = entry_result.context("Failed to read tree entry")?;
-            let name = std::str::from_utf8(entry_ref.filename().as_ref())
-                .context("Invalid UTF-8 in filename")?;
+            let entry_ref = entry_result.map_err(|e| {
+                SnapshotError::Repository(format!("Failed to read tree entry: {}", e))
+            })?;
+            let name = std::str::from_utf8(entry_ref.filename().as_ref()).map_err(|e| {
+                SnapshotError::Repository(format!("Invalid UTF-8 in filename: {}", e))
+            })?;
             let entry_path = prefix.join(name);
 
             if entry_ref.mode().is_tree() {
                 // Recurse into subtree
-                let sub_object = entry_ref
-                    .object()
-                    .context("Failed to find subtree object")?;
+                let sub_object = entry_ref.object().map_err(|e| {
+                    SnapshotError::Repository(format!("Failed to find subtree object: {}", e))
+                })?;
                 let sub_tree = sub_object
                     .try_into_tree()
-                    .map_err(|_| anyhow!("Expected tree object"))?;
+                    .map_err(|_| SnapshotError::Repository("Expected tree object".to_string()))?;
                 Self::restore_tree_recursive(repo, worktree, &sub_tree, &entry_path)?;
             } else if entry_ref.mode().is_blob() || entry_ref.mode().is_blob_or_symlink() {
                 // Restore blob
-                let object = entry_ref.object().context("Failed to find blob object")?;
+                let object = entry_ref.object().map_err(|e| {
+                    SnapshotError::Repository(format!("Failed to find blob object: {}", e))
+                })?;
                 let full_path = worktree.join(&entry_path);
 
                 if let Some(parent) = full_path.parent() {
@@ -368,7 +414,7 @@ impl GitSnapshotBackend {
     }
 
     /// List all commits with timestamps by walking from HEAD
-    fn list_commits(repo: &gix::Repository) -> Result<Vec<(String, i64)>> {
+    fn list_commits(repo: &gix::Repository) -> SnapshotResult<Vec<(String, i64)>> {
         let head = match repo.head_commit() {
             Ok(commit) => commit,
             Err(_) => return Ok(Vec::new()), // Empty repo
@@ -400,7 +446,7 @@ impl SnapshotBackend for GitSnapshotBackend {
         worktree.exists() && worktree.is_dir() && dirs::home_dir().is_some()
     }
 
-    async fn track(&self, worktree: &Path) -> Result<SnapshotId> {
+    async fn track(&self, worktree: &Path) -> SnapshotResult<SnapshotId> {
         let worktree = worktree.to_path_buf();
         #[cfg(test)]
         let snapshot_base = self.snapshot_base_override.clone();
@@ -418,7 +464,7 @@ impl SnapshotBackend for GitSnapshotBackend {
             backend.create_snapshot(&worktree, "snapshot")
         })
         .await
-        .context("Task panicked")?
+        .map_err(|_| SnapshotError::TaskPanicked)?
     }
 
     async fn diff(
@@ -426,7 +472,7 @@ impl SnapshotBackend for GitSnapshotBackend {
         worktree: &Path,
         pre: &SnapshotId,
         post: &SnapshotId,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> SnapshotResult<Vec<PathBuf>> {
         let worktree = worktree.to_path_buf();
         let pre = pre.clone();
         let post = post.clone();
@@ -447,7 +493,7 @@ impl SnapshotBackend for GitSnapshotBackend {
             Self::diff_commits(&repo, &pre, &post)
         })
         .await
-        .context("Task panicked")?
+        .map_err(|_| SnapshotError::TaskPanicked)?
     }
 
     async fn restore_paths(
@@ -455,7 +501,7 @@ impl SnapshotBackend for GitSnapshotBackend {
         worktree: &Path,
         snapshot: &SnapshotId,
         paths: &[PathBuf],
-    ) -> Result<()> {
+    ) -> SnapshotResult<()> {
         let worktree = worktree.to_path_buf();
         let snapshot = snapshot.clone();
         let paths = paths.to_vec();
@@ -476,10 +522,10 @@ impl SnapshotBackend for GitSnapshotBackend {
             Self::checkout_paths(&repo, &worktree, &snapshot, &paths)
         })
         .await
-        .context("Task panicked")?
+        .map_err(|_| SnapshotError::TaskPanicked)?
     }
 
-    async fn restore(&self, worktree: &Path, snapshot: &SnapshotId) -> Result<()> {
+    async fn restore(&self, worktree: &Path, snapshot: &SnapshotId) -> SnapshotResult<()> {
         let worktree = worktree.to_path_buf();
         let snapshot = snapshot.clone();
         #[cfg(test)]
@@ -499,10 +545,10 @@ impl SnapshotBackend for GitSnapshotBackend {
             Self::checkout_all(&repo, &worktree, &snapshot)
         })
         .await
-        .context("Task panicked")?
+        .map_err(|_| SnapshotError::TaskPanicked)?
     }
 
-    async fn gc(&self, worktree: &Path, config: &GcConfig) -> Result<GcResult> {
+    async fn gc(&self, worktree: &Path, config: &GcConfig) -> SnapshotResult<GcResult> {
         let worktree = worktree.to_path_buf();
         let config = config.clone();
         #[cfg(test)]
@@ -548,7 +594,7 @@ impl SnapshotBackend for GitSnapshotBackend {
             })
         })
         .await
-        .context("Task panicked")?
+        .map_err(|_| SnapshotError::TaskPanicked)?
     }
 }
 

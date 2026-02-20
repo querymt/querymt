@@ -43,6 +43,15 @@ pub struct QuorumBuilder {
     pub(super) verification_enabled: bool,
     pub(super) snapshot_policy: SnapshotPolicy,
     pub(super) delegation_summary_config: Option<crate::config::DelegationSummaryConfig>,
+    /// Pre-built registry entries to merge before building (Phase 7: remote agents).
+    ///
+    /// When `Some`, the entries in this registry are merged with the local delegate agents
+    /// before the planner is built, so the planner sees both local and remote agents as
+    /// delegation targets.
+    pub(super) initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+    /// Optional mesh handle to store on the planner's `AgentHandle` after build (Phase 7).
+    #[cfg(feature = "remote")]
+    pub(super) mesh: Option<crate::agent::remote::MeshHandle>,
 }
 
 impl Default for QuorumBuilder {
@@ -62,6 +71,9 @@ impl QuorumBuilder {
             verification_enabled: false,
             snapshot_policy: SnapshotPolicy::None,
             delegation_summary_config: None,
+            initial_registry: None,
+            #[cfg(feature = "remote")]
+            mesh: None,
         }
     }
 
@@ -145,6 +157,19 @@ impl QuorumBuilder {
 
         if let Some(cwd_path) = cwd.clone() {
             builder = builder.cwd(cwd_path);
+        }
+
+        // Phase 7: inject pre-registered remote agents into the quorum's delegate registry.
+        if let Some(ref initial_reg) = self.initial_registry {
+            for info in initial_reg.list_agents() {
+                if let Some(instance) = initial_reg.get_agent_instance(&info.id) {
+                    log::debug!(
+                        "QuorumBuilder: pre-registering remote agent '{}' in quorum",
+                        info.id
+                    );
+                    builder = builder.preregister_agent(info, instance);
+                }
+            }
         }
 
         for delegate in self.delegates {
@@ -289,6 +314,12 @@ impl QuorumBuilder {
             .ok_or_else(|| anyhow!("Planner is not an AgentHandle"))?;
         let planner_handle = Arc::new(AgentHandle::from_config(planner_handle.config.clone()));
 
+        // Phase 7: store the mesh handle on the planner's AgentHandle.
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = self.mesh {
+            planner_handle.set_mesh(mesh);
+        }
+
         Ok(Quorum {
             inner: quorum,
             view_store,
@@ -334,6 +365,15 @@ impl Quorum {
 
     pub fn inner(&self) -> &AgentQuorum {
         &self.inner
+    }
+
+    /// Access the planner's `AgentHandle` for advanced configuration.
+    ///
+    /// The handle provides access to the session registry, event bus, and agent config.
+    /// Use this when you need to interact with sessions directly or integrate with
+    /// the kameo mesh (e.g., bootstrapping `RemoteNodeManager`).
+    pub fn handle(&self) -> Arc<crate::agent::AgentHandle> {
+        self.planner_handle.clone()
     }
 
     pub fn planner(&self) -> Arc<dyn SendAgent> {
@@ -421,6 +461,36 @@ impl Quorum {
 
     /// Build a Quorum from a quorum config
     pub async fn from_quorum_config(config: QuorumConfig) -> Result<Self> {
+        let builder = Self::builder_from_quorum_config(config, None)?;
+        builder.build().await
+    }
+
+    /// Build a `Quorum` from a quorum config, optionally injecting a pre-populated
+    /// agent registry and mesh handle (Phase 7: config-driven remote agents).
+    ///
+    /// When `initial_registry` is `Some`, the remote agent entries from the registry
+    /// are pre-registered in the quorum's delegation registry *before* local delegates,
+    /// so local delegates with the same ID take precedence.
+    ///
+    /// When `mesh` is `Some`, the `MeshHandle` is stored on the planner's `AgentHandle`
+    /// via `set_mesh()` so that mesh-aware methods (`list_remote_nodes`,
+    /// `create_remote_session`, etc.) work.
+    #[cfg(feature = "remote")]
+    pub async fn from_quorum_config_with_registry(
+        config: QuorumConfig,
+        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+        mesh: Option<crate::agent::remote::MeshHandle>,
+    ) -> Result<Self> {
+        let mut builder = Self::builder_from_quorum_config(config, initial_registry)?;
+        builder.mesh = mesh;
+        builder.build().await
+    }
+
+    /// Shared helper: configure a `QuorumBuilder` from a `QuorumConfig`.
+    fn builder_from_quorum_config(
+        config: QuorumConfig,
+        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+    ) -> Result<QuorumBuilder> {
         let mut builder = QuorumBuilder::new();
 
         if let Some(cwd) = config.quorum.cwd {
@@ -469,19 +539,13 @@ impl Quorum {
         planner_config.tools = planner_resolved.builtins;
 
         // Note: MCP tools are not yet supported in the simple Quorum API.
-        // MCP servers would need to be started when sessions are created,
-        // similar to how it's done in protocol.rs. For now, we only validate
-        // and extract builtin tools.
         if !planner_resolved.mcp_servers.is_empty() {
             log::warn!(
                 "MCP servers configured for planner, but MCP is not yet supported in Quorum. Only builtin tools will be available."
             );
         }
 
-        // Copy middleware config for planner
         planner_config.middleware = config.planner.middleware;
-
-        // Copy execution policy for planner
         planner_config.execution = config.planner.execution;
 
         builder.planner_config = Some(planner_config);
@@ -509,7 +573,6 @@ impl Quorum {
             delegate_config.description = delegate.description;
             delegate_config.capabilities = delegate.capabilities;
 
-            // Resolve delegate tools
             let delegate_resolved =
                 resolve_tools(&delegate.tools, &config.mcp, &delegate.mcp, &builtin_names)?;
             delegate_config.tools = delegate_resolved.builtins;
@@ -526,18 +589,16 @@ impl Quorum {
                     .into_iter()
                     .collect();
 
-            // Copy middleware config for this delegate
             delegate_config.middleware = delegate.middleware;
-
-            // Copy execution policy for this delegate
             delegate_config.execution = delegate.execution;
 
             builder.delegates.push(delegate_config);
         }
 
         builder.snapshot_policy = snapshot_policy;
+        builder.initial_registry = initial_registry;
 
-        builder.build().await
+        Ok(builder)
     }
 }
 

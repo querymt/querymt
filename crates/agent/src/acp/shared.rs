@@ -403,15 +403,20 @@ pub async fn handle_rpc_message<S: SendAgent>(
         },
         m if m == AGENT_METHOD_NAMES.session_set_config_option => {
             log::warn!("session/set_config_option not implemented yet");
-            Err(Error::new(
-                -32601,
-                "session/set_config_option not implemented yet",
+            Err(Error::from(
+                crate::error::AgentError::MethodNotImplemented {
+                    method: "session/set_config_option".to_string(),
+                },
             ))
         }
         m if m == AGENT_METHOD_NAMES.session_set_mode => {
             // TODO: Implement once we expose mode setting via SendAgent or direct actor message
             log::warn!("session/set_mode not yet implemented via RPC");
-            Err(Error::new(-32601, "session/set_mode not implemented yet"))
+            Err(Error::from(
+                crate::error::AgentError::MethodNotImplemented {
+                    method: "session/set_mode".to_string(),
+                },
+            ))
         }
         m if m == AGENT_METHOD_NAMES.session_set_model => {
             match serde_json::from_value(req.params) {
@@ -438,10 +443,8 @@ pub async fn handle_rpc_message<S: SendAgent>(
                         let _ = tx.send(params.outcome);
                         Ok(serde_json::Value::Null)
                     } else {
-                        Err(Error::new(
-                            -32000,
-                            "No pending permission for this tool_call_id",
-                        ))
+                        Err(Error::internal_error()
+                            .data("No pending permission for this tool_call_id"))
                     }
                 }
                 Err(e) => {
@@ -481,10 +484,8 @@ pub async fn handle_rpc_message<S: SendAgent>(
                                 let _ = tx.send(response);
                                 Ok(serde_json::Value::Null)
                             } else {
-                                Err(Error::new(
-                                    -32000,
-                                    "No pending elicitation for this elicitation_id",
-                                ))
+                                Err(Error::internal_error()
+                                    .data("No pending elicitation for this elicitation_id"))
                             }
                         }
                         Err(e) => Err(e),

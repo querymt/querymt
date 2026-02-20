@@ -129,6 +129,10 @@ pub enum AgentEventKind {
         model: String,
         config_id: i64,
         context_limit: Option<u64>,
+        /// Mesh node that owns this provider. `None` = local node.
+        /// Included so the UI can display a node badge next to the model label.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_node: Option<String>,
     },
     ToolCallStart {
         tool_call_id: String,
@@ -298,4 +302,213 @@ pub enum AgentEventKind {
 #[async_trait]
 pub trait EventObserver: Send + Sync {
     async fn on_event(&self, event: &AgentEvent) -> Result<(), LLMError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── StopType -> StopReason conversion ──────────────────────────────────
+
+    #[test]
+    fn stop_type_step_limit_converts_to_max_turn_requests() {
+        let stop_reason: StopReason = StopType::StepLimit.into();
+        assert_eq!(stop_reason, StopReason::MaxTurnRequests);
+    }
+
+    #[test]
+    fn stop_type_turn_limit_converts_to_max_turn_requests() {
+        let stop_reason: StopReason = StopType::TurnLimit.into();
+        assert_eq!(stop_reason, StopReason::MaxTurnRequests);
+    }
+
+    #[test]
+    fn stop_type_delegation_blocked_converts_to_max_turn_requests() {
+        let stop_reason: StopReason = StopType::DelegationBlocked.into();
+        assert_eq!(stop_reason, StopReason::MaxTurnRequests);
+    }
+
+    #[test]
+    fn stop_type_price_limit_converts_to_max_tokens() {
+        let stop_reason: StopReason = StopType::PriceLimit.into();
+        assert_eq!(stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn stop_type_context_threshold_converts_to_max_tokens() {
+        let stop_reason: StopReason = StopType::ContextThreshold.into();
+        assert_eq!(stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn stop_type_model_token_limit_converts_to_max_tokens() {
+        let stop_reason: StopReason = StopType::ModelTokenLimit.into();
+        assert_eq!(stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn stop_type_content_filter_converts_to_end_turn() {
+        let stop_reason: StopReason = StopType::ContentFilter.into();
+        assert_eq!(stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn stop_type_other_converts_to_end_turn() {
+        let stop_reason: StopReason = StopType::Other.into();
+        assert_eq!(stop_reason, StopReason::EndTurn);
+    }
+
+    // ── StopType serialization round-trip ──────────────────────────────────
+
+    #[test]
+    fn stop_type_serializes_as_snake_case() {
+        let stop_type = StopType::StepLimit;
+        let json = serde_json::to_string(&stop_type).unwrap();
+        assert_eq!(json, r#""step_limit""#);
+    }
+
+    #[test]
+    fn stop_type_deserializes_from_snake_case() {
+        let json = r#""turn_limit""#;
+        let stop_type: StopType = serde_json::from_str(json).unwrap();
+        assert_eq!(stop_type, StopType::TurnLimit);
+    }
+
+    #[test]
+    fn all_stop_type_variants_round_trip() {
+        let variants = vec![
+            StopType::StepLimit,
+            StopType::TurnLimit,
+            StopType::PriceLimit,
+            StopType::ContextThreshold,
+            StopType::ModelTokenLimit,
+            StopType::ContentFilter,
+            StopType::DelegationBlocked,
+            StopType::Other,
+        ];
+
+        for original in variants {
+            let json = serde_json::to_string(&original).unwrap();
+            let restored: StopType = serde_json::from_str(&json).unwrap();
+            assert_eq!(original, restored);
+        }
+    }
+
+    // ── AgentEventKind variant construction ────────────────────────────────
+
+    #[test]
+    fn agent_event_kind_session_created_construction() {
+        let kind = AgentEventKind::SessionCreated;
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "session_created");
+    }
+
+    #[test]
+    fn agent_event_kind_prompt_received_construction() {
+        let kind = AgentEventKind::PromptReceived {
+            content: "test prompt".to_string(),
+            message_id: Some("msg-1".to_string()),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "prompt_received");
+        assert_eq!(json["content"], "test prompt");
+        assert_eq!(json["message_id"], "msg-1");
+    }
+
+    #[test]
+    fn agent_event_kind_middleware_stopped_construction() {
+        let kind = AgentEventKind::MiddlewareStopped {
+            stop_type: StopType::StepLimit,
+            reason: "max steps reached".to_string(),
+            metrics: ExecutionMetrics {
+                steps: 10,
+                turns: 5,
+            },
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "middleware_stopped");
+        assert_eq!(json["stop_type"], "step_limit");
+        assert_eq!(json["reason"], "max steps reached");
+        assert_eq!(json["metrics"]["steps"], 10);
+        assert_eq!(json["metrics"]["turns"], 5);
+    }
+
+    #[test]
+    fn agent_event_kind_error_construction() {
+        let kind = AgentEventKind::Error {
+            message: "test error".to_string(),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["message"], "test error");
+    }
+
+    // ── AgentEvent clone + debug ───────────────────────────────────────────
+
+    #[test]
+    fn agent_event_implements_clone() {
+        let original = AgentEvent {
+            seq: 1,
+            timestamp: 1234567890,
+            session_id: "sess-1".to_string(),
+            kind: AgentEventKind::SessionCreated,
+        };
+        let cloned = original.clone();
+        assert_eq!(cloned.seq, 1);
+        assert_eq!(cloned.session_id, "sess-1");
+    }
+
+    #[test]
+    fn agent_event_implements_debug() {
+        let event = AgentEvent {
+            seq: 42,
+            timestamp: 1234567890,
+            session_id: "sess-debug".to_string(),
+            kind: AgentEventKind::Cancelled,
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("seq: 42"));
+        assert!(debug_str.contains("sess-debug"));
+        assert!(debug_str.contains("Cancelled"));
+    }
+
+    // ── ExecutionMetrics defaults and serialization ────────────────────────
+
+    #[test]
+    fn execution_metrics_default_is_zero() {
+        let metrics = ExecutionMetrics::default();
+        assert_eq!(metrics.steps, 0);
+        assert_eq!(metrics.turns, 0);
+    }
+
+    #[test]
+    fn execution_metrics_serializes_correctly() {
+        let metrics = ExecutionMetrics { steps: 5, turns: 3 };
+        let json = serde_json::to_value(&metrics).unwrap();
+        assert_eq!(json["steps"], 5);
+        assert_eq!(json["turns"], 3);
+    }
+
+    // ── SessionLimits defaults and serialization ───────────────────────────
+
+    #[test]
+    fn session_limits_default_has_all_none() {
+        let limits = SessionLimits::default();
+        assert!(limits.max_steps.is_none());
+        assert!(limits.max_turns.is_none());
+        assert!(limits.max_cost_usd.is_none());
+    }
+
+    #[test]
+    fn session_limits_serializes_correctly() {
+        let limits = SessionLimits {
+            max_steps: Some(100),
+            max_turns: Some(50),
+            max_cost_usd: Some(1.5),
+        };
+        let json = serde_json::to_value(&limits).unwrap();
+        assert_eq!(json["max_steps"], 100);
+        assert_eq!(json["max_turns"], 50);
+        assert_eq!(json["max_cost_usd"], 1.5);
+    }
 }

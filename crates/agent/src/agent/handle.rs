@@ -46,6 +46,12 @@ pub struct AgentHandle {
 
     // Mutable default mode (UI "set agent mode" → affects new sessions)
     pub default_mode: StdMutex<AgentMode>,
+
+    /// Handle to the kameo mesh swarm, set after `bootstrap_mesh()` succeeds.
+    /// `None` in local-only mode. Wrapped in a `Mutex` for interior mutability
+    /// so startup code can set it on the shared `Arc<AgentHandle>`.
+    #[cfg(feature = "remote")]
+    pub mesh: StdMutex<Option<crate::agent::remote::MeshHandle>>,
 }
 
 impl AgentHandle {
@@ -62,6 +68,8 @@ impl AgentHandle {
             client: Arc::new(StdMutex::new(None)),
             bridge: Arc::new(StdMutex::new(None)),
             default_mode: StdMutex::new(crate::agent::core::AgentMode::Build),
+            #[cfg(feature = "remote")]
+            mesh: StdMutex::new(None),
         }
     }
 
@@ -185,10 +193,11 @@ impl AgentHandle {
 
     /// Switch provider configuration for a session (advanced form)
     pub async fn set_llm_config(&self, session_id: &str, config: LLMParams) -> Result<(), Error> {
+        use crate::error::AgentError;
         let provider_name = config
             .provider
             .as_ref()
-            .ok_or_else(|| Error::new(-32000, "Provider is required in config".to_string()))?;
+            .ok_or_else(|| Error::from(AgentError::ProviderRequired))?;
 
         if self
             .config
@@ -198,10 +207,9 @@ impl AgentHandle {
             .await
             .is_none()
         {
-            return Err(Error::new(
-                -32000,
-                format!("Unknown provider: {}", provider_name),
-            ));
+            return Err(Error::from(AgentError::UnknownProvider {
+                name: provider_name.clone(),
+            }));
         }
 
         let llm_config = self
@@ -210,14 +218,14 @@ impl AgentHandle {
             .history_store()
             .create_or_get_llm_config(&config)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         self.config
             .provider
             .history_store()
             .set_session_llm_config(session_id, llm_config.id)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         // Fetch context limit from model info
         let context_limit =
@@ -231,6 +239,7 @@ impl AgentHandle {
                 model: llm_config.model.clone(),
                 config_id: llm_config.id,
                 context_limit,
+                provider_node: None,
             },
         );
         Ok(())
@@ -246,7 +255,7 @@ impl AgentHandle {
             .history_store()
             .get_session_llm_config(session_id)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))
+            .map_err(|e| Error::internal_error().data(e.to_string()))
     }
 
     /// Get LLM config by ID
@@ -256,7 +265,7 @@ impl AgentHandle {
             .history_store()
             .get_llm_config(config_id)
             .await
-            .map_err(|e| Error::new(-32000, e.to_string()))
+            .map_err(|e| Error::internal_error().data(e.to_string()))
     }
 
     /// Creates a CompositeDriver from the configured middleware drivers
@@ -276,44 +285,322 @@ impl AgentHandle {
 
     /// Undo: revert filesystem to state at the given message_id.
     ///
-    /// Routes through the kameo session actor.
+    /// Routes through the kameo session actor via `SessionActorRef`.
     pub async fn undo(
         &self,
         session_id: &str,
         message_id: &str,
-    ) -> Result<crate::agent::undo::UndoResult> {
-        let actor_ref = {
+    ) -> Result<crate::agent::undo::UndoResult, crate::agent::undo::UndoError> {
+        let session_ref = {
             let registry = self.registry.lock().await;
-            registry
-                .get(session_id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?
+            registry.get(session_id).cloned().ok_or_else(|| {
+                crate::agent::undo::UndoError::Other(format!("Session not found: {}", session_id))
+            })?
         };
 
-        actor_ref
-            .ask(crate::agent::messages::Undo {
-                message_id: message_id.to_string(),
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Actor error: {}", e))
+        session_ref.undo(message_id.to_string()).await
     }
 
     /// Redo: re-apply the next change in the redo stack.
     ///
-    /// Routes through the kameo session actor.
-    pub async fn redo(&self, session_id: &str) -> Result<crate::agent::undo::RedoResult> {
-        let actor_ref = {
+    /// Routes through the kameo session actor via `SessionActorRef`.
+    pub async fn redo(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::agent::undo::RedoResult, crate::agent::undo::UndoError> {
+        let session_ref = {
             let registry = self.registry.lock().await;
-            registry
-                .get(session_id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?
+            registry.get(session_id).cloned().ok_or_else(|| {
+                crate::agent::undo::UndoError::Other(format!("Session not found: {}", session_id))
+            })?
         };
 
-        actor_ref
-            .ask(crate::agent::messages::Redo)
+        session_ref.redo().await
+    }
+
+    // ── Remote session management (requires `remote` feature) ─────────────────
+
+    /// List discovered peers in the kameo mesh.
+    ///
+    /// Looks up all `RemoteNodeManager` instances registered under
+    /// `"node_manager"` in the Kademlia DHT and calls `GetNodeInfo` on each.
+    /// Requires a bootstrapped swarm (`--mesh` flag).
+    ///
+    /// Without a swarm or with no peers, returns an empty list.
+    /// Returns a clone of the `MeshHandle` if the mesh is active.
+    #[cfg(feature = "remote")]
+    pub fn mesh(&self) -> Option<crate::agent::remote::MeshHandle> {
+        self.mesh.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Activate the mesh by storing the `MeshHandle` returned by `bootstrap_mesh()`.
+    #[cfg(feature = "remote")]
+    pub fn set_mesh(&self, mesh: crate::agent::remote::MeshHandle) {
+        *self.mesh.lock().unwrap_or_else(|e| e.into_inner()) = Some(mesh);
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn list_remote_nodes(&self) -> Vec<crate::agent::remote::NodeInfo> {
+        use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
+        use futures_util::StreamExt;
+
+        let Some(mesh) = self.mesh() else {
+            log::debug!("list_remote_nodes: mesh not bootstrapped");
+            return Vec::new();
+        };
+
+        let local_peer_id = *mesh.peer_id();
+        let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>("node_manager");
+        let mut nodes = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(node_manager_ref) => {
+                    // Skip our own node — it is present in the DHT but is not
+                    // a remote peer from the local user's perspective.
+                    let peer_id = node_manager_ref.id().peer_id().copied();
+                    if peer_id == Some(local_peer_id) {
+                        log::debug!("list_remote_nodes: skipping local node");
+                        continue;
+                    }
+
+                    // Skip peers that mDNS has expired but whose DHT records
+                    // haven't been purged yet.
+                    if let Some(pid) = peer_id {
+                        if !mesh.is_peer_alive(&pid) {
+                            log::debug!(
+                                "list_remote_nodes: skipping stale DHT record for peer {pid}"
+                            );
+                            continue;
+                        }
+                    }
+
+                    // Use a timeout to avoid blocking on a dead peer whose DHT
+                    // record somehow survived the known_peers filter.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
+                    )
+                    .await
+                    {
+                        Ok(Ok(info)) => {
+                            log::debug!("list_remote_nodes: found node '{}'", info.hostname);
+                            nodes.push(info);
+                        }
+                        Ok(Err(e)) => {
+                            log::warn!("list_remote_nodes: GetNodeInfo failed: {}", e)
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "list_remote_nodes: GetNodeInfo timed out for peer {:?}",
+                                peer_id
+                            );
+                        }
+                    }
+                }
+                Err(e) => log::warn!("list_remote_nodes: lookup error: {}", e),
+            }
+        }
+
+        nodes
+    }
+
+    /// Find a `RemoteNodeManager` by its node label (hostname).
+    ///
+    /// Iterates all registered `RemoteNodeManager` actors via DHT lookup and
+    /// returns the one whose `GetNodeInfo.hostname` matches the given label.
+    #[cfg(feature = "remote")]
+    pub async fn find_node_manager(
+        &self,
+        label: &str,
+    ) -> Result<
+        kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        agent_client_protocol::Error,
+    > {
+        use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
+        use futures_util::StreamExt;
+
+        use crate::error::AgentError;
+        let mesh = self
+            .mesh()
+            .ok_or_else(|| agent_client_protocol::Error::from(AgentError::MeshNotBootstrapped))?;
+
+        let local_peer_id = *mesh.peer_id();
+        let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>("node_manager");
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(node_manager_ref) => {
+                    // Never return our own node manager — the caller is looking
+                    // for a genuinely remote peer.
+                    let peer_id = node_manager_ref.id().peer_id().copied();
+                    if peer_id == Some(local_peer_id) {
+                        continue;
+                    }
+                    // Skip stale DHT records for expired peers.
+                    if let Some(pid) = peer_id {
+                        if !mesh.is_peer_alive(&pid) {
+                            log::debug!(
+                                "find_node_manager: skipping stale DHT record for peer {pid}"
+                            );
+                            continue;
+                        }
+                    }
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
+                    )
+                    .await
+                    {
+                        Ok(Ok(info)) if info.hostname == label => {
+                            return Ok(node_manager_ref);
+                        }
+                        Ok(Ok(_)) => continue,
+                        Ok(Err(e)) => {
+                            log::warn!("find_node_manager: GetNodeInfo failed: {}", e);
+                            continue;
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "find_node_manager: GetNodeInfo timed out for peer {:?}",
+                                peer_id
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("find_node_manager: lookup error: {}", e);
+                    continue;
+                }
+            }
+        }
+
+        Err(agent_client_protocol::Error::from(
+            AgentError::RemoteSessionNotFound {
+                details: format!(
+                    "Remote node '{}' not found in the mesh. Available nodes can be listed via list_remote_nodes.",
+                    label
+                ),
+            },
+        ))
+    }
+
+    /// List sessions on a specific remote node.
+    ///
+    /// Sends `ListRemoteSessions` to the `RemoteNodeManager` registered under
+    /// `node_manager_name` in the Kademlia DHT.
+    ///
+    /// Requires a bootstrapped swarm (Phase 6). Returns an error if the node
+    /// is not reachable or has no registered `RemoteNodeManager`.
+    #[cfg(feature = "remote")]
+    pub async fn list_remote_sessions(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+    ) -> Result<Vec<crate::agent::remote::RemoteSessionInfo>, agent_client_protocol::Error> {
+        use crate::agent::remote::ListRemoteSessions;
+        use crate::error::AgentError;
+        node_manager_ref
+            .ask(&ListRemoteSessions)
             .await
-            .map_err(|e| anyhow::anyhow!("Actor error: {}", e))
+            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+    }
+
+    /// Create a session on a remote node and attach it to the local registry.
+    ///
+    /// 1. Sends `CreateRemoteSession` to the remote `RemoteNodeManager`
+    /// 2. Gets back `(session_id, actor_id)` for the new remote `SessionActor`
+    /// 3. Looks up `RemoteActorRef<SessionActor>` by the session-scoped DHT name
+    ///    that `RemoteNodeManager` registered under `"session::{session_id}"`.
+    /// 4. Calls `attach_remote_session` on the local registry to insert it
+    ///    and set up event relay
+    ///
+    /// Returns the new session's ID and a `SessionActorRef` for it.
+    #[cfg(feature = "remote")]
+    pub async fn create_remote_session(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        peer_label: String,
+        cwd: Option<String>,
+    ) -> Result<(String, crate::agent::remote::SessionActorRef), agent_client_protocol::Error> {
+        use crate::agent::remote::CreateRemoteSession;
+        use crate::agent::session_actor::SessionActor;
+
+        use crate::error::AgentError;
+        let mesh = self
+            .mesh()
+            .ok_or_else(|| agent_client_protocol::Error::from(AgentError::MeshNotBootstrapped))?;
+
+        let resp = node_manager_ref
+            .ask(&CreateRemoteSession { cwd })
+            .await
+            .map_err(|e| {
+                agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string()))
+            })?;
+
+        let session_id = resp.session_id.clone();
+
+        // Resolve the RemoteActorRef<SessionActor> via DHT lookup.
+        // RemoteNodeManager registers the session under "session::{session_id}"
+        // in its CreateRemoteSession handler once the swarm is up.
+        let dht_name = format!("session::{}", session_id);
+        let remote_session_ref = mesh
+            .lookup_actor::<SessionActor>(dht_name.clone())
+            .await
+            .map_err(|e| {
+                agent_client_protocol::Error::from(AgentError::SwarmLookupFailed {
+                    key: dht_name.clone(),
+                    reason: e.to_string(),
+                })
+            })?
+            .ok_or_else(|| {
+                agent_client_protocol::Error::from(AgentError::RemoteSessionNotFound {
+                    details: format!(
+                        "session {} (actor_id={}) not found in DHT under '{}'; \
+                     remote node may not have registered it yet",
+                        session_id, resp.actor_id, dht_name
+                    ),
+                })
+            })?;
+
+        // Attach to local registry (spawns EventRelayActor, sends SubscribeEvents)
+        let mut registry = self.registry.lock().await;
+        let session_actor_ref = registry
+            .attach_remote_session(
+                session_id.clone(),
+                remote_session_ref,
+                peer_label,
+                Some(mesh),
+            )
+            .await;
+
+        log::info!(
+            "create_remote_session: attached {} from DHT lookup '{}'",
+            session_id,
+            dht_name
+        );
+
+        Ok((session_id, session_actor_ref))
+    }
+
+    /// Attach an existing remote session (already has a `RemoteActorRef`) to
+    /// the local registry.
+    ///
+    /// This is the lower-level entry point used when the caller already has a
+    /// `RemoteActorRef<SessionActor>` (e.g., obtained via swarm lookup after
+    /// Phase 6 bootstrap).
+    #[cfg(feature = "remote")]
+    pub async fn attach_remote_session(
+        &self,
+        session_id: String,
+        remote_ref: kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
+        peer_label: String,
+    ) -> crate::agent::remote::SessionActorRef {
+        let mesh = self.mesh();
+        let mut registry = self.registry.lock().await;
+        registry
+            .attach_remote_session(session_id, remote_ref, peer_label, mesh)
+            .await
     }
 }
 
@@ -401,7 +688,7 @@ impl SendAgent for AgentHandle {
 
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
         let session_id = req.session_id.to_string();
-        let actor_ref = {
+        let session_ref = {
             let registry = self.registry.lock().await;
             registry.get(&session_id).cloned().ok_or_else(|| {
                 Error::invalid_params().data(serde_json::json!({
@@ -411,22 +698,19 @@ impl SendAgent for AgentHandle {
             })?
         };
 
-        actor_ref
-            .ask(crate::agent::messages::Prompt { req })
-            .await
-            .map_err(|e| Error::new(-32000, e.to_string()))
+        session_ref.prompt(req).await
     }
 
     async fn cancel(&self, notif: CancelNotification) -> Result<(), Error> {
         let session_id = notif.session_id.to_string();
 
-        let actor_ref = {
+        let session_ref = {
             let registry = self.registry.lock().await;
             registry.get(&session_id).cloned()
         };
 
-        if let Some(actor_ref) = actor_ref {
-            let _ = actor_ref.tell(crate::agent::messages::Cancel).await;
+        if let Some(session_ref) = session_ref {
+            let _ = session_ref.cancel().await;
         } else {
             log::warn!(
                 "Cancel requested for session {} but not found in registry",
@@ -468,7 +752,7 @@ impl SendAgent for AgentHandle {
         req: SetSessionModelRequest,
     ) -> Result<SetSessionModelResponse, Error> {
         let session_id = req.session_id.to_string();
-        let actor_ref = {
+        let session_ref = {
             let registry = self.registry.lock().await;
             registry.get(&session_id).cloned().ok_or_else(|| {
                 Error::invalid_params().data(serde_json::json!({
@@ -478,16 +762,13 @@ impl SendAgent for AgentHandle {
             })?
         };
 
-        actor_ref
-            .ask(crate::agent::messages::SetSessionModel { req })
-            .await
-            .map_err(|e| Error::new(-32000, e.to_string()))
+        session_ref.set_session_model(req).await
     }
 
     async fn ext_method(&self, _req: ExtRequest) -> Result<ExtResponse, Error> {
         // Return empty response - extensions not yet implemented
         let raw_value = serde_json::value::RawValue::from_string("null".to_string())
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
+            .map_err(|e| Error::from(crate::error::AgentError::Serialization(e.to_string())))?;
         Ok(ExtResponse::new(Arc::from(raw_value)))
     }
 

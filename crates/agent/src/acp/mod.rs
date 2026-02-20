@@ -181,7 +181,7 @@ impl agent_client_protocol::Client for WebClientBridge {
 
         match rx.await {
             Ok(outcome) => Ok(RequestPermissionResponse::new(outcome)),
-            Err(_) => Err(Error::new(-32000, "Permission request cancelled")),
+            Err(_) => Err(Error::from(crate::error::AgentError::PermissionCancelled)),
         }
     }
 }

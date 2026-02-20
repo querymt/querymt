@@ -11,7 +11,7 @@ use notify::{
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{CreateKind, ModifyKind, RemoveKind, RenameMode},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,7 +33,7 @@ pub enum FileIndexError {
 }
 
 /// A single entry in the file index.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileIndexEntry {
     /// Relative path from the index root
     pub path: String,
@@ -317,8 +317,24 @@ impl FileIndexWatcher {
                         if !pending_events.is_empty() && last_rebuild.elapsed() >= rebuild_interval {
                             // Check if .gitignore itself changed — if so, reload it and
                             // always do a full rebuild since ignore rules may have changed.
+                            //
+                            // Only consider content-changing event kinds (Create, Modify::Data,
+                            // Modify::Any, Modify::Name, Remove). Access and Metadata events
+                            // are excluded to avoid a feedback loop: rebuilding the index causes
+                            // build_gitignore() and WalkBuilder to stat <root>/.gitignore, which
+                            // generates new Access/Metadata events that would otherwise re-trigger
+                            // this rebuild indefinitely — especially when .gitignore doesn't exist.
                             let gitignore_changed = pending_events.iter().any(|e| {
-                                e.paths.iter().any(|p| {
+                                matches!(
+                                    e.kind,
+                                    EventKind::Create(_)
+                                        | EventKind::Modify(
+                                            ModifyKind::Data(_)
+                                                | ModifyKind::Any
+                                                | ModifyKind::Name(_)
+                                        )
+                                        | EventKind::Remove(_)
+                                ) && e.paths.iter().any(|p| {
                                     p.file_name().map(|n| n == ".gitignore").unwrap_or(false)
                                 })
                             });

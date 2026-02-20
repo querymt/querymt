@@ -17,10 +17,12 @@ pub mod agent_config_builder;
 pub mod core;
 pub mod execution;
 pub mod execution_context;
+pub mod file_proxy;
 pub mod handle;
 pub mod mcp;
 pub mod messages;
 pub mod protocol;
+pub mod remote;
 pub mod session_actor;
 pub mod session_registry;
 pub mod snapshots;
@@ -40,6 +42,7 @@ pub use snapshots::SnapshotState;
 // Re-export kameo actor types
 pub use agent_config::AgentConfig;
 pub use handle::AgentHandle;
+pub use remote::SessionActorRef;
 pub use session_actor::SessionActor;
 pub use session_registry::SessionRegistry;
 

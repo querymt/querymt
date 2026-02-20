@@ -5,10 +5,13 @@
 //! read-style text chunks in the same user turn.
 
 use super::messages::UiPromptBlock;
+use crate::agent::file_proxy::ReadRemoteFileResponse;
 use crate::index::{
     FileIndex, FileIndexEntry, GetOrCreate, WorkspaceIndexManagerActor, resolve_workspace_root,
 };
-use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_read_output};
+use crate::tools::builtins::read_shared::{
+    DEFAULT_READ_LIMIT, detect_image_mime, render_read_output,
+};
 use agent_client_protocol::{ContentBlock, ImageContent, TextContent};
 use base64::Engine;
 use kameo::actor::ActorRef;
@@ -25,6 +28,7 @@ pub async fn build_prompt_blocks(
     workspace_manager: &ActorRef<WorkspaceIndexManagerActor>,
     cwd: Option<&PathBuf>,
     prompt: &[UiPromptBlock],
+    session_ref: Option<&crate::agent::SessionActorRef>,
 ) -> Vec<ContentBlock> {
     let user_text = prompt
         .iter()
@@ -33,6 +37,12 @@ pub async fn build_prompt_blocks(
             _ => None,
         })
         .unwrap_or_default();
+
+    // Remote sessions: proxy all file operations through the mesh.
+    if let Some(sr) = session_ref
+        && sr.is_remote() {
+            return build_remote_prompt_blocks(sr, cwd, user_text, prompt).await;
+        }
 
     let Some(cwd) = cwd else {
         return vec![ContentBlock::Text(TextContent::new(user_text))];
@@ -164,23 +174,24 @@ async fn build_file_index_lookup(
     Some(lookup)
 }
 
-/// Detect if bytes represent a supported image format.
-fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    let kind = infer::get(bytes)?;
-    match kind.mime_type() {
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp" => Some(kind.mime_type()),
-        _ => None,
-    }
-}
-
 /// Filter file index entries to those under the given working directory.
 pub fn filter_index_for_cwd(index: &FileIndex, relative_cwd: &Path) -> Vec<FileIndexEntry> {
+    filter_index_for_cwd_entries(&index.files, relative_cwd)
+}
+
+/// Filter a slice of file index entries to those under the given working directory.
+///
+/// Used by remote session handlers that receive `Vec<FileIndexEntry>` directly
+/// (without a full `FileIndex`).
+pub fn filter_index_for_cwd_entries(
+    files: &[FileIndexEntry],
+    relative_cwd: &Path,
+) -> Vec<FileIndexEntry> {
     if relative_cwd.as_os_str().is_empty() {
-        return index.files.clone();
+        return files.to_vec();
     }
 
-    index
-        .files
+    files
         .iter()
         .filter_map(|entry| {
             let entry_path = Path::new(&entry.path);
@@ -199,4 +210,60 @@ pub fn filter_index_for_cwd(index: &FileIndex, relative_cwd: &Path) -> Vec<FileI
             })
         })
         .collect()
+}
+
+/// Build prompt blocks for a remote session by proxying file reads over the mesh.
+async fn build_remote_prompt_blocks(
+    session_ref: &crate::agent::SessionActorRef,
+    cwd: Option<&PathBuf>,
+    user_text: String,
+    prompt: &[UiPromptBlock],
+) -> Vec<ContentBlock> {
+    let mut blocks = vec![ContentBlock::Text(TextContent::new(user_text))];
+    let mut seen = HashSet::new();
+
+    for block in prompt {
+        let UiPromptBlock::ResourceLink { uri, .. } = block else {
+            continue;
+        };
+        let raw_path = uri.trim();
+        if raw_path.is_empty() || !seen.insert(raw_path.to_string()) {
+            continue;
+        }
+
+        // Path display: join with cwd for a human-readable label, but the
+        // remote handler does the actual resolution on the remote node.
+        let display_path = cwd
+            .map(|c| c.join(raw_path).display().to_string())
+            .unwrap_or_else(|| raw_path.to_string());
+
+        match session_ref
+            .read_remote_file(raw_path.to_string(), 0, DEFAULT_READ_LIMIT)
+            .await
+        {
+            Ok(ReadRemoteFileResponse::Text(output)) => {
+                blocks.push(ContentBlock::Text(TextContent::new(format!(
+                    "[file: {display_path}]\n{output}"
+                ))));
+            }
+            Ok(ReadRemoteFileResponse::Image {
+                mime_type,
+                base64_data,
+            }) => {
+                blocks.push(ContentBlock::Image(
+                    ImageContent::new(base64_data, mime_type).uri(raw_path.to_string()),
+                ));
+            }
+            Ok(ReadRemoteFileResponse::Binary) => {
+                blocks.push(ContentBlock::Text(TextContent::new(format!(
+                    "[file: {display_path}]\n(binary file; not inlined)"
+                ))));
+            }
+            Err(e) => {
+                log::warn!("remote file read failed for '{raw_path}': {e}");
+            }
+        }
+    }
+
+    blocks
 }

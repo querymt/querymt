@@ -116,6 +116,7 @@ pub fn mock_llm_config() -> LLMConfig {
         params: None,
         created_at: Some(OffsetDateTime::now_utc()),
         updated_at: Some(OffsetDateTime::now_utc()),
+        provider_node: None,
     }
 }
 
@@ -354,12 +355,15 @@ impl UndoTestFixture {
         &self,
         session_id: &str,
         message_id: &str,
-    ) -> Result<crate::agent::undo::UndoResult> {
+    ) -> Result<crate::agent::undo::UndoResult, crate::agent::undo::UndoError> {
         self.handle.undo(session_id, message_id).await
     }
 
     /// Perform redo operation via AgentHandle
-    pub async fn redo(&self, session_id: &str) -> Result<crate::agent::undo::RedoResult> {
+    pub async fn redo(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::agent::undo::RedoResult, crate::agent::undo::UndoError> {
         self.handle.redo(session_id).await
     }
 }
