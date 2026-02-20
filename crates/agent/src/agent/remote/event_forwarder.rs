@@ -46,12 +46,13 @@ impl EventForwarder {
 #[async_trait]
 impl EventObserver for EventForwarder {
     async fn on_event(&self, event: &AgentEvent) -> Result<(), LLMError> {
-        log::trace!(
-            "EventForwarder({}): forwarding seq={} session={} kind={:?}",
-            self.source_label,
-            event.seq,
-            event.session_id,
-            event.kind
+        tracing::trace!(
+            target: "remote::event_forwarder",
+            source = %self.source_label,
+            seq = event.seq,
+            session_id = %event.session_id,
+            kind = ?event.kind,
+            "forwarding event to relay actor"
         );
 
         // Forward the event to the local relay actor.
@@ -63,10 +64,12 @@ impl EventObserver for EventForwarder {
             })
             .send()
         {
-            log::warn!(
-                "EventForwarder({}): Failed to forward event: {}",
-                self.source_label,
-                e
+            tracing::warn!(
+                target: "remote::event_forwarder",
+                source = %self.source_label,
+                seq = event.seq,
+                error = %e,
+                "failed to forward event to relay actor"
             );
             return Err(LLMError::GenericError(format!(
                 "Failed to forward event: {}",

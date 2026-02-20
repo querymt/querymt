@@ -90,7 +90,7 @@ provider = "llama_cpp"
 model = "qwen3-coder-30b"
 description = "Specialized in implementation and code writing"
 capabilities = ["rust", "python"]
-tools = ["question", "edit", "todowrite", "todoread", "code_surgeon", "glob", "search_text", "ls", "shell", "read_tool", "write_file"]
+tools = ["question", "edit", "todowrite", "todoread", "srgn", "glob", "search_text", "ls", "shell", "read_tool", "write_file"]
 system = [
   { file = "../prompts/anthropic_opencode.txt" }
 ]

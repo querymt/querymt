@@ -95,6 +95,23 @@ impl SessionRegistry {
         self.sessions.is_empty()
     }
 
+    /// Return `(session_id, peer_label)` pairs for all remote sessions.
+    ///
+    /// Used by the UI session-list handler to include remote sessions in the
+    /// session picker alongside local (persisted) sessions.
+    #[cfg(feature = "remote")]
+    pub fn remote_sessions(&self) -> Vec<(String, String)> {
+        self.sessions
+            .iter()
+            .filter_map(|(id, r)| match r {
+                SessionActorRef::Remote { peer_label, .. } => {
+                    Some((id.clone(), peer_label.clone()))
+                }
+                SessionActorRef::Local(_) => None,
+            })
+            .collect()
+    }
+
     /// Attach a remote session to this registry.
     ///
     /// Wraps the remote actor ref in a `SessionActorRef::Remote`, spawns a local

@@ -235,6 +235,67 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                     continue;
                 }
 
+                // React to WorkspaceIndexReady from a remote session: push status +
+                // fetch and push the file index so the UI gets it without polling.
+                if let crate::events::AgentEventKind::WorkspaceIndexReady { .. } = &event.kind {
+                    let session_id = event.session_id.clone();
+
+                    // Push WorkspaceIndexStatus { ready }
+                    let _ = send_message(
+                        &tx_events,
+                        UiServerMessage::WorkspaceIndexStatus {
+                            session_id: session_id.clone(),
+                            status: "ready".to_string(),
+                            message: None,
+                        },
+                    )
+                    .await;
+
+                    // Fetch the file index from the remote actor and push it.
+                    let actor_ref = {
+                        let registry = state_events.agent.registry.lock().await;
+                        registry.get(&session_id).cloned()
+                    };
+                    if let Some(actor_ref) = actor_ref {
+                        let cwd = {
+                            let cwds = state_events.session_cwds.lock().await;
+                            cwds.get(&session_id).cloned()
+                        };
+                        match actor_ref.get_file_index().await {
+                            Ok(resp) => {
+                                use super::mentions::filter_index_for_cwd_entries;
+                                let root = std::path::PathBuf::from(&resp.workspace_root);
+                                let files =
+                                    match cwd.as_ref().and_then(|c| c.strip_prefix(&root).ok()) {
+                                        Some(relative_cwd) => {
+                                            filter_index_for_cwd_entries(&resp.files, relative_cwd)
+                                        }
+                                        None => resp.files,
+                                    };
+                                let _ = send_message(
+                                    &tx_events,
+                                    UiServerMessage::FileIndex {
+                                        files,
+                                        generated_at: resp.generated_at,
+                                    },
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "spawn_event_forwarders: WorkspaceIndexReady for {} but \
+                                     get_file_index failed: {}",
+                                    session_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    // Don't forward the raw event to the UI — it's an internal
+                    // infrastructure event not meaningful to the frontend.
+                    continue;
+                }
+
                 let agent_id = {
                     let agents = state_events.session_agents.lock().await;
                     agents
@@ -362,6 +423,57 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                     } else {
                         // Expired: push the updated (node-removed) list immediately.
                         let nodes = state.agent.list_remote_nodes().await;
+
+                        // Clear provider_node for any session that was using the
+                        // expired peer. We detect stale sessions by comparing the
+                        // remote_sessions() peer_label against the set of nodes
+                        // still visible after expiry.
+                        let available_hostnames: HashSet<&str> =
+                            nodes.iter().map(|n| n.hostname.as_str()).collect();
+                        let registry = state.agent.registry.lock().await;
+                        for (session_id, peer_label) in registry.remote_sessions() {
+                            if !available_hostnames.contains(peer_label.as_str()) {
+                                match state.agent.get_session_llm_config(&session_id).await {
+                                    Ok(Some(config)) => {
+                                        state.agent.emit_event(
+                                            &session_id,
+                                            crate::events::AgentEventKind::ProviderChanged {
+                                                provider: config.provider,
+                                                model: config.model,
+                                                config_id: config.id,
+                                                context_limit: None,
+                                                provider_node: None,
+                                            },
+                                        );
+                                        log::info!(
+                                            "spawn_peer_event_watcher: cleared provider_node \
+                                             for session {} (peer {} expired)",
+                                            session_id,
+                                            peer_label
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        log::debug!(
+                                            "spawn_peer_event_watcher: no LLM config for \
+                                             session {} (peer {} expired)",
+                                            session_id,
+                                            peer_label
+                                        );
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "spawn_peer_event_watcher: failed to get LLM \
+                                             config for session {} (peer {} expired): {}",
+                                            session_id,
+                                            peer_label,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        drop(registry);
+
                         let msg = UiServerMessage::RemoteNodes {
                             nodes: nodes
                                 .into_iter()

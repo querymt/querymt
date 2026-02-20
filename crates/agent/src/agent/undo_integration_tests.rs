@@ -429,3 +429,72 @@ async fn test_delete_two_files_full_undo_redo_cycle_tracks_stack_depth() -> Resu
 
     Ok(())
 }
+
+// ==================== Regression tests: nested directory undo ====================
+
+/// Regression: undo must work when the agent changed files in subdirectories.
+///
+/// Previously, `diff_tree_to_tree` returned intermediate directory paths (e.g.
+/// "crates", "crates/agent") in addition to file paths. Those directory paths were
+/// stored in `TurnSnapshotPatch.changed_paths` and then passed to `restore_paths`,
+/// which tried to write a raw git tree object to an on-disk directory, erroring out
+/// before restoring any files.
+#[tokio::test]
+async fn test_undo_nested_directory_file_changes() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+
+    // Create nested directory structure
+    let nested = fixture.worktree.path().join("src/deep");
+    std::fs::create_dir_all(&nested)?;
+    std::fs::write(nested.join("file.rs"), "original")?;
+    fixture.write_file("root.txt", "root-original")?;
+
+    let session_id = fixture.create_session().await?;
+    let user_msg_id = fixture
+        .add_user_message(&session_id, "Modify nested files")
+        .await?;
+    let (turn_id, pre_snapshot) = fixture.take_pre_snapshot(&session_id).await?;
+
+    // Modify both a nested file and a root file (triggers directory tree path changes)
+    std::fs::write(nested.join("file.rs"), "modified")?;
+    fixture.write_file("root.txt", "root-modified")?;
+    fixture
+        .take_post_snapshot(&session_id, &turn_id, &pre_snapshot)
+        .await?;
+
+    // Verify both files are modified
+    assert_eq!(std::fs::read_to_string(nested.join("file.rs"))?, "modified");
+    assert_eq!(fixture.read_file("root.txt")?, "root-modified");
+
+    // Undo – regression: previously silently failed (warn log only) because
+    // directory paths like "src" caused restore_paths to abort with an fs error.
+    let result = fixture.undo(&session_id, &user_msg_id).await?;
+
+    // Both files must be reverted
+    assert_eq!(
+        std::fs::read_to_string(nested.join("file.rs"))?,
+        "original",
+        "nested file must be reverted by undo"
+    );
+    assert_eq!(
+        fixture.read_file("root.txt")?,
+        "root-original",
+        "root file must be reverted by undo"
+    );
+    // reverted_files should contain the actual file paths (no directory entries)
+    assert!(
+        result.reverted_files.len() >= 2,
+        "expected at least 2 reverted files, got: {:?}",
+        result.reverted_files
+    );
+    assert!(
+        result
+            .reverted_files
+            .iter()
+            .all(|p| !std::path::Path::new(p).extension().is_none() || p.contains('.')),
+        "reverted_files should not contain bare directory paths, got: {:?}",
+        result.reverted_files
+    );
+
+    Ok(())
+}

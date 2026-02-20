@@ -93,6 +93,15 @@ impl SessionActorRef {
 
 impl SessionActorRef {
     /// Send a prompt to the session and wait for completion.
+    #[tracing::instrument(
+        name = "remote.session_ref.prompt",
+        skip(self, req),
+        fields(
+            is_remote = self.is_remote(),
+            peer_label = %self.node_label(),
+            timed_out = tracing::field::Empty,
+        )
+    )]
     pub async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, AcpError> {
         match self {
             Self::Local(actor_ref) => actor_ref
@@ -113,11 +122,15 @@ impl SessionActorRef {
                 .await
                 {
                     Ok(result) => {
+                        tracing::Span::current().record("timed_out", false);
                         result.map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string())))
                     }
-                    Err(_elapsed) => Err(AcpError::from(AgentError::SessionTimeout {
-                        details: "Remote prompt timed out (exceeded 600s)".to_string(),
-                    })),
+                    Err(_elapsed) => {
+                        tracing::Span::current().record("timed_out", true);
+                        Err(AcpError::from(AgentError::SessionTimeout {
+                            details: "Remote prompt timed out (exceeded 600s)".to_string(),
+                        }))
+                    }
                 }
             }
         }
@@ -246,6 +259,11 @@ impl SessionActorRef {
     }
 
     /// Get session history. Works for both local and remote sessions.
+    #[tracing::instrument(
+        name = "remote.session_ref.get_history",
+        skip(self),
+        fields(is_remote = self.is_remote(), peer_label = %self.node_label())
+    )]
     pub async fn get_history(&self) -> Result<Vec<AgentMessage>, AcpError> {
         match self {
             Self::Local(actor_ref) => actor_ref
@@ -337,6 +355,15 @@ impl SessionActorRef {
     ///
     /// Registers an event forwarder on the session that sends events to the
     /// specified relay actor (identified by its ActorId as u64).
+    #[tracing::instrument(
+        name = "remote.session_ref.subscribe_events",
+        skip(self),
+        fields(
+            is_remote = self.is_remote(),
+            peer_label = %self.node_label(),
+            relay_actor_id,
+        )
+    )]
     pub async fn subscribe_events(&self, relay_actor_id: u64) -> Result<(), AcpError> {
         match self {
             Self::Local(actor_ref) => actor_ref
@@ -372,6 +399,11 @@ impl SessionActorRef {
     ///
     /// Works for both local and remote sessions. For remote sessions the handler
     /// reads the workspace index on the remote node and returns it over the mesh.
+    #[tracing::instrument(
+        name = "remote.session_ref.get_file_index",
+        skip(self),
+        fields(is_remote = self.is_remote(), peer_label = %self.node_label())
+    )]
     pub async fn get_file_index(&self) -> Result<GetFileIndexResponse, FileProxyError> {
         match self {
             Self::Local(actor_ref) => actor_ref
@@ -391,6 +423,17 @@ impl SessionActorRef {
     ///
     /// Works for both local and remote sessions. For remote sessions the handler
     /// reads from the remote filesystem and returns content over the mesh.
+    #[tracing::instrument(
+        name = "remote.session_ref.read_remote_file",
+        skip(self),
+        fields(
+            is_remote = self.is_remote(),
+            peer_label = %self.node_label(),
+            path = %path,
+            offset,
+            limit,
+        )
+    )]
     pub async fn read_remote_file(
         &self,
         path: String,

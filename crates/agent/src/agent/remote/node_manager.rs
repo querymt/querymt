@@ -71,6 +71,7 @@ mod remote_impl {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+    use tracing::Instrument;
 
     // ── Messages ──────────────────────────────────────────────────────────────
 
@@ -167,6 +168,15 @@ mod remote_impl {
     impl Message<CreateRemoteSession> for RemoteNodeManager {
         type Reply = Result<CreateRemoteSessionResponse, AgentError>;
 
+        #[tracing::instrument(
+            name = "remote.node_manager.create_session",
+            skip(self, _ctx),
+            fields(
+                cwd = msg.cwd.as_deref().unwrap_or("<none>"),
+                session_id = tracing::field::Empty,
+                actor_id = tracing::field::Empty,
+            )
+        )]
         async fn handle(
             &mut self,
             msg: CreateRemoteSession,
@@ -213,11 +223,21 @@ mod remote_impl {
             let actor_ref = SessionActor::spawn(actor);
 
             let actor_id_raw = actor_ref.id().sequence_id();
+            tracing::Span::current()
+                .record("session_id", &session_id)
+                .record("actor_id", actor_id_raw);
 
             // Register in REMOTE_REGISTRY + Kademlia DHT so remote peers can
             // address the session actor by name.
             if let Some(ref mesh) = self.mesh {
-                mesh.register_actor(actor_ref.clone(), format!("session::{}", session_id))
+                let dht_name = format!("session::{}", session_id);
+                let reg_span = tracing::info_span!(
+                    "remote.node_manager.dht_register_session",
+                    session_id = %session_id,
+                    dht_name = %dht_name,
+                );
+                mesh.register_actor(actor_ref.clone(), dht_name)
+                    .instrument(reg_span)
                     .await;
             } else {
                 log::debug!(
@@ -275,15 +295,37 @@ mod remote_impl {
                     let manager_actor = self.config.workspace_manager_actor.clone();
                     let runtime_clone = runtime.clone();
                     let cwd_owned = cwd_path.clone();
-                    tokio::spawn(async move {
-                        let root = crate::index::resolve_workspace_root(&cwd_owned);
-                        match manager_actor.ask(crate::index::GetOrCreate { root }).await {
-                            Ok(handle) => {
-                                let _ = runtime_clone.workspace_handle.set(handle);
+                    let config_clone = self.config.clone();
+                    let session_id_for_index = session_id.clone();
+                    let index_span = tracing::info_span!(
+                        "remote.node_manager.init_workspace_index",
+                        session_id = %session_id,
+                        cwd = %cwd_owned.display(),
+                    );
+                    tokio::spawn(
+                        async move {
+                            let root = crate::index::resolve_workspace_root(&cwd_owned);
+                            match manager_actor
+                                .ask(crate::index::GetOrCreate { root: root.clone() })
+                                .await
+                            {
+                                Ok(handle) => {
+                                    let _ = runtime_clone.workspace_handle.set(handle);
+                                    // Emit event so the local UI (via EventForwarder →
+                                    // EventRelayActor → local EventBus) learns the index
+                                    // is ready and can push FileIndex without polling.
+                                    config_clone.emit_event(
+                                        &session_id_for_index,
+                                        crate::events::AgentEventKind::WorkspaceIndexReady {
+                                            workspace_root: root.display().to_string(),
+                                        },
+                                    );
+                                }
+                                Err(e) => log::warn!("Failed to initialize workspace index: {}", e),
                             }
-                            Err(e) => log::warn!("Failed to initialize workspace index: {}", e),
                         }
-                    });
+                        .instrument(index_span),
+                    );
                 } else {
                     log::debug!(
                         "RemoteNodeManager: cwd {:?} does not exist on this node, skipping workspace index",
@@ -308,6 +350,11 @@ mod remote_impl {
     impl Message<ListRemoteSessions> for RemoteNodeManager {
         type Reply = Result<Vec<RemoteSessionInfo>, AgentError>;
 
+        #[tracing::instrument(
+            name = "remote.node_manager.list_sessions",
+            skip(self, _ctx),
+            fields(count = tracing::field::Empty)
+        )]
         async fn handle(
             &mut self,
             _msg: ListRemoteSessions,
@@ -343,6 +390,7 @@ mod remote_impl {
                 });
             }
 
+            tracing::Span::current().record("count", infos.len());
             Ok(infos)
         }
     }
@@ -350,6 +398,11 @@ mod remote_impl {
     impl Message<DestroyRemoteSession> for RemoteNodeManager {
         type Reply = Result<(), AgentError>;
 
+        #[tracing::instrument(
+            name = "remote.node_manager.destroy_session",
+            skip(self, _ctx),
+            fields(session_id = %msg.session_id, found = tracing::field::Empty)
+        )]
         async fn handle(
             &mut self,
             msg: DestroyRemoteSession,
@@ -361,11 +414,13 @@ mod remote_impl {
             };
 
             if let Some(session_ref) = session_ref {
+                tracing::Span::current().record("found", true);
                 let _ = session_ref.shutdown().await;
                 self.session_meta.remove(&msg.session_id);
                 log::info!("RemoteNodeManager: destroyed session {}", msg.session_id);
                 Ok(())
             } else {
+                tracing::Span::current().record("found", false);
                 Err(AgentError::SessionNotFound {
                     session_id: msg.session_id.clone(),
                 })
@@ -376,6 +431,11 @@ mod remote_impl {
     impl Message<GetNodeInfo> for RemoteNodeManager {
         type Reply = Result<NodeInfo, AgentError>;
 
+        #[tracing::instrument(
+            name = "remote.node_manager.get_node_info",
+            skip(self, _ctx),
+            fields(hostname = tracing::field::Empty, active_sessions = tracing::field::Empty)
+        )]
         async fn handle(
             &mut self,
             _msg: GetNodeInfo,
@@ -388,6 +448,10 @@ mod remote_impl {
                 registry.len()
             };
 
+            tracing::Span::current()
+                .record("hostname", &hostname)
+                .record("active_sessions", active_sessions);
+
             Ok(NodeInfo {
                 hostname,
                 capabilities: vec!["shell".to_string(), "filesystem".to_string()],
@@ -399,6 +463,11 @@ mod remote_impl {
     impl Message<ListAvailableModels> for RemoteNodeManager {
         type Reply = Result<Vec<AvailableModel>, AgentError>;
 
+        #[tracing::instrument(
+            name = "remote.node_manager.list_models",
+            skip(self, _ctx),
+            fields(provider_count = tracing::field::Empty, model_count = tracing::field::Empty)
+        )]
         async fn handle(
             &mut self,
             _msg: ListAvailableModels,
@@ -408,8 +477,10 @@ mod remote_impl {
             registry.load_all_plugins().await;
 
             let mut models = Vec::new();
+            let factories = registry.list();
+            tracing::Span::current().record("provider_count", factories.len());
 
-            for factory in registry.list() {
+            for factory in factories {
                 let provider_name = factory.name().to_string();
 
                 // For HTTP providers, require a valid API key
@@ -490,6 +561,7 @@ mod remote_impl {
                 }
             }
 
+            tracing::Span::current().record("model_count", models.len());
             Ok(models)
         }
     }

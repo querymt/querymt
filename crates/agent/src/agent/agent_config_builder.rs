@@ -71,9 +71,16 @@ impl AgentConfigBuilder {
         store: Arc<dyn SessionStore>,
         initial_config: LLMParams,
     ) -> Self {
-        let provider = Arc::new(SessionProvider::new(plugin_registry, store, initial_config));
+        let provider = Arc::new(SessionProvider::new(
+            Arc::clone(&plugin_registry),
+            store,
+            initial_config,
+        ));
         let mut tool_registry = ToolRegistry::new();
         tool_registry.extend(crate::tools::builtins::all_builtin_tools());
+        tool_registry.add(Arc::new(crate::tools::builtins::SrgnTool::new(
+            plugin_registry,
+        )));
 
         Self {
             provider,

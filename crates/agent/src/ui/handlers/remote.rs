@@ -13,7 +13,7 @@ use super::super::ServerState;
 use super::super::connection::{send_error, send_message};
 use super::super::messages::UiServerMessage;
 #[cfg(feature = "remote")]
-use super::session_ops::{handle_get_file_index, handle_list_sessions};
+use super::session_ops::handle_list_sessions;
 use tokio::sync::mpsc;
 
 /// List remote nodes discovered in the kameo mesh.
@@ -156,25 +156,23 @@ pub async fn handle_create_remote_session(
                 )
                 .await;
 
-                handle_list_sessions(state, tx).await;
-
-                // Fetch the initial file index from the remote node so the UI
-                // has file listings immediately (remote sessions don't get a
-                // local workspace subscription).
-                //
-                // Spawn in the background with a small delay: the remote node's
-                // workspace index may still be initializing right after session
-                // creation.
-                {
-                    let state_fi = state.clone();
-                    let conn_id_fi = conn_id.to_string();
-                    let tx_fi = tx.clone();
-                    tokio::spawn(async move {
-                        // Give the remote workspace index time to build
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        handle_get_file_index(&state_fi, &conn_id_fi, &tx_fi).await;
-                    });
+                // Signal the UI that the workspace index is building.
+                // The UI will show "Loading files..." in the @ mention dropdown
+                // until WorkspaceIndexReady arrives via the event relay and the
+                // server pushes a FileIndex message reactively.
+                if cwd.is_some() {
+                    let _ = send_message(
+                        tx,
+                        UiServerMessage::WorkspaceIndexStatus {
+                            session_id: session_id.clone(),
+                            status: "building".to_string(),
+                            message: None,
+                        },
+                    )
+                    .await;
                 }
+
+                handle_list_sessions(state, tx).await;
 
                 log::info!(
                     "handle_create_remote_session: created session {} on node '{}'",
@@ -286,19 +284,21 @@ pub async fn handle_attach_remote_session(
         )
         .await;
 
-        handle_list_sessions(state, tx).await;
+        // Signal the UI that the workspace index may still be building on the
+        // remote node.  WorkspaceIndexReady (emitted by the remote node via its
+        // event bus) will flow through the EventForwarder → EventRelayActor →
+        // local EventBus chain and trigger a FileIndex push reactively.
+        let _ = send_message(
+            tx,
+            UiServerMessage::WorkspaceIndexStatus {
+                session_id: session_id.to_string(),
+                status: "building".to_string(),
+                message: None,
+            },
+        )
+        .await;
 
-        // Fetch the initial file index from the remote node (same rationale
-        // as handle_create_remote_session — no local workspace subscription).
-        {
-            let state_fi = state.clone();
-            let conn_id_fi = conn_id.to_string();
-            let tx_fi = tx.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                handle_get_file_index(&state_fi, &conn_id_fi, &tx_fi).await;
-            });
-        }
+        handle_list_sessions(state, tx).await;
 
         log::info!(
             "handle_attach_remote_session: attached session {} from node '{}'",

@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 // ── Wire types ────────────────────────────────────────────────────────────────
 
@@ -241,6 +242,11 @@ impl ProviderHostActor {
     }
 
     /// Resolve or build the provider for the given name + model.
+    #[tracing::instrument(
+        name = "remote.provider_host.get_or_build_provider",
+        skip(self),
+        fields(provider = %provider_name, model = %model, cache_hit = tracing::field::Empty)
+    )]
     async fn get_or_build_provider(
         &mut self,
         provider_name: &str,
@@ -249,8 +255,11 @@ impl ProviderHostActor {
         let key = (provider_name.to_string(), model.to_string());
 
         if let Some(cached) = self.provider_cache.get(&key) {
+            tracing::Span::current().record("cache_hit", true);
             return Ok(Arc::clone(cached));
         }
+
+        tracing::Span::current().record("cache_hit", false);
 
         let plugin_registry = self.config.provider.plugin_registry();
         let provider = build_provider_from_config(
@@ -280,6 +289,18 @@ impl ProviderHostActor {
 impl Message<ProviderChatRequest> for ProviderHostActor {
     type Reply = Result<ProviderChatResponse, AgentError>;
 
+    #[tracing::instrument(
+        name = "remote.provider_host.chat",
+        skip(self, _ctx),
+        fields(
+            provider = %msg.provider,
+            model = %msg.model,
+            message_count = msg.messages.len(),
+            has_tools = msg.tools.is_some(),
+            tool_calls_returned = tracing::field::Empty,
+            finish_reason = tracing::field::Empty,
+        )
+    )]
     async fn handle(
         &mut self,
         msg: ProviderChatRequest,
@@ -301,6 +322,10 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
 
         let tool_calls = response.tool_calls().unwrap_or_default();
         let finish_reason = response.finish_reason().map(|r| format!("{:?}", r));
+
+        tracing::Span::current()
+            .record("tool_calls_returned", tool_calls.len())
+            .record("finish_reason", finish_reason.as_deref().unwrap_or("none"));
 
         log::debug!(
             "ProviderHostActor: non-streaming call to {}/{} complete (tool_calls={}, finish={:?})",
@@ -325,6 +350,18 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
 impl Message<ProviderStreamRequest> for ProviderHostActor {
     type Reply = Result<(), AgentError>;
 
+    #[tracing::instrument(
+        name = "remote.provider_host.stream",
+        skip(self, _ctx),
+        fields(
+            provider = %msg.provider,
+            model = %msg.model,
+            message_count = msg.messages.len(),
+            has_tools = msg.tools.is_some(),
+            receiver_name = %msg.stream_receiver_name,
+            receiver_found = tracing::field::Empty,
+        )
+    )]
     async fn handle(
         &mut self,
         msg: ProviderStreamRequest,
@@ -347,61 +384,97 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
             })?;
 
         // Look up the StreamReceiverActor on the requesting node.
-        let receiver_ref = kameo::actor::RemoteActorRef::<StreamReceiverActor>::lookup(
-            msg.stream_receiver_name.clone(),
-        )
-        .await
-        .map_err(|e| AgentError::SwarmLookupFailed {
-            key: msg.stream_receiver_name.clone(),
-            reason: e.to_string(),
-        })?
-        .ok_or_else(|| AgentError::RemoteSessionNotFound {
-            details: format!(
-                "ProviderHostActor: stream receiver '{}' not found in DHT",
-                msg.stream_receiver_name
-            ),
-        })?;
+        let receiver_ref = {
+            let lookup_span = tracing::info_span!(
+                "remote.provider_host.stream.lookup_receiver",
+                receiver_name = %msg.stream_receiver_name,
+                found = tracing::field::Empty,
+            );
+            let result = kameo::actor::RemoteActorRef::<StreamReceiverActor>::lookup(
+                msg.stream_receiver_name.clone(),
+            )
+            .instrument(lookup_span.clone())
+            .await
+            .map_err(|e| AgentError::SwarmLookupFailed {
+                key: msg.stream_receiver_name.clone(),
+                reason: e.to_string(),
+            })
+            .and_then(|opt| {
+                opt.ok_or_else(|| AgentError::RemoteSessionNotFound {
+                    details: format!(
+                        "ProviderHostActor: stream receiver '{}' not found in DHT",
+                        msg.stream_receiver_name
+                    ),
+                })
+            });
+            lookup_span.record("found", result.is_ok());
+            result
+        }?;
+
+        tracing::Span::current().record("receiver_found", true);
 
         let provider_name = msg.provider.clone();
         let model = msg.model.clone();
         let receiver_name = msg.stream_receiver_name.clone();
 
         // Relay chunks asynchronously so this handler returns promptly.
-        tokio::spawn(async move {
-            let mut chunk_count = 0usize;
+        // Propagate the current span into the spawned task so chunk-level
+        // trace events appear as children of this handler span.
+        let relay_span = tracing::info_span!(
+            "remote.provider_host.stream.relay",
+            provider = %provider_name,
+            model = %model,
+            receiver_name = %receiver_name,
+            chunk_count = tracing::field::Empty,
+        );
+        tokio::spawn(
+            async move {
+                let mut chunk_count = 0usize;
+                let relay_start = std::time::Instant::now();
 
-            while let Some(chunk_result) = stream.next().await {
-                let relay = StreamChunkRelay {
-                    chunk: chunk_result.map_err(|e| e.to_string()),
-                };
+                while let Some(chunk_result) = stream.next().await {
+                    let relay = StreamChunkRelay {
+                        chunk: chunk_result.map_err(|e| e.to_string()),
+                    };
 
-                let is_done =
-                    matches!(relay.chunk, Ok(StreamChunk::Done { .. })) || relay.chunk.is_err();
+                    let is_done =
+                        matches!(relay.chunk, Ok(StreamChunk::Done { .. })) || relay.chunk.is_err();
 
-                if let Err(e) = receiver_ref.tell(&relay).send() {
-                    log::warn!(
-                        "ProviderHostActor: failed to relay chunk to '{}': {}",
-                        receiver_name,
-                        e
+                    if let Err(e) = receiver_ref.tell(&relay).send() {
+                        log::warn!(
+                            "ProviderHostActor: failed to relay chunk to '{}': {}",
+                            receiver_name,
+                            e
+                        );
+                        break;
+                    }
+
+                    chunk_count += 1;
+                    let elapsed_ms = relay_start.elapsed().as_millis();
+                    tracing::trace!(
+                        target: "remote::provider_host::stream",
+                        chunk_index = chunk_count,
+                        elapsed_ms,
+                        is_done,
+                        "chunk relayed"
                     );
-                    break;
+
+                    if is_done {
+                        break;
+                    }
                 }
 
-                chunk_count += 1;
-
-                if is_done {
-                    break;
-                }
+                tracing::Span::current().record("chunk_count", chunk_count);
+                log::debug!(
+                    "ProviderHostActor: streaming call to {}/{} complete ({} chunks relayed to '{}')",
+                    provider_name,
+                    model,
+                    chunk_count,
+                    receiver_name,
+                );
             }
-
-            log::debug!(
-                "ProviderHostActor: streaming call to {}/{} complete ({} chunks relayed to '{}')",
-                provider_name,
-                model,
-                chunk_count,
-                receiver_name,
-            );
-        });
+            .instrument(relay_span),
+        );
 
         Ok(())
     }

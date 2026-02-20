@@ -303,8 +303,18 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
             let local_peer_id = key.public().to_peer_id();
             let kameo_behaviour =
                 remote::Behaviour::new(local_peer_id, remote::messaging::Config::default());
-            let mdns_behaviour =
-                mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+            // Use a short TTL and query interval so disconnected peers are
+            // detected promptly (~30 s) rather than waiting for the 5-minute
+            // libp2p default. The query_interval drives how often we re-announce
+            // ourselves; ttl is how long peers are considered alive after their
+            // last announcement. Together these bound the stale-peer window to
+            // roughly ttl (30 s) after a crash rather than 5+ minutes.
+            let mdns_config = mdns::Config {
+                ttl: std::time::Duration::from_secs(30),
+                query_interval: std::time::Duration::from_secs(15),
+                ..mdns::Config::default()
+            };
+            let mdns_behaviour = mdns::tokio::Behaviour::new(mdns_config, local_peer_id)?;
             Ok(MeshBehaviour {
                 kameo: kameo_behaviour,
                 mdns: mdns_behaviour,

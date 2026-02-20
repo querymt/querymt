@@ -27,6 +27,7 @@ tools = [
   "question",
   # Code intelligence
 #  "semantic_edit",
+  "srgn",
   "web_fetch",
   "context7.*",
 ]

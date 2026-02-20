@@ -52,6 +52,15 @@ impl Message<RelayedEvent> for EventRelayActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.received += 1;
+        tracing::trace!(
+            target: "remote::event_relay",
+            source = %self.source_label,
+            received_count = self.received,
+            seq = msg.event.seq,
+            session_id = %msg.event.session_id,
+            kind = ?msg.event.kind,
+            "republishing relayed event to local bus"
+        );
         log::debug!(
             "EventRelayActor({}): received RelayedEvent #{} — \
              original_seq={} session={} kind={:?}",

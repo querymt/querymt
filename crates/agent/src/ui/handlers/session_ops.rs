@@ -27,7 +27,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
         }
     };
 
-    let groups: Vec<SessionGroup> = view
+    let mut groups: Vec<SessionGroup> = view
         .groups
         .into_iter()
         .map(|g| SessionGroup {
@@ -46,11 +46,57 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                     parent_session_id: s.parent_session_id,
                     fork_origin: s.fork_origin,
                     has_children: s.has_children,
-                    node: None, // local sessions
+                    node: None, // local sessions have no node label
                 })
                 .collect(),
         })
         .collect();
+
+    // Append in-memory remote sessions (not persisted to the local view store).
+    // Group them by peer_label so each remote node gets its own collapsible group.
+    #[cfg(feature = "remote")]
+    {
+        let remote = {
+            let registry = state.agent.registry.lock().await;
+            registry.remote_sessions()
+        };
+        if !remote.is_empty() {
+            let cwds = state.session_cwds.lock().await;
+
+            // Collect per-node groups: node_label -> Vec<SessionSummary>
+            let mut by_node: std::collections::HashMap<String, Vec<SessionSummary>> =
+                std::collections::HashMap::new();
+
+            for (session_id, peer_label) in remote {
+                let cwd = cwds.get(&session_id).map(|p| p.display().to_string());
+                by_node
+                    .entry(peer_label.clone())
+                    .or_default()
+                    .push(SessionSummary {
+                        session_id,
+                        name: None,
+                        cwd: cwd.clone(),
+                        title: None,
+                        created_at: None,
+                        updated_at: None,
+                        parent_session_id: None,
+                        fork_origin: None,
+                        has_children: false,
+                        node: Some(peer_label),
+                    });
+            }
+
+            for (node_label, sessions) in by_node {
+                // Use a synthetic cwd like "remote::<node>" so the group header
+                // is recognisable without requiring a real path.
+                groups.push(SessionGroup {
+                    cwd: Some(format!("remote::{}", node_label)),
+                    sessions,
+                    latest_activity: None,
+                });
+            }
+        }
+    }
 
     let _ = send_message(tx, UiServerMessage::SessionList { groups }).await;
 }

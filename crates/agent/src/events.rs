@@ -299,6 +299,13 @@ pub enum AgentEventKind {
         /// Which attempt is now being made
         attempt: usize,
     },
+    /// Emitted on the remote node once its workspace index has finished
+    /// building and is available via `GetFileIndex`.  Flows through the
+    /// EventForwarder → EventRelayActor → local EventBus chain so the
+    /// local UI server can react without polling.
+    WorkspaceIndexReady {
+        workspace_root: String,
+    },
 }
 
 #[async_trait]

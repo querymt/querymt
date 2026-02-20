@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { Command } from 'cmdk';
 import * as Popover from '@radix-ui/react-popover';
 import { RefreshCw, Search, X, ChevronRight, ChevronDown } from 'lucide-react';
@@ -110,7 +110,24 @@ export function ModelPickerPopover({
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedValue, setSelectedValue] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
+  const commandListRef = useRef<HTMLDivElement>(null);
   const { setModeModelPreference, focusMainInput } = useUiStore();
+
+  // When the popover opens, auto-select the current model in the recent section
+  // and scroll the list to the top so the Recent section is visible.
+  // When it closes, reset selection for a clean slate next time.
+  useEffect(() => {
+    if (open && currentProvider && currentModel) {
+      setSelectedValue(`${RECENT_PREFIX}${itemValue(currentProvider, currentModel)}`);
+      setTimeout(() => {
+        if (commandListRef.current) {
+          commandListRef.current.scrollTop = 0;
+        }
+      }, 0);
+    } else if (!open) {
+      setSelectedValue('');
+    }
+  }, [open, currentProvider, currentModel]);
 
   const targetAgents = useMemo(
     () => agents.filter((agent) => sessionsByAgent[agent.id]),
@@ -219,7 +236,7 @@ export function ModelPickerPopover({
       <Popover.Trigger asChild>
         <button
           type="button"
-          className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-surface-border bg-surface-canvas/60 text-xs text-ui-secondary hover:border-accent-primary/60 hover:text-accent-primary transition-colors max-w-[320px]"
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-surface-border bg-surface-canvas/60 text-xs text-ui-secondary hover:border-accent-primary/60 hover:text-accent-primary transition-colors w-[20rem] flex-shrink-0"
           title={triggerTitle}
         >
           <span className="truncate">{triggerLabel}</span>
@@ -316,7 +333,7 @@ export function ModelPickerPopover({
             </div>
 
             {/* Model list */}
-            <Command.List className="flex-1 overflow-y-auto px-1 py-1 max-h-[240px]">
+            <Command.List ref={commandListRef} className="flex-1 overflow-y-auto px-1 py-1 max-h-[240px]">
               {allModels.length === 0 ? (
                 <Command.Loading className="px-3 py-6 text-center text-xs text-ui-muted">
                   Loading models...

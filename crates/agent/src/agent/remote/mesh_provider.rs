@@ -33,6 +33,7 @@ use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
 use std::pin::Pin;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 use uuid::Uuid;
 
 // ── MeshChatProvider ──────────────────────────────────────────────────────────
@@ -76,10 +77,16 @@ impl MeshChatProvider {
     }
 
     /// Resolve the remote `ProviderHostActor` ref from the DHT.
+    #[tracing::instrument(
+        name = "remote.mesh_provider.dht_lookup",
+        skip(self),
+        fields(dht_name = %self.target_dht_name, found = tracing::field::Empty)
+    )]
     async fn lookup_provider_host(
         &self,
     ) -> Result<kameo::actor::RemoteActorRef<ProviderHostActor>, LLMError> {
-        self.mesh
+        let result = self
+            .mesh
             .lookup_actor::<ProviderHostActor>(&self.target_dht_name)
             .await
             .map_err(|e| {
@@ -93,7 +100,9 @@ impl MeshChatProvider {
                     "MeshChatProvider: provider host '{}' not found in DHT (is the node online?)",
                     self.target_dht_name
                 ))
-            })
+            });
+        tracing::Span::current().record("found", result.is_ok());
+        result
     }
 }
 
@@ -105,6 +114,17 @@ impl ChatProvider for MeshChatProvider {
         true
     }
 
+    #[tracing::instrument(
+        name = "remote.mesh_provider.chat",
+        skip(self, messages, tools),
+        fields(
+            provider = %self.provider_name,
+            model = %self.model,
+            target_node = %self.target_dht_name,
+            message_count = messages.len(),
+            has_tools = tools.is_some(),
+        )
+    )]
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -137,6 +157,18 @@ impl ChatProvider for MeshChatProvider {
         Ok(Box::new(chat_response))
     }
 
+    #[tracing::instrument(
+        name = "remote.mesh_provider.chat_stream.setup",
+        skip(self, messages, tools),
+        fields(
+            provider = %self.provider_name,
+            model = %self.model,
+            target_node = %self.target_dht_name,
+            message_count = messages.len(),
+            has_tools = tools.is_some(),
+            request_id = tracing::field::Empty,
+        )
+    )]
     async fn chat_stream_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -153,15 +185,23 @@ impl ChatProvider for MeshChatProvider {
         // ── 2. Spawn the ephemeral StreamReceiverActor on the local node ──────
         let request_id = Uuid::now_v7().to_string();
         let stream_rx_name = format!("stream_rx::{}", request_id);
+        tracing::Span::current().record("request_id", &request_id);
 
-        let receiver_actor = StreamReceiverActor::new(tx, stream_rx_name.clone());
-        let receiver_ref = StreamReceiverActor::spawn(receiver_actor);
+        {
+            let reg_span = tracing::info_span!(
+                "remote.mesh_provider.dht_register_receiver",
+                stream_rx_name = %stream_rx_name,
+            );
+            let receiver_actor = StreamReceiverActor::new(tx, stream_rx_name.clone());
+            let receiver_ref = StreamReceiverActor::spawn(receiver_actor);
 
-        // Register in REMOTE_REGISTRY + DHT so the remote ProviderHostActor can
-        // send StreamChunkRelay messages back to us.
-        self.mesh
-            .register_actor(receiver_ref, stream_rx_name.clone())
-            .await;
+            // Register in REMOTE_REGISTRY + DHT so the remote ProviderHostActor can
+            // send StreamChunkRelay messages back to us.
+            self.mesh
+                .register_actor(receiver_ref, stream_rx_name.clone())
+                .instrument(reg_span)
+                .await;
+        }
 
         log::debug!(
             "MeshChatProvider: registered StreamReceiverActor as '{}' for {}/{}",
@@ -207,14 +247,38 @@ impl ChatProvider for MeshChatProvider {
         let timed = tokio_stream::StreamExt::timeout(raw_stream, STREAM_CHUNK_TIMEOUT);
 
         let stream_rx_name_for_log = stream_rx_name.clone();
+        let provider_for_stream = self.provider_name.clone();
+        let model_for_stream = self.model.clone();
+        let target_for_stream = self.target_dht_name.clone();
+        let mut chunk_index: u64 = 0;
+        let stream_start = std::time::Instant::now();
+
         // Map the timeout wrapper to `Result<StreamChunk, LLMError>`.
         let stream = StreamExt::map(
             timed,
             move |timeout_result| -> Result<StreamChunk, LLMError> {
                 match timeout_result {
                     // Chunk arrived in time — map the inner string-error to LLMError.
-                    Ok(relay_result) => relay_result
-                        .map_err(|e| LLMError::ProviderError(format!("MeshChatProvider: {}", e))),
+                    Ok(relay_result) => {
+                        chunk_index += 1;
+                        let elapsed_ms = stream_start.elapsed().as_millis();
+                        let is_done =
+                            matches!(&relay_result, Ok(StreamChunk::Done { .. }) | Err(_));
+                        tracing::trace!(
+                            target: "remote::mesh_provider::stream",
+                            provider = %provider_for_stream,
+                            model = %model_for_stream,
+                            target_node = %target_for_stream,
+                            stream_rx = %stream_rx_name_for_log,
+                            chunk_index,
+                            elapsed_ms,
+                            is_done,
+                            "stream chunk received"
+                        );
+                        relay_result.map_err(|e| {
+                            LLMError::ProviderError(format!("MeshChatProvider: {}", e))
+                        })
+                    }
                     // No chunk arrived within the deadline — remote node may be down.
                     Err(_elapsed) => {
                         log::warn!(
@@ -279,6 +343,15 @@ impl LLMProvider for MeshChatProvider {}
 /// hostname without any DHT name-reverse-lookup.  The explicit `provider_node`
 /// path (Case 1) is the primary flow; this best-effort scan only runs when
 /// `provider_node` is `None`.
+#[tracing::instrument(
+    name = "remote.mesh_provider.find_on_mesh",
+    skip(mesh),
+    fields(
+        provider_name,
+        peers_checked = tracing::field::Empty,
+        found = tracing::field::Empty,
+    )
+)]
 pub(crate) async fn find_provider_on_mesh(
     mesh: &MeshHandle,
     provider_name: &str,
@@ -287,6 +360,7 @@ pub(crate) async fn find_provider_on_mesh(
     use crate::agent::remote::{ListAvailableModels, NodeInfo};
 
     let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>("node_manager");
+    let mut peers_checked: u32 = 0;
 
     while let Some(node_ref_result) = stream.next().await {
         let node_ref = match node_ref_result {
@@ -296,6 +370,9 @@ pub(crate) async fn find_provider_on_mesh(
                 continue;
             }
         };
+
+        peers_checked += 1;
+        tracing::Span::current().record("peers_checked", peers_checked);
 
         // Ask for available models first (cheaper filter).
         let models = match node_ref
@@ -331,8 +408,10 @@ pub(crate) async fn find_provider_on_mesh(
             provider_name,
             node_info.hostname
         );
+        tracing::Span::current().record("found", true);
         return Some(node_info.hostname);
     }
 
+    tracing::Span::current().record("found", false);
     None
 }

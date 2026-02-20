@@ -17,6 +17,7 @@ use crate::delegation::{AgentInfo, DefaultAgentRegistry};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 /// Result of a successful mesh setup from config.
 pub struct MeshSetupResult {
@@ -51,6 +52,17 @@ pub struct MeshSetupResult {
 /// [`DefaultAgentRegistry`] with one entry per reachable remote agent.
 /// Remote agents that are not reachable at startup are logged and skipped
 /// — they can be re-registered at runtime once the peer becomes available.
+#[tracing::instrument(
+    name = "remote.setup.setup_mesh_from_config",
+    skip(mesh_cfg, node_manager_ref, agent_config),
+    fields(
+        discovery = ?mesh_cfg.discovery,
+        listen = mesh_cfg.listen.as_deref().unwrap_or("<auto>"),
+        peer_count = mesh_cfg.peers.len(),
+        remote_agent_count = remotes.len(),
+        peer_id = tracing::field::Empty,
+    )
+)]
 pub async fn setup_mesh_from_config(
     mesh_cfg: &MeshTomlConfig,
     remotes: &[RemoteAgentConfig],
@@ -79,12 +91,22 @@ pub async fn setup_mesh_from_config(
             peers
         },
     };
+    let listen_addr_str = config.listen.as_deref().unwrap_or("<auto>").to_string();
 
     // ── 2. Bootstrap the libp2p swarm ─────────────────────────────────────────
 
-    let mesh = bootstrap_mesh(&config)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mesh = {
+        let bootstrap_span = tracing::info_span!(
+            "remote.setup.bootstrap_mesh",
+            listen = %listen_addr_str,
+            discovery = ?mesh_cfg.discovery,
+        );
+        bootstrap_mesh(&config)
+            .instrument(bootstrap_span)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+    };
+    tracing::Span::current().record("peer_id", mesh.peer_id().to_string());
     log::info!(
         "Phase 7: Kameo mesh bootstrapped (peer_id={})",
         mesh.peer_id()
@@ -93,7 +115,13 @@ pub async fn setup_mesh_from_config(
     // ── 3. Register the local RemoteNodeManager in the DHT (if provided) ──────
 
     if let Some(nm_ref) = node_manager_ref {
-        mesh.register_actor(nm_ref, "node_manager").await;
+        let reg_span = tracing::info_span!(
+            "remote.setup.register_node_manager",
+            dht_name = "node_manager"
+        );
+        mesh.register_actor(nm_ref, "node_manager")
+            .instrument(reg_span)
+            .await;
         log::info!("Phase 7: Local RemoteNodeManager registered in DHT as 'node_manager'");
     }
 
@@ -107,8 +135,16 @@ pub async fn setup_mesh_from_config(
 
         let actor = ProviderHostActor::new(config);
         let actor_ref = ProviderHostActor::spawn(actor);
-        mesh.register_actor(actor_ref.clone(), dht_name.clone())
-            .await;
+        {
+            let reg_span = tracing::info_span!(
+                "remote.setup.spawn_provider_host",
+                hostname = %hostname,
+                dht_name = %dht_name,
+            );
+            mesh.register_actor(actor_ref.clone(), dht_name.clone())
+                .instrument(reg_span)
+                .await;
+        }
         log::info!(
             "Phase 7: ProviderHostActor registered in DHT as '{}'",
             dht_name
@@ -178,6 +214,16 @@ pub async fn setup_mesh_from_config(
 
 /// Attempt to contact the peer's `RemoteNodeManager` and confirm the agent
 /// exists, then return an `AgentInfo` for registration.
+#[tracing::instrument(
+    name = "remote.setup.register_remote_agent",
+    skip(mesh, _peer_addr),
+    fields(
+        peer = %remote.peer,
+        agent_id = %remote.id,
+        reachable = tracing::field::Empty,
+        peer_hostname = tracing::field::Empty,
+    )
+)]
 async fn register_remote_agent(
     mesh: &MeshHandle,
     remote: &RemoteAgentConfig,
@@ -200,6 +246,9 @@ async fn register_remote_agent(
             // Confirm the peer is reachable by calling GetNodeInfo.
             match node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
                 Ok(node_info) => {
+                    tracing::Span::current()
+                        .record("reachable", true)
+                        .record("peer_hostname", &node_info.hostname);
                     log::debug!(
                         "Phase 7: Peer '{}' reachable (hostname='{}')",
                         remote.peer,
@@ -207,6 +256,7 @@ async fn register_remote_agent(
                     );
                 }
                 Err(e) => {
+                    tracing::Span::current().record("reachable", false);
                     log::debug!(
                         "Phase 7: GetNodeInfo failed for peer '{}': {} (registering anyway)",
                         remote.peer,
@@ -216,6 +266,7 @@ async fn register_remote_agent(
             }
         }
         Ok(Ok(None)) => {
+            tracing::Span::current().record("reachable", false);
             log::debug!(
                 "Phase 7: Peer '{}' not yet in DHT; registering remote agent '{}' speculatively",
                 remote.peer,
@@ -223,6 +274,7 @@ async fn register_remote_agent(
             );
         }
         Ok(Err(e)) => {
+            tracing::Span::current().record("reachable", false);
             log::debug!(
                 "Phase 7: DHT lookup error for peer '{}': {} (registering speculatively)",
                 remote.peer,
@@ -230,6 +282,7 @@ async fn register_remote_agent(
             );
         }
         Err(_timeout) => {
+            tracing::Span::current().record("reachable", false);
             log::debug!(
                 "Phase 7: DHT lookup timed out for peer '{}' (registering speculatively)",
                 remote.peer,
@@ -311,6 +364,17 @@ impl RemoteAgentStub {
     }
 
     /// Create a remote session and return (session_id, SessionActorRef::Remote).
+    #[tracing::instrument(
+        name = "remote.setup.stub.get_or_create_session",
+        skip(self),
+        fields(
+            peer_label = %self.peer_label,
+            agent_id = %self.agent_id,
+            cwd = cwd.as_deref().unwrap_or("<none>"),
+            session_id = tracing::field::Empty,
+            cache_hit = tracing::field::Empty,
+        )
+    )]
     async fn get_or_create_session(
         &self,
         cwd: Option<String>,
@@ -320,8 +384,12 @@ impl RemoteAgentStub {
         let mut guard = self.session.lock().await;
 
         if let Some((session_id, session_ref)) = guard.as_ref() {
+            tracing::Span::current()
+                .record("cache_hit", true)
+                .record("session_id", session_id.as_str());
             return Ok((session_id.clone(), session_ref.clone()));
         }
+        tracing::Span::current().record("cache_hit", false);
 
         // Look up remote node manager.
         let node_manager_ref = self
@@ -360,6 +428,7 @@ impl RemoteAgentStub {
 
         let session_id = resp.session_id;
         let actor_id = resp.actor_id;
+        tracing::Span::current().record("session_id", &session_id);
 
         // Resolve the remote SessionActorRef via DHT name.
         let dht_name = format!("session::{}", session_id);

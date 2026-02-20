@@ -287,6 +287,14 @@ impl GitSnapshotBackend {
 
         let mut changed_files = Vec::new();
         for change in &changes {
+            // Skip tree (directory) entries – we only care about file-level changes.
+            // gix's diff_tree_to_tree emits tree modifications for every ancestor
+            // directory whose hash changed; passing those paths to `restore_paths`
+            // would cause it to try to write a raw git tree object to a directory
+            // path on disk, which errors and aborts the entire restore.
+            if change.entry_mode().is_tree() {
+                continue;
+            }
             let location = change.location();
             if let Ok(path_str) = std::str::from_utf8(location.as_ref()) {
                 changed_files.push(PathBuf::from(path_str));
@@ -318,6 +326,13 @@ impl GitSnapshotBackend {
             })?;
 
             if let Some(entry) = entry {
+                // Defense-in-depth: skip tree (directory) entries.
+                // `diff_commits` already filters these out, but callers may pass
+                // directory paths directly; trying to write a tree object to a
+                // directory path on disk would fail and abort the whole restore.
+                if entry.mode().is_tree() {
+                    continue;
+                }
                 let object = entry.object().map_err(|e| {
                     SnapshotError::Repository(format!("Failed to get blob object: {}", e))
                 })?;
@@ -1104,6 +1119,86 @@ mod tests {
         assert_eq!(
             restored_data, binary_data,
             "Binary content should roundtrip correctly"
+        );
+    }
+
+    // ==================== Regression tests: directory path handling ====================
+
+    /// Regression: diff() must return only file paths, not intermediate directory paths.
+    ///
+    /// gix's diff_tree_to_tree emits change entries for every ancestor tree whose
+    /// hash changed (e.g. "src", "src/foo") in addition to the actual file
+    /// ("src/foo/bar.rs"). Passing those directory paths to restore_paths causes it
+    /// to try to write raw git tree object bytes to a directory path on disk, which
+    /// fails and aborts the entire undo operation.
+    #[tokio::test]
+    async fn test_diff_nested_returns_only_files() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        let nested_dir = tmpdir.path().join("src/foo");
+        fs::create_dir_all(&nested_dir).unwrap();
+        fs::write(nested_dir.join("bar.rs"), "initial").unwrap();
+
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot1 = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(nested_dir.join("bar.rs"), "modified").unwrap();
+        let snapshot2 = backend.track(tmpdir.path()).await.unwrap();
+
+        let diff = backend
+            .diff(tmpdir.path(), &snapshot1, &snapshot2)
+            .await
+            .unwrap();
+
+        // Must only contain the file path, not intermediate directories "src" or "src/foo"
+        assert_eq!(
+            diff.len(),
+            1,
+            "diff should return exactly one entry (the file), got: {:?}",
+            diff
+        );
+        assert_eq!(
+            diff[0],
+            PathBuf::from("src/foo/bar.rs"),
+            "diff should identify src/foo/bar.rs"
+        );
+    }
+
+    /// Regression: restore_paths must not error when directory paths are included.
+    ///
+    /// Even after the fix to diff(), external callers could pass directory paths.
+    /// The defensive check in checkout_paths must skip them gracefully so that
+    /// actual file paths in the same batch are still restored.
+    #[tokio::test]
+    async fn test_restore_paths_with_directory_path_does_not_error() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpbase = TempDir::new().unwrap();
+
+        let src_dir = tmpdir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("main.rs"), "original").unwrap();
+
+        let backend = GitSnapshotBackend::with_snapshot_base(tmpbase.path().to_path_buf());
+        let snapshot = backend.track(tmpdir.path()).await.unwrap();
+
+        fs::write(src_dir.join("main.rs"), "modified").unwrap();
+
+        // Pass both the directory path "src" AND the file path – previously this
+        // caused restore_paths to error on "src" before reaching "src/main.rs".
+        backend
+            .restore_paths(
+                tmpdir.path(),
+                &snapshot,
+                &[PathBuf::from("src"), PathBuf::from("src/main.rs")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(src_dir.join("main.rs")).unwrap(),
+            "original",
+            "file should be restored even when directory paths are included in the list"
         );
     }
 }
