@@ -519,13 +519,15 @@ pub async fn handle_rpc_message<S: SendAgent>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::AgentEventKind;
+    use crate::events::{AgentEventKind, EventOrigin};
 
     fn tool_start_event(tool_name: &str, arguments: serde_json::Value) -> AgentEvent {
         AgentEvent {
             seq: 1,
             timestamp: 0,
             session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::ToolCallStart {
                 tool_call_id: "tc-1".to_string(),
                 tool_name: tool_name.to_string(),
@@ -539,6 +541,8 @@ mod tests {
             seq: 2,
             timestamp: 0,
             session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::ToolCallEnd {
                 tool_call_id: "tc-1".to_string(),
                 tool_name: tool_name.to_string(),
@@ -600,6 +604,8 @@ mod tests {
             seq: 1,
             timestamp: 0,
             session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::ToolCallStart {
                 tool_call_id: "tc-1".to_string(),
                 tool_name: "todowrite".to_string(),

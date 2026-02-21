@@ -103,18 +103,15 @@ impl SessionActor {
 
     /// Sends a session update notification to the client.
     #[allow(dead_code)]
-    pub(crate) fn send_session_update(&self, session_id: &str, update: SessionUpdate) {
+    pub(crate) async fn send_session_update(&self, session_id: &str, update: SessionUpdate) {
         if let Some(ref bridge) = self.bridge {
             let notification = agent_client_protocol::SessionNotification::new(
                 agent_client_protocol::SessionId::from(session_id.to_string()),
                 update,
             );
-            let bridge = bridge.clone();
-            tokio::spawn(async move {
-                if let Err(e) = bridge.notify(notification).await {
-                    log::debug!("Failed to send session update: {}", e);
-                }
-            });
+            if let Err(e) = bridge.notify(notification).await {
+                log::debug!("Failed to send session update: {}", e);
+            }
         }
     }
 
@@ -1097,7 +1094,7 @@ async fn execute_prompt_detached(
         session_handle,
         tool_config,
     )
-    .with_cancellation_token(cancel_token);
+    .with_cancellation_token(cancel_token.clone());
 
     // 4. Store User Messages
     // Keep separate projections for user-visible events vs LLM replay context.
@@ -1107,17 +1104,22 @@ async fn execute_prompt_detached(
     let user_text = format_prompt_user_text_only(&req.prompt);
 
     for block in &req.prompt {
+        if cancel_token.is_cancelled() {
+            break;
+        }
         if let Some(ref bridge) = bridge {
             let notification = agent_client_protocol::SessionNotification::new(
                 agent_client_protocol::SessionId::from(session_id.clone()),
                 SessionUpdate::UserMessageChunk(ContentChunk::new(block.clone())),
             );
-            let bridge = bridge.clone();
-            tokio::spawn(async move {
-                if let Err(e) = bridge.notify(notification).await {
-                    log::debug!("Failed to send session update: {}", e);
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                res = bridge.notify(notification) => {
+                    if let Err(e) = res {
+                        log::debug!("Failed to send session update: {}", e);
+                    }
                 }
-            });
+            }
         }
     }
 

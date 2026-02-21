@@ -570,7 +570,9 @@ pub(super) async fn transition_after_llm(
             SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
                 TextContent::new(response.content.clone()),
             ))),
-        );
+            Some(&exec_ctx.cancellation_token),
+        )
+        .await;
         parts.push(MessagePart::Text {
             content: response.content.clone(),
         });

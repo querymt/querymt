@@ -1216,6 +1216,8 @@ impl EventStore for SqliteStorage {
                         seq: row.get(0)?,
                         timestamp: row.get(1)?,
                         session_id: row.get(2)?,
+                        origin: crate::events::EventOrigin::Local,
+                        source_node: None,
                         kind,
                     })
                 })?
@@ -1251,6 +1253,8 @@ impl EventStore for SqliteStorage {
                         seq: row.get(0)?,
                         timestamp: row.get(1)?,
                         session_id: row.get(2)?,
+                        origin: crate::events::EventOrigin::Local,
+                        source_node: None,
                         kind,
                     })
                 })?

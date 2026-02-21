@@ -29,12 +29,40 @@ use kameo::actor::ActorRef;
 use querymt::LLMParams;
 use std::any::Any;
 use std::sync::{Arc, Mutex as StdMutex};
+#[cfg(feature = "remote")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, broadcast};
+#[cfg(feature = "remote")]
+use tokio::sync::{RwLock, Semaphore};
 
 /// Lightweight facade replacing `Arc<QueryMTAgent>` for all consumers.
 ///
 /// Holds shared config, the kameo session registry, and connection-level
 /// mutable state. Not an actor — just a convenient bundle.
+#[cfg(feature = "remote")]
+#[derive(Clone, Debug)]
+struct CachedNodeEntry {
+    info: crate::agent::remote::NodeInfo,
+    expires_at: std::time::Instant,
+}
+
+#[cfg(feature = "remote")]
+#[derive(Debug)]
+struct RemoteNodeMetadataCache {
+    by_label: RwLock<std::collections::HashMap<String, CachedNodeEntry>>,
+    invalidation_task_started: AtomicBool,
+}
+
+#[cfg(feature = "remote")]
+impl RemoteNodeMetadataCache {
+    fn new() -> Self {
+        Self {
+            by_label: RwLock::new(std::collections::HashMap::new()),
+            invalidation_task_started: AtomicBool::new(false),
+        }
+    }
+}
+
 pub struct AgentHandle {
     pub config: Arc<AgentConfig>,
     pub registry: Arc<Mutex<SessionRegistry>>,
@@ -52,6 +80,9 @@ pub struct AgentHandle {
     /// so startup code can set it on the shared `Arc<AgentHandle>`.
     #[cfg(feature = "remote")]
     pub mesh: StdMutex<Option<crate::agent::remote::MeshHandle>>,
+
+    #[cfg(feature = "remote")]
+    remote_node_cache: Arc<RemoteNodeMetadataCache>,
 }
 
 impl AgentHandle {
@@ -70,6 +101,8 @@ impl AgentHandle {
             default_mode: StdMutex::new(crate::agent::core::AgentMode::Build),
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),
+            #[cfg(feature = "remote")]
+            remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
         }
     }
 
@@ -346,69 +379,181 @@ impl AgentHandle {
     }
 
     #[cfg(feature = "remote")]
+    fn remote_node_info_timeout() -> std::time::Duration {
+        let default_ms = 3_000_u64;
+        let timeout_ms = std::env::var("QUERYMT_REMOTE_NODE_INFO_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_ms);
+        std::time::Duration::from_millis(timeout_ms)
+    }
+
+    #[cfg(feature = "remote")]
+    fn remote_node_lookup_parallelism() -> usize {
+        std::env::var("QUERYMT_REMOTE_NODE_LOOKUP_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(8)
+    }
+
+    #[cfg(feature = "remote")]
+    fn remote_node_cache_ttl() -> std::time::Duration {
+        let default_ms = 10_000_u64;
+        let ttl_ms = std::env::var("QUERYMT_REMOTE_NODE_CACHE_TTL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_ms);
+        std::time::Duration::from_millis(ttl_ms)
+    }
+
+    #[cfg(feature = "remote")]
+    fn peer_cache_key(peer_id: Option<libp2p::PeerId>, fallback_actor_id: u64) -> String {
+        if let Some(pid) = peer_id {
+            format!("peer:{pid}")
+        } else {
+            format!("actor:{fallback_actor_id}")
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    async fn get_cached_remote_node(&self, cache_key: &str) -> Option<crate::agent::remote::NodeInfo> {
+        let now = std::time::Instant::now();
+        if let Some(entry) = self.remote_node_cache.by_label.read().await.get(cache_key).cloned()
+            && entry.expires_at > now
+        {
+            return Some(entry.info);
+        }
+
+        let mut guard = self.remote_node_cache.by_label.write().await;
+        if let Some(entry) = guard.get(cache_key)
+            && entry.expires_at <= now
+        {
+            guard.remove(cache_key);
+        }
+        None
+    }
+
+    #[cfg(feature = "remote")]
+    async fn insert_cached_remote_node(&self, cache_key: String, info: crate::agent::remote::NodeInfo) {
+        let ttl = Self::remote_node_cache_ttl();
+        self.remote_node_cache.by_label.write().await.insert(
+            cache_key,
+            CachedNodeEntry {
+                info,
+                expires_at: std::time::Instant::now() + ttl,
+            },
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    fn ensure_remote_node_cache_invalidation_task(&self, mesh: &crate::agent::remote::MeshHandle) {
+        if self
+            .remote_node_cache
+            .invalidation_task_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let mut rx = mesh.subscribe_peer_events();
+        let cache = Arc::clone(&self.remote_node_cache);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(crate::agent::remote::mesh::PeerEvent::Discovered(peer_id))
+                    | Ok(crate::agent::remote::mesh::PeerEvent::Expired(peer_id)) => {
+                        let key = format!("peer:{peer_id}");
+                        cache.by_label.write().await.remove(&key);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        cache.invalidation_task_started.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "remote")]
     pub async fn list_remote_nodes(&self) -> Vec<crate::agent::remote::NodeInfo> {
         use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
-        use futures_util::StreamExt;
+        use futures_util::{StreamExt, stream::FuturesUnordered};
 
         let Some(mesh) = self.mesh() else {
             log::debug!("list_remote_nodes: mesh not bootstrapped");
             return Vec::new();
         };
 
+        self.ensure_remote_node_cache_invalidation_task(&mesh);
+
         let local_peer_id = *mesh.peer_id();
+        let timeout = Self::remote_node_info_timeout();
+        let concurrency = Self::remote_node_lookup_parallelism();
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+
         let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>("node_manager");
-        let mut nodes = Vec::new();
+        let mut lookups = FuturesUnordered::new();
+        let mut cached_nodes = Vec::new();
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(node_manager_ref) => {
-                    // Skip our own node — it is present in the DHT but is not
-                    // a remote peer from the local user's perspective.
                     let peer_id = node_manager_ref.id().peer_id().copied();
                     if peer_id == Some(local_peer_id) {
                         log::debug!("list_remote_nodes: skipping local node");
                         continue;
                     }
 
-                    // Skip peers that mDNS has expired but whose DHT records
-                    // haven't been purged yet.
-                    if let Some(pid) = peer_id {
-                        if !mesh.is_peer_alive(&pid) {
-                            log::debug!(
-                                "list_remote_nodes: skipping stale DHT record for peer {pid}"
-                            );
-                            continue;
-                        }
+                    if let Some(pid) = peer_id
+                        && !mesh.is_peer_alive(&pid)
+                    {
+                        let key = format!("peer:{pid}");
+                        self.remote_node_cache.by_label.write().await.remove(&key);
+                        log::debug!("list_remote_nodes: skipping stale DHT record for peer {pid}");
+                        continue;
                     }
 
-                    // Use a timeout to avoid blocking on a dead peer whose DHT
-                    // record somehow survived the known_peers filter.
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(3),
-                        node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
-                    )
-                    .await
-                    {
-                        Ok(Ok(info)) => {
-                            log::debug!("list_remote_nodes: found node '{}'", info.hostname);
-                            nodes.push(info);
-                        }
-                        Ok(Err(e)) => {
-                            log::warn!("list_remote_nodes: GetNodeInfo failed: {}", e)
-                        }
-                        Err(_) => {
-                            log::warn!(
-                                "list_remote_nodes: GetNodeInfo timed out for peer {:?}",
-                                peer_id
-                            );
-                        }
+                    let cache_key = Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                    if let Some(info) = self.get_cached_remote_node(&cache_key).await {
+                        cached_nodes.push(info);
+                        continue;
                     }
+
+                    let semaphore = Arc::clone(&semaphore);
+                    lookups.push(async move {
+                        let permit = semaphore.acquire_owned().await.ok();
+                        let res = tokio::time::timeout(timeout, node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo)).await;
+                        drop(permit);
+                        (cache_key, peer_id, res)
+                    });
                 }
                 Err(e) => log::warn!("list_remote_nodes: lookup error: {}", e),
             }
         }
 
-        nodes
+        let mut fetched_nodes = Vec::new();
+        while let Some((cache_key, peer_id, result)) = lookups.next().await {
+            match result {
+                Ok(Ok(info)) => {
+                    self.insert_cached_remote_node(cache_key, info.clone()).await;
+                    fetched_nodes.push(info);
+                }
+                Ok(Err(e)) => {
+                    log::warn!("list_remote_nodes: GetNodeInfo failed: {}", e);
+                }
+                Err(_) => {
+                    log::warn!("list_remote_nodes: GetNodeInfo timed out for peer {:?}", peer_id);
+                }
+            }
+        }
+
+        cached_nodes.extend(fetched_nodes);
+        cached_nodes
     }
 
     /// Find a `RemoteNodeManager` by its node label (hostname).
@@ -424,60 +569,73 @@ impl AgentHandle {
         agent_client_protocol::Error,
     > {
         use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
-        use futures_util::StreamExt;
+        use futures_util::{StreamExt, stream::FuturesUnordered};
 
         use crate::error::AgentError;
         let mesh = self
             .mesh()
             .ok_or_else(|| agent_client_protocol::Error::from(AgentError::MeshNotBootstrapped))?;
 
+        self.ensure_remote_node_cache_invalidation_task(&mesh);
+
         let local_peer_id = *mesh.peer_id();
+        let timeout = Self::remote_node_info_timeout();
+        let concurrency = Self::remote_node_lookup_parallelism();
+        let semaphore = Arc::new(Semaphore::new(concurrency));
         let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>("node_manager");
+        let mut lookups = FuturesUnordered::new();
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(node_manager_ref) => {
-                    // Never return our own node manager — the caller is looking
-                    // for a genuinely remote peer.
                     let peer_id = node_manager_ref.id().peer_id().copied();
                     if peer_id == Some(local_peer_id) {
                         continue;
                     }
-                    // Skip stale DHT records for expired peers.
-                    if let Some(pid) = peer_id {
-                        if !mesh.is_peer_alive(&pid) {
-                            log::debug!(
-                                "find_node_manager: skipping stale DHT record for peer {pid}"
-                            );
-                            continue;
-                        }
-                    }
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(3),
-                        node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
-                    )
-                    .await
+                    if let Some(pid) = peer_id
+                        && !mesh.is_peer_alive(&pid)
                     {
-                        Ok(Ok(info)) if info.hostname == label => {
+                        let key = format!("peer:{pid}");
+                        self.remote_node_cache.by_label.write().await.remove(&key);
+                        log::debug!("find_node_manager: skipping stale DHT record for peer {pid}");
+                        continue;
+                    }
+
+                    let cache_key = Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                    if let Some(info) = self.get_cached_remote_node(&cache_key).await {
+                        if info.hostname == label {
                             return Ok(node_manager_ref);
                         }
-                        Ok(Ok(_)) => continue,
-                        Ok(Err(e)) => {
-                            log::warn!("find_node_manager: GetNodeInfo failed: {}", e);
-                            continue;
-                        }
-                        Err(_) => {
-                            log::warn!(
-                                "find_node_manager: GetNodeInfo timed out for peer {:?}",
-                                peer_id
-                            );
-                            continue;
-                        }
+                        continue;
                     }
+
+                    let semaphore = Arc::clone(&semaphore);
+                    lookups.push(async move {
+                        let permit = semaphore.acquire_owned().await.ok();
+                        let res = tokio::time::timeout(timeout, node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo)).await;
+                        drop(permit);
+                        (node_manager_ref, cache_key, peer_id, res)
+                    });
                 }
                 Err(e) => {
                     log::warn!("find_node_manager: lookup error: {}", e);
-                    continue;
+                }
+            }
+        }
+
+        while let Some((node_manager_ref, cache_key, peer_id, result)) = lookups.next().await {
+            match result {
+                Ok(Ok(info)) => {
+                    self.insert_cached_remote_node(cache_key, info.clone()).await;
+                    if info.hostname == label {
+                        return Ok(node_manager_ref);
+                    }
+                }
+                Ok(Err(e)) => {
+                    log::warn!("find_node_manager: GetNodeInfo failed: {}", e);
+                }
+                Err(_) => {
+                    log::warn!("find_node_manager: GetNodeInfo timed out for peer {:?}", peer_id);
                 }
             }
         }
@@ -1090,5 +1248,36 @@ mod tests {
         // With no auth_methods configured, any method id is accepted
         let result = f.handle.authenticate(req).await;
         assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn test_remote_node_cache_expires_stale_entries() {
+        let f = HandleFixture::new().await;
+        let cache_key = "peer:test-peer".to_string();
+
+        f.handle.remote_node_cache.by_label.write().await.insert(
+            cache_key.clone(),
+            CachedNodeEntry {
+                info: crate::agent::remote::NodeInfo {
+                    hostname: "node-a".to_string(),
+                    capabilities: vec!["shell".to_string()],
+                    active_sessions: 1,
+                },
+                expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            },
+        );
+
+        let expired = f.handle.get_cached_remote_node(&cache_key).await;
+        assert!(expired.is_none());
+        assert!(!f.handle.remote_node_cache.by_label.read().await.contains_key(&cache_key));
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn test_remote_node_lookup_config_defaults() {
+        assert_eq!(AgentHandle::remote_node_info_timeout().as_millis(), 3000);
+        assert_eq!(AgentHandle::remote_node_lookup_parallelism(), 8);
+        assert_eq!(AgentHandle::remote_node_cache_ttl().as_millis(), 10000);
     }
 }

@@ -1,4 +1,4 @@
-use crate::events::{AgentEvent, AgentEventKind, EventObserver};
+use crate::events::{AgentEvent, AgentEventKind, EventObserver, EventOrigin};
 use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -72,6 +72,24 @@ impl EventBus {
     /// Publish an event to all subscribers and observers.
     pub fn publish(&self, session_id: &str, kind: AgentEventKind) {
         let event = self.build_event(session_id, kind);
+        self.publish_raw(event);
+    }
+
+    /// Publish a fully materialized event without changing seq/timestamp.
+    pub fn publish_raw(&self, event: AgentEvent) {
+        self.bump_sequence_after_raw(event.seq);
+        self.dispatch_event(event);
+    }
+
+    /// Shutdown the event bus and abort all pending observer tasks.
+    pub async fn shutdown(&self) {
+        log::debug!("EventBus: Shutting down and aborting all observer tasks");
+        let mut tasks = self.observer_tasks.lock().await;
+        tasks.shutdown().await;
+        log::debug!("EventBus: All observer tasks aborted");
+    }
+
+    fn dispatch_event(&self, event: AgentEvent) {
         let _ = self.sender.send(event.clone());
 
         let observers = {
@@ -96,12 +114,20 @@ impl EventBus {
         });
     }
 
-    /// Shutdown the event bus and abort all pending observer tasks.
-    pub async fn shutdown(&self) {
-        log::debug!("EventBus: Shutting down and aborting all observer tasks");
-        let mut tasks = self.observer_tasks.lock().await;
-        tasks.shutdown().await;
-        log::debug!("EventBus: All observer tasks aborted");
+    fn bump_sequence_after_raw(&self, seq: u64) {
+        let min_next = seq.saturating_add(1);
+        let mut current = self.sequence.load(Ordering::Relaxed);
+        while current < min_next {
+            match self.sequence.compare_exchange_weak(
+                current,
+                min_next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     fn build_event(&self, session_id: &str, kind: AgentEventKind) -> AgentEvent {
@@ -109,6 +135,8 @@ impl EventBus {
             seq: self.sequence.fetch_add(1, Ordering::Relaxed),
             timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
             session_id: session_id.to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind,
         }
     }
@@ -123,7 +151,7 @@ impl Default for EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::AgentEventKind;
+    use crate::events::{AgentEventKind, EventOrigin};
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -263,6 +291,53 @@ mod tests {
         assert_eq!(event1.seq, 1);
         assert_eq!(event2.seq, 2);
         assert_eq!(event3.seq, 3);
+    }
+
+    #[tokio::test]
+    async fn publish_raw_preserves_seq_and_timestamp() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        let raw = AgentEvent {
+            seq: 42,
+            timestamp: 1_700_000_000,
+            session_id: "sess-raw".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionCreated,
+        };
+
+        bus.publish_raw(raw.clone());
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.seq, 42);
+        assert_eq!(received.timestamp, 1_700_000_000);
+        assert_eq!(received.session_id, "sess-raw");
+        assert!(matches!(received.origin, EventOrigin::Local));
+        assert!(received.source_node.is_none());
+        assert!(matches!(received.kind, AgentEventKind::SessionCreated));
+    }
+
+    #[tokio::test]
+    async fn publish_after_publish_raw_uses_next_sequence() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        bus.publish_raw(AgentEvent {
+            seq: 100,
+            timestamp: 123,
+            session_id: "sess-raw".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionCreated,
+        });
+        bus.publish("sess-raw", AgentEventKind::Cancelled);
+
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+
+        assert_eq!(first.seq, 100);
+        assert_eq!(second.seq, 101);
     }
 
     #[tokio::test]

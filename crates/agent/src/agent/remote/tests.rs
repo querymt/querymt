@@ -13,7 +13,7 @@ use crate::agent::remote::SessionActorRef;
 use crate::agent::session_actor::SessionActor;
 use crate::agent::session_registry::SessionRegistry;
 use crate::event_bus::EventBus;
-use crate::events::{AgentEvent, AgentEventKind};
+use crate::events::{AgentEvent, AgentEventKind, EventOrigin};
 use crate::session::backend::StorageBackend;
 use crate::session::sqlite_storage::SqliteStorage;
 use kameo::actor::Spawn;
@@ -270,12 +270,16 @@ mod event_relay_extended {
                 seq: 1,
                 timestamp: 100,
                 session_id: "s1".to_string(),
+                origin: EventOrigin::Local,
+                source_node: None,
                 kind: AgentEventKind::SessionCreated,
             },
             AgentEvent {
                 seq: 2,
                 timestamp: 200,
                 session_id: "s1".to_string(),
+                origin: EventOrigin::Local,
+                source_node: None,
                 kind: AgentEventKind::PromptReceived {
                     content: "hello".to_string(),
                     message_id: None,
@@ -285,6 +289,8 @@ mod event_relay_extended {
                 seq: 3,
                 timestamp: 300,
                 session_id: "s1".to_string(),
+                origin: EventOrigin::Local,
+                source_node: None,
                 kind: AgentEventKind::LlmRequestStart { message_count: 5 },
             },
         ];
@@ -298,13 +304,15 @@ mod event_relay_extended {
                 .expect("tell should succeed");
         }
 
-        // Receive all 3 events
+        // Receive all 3 events with original metadata intact.
         for expected_event in &events {
             let received = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
                 .await
                 .expect("should receive within timeout")
                 .expect("recv should succeed");
 
+            assert_eq!(received.seq, expected_event.seq);
+            assert_eq!(received.timestamp, expected_event.timestamp);
             assert_eq!(received.session_id, expected_event.session_id);
         }
     }
@@ -321,6 +329,8 @@ mod event_relay_extended {
             seq: 99,
             timestamp: 555,
             session_id: "unique-session-id-xyz".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::SessionCreated,
         };
 
@@ -351,6 +361,8 @@ mod event_relay_extended {
             seq: 7,
             timestamp: 777,
             session_id: "s1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::Error {
                 message: "test error".to_string(),
             },
@@ -388,12 +400,16 @@ mod event_relay_extended {
             seq: 1,
             timestamp: 100,
             session_id: "session-a".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::SessionCreated,
         };
         let event_b = AgentEvent {
             seq: 2,
             timestamp: 200,
             session_id: "session-b".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::SessionCreated,
         };
 

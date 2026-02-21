@@ -7,7 +7,7 @@
 //! and other local observers.
 
 use crate::event_bus::EventBus;
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, EventOrigin};
 use kameo::Actor;
 use kameo::message::{Context, Message};
 use serde::{Deserialize, Serialize};
@@ -71,11 +71,13 @@ impl Message<RelayedEvent> for EventRelayActor {
             msg.event.kind,
         );
 
-        // Republish the event on the local event bus
-        // The event already has its original session_id, seq, timestamp, and kind
-        // We just need to publish the kind under the original session_id
-        self.local_event_bus
-            .publish(&msg.event.session_id, msg.event.kind);
+        // Republish full event object with remote provenance metadata.
+        let mut event = msg.event;
+        event.origin = EventOrigin::Remote;
+        if event.source_node.is_none() {
+            event.source_node = Some(self.source_label.clone());
+        }
+        self.local_event_bus.publish_raw(event);
     }
 }
 
@@ -97,6 +99,8 @@ mod tests {
             seq: 42,
             timestamp: 1234567890,
             session_id: "test-session".to_string(),
+            origin: EventOrigin::Remote,
+            source_node: Some("remote-a".to_string()),
             kind: crate::events::AgentEventKind::SessionCreated,
         };
 
@@ -113,7 +117,11 @@ mod tests {
             .expect("Should receive event within timeout")
             .expect("Should successfully receive event");
 
+        assert_eq!(received.seq, 42);
+        assert_eq!(received.timestamp, 1234567890);
         assert_eq!(received.session_id, "test-session");
+        assert!(matches!(received.origin, EventOrigin::Remote));
+        assert_eq!(received.source_node.as_deref(), Some("remote-a"));
         assert!(matches!(
             received.kind,
             crate::events::AgentEventKind::SessionCreated

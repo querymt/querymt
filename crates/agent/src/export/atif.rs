@@ -552,7 +552,7 @@ impl ATIF {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::AgentEventKind;
+    use crate::events::{AgentEventKind, EventOrigin};
 
     // ── ATIF struct serialization ──────────────────────────────────────────
 
@@ -606,6 +606,8 @@ mod tests {
                 seq: 1,
                 timestamp: 1234567890,
                 session_id: "sess-1".to_string(),
+                origin: EventOrigin::Local,
+                source_node: None,
                 kind: AgentEventKind::PromptReceived {
                     content: "test prompt".to_string(),
                     message_id: None,
@@ -615,12 +617,16 @@ mod tests {
                 seq: 2,
                 timestamp: 1234567891,
                 session_id: "sess-1".to_string(),
+                origin: EventOrigin::Local,
+                source_node: None,
                 kind: AgentEventKind::LlmRequestStart { message_count: 1 },
             },
             AgentEvent {
                 seq: 3,
                 timestamp: 1234567892,
                 session_id: "sess-1".to_string(),
+                origin: EventOrigin::Local,
+                source_node: None,
                 kind: AgentEventKind::ToolCallStart {
                     tool_call_id: "call-1".to_string(),
                     tool_name: "read_file".to_string(),
@@ -631,6 +637,8 @@ mod tests {
                 seq: 4,
                 timestamp: 1234567893,
                 session_id: "sess-1".to_string(),
+                origin: EventOrigin::Local,
+                source_node: None,
                 kind: AgentEventKind::LlmRequestEnd {
                     usage: None,
                     tool_calls: 1,
@@ -810,12 +818,16 @@ mod tests {
                 seq: 1,
                 timestamp: 1234567890,
                 session_id: "sess-1".to_string(),
+                origin: EventOrigin::Local,
+                source_node: None,
                 kind: AgentEventKind::LlmRequestStart { message_count: 1 },
             },
             AgentEvent {
                 seq: 2,
                 timestamp: 1234567891,
                 session_id: "sess-1".to_string(),
+                origin: EventOrigin::Local,
+                source_node: None,
                 kind: AgentEventKind::LlmRequestEnd {
                     usage: Some(querymt::Usage {
                         input_tokens: 100,

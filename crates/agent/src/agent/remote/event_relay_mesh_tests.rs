@@ -16,7 +16,7 @@ mod event_relay_mesh_tests {
     use crate::agent::remote::test_helpers::fixtures::{AgentConfigFixture, get_test_mesh};
     use crate::agent::session_actor::SessionActor;
     use crate::event_bus::EventBus;
-    use crate::events::{AgentEvent, AgentEventKind};
+    use crate::events::{AgentEvent, AgentEventKind, EventOrigin};
     use kameo::actor::Spawn;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -72,6 +72,8 @@ mod event_relay_mesh_tests {
             seq: 1,
             timestamp: 1000,
             session_id: "s-f1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::SessionCreated,
         };
 
@@ -84,6 +86,8 @@ mod event_relay_mesh_tests {
             .expect("recv");
 
         assert_eq!(received.session_id, "s-f1");
+        assert!(matches!(received.origin, EventOrigin::Remote));
+        assert_eq!(received.source_node.as_deref(), Some("f1"));
         assert!(matches!(received.kind, AgentEventKind::SessionCreated));
     }
 
@@ -114,6 +118,8 @@ mod event_relay_mesh_tests {
                 seq: i,
                 timestamp: i as i64 * 100,
                 session_id: "s-f2".to_string(),
+                origin: EventOrigin::Local,
+                source_node: None,
                 kind: AgentEventKind::SessionCreated,
             };
             forwarder.on_event(&event).await.expect("on_event");
@@ -128,8 +134,9 @@ mod event_relay_mesh_tests {
             received_seqs.push(evt.seq);
         }
 
-        // The EventBus re-sequences events; just verify we got 5.
-        assert_eq!(received_seqs.len(), 5, "expected 5 events on local bus");
+        // Relayed events should retain original sequence numbers end-to-end.
+        received_seqs.sort_unstable();
+        assert_eq!(received_seqs, vec![1, 2, 3, 4, 5]);
     }
 
     // ── F.3 ──────────────────────────────────────────────────────────────────
@@ -153,6 +160,8 @@ mod event_relay_mesh_tests {
                         seq: i,
                         timestamp: 0,
                         session_id: "s-f3".to_string(),
+                        origin: EventOrigin::Local,
+                        source_node: None,
                         kind: AgentEventKind::SessionCreated,
                     },
                 })

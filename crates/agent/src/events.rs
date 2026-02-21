@@ -69,11 +69,51 @@ pub struct SessionLimits {
     pub max_cost_usd: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EventOrigin {
+    #[default]
+    Local,
+    Remote,
+    Unknown(String),
+}
+
+impl Serialize for EventOrigin {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value = match self {
+            EventOrigin::Local => "local",
+            EventOrigin::Remote => "remote",
+            EventOrigin::Unknown(other) => other.as_str(),
+        };
+        serializer.serialize_str(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for EventOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "local" => EventOrigin::Local,
+            "remote" => EventOrigin::Remote,
+            _ => EventOrigin::Unknown(value),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub seq: u64,
     pub timestamp: i64,
     pub session_id: String,
+    #[serde(default)]
+    pub origin: EventOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node: Option<String>,
     pub kind: AgentEventKind,
 }
 
@@ -452,7 +492,23 @@ mod tests {
         assert_eq!(json["message"], "test error");
     }
 
-    // ── AgentEvent clone + debug ───────────────────────────────────────────
+    // ── EventOrigin serialization/compatibility ────────────────────────────
+
+    #[test]
+    fn event_origin_deserializes_unknown_value_to_unknown_variant() {
+        let origin: EventOrigin = serde_json::from_str("\"mesh_bridge\"").unwrap();
+        assert_eq!(origin, EventOrigin::Unknown("mesh_bridge".to_string()));
+    }
+
+    #[test]
+    fn event_origin_serializes_unknown_value_verbatim() {
+        let origin = EventOrigin::Unknown("mesh_bridge".to_string());
+        let json = serde_json::to_string(&origin).unwrap();
+        assert_eq!(json, "\"mesh_bridge\"");
+    }
+
+     // ── AgentEvent clone + debug ───────────────────────────────────────────
+
 
     #[test]
     fn agent_event_implements_clone() {
@@ -460,6 +516,8 @@ mod tests {
             seq: 1,
             timestamp: 1234567890,
             session_id: "sess-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::SessionCreated,
         };
         let cloned = original.clone();
@@ -473,6 +531,8 @@ mod tests {
             seq: 42,
             timestamp: 1234567890,
             session_id: "sess-debug".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::Cancelled,
         };
         let debug_str = format!("{:?}", event);
