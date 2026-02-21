@@ -3,6 +3,7 @@ use crate::session::domain::{DelegationStatus, TaskStatus};
 use crate::session::store::SessionStore;
 use async_trait::async_trait;
 use log::{debug, trace};
+use parking_lot::Mutex;
 use std::sync::Arc;
 
 /// Middleware that auto-completes tasks when:
@@ -174,7 +175,7 @@ impl MiddlewareDriver for TaskAutoCompletionMiddleware {
 /// Helps prevent agents from calling the same tool repeatedly with identical arguments
 pub struct DuplicateToolCallMiddleware {
     store: Arc<dyn SessionStore>,
-    last_check: std::sync::Mutex<std::collections::HashMap<String, usize>>, // session_id -> last_checked_history_len
+    last_check: Mutex<std::collections::HashMap<String, usize>>, // session_id -> last_checked_history_len
 }
 
 impl DuplicateToolCallMiddleware {
@@ -182,7 +183,7 @@ impl DuplicateToolCallMiddleware {
         debug!("Creating DuplicateToolCallMiddleware");
         Self {
             store,
-            last_check: std::sync::Mutex::new(std::collections::HashMap::new()),
+            last_check: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -196,7 +197,7 @@ impl DuplicateToolCallMiddleware {
         };
 
         // Track last check to avoid re-checking same history
-        let mut last_check = self.last_check.lock().unwrap();
+        let mut last_check = self.last_check.lock();
         let last_checked_len = last_check.get(session_id).copied().unwrap_or(0);
 
         if history.len() <= last_checked_len {
@@ -282,7 +283,7 @@ impl MiddlewareDriver for DuplicateToolCallMiddleware {
 
     fn reset(&self) {
         debug!("DuplicateToolCallMiddleware::reset - clearing last_check cache");
-        let mut last_check = self.last_check.lock().unwrap();
+        let mut last_check = self.last_check.lock();
         last_check.clear();
     }
 
@@ -331,11 +332,11 @@ mod tests {
         let m = DuplicateToolCallMiddleware::new(Arc::new(mock));
         // Add something to last_check to test clearing
         {
-            let mut cache = m.last_check.lock().unwrap();
+            let mut cache = m.last_check.lock();
             cache.insert("sess-1".to_string(), 5);
         }
         m.reset();
-        let cache = m.last_check.lock().unwrap();
+        let cache = m.last_check.lock();
         assert!(cache.is_empty(), "reset() should clear the cache");
     }
 

@@ -21,6 +21,7 @@ use std::fs;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
+use tokio::time::Duration;
 use uuid::Uuid;
 
 /// Helper to capture messages sent by the handler
@@ -224,6 +225,85 @@ async fn test_undo_handler_single_agent() -> Result<()> {
         fs::read_to_string(worktree.path().join("test.txt"))?,
         "original"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_send_state_concurrent_calls_complete() -> Result<()> {
+    let (registry, _config_dir) = empty_plugin_registry()?;
+    let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
+
+    let builder = AgentConfigBuilder::new(
+        Arc::new(registry),
+        storage.session_store(),
+        LLMParams::new().provider("mock").model("mock"),
+    );
+    builder.add_observer(storage.event_observer());
+
+    let config = Arc::new(builder.build());
+    let handle = Arc::new(crate::agent::AgentHandle::from_config(config));
+
+    let state = super::ServerState {
+        agent: handle,
+        view_store: storage,
+        default_cwd: None,
+        event_sources: vec![],
+        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
+            crate::index::WorkspaceIndexManagerConfig::default(),
+        ),
+        model_cache: moka::future::Cache::new(100),
+        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
+    };
+
+    {
+        let mut connections = state.connections.lock().await;
+        connections.insert(
+            "conn-1".to_string(),
+            super::ConnectionState {
+                routing_mode: crate::ui::messages::RoutingMode::Single,
+                active_agent_id: super::session::PRIMARY_AGENT_ID.to_string(),
+                sessions: std::collections::HashMap::new(),
+                subscribed_sessions: std::collections::HashSet::new(),
+                current_workspace_root: None,
+            },
+        );
+    }
+
+    let (tx, mut rx) = mpsc::channel(32);
+    let first = tokio::spawn({
+        let state = state.clone();
+        let tx = tx.clone();
+        async move { super::connection::send_state(&state, "conn-1", &tx).await }
+    });
+    let second = tokio::spawn({
+        let state = state.clone();
+        let tx = tx.clone();
+        async move { super::connection::send_state(&state, "conn-1", &tx).await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let _ = tokio::join!(first, second);
+    })
+    .await
+    .expect("concurrent send_state calls should not block");
+
+    let mut state_messages = 0;
+    for _ in 0..2 {
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("expected a state message")
+            .expect("state sender dropped unexpectedly");
+        let json: serde_json::Value = serde_json::from_str(&msg)?;
+        if json["type"] == "state" {
+            state_messages += 1;
+        }
+    }
+    assert_eq!(state_messages, 2, "expected two state messages");
 
     Ok(())
 }

@@ -1,7 +1,8 @@
 use crate::events::{AgentEvent, AgentEventKind, EventObserver};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
 use tokio::task;
 use tokio::task::JoinSet;
@@ -11,9 +12,9 @@ const EVENT_BUS_BUFFER: usize = 1024;
 /// Unified event bus for broadcasting agent events.
 pub struct EventBus {
     sender: broadcast::Sender<AgentEvent>,
-    observers: Arc<StdMutex<Vec<Arc<dyn EventObserver>>>>,
+    observers: Arc<Mutex<Vec<Arc<dyn EventObserver>>>>,
     sequence: AtomicU64,
-    observer_tasks: Arc<Mutex<JoinSet<()>>>,
+    observer_tasks: Arc<TokioMutex<JoinSet<()>>>,
 }
 
 impl EventBus {
@@ -22,9 +23,9 @@ impl EventBus {
         let (sender, _) = broadcast::channel(EVENT_BUS_BUFFER);
         Self {
             sender,
-            observers: Arc::new(StdMutex::new(Vec::new())),
+            observers: Arc::new(Mutex::new(Vec::new())),
             sequence: AtomicU64::new(1),
-            observer_tasks: Arc::new(Mutex::new(JoinSet::new())),
+            observer_tasks: Arc::new(TokioMutex::new(JoinSet::new())),
         }
     }
 
@@ -35,21 +36,17 @@ impl EventBus {
 
     /// Register an event observer.
     pub fn add_observer(&self, observer: Arc<dyn EventObserver>) {
-        if let Ok(mut observers) = self.observers.lock() {
-            observers.push(observer);
-        }
+        self.observers.lock().push(observer);
     }
 
     /// Register multiple observers.
     pub fn add_observers(&self, observers: Vec<Arc<dyn EventObserver>>) {
-        if let Ok(mut list) = self.observers.lock() {
-            list.extend(observers);
-        }
+        self.observers.lock().extend(observers);
     }
 
     /// Return the number of currently registered observers.
     pub fn observer_count(&self) -> usize {
-        self.observers.lock().map(|l| l.len()).unwrap_or(0)
+        self.observers.lock().len()
     }
 
     /// Publish an event to all subscribers and observers.
@@ -57,13 +54,7 @@ impl EventBus {
         let event = self.build_event(session_id, kind);
         let _ = self.sender.send(event.clone());
 
-        let observers = {
-            if let Ok(list) = self.observers.lock() {
-                list.clone()
-            } else {
-                Vec::new()
-            }
-        };
+        let observers = { self.observers.lock().clone() };
 
         // Spawn observer tasks and track them for cleanup
         let tasks = self.observer_tasks.clone();

@@ -97,6 +97,10 @@ impl TestHarness {
             .returning(|_| Ok(None))
             .times(0..);
         store
+            .expect_get_session_provider_node()
+            .returning(|_| Ok(None))
+            .times(0..);
+        store
             .expect_add_message()
             .returning(|_, _| Ok(()))
             .times(0..);
@@ -111,6 +115,10 @@ impl TestHarness {
         store
             .expect_list_delegations()
             .returning(|_| Ok(vec![]))
+            .times(0..);
+        store
+            .expect_mark_tool_results_compacted()
+            .returning(|_, _| Ok(0))
             .times(0..);
         store
             .expect_create_delegation()

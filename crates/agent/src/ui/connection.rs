@@ -128,8 +128,12 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
 
     // Try to get mode from active session actor, fall back to default_mode
     let agent_mode = if let Some(ref session_id) = active_session_id {
-        let registry = state.agent.registry.lock().await;
-        if let Some(session_ref) = registry.get(session_id) {
+        let session_ref = {
+            let registry = state.agent.registry.lock().await;
+            registry.get(session_id).cloned()
+        };
+
+        if let Some(session_ref) = session_ref {
             match session_ref.get_mode().await {
                 Ok(m) => m,
                 Err(_) => state
@@ -438,8 +442,12 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                         // still visible after expiry.
                         let available_hostnames: HashSet<&str> =
                             nodes.iter().map(|n| n.hostname.as_str()).collect();
-                        let registry = state.agent.registry.lock().await;
-                        for (session_id, peer_label) in registry.remote_sessions() {
+                        let remote_sessions = {
+                            let registry = state.agent.registry.lock().await;
+                            registry.remote_sessions()
+                        };
+
+                        for (session_id, peer_label) in remote_sessions {
                             if !available_hostnames.contains(peer_label.as_str()) {
                                 match state.agent.get_session_llm_config(&session_id).await {
                                     Ok(Some(config)) => {
@@ -480,7 +488,6 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                                 }
                             }
                         }
-                        drop(registry);
 
                         let msg = UiServerMessage::RemoteNodes {
                             nodes: nodes
@@ -599,17 +606,17 @@ pub async fn subscribe_to_file_index(
     // This ensures new subscribers get the current state immediately.
     if let Some(current_index) = handle.file_index() {
         // Get current session's cwd to filter the index
-        let cwd = {
+        let session_id = {
             let connections = state.connections.lock().await;
-            let conn = connections.get(&conn_id);
-            let session_id = conn.and_then(|c| c.sessions.get(&c.active_agent_id).cloned());
-
-            if let Some(session_id) = session_id {
-                let cwds = state.session_cwds.lock().await;
-                cwds.get(&session_id).cloned()
-            } else {
-                None
-            }
+            connections
+                .get(&conn_id)
+                .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
+        };
+        let cwd = if let Some(session_id) = session_id {
+            let cwds = state.session_cwds.lock().await;
+            cwds.get(&session_id).cloned()
+        } else {
+            None
         };
 
         if let Some(cwd) = cwd
@@ -642,7 +649,7 @@ pub async fn subscribe_to_file_index(
     tokio::spawn(async move {
         while let Ok(index) = index_rx.recv().await {
             // Get the current session's cwd to filter the index appropriately
-            let (_session_id, cwd) = {
+            let session_id = {
                 let connections = state.connections.lock().await;
                 let conn = match connections.get(&conn_id) {
                     Some(conn) => conn,
@@ -656,20 +663,20 @@ pub async fn subscribe_to_file_index(
                     }
                 };
 
-                let session_id = conn.sessions.get(&conn.active_agent_id).cloned();
+                conn.sessions.get(&conn.active_agent_id).cloned()
+            };
 
-                let session_id = match session_id {
-                    Some(id) => id,
-                    None => continue, // No active session, skip this update
-                };
+            let session_id = match session_id {
+                Some(id) => id,
+                None => continue, // No active session, skip this update
+            };
 
+            let cwd = {
                 let cwds = state.session_cwds.lock().await;
-                let cwd = match cwds.get(&session_id).cloned() {
+                match cwds.get(&session_id).cloned() {
                     Some(cwd) => cwd,
                     None => continue, // No cwd for this session, skip
-                };
-
-                (session_id, cwd)
+                }
             };
 
             // Filter the index to the session's cwd

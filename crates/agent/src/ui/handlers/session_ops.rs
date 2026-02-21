@@ -437,8 +437,11 @@ pub async fn handle_set_agent_mode(
             };
 
             let previous_mode = if let Some(ref session_id) = session_id {
-                let registry = state.agent.registry.lock().await;
-                if let Some(session_ref) = registry.get(session_id) {
+                let session_ref = {
+                    let registry = state.agent.registry.lock().await;
+                    registry.get(session_id).cloned()
+                };
+                if let Some(session_ref) = session_ref {
                     session_ref.get_mode().await.ok()
                 } else {
                     None
@@ -460,8 +463,11 @@ pub async fn handle_set_agent_mode(
             }
 
             let mode_set_on_actor = if let Some(ref session_id) = session_id {
-                let registry = state.agent.registry.lock().await;
-                if let Some(session_ref) = registry.get(session_id) {
+                let session_ref = {
+                    let registry = state.agent.registry.lock().await;
+                    registry.get(session_id).cloned()
+                };
+                if let Some(session_ref) = session_ref {
                     match session_ref.set_mode(new_mode).await {
                         Ok(_) => {
                             log::info!(
@@ -528,8 +534,12 @@ pub async fn handle_get_agent_mode(state: &ServerState, conn_id: &str, tx: &mpsc
     };
 
     let mode = if let Some(session_id) = session_id {
-        let registry = state.agent.registry.lock().await;
-        if let Some(session_ref) = registry.get(&session_id) {
+        let session_ref = {
+            let registry = state.agent.registry.lock().await;
+            registry.get(&session_id).cloned()
+        };
+
+        if let Some(session_ref) = session_ref {
             match session_ref.get_mode().await {
                 Ok(m) => m,
                 Err(_) => state

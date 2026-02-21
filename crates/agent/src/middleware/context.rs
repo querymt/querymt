@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use log::{debug, trace, warn};
+use parking_lot::Mutex;
 use std::sync::Arc;
 
 use super::{ExecutionState, MiddlewareDriver, Result};
@@ -83,8 +84,8 @@ impl ContextConfig {
 /// Middleware that handles context warnings and optional auto-compaction
 pub struct ContextMiddleware {
     config: ContextConfig,
-    warned_sessions: std::sync::Mutex<std::collections::HashSet<Arc<str>>>,
-    last_model: std::sync::Mutex<Option<(String, String)>>, // (provider, model)
+    warned_sessions: Mutex<std::collections::HashSet<Arc<str>>>,
+    last_model: Mutex<Option<(String, String)>>, // (provider, model)
 }
 
 impl ContextMiddleware {
@@ -95,8 +96,8 @@ impl ContextMiddleware {
         );
         Self {
             config,
-            warned_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
-            last_model: std::sync::Mutex::new(None),
+            warned_sessions: Mutex::new(std::collections::HashSet::new()),
+            last_model: Mutex::new(None),
         }
     }
 
@@ -124,12 +125,12 @@ impl ContextMiddleware {
 
     /// Check if provider changed and reset state if needed
     fn check_provider_changed(&self, context: &ConversationContext) {
-        let mut last = self.last_model.lock().unwrap();
+        let mut last = self.last_model.lock();
         let current = (context.provider.to_string(), context.model.to_string());
 
         if last.as_ref() != Some(&current) {
             // Provider changed - reset warned sessions
-            let mut warned = self.warned_sessions.lock().unwrap();
+            let mut warned = self.warned_sessions.lock();
             warned.clear();
             *last = Some(current.clone());
             debug!(
@@ -149,7 +150,7 @@ impl ContextMiddleware {
             return None;
         }
 
-        let mut warned = self.warned_sessions.lock().unwrap();
+        let mut warned = self.warned_sessions.lock();
         if warned.contains(session_id) {
             return None;
         }
@@ -239,9 +240,9 @@ impl MiddlewareDriver for ContextMiddleware {
 
     fn reset(&self) {
         debug!("ContextMiddleware::reset - clearing warned sessions and model cache");
-        let mut warned = self.warned_sessions.lock().unwrap();
+        let mut warned = self.warned_sessions.lock();
         warned.clear();
-        let mut last = self.last_model.lock().unwrap();
+        let mut last = self.last_model.lock();
         *last = None;
     }
 
@@ -790,7 +791,6 @@ mod tests {
                 .middleware
                 .warned_sessions
                 .lock()
-                .unwrap()
                 .contains(&session_id)
         );
 
@@ -803,7 +803,6 @@ mod tests {
                 .middleware
                 .warned_sessions
                 .lock()
-                .unwrap()
                 .contains(&session_id)
         );
     }
@@ -823,13 +822,13 @@ mod tests {
             }));
 
         // Verify it was set
-        assert!(fixture.middleware.last_model.lock().unwrap().is_some());
+        assert!(fixture.middleware.last_model.lock().is_some());
 
         // Reset
         fixture.middleware.reset();
 
         // Verify it was cleared
-        assert!(fixture.middleware.last_model.lock().unwrap().is_none());
+        assert!(fixture.middleware.last_model.lock().is_none());
     }
 
     #[test]
@@ -912,7 +911,6 @@ mod tests {
                 .middleware
                 .warned_sessions
                 .lock()
-                .unwrap()
                 .is_empty()
         );
 
@@ -924,7 +922,6 @@ mod tests {
                 .middleware
                 .warned_sessions
                 .lock()
-                .unwrap()
                 .is_empty()
         );
     }
@@ -944,12 +941,12 @@ mod tests {
 
         let session_id: Arc<str> = "test".into();
         fixture.middleware.should_warn(&session_id, 8000, 10000);
-        let warned_count_before = fixture.middleware.warned_sessions.lock().unwrap().len();
+        let warned_count_before = fixture.middleware.warned_sessions.lock().len();
 
         // Check same provider again
         fixture.middleware.check_provider_changed(&ctx1);
 
-        let warned_count_after = fixture.middleware.warned_sessions.lock().unwrap().len();
+        let warned_count_after = fixture.middleware.warned_sessions.lock().len();
 
         assert_eq!(
             warned_count_before, warned_count_after,

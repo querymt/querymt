@@ -9521,6 +9521,7 @@ dependencies = [
  "moka",
  "notify",
  "once_cell",
+ "parking_lot",
  "patchkit",
  "pathdiff",
  "querymt",

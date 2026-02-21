@@ -240,11 +240,10 @@ mod tests {
             "semantic_edit tool should be registered"
         );
 
-        // Verify count matches
-        assert_eq!(
-            registered_names.len(),
-            all_tools.len(),
-            "Number of registered tools should match all_builtin_tools()"
+        // Experimental tools may be registered outside all_builtin_tools().
+        assert!(
+            registered_names.len() >= all_tools.len(),
+            "Registered tool count should include at least all_builtin_tools()"
         );
     }
 }

@@ -6,6 +6,7 @@ use crate::middleware::{
 use crate::model_info::{ModelInfoSource, get_model_info};
 use async_trait::async_trait;
 use log::{debug, trace};
+use parking_lot::Mutex;
 use querymt::providers::ModelPricing;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -94,7 +95,7 @@ impl LimitsConfig {
 /// - **Price**: Calculates cumulative cost based on token usage
 pub struct LimitsMiddleware {
     config: LimitsConfig,
-    last_model: std::sync::Mutex<Option<(String, String)>>,
+    last_model: Mutex<Option<(String, String)>>,
 }
 
 impl LimitsMiddleware {
@@ -106,7 +107,7 @@ impl LimitsMiddleware {
 
         Self {
             config,
-            last_model: std::sync::Mutex::new(None),
+            last_model: Mutex::new(None),
         }
     }
 
@@ -140,7 +141,7 @@ impl LimitsMiddleware {
 
     /// Check if provider changed (for logging/debugging)
     fn check_provider_changed(&self, context: &ConversationContext) {
-        let mut last = self.last_model.lock().unwrap();
+        let mut last = self.last_model.lock();
         let current = (context.provider.to_string(), context.model.to_string());
 
         if last.as_ref() != Some(&current) {
@@ -224,7 +225,7 @@ impl MiddlewareDriver for LimitsMiddleware {
 
     fn reset(&self) {
         trace!("LimitsMiddleware::reset");
-        let mut last = self.last_model.lock().unwrap();
+        let mut last = self.last_model.lock();
         *last = None;
     }
 
