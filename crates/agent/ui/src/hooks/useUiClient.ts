@@ -37,6 +37,34 @@ type UndoState = {
   frontierMessageId?: string;
 } | null;
 
+function findLiveAccumulatorIndex(
+  events: EventItem[],
+  messageId: string | undefined,
+  agentId: string
+): number {
+  if (messageId) {
+    const matchByMessageId = [...events].reverse().findIndex(
+      e => e.streamMessageId === messageId && e.isStreamDelta
+    );
+    if (matchByMessageId >= 0) {
+      return events.length - 1 - matchByMessageId;
+    }
+  }
+
+  const matchByAgent = [...events].reverse().findIndex(
+    e => e.isStreamDelta && e.agentId === agentId
+  );
+  return matchByAgent >= 0 ? events.length - 1 - matchByAgent : -1;
+}
+
+function nonEmptyString(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? value : undefined;
+}
+
 function buildUndoStateFromServerStack(
   undoStack: UndoStackFrame[],
   previousState: UndoState,
@@ -275,6 +303,27 @@ export function useUiClient() {
       }
       case 'event': {
         const eventKind = msg.event?.kind?.type ?? msg.event?.kind?.type_name;
+
+        if (
+          eventKind === 'llm_request_start' ||
+          eventKind === 'llm_request_end' ||
+          eventKind === 'assistant_thinking_delta' ||
+          eventKind === 'assistant_content_delta' ||
+          eventKind === 'assistant_message_stored'
+        ) {
+          const rawContent = msg.event?.kind?.content;
+          const contentLen = typeof rawContent === 'string' ? rawContent.length : 0;
+          console.debug('[useUiClient] stream event received', {
+            session_id: msg.session_id,
+            agent_id: msg.agent_id,
+            seq: msg.event?.seq,
+            event_kind: eventKind,
+            message_id: msg.event?.kind?.message_id,
+            content_len: contentLen,
+            has_thinking: typeof msg.event?.kind?.thinking === 'string' && msg.event.kind.thinking.length > 0,
+            finish_reason: msg.event?.kind?.finish_reason,
+          });
+        }
         
         // Track LLM thinking state per session
         if (eventKind === 'llm_request_start') {
@@ -421,11 +470,7 @@ export function useUiClient() {
           setEventsBySession(prev => {
             const next = new Map(prev);
             const existing = next.get(msg.session_id) ?? [];
-            // Find the existing live accumulator for this message_id
-            const liveIdx = [...existing].reverse().findIndex(
-              e => e.streamMessageId === messageId && e.isStreamDelta
-            );
-            const realLiveIdx = liveIdx >= 0 ? existing.length - 1 - liveIdx : -1;
+            const realLiveIdx = findLiveAccumulatorIndex(existing, messageId, msg.agent_id);
 
             if (realLiveIdx >= 0) {
               const updated = [...existing];
@@ -442,9 +487,24 @@ export function useUiClient() {
                 };
               }
               next.set(msg.session_id, updated);
+              console.debug('[useUiClient] stream delta merged', {
+                session_id: msg.session_id,
+                event_kind: eventKind,
+                message_id: messageId,
+                live_index: realLiveIdx,
+                existing_len: existing.length,
+                new_content_len: updated[realLiveIdx].content.length,
+                new_thinking_len: (updated[realLiveIdx].thinking ?? '').length,
+              });
             } else {
               // First delta for this message — create the live accumulator entry
               next.set(msg.session_id, [...existing, translated]);
+              console.debug('[useUiClient] stream delta created live accumulator', {
+                session_id: msg.session_id,
+                event_kind: eventKind,
+                message_id: messageId,
+                existing_len: existing.length,
+              });
             }
             return next;
           });
@@ -458,23 +518,37 @@ export function useUiClient() {
           setEventsBySession(prev => {
             const next = new Map(prev);
             const existing = next.get(msg.session_id) ?? [];
-            // Find the live accumulator event for this message_id
-            const liveIdx = [...existing].reverse().findIndex(
-              e => e.streamMessageId === messageId && e.isStreamDelta
-            );
-            const realLiveIdx = liveIdx >= 0 ? existing.length - 1 - liveIdx : -1;
+            const realLiveIdx = findLiveAccumulatorIndex(existing, messageId, msg.agent_id);
 
             if (realLiveIdx >= 0) {
-              // Swap live accumulator → final message
+              // Swap live accumulator → final message. Preserve streamed thinking if final event omitted it.
               const updated = [...existing];
-              updated[realLiveIdx] = translated;
+              const live = updated[realLiveIdx];
+              updated[realLiveIdx] = {
+                ...translated,
+                thinking: nonEmptyString(translated.thinking) ?? nonEmptyString(live.thinking),
+              };
               next.set(msg.session_id, updated);
+              console.debug('[useUiClient] final assistant message replaced live accumulator', {
+                session_id: msg.session_id,
+                message_id: messageId,
+                live_index: realLiveIdx,
+                final_content_len: updated[realLiveIdx].content.length,
+                final_thinking_len: (updated[realLiveIdx].thinking ?? '').length,
+              });
             } else {
-              // Non-streaming provider: just append
+              // Non-streaming provider or out-of-order final message: append if newer.
               const lastSeq = existing.length > 0 ? (existing[existing.length - 1].seq ?? -1) : -1;
               if (translated.seq == null || translated.seq > lastSeq) {
                 next.set(msg.session_id, [...existing, translated]);
               }
+              console.debug('[useUiClient] final assistant message appended without live accumulator', {
+                session_id: msg.session_id,
+                message_id: messageId,
+                existing_len: existing.length,
+                translated_seq: translated.seq,
+                last_seq: lastSeq,
+              });
             }
             return next;
           });

@@ -186,13 +186,19 @@ pub async fn setup_mesh_from_config(
                     agent_info.id,
                     remote.peer
                 );
-                // Register with a remote-capable SendAgent stub.
+                // Register with both a SendAgent stub (for ACP consumers like
+                // collect_event_sources / agent_for_id) and an AgentActorHandle::Remote
+                // (for the kameo-native delegation path).
                 let stub = Arc::new(RemoteAgentStub::new(
                     remote.peer.clone(),
                     remote.id.clone(),
                     mesh.clone(),
                 ));
-                registry.register(agent_info, stub);
+                let handle = crate::delegation::AgentActorHandle::Remote {
+                    peer_label: remote.peer.clone(),
+                    mesh: mesh.clone(),
+                };
+                registry.register_with_handle(agent_info, stub, handle);
             }
             Err(e) => {
                 log::warn!(

@@ -1,16 +1,15 @@
+use crate::agent::remote::SessionActorRef;
+use crate::agent::session_registry::SessionRegistry;
 use crate::event_bus::EventBus;
 use crate::events::{AgentEvent, AgentEventKind, EventObserver};
-use crate::model::MessagePart;
+use crate::model::{AgentMessage, MessagePart};
 use crate::send_agent::SendAgent;
 use crate::session::domain::{Delegation, DelegationStatus, ForkOrigin, ForkPointType};
 use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
 use crate::verification::VerificationSpec;
 use crate::verification::service::{VerificationContext, VerificationService};
-use agent_client_protocol::{
-    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
-    ProtocolVersion, TextContent,
-};
+use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
 use async_trait::async_trait;
 use log::{debug, error, warn};
 use querymt::chat::ChatRole;
@@ -56,6 +55,139 @@ pub trait AgentRegistry: Send + Sync {
     /// Returns an Arc<dyn SendAgent> that can be used to interact with the agent
     /// via the full ACP protocol lifecycle (initialize, new_session, prompt, etc.).
     fn get_agent_instance(&self, id: &str) -> Option<Arc<dyn SendAgent>>;
+
+    /// Get a kameo-native handle for creating sessions directly.
+    ///
+    /// Returns an `AgentActorHandle` that can create `SessionActorRef`s without going
+    /// through the ACP `initialize()`/`new_session()` ceremony. Used by the delegation
+    /// orchestrator (Phase 5) for both local and remote delegation.
+    ///
+    /// Default implementation returns `None` — registries that don't support the
+    /// kameo-native path fall back to `get_agent_instance()`.
+    fn get_agent_handle(&self, id: &str) -> Option<AgentActorHandle> {
+        let _ = id;
+        None
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  AgentActorHandle — kameo-native session creation
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Handle for creating sessions directly via kameo, bypassing the ACP protocol
+/// ceremony (`initialize()` + `new_session()`).
+///
+/// Used by the delegation orchestrator for both local and remote delegation.
+/// For local agents, it delegates to `SessionRegistry::new_session()`.
+/// For remote agents, it sends `CreateRemoteSession` to a `RemoteNodeManager`.
+#[derive(Clone)]
+pub enum AgentActorHandle {
+    /// Local agent — creates sessions via `SessionRegistry`.
+    Local {
+        config: Arc<crate::agent::agent_config::AgentConfig>,
+        registry: Arc<Mutex<SessionRegistry>>,
+    },
+    /// Remote agent — creates sessions via `RemoteNodeManager` looked up through the mesh.
+    ///
+    /// The `RemoteNodeManager` is resolved lazily via DHT lookup at session creation
+    /// time, so this variant can be constructed even when the peer is not yet reachable
+    /// (speculative registration).
+    #[cfg(feature = "remote")]
+    Remote {
+        peer_label: String,
+        mesh: crate::agent::remote::MeshHandle,
+    },
+}
+
+impl AgentActorHandle {
+    /// Create a session and return a `(session_id, SessionActorRef)`.
+    ///
+    /// For `Local`, this calls `SessionRegistry::new_session()` and extracts the ref.
+    /// For `Remote`, this sends `CreateRemoteSession` and attaches the session locally.
+    pub async fn create_session(
+        &self,
+        cwd: Option<String>,
+        parent_session_id: Option<&str>,
+    ) -> Result<(String, SessionActorRef), agent_client_protocol::Error> {
+        match self {
+            Self::Local { registry, .. } => {
+                let cwd_path = cwd.map(PathBuf::from).unwrap_or_default();
+                // Note: we intentionally do NOT pass `parent_session_id` to
+                // the delegate's `new_session()`.  The delegate's store is
+                // independent (often a different SQLite database or
+                // in-memory), so it cannot resolve the parent session's
+                // public_id to an internal row id.  The parent–child
+                // relationship is tracked in the *parent's* store via the
+                // `SessionForked` event emitted by `handle_delegation_kameo`.
+                let _ = parent_session_id;
+                let req = NewSessionRequest::new(cwd_path);
+                let mut reg = registry.lock().await;
+                let resp = reg.new_session(req).await?;
+                let session_id = resp.session_id.to_string();
+                let session_ref = reg.get(&session_id).cloned().ok_or_else(|| {
+                    agent_client_protocol::Error::internal_error()
+                        .data("Session created but not found in registry")
+                })?;
+                Ok((session_id, session_ref))
+            }
+            #[cfg(feature = "remote")]
+            Self::Remote { peer_label, mesh } => {
+                use crate::agent::remote::{CreateRemoteSession, RemoteNodeManager};
+                use crate::agent::session_actor::SessionActor;
+                use crate::error::AgentError;
+
+                // Lazy DHT lookup for the remote node manager
+                let node_manager = mesh
+                    .lookup_actor::<RemoteNodeManager>("node_manager")
+                    .await
+                    .map_err(|e| {
+                        agent_client_protocol::Error::from(AgentError::SwarmLookupFailed {
+                            key: "node_manager".to_string(),
+                            reason: e.to_string(),
+                        })
+                    })?
+                    .ok_or_else(|| {
+                        agent_client_protocol::Error::new(
+                            -32001,
+                            format!(
+                                "Remote peer '{}' not found in DHT (is the mesh running on that machine?)",
+                                peer_label
+                            ),
+                        )
+                    })?;
+
+                let resp = node_manager
+                    .ask(&CreateRemoteSession { cwd })
+                    .await
+                    .map_err(|e| {
+                        agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string()))
+                    })?;
+
+                let session_id = resp.session_id.clone();
+                let dht_name = format!("session::{}", session_id);
+                let remote_session_ref = mesh
+                    .lookup_actor::<SessionActor>(dht_name.clone())
+                    .await
+                    .map_err(|e| {
+                        agent_client_protocol::Error::from(AgentError::SwarmLookupFailed {
+                            key: dht_name.clone(),
+                            reason: e.to_string(),
+                        })
+                    })?
+                    .ok_or_else(|| {
+                        agent_client_protocol::Error::from(AgentError::RemoteSessionNotFound {
+                            details: format!(
+                                "session {} not found in DHT under '{}'",
+                                session_id, dht_name
+                            ),
+                        })
+                    })?;
+
+                let session_ref = SessionActorRef::remote(remote_session_ref, peer_label.clone());
+                Ok((session_id, session_ref))
+            }
+        }
+    }
 }
 
 /// Builder for verification specifications from structured verification_spec only.
@@ -149,7 +281,6 @@ impl EventObserver for DelegationOrchestrator {
                 let delegator = self.delegator.clone();
                 let event_bus = self.event_bus.clone();
                 let store = self.store.clone();
-                let agent_registry = self.agent_registry.clone();
                 let tool_registry = self.tool_registry.clone();
                 let config = self.config.clone();
                 let delegation_summarizer = self.delegation_summarizer.clone();
@@ -164,18 +295,51 @@ impl EventObserver for DelegationOrchestrator {
                 let delegation_id = delegation.public_id.clone();
                 let cancel_token_clone = cancel_token.clone();
 
+                // Get the kameo-native handle for this agent
+                let agent_handle = self
+                    .agent_registry
+                    .get_agent_handle(&delegation.target_agent_id);
+
                 let handle = tokio::spawn(async move {
                     let ctx = DelegationContext {
                         delegator,
                         event_bus,
                         store,
-                        agent_registry,
                         tool_registry,
                         config,
                         active_delegations: active_delegations_for_spawn,
                         delegation_summarizer,
                     };
-                    handle_delegation(ctx, parent_session_id, delegation, cancel_token).await;
+                    match agent_handle {
+                        Some(agent_handle) => {
+                            handle_delegation_kameo(
+                                ctx,
+                                agent_handle,
+                                parent_session_id,
+                                delegation,
+                                cancel_token,
+                            )
+                            .await;
+                        }
+                        None => {
+                            // No AgentActorHandle registered for this agent.
+                            let error_message = format!(
+                                "Agent '{}' is not registered with a kameo handle. \
+                                 Register it via register_with_handle() in the AgentRegistry.",
+                                delegation.target_agent_id
+                            );
+                            fail_delegation(
+                                &ctx.event_bus,
+                                &ctx.delegator,
+                                &ctx.store,
+                                &ctx.config,
+                                &parent_session_id,
+                                &delegation.public_id,
+                                &error_message,
+                            )
+                            .await;
+                        }
+                    }
                 });
 
                 let mut active = active_delegations.lock().await;
@@ -232,107 +396,30 @@ struct DelegationContext {
     delegator: Arc<dyn SendAgent>,
     event_bus: Arc<EventBus>,
     store: Arc<dyn SessionStore>,
-    agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     tool_registry: Arc<ToolRegistry>,
     config: DelegationOrchestratorConfig,
     active_delegations: ActiveDelegations,
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
 }
 
-/// Inject planning summary into delegate session's system prompt
+// ══════════════════════════════════════════════════════════════════════════
+//  Kameo-native delegation path (Phase 5)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Handle delegation using the kameo-native path via `SessionActorRef`.
 ///
-/// This modifies the delegate session's LLM config to append the planning summary
-/// to the system prompt. The summary persists across all turns of the coder's session.
-async fn inject_planning_summary(
-    store: &Arc<dyn SessionStore>,
-    child_session_id: &str,
-    summary: &str,
-) -> crate::session::error::SessionResult<()> {
-    // 1. Get current LLM config for the delegate session
-    let config = store
-        .get_session_llm_config(child_session_id)
-        .await?
-        .ok_or_else(|| {
-            crate::session::error::SessionError::InvalidOperation(
-                "Delegate session has no LLM config".to_string(),
-            )
-        })?;
-
-    // 2. Extract current params, including system prompt
-    let mut params: querymt::LLMParams = if let Some(params_value) = config.params {
-        serde_json::from_value(params_value).unwrap_or_default()
-    } else {
-        querymt::LLMParams::default()
-    };
-
-    // Ensure provider and model are set from config
-    params.provider = Some(config.provider.clone());
-    params.model = Some(config.model.clone());
-
-    // 3. Append planning summary to system prompt
-    let summary_context = format!("\n\n<planning-context>\n{}\n</planning-context>", summary);
-    params.system.push(summary_context);
-
-    // 4. Create new LLM config with updated params
-    let new_config = store.create_or_get_llm_config(&params).await?;
-
-    // 5. Update session to use new config
-    store
-        .set_session_llm_config(child_session_id, new_config.id)
-        .await?;
-
-    Ok(())
-}
-
-async fn handle_delegation(
+/// This bypasses the ACP `initialize()` + `new_session()` ceremony and creates
+/// sessions directly via `AgentActorHandle::create_session()`. History and
+/// planning context are exchanged via kameo messages (`GetHistory`,
+/// `SetPlanningContext`), so this path works for both local and remote sessions.
+async fn handle_delegation_kameo(
     ctx: DelegationContext,
+    agent_handle: AgentActorHandle,
     parent_session_id: String,
     delegation: Delegation,
     cancel_token: CancellationToken,
 ) {
     let delegation_id = delegation.public_id.clone();
-    // Validate target's capability requirements
-    if let Some(target_info) = ctx.agent_registry.get_agent(&delegation.target_agent_id)
-        && target_info
-            .required_capabilities
-            .contains(&crate::tools::CapabilityRequirement::Filesystem)
-        && ctx.config.cwd.is_none()
-    {
-        let error_message = format!(
-            "Cannot delegate to '{}': agent requires filesystem access but no working directory is set",
-            delegation.target_agent_id
-        );
-        fail_delegation(
-            &ctx.event_bus,
-            &ctx.delegator,
-            &ctx.store,
-            &ctx.config,
-            &parent_session_id,
-            &delegation.public_id,
-            &error_message,
-        )
-        .await;
-        return;
-    }
-
-    let Some(delegate_agent) = ctx
-        .agent_registry
-        .get_agent_instance(&delegation.target_agent_id)
-    else {
-        let error_message = format!("Unknown agent ID: {}", delegation.target_agent_id);
-        warn!("{}", error_message);
-        fail_delegation(
-            &ctx.event_bus,
-            &ctx.delegator,
-            &ctx.store,
-            &ctx.config,
-            &parent_session_id,
-            &delegation.public_id,
-            &error_message,
-        )
-        .await;
-        return;
-    };
 
     if let Err(e) = ctx
         .store
@@ -342,13 +429,15 @@ async fn handle_delegation(
         warn!("Failed to update delegation status to Running: {}", e);
     }
 
-    let init_resp = match delegate_agent
-        .initialize(InitializeRequest::new(ProtocolVersion::LATEST))
+    // 1. Create session directly via kameo — no ACP ceremony
+    let cwd_string = ctx.config.cwd.as_ref().map(|p| p.display().to_string());
+    let (child_session_id, session_ref) = match agent_handle
+        .create_session(cwd_string, Some(&parent_session_id))
         .await
     {
-        Ok(resp) => resp,
+        Ok(result) => result,
         Err(e) => {
-            let error_message = format!("Failed to initialize agent: {}", e);
+            let error_message = format!("Failed to create session via kameo: {}", e);
             fail_delegation(
                 &ctx.event_bus,
                 &ctx.delegator,
@@ -363,78 +452,11 @@ async fn handle_delegation(
         }
     };
 
-    if !init_resp.auth_methods.is_empty() {
-        let error_message =
-            "Delegated agent requires authentication, which is not yet supported".to_string();
-        fail_delegation(
-            &ctx.event_bus,
-            &ctx.delegator,
-            &ctx.store,
-            &ctx.config,
-            &parent_session_id,
-            &delegation.public_id,
-            &error_message,
-        )
-        .await;
-        return;
-    }
-
-    let delegate_session = match &ctx.config.cwd {
-        Some(cwd) => {
-            let mut req = NewSessionRequest::new(cwd.clone());
-            req.meta = Some(serde_json::Map::from_iter([(
-                "parent_session_id".to_string(),
-                serde_json::Value::String(parent_session_id.clone()),
-            )]));
-            match delegate_agent.new_session(req).await {
-                Ok(session) => session,
-                Err(e) => {
-                    let error_message = format!("Failed to create session: {}", e);
-                    fail_delegation(
-                        &ctx.event_bus,
-                        &ctx.delegator,
-                        &ctx.store,
-                        &ctx.config,
-                        &parent_session_id,
-                        &delegation.public_id,
-                        &error_message,
-                    )
-                    .await;
-                    return;
-                }
-            }
-        }
-        None => {
-            let mut req = NewSessionRequest::new(PathBuf::new());
-            req.meta = Some(serde_json::Map::from_iter([(
-                "parent_session_id".to_string(),
-                serde_json::Value::String(parent_session_id.clone()),
-            )]));
-            match delegate_agent.new_session(req).await {
-                Ok(session) => session,
-                Err(e) => {
-                    let error_message = format!("Failed to create session: {}", e);
-                    fail_delegation(
-                        &ctx.event_bus,
-                        &ctx.delegator,
-                        &ctx.store,
-                        &ctx.config,
-                        &parent_session_id,
-                        &delegation.public_id,
-                        &error_message,
-                    )
-                    .await;
-                    return;
-                }
-            }
-        }
-    };
-
     ctx.event_bus.publish(
         &parent_session_id,
         AgentEventKind::SessionForked {
             parent_session_id: parent_session_id.clone(),
-            child_session_id: delegate_session.session_id.to_string(),
+            child_session_id: child_session_id.clone(),
             target_agent_id: delegation.target_agent_id.clone(),
             origin: ForkOrigin::Delegation,
             fork_point_type: ForkPointType::ProgressEntry,
@@ -443,8 +465,8 @@ async fn handle_delegation(
         },
     );
 
-    // ──── Generate and inject planning summary ────
-    let _planning_summary = if let Some(ref summarizer) = ctx.delegation_summarizer {
+    // 2. Generate and inject planning summary via kameo message
+    if let Some(ref summarizer) = ctx.delegation_summarizer {
         match ctx.store.get_history(&parent_session_id).await {
             Ok(history) => {
                 match summarizer.summarize(&history, &delegation.objective).await {
@@ -456,57 +478,45 @@ async fn handle_delegation(
                             warn!("Failed to persist delegation summary: {}", e);
                         }
 
-                        // Inject into delegate session's system prompt
-                        if let Err(e) = inject_planning_summary(
-                            &ctx.store,
-                            &delegate_session.session_id.to_string(),
-                            &summary,
-                        )
-                        .await
-                        {
+                        // Inject via SetPlanningContext kameo message
+                        let formatted_summary =
+                            format!("\n\n<planning-context>\n{}\n</planning-context>", summary);
+                        if let Err(e) = session_ref.set_planning_context(formatted_summary).await {
                             warn!(
-                                "Failed to inject planning summary into delegate session: {}",
+                                "Failed to inject planning summary via SetPlanningContext: {}",
                                 e
                             );
                         } else {
                             log::info!(
-                                "Injected planning summary into delegate session {}",
-                                delegate_session.session_id
+                                "Injected planning summary into delegate session {} via kameo",
+                                child_session_id
                             );
                         }
-
-                        Some(summary)
                     }
                     Err(e) => {
                         warn!("Delegation summary generation failed: {}", e);
-                        None // Proceed without summary — graceful degradation
+                        // Proceed without summary — graceful degradation
                     }
                 }
             }
             Err(e) => {
                 warn!("Failed to load parent history for summary: {}", e);
-                None
             }
         }
-    } else {
-        None
-    };
+    }
 
+    // 3. Send prompt directly via kameo
     let prompt_text = build_delegation_prompt(&delegation);
     let prompt_req = PromptRequest::new(
-        delegate_session.session_id.clone(),
+        child_session_id.clone(),
         vec![ContentBlock::Text(TextContent::new(prompt_text))],
     );
 
-    let child_session_id = delegate_session.session_id.to_string();
-
-    // Use select! to race between prompt completion and cancellation
     let prompt_result = tokio::select! {
-        result = delegate_agent.prompt(prompt_req) => Some(result),
+        result = session_ref.prompt(prompt_req) => Some(result),
         _ = cancel_token.cancelled() => {
-            // Cancellation requested - cancel the child session and exit
-            let cancel_notif = CancelNotification::new(child_session_id.clone());
-            let _ = delegate_agent.cancel(cancel_notif).await;
+            // Cancellation — cancel the child session
+            let _ = session_ref.cancel().await;
 
             if let Err(e) = ctx.store
                 .update_delegation_status(&delegation_id, DelegationStatus::Cancelled)
@@ -522,21 +532,18 @@ async fn handle_delegation(
                 },
             );
 
-            // Clean up from active_delegations map
             let mut active = ctx.active_delegations.lock().await;
             active.remove(&delegation_id);
-
             return;
         }
     };
 
     match prompt_result {
         Some(Ok(_)) => {
+            // 4. Verification (same as legacy path)
             let verification_passed = if ctx.config.run_verification {
-                // Use new verification framework if verification_spec is available or legacy expected_output exists
                 match VerificationSpecBuilder::from_delegation(&delegation) {
                     Some(verification_spec) => {
-                        // Create verification service using the delegator's tool registry
                         let agent_tool_registry = ctx.tool_registry.clone();
                         let service = VerificationService::new(agent_tool_registry.clone());
                         let verification_context = VerificationContext {
@@ -546,7 +553,6 @@ async fn handle_delegation(
                             cwd: ctx.config.cwd.clone(),
                             tool_registry: agent_tool_registry.clone(),
                         };
-
                         match service
                             .verify(&verification_spec, &verification_context)
                             .await
@@ -558,10 +564,7 @@ async fn handle_delegation(
                             }
                         }
                     }
-                    None => {
-                        // No verification spec available, treat as success
-                        true
-                    }
+                    None => true,
                 }
             } else {
                 true
@@ -584,16 +587,14 @@ async fn handle_delegation(
                 return;
             }
 
-            let summary =
-                match extract_session_summary(&ctx.store, &delegate_session.session_id.to_string())
-                    .await
-                {
-                    Ok(summary) => summary,
-                    Err(err) => {
-                        warn!("Error extracting summary: {}", err);
-                        "Error extracting summary.".to_string()
-                    }
-                };
+            // 5. Get history for summary via kameo (works for local and remote)
+            let summary = match session_ref.get_history().await {
+                Ok(history) => extract_session_summary_from_history(&history),
+                Err(err) => {
+                    warn!("Error extracting summary via GetHistory: {}", err);
+                    "Error extracting summary.".to_string()
+                }
+            };
 
             if let Err(e) = ctx
                 .store
@@ -621,7 +622,6 @@ async fn handle_delegation(
                 .await;
             }
 
-            // Clean up from active_delegations map
             let mut active = ctx.active_delegations.lock().await;
             active.remove(&delegation_id);
         }
@@ -638,7 +638,6 @@ async fn handle_delegation(
             )
             .await;
 
-            // Clean up from active_delegations map
             let mut active = ctx.active_delegations.lock().await;
             active.remove(&delegation_id);
         }
@@ -806,15 +805,11 @@ fn classify_delegation_error(error: &str) -> (&str, &str) {
     }
 }
 
-async fn extract_session_summary(
-    store: &Arc<dyn SessionStore>,
-    session_id: &str,
-) -> Result<String, LLMError> {
-    let history = store
-        .get_history(session_id)
-        .await
-        .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-
+/// Extract a delegation summary directly from a history slice.
+///
+/// Works for both local and remote sessions — the caller provides the history.
+/// For local sessions, read from store. For remote, via `GetHistory` message.
+pub fn extract_session_summary_from_history(history: &[AgentMessage]) -> String {
     let mut summary = String::new();
     summary.push_str("=== Delegate Agent Results ===\n\n");
 
@@ -823,7 +818,7 @@ async fn extract_session_summary(
     let mut patches = Vec::new();
     let mut agent_responses = Vec::new();
 
-    for message in &history {
+    for message in history {
         for part in &message.parts {
             match part {
                 MessagePart::ToolUse(tool_call) => {
@@ -892,7 +887,7 @@ async fn extract_session_summary(
         summary.push_str("(No modifications made)\n");
     }
 
-    Ok(summary)
+    summary
 }
 
 fn extract_tool_args_preview(tool_name: &str, args_json: &str) -> String {
@@ -924,6 +919,11 @@ fn extract_tool_args_preview(tool_name: &str, args_json: &str) -> String {
 struct AgentEntry {
     info: AgentInfo,
     instance: Arc<dyn SendAgent>,
+    /// Optional kameo-native handle for direct session creation (Phase 5).
+    ///
+    /// When set, the delegation orchestrator uses this instead of going through
+    /// the `SendAgent` ACP ceremony. Set by `register_with_handle()`.
+    actor_handle: Option<AgentActorHandle>,
 }
 
 #[derive(Default)]
@@ -939,7 +939,33 @@ impl DefaultAgentRegistry {
     /// Register an agent with its metadata and instance.
     pub fn register(&mut self, info: AgentInfo, instance: Arc<dyn SendAgent>) {
         let id = info.id.clone();
-        self.agents.insert(id, AgentEntry { info, instance });
+        self.agents.insert(
+            id,
+            AgentEntry {
+                info,
+                instance,
+                actor_handle: None,
+            },
+        );
+    }
+
+    /// Register an agent with both a `SendAgent` instance (for ACP consumers)
+    /// and a kameo-native `AgentActorHandle` (for Phase 5 delegation).
+    pub fn register_with_handle(
+        &mut self,
+        info: AgentInfo,
+        instance: Arc<dyn SendAgent>,
+        handle: AgentActorHandle,
+    ) {
+        let id = info.id.clone();
+        self.agents.insert(
+            id,
+            AgentEntry {
+                info,
+                instance,
+                actor_handle: Some(handle),
+            },
+        );
     }
 }
 
@@ -957,6 +983,12 @@ impl AgentRegistry for DefaultAgentRegistry {
 
     fn get_agent_instance(&self, id: &str) -> Option<Arc<dyn SendAgent>> {
         self.agents.get(id).map(|entry| entry.instance.clone())
+    }
+
+    fn get_agent_handle(&self, id: &str) -> Option<AgentActorHandle> {
+        self.agents
+            .get(id)
+            .and_then(|entry| entry.actor_handle.clone())
     }
 }
 

@@ -379,6 +379,27 @@ impl SessionActorRef {
         }
     }
 
+    /// Set planning context on a delegate session.
+    ///
+    /// Injects the parent session's planning summary into this session's system prompt.
+    /// Used by the delegation orchestrator to provide context without requiring direct
+    /// access to the child's `SessionStore`.
+    pub async fn set_planning_context(&self, summary: String) -> Result<(), AcpError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(messages::SetPlanningContext { summary })
+                .await
+                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string())))?,
+
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&messages::SetPlanningContext { summary })
+                .await
+                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string())))?,
+        }
+        Ok(())
+    }
+
     /// Unsubscribe from events (remove event forwarder).
     pub async fn unsubscribe_events(&self, relay_actor_id: u64) -> Result<(), AcpError> {
         match self {

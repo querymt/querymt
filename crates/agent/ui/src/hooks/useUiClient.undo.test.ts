@@ -650,4 +650,125 @@ describe('useUiClient - undo/redo', () => {
       frontierMessageId: 'msg-2',
     });
   });
+
+  it('merges thinking deltas and replaces with final assistant message', async () => {
+    const { result } = renderHook(() => useUiClient());
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'session_created',
+        session_id: 'session-thinking',
+        agent_id: 'primary',
+      });
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'event',
+        session_id: 'session-thinking',
+        agent_id: 'primary',
+        event: {
+          seq: 1,
+          timestamp: 1,
+          kind: {
+            type: 'assistant_thinking_delta',
+            content: 'Plan: ',
+            message_id: 'm-1',
+          },
+        },
+      });
+      MockWebSocket.instance?.simulateMessage({
+        type: 'event',
+        session_id: 'session-thinking',
+        agent_id: 'primary',
+        event: {
+          seq: 2,
+          timestamp: 2,
+          kind: {
+            type: 'assistant_thinking_delta',
+            content: 'step by step',
+            message_id: 'm-1',
+          },
+        },
+      });
+      MockWebSocket.instance?.simulateMessage({
+        type: 'event',
+        session_id: 'session-thinking',
+        agent_id: 'primary',
+        event: {
+          seq: 3,
+          timestamp: 3,
+          kind: {
+            type: 'assistant_message_stored',
+            content: 'Final answer',
+            message_id: 'm-1',
+          },
+        },
+      });
+    });
+
+    const rows = result.current.eventsBySession.get('session-thinking') ?? [];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].content).toBe('Final answer');
+    expect(rows[0].thinking).toBe('Plan: step by step');
+    expect(rows[0].isStreamDelta).toBeUndefined();
+  });
+
+  it('replaces live accumulator even when final message_id is missing', async () => {
+    const { result } = renderHook(() => useUiClient());
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'session_created',
+        session_id: 'session-thinking-2',
+        agent_id: 'primary',
+      });
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'event',
+        session_id: 'session-thinking-2',
+        agent_id: 'primary',
+        event: {
+          seq: 1,
+          timestamp: 1,
+          kind: {
+            type: 'assistant_thinking_delta',
+            content: 'hidden rationale',
+            message_id: 'stream-only-id',
+          },
+        },
+      });
+      MockWebSocket.instance?.simulateMessage({
+        type: 'event',
+        session_id: 'session-thinking-2',
+        agent_id: 'primary',
+        event: {
+          seq: 2,
+          timestamp: 2,
+          kind: {
+            type: 'assistant_message_stored',
+            content: 'Final without message id',
+          },
+        },
+      });
+    });
+
+    const rows = result.current.eventsBySession.get('session-thinking-2') ?? [];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].content).toBe('Final without message id');
+    expect(rows[0].thinking).toBe('hidden rationale');
+    expect(rows[0].isStreamDelta).toBeUndefined();
+  });
 });

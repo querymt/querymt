@@ -193,6 +193,17 @@ pub enum StreamOpenResult {
     },
 }
 
+/// Log record transported from an Extism WASM plugin to the host.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExtismLogRecord {
+    /// Numeric log level (Error=1, Warn=2, Info=3, Debug=4, Trace=5)
+    pub level: usize,
+    /// Original plugin log target.
+    pub target: String,
+    /// Formatted log message.
+    pub message: String,
+}
+
 pub trait BinaryCodec {
     type Bytes: AsRef<[u8]>;
     type Error;

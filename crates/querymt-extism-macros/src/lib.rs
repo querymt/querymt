@@ -1,6 +1,54 @@
 use extism_pdk::*;
 use serde::{Deserialize, Serialize};
 
+struct ExtismHostLogger;
+
+impl log::Log for ExtismHostLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        let payload = querymt::plugin::extism_impl::ExtismLogRecord {
+            level: match record.level() {
+                log::Level::Error => 1,
+                log::Level::Warn => 2,
+                log::Level::Info => 3,
+                log::Level::Debug => 4,
+                log::Level::Trace => 5,
+            },
+            target: record.target().to_string(),
+            message: format!("{}", record.args()),
+        };
+
+        let _ = qmt_log_wrapper(&payload);
+    }
+
+    fn flush(&self) {}
+}
+
+static EXTISM_HOST_LOGGER: ExtismHostLogger = ExtismHostLogger;
+
+fn level_filter_from_usize(max_level: usize) -> log::LevelFilter {
+    match max_level {
+        0 => log::LevelFilter::Off,
+        1 => log::LevelFilter::Error,
+        2 => log::LevelFilter::Warn,
+        3 => log::LevelFilter::Info,
+        4 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
+    }
+}
+
+pub fn init_plugin_logging(max_level: usize) {
+    let _ = log::set_logger(&EXTISM_HOST_LOGGER);
+    log::set_max_level(level_filter_from_usize(max_level));
+}
+
 pub fn decode_base64_standard(s: &str) -> Result<Vec<u8>, Error> {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     BASE64.decode(s).map_err(|e| Error::msg(e.to_string()))
@@ -35,6 +83,7 @@ extern "ExtismHost" {
     fn qmt_http_stream_next(stream_id: Json<i64>) -> Vec<u8>;
     fn qmt_http_stream_close(stream_id: Json<i64>);
     fn qmt_yield_chunk(chunk: Vec<u8>);
+    fn qmt_log(record: Json<querymt::plugin::extism_impl::ExtismLogRecord>);
 }
 
 /// Call custom qmt_http_request host function using http-serde-ext
@@ -85,6 +134,12 @@ pub fn qmt_yield_chunk_wrapper(
     unsafe { qmt_yield_chunk(bytes) }
 }
 
+pub fn qmt_log_wrapper(
+    record: &querymt::plugin::extism_impl::ExtismLogRecord,
+) -> Result<(), Error> {
+    unsafe { qmt_log(Json(record.clone())) }
+}
+
 /// Macro to generate all the Extism exports for an HTTP‐based LLM plugin
 #[macro_export]
 macro_rules! impl_extism_http_plugin {
@@ -112,7 +167,7 @@ macro_rules! impl_extism_http_plugin {
             stt, tts,
         };
         use serde_json::Value;
-        use $crate::qmt_http_request_wrapper;
+        use $crate::{init_plugin_logging, qmt_http_request_wrapper};
 
         /// Convert an LLMError into a WithReturnCode<PdkError> with the
         /// appropriate error code and JSON-serialized payload.
@@ -136,6 +191,12 @@ macro_rules! impl_extism_http_plugin {
         #[plugin_fn]
         pub fn api_key_name() -> FnResult<Option<String>> {
             Ok(HTTPLLMProviderFactory::api_key_name(&$Factory))
+        }
+
+        #[plugin_fn]
+        pub fn init_logging(Json(max_level): Json<usize>) -> FnResult<()> {
+            init_plugin_logging(max_level);
+            Ok(())
         }
 
         // Export the JSON schema for the config type

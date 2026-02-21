@@ -126,6 +126,35 @@ describe('TurnCard', () => {
     expect(screen.getByText('Here is the answer')).toBeInTheDocument();
   });
 
+  it('renders final thinking block for assistant messages', () => {
+    const turn = makeTurn({
+      agentMessages: [makeRow({ content: 'Answer body', thinking: 'reasoning trace' })],
+    });
+
+    render(<TurnCard {...defaultProps} turn={turn} />);
+
+    expect(screen.getByText('Thinking')).toBeInTheDocument();
+    expect(screen.getByText('reasoning trace')).toBeInTheDocument();
+    expect(screen.getByText('Answer body')).toBeInTheDocument();
+  });
+
+  it('renders live thinking accumulator for streaming deltas', () => {
+    const turn = makeTurn({
+      agentMessages: [
+        makeRow({
+          content: '',
+          thinking: 'live rationale',
+          isStreamDelta: true,
+          isThinkingDelta: true,
+        }),
+      ],
+    });
+
+    render(<TurnCard {...defaultProps} turn={turn} />);
+
+    expect(screen.getByText('live rationale')).toBeInTheDocument();
+  });
+
   it('renders "thinking..." when turn is active', () => {
     const turn = makeTurn({ isActive: true });
 

@@ -14,6 +14,7 @@ pub(crate) enum CancelState {
 }
 
 pub(crate) struct HostState {
+    pub plugin_name: String,
     pub allowed_hosts: Vec<String>,
     pub cancel_state: CancelState,
     pub cancel_watch_tx: tokio::sync::watch::Sender<bool>,
@@ -31,9 +32,14 @@ pub(crate) struct HostState {
 }
 
 impl HostState {
-    pub fn new(allowed_hosts: Vec<String>, tokio_handle: tokio::runtime::Handle) -> Self {
+    pub fn new(
+        plugin_name: String,
+        allowed_hosts: Vec<String>,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> Self {
         let (cancel_watch_tx, cancel_watch_rx) = tokio::sync::watch::channel(false);
         Self {
+            plugin_name,
             allowed_hosts,
             cancel_state: CancelState::NotCancelled,
             cancel_watch_tx,
@@ -505,6 +511,39 @@ pub(crate) fn qmt_http_stream_close(
         let _ = (inputs, _outputs, user_data);
         Ok(())
     }
+}
+
+pub(crate) fn qmt_log(
+    plugin: &mut CurrentPlugin,
+    inputs: &[Val],
+    _outputs: &mut [Val],
+    user_data: UserData<HostState>,
+) -> Result<(), extism::Error> {
+    let payload_json: Vec<u8> = plugin.memory_get_val(&inputs[0])?;
+    let payload: crate::plugin::extism_impl::ExtismLogRecord =
+        serde_json::from_slice(&payload_json)
+            .map_err(|e| extism::Error::msg(format!("Failed to deserialize log payload: {}", e)))?;
+    let plugin_name = user_data.get()?.lock().unwrap().plugin_name.clone();
+
+    match payload.level {
+        1 => {
+            log::error!(target: payload.target.as_str(), "[extism:{}] {}", plugin_name, payload.message)
+        }
+        2 => {
+            log::warn!(target: payload.target.as_str(), "[extism:{}] {}", plugin_name, payload.message)
+        }
+        3 => {
+            log::info!(target: payload.target.as_str(), "[extism:{}] {}", plugin_name, payload.message)
+        }
+        4 => {
+            log::debug!(target: payload.target.as_str(), "[extism:{}] {}", plugin_name, payload.message)
+        }
+        _ => {
+            log::trace!(target: payload.target.as_str(), "[extism:{}] {}", plugin_name, payload.message)
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn qmt_yield_chunk(

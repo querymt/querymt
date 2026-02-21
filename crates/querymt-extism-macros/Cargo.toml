@@ -12,3 +12,4 @@ serde_json.workspace = true
 extism-pdk.workspace = true
 http-serde-ext.workspace = true
 base64.workspace = true
+log.workspace = true

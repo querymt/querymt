@@ -26,4 +26,5 @@ url.workspace = true
 schemars.workspace = true
 base64.workspace = true
 heck.workspace = true
+log.workspace = true
 extism-pdk = { workspace = true, optional = true }

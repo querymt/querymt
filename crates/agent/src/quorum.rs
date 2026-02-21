@@ -1,4 +1,6 @@
-use crate::delegation::{AgentInfo, AgentRegistry, DefaultAgentRegistry, DelegationOrchestrator};
+use crate::delegation::{
+    AgentActorHandle, AgentInfo, AgentRegistry, DefaultAgentRegistry, DelegationOrchestrator,
+};
 use crate::event_bus::EventBus;
 use crate::send_agent::SendAgent;
 
@@ -238,7 +240,21 @@ impl AgentQuorumBuilder {
 
         for (info, factory) in self.delegate_factories {
             let agent = factory(self.store.clone(), self.event_bus.clone());
-            registry.register(info.clone(), agent.clone());
+
+            // Try to extract AgentActorHandle::Local by downcasting to AgentHandle
+            let actor_handle = agent
+                .as_any()
+                .downcast_ref::<crate::agent::AgentHandle>()
+                .map(|handle| AgentActorHandle::Local {
+                    config: handle.config.clone(),
+                    registry: handle.registry.clone(),
+                });
+
+            if let Some(handle) = actor_handle {
+                registry.register_with_handle(info.clone(), agent.clone(), handle);
+            } else {
+                registry.register(info.clone(), agent.clone());
+            }
             delegates.push(DelegateAgent { info, agent });
         }
 

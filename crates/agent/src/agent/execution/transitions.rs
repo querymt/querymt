@@ -156,190 +156,243 @@ pub(super) async fn transition_call_llm(
 
     // Determine response via streaming or non-streaming path.
     // Each arm produces the same tuple so the rest of the function is uniform.
-    let (response_content, response_thinking, tool_calls, usage, finish_reason) =
-        if tools.is_empty() {
-            // No tools — always use the non-streaming simple submit path.
-            let cancel = exec_ctx.cancellation_token.clone();
-            let resp = super::llm_retry::call_llm_with_retry(
+    let (response_content, response_thinking, tool_calls, usage, finish_reason) = if tools
+        .is_empty()
+    {
+        // No tools — always use the non-streaming simple submit path.
+        let cancel = exec_ctx.cancellation_token.clone();
+        let resp = super::llm_retry::call_llm_with_retry(
+            config,
+            session_id,
+            &exec_ctx.cancellation_token,
+            || {
+                let messages_with_cache = &messages_with_cache;
+                let cancel = cancel.clone();
+                async move {
+                    tokio::select! {
+                        result = session_handle.submit_request(messages_with_cache) => {
+                            result
+                        }
+                        _ = cancel.cancelled() => {
+                            Err(querymt::error::LLMError::Cancelled)
+                        }
+                    }
+                }
+            },
+        )
+        .await?;
+
+        (
+            resp.text().unwrap_or_default(),
+            resp.thinking(),
+            resp.tool_calls().unwrap_or_default(),
+            resp.usage(),
+            resp.finish_reason(),
+        )
+    } else {
+        let provider = session_handle
+            .provider()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to build provider: {}", e))?;
+
+        if provider.supports_streaming() {
+            // === STREAMING PATH (all capable providers) ===
+            let message_id = Uuid::new_v4().to_string();
+            streaming_message_id = Some(message_id.clone());
+
+            let mut stream = super::llm_retry::create_stream_with_retry(
                 config,
                 session_id,
                 &exec_ctx.cancellation_token,
                 || {
+                    let provider = &provider;
                     let messages_with_cache = &messages_with_cache;
-                    let cancel = cancel.clone();
+                    let tools_slice = tools.as_ref();
                     async move {
-                        tokio::select! {
-                            result = session_handle.submit_request(messages_with_cache) => {
-                                result
-                            }
-                            _ = cancel.cancelled() => {
-                                Err(querymt::error::LLMError::Cancelled)
-                            }
-                        }
+                        provider
+                            .chat_stream_with_tools(messages_with_cache, Some(tools_slice))
+                            .await
                     }
                 },
             )
             .await?;
 
-            (
-                resp.text().unwrap_or_default(),
-                resp.thinking(),
-                resp.tool_calls().unwrap_or_default(),
-                resp.usage(),
-                resp.finish_reason(),
-            )
-        } else {
-            let provider = session_handle
-                .provider()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to build provider: {}", e))?;
+            let mut text = String::new();
+            let mut thinking = String::new();
+            let mut stream_tool_calls: Vec<ToolCall> = Vec::new();
+            let mut tool_call_ids = std::collections::HashSet::new();
+            let mut usage: Option<querymt::Usage> = None;
 
-            if provider.supports_streaming() {
-                // === STREAMING PATH (all capable providers) ===
-                let message_id = Uuid::new_v4().to_string();
-                streaming_message_id = Some(message_id.clone());
+            // Batching buffers — we flush at most every 50ms or 256 chars to
+            // avoid per-token React state updates on fast local models.
+            let mut text_buffer = String::new();
+            let mut thinking_buffer = String::new();
+            let mut last_flush = Instant::now();
+            const BATCH_INTERVAL: Duration = Duration::from_millis(50);
+            const BATCH_CHARS: usize = 256;
 
-                let mut stream = super::llm_retry::create_stream_with_retry(
-                    config,
-                    session_id,
-                    &exec_ctx.cancellation_token,
-                    || {
-                        let provider = &provider;
-                        let messages_with_cache = &messages_with_cache;
-                        let tools_slice = tools.as_ref();
-                        async move {
-                            provider
-                                .chat_stream_with_tools(messages_with_cache, Some(tools_slice))
-                                .await
-                        }
-                    },
-                )
-                .await?;
-
-                let mut text = String::new();
-                let mut thinking = String::new();
-                let mut stream_tool_calls: Vec<ToolCall> = Vec::new();
-                let mut tool_call_ids = std::collections::HashSet::new();
-                let mut usage: Option<querymt::Usage> = None;
-
-                // Batching buffers — we flush at most every 50ms or 256 chars to
-                // avoid per-token React state updates on fast local models.
-                let mut text_buffer = String::new();
-                let mut thinking_buffer = String::new();
-                let mut last_flush = Instant::now();
-                const BATCH_INTERVAL: Duration = Duration::from_millis(50);
-                const BATCH_CHARS: usize = 256;
-
-                macro_rules! flush_buffers {
-                    ($reset_timer:expr) => {
-                        if !text_buffer.is_empty() {
-                            config.emit_event(
-                                session_id,
-                                AgentEventKind::AssistantContentDelta {
-                                    content: text_buffer.drain(..).collect(),
-                                    message_id: message_id.clone(),
-                                },
-                            );
-                        }
-                        if !thinking_buffer.is_empty() {
-                            config.emit_event(
-                                session_id,
-                                AgentEventKind::AssistantThinkingDelta {
-                                    content: thinking_buffer.drain(..).collect(),
-                                    message_id: message_id.clone(),
-                                },
-                            );
-                        }
-                        if $reset_timer {
-                            #[allow(unused_assignments)]
-                            {
-                                last_flush = Instant::now();
-                            }
-                        }
-                    };
-                }
-
-                while let Some(item) = stream.next().await {
-                    if exec_ctx.cancellation_token.is_cancelled() {
-                        return Ok(ExecutionState::Cancelled);
+            macro_rules! flush_buffers {
+                ($reset_timer:expr) => {
+                    if !text_buffer.is_empty() {
+                        let text_delta: String = text_buffer.drain(..).collect();
+                        debug!(
+                            "stream flush: session={} message_id={} text_delta_len={}",
+                            session_id,
+                            message_id,
+                            text_delta.len()
+                        );
+                        config.emit_event(
+                            session_id,
+                            AgentEventKind::AssistantContentDelta {
+                                content: text_delta,
+                                message_id: message_id.clone(),
+                            },
+                        );
                     }
-
-                    match item.map_err(|e| anyhow::anyhow!("LLM streaming error: {}", e))? {
-                        StreamChunk::Text(delta) => {
-                            text.push_str(&delta);
-                            text_buffer.push_str(&delta);
-                        }
-                        StreamChunk::Thinking(delta) => {
-                            thinking.push_str(&delta);
-                            thinking_buffer.push_str(&delta);
-                        }
-                        StreamChunk::ToolUseComplete { tool_call, .. } => {
-                            // Flush before tool use so UI sees final text before tool starts
-                            flush_buffers!(true);
-                            if tool_call_ids.insert(tool_call.id.clone()) {
-                                stream_tool_calls.push(tool_call);
-                            }
-                        }
-                        StreamChunk::Usage(u) => {
-                            // Anthropic (and potentially other providers) split usage across
-                            // multiple streaming events: `input_tokens` arrives in
-                            // `message_start`, while cumulative `output_tokens` arrives in
-                            // `message_delta`.  Taking the field-wise maximum merges both
-                            // events correctly regardless of order.
-                            usage = Some(match usage {
-                                Some(prev) => prev.merge_max(u),
-                                None => u,
-                            });
-                        }
-                        StreamChunk::Done { .. } => break,
-                        _ => {}
+                    if !thinking_buffer.is_empty() {
+                        let thinking_delta: String = thinking_buffer.drain(..).collect();
+                        debug!(
+                            "stream flush: session={} message_id={} thinking_delta_len={}",
+                            session_id,
+                            message_id,
+                            thinking_delta.len()
+                        );
+                        config.emit_event(
+                            session_id,
+                            AgentEventKind::AssistantThinkingDelta {
+                                content: thinking_delta,
+                                message_id: message_id.clone(),
+                            },
+                        );
                     }
-
-                    // Time- or size-based flush
-                    if last_flush.elapsed() >= BATCH_INTERVAL
-                        || text_buffer.len() >= BATCH_CHARS
-                        || thinking_buffer.len() >= BATCH_CHARS
-                    {
-                        flush_buffers!(true);
+                    if $reset_timer {
+                        #[allow(unused_assignments)]
+                        {
+                            last_flush = Instant::now();
+                        }
                     }
-                }
+                };
+            }
 
-                // Final flush of any remaining buffered content (no timer reset needed)
-                flush_buffers!(false);
-
-                // The streaming loop exits via `Done => break`, which bypasses the
-                // per-chunk cancellation check at the top of the loop. Re-check here
-                // so a cancel signal that arrived concurrently with the Done chunk is
-                // not missed — without this the state machine would advance to AfterLlm.
+            while let Some(item) = stream.next().await {
                 if exec_ctx.cancellation_token.is_cancelled() {
                     return Ok(ExecutionState::Cancelled);
                 }
 
-                let finish_reason = if stream_tool_calls.is_empty() {
-                    Some(FinishReason::Stop)
-                } else {
-                    Some(FinishReason::ToolCalls)
-                };
+                match item.map_err(|e| anyhow::anyhow!("LLM streaming error: {}", e))? {
+                    StreamChunk::Text(delta) => {
+                        debug!(
+                            "stream chunk: session={} message_id={} type=text len={}",
+                            session_id,
+                            message_id,
+                            delta.len()
+                        );
+                        text.push_str(&delta);
+                        text_buffer.push_str(&delta);
+                    }
+                    StreamChunk::Thinking(delta) => {
+                        debug!(
+                            "stream chunk: session={} message_id={} type=thinking len={}",
+                            session_id,
+                            message_id,
+                            delta.len()
+                        );
+                        thinking.push_str(&delta);
+                        thinking_buffer.push_str(&delta);
+                    }
+                    StreamChunk::ToolUseComplete { tool_call, .. } => {
+                        // Flush before tool use so UI sees final text before tool starts
+                        debug!(
+                            "stream chunk: session={} message_id={} type=tool_use_complete id={}",
+                            session_id, message_id, tool_call.id
+                        );
+                        flush_buffers!(true);
+                        if tool_call_ids.insert(tool_call.id.clone()) {
+                            stream_tool_calls.push(tool_call);
+                        }
+                    }
+                    StreamChunk::Usage(u) => {
+                        debug!(
+                            "stream chunk: session={} message_id={} type=usage input={} output={} reasoning={}",
+                            session_id,
+                            message_id,
+                            u.input_tokens,
+                            u.output_tokens,
+                            u.reasoning_tokens
+                        );
+                        // Anthropic (and potentially other providers) split usage across
+                        // multiple streaming events: `input_tokens` arrives in
+                        // `message_start`, while cumulative `output_tokens` arrives in
+                        // `message_delta`.  Taking the field-wise maximum merges both
+                        // events correctly regardless of order.
+                        usage = Some(match usage {
+                            Some(prev) => prev.merge_max(u),
+                            None => u,
+                        });
+                    }
+                    StreamChunk::Done { .. } => {
+                        debug!(
+                            "stream chunk: session={} message_id={} type=done",
+                            session_id, message_id
+                        );
+                        break;
+                    }
+                    _ => {}
+                }
 
-                // Stash message_id in response so transition_after_llm reuses it
-                // (see LlmResponse::with_message_id)
-                // We return the id via a side-channel: we wrap it below.
-                // Use an Option wrapper: the streaming_message_id is set later.
-                (
-                    text,
-                    if thinking.is_empty() {
-                        None
-                    } else {
-                        Some(thinking)
-                    },
-                    stream_tool_calls,
-                    usage,
-                    finish_reason,
-                )
+                // Time- or size-based flush
+                if last_flush.elapsed() >= BATCH_INTERVAL
+                    || text_buffer.len() >= BATCH_CHARS
+                    || thinking_buffer.len() >= BATCH_CHARS
+                {
+                    flush_buffers!(true);
+                }
+            }
+
+            // Final flush of any remaining buffered content (no timer reset needed)
+            flush_buffers!(false);
+            debug!(
+                "stream finished: session={} message_id={} final_text_len={} final_thinking_len={} tool_calls={}",
+                session_id,
+                message_id,
+                text.len(),
+                thinking.len(),
+                stream_tool_calls.len()
+            );
+
+            // The streaming loop exits via `Done => break`, which bypasses the
+            // per-chunk cancellation check at the top of the loop. Re-check here
+            // so a cancel signal that arrived concurrently with the Done chunk is
+            // not missed — without this the state machine would advance to AfterLlm.
+            if exec_ctx.cancellation_token.is_cancelled() {
+                return Ok(ExecutionState::Cancelled);
+            }
+
+            let finish_reason = if stream_tool_calls.is_empty() {
+                Some(FinishReason::Stop)
             } else {
-                // === NON-STREAMING FALLBACK ===
-                let cancel = exec_ctx.cancellation_token.clone();
-                let resp = super::llm_retry::call_llm_with_retry(
+                Some(FinishReason::ToolCalls)
+            };
+
+            // Stash message_id in response so transition_after_llm reuses it
+            // (see LlmResponse::with_message_id)
+            // We return the id via a side-channel: we wrap it below.
+            // Use an Option wrapper: the streaming_message_id is set later.
+            (
+                text,
+                if thinking.is_empty() {
+                    None
+                } else {
+                    Some(thinking)
+                },
+                stream_tool_calls,
+                usage,
+                finish_reason,
+            )
+        } else {
+            // === NON-STREAMING FALLBACK ===
+            let cancel = exec_ctx.cancellation_token.clone();
+            let resp = super::llm_retry::call_llm_with_retry(
                 config,
                 session_id,
                 &exec_ctx.cancellation_token,
@@ -362,15 +415,15 @@ pub(super) async fn transition_call_llm(
             )
             .await?;
 
-                (
-                    resp.text().unwrap_or_default(),
-                    resp.thinking(),
-                    resp.tool_calls().unwrap_or_default(),
-                    resp.usage(),
-                    resp.finish_reason(),
-                )
-            }
-        };
+            (
+                resp.text().unwrap_or_default(),
+                resp.thinking(),
+                resp.tool_calls().unwrap_or_default(),
+                resp.usage(),
+                resp.finish_reason(),
+            )
+        }
+    };
 
     let (request_cost, cumulative_cost) = if let Some(usage_info) = &usage {
         let pricing = session_handle.get_pricing();

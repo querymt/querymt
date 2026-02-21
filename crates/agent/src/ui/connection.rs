@@ -179,23 +179,13 @@ pub async fn send_message(
     let message_type = message.type_name();
 
     match serde_json::to_string(&message) {
-        Ok(json) => {
-            log::debug!(
-                "send_message: sending {} (length: {})",
-                message_type,
-                json.len()
-            );
-            match tx.send(json).await {
-                Ok(_) => {
-                    log::debug!("send_message: {} sent successfully", message_type);
-                    Ok(())
-                }
-                Err(e) => {
-                    log::error!("send_message: failed to send {}: {}", message_type, e);
-                    Err(format!("Failed to send: {}", e))
-                }
+        Ok(json) => match tx.send(json).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                log::error!("send_message: failed to send {}: {}", message_type, e);
+                Err(format!("Failed to send: {}", e))
             }
-        }
+        },
         Err(err) => {
             log::error!(
                 "send_message: failed to serialize {}: {}",
@@ -303,6 +293,24 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                         .cloned()
                         .unwrap_or_else(|| "unknown".to_string())
                 };
+
+                if matches!(
+                    &event.kind,
+                    crate::events::AgentEventKind::AssistantThinkingDelta { .. }
+                        | crate::events::AgentEventKind::AssistantContentDelta { .. }
+                        | crate::events::AgentEventKind::AssistantMessageStored { .. }
+                        | crate::events::AgentEventKind::LlmRequestStart { .. }
+                        | crate::events::AgentEventKind::LlmRequestEnd { .. }
+                ) {
+                    log::debug!(
+                        "ui forwarder: conn={} session={} agent={} seq={} kind={:?}",
+                        conn_id_events,
+                        event.session_id,
+                        agent_id,
+                        event.seq,
+                        event.kind
+                    );
+                }
 
                 if send_message(
                     &tx_events,
