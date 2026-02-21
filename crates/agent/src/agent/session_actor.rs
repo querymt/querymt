@@ -24,6 +24,7 @@ use kameo::message::{Context, Message};
 use kameo::reply::DelegatedReply;
 use log::{debug, info, warn};
 use querymt::chat::ChatRole;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, instrument};
@@ -60,6 +61,9 @@ pub struct SessionActor {
     /// remote `EventRelayActor` in the Kademlia DHT.
     #[cfg(feature = "remote")]
     pub(crate) mesh: Option<crate::agent::remote::MeshHandle>,
+
+    // Tracks EventBus observer tokens by relay actor so unsubscribe can detach.
+    pub(crate) relay_observer_tokens: HashMap<u64, crate::event_bus::ObserverToken>,
 }
 
 impl SessionActor {
@@ -83,6 +87,7 @@ impl SessionActor {
             prompt_running: false,
             #[cfg(feature = "remote")]
             mesh: None,
+            relay_observer_tokens: HashMap::new(),
         }
     }
 
@@ -658,13 +663,25 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
                             relay_ref,
                             format!("session:{}", self.session_id),
                         ));
-                        self.config.event_bus.add_observer(forwarder);
+                        let token = self.config.event_bus.add_observer(forwarder);
+                        if let Some(previous_token) =
+                            self.relay_observer_tokens.insert(msg.relay_actor_id, token)
+                        {
+                            let removed = self.config.event_bus.remove_observer(previous_token);
+                            if !removed {
+                                warn!(
+                                    "Session {}: SubscribeEvents relay_actor_id={} replaced token {} but old observer was already missing",
+                                    self.session_id, msg.relay_actor_id, previous_token
+                                );
+                            }
+                        }
                         let observer_count = self.config.event_bus.observer_count();
                         log::debug!(
-                            "Session {}: SubscribeEvents — EventForwarder registered for relay '{}'; \
-                             total observers on bus now: {}",
+                            "Session {}: SubscribeEvents — EventForwarder registered for relay '{}' (relay_actor_id={}, token={}); total observers on bus now: {}",
                             self.session_id,
                             relay_name,
+                            msg.relay_actor_id,
+                            token,
                             observer_count
                         );
                     }
@@ -713,13 +730,26 @@ impl Message<crate::agent::messages::UnsubscribeEvents> for SessionActor {
         msg: crate::agent::messages::UnsubscribeEvents,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        info!(
-            "Session {}: UnsubscribeEvents relay_actor_id={}",
-            self.session_id, msg.relay_actor_id
-        );
-        // EventBus does not currently support removing individual observers by ID.
-        // When observer removal is needed, track the Arc<EventForwarder> on self
-        // and call event_bus.remove_observer() if/when that API is added.
+        if let Some(token) = self.relay_observer_tokens.remove(&msg.relay_actor_id) {
+            let removed = self.config.event_bus.remove_observer(token);
+            let observer_count = self.config.event_bus.observer_count();
+            if removed {
+                info!(
+                    "Session {}: UnsubscribeEvents relay_actor_id={} removed token {}; total observers now: {}",
+                    self.session_id, msg.relay_actor_id, token, observer_count
+                );
+            } else {
+                warn!(
+                    "Session {}: UnsubscribeEvents relay_actor_id={} token {} not found on bus; total observers now: {}",
+                    self.session_id, msg.relay_actor_id, token, observer_count
+                );
+            }
+        } else {
+            info!(
+                "Session {}: UnsubscribeEvents relay_actor_id={} had no registered observer",
+                self.session_id, msg.relay_actor_id
+            );
+        }
         Ok(())
     }
 }

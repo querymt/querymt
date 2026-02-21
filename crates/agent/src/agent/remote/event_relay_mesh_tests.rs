@@ -262,15 +262,11 @@ mod event_relay_mesh_tests {
         );
     }
 
-    // ── F.6 — Bug #4 ─────────────────────────────────────────────────────────
+    // ── F.6 — Unsubscribe lifecycle ──────────────────────────────────────────
 
-    /// Documents **Bug #4**: `UnsubscribeEvents` is a no-op.
-    ///
-    /// `EventBus` has no remove-by-id API, so observers accumulate.  When the
-    /// bug is fixed, the observer count after subscribe+unsubscribe should
-    /// return to the initial value.
+    /// Verifies subscribe+unsubscribe detaches the relay observer.
     #[tokio::test]
-    async fn test_unsubscribe_events_is_noop_currently() {
+    async fn test_unsubscribe_events_detaches_observer() {
         let test_id = Uuid::now_v7().to_string();
         let mesh = get_test_mesh().await;
 
@@ -300,24 +296,21 @@ mod event_relay_mesh_tests {
 
         let after_subscribe = f.config.event_bus.observer_count();
 
-        // Unsubscribe — Bug #4: this is currently a no-op.
+        // Unsubscribe and verify the relay observer is detached.
         let result = session_ref.unsubscribe_events(7).await;
         assert!(result.is_ok(), "unsubscribe_events should return Ok");
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let after_unsubscribe = f.config.event_bus.observer_count();
-
-        // Bug #4: observer count is NOT decreased because EventBus has no
-        // remove-by-id. When fixed, after_unsubscribe should equal before.
         assert_eq!(
-            after_subscribe, after_unsubscribe,
-            "Bug #4: UnsubscribeEvents is a no-op — observer count unchanged after unsubscribe"
+            before, after_unsubscribe,
+            "observer count should return to baseline after unsubscribe"
         );
 
-        // Document what "fixed" would look like (currently this would fail):
-        if after_unsubscribe == before {
-            // Bug is fixed — update this test.
-        }
+        assert!(
+            after_subscribe > before,
+            "subscribe should still increase observer count before unsubscribe"
+        );
     }
 }

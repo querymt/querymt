@@ -9,11 +9,14 @@ use tokio::task::JoinSet;
 
 const EVENT_BUS_BUFFER: usize = 1024;
 
+pub type ObserverToken = u64;
+
 /// Unified event bus for broadcasting agent events.
 pub struct EventBus {
     sender: broadcast::Sender<AgentEvent>,
-    observers: Arc<Mutex<Vec<Arc<dyn EventObserver>>>>,
+    observers: Arc<Mutex<Vec<(ObserverToken, Arc<dyn EventObserver>)>>>,
     sequence: AtomicU64,
+    observer_sequence: AtomicU64,
     observer_tasks: Arc<TokioMutex<JoinSet<()>>>,
 }
 
@@ -25,6 +28,7 @@ impl EventBus {
             sender,
             observers: Arc::new(Mutex::new(Vec::new())),
             sequence: AtomicU64::new(1),
+            observer_sequence: AtomicU64::new(1),
             observer_tasks: Arc::new(TokioMutex::new(JoinSet::new())),
         }
     }
@@ -35,13 +39,29 @@ impl EventBus {
     }
 
     /// Register an event observer.
-    pub fn add_observer(&self, observer: Arc<dyn EventObserver>) {
-        self.observers.lock().push(observer);
+    pub fn add_observer(&self, observer: Arc<dyn EventObserver>) -> ObserverToken {
+        let token = self.observer_sequence.fetch_add(1, Ordering::Relaxed);
+        self.observers.lock().push((token, observer));
+        token
     }
 
     /// Register multiple observers.
     pub fn add_observers(&self, observers: Vec<Arc<dyn EventObserver>>) {
-        self.observers.lock().extend(observers);
+        let mut current_observers = self.observers.lock();
+        for observer in observers {
+            let token = self.observer_sequence.fetch_add(1, Ordering::Relaxed);
+            current_observers.push((token, observer));
+        }
+    }
+
+    /// Remove a previously registered observer by token.
+    ///
+    /// Returns true when an observer is removed, false if token was not found.
+    pub fn remove_observer(&self, token: ObserverToken) -> bool {
+        let mut observers = self.observers.lock();
+        let before = observers.len();
+        observers.retain(|(observer_token, _)| *observer_token != token);
+        before != observers.len()
     }
 
     /// Return the number of currently registered observers.
@@ -54,7 +74,13 @@ impl EventBus {
         let event = self.build_event(session_id, kind);
         let _ = self.sender.send(event.clone());
 
-        let observers = { self.observers.lock().clone() };
+        let observers = {
+            self.observers
+                .lock()
+                .iter()
+                .map(|(_, observer)| Arc::clone(observer))
+                .collect::<Vec<_>>()
+        };
 
         // Spawn observer tasks and track them for cleanup
         let tasks = self.observer_tasks.clone();
@@ -155,7 +181,7 @@ mod tests {
         let bus = EventBus::new();
         let observer = Arc::new(MockObserver::new());
 
-        bus.add_observer(observer.clone());
+        let _token = bus.add_observer(observer.clone());
         assert_eq!(bus.observer_count(), 1);
 
         bus.publish("sess-test", AgentEventKind::Cancelled);
@@ -185,13 +211,40 @@ mod tests {
         assert_eq!(bus.observer_count(), 0);
 
         let observer1 = Arc::new(MockObserver::new()) as Arc<dyn EventObserver>;
-        bus.add_observer(observer1);
+        let _token1 = bus.add_observer(observer1);
         assert_eq!(bus.observer_count(), 1);
 
         let observer2 = Arc::new(MockObserver::new()) as Arc<dyn EventObserver>;
         let observer3 = Arc::new(MockObserver::new()) as Arc<dyn EventObserver>;
-        bus.add_observers(vec![observer2, observer3]);
+        let _tokens = bus.add_observers(vec![observer2, observer3]);
         assert_eq!(bus.observer_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn remove_observer_detaches_registered_observer() {
+        let bus = EventBus::new();
+        let observer = Arc::new(MockObserver::new()) as Arc<dyn EventObserver>;
+        let token = bus.add_observer(observer);
+        assert_eq!(bus.observer_count(), 1);
+
+        assert!(bus.remove_observer(token));
+        assert_eq!(bus.observer_count(), 0);
+
+        // Removing again should report not found.
+        assert!(!bus.remove_observer(token));
+    }
+
+    #[tokio::test]
+    async fn subscribe_unsubscribe_cycles_do_not_accumulate_observers() {
+        let bus = EventBus::new();
+
+        for _ in 0..5 {
+            let observer = Arc::new(MockObserver::new()) as Arc<dyn EventObserver>;
+            let token = bus.add_observer(observer);
+            assert_eq!(bus.observer_count(), 1);
+            assert!(bus.remove_observer(token));
+            assert_eq!(bus.observer_count(), 0);
+        }
     }
 
     #[tokio::test]
@@ -245,7 +298,7 @@ mod tests {
     async fn shutdown_completes_without_error() {
         let bus = EventBus::new();
         let observer = Arc::new(MockObserver::new()) as Arc<dyn EventObserver>;
-        bus.add_observer(observer);
+        let _token = bus.add_observer(observer);
 
         bus.publish("sess-shutdown", AgentEventKind::SessionCreated);
         bus.shutdown().await;
