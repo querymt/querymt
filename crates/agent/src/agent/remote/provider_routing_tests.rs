@@ -338,7 +338,7 @@ mod provider_routing_integration_tests {
         let f = ProviderHostFixture::new().await;
         let mesh = get_test_mesh().await;
 
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, _rx) = mpsc::channel(16);
         let stream_rx_name = format!("stream_rx::h9-{}", test_id);
         let receiver_actor = StreamReceiverActor::new(tx, stream_rx_name.clone());
         let receiver_ref = StreamReceiverActor::spawn(receiver_actor);
@@ -1122,7 +1122,7 @@ mod mesh_setup_config_tests {
         // "node_manager" in the DHT. If not found, it registers speculatively.
         // The returned registry entry is still created (speculative registration).
         // We document that no panic occurs.
-        let mut registry = DefaultAgentRegistry::new();
+        let registry = DefaultAgentRegistry::new();
         // We can't call `register_remote_agent` directly (private), so we
         // verify that building the AgentInfo doesn't panic:
         let info = crate::delegation::AgentInfo {

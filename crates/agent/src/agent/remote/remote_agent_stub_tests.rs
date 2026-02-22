@@ -13,6 +13,7 @@
 //! succeed where expected.
 
 #[cfg(all(test, feature = "remote"))]
+#[allow(clippy::module_inception)]
 mod remote_agent_stub_tests {
     use crate::agent::remote::remote_setup::RemoteAgentStub;
     use crate::agent::remote::test_helpers::fixtures::{MeshNodeManagerFixture, get_test_mesh};

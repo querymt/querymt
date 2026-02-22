@@ -306,7 +306,7 @@ mod tests {
     async fn check_delegation_allowed_blocks_running_duplicate() {
         let objective = "do the thing";
         let hash = RapidHash::new(objective.as_bytes());
-        let hash_clone = hash.clone();
+        let hash_clone = hash;
 
         let delegation = Delegation {
             id: 1,
@@ -344,7 +344,7 @@ mod tests {
     async fn check_delegation_allowed_blocks_when_max_retries_exceeded() {
         let objective = "repeated task";
         let hash = RapidHash::new(objective.as_bytes());
-        let hash_clone = hash.clone();
+        let hash_clone = hash;
 
         let delegation = Delegation {
             id: 1,
@@ -382,7 +382,7 @@ mod tests {
     async fn check_delegation_allowed_permits_completed_delegation() {
         let objective = "completed task";
         let hash = RapidHash::new(objective.as_bytes());
-        let hash_clone = hash.clone();
+        let hash_clone = hash;
 
         let delegation = Delegation {
             id: 1,

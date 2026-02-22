@@ -892,7 +892,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fork_session_empty_history_fails() {
-        let mut f = RegistryFixture::new().await;
+        let _f = RegistryFixture::new().await;
 
         // Override: get_history returns empty vec, get_session returns Some
         let mut store2 = MockSessionStore::new();

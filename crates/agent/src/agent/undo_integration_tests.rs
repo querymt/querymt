@@ -491,7 +491,7 @@ async fn test_undo_nested_directory_file_changes() -> Result<()> {
         result
             .reverted_files
             .iter()
-            .all(|p| !std::path::Path::new(p).extension().is_none() || p.contains('.')),
+            .all(|p| std::path::Path::new(p).extension().is_some() || p.contains('.')),
         "reverted_files should not contain bare directory paths, got: {:?}",
         result.reverted_files
     );

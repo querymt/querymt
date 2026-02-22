@@ -12,9 +12,11 @@ const EVENT_BUS_BUFFER: usize = 1024;
 pub type ObserverToken = u64;
 
 /// Unified event bus for broadcasting agent events.
+type ObserverList = Vec<(ObserverToken, Arc<dyn EventObserver>)>;
+
 pub struct EventBus {
     sender: broadcast::Sender<AgentEvent>,
-    observers: Arc<Mutex<Vec<(ObserverToken, Arc<dyn EventObserver>)>>>,
+    observers: Arc<Mutex<ObserverList>>,
     sequence: AtomicU64,
     observer_sequence: AtomicU64,
     observer_tasks: Arc<TokioMutex<JoinSet<()>>>,
@@ -244,7 +246,7 @@ mod tests {
 
         let observer2 = Arc::new(MockObserver::new()) as Arc<dyn EventObserver>;
         let observer3 = Arc::new(MockObserver::new()) as Arc<dyn EventObserver>;
-        let _tokens = bus.add_observers(vec![observer2, observer3]);
+        bus.add_observers(vec![observer2, observer3]);
         assert_eq!(bus.observer_count(), 3);
     }
 

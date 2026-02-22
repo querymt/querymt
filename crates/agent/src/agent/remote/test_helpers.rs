@@ -188,7 +188,7 @@ pub(crate) mod fixtures {
             None
         }
         fn finish_reason(&self) -> Option<FinishReason> {
-            Some(self.finish.clone())
+            Some(self.finish)
         }
         fn usage(&self) -> Option<querymt::Usage> {
             None
@@ -257,7 +257,7 @@ pub(crate) mod fixtures {
     /// ```
     pub struct ProviderHostFixture {
         pub actor_ref: ActorRef<ProviderHostActor>,
-        pub config: Arc<AgentConfig>,
+        pub _config: Arc<AgentConfig>,
         pub _tempdir: TempDir,
     }
 
@@ -268,7 +268,7 @@ pub(crate) mod fixtures {
             let actor_ref = ProviderHostActor::spawn(actor);
             Self {
                 actor_ref,
-                config: f.config,
+                _config: f.config,
                 _tempdir: f._tempdir,
             }
         }
@@ -320,7 +320,7 @@ pub(crate) mod fixtures {
         pub actor_ref: ActorRef<RemoteNodeManager>,
         pub config: Arc<AgentConfig>,
         pub dht_name: String,
-        pub mesh: &'static MeshHandle,
+        pub _mesh: &'static MeshHandle,
         pub _tempdir: TempDir,
     }
 
@@ -340,7 +340,7 @@ pub(crate) mod fixtures {
                 actor_ref,
                 config: f.config,
                 dht_name,
-                mesh,
+                _mesh: mesh,
                 _tempdir: f._tempdir,
             }
         }
@@ -359,7 +359,7 @@ pub(crate) mod fixtures {
     /// // f.mesh            — &'static MeshHandle
     /// ```
     pub struct TwoNodeFixture {
-        pub alpha: MeshNodeManagerFixture,
+        pub _alpha: MeshNodeManagerFixture,
         pub beta: MeshNodeManagerFixture,
         pub mesh: &'static MeshHandle,
     }
@@ -369,7 +369,11 @@ pub(crate) mod fixtures {
             let mesh = get_test_mesh().await;
             let alpha = MeshNodeManagerFixture::new("alpha", test_id).await;
             let beta = MeshNodeManagerFixture::new("beta", test_id).await;
-            Self { alpha, beta, mesh }
+            Self {
+                _alpha: alpha,
+                beta,
+                mesh,
+            }
         }
     }
 
@@ -390,11 +394,11 @@ pub(crate) mod fixtures {
     /// // f.call_count         — Arc<Mutex<usize>> to verify mock was invoked
     /// ```
     pub struct ProviderRoutingFixture {
-        pub provider_host_ref: ActorRef<ProviderHostActor>,
-        pub provider_host_dht: String,
+        pub _provider_host_ref: ActorRef<ProviderHostActor>,
+        pub _provider_host_dht: String,
         pub beta: MeshNodeManagerFixture,
-        pub alpha_config: Arc<AgentConfig>,
-        pub call_count: Arc<Mutex<usize>>,
+        pub _alpha_config: Arc<AgentConfig>,
+        pub _call_count: Arc<Mutex<usize>>,
         pub mesh: &'static MeshHandle,
         pub _alpha_tempdir: TempDir,
     }
@@ -424,11 +428,11 @@ pub(crate) mod fixtures {
             let beta = MeshNodeManagerFixture::new("beta", test_id).await;
 
             Self {
-                provider_host_ref: actor_ref,
-                provider_host_dht,
+                _provider_host_ref: actor_ref,
+                _provider_host_dht: provider_host_dht,
                 beta,
-                alpha_config: alpha_f.config,
-                call_count,
+                _alpha_config: alpha_f.config,
+                _call_count: call_count,
                 mesh,
                 _alpha_tempdir: alpha_f._tempdir,
             }
@@ -443,6 +447,7 @@ pub(crate) mod fixtures {
     /// `RemoteAgentStub` via the same construction path as
     /// `setup_mesh_from_config`.  Tests only require local actor refs —
     /// no DHT lookup is exercised.
+    #[allow(dead_code)]
     pub struct RemoteAgentStubFixture {
         pub stub: Arc<dyn crate::send_agent::SendAgent>,
         pub node_manager: ActorRef<RemoteNodeManager>,
@@ -450,6 +455,7 @@ pub(crate) mod fixtures {
         pub _tempdir: TempDir,
     }
 
+    #[allow(dead_code)]
     impl RemoteAgentStubFixture {
         pub async fn new(test_id: &str) -> Self {
             use crate::agent::remote::remote_setup::RemoteAgentStub;

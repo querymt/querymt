@@ -724,17 +724,12 @@ pub struct QuorumConfig {
     pub remote_agents: Vec<RemoteAgentConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationWaitPolicy {
     All,
+    #[default]
     Any,
-}
-
-impl Default for DelegationWaitPolicy {
-    fn default() -> Self {
-        Self::Any
-    }
 }
 
 fn default_delegation_wait_timeout_secs() -> u64 {

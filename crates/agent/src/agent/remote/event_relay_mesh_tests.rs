@@ -8,6 +8,7 @@
 //! - **#5** — Race in `attach_remote_session` / `SubscribeEvents` (G.8).
 
 #[cfg(all(test, feature = "remote"))]
+#[allow(clippy::module_inception)]
 mod event_relay_mesh_tests {
     use crate::agent::core::SessionRuntime;
     use crate::agent::remote::SessionActorRef;

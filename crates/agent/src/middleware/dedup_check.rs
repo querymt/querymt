@@ -333,10 +333,10 @@ impl DedupCheckMiddleware {
 
     /// Return a workspace-relative version of `path` if possible, else the full path string.
     fn rel_path(path: &std::path::Path, workspace_root: Option<&std::path::Path>) -> String {
-        if let Some(root) = workspace_root {
-            if let Ok(rel) = path.strip_prefix(root) {
-                return rel.display().to_string();
-            }
+        if let Some(root) = workspace_root
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            return rel.display().to_string();
         }
         path.display().to_string()
     }

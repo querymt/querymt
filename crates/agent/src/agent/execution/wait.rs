@@ -16,15 +16,15 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 enum WaitEventOutcome {
-    DelegationCompleted {
+    Completed {
         delegation_id: String,
         result: Option<String>,
     },
-    DelegationFailed {
+    Failed {
         delegation_id: String,
         error: String,
     },
-    DelegationCancelled {
+    Cancelled {
         delegation_id: String,
     },
 }
@@ -146,9 +146,9 @@ pub(super) async fn transition_waiting_for_event(
                 };
 
                 let delegation_id = match &outcome {
-                    WaitEventOutcome::DelegationCompleted { delegation_id, .. }
-                    | WaitEventOutcome::DelegationFailed { delegation_id, .. }
-                    | WaitEventOutcome::DelegationCancelled { delegation_id } => delegation_id,
+                    WaitEventOutcome::Completed { delegation_id, .. }
+                    | WaitEventOutcome::Failed { delegation_id, .. }
+                    | WaitEventOutcome::Cancelled { delegation_id } => delegation_id,
                 };
 
                 if !pending.remove(delegation_id) {
@@ -180,7 +180,7 @@ fn match_wait_event(
                 {
                     return None;
                 }
-                Some(WaitEventOutcome::DelegationCompleted {
+                Some(WaitEventOutcome::Completed {
                     delegation_id: delegation_id.clone(),
                     result: result.clone(),
                 })
@@ -193,7 +193,7 @@ fn match_wait_event(
                 {
                     return None;
                 }
-                Some(WaitEventOutcome::DelegationFailed {
+                Some(WaitEventOutcome::Failed {
                     delegation_id: delegation_id.clone(),
                     error: error.clone(),
                 })
@@ -203,7 +203,7 @@ fn match_wait_event(
                 {
                     return None;
                 }
-                Some(WaitEventOutcome::DelegationCancelled {
+                Some(WaitEventOutcome::Cancelled {
                     delegation_id: delegation_id.clone(),
                 })
             }
@@ -214,18 +214,18 @@ fn match_wait_event(
 
 fn format_wait_outcome(outcome: &WaitEventOutcome) -> String {
     match outcome {
-        WaitEventOutcome::DelegationCompleted {
+        WaitEventOutcome::Completed {
             delegation_id,
             result,
         } => {
             let summary = result.as_deref().unwrap_or("No summary provided.");
             format_delegation_completion_message(delegation_id, summary)
         }
-        WaitEventOutcome::DelegationFailed {
+        WaitEventOutcome::Failed {
             delegation_id,
             error,
         } => format_delegation_failure_message(delegation_id, error),
-        WaitEventOutcome::DelegationCancelled { delegation_id } => {
+        WaitEventOutcome::Cancelled { delegation_id } => {
             format!("Delegation cancelled.\n\nDelegation ID: {}", delegation_id)
         }
     }
@@ -233,18 +233,18 @@ fn format_wait_outcome(outcome: &WaitEventOutcome) -> String {
 
 fn format_wait_all_item(outcome: &WaitEventOutcome) -> String {
     match outcome {
-        WaitEventOutcome::DelegationCompleted {
+        WaitEventOutcome::Completed {
             delegation_id,
             result,
         } => {
             let summary = result.as_deref().unwrap_or("No summary provided.");
             format!("- {}: completed ({})", delegation_id, summary)
         }
-        WaitEventOutcome::DelegationFailed {
+        WaitEventOutcome::Failed {
             delegation_id,
             error,
         } => format!("- {}: failed ({})", delegation_id, error),
-        WaitEventOutcome::DelegationCancelled { delegation_id } => {
+        WaitEventOutcome::Cancelled { delegation_id } => {
             format!("- {}: cancelled", delegation_id)
         }
     }

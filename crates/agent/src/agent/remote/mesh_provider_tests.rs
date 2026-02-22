@@ -7,6 +7,7 @@
 //! as the hostname placeholder (B.6, marked `#[ignore]`).
 
 #[cfg(all(test, feature = "remote"))]
+#[allow(clippy::module_inception)]
 mod mesh_provider_tests {
     use crate::agent::remote::mesh_provider::{MeshChatProvider, find_provider_on_mesh};
     use crate::agent::remote::test_helpers::fixtures::{

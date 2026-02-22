@@ -393,11 +393,11 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         }
     });
 
-    if matches!(&config.discovery, MeshDiscovery::Kademlia { bootstrap } if !bootstrap.is_empty()) {
-        if let MeshDiscovery::Kademlia { bootstrap } = &config.discovery {
-            for addr in bootstrap {
-                log::info!("Kademlia bootstrap peer: {}", addr);
-            }
+    if matches!(&config.discovery, MeshDiscovery::Kademlia { bootstrap } if !bootstrap.is_empty())
+        && let MeshDiscovery::Kademlia { bootstrap } = &config.discovery
+    {
+        for addr in bootstrap {
+            log::info!("Kademlia bootstrap peer: {}", addr);
         }
     }
 
@@ -425,10 +425,10 @@ pub async fn bootstrap_mesh_default() -> Result<MeshHandle, MeshError> {
 /// Resolve the local hostname (same logic as `RemoteNodeManager::get_hostname`
 /// but available outside the `remote_impl` module).
 fn resolve_local_hostname() -> String {
-    if let Ok(h) = std::env::var("HOSTNAME") {
-        if !h.is_empty() {
-            return h;
-        }
+    if let Ok(h) = std::env::var("HOSTNAME")
+        && !h.is_empty()
+    {
+        return h;
     }
     std::process::Command::new("hostname")
         .output()

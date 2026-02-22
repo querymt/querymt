@@ -995,16 +995,16 @@ impl Message<Prompt> for SessionActor {
         let actor_ref = ctx.actor_ref().clone();
 
         ctx.spawn(async move {
-            let result = execute_prompt_detached(
-                msg.req,
-                session_id.clone(),
+            let result = execute_prompt_detached(DetachedPromptExecution {
+                req: msg.req,
+                session_id: session_id.clone(),
                 runtime,
                 config,
                 cancel_token,
                 bridge,
                 mode,
                 tool_config,
-            )
+            })
             .await;
 
             debug!("Session {}: sending PromptFinished to actor", session_id);
@@ -1033,12 +1033,7 @@ impl Message<Prompt> for SessionActor {
 ///
 /// This function gathers all needed state upfront and runs the full execution cycle.
 /// It does NOT access the actor — everything is passed as parameters.
-#[instrument(
-    name = "agent.prompt.execute",
-    skip(req, runtime, config, cancel_token, bridge, tool_config),
-    fields(session_id = %session_id, mode = %mode)
-)]
-async fn execute_prompt_detached(
+struct DetachedPromptExecution {
     req: agent_client_protocol::PromptRequest,
     session_id: String,
     runtime: Arc<SessionRuntime>,
@@ -1047,7 +1042,24 @@ async fn execute_prompt_detached(
     bridge: Option<ClientBridgeSender>,
     mode: AgentMode,
     tool_config: ToolConfig,
-) -> Result<PromptResponse, AgentError> {
+}
+
+#[instrument(
+    name = "agent.prompt.execute",
+    skip(exec),
+    fields(session_id = %exec.session_id, mode = %exec.mode)
+)]
+async fn execute_prompt_detached(exec: DetachedPromptExecution) -> Result<PromptResponse, AgentError> {
+    let DetachedPromptExecution {
+        req,
+        session_id,
+        runtime,
+        config,
+        cancel_token,
+        bridge,
+        mode,
+        tool_config,
+    } = exec;
     debug!(
         "Prompt request for session {} with {} block(s)",
         session_id,
@@ -1423,7 +1435,6 @@ mod tests {
     };
     use crate::tools::ToolRegistry;
     use kameo::actor::Spawn;
-    use kameo::message::Message;
     use querymt::LLMParams;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -1435,7 +1446,7 @@ mod tests {
     struct ActorFixture {
         config: Arc<AgentConfig>,
         actor_ref: kameo::actor::ActorRef<SessionActor>,
-        session_id: String,
+        _session_id: String,
         _temp_dir: tempfile::TempDir,
     }
 
@@ -1547,7 +1558,7 @@ mod tests {
             Self {
                 config,
                 actor_ref,
-                session_id: session_id.to_string(),
+                _session_id: session_id.to_string(),
                 _temp_dir: temp_dir,
             }
         }

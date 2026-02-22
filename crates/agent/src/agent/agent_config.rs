@@ -279,7 +279,7 @@ impl AgentConfig {
             if let (Some(runtime), ToolPolicy::ProviderOnly | ToolPolicy::BuiltInAndProvider) =
                 (runtime, config.policy)
             {
-                runtime.mcp_tool_defs.iter().cloned().collect()
+                runtime.mcp_tool_defs.to_vec()
             } else {
                 vec![]
             };

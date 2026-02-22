@@ -7,6 +7,7 @@
 //! string-match that must align with `format!("{:?}", FinishReason::*)`.
 
 #[cfg(all(test, feature = "remote"))]
+#[allow(clippy::module_inception)]
 mod provider_host_tests {
     use crate::agent::remote::provider_host::{
         ProviderChatRequest, ProviderChatResponse, StreamChunkRelay, StreamReceiverActor,

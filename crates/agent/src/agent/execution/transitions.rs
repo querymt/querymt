@@ -921,11 +921,8 @@ mod tests {
             .collect();
         let result = apply_cache_breakpoints(&msgs);
         assert_eq!(result.len(), 5);
-        for i in 0..3 {
-            assert!(
-                result[i].cache.is_none(),
-                "msg-{i} should NOT have cache hint"
-            );
+        for (i, msg) in result.iter().enumerate().take(3) {
+            assert!(msg.cache.is_none(), "msg-{i} should NOT have cache hint");
         }
         assert!(result[3].cache.is_some(), "msg-3 should be cached");
         assert!(result[4].cache.is_some(), "msg-4 should be cached");

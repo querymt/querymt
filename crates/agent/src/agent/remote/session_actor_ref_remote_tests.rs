@@ -9,6 +9,7 @@
 //! 6. Asserting behaviour.
 
 #[cfg(all(test, feature = "remote"))]
+#[allow(clippy::module_inception)]
 mod session_actor_ref_remote_tests {
     use crate::agent::core::{AgentMode, SessionRuntime};
     use crate::agent::remote::SessionActorRef;
