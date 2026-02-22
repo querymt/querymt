@@ -38,9 +38,18 @@ impl LLMProviderFactory for LlamaCppFactory {
     fn list_models<'a>(&'a self, cfg: &str) -> Fut<'a, Result<Vec<String>, LLMError>> {
         let cfg = cfg.to_string();
         Box::pin(async move {
-            let cfg: LlamaCppConfig = serde_json::from_str(&cfg)?;
+            let cfg: LlamaCppConfig = serde_json::from_str(&cfg).map_err(|err| {
+                LLMError::InvalidRequest(format!(
+                    "Invalid llama_cpp config for list_models: {}. Expected JSON with at least a 'model' field.",
+                    err
+                ))
+            })?;
             Ok(vec![cfg.model])
         })
+    }
+
+    fn supports_custom_models(&self) -> bool {
+        true
     }
 }
 

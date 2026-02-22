@@ -6,7 +6,9 @@ use crate::session::domain::{
     TaskStatus,
 };
 use crate::session::error::SessionResult;
-use crate::session::store::{LLMConfig, Session, SessionExecutionConfig, SessionStore};
+use crate::session::store::{
+    CustomModel, LLMConfig, Session, SessionExecutionConfig, SessionStore,
+};
 use async_trait::async_trait;
 use mockall::mock;
 use querymt::LLMParams;
@@ -62,6 +64,14 @@ mock! {
             &'a self,
             session_id: &'b str,
         ) -> SessionResult<Option<SessionExecutionConfig>>;
+        async fn list_custom_models(&self, provider: &str) -> SessionResult<Vec<CustomModel>>;
+        async fn get_custom_model(
+            &self,
+            provider: &str,
+            model_id: &str,
+        ) -> SessionResult<Option<CustomModel>>;
+        async fn upsert_custom_model(&self, model: &CustomModel) -> SessionResult<()>;
+        async fn delete_custom_model(&self, provider: &str, model_id: &str) -> SessionResult<()>;
         async fn set_current_intent_snapshot<'a, 'b, 'c>(
             &'a self,
             session_id: &'b str,

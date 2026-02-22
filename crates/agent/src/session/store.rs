@@ -68,6 +68,23 @@ pub struct LLMConfig {
     pub provider_node: Option<String>,
 }
 
+/// User-managed custom model metadata persisted in storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomModel {
+    pub provider: String,
+    pub model_id: String,
+    pub display_name: String,
+    pub config_json: serde_json::Value,
+    pub source_type: String,
+    pub source_ref: Option<String>,
+    pub family: Option<String>,
+    pub quant: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub created_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub updated_at: Option<OffsetDateTime>,
+}
+
 /// Stored session-scoped execution configuration snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionExecutionConfig {
@@ -233,6 +250,22 @@ pub trait SessionStore: Send + Sync {
         &self,
         session_id: &str,
     ) -> SessionResult<Option<SessionExecutionConfig>>;
+
+    /// List user-managed custom models for a provider.
+    async fn list_custom_models(&self, provider: &str) -> SessionResult<Vec<CustomModel>>;
+
+    /// Get a user-managed custom model by canonical model_id.
+    async fn get_custom_model(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> SessionResult<Option<CustomModel>>;
+
+    /// Insert or update a user-managed custom model.
+    async fn upsert_custom_model(&self, model: &CustomModel) -> SessionResult<()>;
+
+    /// Delete a user-managed custom model.
+    async fn delete_custom_model(&self, provider: &str, model_id: &str) -> SessionResult<()>;
 
     // Phase 3 additions: Repository methods for domain entities
 

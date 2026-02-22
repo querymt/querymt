@@ -514,6 +514,7 @@ impl Agent {
         AgentServer::new(
             self.inner.clone(),
             self.view_store.clone(),
+            self.inner.config.provider.history_store(),
             self.cwd.clone(),
         )
     }

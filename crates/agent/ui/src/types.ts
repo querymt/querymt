@@ -400,6 +400,7 @@ export type UiServerMessage =
     }
   | { type: 'all_models_list'; models: ModelEntry[] }
   | { type: 'recent_models'; by_workspace: Record<string, RecentModelEntry[]> }
+  | { type: 'provider_capabilities'; providers: ProviderCapabilityEntry[] }
   | { type: 'auth_providers'; providers: AuthProviderEntry[] }
   | { type: 'oauth_flow_started'; flow_id: string; provider: string; authorization_url: string }
   | { type: 'oauth_result'; provider: string; success: boolean; message: string }
@@ -416,13 +417,24 @@ export type UiServerMessage =
   | { type: 'redo_result'; success: boolean; message?: string | null; undo_stack: UndoStackFrame[] }
   | { type: 'agent_mode'; mode: string }
   | { type: 'remote_nodes'; nodes: RemoteNodeInfo[] }
-  | { type: 'remote_sessions'; node: string; sessions: RemoteSessionInfo[] };
+  | { type: 'remote_sessions'; node: string; sessions: RemoteSessionInfo[] }
+  | ({ type: 'model_download_status' } & ModelDownloadStatus);
 
 export interface ModelEntry {
+  id?: string;
+  label?: string;
+  source?: 'preset' | 'cached' | 'custom' | 'catalog' | string;
+  family?: string;
+  quant?: string;
   provider: string;
   model: string;
   /** Node label where this provider lives. Absent for local models, set for remote mesh nodes. */
   node?: string;
+}
+
+export interface ProviderCapabilityEntry {
+  provider: string;
+  supports_custom_models: boolean;
 }
 
 export interface RecentModelEntry {
@@ -430,6 +442,18 @@ export interface RecentModelEntry {
   model: string;
   last_used: string;  // ISO 8601 timestamp
   use_count: number;
+}
+
+export interface ModelDownloadStatus {
+  provider: string;
+  model_id: string;
+  status: 'queued' | 'downloading' | 'completed' | 'failed' | string;
+  bytes_downloaded: number;
+  bytes_total?: number | null;
+  percent?: number | null;
+  speed_bps?: number | null;
+  eta_seconds?: number | null;
+  message?: string | null;
 }
 
 export type OAuthStatus = 'not_authenticated' | 'expired' | 'connected';
@@ -507,4 +531,7 @@ export type UiClientMessage =
   | { type: 'list_remote_nodes' }
   | { type: 'list_remote_sessions'; node: string }
   | { type: 'create_remote_session'; node: string; cwd?: string | null; request_id?: string }
-  | { type: 'attach_remote_session'; node: string; session_id: string };
+  | { type: 'attach_remote_session'; node: string; session_id: string }
+  | { type: 'add_custom_model_from_hf'; provider: string; repo: string; filename: string; display_name?: string }
+  | { type: 'add_custom_model_from_file'; provider: string; file_path: string; display_name?: string }
+  | { type: 'delete_custom_model'; provider: string; model_id: string };

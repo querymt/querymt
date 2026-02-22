@@ -415,6 +415,7 @@ impl Quorum {
         AgentServer::new(
             self.planner_handle.clone(),
             self.view_store.clone(),
+            self.planner_handle.config.provider.history_store(),
             self.cwd.clone(),
         )
     }

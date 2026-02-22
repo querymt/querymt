@@ -41,14 +41,34 @@ pub enum RoutingMode {
     Broadcast,
 }
 
-/// Cached model list entry.
+/// Cached model list entry with canonical identity.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelEntry {
+    /// Canonical internal identifier (e.g., "hf:repo:file.gguf", "file:/path/to/model.gguf", or provider-specific ID)
+    pub id: String,
+    /// Human-readable display label
+    pub label: String,
+    /// Model source: "preset", "cached", "custom", "catalog"
+    pub source: String,
+    /// Provider name
     pub provider: String,
+    /// Original model identifier (for backwards compatibility)
     pub model: String,
     /// Node label where this provider lives. `None` = local node, `Some(hostname)` = remote mesh node.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// Model family/repo for grouping (e.g., "Qwen2.5-Coder-32B-Instruct")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// Quantization level (e.g., "Q8_0", "Q6_K", "unknown")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quant: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderCapabilityEntry {
+    pub provider: String,
+    pub supports_custom_models: bool,
 }
 
 /// Recent model usage entry from event history.
@@ -234,6 +254,23 @@ pub enum UiClientMessage {
         /// Session ID to attach
         session_id: String,
     },
+    AddCustomModelFromHf {
+        provider: String,
+        repo: String,
+        filename: String,
+        #[serde(default)]
+        display_name: Option<String>,
+    },
+    AddCustomModelFromFile {
+        provider: String,
+        file_path: String,
+        #[serde(default)]
+        display_name: Option<String>,
+    },
+    DeleteCustomModel {
+        provider: String,
+        model_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -293,7 +330,10 @@ pub enum UiServerMessage {
     },
     /// Recent models from event history, grouped by workspace
     RecentModels {
-        by_workspace: HashMap<Option<String>, Vec<RecentModelEntry>>,
+        by_workspace: HashMap<String, Vec<RecentModelEntry>>,
+    },
+    ProviderCapabilities {
+        providers: Vec<ProviderCapabilityEntry>,
     },
     /// File index for autocomplete
     FileIndex {
@@ -354,6 +394,17 @@ pub enum UiServerMessage {
         /// Sessions on that node
         sessions: Vec<crate::agent::remote::RemoteSessionInfo>,
     },
+    ModelDownloadStatus {
+        provider: String,
+        model_id: String,
+        status: String,
+        bytes_downloaded: u64,
+        bytes_total: Option<u64>,
+        percent: Option<f32>,
+        speed_bps: Option<u64>,
+        eta_seconds: Option<u64>,
+        message: Option<String>,
+    },
 }
 
 impl UiServerMessage {
@@ -369,6 +420,7 @@ impl UiServerMessage {
             Self::WorkspaceIndexStatus { .. } => "workspace_index_status",
             Self::AllModelsList { .. } => "all_models_list",
             Self::RecentModels { .. } => "recent_models",
+            Self::ProviderCapabilities { .. } => "provider_capabilities",
             Self::FileIndex { .. } => "file_index",
             Self::LlmConfig { .. } => "llm_config",
             Self::SessionEvents { .. } => "session_events",
@@ -380,6 +432,7 @@ impl UiServerMessage {
             Self::OAuthResult { .. } => "oauth_result",
             Self::RemoteNodes { .. } => "remote_nodes",
             Self::RemoteSessions { .. } => "remote_sessions",
+            Self::ModelDownloadStatus { .. } => "model_download_status",
         }
     }
 }

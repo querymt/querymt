@@ -25,7 +25,7 @@ use crate::session::repository::{
 };
 use crate::session::schema;
 use crate::session::store::{
-    LLMConfig, Session, SessionExecutionConfig, SessionStore, extract_llm_config_values,
+    CustomModel, LLMConfig, Session, SessionExecutionConfig, SessionStore, extract_llm_config_values,
 };
 use async_trait::async_trait;
 use querymt::LLMParams;
@@ -647,6 +647,139 @@ impl SessionStore for SqliteStorage {
                 }
                 None => Ok(None),
             }
+        })
+        .await
+    }
+
+    async fn list_custom_models(&self, provider: &str) -> SessionResult<Vec<CustomModel>> {
+        let provider = provider.to_string();
+        self.run_blocking(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT provider, model_id, display_name, config_json, source_type, source_ref, family, quant, created_at, updated_at FROM custom_models WHERE provider = ? ORDER BY updated_at DESC",
+            )?;
+            let rows = stmt.query_map(params![provider], |row| {
+                let config_json: String = row.get(3)?;
+                let parsed_json = serde_json::from_str(&config_json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                let created_at: Option<OffsetDateTime> = row
+                    .get::<_, String>(8)
+                    .ok()
+                    .and_then(|s| OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).ok());
+                let updated_at: Option<OffsetDateTime> = row
+                    .get::<_, String>(9)
+                    .ok()
+                    .and_then(|s| OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).ok());
+                Ok(CustomModel {
+                    provider: row.get(0)?,
+                    model_id: row.get(1)?,
+                    display_name: row.get(2)?,
+                    config_json: parsed_json,
+                    source_type: row.get(4)?,
+                    source_ref: row.get(5)?,
+                    family: row.get(6)?,
+                    quant: row.get(7)?,
+                    created_at,
+                    updated_at,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .await
+    }
+
+    async fn get_custom_model(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> SessionResult<Option<CustomModel>> {
+        let provider = provider.to_string();
+        let model_id = model_id.to_string();
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT provider, model_id, display_name, config_json, source_type, source_ref, family, quant, created_at, updated_at FROM custom_models WHERE provider = ? AND model_id = ?",
+                params![provider, model_id],
+                |row| {
+                    let config_json: String = row.get(3)?;
+                    let parsed_json = serde_json::from_str(&config_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                    let created_at: Option<OffsetDateTime> = row
+                        .get::<_, String>(8)
+                        .ok()
+                        .and_then(|s| OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).ok());
+                    let updated_at: Option<OffsetDateTime> = row
+                        .get::<_, String>(9)
+                        .ok()
+                        .and_then(|s| OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).ok());
+                    Ok(CustomModel {
+                        provider: row.get(0)?,
+                        model_id: row.get(1)?,
+                        display_name: row.get(2)?,
+                        config_json: parsed_json,
+                        source_type: row.get(4)?,
+                        source_ref: row.get(5)?,
+                        family: row.get(6)?,
+                        quant: row.get(7)?,
+                        created_at,
+                        updated_at,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    async fn upsert_custom_model(&self, model: &CustomModel) -> SessionResult<()> {
+        let model = model.clone();
+        self.run_blocking(move |conn| {
+            let now = OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
+            let created_at = model
+                .created_at
+                .and_then(|ts| ts.format(&time::format_description::well_known::Rfc3339).ok())
+                .unwrap_or_else(|| now.clone());
+            let config_json = serde_json::to_string(&model.config_json)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            conn.execute(
+                "INSERT INTO custom_models (provider, model_id, display_name, config_json, source_type, source_ref, family, quant, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(provider, model_id) DO UPDATE SET display_name = excluded.display_name, config_json = excluded.config_json, source_type = excluded.source_type, source_ref = excluded.source_ref, family = excluded.family, quant = excluded.quant, updated_at = excluded.updated_at",
+                params![
+                    model.provider,
+                    model.model_id,
+                    model.display_name,
+                    config_json,
+                    model.source_type,
+                    model.source_ref,
+                    model.family,
+                    model.quant,
+                    created_at,
+                    now,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_custom_model(&self, provider: &str, model_id: &str) -> SessionResult<()> {
+        let provider = provider.to_string();
+        let model_id = model_id.to_string();
+        self.run_blocking(move |conn| {
+            conn.execute(
+                "DELETE FROM custom_models WHERE provider = ? AND model_id = ?",
+                params![provider, model_id],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -1983,5 +2116,63 @@ mod tests {
             )
             .expect("check migration table existence");
         assert_eq!(has_migration_table, 0);
+    }
+
+    #[tokio::test]
+    async fn custom_model_crud_round_trip() {
+        let storage = SqliteStorage::connect(":memory:".into())
+            .await
+            .expect("in-memory storage");
+
+        let base = CustomModel {
+            provider: "llama_cpp".to_string(),
+            model_id: "hf:foo/bar:model.gguf".to_string(),
+            display_name: "Model A".to_string(),
+            config_json: serde_json::json!({"model": "hf:foo/bar:model.gguf"}),
+            source_type: "hf".to_string(),
+            source_ref: Some("foo/bar:model.gguf".to_string()),
+            family: Some("Foo-Model".to_string()),
+            quant: Some("Q8_0".to_string()),
+            created_at: None,
+            updated_at: None,
+        };
+
+        storage
+            .upsert_custom_model(&base)
+            .await
+            .expect("insert custom model");
+
+        let fetched = storage
+            .get_custom_model("llama_cpp", "hf:foo/bar:model.gguf")
+            .await
+            .expect("get custom model")
+            .expect("custom model exists");
+        assert_eq!(fetched.display_name, "Model A");
+        assert_eq!(fetched.source_type, "hf");
+
+        let mut updated = fetched.clone();
+        updated.display_name = "Model A Updated".to_string();
+        storage
+            .upsert_custom_model(&updated)
+            .await
+            .expect("update custom model");
+
+        let listed = storage
+            .list_custom_models("llama_cpp")
+            .await
+            .expect("list custom models");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].display_name, "Model A Updated");
+
+        storage
+            .delete_custom_model("llama_cpp", "hf:foo/bar:model.gguf")
+            .await
+            .expect("delete custom model");
+
+        let after_delete = storage
+            .get_custom_model("llama_cpp", "hf:foo/bar:model.gguf")
+            .await
+            .expect("get custom model after delete");
+        assert!(after_delete.is_none());
     }
 }

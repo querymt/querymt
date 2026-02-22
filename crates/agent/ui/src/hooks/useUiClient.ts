@@ -15,7 +15,9 @@ import {
   LlmConfigDetails,
   SessionLimits,
   AuthProviderEntry,
+  ModelDownloadStatus,
   OAuthFlowState,
+  ProviderCapabilityEntry,
   OAuthResultState,
   UndoStackFrame,
   RemoteNodeInfo,
@@ -131,8 +133,10 @@ export function useUiClient() {
   const [availableModes, setAvailableModes] = useState<string[]>(['build', 'plan']);
   const [sessionGroups, setSessionGroups] = useState<SessionGroup[]>([]);
   const [allModels, setAllModels] = useState<ModelEntry[]>([]);
+  const [providerCapabilities, setProviderCapabilities] = useState<Record<string, ProviderCapabilityEntry>>({});
   const [recentModelsByWorkspace, setRecentModelsByWorkspace] = useState<Record<string, RecentModelEntry[]>>({});
   const [authProviders, setAuthProviders] = useState<AuthProviderEntry[]>([]);
+  const [modelDownloads, setModelDownloads] = useState<Record<string, ModelDownloadStatus>>({});
   const [oauthFlow, setOauthFlow] = useState<OAuthFlowState | null>(null);
   const [oauthResult, setOauthResult] = useState<OAuthResultState | null>(null);
   const [sessionsByAgent, setSessionsByAgent] = useState<Record<string, string>>({});
@@ -717,6 +721,14 @@ export function useUiClient() {
       case 'all_models_list':
         setAllModels(msg.models);
         break;
+      case 'provider_capabilities': {
+        const next: Record<string, ProviderCapabilityEntry> = {};
+        for (const entry of msg.providers) {
+          next[entry.provider] = entry;
+        }
+        setProviderCapabilities(next);
+        break;
+      }
       case 'recent_models': {
         // Convert null keys to empty string for consistent lookup
         const normalized: Record<string, RecentModelEntry[]> = {};
@@ -816,6 +828,30 @@ export function useUiClient() {
         // data is handled by the caller via callback if needed.
         console.log('[useUiClient] remote_sessions for node:', msg.node, msg.sessions);
         break;
+      case 'model_download_status': {
+        const key = `${msg.provider}:${msg.model_id}`;
+        setModelDownloads((prev) => ({
+          ...prev,
+          [key]: {
+            provider: msg.provider,
+            model_id: msg.model_id,
+            status: msg.status,
+            bytes_downloaded: msg.bytes_downloaded,
+            bytes_total: msg.bytes_total,
+            percent: msg.percent,
+            speed_bps: msg.speed_bps,
+            eta_seconds: msg.eta_seconds,
+            message: msg.message,
+          },
+        }));
+
+        if (msg.status === 'completed') {
+          setTimeout(() => {
+            sendMessage({ type: 'list_all_models', refresh: true });
+          }, 250);
+        }
+        break;
+      }
       default:
         break;
     }
@@ -932,6 +968,35 @@ export function useUiClient() {
         sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
       }, 500);
     }
+  }, []);
+
+  const addCustomModelFromHf = useCallback(
+    (provider: string, repo: string, filename: string, displayName?: string) => {
+      sendMessage({
+        type: 'add_custom_model_from_hf',
+        provider,
+        repo,
+        filename,
+        display_name: displayName,
+      });
+    },
+    []
+  );
+
+  const addCustomModelFromFile = useCallback(
+    (provider: string, filePath: string, displayName?: string) => {
+      sendMessage({
+        type: 'add_custom_model_from_file',
+        provider,
+        file_path: filePath,
+        display_name: displayName,
+      });
+    },
+    []
+  );
+
+  const deleteCustomModel = useCallback((provider: string, modelId: string) => {
+    sendMessage({ type: 'delete_custom_model', provider, model_id: modelId });
   }, []);
 
   const fetchRecentModels = useCallback(() => {
@@ -1081,6 +1146,8 @@ export function useUiClient() {
     setRoutingMode: selectRoutingMode,
     sessionGroups,
     allModels,
+    providerCapabilities,
+    modelDownloads,
     recentModelsByWorkspace,
     authProviders,
     oauthFlow,
@@ -1096,6 +1163,9 @@ export function useUiClient() {
     disconnectOAuth,
     clearOAuthState,
     setSessionModel,
+    addCustomModelFromHf,
+    addCustomModelFromFile,
+    deleteCustomModel,
     sessionAudit,
     thinkingAgentId,
     thinkingAgentIds,

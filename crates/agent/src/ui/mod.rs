@@ -25,6 +25,7 @@ mod undo_handler_tests;
 use crate::event_bus::EventBus;
 use crate::index::WorkspaceIndexManagerActor;
 use crate::session::projection::ViewStore;
+use crate::session::store::SessionStore;
 use axum::{
     Router,
     extract::{State, ws::WebSocketUpgrade},
@@ -49,6 +50,7 @@ const MODEL_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 pub struct UiServer {
     agent: Arc<crate::agent::AgentHandle>,
     view_store: Arc<dyn ViewStore>,
+    session_store: Arc<dyn SessionStore>,
     default_cwd: Option<PathBuf>,
     event_sources: Vec<Arc<EventBus>>,
     connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
@@ -65,6 +67,7 @@ pub struct UiServer {
 pub(crate) struct ServerState {
     pub agent: Arc<crate::agent::AgentHandle>,
     pub view_store: Arc<dyn ViewStore>,
+    pub session_store: Arc<dyn SessionStore>,
     pub default_cwd: Option<PathBuf>,
     pub event_sources: Vec<Arc<EventBus>>,
     pub connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
@@ -94,13 +97,14 @@ pub(crate) struct PendingOAuthFlow {
 }
 
 /// State for a single WebSocket connection.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ConnectionState {
     pub routing_mode: MsgRoutingMode,
     pub active_agent_id: String,
     pub sessions: HashMap<String, String>,
     pub subscribed_sessions: HashSet<String>,
     pub current_workspace_root: Option<PathBuf>,
+    pub file_index_forwarder: Option<JoinHandle<()>>,
 }
 
 impl UiServer {
@@ -108,6 +112,7 @@ impl UiServer {
     pub fn new(
         agent: Arc<crate::agent::AgentHandle>,
         view_store: Arc<dyn ViewStore>,
+        session_store: Arc<dyn SessionStore>,
         default_cwd: Option<PathBuf>,
     ) -> Self {
         let event_sources = collect_event_sources(&agent);
@@ -116,6 +121,7 @@ impl UiServer {
         Self {
             agent: agent.clone(),
             view_store,
+            session_store,
             default_cwd: default_cwd.or_else(|| std::env::current_dir().ok()),
             event_sources,
             connections: Arc::new(Mutex::new(HashMap::new())),
@@ -133,6 +139,7 @@ impl UiServer {
         let state = ServerState {
             agent: self.agent,
             view_store: self.view_store,
+            session_store: self.session_store,
             default_cwd: self.default_cwd,
             event_sources: self.event_sources,
             connections: self.connections,

@@ -1,8 +1,15 @@
 import { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { Command } from 'cmdk';
 import * as Popover from '@radix-ui/react-popover';
-import { RefreshCw, Search, X, ChevronRight, ChevronDown } from 'lucide-react';
-import type { ModelEntry, RecentModelEntry, RoutingMode, UiAgentInfo } from '../types';
+import { RefreshCw, Search, X, ChevronRight, ChevronDown, Plus, Trash2 } from 'lucide-react';
+import type {
+  ModelDownloadStatus,
+  ModelEntry,
+  ProviderCapabilityEntry,
+  RecentModelEntry,
+  RoutingMode,
+  UiAgentInfo,
+} from '../types';
 import { useUiStore } from '../store/uiStore';
 
 /* ------------------------------------------------------------------ */
@@ -28,6 +35,11 @@ interface ModelPickerPopoverProps {
   agentMode: string;
   onRefresh: () => void;
   onSetSessionModel: (sessionId: string, modelId: string, node?: string) => void;
+  providerCapabilities: Record<string, ProviderCapabilityEntry>;
+  modelDownloads: Record<string, ModelDownloadStatus>;
+  onAddCustomModelFromHf: (provider: string, repo: string, filename: string, displayName?: string) => void;
+  onAddCustomModelFromFile: (provider: string, filePath: string, displayName?: string) => void;
+  onDeleteCustomModel: (provider: string, modelId: string) => void;
 }
 
 const TARGET_ACTIVE = 'active';
@@ -46,7 +58,7 @@ interface GroupedModels {
   heading: string;
   provider: string;
   node?: string;
-  models: string[];
+  models: { value: string; display: string; id?: string; source?: string }[];
 }
 
 const localeCompare = new Intl.Collator(undefined, { sensitivity: 'base' }).compare;
@@ -71,16 +83,29 @@ function groupByProvider(models: ModelEntry[]): GroupedModels[] {
           : entry.provider;
       map.set(key, { heading, provider: entry.provider, node: entry.node, models: [] });
     }
-    map.get(key)!.models.push(entry.model);
+    map.get(key)!.models.push({
+      value: entry.model,
+      display: entry.label ?? entry.model,
+      id: entry.id,
+      source: entry.source,
+    });
   }
   return Array.from(map.values())
     .sort((a, b) => localeCompare(a.heading, b.heading))
-    .map((g) => ({ ...g, models: [...g.models].sort(localeCompare) }));
+    .map((g) => ({
+      ...g,
+      models: [...g.models].sort((a, b) => localeCompare(a.display, b.display)),
+    }));
 }
 
 /** Build the cmdk item value for a model entry: "provider/model" or "provider@node/model". */
 function itemValue(provider: string, model: string, node?: string): string {
   return node ? `${provider}@${node}/${model}` : `${provider}/${model}`;
+}
+
+function sessionModelId(provider: string, model: string, id?: string): string {
+  const canonical = id ?? model;
+  return canonical.includes(':') ? `${provider}/${canonical}` : `${provider}/${canonical}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -105,10 +130,18 @@ export function ModelPickerPopover({
   agentMode,
   onRefresh,
   onSetSessionModel,
+  providerCapabilities,
+  modelDownloads,
+  onAddCustomModelFromHf,
+  onAddCustomModelFromFile,
+  onDeleteCustomModel,
 }: ModelPickerPopoverProps) {
   const [target, setTarget] = useState(TARGET_ACTIVE);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedValue, setSelectedValue] = useState('');
+  const [hfRepo, setHfRepo] = useState('');
+  const [hfFilename, setHfFilename] = useState('');
+  const [filePath, setFilePath] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
   const commandListRef = useRef<HTMLDivElement>(null);
   const { setModeModelPreference, focusMainInput } = useUiStore();
@@ -136,6 +169,23 @@ export function ModelPickerPopover({
 
   const grouped = useMemo(() => groupByProvider(allModels), [allModels]);
 
+  const selectedProvider = currentProvider ?? '';
+  const selectedProviderCapabilities = providerCapabilities[selectedProvider];
+  const canManageCustomModels = Boolean(
+    selectedProvider && !currentNode && selectedProviderCapabilities?.supports_custom_models,
+  );
+
+  const selectedProviderEntry = useMemo(
+    () => allModels.find((m) => m.provider === selectedProvider && m.model === currentModel && !m.node),
+    [allModels, selectedProvider, currentModel],
+  );
+
+  const activeDownload = useMemo(() => {
+    if (!selectedProvider) return undefined;
+    const values = Object.values(modelDownloads).filter((d) => d.provider === selectedProvider);
+    return values.sort((a, b) => (b.percent ?? 0) - (a.percent ?? 0))[0];
+  }, [modelDownloads, selectedProvider]);
+
   // Build a lookup map so we can resolve provider/model/node from the cmdk value
   const modelMap = useMemo(() => {
     const m = new Map<string, { provider: string; model: string; node?: string }>();
@@ -145,6 +195,17 @@ export function ModelPickerPopover({
         model: entry.model,
         node: entry.node,
       });
+    }
+    return m;
+  }, [allModels]);
+
+  const modelIdByValue = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const entry of allModels) {
+      m.set(
+        itemValue(entry.provider, entry.model, entry.node),
+        sessionModelId(entry.provider, entry.model, entry.id),
+      );
     }
     return m;
   }, [allModels]);
@@ -186,7 +247,8 @@ export function ModelPickerPopover({
       const entry = modelMap.get(normalizeValue(value));
       if (!entry) return;
 
-      const modelId = `${entry.provider}/${entry.model}`;
+      const normalized = normalizeValue(value);
+      const modelId = modelIdByValue.get(normalized) ?? `${entry.provider}/${entry.model}`;
       const sessionIds = new Set<string>();
 
       if (target === TARGET_ALL) {
@@ -212,12 +274,45 @@ export function ModelPickerPopover({
       
       // Focus is handled by onCloseAutoFocus in Popover.Content
     },
-    [modelMap, target, sessionsByAgent, sessionId, onSetSessionModel, onOpenChange, agentMode, setModeModelPreference],
+    [
+      modelMap,
+      modelIdByValue,
+      target,
+      sessionsByAgent,
+      sessionId,
+      onSetSessionModel,
+      onOpenChange,
+      agentMode,
+      setModeModelPreference,
+    ],
   );
 
   const handleSwitchClick = useCallback(() => {
     if (canSwitch) switchModel(selectedValue);
   }, [canSwitch, selectedValue, switchModel]);
+
+  const handleAddHfModel = useCallback(() => {
+    const repo = hfRepo.trim();
+    const filename = hfFilename.trim();
+    if (!repo || !filename || !selectedProvider) return;
+    onAddCustomModelFromHf(selectedProvider, repo, filename, filename);
+    setHfRepo('');
+    setHfFilename('');
+  }, [hfRepo, hfFilename, onAddCustomModelFromHf, selectedProvider]);
+
+  const handleAddFileModel = useCallback(() => {
+    const path = filePath.trim();
+    if (!path || !selectedProvider) return;
+    const label = path.split('/').pop() || path;
+    onAddCustomModelFromFile(selectedProvider, path, label);
+    setFilePath('');
+  }, [filePath, onAddCustomModelFromFile, selectedProvider]);
+
+  const handleDeleteCurrentCustom = useCallback(() => {
+    const modelId = selectedProviderEntry?.id;
+    if (!modelId || selectedProviderEntry?.source !== 'custom' || !selectedProvider) return;
+    onDeleteCustomModel(selectedProvider, modelId);
+  }, [onDeleteCustomModel, selectedProviderEntry, selectedProvider]);
 
   /* ---- trigger label ---- */
   const triggerLabel =
@@ -305,6 +400,65 @@ export function ModelPickerPopover({
                 ))}
               </select>
             </div>
+            {canManageCustomModels && (
+              <div className="mt-2 pt-2 border-t border-surface-border/40 space-y-2">
+                <div className="text-[10px] uppercase tracking-widest text-ui-muted">Add custom model ({selectedProvider})</div>
+                <div className="flex items-center gap-2">
+                  <input
+                    value={hfRepo}
+                    onChange={(e) => setHfRepo(e.target.value)}
+                    placeholder="HF repo (owner/name-GGUF)"
+                    className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-2 py-1 text-xs text-ui-primary"
+                  />
+                  <input
+                    value={hfFilename}
+                    onChange={(e) => setHfFilename(e.target.value)}
+                    placeholder="filename.gguf"
+                    className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-2 py-1 text-xs text-ui-primary"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddHfModel}
+                    className="px-2 py-1 rounded border border-surface-border text-ui-secondary hover:text-accent-primary"
+                    title="Add from Hugging Face"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    value={filePath}
+                    onChange={(e) => setFilePath(e.target.value)}
+                    placeholder="/absolute/path/to/model.gguf"
+                    className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-2 py-1 text-xs text-ui-primary"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddFileModel}
+                    className="px-2 py-1 rounded border border-surface-border text-ui-secondary hover:text-accent-primary"
+                    title="Add local GGUF file"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDeleteCurrentCustom}
+                    disabled={selectedProviderEntry?.source !== 'custom'}
+                    className="px-2 py-1 rounded border border-surface-border text-ui-secondary hover:text-red-400 disabled:opacity-40"
+                    title="Delete selected custom model"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+                {activeDownload && (
+                  <div className="text-[10px] text-ui-muted">
+                    {activeDownload.status}: {activeDownload.model_id}
+                    {activeDownload.percent != null ? ` (${Math.round(activeDownload.percent)}%)` : ''}
+                    {activeDownload.message ? ` - ${activeDownload.message}` : ''}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Command palette (filter + list) */}
@@ -391,20 +545,20 @@ export function ModelPickerPopover({
                       className="mb-1 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-ui-muted [&_[cmdk-group-heading]]:bg-surface-canvas/95"
                     >
                       {group.models.map((model) => {
-                        const val = itemValue(group.provider, model, group.node);
+                        const val = itemValue(group.provider, model.value, group.node);
                         const isCurrent =
-                          currentProvider === group.provider && currentModel === model;
+                          currentProvider === group.provider && currentModel === model.value;
 
                         return (
                           <Command.Item
                             key={val}
                             value={val}
-                            keywords={[group.provider, model, ...(group.node ? [group.node] : [])]}
+                            keywords={[group.provider, model.display, model.value, ...(group.node ? [group.node] : [])]}
                             onSelect={(v) => switchModel(v)}
                             className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-ui-secondary data-[selected=true]:bg-accent-primary/20 data-[selected=true]:text-accent-primary data-[selected=true]:border data-[selected=true]:border-accent-primary/40 hover:bg-surface-elevated/60 cursor-pointer"
                           >
                             <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-accent-primary transition-opacity" />
-                            <span className="flex-1 truncate">{model}</span>
+                            <span className="flex-1 truncate">{model.display}</span>
                             {group.node ? (
                               <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
                                 {group.node}

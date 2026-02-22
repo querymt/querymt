@@ -240,6 +240,25 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_message_parts_message ON message_parts(message_id, sort_order);
+
+        -- User-managed custom local models per provider
+        CREATE TABLE IF NOT EXISTS custom_models (
+            id INTEGER PRIMARY KEY,
+            provider TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_ref TEXT,
+            family TEXT,
+            quant TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(provider, model_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_custom_models_provider
+            ON custom_models(provider);
         "#,
     )?;
 

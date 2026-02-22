@@ -15,6 +15,9 @@ mod session_ops;
 
 // ── Re-exports consumed by sibling modules ────────────────────────────────────
 
+pub use models::handle_add_custom_model_from_file;
+pub use models::handle_add_custom_model_from_hf;
+pub use models::handle_delete_custom_model;
 pub use models::handle_list_all_models;
 pub use models::handle_list_auth_providers;
 pub use oauth::handle_complete_oauth_login;
@@ -222,6 +225,35 @@ pub async fn handle_ui_message(
         }
         UiClientMessage::AttachRemoteSession { node, session_id } => {
             handle_attach_remote_session(state, conn_id, &node, &session_id, tx).await;
+        }
+        UiClientMessage::AddCustomModelFromHf {
+            provider,
+            repo,
+            filename,
+            display_name,
+        } => {
+            if let Err(err) =
+                handle_add_custom_model_from_hf(state, &provider, &repo, &filename, display_name, tx)
+                    .await
+            {
+                let _ = send_error(tx, err).await;
+            }
+        }
+        UiClientMessage::AddCustomModelFromFile {
+            provider,
+            file_path,
+            display_name,
+        } => {
+            if let Err(err) =
+                handle_add_custom_model_from_file(state, &provider, &file_path, display_name).await
+            {
+                let _ = send_error(tx, err).await;
+            }
+        }
+        UiClientMessage::DeleteCustomModel { provider, model_id } => {
+            if let Err(err) = handle_delete_custom_model(state, &provider, &model_id).await {
+                let _ = send_error(tx, err).await;
+            }
         }
     }
 }

@@ -161,6 +161,7 @@ async fn test_undo_handler_single_agent() -> Result<()> {
     let state = super::ServerState {
         agent: handle,
         view_store: storage.clone(),
+        session_store: storage.clone(),
         default_cwd: None,
         event_sources: vec![],
         connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -187,6 +188,7 @@ async fn test_undo_handler_single_agent() -> Result<()> {
                     .collect(),
                 subscribed_sessions: std::collections::HashSet::new(),
                 current_workspace_root: None,
+                file_index_forwarder: None,
             },
         );
     }
@@ -246,8 +248,10 @@ async fn test_send_state_concurrent_calls_complete() -> Result<()> {
 
     let state = super::ServerState {
         agent: handle,
-        view_store: storage,
+        view_store: storage.clone(),
+        session_store: storage.clone(),
         default_cwd: None,
+
         event_sources: vec![],
         connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -270,6 +274,7 @@ async fn test_send_state_concurrent_calls_complete() -> Result<()> {
                 sessions: std::collections::HashMap::new(),
                 subscribed_sessions: std::collections::HashSet::new(),
                 current_workspace_root: None,
+                file_index_forwarder: None,
             },
         );
     }
@@ -455,6 +460,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
     let state = super::ServerState {
         agent: handle,
         view_store: storage.clone(),
+        session_store: storage.clone(),
         default_cwd: None,
         event_sources: vec![],
         connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -481,6 +487,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
                     .collect(),
                 subscribed_sessions: std::collections::HashSet::new(),
                 current_workspace_root: None,
+                file_index_forwarder: None,
             },
         );
     }

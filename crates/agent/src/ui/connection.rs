@@ -30,6 +30,7 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
                 sessions: HashMap::new(),
                 subscribed_sessions: HashSet::new(),
                 current_workspace_root: None,
+                file_index_forwarder: None,
             },
         );
     }
@@ -88,7 +89,11 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
 
     {
         let mut connections = state.connections.lock().await;
-        connections.remove(&conn_id);
+        if let Some(conn) = connections.remove(&conn_id)
+            && let Some(handle) = conn.file_index_forwarder
+        {
+            handle.abort();
+        }
     }
 
     super::handlers::stop_oauth_callback_listener_for_connection(&state, &conn_id).await;
@@ -584,13 +589,113 @@ pub async fn subscribe_to_file_index(
         }
     };
 
+    // Ensure each connection has at most one active forwarder task.
+    let existing_forwarder = {
+        let mut connections = state.connections.lock().await;
+        let Some(conn) = connections.get_mut(&conn_id) else {
+            return;
+        };
+
+        let already_subscribed = conn.current_workspace_root.as_ref() == Some(&workspace_root)
+            && conn
+                .file_index_forwarder
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished());
+        if already_subscribed {
+            log::debug!(
+                "Connection {} is already subscribed to workspace {:?}",
+                conn_id,
+                workspace_root
+            );
+            return;
+        }
+
+        conn.current_workspace_root = Some(workspace_root.clone());
+        conn.file_index_forwarder.take()
+    };
+
+    if let Some(handle) = existing_forwarder {
+        handle.abort();
+    }
+
     let mut index_rx = handle.file_watcher.subscribe_index();
 
-    // Update connection state to track which workspace we're subscribed to
+    let state_for_forward = state.clone();
+    let conn_id_for_forward = conn_id.clone();
+    let workspace_root_for_forward = workspace_root.clone();
+    let tx_for_forward = tx.clone();
+
+    // Spawn a task to forward file index updates to the client
+    let forwarder = tokio::spawn(async move {
+        while let Ok(index) = index_rx.recv().await {
+            // Get the current session's cwd to filter the index appropriately
+            let session_id = {
+                let connections = state_for_forward.connections.lock().await;
+                let conn = match connections.get(&conn_id_for_forward) {
+                    Some(conn) => conn,
+                    None => {
+                        // Connection closed, stop forwarding
+                        log::debug!(
+                            "Connection {} closed, stopping file index forwarding",
+                            conn_id_for_forward
+                        );
+                        break;
+                    }
+                };
+
+                conn.sessions.get(&conn.active_agent_id).cloned()
+            };
+
+            let session_id = match session_id {
+                Some(id) => id,
+                None => continue, // No active session, skip this update
+            };
+
+            let cwd = {
+                let cwds = state_for_forward.session_cwds.lock().await;
+                match cwds.get(&session_id).cloned() {
+                    Some(cwd) => cwd,
+                    None => continue, // No cwd for this session, skip
+                }
+            };
+
+            // Filter the index to the session's cwd
+            let relative_cwd = match cwd.strip_prefix(&workspace_root_for_forward) {
+                Ok(relative) => relative,
+                Err(_) => continue, // cwd outside workspace root, skip
+            };
+
+            let files = super::mentions::filter_index_for_cwd(&index, relative_cwd);
+
+            // Send the filtered index to the client
+            if send_message(
+                &tx_for_forward,
+                UiServerMessage::FileIndex {
+                    files,
+                    generated_at: index.generated_at,
+                },
+            )
+            .await
+            .is_err()
+            {
+                log::debug!(
+                    "Failed to send file index to connection {}, stopping forwarding",
+                    conn_id_for_forward
+                );
+                break;
+            }
+
+            log::debug!("Pushed file index update to connection {}", conn_id_for_forward);
+        }
+    });
+
     {
         let mut connections = state.connections.lock().await;
         if let Some(conn) = connections.get_mut(&conn_id) {
-            conn.current_workspace_root = Some(workspace_root.clone());
+            conn.file_index_forwarder = Some(forwarder);
+        } else {
+            forwarder.abort();
+            return;
         }
     }
 
@@ -600,7 +705,7 @@ pub async fn subscribe_to_file_index(
         workspace_root
     );
 
-    // IMPORTANT: Send the current index immediately to avoid subscription race condition
+    // IMPORTANT: Send the current index immediately to avoid subscription race condition.
     // When subscribing to a broadcast channel, we only receive FUTURE messages.
     // If the workspace already existed (cached), the initial index was sent before we subscribed.
     // This ensures new subscribers get the current state immediately.
@@ -644,68 +749,4 @@ pub async fn subscribe_to_file_index(
             }
         }
     }
-
-    // Spawn a task to forward file index updates to the client
-    tokio::spawn(async move {
-        while let Ok(index) = index_rx.recv().await {
-            // Get the current session's cwd to filter the index appropriately
-            let session_id = {
-                let connections = state.connections.lock().await;
-                let conn = match connections.get(&conn_id) {
-                    Some(conn) => conn,
-                    None => {
-                        // Connection closed, stop forwarding
-                        log::debug!(
-                            "Connection {} closed, stopping file index forwarding",
-                            conn_id
-                        );
-                        break;
-                    }
-                };
-
-                conn.sessions.get(&conn.active_agent_id).cloned()
-            };
-
-            let session_id = match session_id {
-                Some(id) => id,
-                None => continue, // No active session, skip this update
-            };
-
-            let cwd = {
-                let cwds = state.session_cwds.lock().await;
-                match cwds.get(&session_id).cloned() {
-                    Some(cwd) => cwd,
-                    None => continue, // No cwd for this session, skip
-                }
-            };
-
-            // Filter the index to the session's cwd
-            let relative_cwd = match cwd.strip_prefix(&workspace_root) {
-                Ok(relative) => relative,
-                Err(_) => continue, // cwd outside workspace root, skip
-            };
-
-            let files = super::mentions::filter_index_for_cwd(&index, relative_cwd);
-
-            // Send the filtered index to the client
-            if send_message(
-                &tx,
-                UiServerMessage::FileIndex {
-                    files,
-                    generated_at: index.generated_at,
-                },
-            )
-            .await
-            .is_err()
-            {
-                log::debug!(
-                    "Failed to send file index to connection {}, stopping forwarding",
-                    conn_id
-                );
-                break;
-            }
-
-            log::debug!("Pushed file index update to connection {}", conn_id);
-        }
-    });
 }

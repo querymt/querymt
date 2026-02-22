@@ -40,6 +40,11 @@ pub fn parse_retry_after(headers: &http::HeaderMap) -> Option<u64> {
 pub trait HTTPLLMProviderFactory: Send + Sync {
     fn name(&self) -> &str;
 
+    /// Whether this provider supports user-managed custom models.
+    fn supports_custom_models(&self) -> bool {
+        false
+    }
+
     fn api_key_name(&self) -> Option<String> {
         None
     }

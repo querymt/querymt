@@ -53,17 +53,22 @@ export function AppShell() {
     activeAgentId,
     sessionsByAgent,
     allModels,
+    providerCapabilities,
     recentModelsByWorkspace,
     authProviders,
     oauthFlow,
     oauthResult,
     refreshAllModels,
     requestAuthProviders,
+    modelDownloads,
     startOAuthLogin,
     completeOAuthLogin,
     disconnectOAuth,
     clearOAuthState,
     setSessionModel,
+    addCustomModelFromHf,
+    addCustomModelFromFile,
+    deleteCustomModel,
     sessionGroups,
     thinkingBySession,
     agentMode,
@@ -524,6 +529,11 @@ export function AppShell() {
               agentMode={agentMode}
               onRefresh={refreshAllModels}
               onSetSessionModel={setSessionModel}
+              providerCapabilities={providerCapabilities}
+              modelDownloads={modelDownloads}
+              onAddCustomModelFromHf={addCustomModelFromHf}
+              onAddCustomModelFromFile={addCustomModelFromFile}
+              onDeleteCustomModel={deleteCustomModel}
             />
 
             {/* Dashboard theme picker */}

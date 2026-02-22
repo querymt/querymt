@@ -81,9 +81,6 @@ impl AgentConfigBuilder {
         ));
         let mut tool_registry = ToolRegistry::new();
         tool_registry.extend(crate::tools::builtins::all_builtin_tools());
-        tool_registry.add(Arc::new(crate::tools::builtins::SrgnTool::new(
-            plugin_registry,
-        )));
 
         Self {
             provider,
