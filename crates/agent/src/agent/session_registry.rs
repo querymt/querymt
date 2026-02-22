@@ -4,17 +4,50 @@
 //! protected by a mutex (acceptable: only accessed for routing, not during execution).
 
 use crate::agent::agent_config::AgentConfig;
-use crate::agent::core::SessionRuntime;
+use crate::agent::core::{AgentMode, SessionRuntime};
 use crate::agent::remote::SessionActorRef;
 use crate::agent::session_actor::SessionActor;
 use crate::error::AgentError;
 use agent_client_protocol::{
     Error, ListSessionsRequest, ListSessionsResponse, McpServer, NewSessionRequest,
-    NewSessionResponse, SessionInfo,
+    NewSessionResponse, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionInfo, SessionMode, SessionModeState,
 };
 use kameo::actor::Spawn;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+fn all_session_modes() -> Vec<SessionMode> {
+    vec![
+        SessionMode::new("build", "Build").description("Full read/write mode"),
+        SessionMode::new("plan", "Plan").description("Read-only planning mode"),
+        SessionMode::new("review", "Review").description("Read-only review mode"),
+    ]
+}
+
+fn mode_state(mode: AgentMode) -> SessionModeState {
+    SessionModeState::new(mode.as_str(), all_session_modes())
+}
+
+fn config_options(mode: AgentMode) -> Vec<SessionConfigOption> {
+    vec![
+        SessionConfigOption::select(
+            "mode",
+            "Session Mode",
+            mode.as_str(),
+            vec![
+                SessionConfigSelectOption::new("build", "Build")
+                    .description("Full read/write mode"),
+                SessionConfigSelectOption::new("plan", "Plan")
+                    .description("Read-only planning mode"),
+                SessionConfigSelectOption::new("review", "Review")
+                    .description("Read-only review mode"),
+            ],
+        )
+        .description("Controls how the agent operates for this session")
+        .category(SessionConfigOptionCategory::Mode),
+    ]
+}
 
 /// Manages session actors. Lives on the server layer.
 pub struct SessionRegistry {
@@ -328,7 +361,20 @@ impl SessionRegistry {
             },
         );
 
-        Ok(NewSessionResponse::new(session_id))
+        let current_mode = {
+            let session_ref = self
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| {
+                    Error::internal_error().data("session actor missing after creation")
+                })?
+                .clone();
+            session_ref.get_mode().await.map_err(Error::from)?
+        };
+
+        Ok(NewSessionResponse::new(session_id)
+            .modes(mode_state(current_mode))
+            .config_options(config_options(current_mode)))
     }
 
     /// Load an existing session: validate it exists, build runtime, spawn SessionActor.
@@ -407,7 +453,18 @@ impl SessionRegistry {
             );
         }
 
-        Ok(agent_client_protocol::LoadSessionResponse::new())
+        let current_mode = {
+            let session_ref = self
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| Error::internal_error().data("session actor missing after load"))?
+                .clone();
+            session_ref.get_mode().await.map_err(Error::from)?
+        };
+
+        Ok(agent_client_protocol::LoadSessionResponse::new()
+            .modes(mode_state(current_mode))
+            .config_options(config_options(current_mode)))
     }
 
     /// Fork an existing session at the latest message.
@@ -511,7 +568,18 @@ impl SessionRegistry {
         self.config
             .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
 
-        Ok(agent_client_protocol::ResumeSessionResponse::new())
+        let current_mode = {
+            let session_ref = self
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| Error::internal_error().data("session actor missing after resume"))?
+                .clone();
+            session_ref.get_mode().await.map_err(Error::from)?
+        };
+
+        Ok(agent_client_protocol::ResumeSessionResponse::new()
+            .modes(mode_state(current_mode))
+            .config_options(config_options(current_mode)))
     }
 
     /// List all sessions (queries the store, not the actors).
@@ -664,6 +732,9 @@ mod tests {
                 mutating_tools: HashSet::new(),
                 max_prompt_bytes: None,
                 execution_timeout_secs: 300,
+                delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
+                delegation_wait_timeout_secs: 120,
+                delegation_cancel_grace_secs: 5,
                 execution_policy: RuntimeExecutionPolicy::default(),
                 compaction: crate::session::compaction::SessionCompaction::new(),
                 snapshot_backend: None,
@@ -706,6 +777,26 @@ mod tests {
         assert!(f.registry.is_empty());
         assert_eq!(f.registry.len(), 0);
         assert!(f.registry.session_ids().is_empty());
+    }
+
+    #[test]
+    fn test_mode_state_contains_all_supported_modes() {
+        let state = mode_state(AgentMode::Build);
+        assert_eq!(state.current_mode_id.0.as_ref(), "build");
+        assert_eq!(state.available_modes.len(), 3);
+    }
+
+    #[test]
+    fn test_config_options_include_mode_selector() {
+        let options = config_options(AgentMode::Review);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].id.0.as_ref(), "mode");
+
+        let select = match &options[0].kind {
+            agent_client_protocol::SessionConfigKind::Select(select) => select,
+            _ => panic!("expected select mode option"),
+        };
+        assert_eq!(select.current_value.0.as_ref(), "review");
     }
 
     #[tokio::test]
@@ -854,6 +945,9 @@ mod tests {
             mutating_tools: HashSet::new(),
             max_prompt_bytes: None,
             execution_timeout_secs: 300,
+            delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
+            delegation_wait_timeout_secs: 120,
+            delegation_cancel_grace_secs: 5,
             execution_policy: RuntimeExecutionPolicy::default(),
             compaction: crate::session::compaction::SessionCompaction::new(),
             snapshot_backend: None,

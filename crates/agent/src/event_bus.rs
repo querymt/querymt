@@ -1,7 +1,7 @@
 use crate::events::{AgentEvent, AgentEventKind, EventObserver, EventOrigin};
-use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
 use tokio::task;

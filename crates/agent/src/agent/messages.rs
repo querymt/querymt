@@ -36,10 +36,14 @@ pub struct Prompt {
 pub struct Cancel;
 
 /// Internal message sent by the spawned prompt task when it finishes.
-/// Resets the `prompt_running` flag on the actor.
+///
+/// Carries the prompt generation that completed so the actor can ignore stale
+/// completions from older queued tasks.
 ///
 /// NOT serializable — only sent by spawned task within the same actor.
-pub(crate) struct PromptFinished;
+pub(crate) struct PromptFinished {
+    pub generation: u64,
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 //  Configuration

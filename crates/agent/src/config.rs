@@ -724,6 +724,31 @@ pub struct QuorumConfig {
     pub remote_agents: Vec<RemoteAgentConfig>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationWaitPolicy {
+    All,
+    Any,
+}
+
+impl Default for DelegationWaitPolicy {
+    fn default() -> Self {
+        Self::Any
+    }
+}
+
+fn default_delegation_wait_timeout_secs() -> u64 {
+    120
+}
+
+fn default_delegation_cancel_grace_secs() -> u64 {
+    5
+}
+
+fn default_max_parallel_delegations() -> usize {
+    5
+}
+
 /// Quorum-level settings
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -738,6 +763,14 @@ pub struct QuorumSettings {
     pub snapshot_policy: Option<String>,
     /// Optional: Configure delegation summary LLM for enriching context
     pub delegation_summary: Option<DelegationSummaryConfig>,
+    #[serde(default)]
+    pub delegation_wait_policy: DelegationWaitPolicy,
+    #[serde(default = "default_delegation_wait_timeout_secs")]
+    pub delegation_wait_timeout_secs: u64,
+    #[serde(default = "default_delegation_cancel_grace_secs")]
+    pub delegation_cancel_grace_secs: u64,
+    #[serde(default = "default_max_parallel_delegations")]
+    pub max_parallel_delegations: usize,
 }
 
 fn default_true() -> bool {

@@ -28,9 +28,9 @@ use async_trait::async_trait;
 use kameo::actor::ActorRef;
 use querymt::LLMParams;
 use std::any::Any;
-use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(feature = "remote")]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, broadcast};
 #[cfg(feature = "remote")]
 use tokio::sync::{RwLock, Semaphore};
@@ -419,9 +419,18 @@ impl AgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    async fn get_cached_remote_node(&self, cache_key: &str) -> Option<crate::agent::remote::NodeInfo> {
+    async fn get_cached_remote_node(
+        &self,
+        cache_key: &str,
+    ) -> Option<crate::agent::remote::NodeInfo> {
         let now = std::time::Instant::now();
-        if let Some(entry) = self.remote_node_cache.by_label.read().await.get(cache_key).cloned()
+        if let Some(entry) = self
+            .remote_node_cache
+            .by_label
+            .read()
+            .await
+            .get(cache_key)
+            .cloned()
             && entry.expires_at > now
         {
             return Some(entry.info);
@@ -437,7 +446,11 @@ impl AgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    async fn insert_cached_remote_node(&self, cache_key: String, info: crate::agent::remote::NodeInfo) {
+    async fn insert_cached_remote_node(
+        &self,
+        cache_key: String,
+        info: crate::agent::remote::NodeInfo,
+    ) {
         let ttl = Self::remote_node_cache_ttl();
         self.remote_node_cache.by_label.write().await.insert(
             cache_key,
@@ -471,7 +484,9 @@ impl AgentHandle {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        cache.invalidation_task_started.store(false, Ordering::SeqCst);
+                        cache
+                            .invalidation_task_started
+                            .store(false, Ordering::SeqCst);
                         break;
                     }
                 }
@@ -518,7 +533,8 @@ impl AgentHandle {
                         continue;
                     }
 
-                    let cache_key = Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                    let cache_key =
+                        Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
                     if let Some(info) = self.get_cached_remote_node(&cache_key).await {
                         cached_nodes.push(info);
                         continue;
@@ -527,7 +543,11 @@ impl AgentHandle {
                     let semaphore = Arc::clone(&semaphore);
                     lookups.push(async move {
                         let permit = semaphore.acquire_owned().await.ok();
-                        let res = tokio::time::timeout(timeout, node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo)).await;
+                        let res = tokio::time::timeout(
+                            timeout,
+                            node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
+                        )
+                        .await;
                         drop(permit);
                         (cache_key, peer_id, res)
                     });
@@ -540,14 +560,18 @@ impl AgentHandle {
         while let Some((cache_key, peer_id, result)) = lookups.next().await {
             match result {
                 Ok(Ok(info)) => {
-                    self.insert_cached_remote_node(cache_key, info.clone()).await;
+                    self.insert_cached_remote_node(cache_key, info.clone())
+                        .await;
                     fetched_nodes.push(info);
                 }
                 Ok(Err(e)) => {
                     log::warn!("list_remote_nodes: GetNodeInfo failed: {}", e);
                 }
                 Err(_) => {
-                    log::warn!("list_remote_nodes: GetNodeInfo timed out for peer {:?}", peer_id);
+                    log::warn!(
+                        "list_remote_nodes: GetNodeInfo timed out for peer {:?}",
+                        peer_id
+                    );
                 }
             }
         }
@@ -601,7 +625,8 @@ impl AgentHandle {
                         continue;
                     }
 
-                    let cache_key = Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                    let cache_key =
+                        Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
                     if let Some(info) = self.get_cached_remote_node(&cache_key).await {
                         if info.hostname == label {
                             return Ok(node_manager_ref);
@@ -612,7 +637,11 @@ impl AgentHandle {
                     let semaphore = Arc::clone(&semaphore);
                     lookups.push(async move {
                         let permit = semaphore.acquire_owned().await.ok();
-                        let res = tokio::time::timeout(timeout, node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo)).await;
+                        let res = tokio::time::timeout(
+                            timeout,
+                            node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
+                        )
+                        .await;
                         drop(permit);
                         (node_manager_ref, cache_key, peer_id, res)
                     });
@@ -626,7 +655,8 @@ impl AgentHandle {
         while let Some((node_manager_ref, cache_key, peer_id, result)) = lookups.next().await {
             match result {
                 Ok(Ok(info)) => {
-                    self.insert_cached_remote_node(cache_key, info.clone()).await;
+                    self.insert_cached_remote_node(cache_key, info.clone())
+                        .await;
                     if info.hostname == label {
                         return Ok(node_manager_ref);
                     }
@@ -635,7 +665,10 @@ impl AgentHandle {
                     log::warn!("find_node_manager: GetNodeInfo failed: {}", e);
                 }
                 Err(_) => {
-                    log::warn!("find_node_manager: GetNodeInfo timed out for peer {:?}", peer_id);
+                    log::warn!(
+                        "find_node_manager: GetNodeInfo timed out for peer {:?}",
+                        peer_id
+                    );
                 }
             }
         }
@@ -1053,6 +1086,9 @@ mod tests {
                 mutating_tools: HashSet::new(),
                 max_prompt_bytes: None,
                 execution_timeout_secs: 300,
+                delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
+                delegation_wait_timeout_secs: 120,
+                delegation_cancel_grace_secs: 5,
                 execution_policy: RuntimeExecutionPolicy::default(),
                 compaction: crate::session::compaction::SessionCompaction::new(),
                 snapshot_backend: None,
@@ -1270,7 +1306,14 @@ mod tests {
 
         let expired = f.handle.get_cached_remote_node(&cache_key).await;
         assert!(expired.is_none());
-        assert!(!f.handle.remote_node_cache.by_label.read().await.contains_key(&cache_key));
+        assert!(
+            !f.handle
+                .remote_node_cache
+                .by_label
+                .read()
+                .await
+                .contains_key(&cache_key)
+        );
     }
 
     #[cfg(feature = "remote")]

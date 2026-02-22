@@ -9,6 +9,10 @@ db = "/tmp/test.db"
 delegation = true
 verification = false
 snapshot_policy = "diff"
+delegation_wait_policy = "all"
+delegation_wait_timeout_secs = 120
+delegation_cancel_grace_secs = 5
+max_parallel_delegations = 5
 
 [planner]
 provider = "anthropic"
@@ -17,8 +21,7 @@ model = "claude-opus-4-5"
 #model = "gpt-5.2-codex"
 tools = ["delegate", "create_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "read_tool", "shell"]
 system = [
-  "You are Claude Code, Anthropic's official CLI for Claude.",
-#  { file = "../prompts/anthropic_opencode.txt" }
+  { file = "../prompts/default_system.txt" }
 ]
 
 # Middleware for planner

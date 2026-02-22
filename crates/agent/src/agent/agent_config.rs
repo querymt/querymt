@@ -7,7 +7,7 @@
 use crate::agent::core::{
     AgentMode, DelegationContextConfig, SnapshotPolicy, ToolConfig, ToolPolicy,
 };
-use crate::config::{McpServerConfig, RuntimeExecutionPolicy};
+use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy};
 use crate::delegation::AgentRegistry;
 use crate::event_bus::EventBus;
 use crate::index::WorkspaceIndexManagerActor;
@@ -56,6 +56,9 @@ pub struct AgentConfig {
     pub mutating_tools: HashSet<String>,
     pub max_prompt_bytes: Option<usize>,
     pub execution_timeout_secs: u64,
+    pub delegation_wait_policy: DelegationWaitPolicy,
+    pub delegation_wait_timeout_secs: u64,
+    pub delegation_cancel_grace_secs: u64,
     /// Grouped execution policy: tool output, pruning, compaction, rate limit.
     pub execution_policy: RuntimeExecutionPolicy,
     pub compaction: SessionCompaction,

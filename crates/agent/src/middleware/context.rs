@@ -906,24 +906,12 @@ mod tests {
         // Before calling check_provider_changed with ctx2, add a warned session
         let session_id: Arc<str> = "test".into();
         fixture.middleware.should_warn(&session_id, 8000, 10000);
-        assert!(
-            !fixture
-                .middleware
-                .warned_sessions
-                .lock()
-                .is_empty()
-        );
+        assert!(!fixture.middleware.warned_sessions.lock().is_empty());
 
         fixture.middleware.check_provider_changed(&ctx2);
 
         // Warned sessions should be cleared on provider change
-        assert!(
-            fixture
-                .middleware
-                .warned_sessions
-                .lock()
-                .is_empty()
-        );
+        assert!(fixture.middleware.warned_sessions.lock().is_empty());
     }
 
     #[test]

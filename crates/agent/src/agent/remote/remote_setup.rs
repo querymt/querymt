@@ -504,8 +504,45 @@ impl crate::send_agent::SendAgent for RemoteAgentStub {
         req: agent_client_protocol::NewSessionRequest,
     ) -> Result<agent_client_protocol::NewSessionResponse, agent_client_protocol::Error> {
         let cwd = req.cwd.to_str().map(|s| s.to_string());
-        let (session_id, _) = self.get_or_create_session(cwd).await?;
-        Ok(agent_client_protocol::NewSessionResponse::new(session_id))
+        let (session_id, session_ref) = self.get_or_create_session(cwd).await?;
+
+        let current_mode = session_ref
+            .get_mode()
+            .await
+            .map_err(agent_client_protocol::Error::from)?;
+        let current_mode = current_mode.as_str();
+        let modes = agent_client_protocol::SessionModeState::new(
+            current_mode,
+            vec![
+                agent_client_protocol::SessionMode::new("build", "Build")
+                    .description("Full read/write mode"),
+                agent_client_protocol::SessionMode::new("plan", "Plan")
+                    .description("Read-only planning mode"),
+                agent_client_protocol::SessionMode::new("review", "Review")
+                    .description("Read-only review mode"),
+            ],
+        );
+        let config_options = vec![
+            agent_client_protocol::SessionConfigOption::select(
+                "mode",
+                "Session Mode",
+                current_mode,
+                vec![
+                    agent_client_protocol::SessionConfigSelectOption::new("build", "Build")
+                        .description("Full read/write mode"),
+                    agent_client_protocol::SessionConfigSelectOption::new("plan", "Plan")
+                        .description("Read-only planning mode"),
+                    agent_client_protocol::SessionConfigSelectOption::new("review", "Review")
+                        .description("Read-only review mode"),
+                ],
+            )
+            .description("Controls how the agent operates for this session")
+            .category(agent_client_protocol::SessionConfigOptionCategory::Mode),
+        ];
+
+        Ok(agent_client_protocol::NewSessionResponse::new(session_id)
+            .modes(modes)
+            .config_options(config_options))
     }
 
     async fn prompt(

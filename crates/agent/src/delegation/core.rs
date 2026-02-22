@@ -16,6 +16,7 @@ use querymt::chat::ChatRole;
 use querymt::error::LLMError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -207,6 +208,10 @@ pub struct DelegationOrchestratorConfig {
     pub cwd: Option<PathBuf>,
     pub inject_results: bool,
     pub run_verification: bool,
+    pub wait_policy: crate::config::DelegationWaitPolicy,
+    pub wait_timeout_secs: u64,
+    pub cancel_grace_secs: u64,
+    pub max_parallel_delegations: NonZeroUsize,
 }
 
 impl DelegationOrchestratorConfig {
@@ -215,6 +220,10 @@ impl DelegationOrchestratorConfig {
             cwd,
             inject_results: false,
             run_verification: false,
+            wait_policy: crate::config::DelegationWaitPolicy::default(),
+            wait_timeout_secs: 120,
+            cancel_grace_secs: 5,
+            max_parallel_delegations: NonZeroUsize::new(5).expect("non-zero default"),
         }
     }
 }
@@ -226,6 +235,7 @@ pub struct DelegationOrchestrator {
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     tool_registry: Arc<ToolRegistry>,
     config: DelegationOrchestratorConfig,
+    max_parallel: Arc<tokio::sync::Semaphore>,
     /// Maps delegation_id -> (parent_session_id, cancellation_token, join_handle)
     active_delegations: ActiveDelegations,
     /// Optional summarizer for generating planning context
@@ -248,6 +258,7 @@ impl DelegationOrchestrator {
             agent_registry,
             tool_registry,
             config: DelegationOrchestratorConfig::new(cwd),
+            max_parallel: Arc::new(tokio::sync::Semaphore::new(5)),
             active_delegations: Arc::new(Mutex::new(HashMap::new())),
             delegation_summarizer: None,
         }
@@ -261,6 +272,27 @@ impl DelegationOrchestrator {
 
     pub fn with_verification(mut self, enabled: bool) -> Self {
         self.config.run_verification = enabled;
+        self
+    }
+
+    pub fn with_wait_policy(mut self, policy: crate::config::DelegationWaitPolicy) -> Self {
+        self.config.wait_policy = policy;
+        self
+    }
+
+    pub fn with_wait_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.config.wait_timeout_secs = timeout_secs;
+        self
+    }
+
+    pub fn with_cancel_grace_secs(mut self, grace_secs: u64) -> Self {
+        self.config.cancel_grace_secs = grace_secs;
+        self
+    }
+
+    pub fn with_max_parallel_delegations(mut self, max_parallel: NonZeroUsize) -> Self {
+        self.config.max_parallel_delegations = max_parallel;
+        self.max_parallel = Arc::new(tokio::sync::Semaphore::new(max_parallel.get()));
         self
     }
 
@@ -283,6 +315,7 @@ impl EventObserver for DelegationOrchestrator {
                 let store = self.store.clone();
                 let tool_registry = self.tool_registry.clone();
                 let config = self.config.clone();
+                let max_parallel = self.max_parallel.clone();
                 let delegation_summarizer = self.delegation_summarizer.clone();
                 let parent_session_id = event.session_id.clone();
                 let parent_session_id_for_insert = parent_session_id.clone();
@@ -301,6 +334,23 @@ impl EventObserver for DelegationOrchestrator {
                     .get_agent_handle(&delegation.target_agent_id);
 
                 let handle = tokio::spawn(async move {
+                    let _permit = match max_parallel.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            fail_delegation(
+                                &event_bus,
+                                &delegator,
+                                &store,
+                                &config,
+                                &parent_session_id,
+                                &delegation.public_id,
+                                "Delegation queue closed before execution could start",
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+
                     let ctx = DelegationContext {
                         delegator,
                         event_bus,
@@ -348,6 +398,28 @@ impl EventObserver for DelegationOrchestrator {
                     (parent_session_id_for_insert, cancel_token_clone, handle),
                 );
             }
+            AgentEventKind::DelegationCancelRequested { delegation_id } => {
+                let delegation_id_owned = delegation_id.clone();
+                let mut active = self.active_delegations.lock().await;
+                let entry = active.remove(&delegation_id_owned);
+                drop(active);
+
+                if let Some((_parent_id, cancel_token, mut handle)) = entry {
+                    let grace_secs = self.config.cancel_grace_secs;
+                    cancel_token.cancel();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = &mut handle => {
+                                debug!("Delegation {} terminated gracefully after cancel request", delegation_id_owned);
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(grace_secs)) => {
+                                warn!("Delegation {} did not terminate within {}s timeout after cancel request, force aborting", delegation_id_owned, grace_secs);
+                                handle.abort();
+                            }
+                        }
+                    });
+                }
+            }
             AgentEventKind::Cancelled => {
                 // Cancel all delegations for this session
                 let session_id = &event.session_id;
@@ -371,14 +443,15 @@ impl EventObserver for DelegationOrchestrator {
                 drop(active);
 
                 // Spawn watchdog tasks to force-abort delegations that don't terminate within timeout
+                let grace_secs = self.config.cancel_grace_secs;
                 for (delegation_id, mut handle) in to_cancel {
                     tokio::spawn(async move {
                         tokio::select! {
                             _ = &mut handle => {
                                 debug!("Delegation {} terminated gracefully after cancel", delegation_id);
                             }
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                                warn!("Delegation {} did not terminate within 5s timeout, force aborting", delegation_id);
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(grace_secs)) => {
+                                warn!("Delegation {} did not terminate within {}s timeout, force aborting", delegation_id, grace_secs);
                                 handle.abort();
                             }
                         }
@@ -1236,6 +1309,10 @@ mod tests {
         let config = DelegationOrchestratorConfig::new(None);
         assert!(!config.inject_results);
         assert!(!config.run_verification);
+        assert_eq!(config.wait_policy, crate::config::DelegationWaitPolicy::Any);
+        assert_eq!(config.wait_timeout_secs, 120);
+        assert_eq!(config.cancel_grace_secs, 5);
+        assert_eq!(config.max_parallel_delegations.get(), 5);
         assert!(config.cwd.is_none());
     }
 

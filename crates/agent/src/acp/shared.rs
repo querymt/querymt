@@ -5,14 +5,18 @@
 //! RPC message handling.
 
 use crate::agent::AgentHandle;
+use crate::agent::core::AgentMode;
 use crate::event_bus::EventBus;
 use crate::events::{AgentEvent, AgentEventKind};
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
 use agent_client_protocol::{
     Content, ContentBlock, ContentChunk, Error, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, RequestPermissionOutcome, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    PlanEntryStatus, RequestPermissionOutcome, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, TextContent,
+    ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind,
 };
 use agent_client_protocol_schema::AGENT_METHOD_NAMES;
 use serde::{Deserialize, Serialize};
@@ -298,6 +302,88 @@ pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<EventBus>> {
     sources
 }
 
+fn session_config_options(mode: AgentMode) -> Vec<SessionConfigOption> {
+    vec![
+        SessionConfigOption::select(
+            "mode",
+            "Session Mode",
+            mode.as_str(),
+            vec![
+                SessionConfigSelectOption::new("build", "Build")
+                    .description("Full read/write mode"),
+                SessionConfigSelectOption::new("plan", "Plan")
+                    .description("Read-only planning mode"),
+                SessionConfigSelectOption::new("review", "Review")
+                    .description("Read-only review mode"),
+            ],
+        )
+        .description("Controls how the agent operates for this session")
+        .category(SessionConfigOptionCategory::Mode),
+    ]
+}
+
+async fn set_mode_for_session<S: SendAgent>(
+    agent: &S,
+    session_id: &str,
+    mode: AgentMode,
+) -> Result<(), Error> {
+    let Some(handle) = agent.as_any().downcast_ref::<AgentHandle>() else {
+        return Err(Error::internal_error().data("set_mode requires AgentHandle"));
+    };
+
+    let session_ref = {
+        let registry = handle.registry.lock().await;
+        registry.get(session_id).cloned().ok_or_else(|| {
+            Error::invalid_params().data(serde_json::json!({
+                "message": "unknown session",
+                "sessionId": session_id,
+            }))
+        })?
+    };
+
+    session_ref.set_mode(mode).await.map_err(Error::from)
+}
+
+async fn handle_set_session_mode<S: SendAgent>(
+    agent: &S,
+    params: SetSessionModeRequest,
+) -> Result<serde_json::Value, Error> {
+    let mode = params.mode_id.0.parse::<AgentMode>().map_err(|e| {
+        Error::invalid_params().data(serde_json::json!({
+            "error": e,
+        }))
+    })?;
+
+    set_mode_for_session(agent, &params.session_id.0, mode).await?;
+    Ok(serde_json::to_value(SetSessionModeResponse::new()).unwrap())
+}
+
+async fn handle_set_session_config_option<S: SendAgent>(
+    agent: &S,
+    params: SetSessionConfigOptionRequest,
+) -> Result<serde_json::Value, Error> {
+    if params.config_id.0.as_ref() != "mode" {
+        return Err(Error::invalid_params().data(serde_json::json!({
+            "error": format!("Unsupported configId: {}", params.config_id.0),
+        })));
+    }
+
+    let mode = params.value.0.parse::<AgentMode>().map_err(|e| {
+        Error::invalid_params().data(serde_json::json!({
+            "error": e,
+        }))
+    })?;
+
+    set_mode_for_session(agent, &params.session_id.0, mode).await?;
+
+    Ok(
+        serde_json::to_value(SetSessionConfigOptionResponse::new(session_config_options(
+            mode,
+        )))
+        .unwrap(),
+    )
+}
+
 /// Handle an RPC request and return a response.
 ///
 /// This function routes JSON-RPC methods to the appropriate `SendAgent` trait methods.
@@ -402,22 +488,19 @@ pub async fn handle_rpc_message<S: SendAgent>(
             }
         },
         m if m == AGENT_METHOD_NAMES.session_set_config_option => {
-            log::warn!("session/set_config_option not implemented yet");
-            Err(Error::from(
-                crate::error::AgentError::MethodNotImplemented {
-                    method: "session/set_config_option".to_string(),
-                },
-            ))
+            match serde_json::from_value(req.params) {
+                Ok(params) => handle_set_session_config_option(agent, params).await,
+                Err(e) => {
+                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                }
+            }
         }
-        m if m == AGENT_METHOD_NAMES.session_set_mode => {
-            // TODO: Implement once we expose mode setting via SendAgent or direct actor message
-            log::warn!("session/set_mode not yet implemented via RPC");
-            Err(Error::from(
-                crate::error::AgentError::MethodNotImplemented {
-                    method: "session/set_mode".to_string(),
-                },
-            ))
-        }
+        m if m == AGENT_METHOD_NAMES.session_set_mode => match serde_json::from_value(req.params) {
+            Ok(params) => handle_set_session_mode(agent, params).await,
+            Err(e) => {
+                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+            }
+        },
         m if m == AGENT_METHOD_NAMES.session_set_model => {
             match serde_json::from_value(req.params) {
                 Ok(params) => agent
@@ -635,5 +718,112 @@ mod tests {
             translate_event_to_update(&end),
             Some(SessionUpdate::ToolCallUpdate(_))
         ));
+    }
+
+    #[test]
+    fn mode_config_option_contains_expected_shape() {
+        let options = session_config_options(AgentMode::Plan);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].id.0.as_ref(), "mode");
+        assert_eq!(options[0].category, Some(SessionConfigOptionCategory::Mode));
+
+        let select = match &options[0].kind {
+            agent_client_protocol::SessionConfigKind::Select(select) => select,
+            _ => panic!("expected select config option"),
+        };
+        assert_eq!(select.current_value.0.as_ref(), "plan");
+    }
+
+    #[test]
+    fn set_config_option_rejects_unknown_config_id() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            struct Dummy;
+
+            #[async_trait::async_trait]
+            impl SendAgent for Dummy {
+                async fn initialize(
+                    &self,
+                    _req: agent_client_protocol::InitializeRequest,
+                ) -> Result<agent_client_protocol::InitializeResponse, Error> {
+                    unreachable!()
+                }
+                async fn authenticate(
+                    &self,
+                    _req: agent_client_protocol::AuthenticateRequest,
+                ) -> Result<agent_client_protocol::AuthenticateResponse, Error> {
+                    unreachable!()
+                }
+                async fn new_session(
+                    &self,
+                    _req: agent_client_protocol::NewSessionRequest,
+                ) -> Result<agent_client_protocol::NewSessionResponse, Error> {
+                    unreachable!()
+                }
+                async fn prompt(
+                    &self,
+                    _req: agent_client_protocol::PromptRequest,
+                ) -> Result<agent_client_protocol::PromptResponse, Error> {
+                    unreachable!()
+                }
+                async fn cancel(
+                    &self,
+                    _notif: agent_client_protocol::CancelNotification,
+                ) -> Result<(), Error> {
+                    unreachable!()
+                }
+                async fn load_session(
+                    &self,
+                    _req: agent_client_protocol::LoadSessionRequest,
+                ) -> Result<agent_client_protocol::LoadSessionResponse, Error> {
+                    unreachable!()
+                }
+                async fn list_sessions(
+                    &self,
+                    _req: agent_client_protocol::ListSessionsRequest,
+                ) -> Result<agent_client_protocol::ListSessionsResponse, Error> {
+                    unreachable!()
+                }
+                async fn fork_session(
+                    &self,
+                    _req: agent_client_protocol::ForkSessionRequest,
+                ) -> Result<agent_client_protocol::ForkSessionResponse, Error> {
+                    unreachable!()
+                }
+                async fn resume_session(
+                    &self,
+                    _req: agent_client_protocol::ResumeSessionRequest,
+                ) -> Result<agent_client_protocol::ResumeSessionResponse, Error> {
+                    unreachable!()
+                }
+                async fn set_session_model(
+                    &self,
+                    _req: agent_client_protocol::SetSessionModelRequest,
+                ) -> Result<agent_client_protocol::SetSessionModelResponse, Error> {
+                    unreachable!()
+                }
+                async fn ext_method(
+                    &self,
+                    _req: agent_client_protocol::ExtRequest,
+                ) -> Result<agent_client_protocol::ExtResponse, Error> {
+                    unreachable!()
+                }
+                async fn ext_notification(
+                    &self,
+                    _notif: agent_client_protocol::ExtNotification,
+                ) -> Result<(), Error> {
+                    unreachable!()
+                }
+                fn as_any(&self) -> &dyn std::any::Any {
+                    self
+                }
+            }
+
+            let req = SetSessionConfigOptionRequest::new("s-1", "other", "plan");
+            let err = handle_set_session_config_option(&Dummy, req)
+                .await
+                .expect_err("expected invalid config id");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+        });
     }
 }

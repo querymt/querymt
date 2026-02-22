@@ -45,9 +45,11 @@ pub struct SessionActor {
     pub(crate) tool_config: ToolConfig,
 
     // ── Cancellation ─────────────────────────────────────────────
-    /// Cancelled when a `Cancel` message is received; replaced with a fresh
-    /// token at the start of each new `Prompt` so the next turn starts clean.
-    pub(crate) cancel_token: CancellationToken,
+    /// Tracks the active prompt generation and cancellation token.
+    ///
+    /// Generation advances when a new `Prompt` is accepted so stale
+    /// `PromptFinished` notifications can be ignored safely.
+    pub(crate) turn_state: TurnState,
 
     // ── Client bridge (for SessionUpdate notifications) ──────────
     pub(crate) bridge: Option<ClientBridgeSender>,
@@ -66,6 +68,21 @@ pub struct SessionActor {
     pub(crate) relay_observer_tokens: HashMap<u64, crate::event_bus::ObserverToken>,
 }
 
+#[derive(Clone)]
+pub(crate) struct TurnState {
+    pub(crate) generation: u64,
+    pub(crate) token: CancellationToken,
+}
+
+impl TurnState {
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            token: CancellationToken::new(),
+        }
+    }
+}
+
 impl SessionActor {
     /// Create a new SessionActor. Call `kameo::actor::spawn()` to start it.
     pub fn new(config: Arc<AgentConfig>, session_id: String, runtime: Arc<SessionRuntime>) -> Self {
@@ -82,7 +99,7 @@ impl SessionActor {
             runtime,
             mode,
             tool_config,
-            cancel_token: CancellationToken::new(),
+            turn_state: TurnState::new(),
             bridge: None,
             prompt_running: false,
             #[cfg(feature = "remote")]
@@ -147,18 +164,17 @@ impl SessionActor {
 // ── Cancel ───────────────────────────────────────────────────────────────
 //
 // Cancellation flow:
-// 1. Cancel message cancels cancel_token — always reaches the running task because
-//    the Prompt handler no longer replaces the token while a task is live.
-// 2. Detached prompt task observes cancel_token.is_cancelled() and exits early.
-// 3. PromptFinished resets cancel_token to a fresh one and clears prompt_running.
-// 4. Session is ready to accept new prompts.
+// 1. Cancel message cancels turn_state.token.
+// 2. Detached prompt task observes token.is_cancelled() and exits early.
+// 3. PromptFinished applies only when generation matches the current turn.
+// 4. Matching PromptFinished resets token and clears prompt_running.
 
 impl Message<Cancel> for SessionActor {
     type Reply = ();
 
     async fn handle(&mut self, _msg: Cancel, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         debug!("Session {}: Cancel received", self.session_id);
-        self.cancel_token.cancel();
+        self.turn_state.token.cancel();
         self.config
             .emit_event(&self.session_id, AgentEventKind::Cancelled);
     }
@@ -171,17 +187,23 @@ impl Message<PromptFinished> for SessionActor {
 
     async fn handle(
         &mut self,
-        _msg: PromptFinished,
+        msg: PromptFinished,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        if msg.generation != self.turn_state.generation {
+            debug!(
+                "Session {} PromptFinished: stale generation={}, current={} (ignored)",
+                self.session_id, msg.generation, self.turn_state.generation
+            );
+            return;
+        }
+
         self.prompt_running = false;
         // Reset the token so the next turn starts with a clean (uncancelled) token.
-        // This is the only place we replace cancel_token; the Prompt handler no longer
-        // does so, which guarantees Cancel always reaches the currently-running task.
-        self.cancel_token = CancellationToken::new();
+        self.turn_state.token = CancellationToken::new();
         debug!(
-            "Session {} PromptFinished: prompt_running=false, cancel_token reset",
-            self.session_id
+            "Session {} PromptFinished: prompt_running=false, token reset (generation={})",
+            self.session_id, msg.generation
         );
     }
 }
@@ -921,7 +943,7 @@ impl Message<Prompt> for SessionActor {
             // Allow new prompts through even while one is running.
             // execution_permit still serializes actual turn execution, so this
             // behaves like queueing instead of fail-fast rejection.
-            if self.cancel_token.is_cancelled() {
+            if self.turn_state.token.is_cancelled() {
                 debug!(
                     "Session {}: prompt_running=true, cancelled=true → allowing new prompt through",
                     self.session_id
@@ -941,21 +963,24 @@ impl Message<Prompt> for SessionActor {
 
         self.prompt_running = true;
 
-        // Only create a fresh token when the previous one was already cancelled
-        // (i.e. the user cancelled the last turn and is now starting a new one).
-        // When no task is running yet, or a task is running and hasn't been
-        // cancelled, we keep the existing token so that a Cancel message arriving
-        // between two Prompt messages still reaches the running task.
-        if self.cancel_token.is_cancelled() {
-            self.cancel_token = CancellationToken::new();
+        // Advance generation for this prompt so stale PromptFinished messages from
+        // older detached tasks cannot mutate current state.
+        self.turn_state.generation = self.turn_state.generation.saturating_add(1);
+        let prompt_generation = self.turn_state.generation;
+
+        // Only create a fresh token when the previous token was already cancelled.
+        // Otherwise keep the token so Cancel still reaches the currently-running task
+        // while additional prompts wait behind the execution permit.
+        if self.turn_state.token.is_cancelled() {
+            self.turn_state.token = CancellationToken::new();
             debug!(
-                "Session {}: set prompt_running=true, fresh cancel_token created (previous was cancelled)",
-                self.session_id
+                "Session {}: set prompt_running=true, generation={}, fresh token created (previous was cancelled)",
+                self.session_id, prompt_generation
             );
         } else {
             debug!(
-                "Session {}: set prompt_running=true, reusing existing cancel_token",
-                self.session_id
+                "Session {}: set prompt_running=true, generation={}, reusing existing token",
+                self.session_id, prompt_generation
             );
         }
 
@@ -963,7 +988,7 @@ impl Message<Prompt> for SessionActor {
         let config = self.config.clone();
         let session_id = self.session_id.clone();
         let runtime = self.runtime.clone();
-        let cancel_token = self.cancel_token.clone();
+        let cancel_token = self.turn_state.token.clone();
         let bridge = self.bridge.clone();
         let mode = self.mode;
         let tool_config = self.tool_config.clone();
@@ -984,7 +1009,12 @@ impl Message<Prompt> for SessionActor {
 
             debug!("Session {}: sending PromptFinished to actor", session_id);
             // Reset prompt_running flag via message back to actor
-            if let Err(e) = actor_ref.tell(PromptFinished).await {
+            if let Err(e) = actor_ref
+                .tell(PromptFinished {
+                    generation: prompt_generation,
+                })
+                .await
+            {
                 warn!(
                     "Failed to send PromptFinished message to actor: {:?}. \
                      Session may remain in 'busy' state until next prompt resets it.",
@@ -1490,6 +1520,9 @@ mod tests {
                 mutating_tools: HashSet::new(),
                 max_prompt_bytes: None,
                 execution_timeout_secs: 300,
+                delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
+                delegation_wait_timeout_secs: 120,
+                delegation_cancel_grace_secs: 5,
                 execution_policy: RuntimeExecutionPolicy::default(),
                 compaction: crate::session::compaction::SessionCompaction::new(),
                 snapshot_backend: None,
@@ -1726,7 +1759,7 @@ mod tests {
         let f = ActorFixture::new().await;
         // Send PromptFinished — even when not "running", should be a no-op that doesn't panic
         f.actor_ref
-            .tell(PromptFinished)
+            .tell(PromptFinished { generation: 0 })
             .await
             .expect("tell PromptFinished");
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -1787,7 +1820,27 @@ mod tests {
         );
     }
 
-    // ── Token state machine tests (pre-existing, unchanged) ──────────────────
+    // ── Token state machine tests ─────────────────────────────────────────────
+
+    #[test]
+    fn stale_prompt_finished_generation_is_ignored() {
+        let mut turn_state = TurnState::new();
+        turn_state.generation = 4;
+
+        let running_token = turn_state.token.clone();
+        let stale_generation = 3;
+
+        // Simulate PromptFinished for an older prompt while generation 4 is current.
+        if stale_generation == turn_state.generation {
+            turn_state.token = CancellationToken::new();
+        }
+
+        turn_state.token.cancel();
+        assert!(
+            running_token.is_cancelled(),
+            "Stale PromptFinished must not replace the current turn token"
+        );
+    }
 
     /// Simulates the cancel-then-resume scenario:
     ///

@@ -43,6 +43,10 @@ pub struct QuorumBuilder {
     pub(super) verification_enabled: bool,
     pub(super) snapshot_policy: SnapshotPolicy,
     pub(super) delegation_summary_config: Option<crate::config::DelegationSummaryConfig>,
+    pub(super) delegation_wait_policy: crate::config::DelegationWaitPolicy,
+    pub(super) delegation_wait_timeout_secs: u64,
+    pub(super) delegation_cancel_grace_secs: u64,
+    pub(super) max_parallel_delegations: usize,
     /// Pre-built registry entries to merge before building (Phase 7: remote agents).
     ///
     /// When `Some`, the entries in this registry are merged with the local delegate agents
@@ -71,6 +75,10 @@ impl QuorumBuilder {
             verification_enabled: false,
             snapshot_policy: SnapshotPolicy::None,
             delegation_summary_config: None,
+            delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
+            delegation_wait_timeout_secs: 120,
+            delegation_cancel_grace_secs: 5,
+            max_parallel_delegations: 5,
             initial_registry: None,
             #[cfg(feature = "remote")]
             mesh: None,
@@ -187,6 +195,9 @@ impl QuorumBuilder {
             let exec = delegate.execution.clone();
             let registry = registry.clone();
             let snapshot_policy_for_delegate = self.snapshot_policy;
+            let delegation_wait_policy_for_delegate = self.delegation_wait_policy.clone();
+            let delegation_wait_timeout_for_delegate = self.delegation_wait_timeout_secs;
+            let delegation_cancel_grace_for_delegate = self.delegation_cancel_grace_secs;
             builder = builder.add_delegate_agent(agent_info, move |store, event_bus| {
                 use crate::config::RuntimeExecutionPolicy;
                 let mut b =
@@ -204,7 +215,11 @@ impl QuorumBuilder {
                 }
 
                 let auto_compact = exec.compaction.auto;
-                b = b.with_execution_policy(RuntimeExecutionPolicy::from(&exec));
+                b = b
+                    .with_execution_policy(RuntimeExecutionPolicy::from(&exec))
+                    .with_delegation_wait_policy(delegation_wait_policy_for_delegate.clone())
+                    .with_delegation_wait_timeout_secs(delegation_wait_timeout_for_delegate)
+                    .with_delegation_cancel_grace_secs(delegation_cancel_grace_for_delegate);
                 apply_middleware_from_config(&mut b, &middleware_entries, auto_compact);
 
                 match exec.snapshot.backend.as_str() {
@@ -231,6 +246,9 @@ impl QuorumBuilder {
         let planner_exec = planner_config.execution.clone();
         let registry_for_planner = registry.clone();
         let snapshot_policy_for_planner = self.snapshot_policy;
+        let delegation_wait_policy_for_planner = self.delegation_wait_policy.clone();
+        let delegation_wait_timeout_for_planner = self.delegation_wait_timeout_secs;
+        let delegation_cancel_grace_for_planner = self.delegation_cancel_grace_secs;
         builder = builder.with_planner(move |store, event_bus, agent_registry| {
             use crate::config::RuntimeExecutionPolicy;
             let mut b = AgentConfigBuilder::new(
@@ -253,7 +271,11 @@ impl QuorumBuilder {
             }
 
             let auto_compact = planner_exec.compaction.auto;
-            b = b.with_execution_policy(RuntimeExecutionPolicy::from(&planner_exec));
+            b = b
+                .with_execution_policy(RuntimeExecutionPolicy::from(&planner_exec))
+                .with_delegation_wait_policy(delegation_wait_policy_for_planner.clone())
+                .with_delegation_wait_timeout_secs(delegation_wait_timeout_for_planner)
+                .with_delegation_cancel_grace_secs(delegation_cancel_grace_for_planner);
             apply_middleware_from_config(&mut b, &planner_middleware, auto_compact);
 
             match planner_exec.snapshot.backend.as_str() {
@@ -272,7 +294,11 @@ impl QuorumBuilder {
 
         builder = builder
             .with_delegation(self.delegation_enabled)
-            .with_verification(self.verification_enabled);
+            .with_verification(self.verification_enabled)
+            .with_wait_policy(self.delegation_wait_policy)
+            .with_wait_timeout_secs(self.delegation_wait_timeout_secs)
+            .with_cancel_grace_secs(self.delegation_cancel_grace_secs)
+            .with_max_parallel_delegations(self.max_parallel_delegations);
 
         // Build delegation summarizer if configured
         if let Some(ref summary_config) = self.delegation_summary_config {
@@ -503,6 +529,10 @@ impl Quorum {
         builder.delegation_enabled = config.quorum.delegation;
         builder.verification_enabled = config.quorum.verification;
         builder.delegation_summary_config = config.quorum.delegation_summary;
+        builder.delegation_wait_policy = config.quorum.delegation_wait_policy;
+        builder.delegation_wait_timeout_secs = config.quorum.delegation_wait_timeout_secs;
+        builder.delegation_cancel_grace_secs = config.quorum.delegation_cancel_grace_secs;
+        builder.max_parallel_delegations = config.quorum.max_parallel_delegations;
 
         // Parse snapshot policy
         let snapshot_policy = parse_snapshot_policy(config.quorum.snapshot_policy)?;
@@ -798,6 +828,9 @@ fn apply_middleware_from_config(
         mutating_tools: HashSet::new(),
         max_prompt_bytes: None,
         execution_timeout_secs: 300,
+        delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
+        delegation_wait_timeout_secs: 120,
+        delegation_cancel_grace_secs: 5,
         execution_policy: ephemeral_policy,
         compaction: SessionCompaction::new(),
         snapshot_backend: None,

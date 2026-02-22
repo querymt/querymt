@@ -10,6 +10,7 @@ use crate::session::projection::ViewStore;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::SessionStore;
 use crate::tools::CapabilityRequirement;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -107,6 +108,10 @@ pub struct AgentQuorumBuilder {
     planner_factory: Option<PlannerFactory>,
     delegation_enabled: bool,
     verification_enabled: bool,
+    wait_policy: crate::config::DelegationWaitPolicy,
+    wait_timeout_secs: u64,
+    cancel_grace_secs: u64,
+    max_parallel_delegations: NonZeroUsize,
     delegation_summarizer: Option<Arc<crate::delegation::DelegationSummarizer>>,
     /// Pre-registered agents to merge into the registry before building (Phase 7).
     ///
@@ -126,6 +131,10 @@ impl AgentQuorumBuilder {
             planner_factory: None,
             delegation_enabled: true,
             verification_enabled: false,
+            wait_policy: crate::config::DelegationWaitPolicy::default(),
+            wait_timeout_secs: 120,
+            cancel_grace_secs: 5,
+            max_parallel_delegations: NonZeroUsize::new(5).expect("non-zero default"),
             delegation_summarizer: None,
             preregistered: Vec::new(),
         }
@@ -155,6 +164,10 @@ impl AgentQuorumBuilder {
             planner_factory: None,
             delegation_enabled: true,
             verification_enabled: false,
+            wait_policy: crate::config::DelegationWaitPolicy::default(),
+            wait_timeout_secs: 120,
+            cancel_grace_secs: 5,
+            max_parallel_delegations: NonZeroUsize::new(5).expect("non-zero default"),
             delegation_summarizer: None,
             preregistered: Vec::new(),
         }
@@ -199,6 +212,28 @@ impl AgentQuorumBuilder {
 
     pub fn with_verification(mut self, enabled: bool) -> Self {
         self.verification_enabled = enabled;
+        self
+    }
+
+    pub fn with_wait_policy(mut self, policy: crate::config::DelegationWaitPolicy) -> Self {
+        self.wait_policy = policy;
+        self
+    }
+
+    pub fn with_wait_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.wait_timeout_secs = timeout_secs;
+        self
+    }
+
+    pub fn with_cancel_grace_secs(mut self, grace_secs: u64) -> Self {
+        self.cancel_grace_secs = grace_secs;
+        self
+    }
+
+    pub fn with_max_parallel_delegations(mut self, max_parallel: usize) -> Self {
+        if let Some(nz) = NonZeroUsize::new(max_parallel) {
+            self.max_parallel_delegations = nz;
+        }
         self
     }
 
@@ -282,6 +317,10 @@ impl AgentQuorumBuilder {
                     self.cwd.clone(),
                 )
                 .with_verification(self.verification_enabled)
+                .with_wait_policy(self.wait_policy.clone())
+                .with_wait_timeout_secs(self.wait_timeout_secs)
+                .with_cancel_grace_secs(self.cancel_grace_secs)
+                .with_max_parallel_delegations(self.max_parallel_delegations)
                 .with_summarizer(self.delegation_summarizer.clone()),
             );
 

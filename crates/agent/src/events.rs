@@ -262,6 +262,9 @@ pub enum AgentEventKind {
     DelegationCancelled {
         delegation_id: String,
     },
+    DelegationCancelRequested {
+        delegation_id: String,
+    },
     UncertaintyEscalated {
         task_id: Option<String>,
         description: String,
@@ -507,8 +510,7 @@ mod tests {
         assert_eq!(json, "\"mesh_bridge\"");
     }
 
-     // ── AgentEvent clone + debug ───────────────────────────────────────────
-
+    // ── AgentEvent clone + debug ───────────────────────────────────────────
 
     #[test]
     fn agent_event_implements_clone() {

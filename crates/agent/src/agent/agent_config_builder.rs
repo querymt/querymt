@@ -10,8 +10,8 @@ use crate::agent::core::{
     ToolConfig, ToolPolicy,
 };
 use crate::config::{
-    CompactionConfig, McpServerConfig, PruningConfig, RateLimitConfig, RuntimeExecutionPolicy,
-    ToolOutputConfig,
+    CompactionConfig, DelegationWaitPolicy, McpServerConfig, PruningConfig, RateLimitConfig,
+    RuntimeExecutionPolicy, ToolOutputConfig,
 };
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_bus::EventBus;
@@ -54,6 +54,9 @@ pub struct AgentConfigBuilder {
     delegation_context_config: DelegationContextConfig,
     workspace_manager_actor: kameo::actor::ActorRef<WorkspaceIndexManagerActor>,
     execution_timeout_secs: u64,
+    delegation_wait_policy: DelegationWaitPolicy,
+    delegation_wait_timeout_secs: u64,
+    delegation_cancel_grace_secs: u64,
     execution_policy: RuntimeExecutionPolicy,
     compaction: SessionCompaction,
     snapshot_backend: Option<Arc<dyn crate::snapshot::SnapshotBackend>>,
@@ -104,6 +107,9 @@ impl AgentConfigBuilder {
                 WorkspaceIndexManagerConfig::default(),
             ),
             execution_timeout_secs: 300,
+            delegation_wait_policy: DelegationWaitPolicy::default(),
+            delegation_wait_timeout_secs: 120,
+            delegation_cancel_grace_secs: 5,
             execution_policy: RuntimeExecutionPolicy::default(),
             compaction: SessionCompaction::new(),
             snapshot_backend: None,
@@ -131,6 +137,9 @@ impl AgentConfigBuilder {
             mutating_tools: self.mutating_tools,
             max_prompt_bytes: self.max_prompt_bytes,
             execution_timeout_secs: self.execution_timeout_secs,
+            delegation_wait_policy: self.delegation_wait_policy,
+            delegation_wait_timeout_secs: self.delegation_wait_timeout_secs,
+            delegation_cancel_grace_secs: self.delegation_cancel_grace_secs,
             execution_policy: self.execution_policy,
             compaction: self.compaction,
             snapshot_backend: self.snapshot_backend,
@@ -207,6 +216,24 @@ impl AgentConfigBuilder {
     /// Sets the maximum prompt size in bytes.
     pub fn with_max_prompt_bytes(mut self, bytes: usize) -> Self {
         self.max_prompt_bytes = Some(bytes);
+        self
+    }
+
+    /// Configure delegation wait behavior for this agent.
+    pub fn with_delegation_wait_policy(mut self, policy: DelegationWaitPolicy) -> Self {
+        self.delegation_wait_policy = policy;
+        self
+    }
+
+    /// Configure timeout used when waiting for delegated work.
+    pub fn with_delegation_wait_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.delegation_wait_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Configure cancellation grace period for timed-out delegation cleanup.
+    pub fn with_delegation_cancel_grace_secs(mut self, grace_secs: u64) -> Self {
+        self.delegation_cancel_grace_secs = grace_secs;
         self
     }
 
