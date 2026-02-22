@@ -32,6 +32,7 @@ use querymt::LLMParams;
 use querymt::chat::ChatRole;
 use querymt::error::LLMError;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
@@ -1853,8 +1854,57 @@ fn parse_llm_config_row(row: &rusqlite::Row<'_>) -> Result<LLMConfig, rusqlite::
     })
 }
 
+type MigrationFn = fn(&mut Connection) -> Result<(), rusqlite::Error>;
+
+struct Migration {
+    version: &'static str,
+    apply: MigrationFn,
+}
+
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: "0001_initial_reset",
+    apply: migration_0001_initial_reset,
+}];
+
 fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
-    // Drop every table that might have been created by older schema versions so we can start fresh.
+    conn.execute_batch(
+        r#"
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            );
+        "#,
+    )?;
+
+    let applied = load_applied_migrations(conn)?;
+
+    for migration in MIGRATIONS {
+        if applied.contains(migration.version) {
+            continue;
+        }
+
+        (migration.apply)(conn)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![
+                migration.version,
+                OffsetDateTime::now_utc().unix_timestamp()
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn load_applied_migrations(conn: &Connection) -> Result<HashSet<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT version FROM schema_migrations")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
+fn migration_0001_initial_reset(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    // Migration 0001 intentionally resets all known tables so this release becomes
+    // the new baseline for forward-only schema evolution.
     conn.execute_batch(
         r#"
             DROP TABLE IF EXISTS message_tool_calls;
@@ -1880,4 +1930,58 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 
     schema::init_schema(conn)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_0001_is_recorded() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        apply_migrations(&mut conn).expect("apply migrations");
+
+        let version: String = conn
+            .query_row(
+                "SELECT version FROM schema_migrations ORDER BY version LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query migration version");
+        assert_eq!(version, "0001_initial_reset");
+    }
+
+    #[test]
+    fn migrations_are_idempotent() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        apply_migrations(&mut conn).expect("first migration run");
+        apply_migrations(&mut conn).expect("second migration run");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("count migration rows");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn connect_with_options_without_migration_keeps_db_unmodified() {
+        let tmp = tempfile::NamedTempFile::new().expect("temp db file");
+        let path = tmp.path().to_path_buf();
+
+        let _storage = SqliteStorage::connect_with_options(path.clone(), false)
+            .await
+            .expect("connect without migrations");
+
+        let conn = Connection::open(path).expect("reopen db");
+        let has_migration_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check migration table existence");
+        assert_eq!(has_migration_table, 0);
+    }
 }

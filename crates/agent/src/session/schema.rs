@@ -1,4 +1,4 @@
-//! Database schema initialization (breaking changes allowed, no migrations)
+//! Database schema initialization used by the migration framework.
 //!
 //! Hybrid ID Strategy:
 //! - INTEGER PRIMARY KEYS for fast internal operations and foreign keys

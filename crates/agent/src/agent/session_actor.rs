@@ -1049,7 +1049,9 @@ struct DetachedPromptExecution {
     skip(exec),
     fields(session_id = %exec.session_id, mode = %exec.mode)
 )]
-async fn execute_prompt_detached(exec: DetachedPromptExecution) -> Result<PromptResponse, AgentError> {
+async fn execute_prompt_detached(
+    exec: DetachedPromptExecution,
+) -> Result<PromptResponse, AgentError> {
     let DetachedPromptExecution {
         req,
         session_id,

@@ -4,7 +4,7 @@ use crate::delegation::{
 use crate::event_bus::EventBus;
 use crate::send_agent::SendAgent;
 
-use crate::session::backend::StorageBackend;
+use crate::session::backend::{StorageBackend, default_agent_db_path};
 use crate::session::error::SessionError;
 use crate::session::projection::ViewStore;
 use crate::session::sqlite_storage::SqliteStorage;
@@ -54,7 +54,10 @@ pub struct AgentQuorum {
 
 impl AgentQuorum {
     pub async fn builder(db_path: Option<PathBuf>) -> Result<AgentQuorumBuilder, AgentQuorumError> {
-        let path = db_path.unwrap_or_else(|| PathBuf::from(":memory:"));
+        let path = match db_path {
+            Some(path) => path,
+            None => default_agent_db_path()?,
+        };
         let backend = SqliteStorage::connect(path).await?;
         Ok(AgentQuorumBuilder::from_backend(backend))
     }

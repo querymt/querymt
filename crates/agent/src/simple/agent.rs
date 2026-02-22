@@ -19,7 +19,7 @@ use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
 #[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
-use crate::session::backend::StorageBackend;
+use crate::session::backend::{StorageBackend, default_agent_db_path};
 use crate::session::projection::ViewStore;
 use crate::session::sqlite_storage::SqliteStorage;
 use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
@@ -192,9 +192,11 @@ impl AgentBuilder {
             .ok_or_else(|| anyhow!("LLM configuration is required (call .provider() first)"))?;
 
         let plugin_registry = Arc::new(default_registry().await?);
-        let backend =
-            SqliteStorage::connect(self.db_path.unwrap_or_else(|| PathBuf::from(":memory:")))
-                .await?;
+        let db_path = match self.db_path {
+            Some(path) => path,
+            None => default_agent_db_path()?,
+        };
+        let backend = SqliteStorage::connect(db_path).await?;
 
         let mut builder =
             AgentConfigBuilder::new(plugin_registry, backend.session_store(), llm_config)

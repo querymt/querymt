@@ -5,13 +5,31 @@
 //! and event/projection handling (query side).
 
 use crate::events::EventObserver;
-use crate::session::error::SessionResult;
+use crate::session::error::{SessionError, SessionResult};
 use crate::session::projection::{EventStore, ViewStore};
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::SessionStore;
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Resolve the default on-disk SQLite path for agent state.
+///
+/// Uses the shared QueryMT config directory (`$HOME/.qmt`) and ensures the
+/// directory exists before returning `<config_dir>/agent.db`.
+pub fn default_agent_db_path() -> SessionResult<PathBuf> {
+    let cfg_dir = querymt_utils::providers::config_dir()
+        .map_err(|e| SessionError::Other(format!("Failed to resolve QueryMT config dir: {e}")))?;
+
+    std::fs::create_dir_all(&cfg_dir).map_err(|e| {
+        SessionError::Other(format!(
+            "Failed to create QueryMT config dir {:?}: {e}",
+            cfg_dir
+        ))
+    })?;
+
+    Ok(cfg_dir.join("agent.db"))
+}
 
 /// Unified storage backend providing both command and query side stores.
 ///
@@ -60,11 +78,22 @@ impl StorageBackend for SqliteStorage {
 }
 
 impl SqliteStorage {
-    /// Helper: Connect to SQLite database at the given path.
+    /// Helper: connect to SQLite at the given path.
     ///
-    /// Creates the database and schema if it doesn't exist.
-    /// Use `:memory:` for in-memory database.
+    /// Creates the database file if needed and applies pending migrations.
     pub async fn connect_backend(path: PathBuf) -> SessionResult<Self> {
         SqliteStorage::connect(path).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_agent_db_path_points_to_qmt_dir() {
+        let path = default_agent_db_path().expect("default agent db path");
+        let cfg_dir = querymt_utils::providers::config_dir().expect("config dir");
+        assert_eq!(path, cfg_dir.join("agent.db"));
     }
 }
