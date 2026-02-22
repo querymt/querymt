@@ -863,6 +863,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen_cuda"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "282be55fb326843bb67cccceeeaf21c961ef303f60018f9a2ab69494dad8eaf9"
+dependencies = [
+ "glob",
+ "num_cpus",
+ "rayon",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1130,7 +1141,8 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 [[package]]
 name = "candle-core"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c15b675b80d994b2eadb20a4bbe434eabeb454eac3ee5e2b4cf6f147ee9be091"
 dependencies = [
  "accelerate-src",
  "byteorder",
@@ -1138,7 +1150,7 @@ dependencies = [
  "candle-metal-kernels",
  "candle-ug",
  "cudarc 0.19.2",
- "float8",
+ "float8 0.6.1",
  "gemm 0.19.0",
  "half",
  "intel-mkl-src",
@@ -1161,26 +1173,39 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c94ddd2e7bb828777b0a8d999ed40d2d6c3c96c9ef2a3111a69e0d96efc436d2"
 dependencies = [
  "anyhow",
+ "bindgen_cuda",
  "candle-core",
- "cudaforge",
+ "candle-flash-attn-build",
  "half",
+]
+
+[[package]]
+name = "candle-flash-attn-build"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bd79da06f2a3b831cb4f5a1ee393d6f2c5a913e28f5000c678a84108519a78c"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
 name = "candle-kernels"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8455f84bd810047c7c41216683c1020c915a9f8a740b3b0eabdd4fb2fbaa660"
 dependencies = [
- "cudaforge",
+ "bindgen_cuda",
 ]
 
 [[package]]
 name = "candle-metal-kernels"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fdfe9d06de16ce49961e49084e5b79a75a9bdf157246e7c7b6328e87a7aa25d"
 dependencies = [
  "half",
  "objc2",
@@ -1194,7 +1219,8 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3045fa9e7aef8567d209a27d56b692f60b96f4d0569f4c3011f8ca6715c65e03"
 dependencies = [
  "accelerate-src",
  "candle-core",
@@ -1213,7 +1239,8 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c22d62be69068bf58987a45f690612739d8d2ea1bf508c1b87dc6815a019575d"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -2176,25 +2203,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cudaforge"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ac9cd50bed6f024583322f1a5b8027eabef203086ccceb27aac1b0b58515a32"
-dependencies = [
- "anyhow",
- "fs2",
- "glob",
- "num_cpus",
- "rayon",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "walkdir",
- "which 7.0.3",
-]
-
-[[package]]
 name = "cudarc"
 version = "0.17.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2210,7 +2218,7 @@ version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aed81f178e780f3d5d354d12b4c5c5a484c4a9c329ecd037ac57f2a0e0648397"
 dependencies = [
- "float8",
+ "float8 0.7.0",
  "half",
  "libloading 0.9.0",
 ]
@@ -2531,9 +2539,9 @@ dependencies = [
 
 [[package]]
 name = "deranged"
-version = "0.5.6"
+version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc3dc5ad92c2e2d1c193bbbbdf2ea477cb81331de4f3103f267ca18368b988c4"
+checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "powerfmt",
  "serde_core",
@@ -2706,7 +2714,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89a09f22a6c6069a18470eb92d2298acf25463f14256d24778e1230d789a2aec"
 dependencies = [
  "bitflags 2.11.0",
- "block2",
  "objc2",
 ]
 
@@ -3370,14 +3377,24 @@ dependencies = [
 
 [[package]]
 name = "float8"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "719a903cc23e4a89e87962c2a80fdb45cdaad0983a89bd150bb57b4c8571a7d5"
+dependencies = [
+ "cudarc 0.19.2",
+ "half",
+ "num-traits",
+ "rand 0.9.2",
+ "rand_distr 0.5.1",
+]
+
+[[package]]
+name = "float8"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2d1f04709a8ac06e8e8042875a3c466cc4832d3c1a18dbcb9dba3c6e83046bc"
 dependencies = [
  "half",
- "num-traits",
- "rand 0.9.2",
- "rand_distr 0.5.1",
 ]
 
 [[package]]
@@ -3470,16 +3487,6 @@ dependencies = [
  "io-lifetimes",
  "rustix 1.1.3",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "fs2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
 ]
 
 [[package]]
@@ -5889,9 +5896,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.85"
+version = "0.3.88"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c942ebf8e95485ca0d52d97da7c5a2c387d0e7f0ba4c35e93bfcaee045955b3"
+checksum = "c7e709f3e3d22866f9c25b3aff01af289b18422cc8b4262fb19103ee80fe513d"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
@@ -7045,9 +7052,9 @@ dependencies = [
 
 [[package]]
 name = "minijinja"
-version = "2.15.1"
+version = "2.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b479616bb6f0779fb0f3964246beda02d4b01144e1b0d5519616e012ccc2a245"
+checksum = "5c54f3bcc034dd74496b5ca929fd0b710186672d5ff0b0f255a9ceb259042ece"
 dependencies = [
  "serde",
  "serde_json",
@@ -7055,9 +7062,9 @@ dependencies = [
 
 [[package]]
 name = "minijinja-contrib"
-version = "2.15.1"
+version = "2.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7826089e6af7bc638f69a44b100ebe7f6c64b182cfde16558d5cd38ac8adde20"
+checksum = "86201a560fde90bf270d3c9d5da0c2a5a0c25bd3242d674fcf03e6a35fcfa7ba"
 dependencies = [
  "minijinja",
  "serde",
@@ -7105,8 +7112,9 @@ dependencies = [
 
 [[package]]
 name = "mistralrs"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#2a10942d89c17d2c33282f9c7cf97293f7bc271e"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b94ffe881c76d6531a334c729743db91a255267a097e9b20b52f66d8531296d1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -7123,7 +7131,6 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -7132,8 +7139,9 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-audio"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#2a10942d89c17d2c33282f9c7cf97293f7bc271e"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a78dd99327fca9c2c59ac8e5aa0a922db076645e4b46a1dbe6cfbb9fe11443b"
 dependencies = [
  "anyhow",
  "apodize",
@@ -7143,8 +7151,9 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#2a10942d89c17d2c33282f9c7cf97293f7bc271e"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44fb8dc16443f611d7611c377e3239cd4c41fa4fbbcebdbd40dc80549436b125"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -7153,6 +7162,7 @@ dependencies = [
  "as-any",
  "async-trait",
  "base64 0.22.1",
+ "bindgen_cuda",
  "bm25",
  "bytemuck",
  "bytemuck_derive",
@@ -7164,12 +7174,11 @@ dependencies = [
  "chrono",
  "clap",
  "csv",
- "cudaforge",
  "derive-new",
  "derive_more",
  "dirs",
  "either",
- "float8",
+ "float8 0.6.1",
  "futures",
  "galil-seiferas",
  "half",
@@ -7228,7 +7237,6 @@ dependencies = [
  "tokio",
  "tokio-rayon",
  "tokio-tungstenite 0.28.0",
- "toktrie",
  "toktrie_hf_tokenizers",
  "toml 0.9.12+spec-1.1.0",
  "tqdm",
@@ -7242,8 +7250,9 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-macros"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#2a10942d89c17d2c33282f9c7cf97293f7bc271e"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c4805bae591126918a68c86cb541498ee64e4a584451127e6044643f2fafc1b"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -7253,8 +7262,9 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-mcp"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#2a10942d89c17d2c33282f9c7cf97293f7bc271e"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e82edad2da585a3ea817684856b3ffd6d8da2a4996e829c767de2a77c83c1b8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7273,15 +7283,15 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-paged-attn"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#2a10942d89c17d2c33282f9c7cf97293f7bc271e"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6000b390e4a7b56a58fc7005ac721780edd6fd28e70cb6a138872dd3c700dda"
 dependencies = [
  "anyhow",
+ "bindgen_cuda",
  "candle-core",
  "candle-metal-kernels",
- "cudaforge",
- "dispatch2",
- "float8",
+ "float8 0.6.1",
  "half",
  "objc2-foundation",
  "objc2-metal",
@@ -7290,16 +7300,16 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-quant"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#2a10942d89c17d2c33282f9c7cf97293f7bc271e"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fb9fb187f2c9397a73f2b00437f6bbedb4c556f1c06d13af2f8d35ec5543a00"
 dependencies = [
+ "bindgen_cuda",
  "byteorder",
  "candle-core",
  "candle-metal-kernels",
  "candle-nn",
- "cudaforge",
- "dispatch2",
- "float8",
+ "float8 0.6.1",
  "half",
  "hf-hub",
  "lazy_static",
@@ -7320,8 +7330,9 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-vision"
-version = "0.7.1-alpha.1"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git#2a10942d89c17d2c33282f9c7cf97293f7bc271e"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d79247946a50fdac4300e80504bc6950e298a9c2e7e1a2bcd948fe91852b8a7b"
 dependencies = [
  "candle-core",
  "image",
@@ -9437,10 +9448,10 @@ dependencies = [
  "async-trait",
  "encoding_rs",
  "futures",
- "hf-hub",
  "llama-cpp-2",
  "log",
  "querymt",
+ "querymt-provider-common",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -9491,6 +9502,7 @@ dependencies = [
  "image",
  "mistralrs",
  "querymt",
+ "querymt-provider-common",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -9611,7 +9623,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid 1.21.0",
- "which 8.0.0",
+ "which",
 ]
 
 [[package]]
@@ -9722,6 +9734,14 @@ dependencies = [
  "querymt",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "querymt-provider-common"
+version = "0.0.0"
+dependencies = [
+ "hf-hub",
+ "tokio",
 ]
 
 [[package]]
@@ -11420,7 +11440,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sigstore-protobuf-specs-derive",
- "which 8.0.0",
+ "which",
 ]
 
 [[package]]
@@ -13616,9 +13636,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.108"
+version = "0.2.111"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64024a30ec1e37399cf85a7ffefebdb72205ca1c972291c51512360d90bd8566"
+checksum = "ec1adf1535672f5b7824f817792b1afd731d7e843d2d04ec8f27e8cb51edd8ac"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -13629,9 +13649,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.58"
+version = "0.4.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70a6e77fd0ae8029c9ea0063f87c46fde723e7d887703d74ad2616d792e51e6f"
+checksum = "fe88540d1c934c4ec8e6db0afa536876c5441289d7f9f9123d4f065ac1250a6b"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -13643,9 +13663,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.108"
+version = "0.2.111"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "008b239d9c740232e71bd39e8ef6429d27097518b6b30bdf9086833bd5b6d608"
+checksum = "19e638317c08b21663aed4d2b9a2091450548954695ff4efa75bff5fa546b3b1"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -13653,9 +13673,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.108"
+version = "0.2.111"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5256bae2d58f54820e6490f9839c49780dff84c65aeab9e772f15d5f0e913a55"
+checksum = "2c64760850114d03d5f65457e96fc988f11f01d38fbaa51b254e4ab5809102af"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -13666,9 +13686,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.108"
+version = "0.2.111"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f01b580c9ac74c8d8f0c0e4afb04eeef2acf145458e52c03845ee9cd23e3d12"
+checksum = "60eecd4fe26177cfa3339eb00b4a36445889ba3ad37080c2429879718e20ca41"
 dependencies = [
  "unicode-ident",
 ]
@@ -14091,9 +14111,9 @@ dependencies = [
 
 [[package]]
 name = "web-sys"
-version = "0.3.85"
+version = "0.3.88"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "312e32e551d92129218ea9a2452120f4aabc03529ef03e4d0d82fb2780608598"
+checksum = "9d6bb20ed2d9572df8584f6dc81d68a41a625cadc6f15999d649a70ce7e3597a"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -14169,18 +14189,6 @@ name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
-
-[[package]]
-name = "which"
-version = "7.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
-dependencies = [
- "either",
- "env_home",
- "rustix 1.1.3",
- "winsafe",
-]
 
 [[package]]
 name = "which"

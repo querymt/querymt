@@ -24,13 +24,14 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 querymt = { path = "../../querymt", default-features = false, optional = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-url = { workspace = true }
-schemars = { workspace = true }
-futures = { workspace = true }
-mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs.git" }
-async-trait = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+schemars.workspace = true
+futures.workspace = true
+mistralrs = "0.7"
+async-trait.workspace = true
 tokio = { version = "1", features = ["full"] }
 image = "0.25"
 hf-hub.workspace = true
+querymt-provider-common = { path = "../../provider-common" }

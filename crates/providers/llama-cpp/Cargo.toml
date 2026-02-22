@@ -22,8 +22,8 @@ crate-type = ["cdylib", "rlib"]
 async-trait.workspace = true
 encoding_rs = "0.8"
 futures.workspace = true
-hf-hub.workspace = true
 llama-cpp-2 = { version = "0.1", default-features = false }
+querymt-provider-common = { path = "../../provider-common" }
 log.workspace = true
 querymt = { path = "../../querymt", default-features = false, optional = true }
 schemars.workspace = true

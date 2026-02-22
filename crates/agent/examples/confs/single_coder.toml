@@ -52,7 +52,7 @@ protect_tokens = 40000
 auto = true
 
 #[agent.parameters]
-#model_path = "hf:unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf"
+#model = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf"
 #n_ctx = 32768
 
 # =============================================================================

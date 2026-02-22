@@ -386,18 +386,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Validate provider-specific requirements
     if prov_name == "llama_cpp" {
-        let has_model_path = args.options.iter().any(|(k, _)| k == "model_path");
-        if !has_model_path {
+        let has_model = args.options.iter().any(|(k, _)| k == "model") || args.model.is_some();
+        if !has_model {
             eprintln!(
-                "{} The llama_cpp provider requires 'model_path' to be specified.",
+                "{} The llama_cpp provider requires 'model' to be specified.",
                 "Error:".bright_red()
             );
             eprintln!("\n{}", "Usage examples:".bright_cyan());
             eprintln!("  {}", "Local file:".bright_yellow());
-            eprintln!("    qmt -p llama_cpp -o model_path=\"/path/to/model.gguf\"");
+            eprintln!("    qmt -p llama_cpp -o model=\"/path/to/model.gguf\"");
             eprintln!("\n  {}", "HuggingFace model:".bright_yellow());
             eprintln!(
-                "    qmt -p llama_cpp -o model_path=\"hf:Qwen/Qwen3-VL-8B-Instruct-GGUF:Qwen3VL-8B-Instruct-Q4_K_M.gguf\""
+                "    qmt -p llama_cpp -o model=\"Qwen/Qwen3-VL-8B-Instruct-GGUF:Qwen3VL-8B-Instruct-Q4_K_M.gguf\""
             );
             eprintln!(
                 "\n{}",
@@ -407,8 +407,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("    name = \"llama_cpp\"");
             eprintln!("    path = \"target/debug/libqmt_llama_cpp.dylib\"");
             eprintln!("    [providers.config]");
-            eprintln!("    model_path = \"/path/to/model.gguf\"");
-            return Err("Missing required parameter 'model_path' for llama_cpp provider".into());
+            eprintln!("    model = \"/path/to/model.gguf\"");
+            return Err("Missing required parameter 'model' for llama_cpp provider".into());
         }
     }
 

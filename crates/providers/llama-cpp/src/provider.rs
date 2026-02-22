@@ -14,8 +14,9 @@ use crate::tools::{
 use async_trait::async_trait;
 use futures::Stream;
 use futures::channel::mpsc;
-use hf_hub::api::sync::ApiBuilder as SyncApiBuilder;
-use hf_hub::api::tokio::ApiBuilder as AsyncApiBuilder;
+use querymt_provider_common::{
+    ModelRef, ModelRefError, parse_model_ref, resolve_hf_model_fast, resolve_hf_model_sync,
+};
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
@@ -35,52 +36,29 @@ pub(crate) struct LlamaCppProvider {
 }
 
 impl LlamaCppProvider {
-    /// Resolve a model path, potentially downloading from HuggingFace Hub.
+    /// Resolve a model path, potentially downloading from Hugging Face Hub.
     fn resolve_model_path(raw: &str, fast: bool) -> Result<PathBuf, LLMError> {
-        let Some(rest) = raw.strip_prefix("hf:") else {
-            return Ok(PathBuf::from(raw));
-        };
-        let mut parts = rest.splitn(2, ':');
-        let repo = parts.next().unwrap_or("").trim();
-        let file = parts.next().unwrap_or("").trim();
-        if repo.is_empty() || file.is_empty() {
-            return Err(LLMError::InvalidRequest(
-                "hf: model_path must be formatted as hf:<repo>:<file>".into(),
-            ));
-        }
-
-        // High-throughput async download when explicitly enabled and a tokio runtime is available
-        if fast {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let repo = repo.to_string();
-                let file = file.to_string();
-                let path = tokio::task::block_in_place(|| {
-                    handle.block_on(async {
-                        let api = AsyncApiBuilder::new()
-                            .with_progress(true)
-                            .high()
-                            .build()
-                            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-                        api.model(repo)
-                            .get(&file)
-                            .await
-                            .map_err(|e| LLMError::ProviderError(e.to_string()))
-                    })
-                })?;
-                return Ok(path);
+        let model_ref = parse_model_ref(raw).map_err(Self::map_model_ref_error)?;
+        match model_ref {
+            ModelRef::LocalPath(path) => Ok(path),
+            ModelRef::Hf(model) => {
+                if fast {
+                    resolve_hf_model_fast(&model).map_err(Self::map_model_ref_error)
+                } else {
+                    resolve_hf_model_sync(&model).map_err(Self::map_model_ref_error)
+                }
             }
+            ModelRef::HfRepo(repo) => Err(LLMError::InvalidRequest(format!(
+                "llama_cpp model must include a selector for Hugging Face repos: {repo}:<selector>"
+            ))),
         }
+    }
 
-        // Standard sync download (default, or fallback when no tokio runtime available)
-        let api = SyncApiBuilder::new()
-            .with_progress(true)
-            .build()
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-        let path = api
-            .model(repo.to_string())
-            .get(file)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-        Ok(path)
+    fn map_model_ref_error(err: ModelRefError) -> LLMError {
+        match err {
+            ModelRefError::Invalid(msg) => LLMError::InvalidRequest(msg),
+            ModelRefError::Download(msg) => LLMError::ProviderError(msg),
+        }
     }
 
     pub(crate) fn new(cfg: LlamaCppConfig) -> Result<Self, LLMError> {
@@ -96,8 +74,7 @@ impl LlamaCppProvider {
             LlamaCppLogMode::Tracing => send_logs_to_tracing(LogOptions::default()),
             LlamaCppLogMode::Off => backend.void_logs(),
         }
-        let model_path =
-            Self::resolve_model_path(&cfg.model_path, cfg.fast_download.unwrap_or(false))?;
+        let model_path = Self::resolve_model_path(&cfg.model, cfg.fast_download.unwrap_or(false))?;
         let model_path = Path::new(&model_path);
         if !model_path.exists() {
             return Err(LLMError::InvalidRequest(format!(

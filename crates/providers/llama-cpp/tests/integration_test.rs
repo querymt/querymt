@@ -16,8 +16,7 @@ fn test_config_schema_generation() {
 fn test_config_serialization() {
     // Verify config can be serialized/deserialized
     let config = LlamaCppConfig {
-        model_path: "/path/to/model.gguf".to_string(),
-        model: Some("test-model".to_string()),
+        model: "/path/to/model.gguf".to_string(),
         max_tokens: Some(512),
         temperature: Some(0.7),
         top_p: Some(0.9),
@@ -44,7 +43,7 @@ fn test_config_serialization() {
     let deserialized: LlamaCppConfig =
         serde_json::from_str(&json).expect("Failed to deserialize config");
 
-    assert_eq!(deserialized.model_path, "/path/to/model.gguf");
+    assert_eq!(deserialized.model, "/path/to/model.gguf");
     assert_eq!(deserialized.max_tokens, Some(512));
     assert_eq!(deserialized.kv_cache_type_k, Some("q4_0".to_string()));
 }

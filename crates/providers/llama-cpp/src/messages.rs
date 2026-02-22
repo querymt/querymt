@@ -207,8 +207,7 @@ mod tests {
 
     fn test_config() -> LlamaCppConfig {
         LlamaCppConfig {
-            model_path: "test.gguf".to_string(),
-            model: None,
+            model: "test.gguf".to_string(),
             max_tokens: None,
             temperature: None,
             top_p: None,

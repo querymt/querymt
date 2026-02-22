@@ -12,10 +12,8 @@ pub(crate) const LLAMA_FLASH_ATTN_TYPE_ENABLED: i32 = 1;
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct LlamaCppConfig {
-    /// Path to a local GGUF model file.
-    pub model_path: String,
-    /// Optional display name for the model.
-    pub model: Option<String>,
+    /// Model reference. Supports local GGUF paths and Hugging Face refs `<repo>:<selector>`.
+    pub model: String,
     /// Maximum tokens to generate.
     pub max_tokens: Option<u32>,
     /// Sampling temperature; set to 0 for greedy.
