@@ -228,6 +228,15 @@ export function buildDelegationTurn(group: DelegationGroupInfo): Turn {
   };
 }
 
+export function isDelegationAwaitingInput(group: DelegationGroupInfo): boolean {
+  if (group.status !== 'in_progress' || group.events.length === 0) {
+    return false;
+  }
+
+  const lastEvent = group.events[group.events.length - 1];
+  return !!lastEvent?.elicitationData;
+}
+
 // Build event rows with delegation grouping (from previous implementation)
 export function buildEventRowsWithDelegations(events: EventItem[]): {
   rows: EventRow[];

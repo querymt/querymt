@@ -393,6 +393,7 @@ pub async fn handle_elicitation_response(
     action: &str,
     content: Option<&serde_json::Value>,
 ) {
+    // Parse action string to enum
     let action_enum = match action {
         "accept" => crate::elicitation::ElicitationAction::Accept,
         "decline" => crate::elicitation::ElicitationAction::Decline,
@@ -408,10 +409,21 @@ pub async fn handle_elicitation_response(
         content: content.cloned(),
     };
 
-    let pending_map = state.agent.pending_elicitations();
-    let mut pending = pending_map.lock().await;
-    if let Some(tx) = pending.remove(elicitation_id) {
-        let _ = tx.send(response);
+    if let Some(tx) =
+        crate::elicitation::take_pending_elicitation_sender(state.agent.as_ref(), elicitation_id)
+            .await
+    {
+        if tx.send(response).is_err() {
+            log::warn!(
+                "Elicitation response receiver dropped for elicitation_id={}",
+                elicitation_id
+            );
+        }
+    } else {
+        log::warn!(
+            "No pending elicitation found for elicitation_id={} (checked primary and delegates)",
+            elicitation_id
+        );
     }
 }
 

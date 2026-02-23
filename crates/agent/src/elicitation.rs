@@ -11,7 +11,7 @@ use rmcp::handler::client::ClientHandler;
 use rmcp::model::{ClientInfo, CreateElicitationRequestParam, CreateElicitationResult};
 use rmcp::service::RequestContext;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 
@@ -53,6 +53,58 @@ pub struct ElicitationResponse {
 
 /// Type alias for the pending elicitation map (elicitation_id -> response sender)
 pub type PendingElicitationMap = Arc<Mutex<HashMap<String, oneshot::Sender<ElicitationResponse>>>>;
+
+/// Removes and returns a pending elicitation sender by ID.
+///
+/// Searches the primary agent first, then all registered delegate agents.
+/// This allows UI/ACP responders to resolve delegate-originated elicitations
+/// while holding only a reference to the primary agent.
+pub async fn take_pending_elicitation_sender(
+    agent: &crate::agent::QueryMTAgent,
+    elicitation_id: &str,
+) -> Option<oneshot::Sender<ElicitationResponse>> {
+    if let Some(sender) = take_from_pending_map(&agent.pending_elicitations(), elicitation_id).await
+    {
+        return Some(sender);
+    }
+
+    let registry = agent.agent_registry();
+    let mut seen_agents = HashSet::new();
+
+    for info in registry.list_agents() {
+        let Some(instance) = registry.get_agent_instance(&info.id) else {
+            continue;
+        };
+
+        let Some(delegate) = instance
+            .as_any()
+            .downcast_ref::<crate::agent::QueryMTAgent>()
+        else {
+            continue;
+        };
+
+        let ptr = delegate as *const _ as usize;
+        if !seen_agents.insert(ptr) {
+            continue;
+        }
+
+        if let Some(sender) =
+            take_from_pending_map(&delegate.pending_elicitations(), elicitation_id).await
+        {
+            return Some(sender);
+        }
+    }
+
+    None
+}
+
+async fn take_from_pending_map(
+    pending_map: &PendingElicitationMap,
+    elicitation_id: &str,
+) -> Option<oneshot::Sender<ElicitationResponse>> {
+    let mut pending = pending_map.lock().await;
+    pending.remove(elicitation_id)
+}
 
 /// MCP client handler that routes elicitation requests through the agent's event system.
 /// This replaces `()` as the handler in `serve_client()`.
@@ -305,5 +357,73 @@ mod tests {
 
         let received = rx.await.unwrap();
         assert_eq!(received.action, ElicitationAction::Accept);
+    }
+
+    /*
+    use crate::agent::builder::AgentBuilderExt;
+    use crate::delegation::{AgentInfo, DefaultAgentRegistry};
+    use crate::session::backend::StorageBackend;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use crate::test_utils::empty_plugin_registry;
+    use querymt::LLMParams;
+    */
+
+    #[tokio::test]
+    async fn take_sender_resolves_delegate_pending_elicitation() {
+        let (planner_registry, _planner_cfg_dir) = empty_plugin_registry().unwrap();
+        let planner_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let planner = crate::agent::QueryMTAgent::new(
+            Arc::new(planner_registry),
+            planner_storage.session_store(),
+            LLMParams::new().provider("mock").model("mock-model"),
+        );
+
+        let (delegate_registry, _delegate_cfg_dir) = empty_plugin_registry().unwrap();
+        let delegate_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let delegate = Arc::new(crate::agent::QueryMTAgent::new(
+            Arc::new(delegate_registry),
+            delegate_storage.session_store(),
+            LLMParams::new().provider("mock").model("mock-model"),
+        ));
+
+        let mut registry = DefaultAgentRegistry::new();
+        registry.register(
+            AgentInfo {
+                id: "coder".to_string(),
+                name: "Coder".to_string(),
+                description: "Delegate coder".to_string(),
+                capabilities: vec![],
+                required_capabilities: vec![],
+                meta: None,
+            },
+            delegate.clone(),
+        );
+        let planner = planner.with_agent_registry(Arc::new(registry));
+
+        let elicitation_id = "delegate-elicitation-1".to_string();
+        let (tx, rx) = oneshot::channel();
+        delegate
+            .pending_elicitations()
+            .lock()
+            .await
+            .insert(elicitation_id.clone(), tx);
+
+        let sender = take_pending_elicitation_sender(&planner, &elicitation_id)
+            .await
+            .expect("delegate pending elicitation should be resolved");
+
+        sender
+            .send(ElicitationResponse {
+                action: ElicitationAction::Accept,
+                content: Some(serde_json::json!({"selection": "allow_once"})),
+            })
+            .unwrap();
+
+        let response = rx.await.unwrap();
+        assert_eq!(response.action, ElicitationAction::Accept);
+        assert_eq!(
+            response.content,
+            Some(serde_json::json!({"selection": "allow_once"}))
+        );
     }
 }
