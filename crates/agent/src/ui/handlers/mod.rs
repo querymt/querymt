@@ -46,6 +46,7 @@ use super::connection::{send_error, send_state};
 use super::messages::{UiClientMessage, UiPromptBlock};
 use super::session::{ensure_sessions_for_mode, prompt_for_mode, resolve_cwd};
 use models::{handle_get_recent_models, handle_set_session_model};
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 // ── Main dispatch ─────────────────────────────────────────────────────────────
@@ -59,8 +60,18 @@ pub async fn handle_ui_message(
 ) {
     match msg {
         UiClientMessage::Init => {
+            let started = Instant::now();
             send_state(state, conn_id, tx).await;
+            let send_state_ms = started.elapsed().as_millis() as u64;
+
             handle_list_sessions(state, tx).await;
+            tracing::info!(
+                target: "querymt_agent::ui::handlers",
+                operation = "ui.init",
+                send_state_ms,
+                total_ms = started.elapsed().as_millis() as u64,
+                "ui init completed"
+            );
         }
         UiClientMessage::SetActiveAgent { agent_id } => {
             let mut connections = state.connections.lock().await;

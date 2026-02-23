@@ -600,7 +600,8 @@ export function useUiClient() {
       }
       case 'error': {
         console.error('UI server error:', msg.message);
-        // Reset thinking state on error - clear all agents (connection-level error)
+        // Connection-level errors have no session_id. Do not inject them into the
+        // active session timeline, otherwise provider errors can bleed across sessions.
         setThinkingAgentIds(new Set());
         // Check if this is a file index related error and notify
         if (
@@ -610,25 +611,6 @@ export function useUiClient() {
             msg.message.includes('working directory'))
         ) {
           fileIndexErrorCallbackRef.current(msg.message);
-        }
-        // Add error to main session events if we have one
-        if (mainSessionId) {
-          setEventsBySession((prev) => {
-            const next = new Map(prev);
-            const existing = next.get(mainSessionId) ?? [];
-            next.set(mainSessionId, [
-              ...existing,
-              {
-                id: `ui-error-${Date.now()}-${Math.random()}`,
-                agentId: 'system',
-                type: 'system',
-                content: msg.message,
-                timestamp: Date.now(),
-                isMessage: true,
-              },
-            ]);
-            return next;
-          });
         }
         break;
       }

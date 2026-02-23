@@ -12,6 +12,7 @@ use super::super::messages::AuthProviderEntry;
 #[cfg(feature = "oauth")]
 use super::super::messages::OAuthStatus;
 use super::super::messages::{ModelEntry, ProviderCapabilityEntry, UiServerMessage};
+use super::session_ops::ensure_session_loaded;
 use crate::session::store::CustomModel;
 #[cfg(feature = "remote")]
 use futures_util::StreamExt;
@@ -424,6 +425,8 @@ pub async fn handle_set_session_model(
     node: Option<&str>,
 ) -> Result<(), String> {
     use crate::agent::messages::SetSessionModel;
+
+    ensure_session_loaded(state, session_id, "set_session_model").await?;
 
     // Look up the session actor ref through the registry so remote sessions work too.
     let session_ref = {

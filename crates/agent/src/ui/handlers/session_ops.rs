@@ -11,21 +11,52 @@ use super::super::messages::{SessionGroup, SessionSummary, UiServerMessage};
 use super::super::session::PRIMARY_AGENT_ID;
 use crate::agent::core::AgentMode;
 use crate::index::resolve_workspace_root;
-use agent_client_protocol::CancelNotification;
+use crate::send_agent::SendAgent;
+use agent_client_protocol::{CancelNotification, LoadSessionRequest, SessionId};
+use std::path::PathBuf;
+use std::time::Instant;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 // ── Session list / load ───────────────────────────────────────────────────────
 
 /// Handle session listing request.
+#[tracing::instrument(
+    name = "ui.handle_list_sessions",
+    skip(state, tx),
+    fields(
+        local_group_count = tracing::field::Empty,
+        local_session_count = tracing::field::Empty,
+        remote_group_count = tracing::field::Empty,
+        remote_session_count = tracing::field::Empty,
+        total_group_count = tracing::field::Empty,
+        total_session_count = tracing::field::Empty,
+        view_fetch_ms = tracing::field::Empty,
+        remote_merge_ms = tracing::field::Empty,
+        total_ms = tracing::field::Empty
+    )
+)]
 pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>) {
-    let view = match state.view_store.get_session_list_view(None).await {
+    let started = Instant::now();
+    let view_started = Instant::now();
+
+    let view = match state
+        .view_store
+        .get_session_list_view(None)
+        .instrument(tracing::info_span!("ui.handle_list_sessions.get_session_list_view"))
+        .await
+    {
         Ok(view) => view,
         Err(e) => {
             let _ = send_error(tx, format!("Failed to list sessions: {}", e)).await;
             return;
         }
     };
+
+    let view_fetch_ms = view_started.elapsed().as_millis() as u64;
+    let local_group_count = view.groups.len();
+    let local_session_count: usize = view.groups.iter().map(|g| g.sessions.len()).sum();
 
     let mut groups: Vec<SessionGroup> = view
         .groups
@@ -55,48 +86,79 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
     // Append in-memory remote sessions (not persisted to the local view store).
     // Group them by peer_label so each remote node gets its own collapsible group.
     #[cfg(feature = "remote")]
+    let mut remote_group_count = 0usize;
+    #[cfg(feature = "remote")]
+    let mut remote_session_count = 0usize;
+    #[cfg(not(feature = "remote"))]
+    let remote_group_count = 0usize;
+    #[cfg(not(feature = "remote"))]
+    let remote_session_count = 0usize;
+
+    let remote_merge_started = Instant::now();
+    #[cfg(feature = "remote")]
     {
-        let remote = {
-            let registry = state.agent.registry.lock().await;
-            registry.remote_sessions()
-        };
-        if !remote.is_empty() {
-            let cwds = state.session_cwds.lock().await;
+        async {
+            let remote = {
+                let registry = state.agent.registry.lock().await;
+                registry.remote_sessions()
+            };
+            if !remote.is_empty() {
+                let cwds = state.session_cwds.lock().await;
 
-            // Collect per-node groups: node_label -> Vec<SessionSummary>
-            let mut by_node: std::collections::HashMap<String, Vec<SessionSummary>> =
-                std::collections::HashMap::new();
+                // Collect per-node groups: node_label -> Vec<SessionSummary>
+                let mut by_node: std::collections::HashMap<String, Vec<SessionSummary>> =
+                    std::collections::HashMap::new();
 
-            for (session_id, peer_label) in remote {
-                let cwd = cwds.get(&session_id).map(|p| p.display().to_string());
-                by_node
-                    .entry(peer_label.clone())
-                    .or_default()
-                    .push(SessionSummary {
-                        session_id,
-                        name: None,
-                        cwd: cwd.clone(),
-                        title: None,
-                        created_at: None,
-                        updated_at: None,
-                        parent_session_id: None,
-                        fork_origin: None,
-                        has_children: false,
-                        node: Some(peer_label),
+                for (session_id, peer_label) in remote {
+                    let cwd = cwds.get(&session_id).map(|p| p.display().to_string());
+                    by_node
+                        .entry(peer_label.clone())
+                        .or_default()
+                        .push(SessionSummary {
+                            session_id,
+                            name: None,
+                            cwd: cwd.clone(),
+                            title: None,
+                            created_at: None,
+                            updated_at: None,
+                            parent_session_id: None,
+                            fork_origin: None,
+                            has_children: false,
+                            node: Some(peer_label),
+                        });
+                }
+
+                for (node_label, sessions) in by_node {
+                    remote_group_count += 1;
+                    remote_session_count += sessions.len();
+                    // Use a synthetic cwd like "remote::<node>" so the group header
+                    // is recognisable without requiring a real path.
+                    groups.push(SessionGroup {
+                        cwd: Some(format!("remote::{}", node_label)),
+                        sessions,
+                        latest_activity: None,
                     });
-            }
-
-            for (node_label, sessions) in by_node {
-                // Use a synthetic cwd like "remote::<node>" so the group header
-                // is recognisable without requiring a real path.
-                groups.push(SessionGroup {
-                    cwd: Some(format!("remote::{}", node_label)),
-                    sessions,
-                    latest_activity: None,
-                });
+                }
             }
         }
+        .instrument(tracing::info_span!("ui.handle_list_sessions.remote_merge"))
+        .await;
     }
+    let remote_merge_ms = remote_merge_started.elapsed().as_millis() as u64;
+
+    let total_group_count = groups.len();
+    let total_session_count: usize = groups.iter().map(|g| g.sessions.len()).sum();
+
+    let span = tracing::Span::current();
+    span.record("local_group_count", local_group_count);
+    span.record("local_session_count", local_session_count);
+    span.record("remote_group_count", remote_group_count);
+    span.record("remote_session_count", remote_session_count);
+    span.record("total_group_count", total_group_count);
+    span.record("total_session_count", total_session_count);
+    span.record("view_fetch_ms", view_fetch_ms);
+    span.record("remote_merge_ms", remote_merge_ms);
+    span.record("total_ms", started.elapsed().as_millis() as u64);
 
     let _ = send_message(tx, UiServerMessage::SessionList { groups }).await;
 }
@@ -131,6 +193,11 @@ pub async fn handle_load_session(
 
     // 2. Determine agent ID (default to primary)
     let agent_id = PRIMARY_AGENT_ID.to_string();
+
+    if let Err(e) = ensure_session_loaded(state, session_id, "load_session").await {
+        let _ = send_error(tx, e).await;
+        return;
+    }
 
     // 3. Register in connection state
     {
@@ -169,6 +236,74 @@ pub async fn handle_load_session(
     if let Some(cwd) = cwd_path {
         let root = resolve_workspace_root(&cwd);
         subscribe_to_file_index(state.clone(), conn_id.to_string(), tx.clone(), root).await;
+    }
+}
+
+pub(super) async fn ensure_session_loaded(
+    state: &ServerState,
+    session_id: &str,
+    op_name: &'static str,
+) -> Result<(), String> {
+    let registry_hit = {
+        let registry = state.agent.registry.lock().await;
+        registry.get(session_id).is_some()
+    };
+
+    if registry_hit {
+        tracing::debug!(
+            op_name,
+            session_id,
+            registry_hit,
+            store_exists = true,
+            actor_loaded = true,
+            "session already hydrated"
+        );
+        return Ok(());
+    }
+
+    let store_exists = state
+        .agent
+        .config
+        .provider
+        .history_store()
+        .get_session(session_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some();
+
+    if !store_exists {
+        tracing::warn!(
+            op_name,
+            session_id,
+            registry_hit,
+            store_exists,
+            actor_loaded = false,
+            "session hydration failed: missing from store"
+        );
+        return Err(format!("Session not found: {}", session_id));
+    }
+
+    let req = LoadSessionRequest::new(SessionId::from(session_id.to_string()), PathBuf::new());
+    state.agent.load_session(req).await.map_err(|e| e.to_string())?;
+
+    let actor_loaded = {
+        let registry = state.agent.registry.lock().await;
+        registry.get(session_id).is_some()
+    };
+
+    tracing::info!(
+        op_name,
+        session_id,
+        registry_hit,
+        store_exists,
+        actor_loaded,
+        "session lazy hydration evaluated"
+    );
+
+    if actor_loaded {
+        Ok(())
+    } else {
+        Err(format!("Session not found: {}", session_id))
     }
 }
 

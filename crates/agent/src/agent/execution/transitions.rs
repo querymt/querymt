@@ -21,7 +21,7 @@ use agent_client_protocol::{ContentBlock, ContentChunk, SessionUpdate, TextConte
 use anyhow::Context as _;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use querymt::ToolCall;
 use querymt::chat::{CacheHint, ChatMessage, ChatRole, FinishReason, StreamChunk};
 use std::sync::Arc;
@@ -281,7 +281,7 @@ pub(super) async fn transition_call_llm(
 
                 match item.map_err(|e| anyhow::anyhow!("LLM streaming error: {}", e))? {
                     StreamChunk::Text(delta) => {
-                        debug!(
+                        trace!(
                             "stream chunk: session={} message_id={} type=text len={}",
                             session_id,
                             message_id,
@@ -291,7 +291,7 @@ pub(super) async fn transition_call_llm(
                         text_buffer.push_str(&delta);
                     }
                     StreamChunk::Thinking(delta) => {
-                        debug!(
+                        trace!(
                             "stream chunk: session={} message_id={} type=thinking len={}",
                             session_id,
                             message_id,
@@ -302,7 +302,7 @@ pub(super) async fn transition_call_llm(
                     }
                     StreamChunk::ToolUseComplete { tool_call, .. } => {
                         // Flush before tool use so UI sees final text before tool starts
-                        debug!(
+                        trace!(
                             "stream chunk: session={} message_id={} type=tool_use_complete id={}",
                             session_id, message_id, tool_call.id
                         );
@@ -312,7 +312,7 @@ pub(super) async fn transition_call_llm(
                         }
                     }
                     StreamChunk::Usage(u) => {
-                        debug!(
+                        trace!(
                             "stream chunk: session={} message_id={} type=usage input={} output={} reasoning={}",
                             session_id,
                             message_id,
@@ -331,7 +331,7 @@ pub(super) async fn transition_call_llm(
                         });
                     }
                     StreamChunk::Done { .. } => {
-                        debug!(
+                        trace!(
                             "stream chunk: session={} message_id={} type=done",
                             session_id, message_id
                         );

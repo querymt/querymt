@@ -1572,18 +1572,41 @@ impl ViewStore for SqliteStorage {
         })
     }
 
+    #[tracing::instrument(
+        name = "session.get_session_list_view",
+        skip(self, filter),
+        fields(
+            session_count = tracing::field::Empty,
+            filtered_out_count = tracing::field::Empty,
+            total_count = tracing::field::Empty,
+            group_count = tracing::field::Empty,
+            title_lookup_count = tracing::field::Empty,
+            total_ms = tracing::field::Empty,
+            list_sessions_ms = tracing::field::Empty,
+            filter_ms = tracing::field::Empty,
+            title_lookup_ms = tracing::field::Empty,
+            hierarchy_build_ms = tracing::field::Empty,
+            group_build_ms = tracing::field::Empty
+        )
+    )]
     async fn get_session_list_view(
         &self,
         filter: Option<SessionListFilter>,
     ) -> SessionResult<SessionListView> {
         use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
 
+        let started = Instant::now();
         let session_repo = SqliteSessionRepository::new(self.conn.clone());
         let intent_repo = SqliteIntentRepository::new(self.conn.clone());
 
         // Get all sessions (list_sessions already returns sorted by updated_at DESC)
+        let list_sessions_started = Instant::now();
         let mut sessions = session_repo.list_sessions().await?;
+        let list_sessions_ms = list_sessions_started.elapsed().as_millis() as u64;
+        let session_count_before_filter = sessions.len();
 
+        let filter_started = Instant::now();
         // Apply filters if provided
         if let Some(filter_spec) = filter {
             if let Some(filter_expr) = filter_spec.filter {
@@ -1595,6 +1618,7 @@ impl ViewStore for SqliteStorage {
                 sessions.truncate(limit);
             }
         }
+        let filter_ms = filter_started.elapsed().as_millis() as u64;
 
         let total_count = sessions.len();
 
@@ -1615,6 +1639,7 @@ impl ViewStore for SqliteStorage {
         }
 
         // Build session list items with titles and hierarchy info
+        let title_lookup_started = Instant::now();
         let mut items = Vec::with_capacity(sessions.len());
 
         for session in sessions {
@@ -1657,8 +1682,10 @@ impl ViewStore for SqliteStorage {
                 has_children,
             });
         }
+        let title_lookup_ms = title_lookup_started.elapsed().as_millis() as u64;
 
         // Build a parent-child map to organize sessions hierarchically
+        let hierarchy_started = Instant::now();
         let mut parent_children_map: HashMap<String, Vec<SessionListItem>> = HashMap::new();
         let mut root_sessions: Vec<SessionListItem> = Vec::new();
 
@@ -1705,7 +1732,10 @@ impl ViewStore for SqliteStorage {
             }
         }
 
+        let hierarchy_build_ms = hierarchy_started.elapsed().as_millis() as u64;
+
         // Group by CWD
+        let group_build_started = Instant::now();
         let mut groups_map: HashMap<Option<String>, Vec<SessionListItem>> = HashMap::new();
         for item in flat_items {
             groups_map.entry(item.cwd.clone()).or_default().push(item);
@@ -1736,6 +1766,25 @@ impl ViewStore for SqliteStorage {
                 }
             }
         });
+
+        let group_count = groups.len();
+        let group_build_ms = group_build_started.elapsed().as_millis() as u64;
+        let total_ms = started.elapsed().as_millis() as u64;
+        let span = tracing::Span::current();
+        span.record("session_count", session_count_before_filter);
+        span.record(
+            "filtered_out_count",
+            session_count_before_filter.saturating_sub(total_count),
+        );
+        span.record("total_count", total_count);
+        span.record("group_count", group_count);
+        span.record("title_lookup_count", total_count);
+        span.record("total_ms", total_ms);
+        span.record("list_sessions_ms", list_sessions_ms);
+        span.record("filter_ms", filter_ms);
+        span.record("title_lookup_ms", title_lookup_ms);
+        span.record("hierarchy_build_ms", hierarchy_build_ms);
+        span.record("group_build_ms", group_build_ms);
 
         Ok(SessionListView {
             groups,

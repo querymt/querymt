@@ -111,3 +111,7 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 [[bench]]
 name = "agent_startup"
 harness = false
+
+[[bench]]
+name = "session_list_view"
+harness = false
