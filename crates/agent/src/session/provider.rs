@@ -497,7 +497,7 @@ impl SessionHandle {
                     .rposition(|m| {
                         m.parts
                             .iter()
-                            .any(|p| matches!(p, MessagePart::Compaction { .. }))
+                            .any(|p| matches!(p, MessagePart::CompactionRequest { .. }))
                     })
                     .unwrap_or(0);
                 agent_msgs[start_index..]

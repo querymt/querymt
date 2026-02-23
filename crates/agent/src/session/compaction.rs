@@ -212,23 +212,45 @@ impl SessionCompaction {
             .sum()
     }
 
-    /// Create a compaction message to be stored in history
-    pub fn create_compaction_message(
+    /// Create a compaction message pair to be stored in history.
+    ///
+    /// Returns a (user_request, assistant_summary) tuple that forms a natural
+    /// user→assistant exchange after context compaction. The user message asks
+    /// "Summarize our conversation so far." and the assistant message contains
+    /// the actual summary.
+    pub fn create_compaction_messages(
         session_id: &str,
         summary: &str,
         original_token_count: usize,
-    ) -> AgentMessage {
-        AgentMessage {
-            id: uuid::Uuid::new_v4().to_string(),
+    ) -> (AgentMessage, AgentMessage) {
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let summary_id = uuid::Uuid::now_v7().to_string();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+        let request_msg = AgentMessage {
+            id: request_id.clone(),
+            session_id: session_id.to_string(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::CompactionRequest {
+                original_token_count,
+            }],
+            created_at: now,
+            parent_message_id: None,
+        };
+
+        let summary_msg = AgentMessage {
+            id: summary_id,
             session_id: session_id.to_string(),
             role: ChatRole::Assistant,
             parts: vec![MessagePart::Compaction {
                 summary: summary.to_string(),
                 original_token_count,
             }],
-            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
-            parent_message_id: None,
-        }
+            created_at: now,
+            parent_message_id: Some(request_id),
+        };
+
+        (request_msg, summary_msg)
     }
 }
 
@@ -246,11 +268,13 @@ impl SessionCompaction {
 /// A subset of messages starting from (and including) the last compaction,
 /// or all messages if no compaction exists.
 pub fn filter_to_effective_history(messages: Vec<AgentMessage>) -> Vec<AgentMessage> {
-    // Find the index of the last compaction message
+    // Find the index of the last compaction request (user message).
+    // This anchors on the user side of the compaction pair so that the
+    // effective history starts with the user→assistant compaction exchange.
     let last_compaction_idx = messages.iter().rposition(|m| {
         m.parts
             .iter()
-            .any(|p| matches!(p, MessagePart::Compaction { .. }))
+            .any(|p| matches!(p, MessagePart::CompactionRequest { .. }))
     });
 
     let filtered: Vec<AgentMessage> = match last_compaction_idx {
@@ -274,12 +298,15 @@ pub fn filter_to_effective_history(messages: Vec<AgentMessage>) -> Vec<AgentMess
         .collect()
 }
 
-/// Check if messages contain a compaction summary
+/// Check if messages contain a compaction pair
 pub fn has_compaction(messages: &[AgentMessage]) -> bool {
     messages.iter().any(|m| {
-        m.parts
-            .iter()
-            .any(|p| matches!(p, MessagePart::Compaction { .. }))
+        m.parts.iter().any(|p| {
+            matches!(
+                p,
+                MessagePart::CompactionRequest { .. } | MessagePart::Compaction { .. }
+            )
+        })
     })
 }
 
@@ -347,6 +374,19 @@ mod tests {
                     tool_name: Some("test_tool".to_string()),
                     tool_arguments: None,
                     compacted_at: None,
+                }],
+                created_at: 0,
+                parent_message_id: None,
+            }
+        }
+
+        fn compaction_request_message(id: &str, session_id: &str) -> AgentMessage {
+            AgentMessage {
+                id: id.to_string(),
+                session_id: session_id.to_string(),
+                role: ChatRole::User,
+                parts: vec![MessagePart::CompactionRequest {
+                    original_token_count: 1000,
                 }],
                 created_at: 0,
                 parent_message_id: None,
@@ -451,6 +491,10 @@ mod tests {
         MessageFixture::text_message(id, session_id, role, text)
     }
 
+    fn make_compaction_request_message(id: &str, session_id: &str) -> AgentMessage {
+        MessageFixture::compaction_request_message(id, session_id)
+    }
+
     fn make_compaction_message(id: &str, session_id: &str, summary: &str) -> AgentMessage {
         MessageFixture::compaction_message(id, session_id, summary)
     }
@@ -473,32 +517,37 @@ mod tests {
         let messages = vec![
             make_text_message("1", "s1", ChatRole::User, "Old message"),
             make_text_message("2", "s1", ChatRole::Assistant, "Old response"),
-            make_compaction_message("3", "s1", "Summary of previous conversation"),
-            make_text_message("4", "s1", ChatRole::User, "New message"),
-            make_text_message("5", "s1", ChatRole::Assistant, "New response"),
+            make_compaction_request_message("3", "s1"),
+            make_compaction_message("4", "s1", "Summary of previous conversation"),
+            make_text_message("5", "s1", ChatRole::User, "New message"),
+            make_text_message("6", "s1", ChatRole::Assistant, "New response"),
         ];
 
         let filtered = filter_to_effective_history(messages);
-        assert_eq!(filtered.len(), 3);
-        assert_eq!(filtered[0].id, "3"); // Compaction message
-        assert_eq!(filtered[1].id, "4");
+        assert_eq!(filtered.len(), 4);
+        assert_eq!(filtered[0].id, "3"); // CompactionRequest (user)
+        assert_eq!(filtered[1].id, "4"); // Compaction (assistant)
         assert_eq!(filtered[2].id, "5");
+        assert_eq!(filtered[3].id, "6");
     }
 
     #[test]
     fn test_filter_uses_last_compaction() {
         let messages = vec![
             make_text_message("1", "s1", ChatRole::User, "Very old"),
-            make_compaction_message("2", "s1", "First summary"),
-            make_text_message("3", "s1", ChatRole::User, "Medium old"),
-            make_compaction_message("4", "s1", "Second summary"),
-            make_text_message("5", "s1", ChatRole::User, "Recent"),
+            make_compaction_request_message("2", "s1"),
+            make_compaction_message("3", "s1", "First summary"),
+            make_text_message("4", "s1", ChatRole::User, "Medium old"),
+            make_compaction_request_message("5", "s1"),
+            make_compaction_message("6", "s1", "Second summary"),
+            make_text_message("7", "s1", ChatRole::User, "Recent"),
         ];
 
         let filtered = filter_to_effective_history(messages);
-        assert_eq!(filtered.len(), 2);
-        assert_eq!(filtered[0].id, "4"); // Second compaction
-        assert_eq!(filtered[1].id, "5");
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].id, "5"); // Second CompactionRequest
+        assert_eq!(filtered[1].id, "6"); // Second Compaction
+        assert_eq!(filtered[2].id, "7");
     }
 
     #[test]
@@ -535,17 +584,31 @@ mod tests {
     }
 
     #[test]
-    fn test_create_compaction_message() {
-        let msg = SessionCompaction::create_compaction_message("session1", "Test summary", 5000);
+    fn test_create_compaction_messages() {
+        let (req, sum) =
+            SessionCompaction::create_compaction_messages("session1", "Test summary", 5000);
 
-        assert_eq!(msg.session_id, "session1");
-        assert_eq!(msg.role, ChatRole::Assistant);
-        assert_eq!(msg.parts.len(), 1);
+        // Request message (user side)
+        assert_eq!(req.session_id, "session1");
+        assert_eq!(req.role, ChatRole::User);
+        assert_eq!(req.parts.len(), 1);
+        assert!(matches!(
+            req.parts[0],
+            MessagePart::CompactionRequest {
+                original_token_count: 5000
+            }
+        ));
+
+        // Summary message (assistant side)
+        assert_eq!(sum.session_id, "session1");
+        assert_eq!(sum.role, ChatRole::Assistant);
+        assert_eq!(sum.parts.len(), 1);
+        assert_eq!(sum.parent_message_id.as_deref(), Some(req.id.as_str()));
 
         if let MessagePart::Compaction {
             summary,
             original_token_count,
-        } = &msg.parts[0]
+        } = &sum.parts[0]
         {
             assert_eq!(summary, "Test summary");
             assert_eq!(*original_token_count, 5000);
@@ -819,34 +882,42 @@ mod tests {
     }
 
     #[test]
-    fn test_create_compaction_message_structure() {
-        let msg = SessionCompaction::create_compaction_message("session1", "Test summary", 5000);
+    fn test_create_compaction_messages_structure() {
+        let (req, sum) =
+            SessionCompaction::create_compaction_messages("session1", "Test summary", 5000);
 
-        assert_eq!(msg.session_id, "session1");
-        assert_eq!(msg.role, ChatRole::Assistant);
-        assert_eq!(msg.parts.len(), 1);
-        assert!(!msg.id.is_empty());
-        assert!(msg.created_at > 0);
+        assert_eq!(req.session_id, "session1");
+        assert_eq!(req.role, ChatRole::User);
+        assert_eq!(req.parts.len(), 1);
+        assert!(!req.id.is_empty());
+        assert!(req.created_at > 0);
+
+        assert_eq!(sum.session_id, "session1");
+        assert_eq!(sum.role, ChatRole::Assistant);
+        assert_eq!(sum.parts.len(), 1);
+        assert!(!sum.id.is_empty());
+        assert!(sum.created_at > 0);
+        assert_eq!(sum.parent_message_id.as_deref(), Some(req.id.as_str()));
     }
 
     #[test]
-    fn test_create_compaction_message_with_different_summaries() {
-        let msg1 = SessionCompaction::create_compaction_message("s1", "Summary 1", 1000);
-        let msg2 = SessionCompaction::create_compaction_message("s1", "Summary 2", 2000);
+    fn test_create_compaction_messages_with_different_summaries() {
+        let (_, sum1) = SessionCompaction::create_compaction_messages("s1", "Summary 1", 1000);
+        let (_, sum2) = SessionCompaction::create_compaction_messages("s1", "Summary 2", 2000);
 
         assert_ne!(
-            msg1.id, msg2.id,
+            sum1.id, sum2.id,
             "Different messages should have different IDs"
         );
 
         if let MessagePart::Compaction {
             summary: s1,
             original_token_count: t1,
-        } = &msg1.parts[0]
+        } = &sum1.parts[0]
             && let MessagePart::Compaction {
                 summary: s2,
                 original_token_count: t2,
-            } = &msg2.parts[0]
+            } = &sum2.parts[0]
         {
             assert_ne!(s1, s2);
             assert_ne!(t1, t2);
@@ -864,5 +935,59 @@ mod tests {
         if let MessagePart::Text { content } = &messages[0].parts[0] {
             assert!(chat_messages[0].content.contains(content));
         }
+    }
+
+    #[test]
+    fn test_compaction_message_to_chat_has_no_trailing_whitespace() {
+        let (_, sum) = SessionCompaction::create_compaction_messages("s1", "Test summary", 5000);
+        let chat = sum.to_chat_message();
+
+        assert!(
+            !chat.content.ends_with(char::is_whitespace),
+            "Compaction chat message must not end with whitespace, got: {:?}",
+            &chat.content[chat.content.len().saturating_sub(30)..]
+        );
+    }
+
+    #[test]
+    fn test_filter_to_effective_history_only_returns_post_compaction() {
+        // Simulate a second compaction scenario: old messages, compaction pair, new messages
+        let messages = vec![
+            MessageFixture::user_message("1", "s1", "Very old message"),
+            MessageFixture::assistant_message("2", "s1", "Very old response"),
+            MessageFixture::user_message("3", "s1", "Another old message"),
+            MessageFixture::assistant_message("4", "s1", "Another old response"),
+            MessageFixture::compaction_request_message("5", "s1"),
+            MessageFixture::compaction_message("6", "s1", "Summary of old messages"),
+            MessageFixture::user_message("7", "s1", "New message after compaction"),
+            MessageFixture::assistant_message("8", "s1", "New response"),
+            MessageFixture::user_message("9", "s1", "Latest message"),
+        ];
+
+        let filtered = filter_to_effective_history(messages);
+
+        // Should contain compaction pair + everything after
+        assert_eq!(filtered.len(), 5);
+        assert_eq!(filtered[0].id, "5"); // CompactionRequest (user)
+        assert_eq!(filtered[1].id, "6"); // Compaction (assistant)
+        assert_eq!(filtered[2].id, "7");
+        assert_eq!(filtered[3].id, "8");
+        assert_eq!(filtered[4].id, "9");
+
+        // Verify the pair starts with user→assistant
+        assert_eq!(filtered[0].role, ChatRole::User);
+        assert!(
+            filtered[0]
+                .parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::CompactionRequest { .. }))
+        );
+        assert_eq!(filtered[1].role, ChatRole::Assistant);
+        assert!(
+            filtered[1]
+                .parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::Compaction { .. }))
+        );
     }
 }

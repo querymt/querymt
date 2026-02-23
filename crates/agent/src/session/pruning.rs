@@ -122,11 +122,13 @@ pub fn compute_prune_candidates(
             continue;
         }
 
-        // Step 3: Stop if we hit a compaction summary
-        let has_compaction = message
-            .parts
-            .iter()
-            .any(|p| matches!(p, MessagePart::Compaction { .. }));
+        // Step 3: Stop if we hit a compaction boundary (request or summary)
+        let has_compaction = message.parts.iter().any(|p| {
+            matches!(
+                p,
+                MessagePart::Compaction { .. } | MessagePart::CompactionRequest { .. }
+            )
+        });
         if has_compaction {
             break;
         }

@@ -77,11 +77,12 @@ pub(super) async fn run_ai_compaction(
     current_state: &ExecutionState,
 ) -> Result<ExecutionState, anyhow::Error> {
     let session_id = &exec_ctx.session_id;
-    let messages = exec_ctx
+    let raw_messages = exec_ctx
         .session_handle
         .get_agent_history()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get agent history: {}", e))?;
+    let messages = crate::session::compaction::filter_to_effective_history(raw_messages);
 
     let token_estimate = messages
         .iter()
@@ -144,16 +145,20 @@ pub(super) async fn run_ai_compaction(
         result.original_token_count, result.summary_token_count
     );
 
-    let compaction_msg = SessionCompaction::create_compaction_message(
+    let (request_msg, summary_msg) = SessionCompaction::create_compaction_messages(
         session_id,
         &result.summary,
         result.original_token_count,
     );
 
     exec_ctx
-        .add_message(compaction_msg)
+        .add_message(request_msg)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to store compaction message: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to store compaction request: {}", e))?;
+    exec_ctx
+        .add_message(summary_msg)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to store compaction summary: {}", e))?;
 
     config.emit_event(
         session_id,

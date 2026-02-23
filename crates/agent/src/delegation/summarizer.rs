@@ -187,14 +187,14 @@ impl DelegationSummarizer {
 
     /// Prepare the input for the summarizer LLM
     fn prepare_input(&self, history: &[AgentMessage], objective: &str) -> String {
-        // Find the last compaction message — only process from there forward
+        // Find the last compaction request — only process from there forward
         // This mirrors the pattern in SessionContext::history()
         let start_index = history
             .iter()
             .rposition(|m| {
                 m.parts
                     .iter()
-                    .any(|p| matches!(p, MessagePart::Compaction { .. }))
+                    .any(|p| matches!(p, MessagePart::CompactionRequest { .. }))
             })
             .unwrap_or(0);
 
