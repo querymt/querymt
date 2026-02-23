@@ -6,16 +6,24 @@ impl ProvidersRegistry {
     }
 
     pub fn get_model(&self, provider: &str, model: &str) -> Option<&ModelInfo> {
-        let result = self
+        let mut result = self
             .providers
             .get(provider)
             .and_then(|provider| provider.models.get(model));
 
         // Fallback: if provider is "codex" and model not found, try "openai"
         if result.is_none() && provider == "codex" {
-            return self
+            result = self
                 .providers
                 .get("openai")
+                .and_then(|provider| provider.models.get(model));
+        }
+
+        // Fallback: if provider is "kimi-code" and model not found, try "moonshotai".
+        if result.is_none() && provider == "kimi-code" {
+            result = self
+                .providers
+                .get("moonshotai")
                 .and_then(|provider| provider.models.get(model));
         }
 
@@ -94,6 +102,38 @@ mod tests {
             },
         );
 
+        // Create moonshotai provider with a test model
+        let mut moonshot_models = HashMap::new();
+        moonshot_models.insert(
+            "kimi-k2".to_string(),
+            ModelInfo {
+                id: "kimi-k2".to_string(),
+                name: "Kimi K2".to_string(),
+                ..Default::default()
+            },
+        );
+
+        providers.insert(
+            "moonshotai".to_string(),
+            ProviderInfo {
+                id: "moonshotai".to_string(),
+                name: "Moonshot".to_string(),
+                models: moonshot_models,
+                ..Default::default()
+            },
+        );
+
+        // Create kimi-code provider without models to exercise fallback.
+        providers.insert(
+            "kimi-code".to_string(),
+            ProviderInfo {
+                id: "kimi-code".to_string(),
+                name: "Kimi Code".to_string(),
+                models: HashMap::new(),
+                ..Default::default()
+            },
+        );
+
         ProvidersRegistry { providers }
     }
 
@@ -143,6 +183,15 @@ mod tests {
         // Non-codex provider shouldn't fallback
         assert!(registry.get_model("openai", "nonexistent").is_none());
         assert!(registry.get_model("other", "gpt-4").is_none());
+    }
+
+    #[test]
+    fn test_get_model_kimi_code_fallback() {
+        let registry = create_test_registry();
+
+        let model = registry.get_model("kimi-code", "kimi-k2");
+        assert!(model.is_some());
+        assert_eq!(model.unwrap().id, "kimi-k2");
     }
 
     #[test]

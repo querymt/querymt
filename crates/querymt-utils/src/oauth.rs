@@ -1,7 +1,7 @@
 //! OAuth authentication and token management
 //!
 //! This module provides presentation-agnostic OAuth authentication flows through the
-//! `OAuthUI` trait abstraction. It supports multiple OAuth providers (Anthropic, Codex)
+//! `OAuthUI` trait abstraction. It supports multiple OAuth providers (Anthropic, Codex, Kimi Code)
 //! with automatic token refresh and secure keyring storage.
 //!
 //! # Architecture
@@ -47,7 +47,7 @@ pub trait OAuthUI: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `provider_name` - The name of the provider (e.g., "anthropic", "codex")
+    /// * `provider_name` - The name of the provider (e.g., "anthropic", "codex", "kimi-code")
     /// * `url` - The authorization URL to present
     /// * `state` - The OAuth state parameter for validation
     ///
@@ -87,7 +87,7 @@ pub trait OAuthUI: Send + Sync {
 /// and token refresh logic.
 #[async_trait]
 pub trait OAuthProvider: Send + Sync {
-    /// Get the provider name (e.g., "anthropic", "codex")
+    /// Get the provider name (e.g., "anthropic", "codex", "kimi-code")
     fn name(&self) -> &str;
 
     /// Get the display name for user-facing messages
@@ -247,11 +247,91 @@ impl OAuthProvider for CodexProvider {
     }
 }
 
+/// Kimi Code OAuth provider implementation.
+///
+/// Uses Kimi's OAuth device flow and stores tokens under `oauth_kimi-code` in keychain.
+pub struct KimiCodeProvider;
+
+impl Default for KimiCodeProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KimiCodeProvider {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn convert_tokens(tokens: kimi_auth::TokenSet) -> TokenSet {
+        TokenSet {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            expires_at: tokens.expires_at,
+        }
+    }
+
+    fn oauth_config() -> kimi_auth::OAuthConfig {
+        kimi_auth::kimi_cli_oauth_config()
+    }
+}
+
+#[async_trait]
+impl OAuthProvider for KimiCodeProvider {
+    fn name(&self) -> &str {
+        "kimi-code"
+    }
+
+    fn display_name(&self) -> &str {
+        "Kimi Code"
+    }
+
+    async fn start_flow(&self) -> Result<OAuthFlowData> {
+        let config = Self::oauth_config();
+        let client = kimi_auth::AsyncOAuthClient::new(config.clone())?;
+        let flow = client.start_flow().await?;
+
+        let snapshot = kimi_auth::OAuthFlowState::new(config, flow.clone());
+        let verifier = serde_json::to_string(&snapshot)
+            .map_err(|e| anyhow!("Failed to serialize Kimi OAuth flow data: {}", e))?;
+
+        Ok(OAuthFlowData {
+            authorization_url: flow.verification_uri_complete.clone(),
+            state: flow.user_code,
+            verifier,
+        })
+    }
+
+    async fn exchange_code(&self, _code: &str, _state: &str, verifier: &str) -> Result<TokenSet> {
+        let snapshot: kimi_auth::OAuthFlowState = serde_json::from_str(verifier)
+            .map_err(|e| anyhow!("Invalid Kimi OAuth flow data: {}", e))?;
+        let (config, flow) = snapshot.into_parts();
+
+        let client = kimi_auth::AsyncOAuthClient::new(config)?;
+        let tokens = client.poll_for_token(&flow).await?;
+        Ok(Self::convert_tokens(tokens))
+    }
+
+    async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
+        let client = kimi_auth::AsyncOAuthClient::new(Self::oauth_config())?;
+        let tokens = client.refresh_token(refresh_token).await?;
+        Ok(Self::convert_tokens(tokens))
+    }
+
+    async fn create_api_key(&self, _access_token: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn api_key_name(&self) -> Option<&str> {
+        None
+    }
+}
+
 /// Get the appropriate OAuth provider for a given provider name
 ///
 /// # Arguments
 ///
-/// * `provider_name` - The name of the provider (e.g., "anthropic", "codex")
+/// * `provider_name` - The name of the provider (e.g., "anthropic", "codex", "kimi-code")
 /// * `mode` - Optional mode string for providers that support multiple modes (e.g., "max", "console" for Anthropic)
 ///
 /// # Returns
@@ -280,6 +360,7 @@ pub fn get_oauth_provider(
             Ok(Box::new(AnthropicProvider::new(oauth_mode)))
         }
         "codex" => Ok(Box::new(CodexProvider::new())),
+        "kimi-code" => Ok(Box::new(KimiCodeProvider::new())),
         _ => Err(anyhow!(
             "OAuth is not supported for provider '{}'",
             provider_name
@@ -454,7 +535,11 @@ pub async fn show_auth_status(
         vec![p.to_string()]
     } else {
         // List all known OAuth providers
-        vec!["anthropic".to_string(), "codex".to_string()]
+        vec![
+            "anthropic".to_string(),
+            "codex".to_string(),
+            "kimi-code".to_string(),
+        ]
     };
 
     ui.status("OAuth Authentication Status");
@@ -666,7 +751,7 @@ pub fn extract_code_from_query(input: &str) -> Option<String> {
 ///
 /// # Arguments
 ///
-/// * `provider` - The provider name (e.g., "anthropic", "codex")
+/// * `provider` - The provider name (e.g., "anthropic", "codex", "kimi-code")
 ///
 /// # Returns
 ///
