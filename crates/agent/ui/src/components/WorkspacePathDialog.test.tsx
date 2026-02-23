@@ -44,4 +44,36 @@ describe('WorkspacePathDialog', () => {
 
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
+
+  it('passes node.id (not node.label) when a remote node is selected', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+
+    const remoteNodes = [
+      {
+        id: 'peer-abc-123',
+        label: 'gpu-server',
+        capabilities: ['llm'],
+        active_sessions: 2,
+      },
+    ];
+
+    render(
+      <WorkspacePathDialog
+        open={true}
+        defaultValue=""
+        remoteNodes={remoteNodes}
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    // Click the remote node pill
+    await user.click(screen.getByRole('button', { name: /gpu-server/i }));
+    // Submit the form
+    await user.click(screen.getByRole('button', { name: /Start on gpu-server/i }));
+
+    // Should pass the stable node id, not the display label
+    expect(onSubmit).toHaveBeenCalledWith('', 'peer-abc-123');
+  });
 });

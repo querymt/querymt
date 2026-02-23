@@ -57,7 +57,10 @@ interface GroupedModels {
   /** Display heading — "provider" for local, "provider (node)" for remote */
   heading: string;
   provider: string;
+  /** Stable node id (PeerId) — used as identity for backend requests. */
   node?: string;
+  /** Human-readable node label — used for display badges. */
+  nodeLabel?: string;
   models: { value: string; display: string; id?: string; source?: string }[];
 }
 
@@ -65,23 +68,24 @@ const localeCompare = new Intl.Collator(undefined, { sensitivity: 'base' }).comp
 
 /** Build a unique group key that separates local vs. remote providers. */
 function groupKey(entry: ModelEntry): string {
-  return entry.node ? `${entry.provider}@${entry.node}` : entry.provider;
+  return entry.node_id ? `${entry.provider}@${entry.node_id}` : entry.provider;
 }
 
 function groupByProvider(models: ModelEntry[]): GroupedModels[] {
-  const hasRemote = models.some((m) => m.node);
+  const hasRemote = models.some((m) => m.node_id);
   const map = new Map<string, GroupedModels>();
   for (const entry of models) {
     const key = groupKey(entry);
     if (!map.has(key)) {
+      const nodeDisplay = entry.node_label ?? entry.node_id;
       // When remote models exist, annotate local groups with "(local)" and
       // remote groups with "(node)" so the user can distinguish them.
-      const heading = entry.node
-        ? `${entry.provider} (${entry.node})`
+      const heading = nodeDisplay
+        ? `${entry.provider} (${nodeDisplay})`
         : hasRemote
           ? `${entry.provider} (local)`
           : entry.provider;
-      map.set(key, { heading, provider: entry.provider, node: entry.node, models: [] });
+      map.set(key, { heading, provider: entry.provider, node: entry.node_id, nodeLabel: nodeDisplay, models: [] });
     }
     map.get(key)!.models.push({
       value: entry.model,
@@ -176,7 +180,7 @@ export function ModelPickerPopover({
   );
 
   const selectedProviderEntry = useMemo(
-    () => allModels.find((m) => m.provider === selectedProvider && m.model === currentModel && !m.node),
+    () => allModels.find((m) => m.provider === selectedProvider && m.model === currentModel && !m.node_id),
     [allModels, selectedProvider, currentModel],
   );
 
@@ -186,14 +190,15 @@ export function ModelPickerPopover({
     return values.sort((a, b) => (b.percent ?? 0) - (a.percent ?? 0))[0];
   }, [modelDownloads, selectedProvider]);
 
-  // Build a lookup map so we can resolve provider/model/node from the cmdk value
+   // Build a lookup map so we can resolve provider/model/node from the cmdk value
   const modelMap = useMemo(() => {
-    const m = new Map<string, { provider: string; model: string; node?: string }>();
+    const m = new Map<string, { provider: string; model: string; node?: string; nodeLabel?: string }>();
     for (const entry of allModels) {
-      m.set(itemValue(entry.provider, entry.model, entry.node), {
+      m.set(itemValue(entry.provider, entry.model, entry.node_id), {
         provider: entry.provider,
         model: entry.model,
-        node: entry.node,
+        node: entry.node_id,
+        nodeLabel: entry.node_label ?? entry.node_id,
       });
     }
     return m;
@@ -203,7 +208,7 @@ export function ModelPickerPopover({
     const m = new Map<string, string>();
     for (const entry of allModels) {
       m.set(
-        itemValue(entry.provider, entry.model, entry.node),
+        itemValue(entry.provider, entry.model, entry.node_id),
         sessionModelId(entry.provider, entry.model, entry.id),
       );
     }
@@ -219,7 +224,7 @@ export function ModelPickerPopover({
     // Recent models are always local (no node field) — they come from local event history
     return recent
       .filter(entry => 
-        allModels.some(m => m.provider === entry.provider && m.model === entry.model && !m.node)
+        allModels.some(m => m.provider === entry.provider && m.model === entry.model && !m.node_id)
       )
       .slice(0, 5);
   }, [currentWorkspace, recentModelsByWorkspace, allModels]);
@@ -260,7 +265,7 @@ export function ModelPickerPopover({
       }
 
       if (sessionIds.size === 0) return;
-      // Pass node along so the backend can route to the correct provider host
+      // Pass node_id along so the backend can route to the correct provider host
       sessionIds.forEach((id) => onSetSessionModel(id, modelId, entry.node));
       
       // Save the model preference for the current agent mode (local models only)
@@ -553,15 +558,15 @@ export function ModelPickerPopover({
                           <Command.Item
                             key={val}
                             value={val}
-                            keywords={[group.provider, model.display, model.value, ...(group.node ? [group.node] : [])]}
+                            keywords={[group.provider, model.display, model.value, ...(group.nodeLabel ? [group.nodeLabel] : [])]}
                             onSelect={(v) => switchModel(v)}
                             className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-ui-secondary data-[selected=true]:bg-accent-primary/20 data-[selected=true]:text-accent-primary data-[selected=true]:border data-[selected=true]:border-accent-primary/40 hover:bg-surface-elevated/60 cursor-pointer"
                           >
                             <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-accent-primary transition-opacity" />
                             <span className="flex-1 truncate">{model.display}</span>
-                            {group.node && (
+                            {group.nodeLabel && (
                               <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                                {group.node}
+                                {group.nodeLabel}
                               </span>
                             )}
                             {isCurrent && (
@@ -588,9 +593,9 @@ export function ModelPickerPopover({
                     <span className="text-ui-secondary">
                       {selectedEntry.provider} / {selectedEntry.model}
                     </span>
-                    {selectedEntry.node && (
+                    {selectedEntry.nodeLabel && (
                       <span className="px-1 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                        {selectedEntry.node}
+                        {selectedEntry.nodeLabel}
                       </span>
                     )}
                   </>

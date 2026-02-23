@@ -72,17 +72,17 @@ jobs:
       - name: Cache Cargo dependencies
         uses: swatinem/rust-cache@v2
       
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
       
       - name: Run tests with coverage
-        run: cargo tarpaulin --package querymt-agent --all-targets --features "${features}" --out xml --output-dir ./coverage
+        run: cargo llvm-cov --package querymt-agent --all-targets --features "${features}" --codecov --output-path ./coverage/codecov.json
       
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/cobertura.xml
+          files: ./coverage/codecov.json
           flags: agent
           verbose: true
           fail_ci_if_error: false

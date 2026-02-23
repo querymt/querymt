@@ -173,7 +173,7 @@ pub enum UiClientMessage {
         session_id: String,
         model_id: String,
         /// Optional mesh node id (PeerId string) that owns the provider. `None` = local.
-        #[serde(default)]
+        #[serde(default, alias = "node")]
         node_id: Option<String>,
     },
     /// Get recent models from event history
@@ -240,11 +240,13 @@ pub enum UiClientMessage {
     /// List sessions on a specific remote node
     ListRemoteSessions {
         /// Stable node id (PeerId string) identifying the target node
+        #[serde(alias = "node")]
         node_id: String,
     },
     /// Create a new session on a specific remote node
     CreateRemoteSession {
         /// Stable node id (PeerId string) identifying the target node
+        #[serde(alias = "node")]
         node_id: String,
         /// Working directory on the remote machine (optional)
         cwd: Option<String>,
@@ -255,6 +257,7 @@ pub enum UiClientMessage {
     /// Attach an existing remote session to the local dashboard
     AttachRemoteSession {
         /// Stable node id (PeerId string) identifying the target node
+        #[serde(alias = "node")]
         node_id: String,
         /// Session ID to attach
         session_id: String,
@@ -501,6 +504,116 @@ mod tests {
             UiClientMessage::DisconnectOAuth { provider } => assert_eq!(provider, "openai"),
             _ => panic!("expected DisconnectOAuth variant"),
         }
+    }
+
+    // ── Remote message node/node_id alias tests ──────────────────────────
+
+    #[test]
+    fn create_remote_session_accepts_node_id_field() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "create_remote_session",
+            "node_id": "peer-abc",
+            "cwd": "/tmp"
+        }))
+        .expect("node_id field should deserialize");
+
+        match msg {
+            UiClientMessage::CreateRemoteSession { node_id, cwd, .. } => {
+                assert_eq!(node_id, "peer-abc");
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+            }
+            _ => panic!("expected CreateRemoteSession"),
+        }
+    }
+
+    #[test]
+    fn create_remote_session_accepts_node_alias() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "create_remote_session",
+            "node": "peer-abc",
+            "cwd": "/tmp"
+        }))
+        .expect("node alias should deserialize to node_id");
+
+        match msg {
+            UiClientMessage::CreateRemoteSession { node_id, cwd, .. } => {
+                assert_eq!(node_id, "peer-abc");
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+            }
+            _ => panic!("expected CreateRemoteSession"),
+        }
+    }
+
+    #[test]
+    fn list_remote_sessions_accepts_node_alias() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "list_remote_sessions",
+            "node": "peer-xyz"
+        }))
+        .expect("node alias should deserialize to node_id");
+
+        match msg {
+            UiClientMessage::ListRemoteSessions { node_id } => {
+                assert_eq!(node_id, "peer-xyz");
+            }
+            _ => panic!("expected ListRemoteSessions"),
+        }
+    }
+
+    #[test]
+    fn attach_remote_session_accepts_node_alias() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "attach_remote_session",
+            "node": "peer-xyz",
+            "session_id": "sess-1"
+        }))
+        .expect("node alias should deserialize to node_id");
+
+        match msg {
+            UiClientMessage::AttachRemoteSession {
+                node_id,
+                session_id,
+            } => {
+                assert_eq!(node_id, "peer-xyz");
+                assert_eq!(session_id, "sess-1");
+            }
+            _ => panic!("expected AttachRemoteSession"),
+        }
+    }
+
+    #[test]
+    fn set_session_model_accepts_node_alias() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "set_session_model",
+            "session_id": "sess-1",
+            "model_id": "claude-3-opus",
+            "node": "peer-abc"
+        }))
+        .expect("node alias should deserialize to node_id");
+
+        match msg {
+            UiClientMessage::SetSessionModel {
+                session_id,
+                model_id,
+                node_id,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(model_id, "claude-3-opus");
+                assert_eq!(node_id.as_deref(), Some("peer-abc"));
+            }
+            _ => panic!("expected SetSessionModel"),
+        }
+    }
+
+    #[test]
+    fn remote_sessions_server_msg_serializes_node_id() {
+        let msg = UiServerMessage::RemoteSessions {
+            node_id: "peer-abc".to_string(),
+            sessions: Vec::new(),
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        assert_eq!(json["type"], "remote_sessions");
+        assert_eq!(json["node_id"], "peer-abc");
     }
 
     #[test]

@@ -158,6 +158,7 @@ export function useUiClient() {
   const [undoState, setUndoState] = useState<UndoState>(null);
   const undoStateRef = useRef<UndoState>(null);
   const [remoteNodes, setRemoteNodes] = useState<RemoteNodeInfo[]>([]);
+  const [connectionErrors, setConnectionErrors] = useState<{ id: number; message: string }[]>([]);
   const [defaultCwd, setDefaultCwd] = useState<string | null>(null);
   const [workspacePathDialogOpen, setWorkspacePathDialogOpen] = useState(false);
   const [workspacePathDialogDefaultValue, setWorkspacePathDialogDefaultValue] = useState('');
@@ -612,6 +613,15 @@ export function useUiClient() {
         ) {
           fileIndexErrorCallbackRef.current(msg.message);
         }
+        // Surface error to the UI via connectionErrors state
+        {
+          const errorId = Date.now();
+          setConnectionErrors((prev) => [...prev, { id: errorId, message: msg.message }]);
+          // Auto-dismiss after 8 seconds
+          setTimeout(() => {
+            setConnectionErrors((prev) => prev.filter((e) => e.id !== errorId));
+          }, 8000);
+        }
         break;
       }
       case 'session_list':
@@ -808,7 +818,7 @@ export function useUiClient() {
       case 'remote_sessions':
         // Currently used for on-demand node session listing;
         // data is handled by the caller via callback if needed.
-        console.log('[useUiClient] remote_sessions for node:', msg.node, msg.sessions);
+        console.log('[useUiClient] remote_sessions for node:', msg.node_id, msg.sessions);
         break;
       case 'model_download_status': {
         const key = `${msg.provider}:${msg.model_id}`;
@@ -903,7 +913,7 @@ export function useUiClient() {
         pendingRequestsRef.current.set(requestId, resolve);
         sendMessage({
           type: 'create_remote_session',
-          node,
+          node_id: node,
           cwd: cwd.length > 0 ? cwd : null,
           request_id: requestId,
         });
@@ -943,7 +953,7 @@ export function useUiClient() {
   }, []);
 
   const setSessionModel = useCallback((sessionId: string, modelId: string, node?: string) => {
-    sendMessage({ type: 'set_session_model', session_id: sessionId, model_id: modelId, node });
+    sendMessage({ type: 'set_session_model', session_id: sessionId, model_id: modelId, node_id: node });
     // Refresh recent models after a short delay (only for local providers)
     if (!node) {
       setTimeout(() => {
@@ -1033,6 +1043,11 @@ export function useUiClient() {
   // Refresh the list of remote nodes from the mesh
   const listRemoteNodes = useCallback(() => {
     sendMessage({ type: 'list_remote_nodes' });
+  }, []);
+
+  // Dismiss a connection error by id
+  const dismissConnectionError = useCallback((errorId: number) => {
+    setConnectionErrors((prev) => prev.filter((e) => e.id !== errorId));
   }, []);
 
   // Request LLM config by ID (returns cached if available, otherwise fetches)
@@ -1178,6 +1193,8 @@ export function useUiClient() {
     cycleAgentMode,
     remoteNodes,
     listRemoteNodes,
+    connectionErrors,
+    dismissConnectionError,
   };
 }
 

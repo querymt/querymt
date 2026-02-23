@@ -78,6 +78,8 @@ export function AppShell() {
     submitWorkspacePathDialog,
     cancelWorkspacePathDialog,
     remoteNodes,
+    connectionErrors,
+    dismissConnectionError,
   } = useUiClientContext();
   
   const navigate = useNavigate();
@@ -655,6 +657,28 @@ export function AppShell() {
           agentModels={agentModels}
           sessionLimits={sessionLimits}
         />
+      )}
+
+      {/* Connection error toasts */}
+      {connectionErrors.length > 0 && (
+        <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-md">
+          {connectionErrors.map((err) => (
+            <div
+              key={err.id}
+              className="flex items-start gap-2 px-4 py-3 rounded-lg border border-status-warning/40 bg-surface-elevated shadow-lg animate-fade-in"
+            >
+              <span className="text-xs text-status-warning flex-1 break-words">{err.message}</span>
+              <button
+                type="button"
+                onClick={() => dismissConnectionError(err.id)}
+                className="text-ui-muted hover:text-ui-primary transition-colors flex-shrink-0"
+                aria-label="Dismiss"
+              >
+                &times;
+              </button>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );

@@ -30,6 +30,11 @@ export function WorkspacePathDialog({
 
   const hasRemoteNodes = remoteNodes.length > 0;
 
+  // Derive display label for the selected node (selectedNode stores node.id)
+  const selectedNodeLabel = selectedNode
+    ? remoteNodes.find((n) => n.id === selectedNode)?.label ?? selectedNode
+    : null;
+
   return (
     <Dialog.Root
       open={open}
@@ -82,16 +87,16 @@ export function WorkspacePathDialog({
                   {/* Remote node pills */}
                   {remoteNodes.map((node) => (
                     <button
-                      key={node.label}
+                      key={node.id}
                       type="button"
-                      onClick={() => setSelectedNode(node.label)}
+                      onClick={() => setSelectedNode(node.id)}
                       title={
                         node.capabilities.length > 0
                           ? `Capabilities: ${node.capabilities.join(', ')}`
                           : `${node.active_sessions} active session${node.active_sessions !== 1 ? 's' : ''}`
                       }
                       className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-sm transition-all ${
-                        selectedNode === node.label
+                        selectedNode === node.id
                           ? 'border-accent-secondary bg-accent-secondary/15 text-accent-secondary shadow-[0_0_8px_rgba(var(--accent-secondary-rgb),0.2)]'
                           : 'border-surface-border bg-surface-canvas text-ui-secondary hover:border-surface-border/80 hover:bg-surface-elevated'
                       }`}
@@ -140,7 +145,7 @@ export function WorkspacePathDialog({
                     : 'border-accent-primary/50 bg-accent-primary/12 text-accent-primary hover:bg-accent-primary/20'
                 }`}
               >
-                {selectedNode ? `Start on ${selectedNode}` : 'Start Session'}
+                {selectedNodeLabel ? `Start on ${selectedNodeLabel}` : 'Start Session'}
               </button>
             </div>
           </form>

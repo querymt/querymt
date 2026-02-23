@@ -1789,18 +1789,20 @@ impl ViewStore for SqliteStorage {
             move || -> Result<Vec<(Option<String>, String, String, i64, u32)>, rusqlite::Error> {
                 let conn = conn_arc.lock().unwrap();
 
-                // Query all ProviderChanged events with workspace info
+                // Query all ProviderChanged events with workspace info.
+                // Uses event_journal (the legacy `events` table was dropped
+                // by migration 0002).
                 let mut stmt = conn.prepare(
                     r#"
                 SELECT 
                     s.cwd,
-                    json_extract(e.kind, '$.provider') as provider,
-                    json_extract(e.kind, '$.model') as model,
+                    json_extract(e.payload_json, '$.provider') as provider,
+                    json_extract(e.payload_json, '$.model') as model,
                     MAX(e.timestamp) as last_used_ts,
                     COUNT(*) as use_count
-                FROM events e
+                FROM event_journal e
                 JOIN sessions s ON s.public_id = e.session_id
-                WHERE json_extract(e.kind, '$.type') = 'provider_changed'
+                WHERE e.kind = 'provider_changed'
                   AND provider IS NOT NULL
                   AND model IS NOT NULL
                 GROUP BY s.cwd, provider, model
@@ -2596,6 +2598,126 @@ mod tests {
             assert!(
                 window[1].stream_seq > window[0].stream_seq,
                 "stream_seq must be strictly increasing"
+            );
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ViewStore — get_recent_models_view tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn recent_models_view_reads_from_event_journal() {
+        // This test verifies that get_recent_models_view reads from
+        // event_journal (not the dropped legacy `events` table).
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+
+        // Create a session so we can join on sessions.public_id
+        let session = storage
+            .create_session(
+                None,
+                Some(std::path::PathBuf::from("/home/user/project")),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session_id = session.public_id;
+
+        // Insert a ProviderChanged event into event_journal
+        let journal: &dyn EventJournal = &storage;
+        journal
+            .append_durable(&NewDurableEvent {
+                session_id: session_id.clone(),
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::ProviderChanged {
+                    provider: "anthropic".to_string(),
+                    model: "claude-3-opus".to_string(),
+                    config_id: 1,
+                    context_limit: Some(200_000),
+                    provider_node_id: None,
+                },
+            })
+            .await
+            .unwrap();
+
+        // Query recent models — should find the one we just inserted
+        let view: &dyn ViewStore = &storage;
+        let result = view.get_recent_models_view(10).await.unwrap();
+
+        // Flatten all workspace entries
+        let all_entries: Vec<&RecentModelEntry> = result.by_workspace.values().flatten().collect();
+        assert_eq!(
+            all_entries.len(),
+            1,
+            "expected 1 recent model entry, got {}",
+            all_entries.len()
+        );
+        assert_eq!(all_entries[0].provider, "anthropic");
+        assert_eq!(all_entries[0].model, "claude-3-opus");
+        assert_eq!(all_entries[0].use_count, 1);
+    }
+
+    #[tokio::test]
+    async fn recent_models_view_returns_empty_when_no_provider_changed_events() {
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+
+        let view: &dyn ViewStore = &storage;
+        let result = view.get_recent_models_view(10).await.unwrap();
+        assert!(
+            result.by_workspace.is_empty(),
+            "expected empty recent models on fresh db"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_models_view_respects_limit_per_workspace() {
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+
+        let session = storage
+            .create_session(
+                None,
+                Some(std::path::PathBuf::from("/workspace")),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session_id = session.public_id;
+
+        let journal: &dyn EventJournal = &storage;
+        for (provider, model) in &[
+            ("anthropic", "model-a"),
+            ("openai", "model-b"),
+            ("cohere", "model-c"),
+        ] {
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::ProviderChanged {
+                        provider: provider.to_string(),
+                        model: model.to_string(),
+                        config_id: 1,
+                        context_limit: None,
+                        provider_node_id: None,
+                    },
+                })
+                .await
+                .unwrap();
+        }
+
+        let view: &dyn ViewStore = &storage;
+        let result = view.get_recent_models_view(2).await.unwrap();
+
+        // Each workspace should have at most 2 entries
+        for entries in result.by_workspace.values() {
+            assert!(
+                entries.len() <= 2,
+                "expected at most 2 entries per workspace, got {}",
+                entries.len()
             );
         }
     }

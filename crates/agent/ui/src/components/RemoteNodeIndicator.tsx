@@ -63,7 +63,7 @@ export function RemoteNodeIndicator({ remoteNodes }: RemoteNodeIndicatorProps) {
           <div className="py-2 max-h-64 overflow-y-auto custom-scrollbar">
             {remoteNodes.map((node) => (
               <div
-                key={node.label}
+                key={node.id}
                 className="flex items-start gap-3 px-4 py-2.5 hover:bg-surface-canvas/40 transition-colors"
               >
                 {/* Status dot */}

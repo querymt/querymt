@@ -419,7 +419,7 @@ export type UiServerMessage =
   | { type: 'redo_result'; success: boolean; message?: string | null; undo_stack: UndoStackFrame[] }
   | { type: 'agent_mode'; mode: string }
   | { type: 'remote_nodes'; nodes: RemoteNodeInfo[] }
-  | { type: 'remote_sessions'; node: string; sessions: RemoteSessionInfo[] }
+  | { type: 'remote_sessions'; node_id: string; sessions: RemoteSessionInfo[] }
   | ({ type: 'model_download_status' } & ModelDownloadStatus);
 
 export interface ModelEntry {
@@ -430,7 +430,11 @@ export interface ModelEntry {
   quant?: string;
   provider: string;
   model: string;
-  /** Node label where this provider lives. Absent for local models, set for remote mesh nodes. */
+  /** Stable mesh node id (PeerId) where this provider lives. Absent for local models. */
+  node_id?: string;
+  /** Human-readable node label for display. Absent for local models. */
+  node_label?: string;
+  /** @deprecated Use node_label for display or node_id for identity. Alias for node_label. */
   node?: string;
 }
 
@@ -488,6 +492,9 @@ export interface LlmConfigDetails {
 
 // Remote node/session types for mesh-based multi-node support
 export interface RemoteNodeInfo {
+  /** Stable mesh node id (PeerId string) — used as the identity for backend messages. */
+  id: string;
+  /** Human-readable label / hostname — used for display only. */
   label: string;
   capabilities: string[];
   active_sessions: number;
@@ -514,7 +521,7 @@ export type UiClientMessage =
   | { type: 'list_sessions' }
   | { type: 'load_session'; session_id: string }
   | { type: 'list_all_models'; refresh?: boolean }
-  | { type: 'set_session_model'; session_id: string; model_id: string; node?: string }
+  | { type: 'set_session_model'; session_id: string; model_id: string; node_id?: string }
   | { type: 'get_recent_models'; limit_per_workspace?: number }
   | { type: 'list_auth_providers' }
   | { type: 'start_oauth_login'; provider: string }
@@ -531,9 +538,9 @@ export type UiClientMessage =
   | { type: 'set_agent_mode'; mode: string }
   | { type: 'get_agent_mode' }
   | { type: 'list_remote_nodes' }
-  | { type: 'list_remote_sessions'; node: string }
-  | { type: 'create_remote_session'; node: string; cwd?: string | null; request_id?: string }
-  | { type: 'attach_remote_session'; node: string; session_id: string }
+  | { type: 'list_remote_sessions'; node_id: string }
+  | { type: 'create_remote_session'; node_id: string; cwd?: string | null; request_id?: string }
+  | { type: 'attach_remote_session'; node_id: string; session_id: string }
   | { type: 'add_custom_model_from_hf'; provider: string; repo: string; filename: string; display_name?: string }
   | { type: 'add_custom_model_from_file'; provider: string; file_path: string; display_name?: string }
   | { type: 'delete_custom_model'; provider: string; model_id: string };
