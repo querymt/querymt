@@ -3,8 +3,10 @@
 use crate::agent::AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
+use crate::delegation::DefaultAgentRegistry;
 use crate::middleware::{AgentStats, ConversationContext, ToolCall, ToolFunction};
 use crate::model::{AgentMessage, MessagePart};
+use crate::prelude::AgentInfo;
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
 use crate::session::sqlite_storage::SqliteStorage;
@@ -365,5 +367,60 @@ impl UndoTestFixture {
         session_id: &str,
     ) -> Result<crate::agent::undo::RedoResult, crate::agent::undo::UndoError> {
         self.handle.redo(session_id).await
+    }
+}
+
+pub struct DelegateTestFixture {
+    pub planner: Arc<AgentHandle>,
+    pub planner_storage: Arc<dyn StorageBackend>,
+    pub delegate: Arc<AgentHandle>,
+    pub delegate_storage: Arc<dyn StorageBackend>,
+}
+
+impl DelegateTestFixture {
+    /// Creates a new test fixture with snapshot support enabled.
+    pub async fn new() -> Result<Self> {
+        let (delegate_registry, _delegate_cfg_dir) = empty_plugin_registry()?;
+        let delegate_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
+        let delegate_builder = AgentConfigBuilder::new(
+            Arc::new(delegate_registry),
+            delegate_storage.session_store(),
+            LLMParams::new().provider("mock").model("mock-model"),
+        );
+        let delegate_config = Arc::new(delegate_builder.build());
+        let delegate = Arc::new(crate::agent::AgentHandle::from_config(delegate_config));
+
+        let mut registry = DefaultAgentRegistry::new();
+        registry.register(
+            AgentInfo {
+                id: "coder".to_string(),
+                name: "Coder".to_string(),
+                description: "Delegate coder".to_string(),
+                capabilities: vec![],
+                required_capabilities: vec![],
+                meta: None,
+            },
+            delegate.clone(),
+        );
+
+        let (planner_registry, _config_dir) = empty_plugin_registry()?;
+        let planner_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
+
+        let builder = AgentConfigBuilder::new(
+            Arc::new(planner_registry),
+            planner_storage.session_store(),
+            LLMParams::new().provider("mock").model("mock-model"),
+        )
+        .with_agent_registry(Arc::new(registry));
+        let planner = Arc::new(crate::agent::AgentHandle::from_config(
+            builder.build().into(),
+        ));
+
+        Ok(Self {
+            planner,
+            planner_storage,
+            delegate,
+            delegate_storage,
+        })
     }
 }

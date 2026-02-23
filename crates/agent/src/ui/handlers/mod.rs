@@ -232,9 +232,15 @@ pub async fn handle_ui_message(
             filename,
             display_name,
         } => {
-            if let Err(err) =
-                handle_add_custom_model_from_hf(state, &provider, &repo, &filename, display_name, tx)
-                    .await
+            if let Err(err) = handle_add_custom_model_from_hf(
+                state,
+                &provider,
+                &repo,
+                &filename,
+                display_name,
+                tx,
+            )
+            .await
             {
                 let _ = send_error(tx, err).await;
             }

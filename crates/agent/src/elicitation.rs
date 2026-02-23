@@ -60,7 +60,7 @@ pub type PendingElicitationMap = Arc<Mutex<HashMap<String, oneshot::Sender<Elici
 /// This allows UI/ACP responders to resolve delegate-originated elicitations
 /// while holding only a reference to the primary agent.
 pub async fn take_pending_elicitation_sender(
-    agent: &crate::agent::QueryMTAgent,
+    agent: &crate::agent::AgentHandle,
     elicitation_id: &str,
 ) -> Option<oneshot::Sender<ElicitationResponse>> {
     if let Some(sender) = take_from_pending_map(&agent.pending_elicitations(), elicitation_id).await
@@ -78,7 +78,7 @@ pub async fn take_pending_elicitation_sender(
 
         let Some(delegate) = instance
             .as_any()
-            .downcast_ref::<crate::agent::QueryMTAgent>()
+            .downcast_ref::<crate::agent::AgentHandle>()
         else {
             continue;
         };
@@ -187,6 +187,7 @@ impl ClientHandler for ElicitationHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::DelegateTestFixture;
 
     // ── ElicitationAction -> rmcp::model::ElicitationAction ───────────────
 
@@ -359,56 +360,20 @@ mod tests {
         assert_eq!(received.action, ElicitationAction::Accept);
     }
 
-    /*
-    use crate::agent::builder::AgentBuilderExt;
-    use crate::delegation::{AgentInfo, DefaultAgentRegistry};
-    use crate::session::backend::StorageBackend;
-    use crate::session::sqlite_storage::SqliteStorage;
-    use crate::test_utils::empty_plugin_registry;
-    use querymt::LLMParams;
-    */
-
     #[tokio::test]
     async fn take_sender_resolves_delegate_pending_elicitation() {
-        let (planner_registry, _planner_cfg_dir) = empty_plugin_registry().unwrap();
-        let planner_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
-        let planner = crate::agent::QueryMTAgent::new(
-            Arc::new(planner_registry),
-            planner_storage.session_store(),
-            LLMParams::new().provider("mock").model("mock-model"),
-        );
-
-        let (delegate_registry, _delegate_cfg_dir) = empty_plugin_registry().unwrap();
-        let delegate_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
-        let delegate = Arc::new(crate::agent::QueryMTAgent::new(
-            Arc::new(delegate_registry),
-            delegate_storage.session_store(),
-            LLMParams::new().provider("mock").model("mock-model"),
-        ));
-
-        let mut registry = DefaultAgentRegistry::new();
-        registry.register(
-            AgentInfo {
-                id: "coder".to_string(),
-                name: "Coder".to_string(),
-                description: "Delegate coder".to_string(),
-                capabilities: vec![],
-                required_capabilities: vec![],
-                meta: None,
-            },
-            delegate.clone(),
-        );
-        let planner = planner.with_agent_registry(Arc::new(registry));
+        let fixture = DelegateTestFixture::new().await.unwrap();
 
         let elicitation_id = "delegate-elicitation-1".to_string();
         let (tx, rx) = oneshot::channel();
-        delegate
+        fixture
+            .delegate
             .pending_elicitations()
             .lock()
             .await
             .insert(elicitation_id.clone(), tx);
 
-        let sender = take_pending_elicitation_sender(&planner, &elicitation_id)
+        let sender = take_pending_elicitation_sender(fixture.planner.as_ref(), &elicitation_id)
             .await
             .expect("delegate pending elicitation should be resolved");
 

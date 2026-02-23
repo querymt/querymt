@@ -42,8 +42,7 @@ pub struct DelegateAgent {
 }
 
 pub struct AgentQuorum {
-    store: Arc<dyn SessionStore>,
-    view_store: Arc<dyn ViewStore>,
+    storage: Arc<dyn StorageBackend>,
     event_bus: Arc<EventBus>,
     registry: Arc<dyn AgentRegistry + Send + Sync>,
     planner: Arc<dyn SendAgent>,
@@ -59,7 +58,7 @@ impl AgentQuorum {
             None => default_agent_db_path()?,
         };
         let backend = SqliteStorage::connect(path).await?;
-        Ok(AgentQuorumBuilder::from_backend(backend))
+        Ok(AgentQuorumBuilder::from_backend(Arc::new(backend)))
     }
 
     pub fn planner(&self) -> Arc<dyn SendAgent> {
@@ -78,9 +77,15 @@ impl AgentQuorum {
     }
 
     pub fn store(&self) -> Arc<dyn SessionStore> {
-        self.store.clone()
+        self.storage.session_store().clone()
     }
 
+    pub fn view_store(&self) -> Arc<dyn ViewStore> {
+        self.storage
+            .view_store()
+            .expect("SqliteStorage required")
+            .clone()
+    }
     pub fn event_bus(&self) -> Arc<EventBus> {
         self.event_bus.clone()
     }
@@ -96,15 +101,10 @@ impl AgentQuorum {
     pub fn cwd(&self) -> Option<&PathBuf> {
         self.cwd.as_ref()
     }
-
-    pub fn view_store(&self) -> Arc<dyn ViewStore> {
-        self.view_store.clone()
-    }
 }
 
 pub struct AgentQuorumBuilder {
-    store: Arc<dyn SessionStore>,
-    view_store: Arc<dyn ViewStore>,
+    storage: Arc<dyn StorageBackend>,
     event_bus: Arc<EventBus>,
     cwd: Option<PathBuf>,
     delegate_factories: Vec<(AgentInfo, DelegateFactory)>,
@@ -124,10 +124,9 @@ pub struct AgentQuorumBuilder {
 }
 
 impl AgentQuorumBuilder {
-    pub fn new(store: Arc<dyn SessionStore>, view_store: Arc<dyn ViewStore>) -> Self {
+    pub fn new(storage: Arc<dyn StorageBackend>) -> Self {
         Self {
-            store,
-            view_store,
+            storage: storage.clone(),
             event_bus: Arc::new(EventBus::new()),
             cwd: None,
             delegate_factories: Vec::new(),
@@ -153,14 +152,11 @@ impl AgentQuorumBuilder {
     }
 
     /// Create builder from a storage backend (registers event observer automatically).
-    pub fn from_backend(backend: SqliteStorage) -> Self {
+    pub fn from_backend(backend: Arc<dyn StorageBackend>) -> Self {
         let event_bus = Arc::new(EventBus::new());
         event_bus.add_observer(backend.event_observer());
         Self {
-            store: backend.session_store(),
-            view_store: backend
-                .view_store()
-                .expect("SqliteStorage always provides ViewStore"),
+            storage: backend.clone(),
             event_bus,
             cwd: None,
             delegate_factories: Vec::new(),
@@ -277,7 +273,7 @@ impl AgentQuorumBuilder {
         }
 
         for (info, factory) in self.delegate_factories {
-            let agent = factory(self.store.clone(), self.event_bus.clone());
+            let agent = factory(self.storage.session_store().clone(), self.event_bus.clone());
 
             // Try to extract AgentActorHandle::Local by downcasting to AgentHandle
             let actor_handle = agent
@@ -301,7 +297,11 @@ impl AgentQuorumBuilder {
         let planner_factory = self
             .planner_factory
             .ok_or(AgentQuorumError::MissingPlanner)?;
-        let planner = planner_factory(self.store.clone(), self.event_bus.clone(), registry.clone());
+        let planner = planner_factory(
+            self.storage.session_store().clone(),
+            self.event_bus.clone(),
+            registry.clone(),
+        );
 
         let orchestrator = if self.delegation_enabled {
             // We need to get the tool_registry. For now, we'll use a default/empty one
@@ -314,7 +314,7 @@ impl AgentQuorumBuilder {
                 DelegationOrchestrator::new(
                     planner.clone(),
                     self.event_bus.clone(),
-                    self.store.clone(),
+                    self.storage.session_store().clone(),
                     registry.clone(),
                     tool_registry,
                     self.cwd.clone(),
@@ -338,8 +338,7 @@ impl AgentQuorumBuilder {
         };
 
         Ok(AgentQuorum {
-            store: self.store,
-            view_store: self.view_store,
+            storage: self.storage,
             event_bus: self.event_bus,
             registry,
             planner,

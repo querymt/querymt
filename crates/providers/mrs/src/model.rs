@@ -5,7 +5,6 @@ use std::{
 };
 
 use hf_hub::{Cache, Repo, RepoType, api::sync::ApiBuilder};
-use querymt_provider_common::{ModelRef, parse_model_ref};
 use mistralrs::core::{EmbeddingLoaderType, NormalLoaderType, PagedCacheType, VisionLoaderType};
 use mistralrs::{
     DeviceMapSetting, EmbeddingModelBuilder, EmbeddingRequestBuilder, GgufModelBuilder, IsqType,
@@ -16,6 +15,7 @@ use querymt::chat::Tool;
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::{LLMProvider, error::LLMError};
+use querymt_provider_common::{ModelRef, parse_model_ref};
 use serde::Deserialize;
 
 use crate::config::{
@@ -357,7 +357,8 @@ struct GgufSpec {
 }
 
 fn gguf_spec_from_config(cfg: &MistralRSConfig) -> Result<Option<GgufSpec>, LLMError> {
-    let model_ref = parse_model_ref(&cfg.model).map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
+    let model_ref =
+        parse_model_ref(&cfg.model).map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
     match model_ref {
         ModelRef::Hf(model) => Ok(Some(GgufSpec {
             model_id: model.repo,
@@ -365,7 +366,8 @@ fn gguf_spec_from_config(cfg: &MistralRSConfig) -> Result<Option<GgufSpec>, LLME
         })),
         ModelRef::LocalPath(path)
             if cfg.model.ends_with(".gguf")
-                || path.extension().and_then(|ext| ext.to_str()) == Some("gguf") => {
+                || path.extension().and_then(|ext| ext.to_str()) == Some("gguf") =>
+        {
             let file = path
                 .file_name()
                 .and_then(|name| name.to_str())

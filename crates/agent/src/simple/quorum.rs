@@ -6,6 +6,7 @@ use super::utils::{
     build_llm_config, default_registry, infer_required_capabilities, latest_assistant_message,
     to_absolute_path,
 };
+use crate::AgentQuorumBuilder;
 use crate::agent::AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
@@ -20,8 +21,9 @@ use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
 #[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
-use crate::session::projection::ViewStore;
+use crate::session::backend::default_agent_db_path;
 use crate::session::store::SessionStore;
+use crate::session::{SqliteStorage, StorageBackend};
 use crate::snapshot::GitSnapshotBackend;
 use crate::tools::CapabilityRequirement;
 use crate::tools::builtins::all_builtin_tools;
@@ -159,9 +161,12 @@ impl QuorumBuilder {
 
         let registry = Arc::new(default_registry().await?);
 
-        let mut builder = AgentQuorum::builder(self.db_path)
-            .await
-            .map_err(|e| anyhow!(format!("Failed to build quorum: {e}")))?;
+        let path = match self.db_path {
+            Some(path) => path,
+            None => default_agent_db_path()?,
+        };
+        let backend = Arc::new(SqliteStorage::connect(path).await?);
+        let mut builder = AgentQuorumBuilder::from_backend(backend.clone());
 
         if let Some(cwd_path) = cwd.clone() {
             builder = builder.cwd(cwd_path);
@@ -330,7 +335,6 @@ impl QuorumBuilder {
         }
 
         let quorum = builder.build().map_err(|e| anyhow!(e.to_string()))?;
-        let view_store = quorum.view_store();
 
         // Extract planner handle for dashboard use
         let planner = quorum.planner();
@@ -348,7 +352,7 @@ impl QuorumBuilder {
 
         Ok(Quorum {
             inner: quorum,
-            view_store,
+            storage: backend,
             planner_handle,
             planner_session_id: Arc::new(Mutex::new(None)),
             cwd,
@@ -360,7 +364,7 @@ impl QuorumBuilder {
 pub struct Quorum {
     inner: AgentQuorum,
     #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
-    view_store: Arc<dyn ViewStore>,
+    storage: Arc<dyn StorageBackend>,
     #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
     planner_handle: Arc<AgentHandle>,
     planner_session_id: Arc<Mutex<Option<String>>>,
@@ -414,8 +418,7 @@ impl Quorum {
     pub fn dashboard(&self) -> AgentServer {
         AgentServer::new(
             self.planner_handle.clone(),
-            self.view_store.clone(),
-            self.planner_handle.config.provider.history_store(),
+            self.storage.clone(),
             self.cwd.clone(),
         )
     }

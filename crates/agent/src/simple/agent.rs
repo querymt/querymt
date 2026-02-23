@@ -20,7 +20,6 @@ use crate::send_agent::SendAgent;
 #[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
 use crate::session::backend::{StorageBackend, default_agent_db_path};
-use crate::session::projection::ViewStore;
 use crate::session::sqlite_storage::SqliteStorage;
 use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
 use anyhow::{Result, anyhow};
@@ -386,13 +385,9 @@ impl AgentBuilder {
 
         let handle = Arc::new(AgentHandle::from_config(final_config));
 
-        let view_store = backend
-            .view_store()
-            .expect("SqliteStorage always provides ViewStore");
-
         Ok(Agent {
             inner: handle,
-            view_store,
+            storage: Arc::new(backend),
             default_session_id: Arc::new(Mutex::new(None)),
             cwd,
             callbacks: Arc::new(EventCallbacksState::new(None)),
@@ -403,7 +398,7 @@ impl AgentBuilder {
 pub struct Agent {
     pub(super) inner: Arc<AgentHandle>,
     #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
-    pub(super) view_store: Arc<dyn ViewStore>,
+    pub(super) storage: Arc<dyn StorageBackend>,
     default_session_id: Arc<Mutex<Option<String>>>,
     pub(super) cwd: Option<PathBuf>,
     callbacks: Arc<EventCallbacksState>,
@@ -511,12 +506,7 @@ impl Agent {
 
     #[cfg(feature = "dashboard")]
     pub fn dashboard(&self) -> AgentServer {
-        AgentServer::new(
-            self.inner.clone(),
-            self.view_store.clone(),
-            self.inner.config.provider.history_store(),
-            self.cwd.clone(),
-        )
+        AgentServer::new(self.inner.clone(), self.storage.clone(), self.cwd.clone())
     }
 
     /// Start an ACP server with the specified transport.

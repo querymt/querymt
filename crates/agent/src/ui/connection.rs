@@ -685,7 +685,10 @@ pub async fn subscribe_to_file_index(
                 break;
             }
 
-            log::debug!("Pushed file index update to connection {}", conn_id_for_forward);
+            log::debug!(
+                "Pushed file index update to connection {}",
+                conn_id_for_forward
+            );
         }
     });
 

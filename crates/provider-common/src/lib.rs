@@ -77,13 +77,13 @@ pub fn parse_model_ref(input: &str) -> Result<ModelRef, ModelRefError> {
     }
 
     if raw.starts_with("hf:") {
-        if let Some(rest) = raw.strip_prefix("hf:") {
-            if let Some((repo, filename)) = rest.split_once(':') {
-                return Ok(ModelRef::Hf(HfModelRef {
-                    repo: repo.to_string(),
-                    file: filename.to_string(),
-                }));
-            }
+        if let Some(rest) = raw.strip_prefix("hf:")
+            && let Some((repo, filename)) = rest.split_once(':')
+        {
+            return Ok(ModelRef::Hf(HfModelRef {
+                repo: repo.to_string(),
+                file: filename.to_string(),
+            }));
         }
         return Err(ModelRefError::Invalid(
             "hf: model refs must be formatted as hf:<repo>:<filename>".to_string(),
@@ -181,10 +181,7 @@ pub fn parse_gguf_metadata(filename: &str) -> GgufMetadata {
 pub fn list_cached_hf_gguf_models() -> Result<Vec<CachedGgufModel>, ModelRefError> {
     let home = dirs::home_dir()
         .ok_or_else(|| ModelRefError::Invalid("failed to resolve home directory".to_string()))?;
-    let root = home
-        .join(".cache")
-        .join("huggingface")
-        .join("hub");
+    let root = home.join(".cache").join("huggingface").join("hub");
 
     if !root.exists() {
         return Ok(Vec::new());
@@ -212,9 +209,7 @@ pub fn list_cached_hf_gguf_models() -> Result<Vec<CachedGgufModel>, ModelRefErro
         if !dirname.starts_with("models--") {
             continue;
         }
-        let repo = dirname
-            .trim_start_matches("models--")
-            .replace("--", "/");
+        let repo = dirname.trim_start_matches("models--").replace("--", "/");
         let snapshots_dir = entry.path().join("snapshots");
         if !snapshots_dir.is_dir() {
             continue;

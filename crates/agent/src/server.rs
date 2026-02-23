@@ -1,7 +1,5 @@
-use crate::acp::AcpServer;
-use crate::session::projection::ViewStore;
-use crate::session::store::SessionStore;
 use crate::ui::UiServer;
+use crate::{acp::AcpServer, session::StorageBackend};
 use axum::{
     Router,
     http::{StatusCode, header},
@@ -18,22 +16,19 @@ struct Assets;
 
 pub struct AgentServer {
     agent: Arc<crate::agent::AgentHandle>,
-    view_store: Arc<dyn ViewStore>,
-    session_store: Arc<dyn SessionStore>,
+    storage: Arc<dyn StorageBackend>,
     default_cwd: Option<PathBuf>,
 }
 
 impl AgentServer {
     pub fn new(
         agent: Arc<crate::agent::AgentHandle>,
-        view_store: Arc<dyn ViewStore>,
-        session_store: Arc<dyn SessionStore>,
+        storage: Arc<dyn StorageBackend>,
         default_cwd: Option<PathBuf>,
     ) -> Self {
         Self {
             agent,
-            view_store,
-            session_store,
+            storage,
             default_cwd,
         }
     }
@@ -41,8 +36,16 @@ impl AgentServer {
     pub async fn run(self, addr: &str) -> anyhow::Result<()> {
         let agent = self.agent;
         let acp_router = AcpServer::new(agent.clone()).router();
-        let ui_router = UiServer::new(agent.clone(), self.view_store, self.session_store, self.default_cwd)
-            .router();
+        let ui_router = UiServer::new(
+            agent.clone(),
+            self.storage
+                .view_store()
+                .expect("ViewStore is expected for UI")
+                .clone(),
+            self.storage.session_store().clone(),
+            self.default_cwd,
+        )
+        .router();
 
         let app = Router::new()
             .nest("/acp", acp_router)

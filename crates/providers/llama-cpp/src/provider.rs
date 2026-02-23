@@ -14,9 +14,6 @@ use crate::tools::{
 use async_trait::async_trait;
 use futures::Stream;
 use futures::channel::mpsc;
-use querymt_provider_common::{
-    ModelRef, ModelRefError, parse_model_ref, resolve_hf_model_fast, resolve_hf_model_sync,
-};
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
@@ -25,6 +22,9 @@ use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, FinishReason, Tool}
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
+use querymt_provider_common::{
+    ModelRef, ModelRefError, parse_model_ref, resolve_hf_model_fast, resolve_hf_model_sync,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;

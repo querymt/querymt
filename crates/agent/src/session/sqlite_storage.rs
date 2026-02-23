@@ -25,7 +25,8 @@ use crate::session::repository::{
 };
 use crate::session::schema;
 use crate::session::store::{
-    CustomModel, LLMConfig, Session, SessionExecutionConfig, SessionStore, extract_llm_config_values,
+    CustomModel, LLMConfig, Session, SessionExecutionConfig, SessionStore,
+    extract_llm_config_values,
 };
 use async_trait::async_trait;
 use querymt::LLMParams;

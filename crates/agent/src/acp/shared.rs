@@ -569,7 +569,7 @@ pub async fn handle_rpc_message<S: SendAgent>(
 
                             if tx.is_none()
                                 && let Some(query_agent) =
-                                    agent.as_any().downcast_ref::<QueryMTAgent>()
+                                    agent.as_any().downcast_ref::<AgentHandle>()
                             {
                                 tx = crate::elicitation::take_pending_elicitation_sender(
                                     query_agent,
@@ -617,14 +617,9 @@ pub async fn handle_rpc_message<S: SendAgent>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::builder::AgentBuilderExt;
-    use crate::delegation::{AgentInfo, DefaultAgentRegistry};
     use crate::elicitation::ElicitationAction;
     use crate::events::{AgentEventKind, EventOrigin};
-    use crate::session::backend::StorageBackend;
-    use crate::session::sqlite_storage::SqliteStorage;
-    use crate::test_utils::empty_plugin_registry;
-    use querymt::LLMParams;
+    use crate::test_utils::DelegateTestFixture;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -855,39 +850,12 @@ mod tests {
 
     #[tokio::test]
     async fn elicitation_result_routes_to_delegate_pending_map() {
-        let (planner_registry, _planner_cfg_dir) = empty_plugin_registry().unwrap();
-        let planner_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
-        let planner = QueryMTAgent::new(
-            Arc::new(planner_registry),
-            planner_storage.session_store(),
-            LLMParams::new().provider("mock").model("mock"),
-        );
-
-        let (delegate_registry, _delegate_cfg_dir) = empty_plugin_registry().unwrap();
-        let delegate_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
-        let delegate = Arc::new(QueryMTAgent::new(
-            Arc::new(delegate_registry),
-            delegate_storage.session_store(),
-            LLMParams::new().provider("mock").model("mock"),
-        ));
-
-        let mut registry = DefaultAgentRegistry::new();
-        registry.register(
-            AgentInfo {
-                id: "coder".to_string(),
-                name: "Coder".to_string(),
-                description: "Delegate".to_string(),
-                capabilities: vec![],
-                required_capabilities: vec![],
-                meta: None,
-            },
-            delegate.clone(),
-        );
-        let planner = planner.with_agent_registry(Arc::new(registry));
+        let fixture = DelegateTestFixture::new().await.unwrap();
 
         let elicitation_id = "delegate-elicitation-rpc".to_string();
         let (tx, rx) = oneshot::channel();
-        delegate
+        fixture
+            .delegate
             .pending_elicitations()
             .lock()
             .await
@@ -895,10 +863,10 @@ mod tests {
 
         let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
-        let pending_elicitations = planner.pending_elicitations();
+        let pending_elicitations = fixture.planner.pending_elicitations();
 
         let response = handle_rpc_message(
-            &planner,
+            fixture.planner.as_ref(),
             &session_owners,
             &pending_permissions,
             &pending_elicitations,
