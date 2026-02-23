@@ -156,10 +156,10 @@ pub async fn handle_ui_message(
         UiClientMessage::SetSessionModel {
             session_id,
             model_id,
-            node,
+            node_id,
         } => {
             if let Err(err) =
-                handle_set_session_model(state, &session_id, &model_id, node.as_deref()).await
+                handle_set_session_model(state, &session_id, &model_id, node_id.as_deref()).await
             {
                 let _ = send_error(tx, err).await;
             }
@@ -216,26 +216,29 @@ pub async fn handle_ui_message(
         UiClientMessage::ListRemoteNodes => {
             handle_list_remote_nodes(state, tx).await;
         }
-        UiClientMessage::ListRemoteSessions { node } => {
-            handle_list_remote_sessions(state, &node, tx).await;
+        UiClientMessage::ListRemoteSessions { node_id } => {
+            handle_list_remote_sessions(state, &node_id, tx).await;
         }
         UiClientMessage::CreateRemoteSession {
-            node,
+            node_id,
             cwd,
             request_id,
         } => {
             handle_create_remote_session(
                 state,
                 conn_id,
-                &node,
+                &node_id,
                 cwd.as_deref(),
                 request_id.as_deref(),
                 tx,
             )
             .await;
         }
-        UiClientMessage::AttachRemoteSession { node, session_id } => {
-            handle_attach_remote_session(state, conn_id, &node, &session_id, tx).await;
+        UiClientMessage::AttachRemoteSession {
+            node_id,
+            session_id,
+        } => {
+            handle_attach_remote_session(state, conn_id, &node_id, &session_id, tx).await;
         }
         UiClientMessage::AddCustomModelFromHf {
             provider,

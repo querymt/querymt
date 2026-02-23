@@ -14,13 +14,15 @@ use crate::config::{
     RuntimeExecutionPolicy, ToolOutputConfig,
 };
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
-use crate::event_bus::EventBus;
+use crate::event_fanout::EventFanout;
+use crate::event_sink::EventSink;
 use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
 use crate::middleware::{
     AgentModeMiddleware, ContextConfig, ContextMiddleware, DelegationConfig, DelegationMiddleware,
     LimitsConfig, LimitsMiddleware, MiddlewareDriver,
 };
 use crate::session::compaction::SessionCompaction;
+use crate::session::projection::EventJournal;
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
@@ -39,6 +41,8 @@ use tokio::sync::Mutex;
 /// config directly.
 pub struct AgentConfigBuilder {
     provider: Arc<SessionProvider>,
+    event_journal: Arc<dyn EventJournal>,
+    event_fanout: Arc<EventFanout>,
     default_mode: Arc<StdMutex<AgentMode>>,
     max_steps: Option<usize>,
     snapshot_policy: SnapshotPolicy,
@@ -48,7 +52,6 @@ pub struct AgentConfigBuilder {
     tool_config: ToolConfig,
     tool_registry: ToolRegistry,
     middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
-    event_bus: Arc<EventBus>,
     auth_methods: Vec<AuthMethod>,
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     delegation_context_config: DelegationContextConfig,
@@ -72,6 +75,7 @@ impl AgentConfigBuilder {
     pub fn new(
         plugin_registry: Arc<PluginRegistry>,
         store: Arc<dyn SessionStore>,
+        event_journal: Arc<dyn EventJournal>,
         initial_config: LLMParams,
     ) -> Self {
         let provider = Arc::new(SessionProvider::new(
@@ -84,6 +88,8 @@ impl AgentConfigBuilder {
 
         Self {
             provider,
+            event_journal,
+            event_fanout: Arc::new(EventFanout::new()),
             default_mode: Arc::new(StdMutex::new(AgentMode::Build)),
             max_steps: None,
             snapshot_policy: SnapshotPolicy::None,
@@ -93,7 +99,51 @@ impl AgentConfigBuilder {
             tool_config: ToolConfig::default(),
             tool_registry,
             middleware_drivers: Vec::new(),
-            event_bus: Arc::new(EventBus::new()),
+            auth_methods: Vec::new(),
+            agent_registry: Arc::new(DefaultAgentRegistry::new()),
+            delegation_context_config: DelegationContextConfig {
+                timing: DelegationContextTiming::FirstTurnOnly,
+                auto_inject: true,
+            },
+            workspace_manager_actor: WorkspaceIndexManagerActor::new(
+                WorkspaceIndexManagerConfig::default(),
+            ),
+            execution_timeout_secs: 300,
+            delegation_wait_policy: DelegationWaitPolicy::default(),
+            delegation_wait_timeout_secs: 120,
+            delegation_cancel_grace_secs: 5,
+            execution_policy: RuntimeExecutionPolicy::default(),
+            compaction: SessionCompaction::new(),
+            snapshot_backend: None,
+            snapshot_gc_config: crate::snapshot::GcConfig::default(),
+            pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    /// Create a builder from a pre-built [`SessionProvider`] and event journal.
+    ///
+    /// Use this when you already have a `SessionProvider` (e.g. with a mock
+    /// store or a custom LLM provider) and want builder defaults for
+    /// everything else.  Does **not** register built-in tools — call
+    /// [`with_tool_registry`] if you need them.
+    pub fn from_provider(
+        provider: Arc<SessionProvider>,
+        event_journal: Arc<dyn EventJournal>,
+    ) -> Self {
+        Self {
+            provider,
+            event_journal,
+            event_fanout: Arc::new(EventFanout::new()),
+            default_mode: Arc::new(StdMutex::new(AgentMode::Build)),
+            max_steps: None,
+            snapshot_policy: SnapshotPolicy::None,
+            assume_mutating: true,
+            mutating_tools: HashSet::new(),
+            max_prompt_bytes: None,
+            tool_config: ToolConfig::default(),
+            tool_registry: ToolRegistry::new(),
+            middleware_drivers: Vec::new(),
             auth_methods: Vec::new(),
             agent_registry: Arc::new(DefaultAgentRegistry::new()),
             delegation_context_config: DelegationContextConfig {
@@ -118,9 +168,13 @@ impl AgentConfigBuilder {
 
     /// Build the final [`AgentConfig`].
     pub fn build(self) -> AgentConfig {
+        let event_sink = Arc::new(EventSink::new(
+            self.event_journal.clone(),
+            self.event_fanout.clone(),
+        ));
         AgentConfig {
             provider: self.provider,
-            event_bus: self.event_bus,
+            event_sink,
             agent_registry: self.agent_registry,
             workspace_manager_actor: self.workspace_manager_actor,
             default_mode: self.default_mode,
@@ -145,13 +199,6 @@ impl AgentConfigBuilder {
             pending_elicitations: self.pending_elicitations,
             mcp_servers: self.mcp_servers,
         }
-    }
-
-    // ── Observer ─────────────────────────────────────────────────────────
-
-    /// Add an event observer (non-consuming; useful during construction).
-    pub fn add_observer(&self, observer: Arc<dyn crate::events::EventObserver>) {
-        self.event_bus.add_observer(observer);
     }
 
     // ── Delegation ────────────────────────────────────────────────────────
@@ -184,6 +231,17 @@ impl AgentConfigBuilder {
         self
     }
 
+    /// Sets the agent registry without auto-registering `DelegateTool` or
+    /// `DelegationMiddleware`. Use this when you wire delegation externally
+    /// (e.g. via a `DelegationOrchestrator` added as an observer).
+    pub fn with_agent_registry_only(
+        mut self,
+        registry: Arc<dyn AgentRegistry + Send + Sync>,
+    ) -> Self {
+        self.agent_registry = registry;
+        self
+    }
+
     /// Sets the delegation context timing.
     pub fn with_delegation_context_timing(mut self, timing: DelegationContextTiming) -> Self {
         self.delegation_context_config.timing = timing;
@@ -213,6 +271,12 @@ impl AgentConfigBuilder {
     /// Sets the maximum prompt size in bytes.
     pub fn with_max_prompt_bytes(mut self, bytes: usize) -> Self {
         self.max_prompt_bytes = Some(bytes);
+        self
+    }
+
+    /// Sets the execution timeout in seconds.
+    pub fn with_execution_timeout_secs(mut self, secs: u64) -> Self {
+        self.execution_timeout_secs = secs;
         self
     }
 
@@ -277,32 +341,6 @@ impl AgentConfigBuilder {
     pub fn with_agent_mode_middleware<T: Into<String>>(mut self, reminder: T) -> Self {
         self.middleware_drivers
             .push(Arc::new(AgentModeMiddleware::new(reminder.into())));
-        self
-    }
-
-    // ── Events ────────────────────────────────────────────────────────────
-
-    /// Wires a shared event bus for aggregated event streaming.
-    pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
-        self.event_bus = bus;
-        self
-    }
-
-    /// Adds an event observer (consuming).
-    pub fn with_event_observer<O: crate::events::EventObserver + 'static>(
-        self,
-        observer: O,
-    ) -> Self {
-        self.event_bus.add_observer(Arc::new(observer));
-        self
-    }
-
-    /// Sets the event observers (replaces any pending add calls, just adds them).
-    pub fn with_event_observers(
-        self,
-        observers: Vec<Arc<dyn crate::events::EventObserver>>,
-    ) -> Self {
-        self.event_bus.add_observers(observers);
         self
     }
 
@@ -467,9 +505,9 @@ impl AgentConfigBuilder {
 
     // ── Internal accessors (used by simple::agent and quorum) ─────────────
 
-    /// Read the current `event_bus` (for passing to middleware factories).
-    pub fn event_bus(&self) -> Arc<EventBus> {
-        self.event_bus.clone()
+    /// Read the current `event_journal`.
+    pub fn event_journal(&self) -> Arc<dyn EventJournal> {
+        self.event_journal.clone()
     }
 
     /// Read the current `compaction_config` (for auto-ContextMiddleware check).
@@ -536,7 +574,12 @@ mod tests {
         let (registry, temp_dir) = empty_plugin_registry().unwrap();
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock-model");
-        let builder = AgentConfigBuilder::new(Arc::new(registry), storage.session_store(), llm);
+        let builder = AgentConfigBuilder::new(
+            Arc::new(registry),
+            storage.session_store(),
+            storage.event_journal(),
+            llm,
+        );
         (builder, temp_dir)
     }
 
@@ -676,11 +719,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_bus_accessor_works() {
+    async fn event_journal_accessor_works() {
         let (builder, _td) = make_builder().await;
-        let bus = builder.event_bus();
+        let journal = builder.event_journal();
         // Just verify we get an Arc back
-        let _ = Arc::strong_count(&bus);
+        let _ = Arc::strong_count(&journal);
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@
 //!                          → `StreamChunkRelay` messages arrive at `StreamReceiverActor`
 //!                          → forwarded via `mpsc` channel → `Stream<StreamChunk>`
 
+use crate::agent::remote::NodeId;
 use crate::agent::remote::mesh::MeshHandle;
 use crate::agent::remote::provider_host::{
     ProviderChatRequest, ProviderHostActor, ProviderStreamRequest, STREAM_CHUNK_TIMEOUT,
@@ -42,7 +43,7 @@ use uuid::Uuid;
 /// to a `ProviderHostActor` running on `target_node` in the kameo mesh.
 ///
 /// Constructed by `build_provider_from_config` when:
-/// 1. The session's `LLMConfig.provider_node` names a specific remote node, or
+/// 1. The session's `LLMConfig.provider_node_id` names a specific remote node, or
 /// 2. The provider is not available locally but is found on a mesh peer.
 ///
 /// API keys never leave the owning node. Only `ChatMessage`s flow outbound,
@@ -54,7 +55,7 @@ pub struct MeshChatProvider {
     model: String,
     /// Mesh handle used for DHT lookups and actor registration.
     mesh: MeshHandle,
-    /// DHT name of the target `ProviderHostActor`, e.g. `"provider_host::gpu-server"`.
+    /// DHT name of the target `ProviderHostActor`, e.g. `"provider_host::peer::<peer_id>"`.
     target_dht_name: String,
 }
 
@@ -63,17 +64,27 @@ impl MeshChatProvider {
     ///
     /// # Arguments
     /// * `mesh`          — live mesh handle (for DHT operations).
-    /// * `target_node`   — hostname of the node whose `ProviderHostActor` to call.
-    ///   Format: plain hostname (e.g. `"gpu-server"`).
-    /// * `provider_name` — provider plugin name (e.g. `"anthropic"`).
-    /// * `model`         — model name (e.g. `"claude-sonnet-4-20250514"`).
-    pub fn new(mesh: &MeshHandle, target_node: &str, provider_name: &str, model: &str) -> Self {
+    /// * `target_node_id` — stable mesh node id (`PeerId`) string of the node
+    ///   whose `ProviderHostActor` to call.
+    /// * `provider_name`  — provider plugin name (e.g. `"anthropic"`).
+    /// * `model`          — model name (e.g. `"claude-sonnet-4-20250514"`).
+    pub fn new(mesh: &MeshHandle, target_node_id: &str, provider_name: &str, model: &str) -> Self {
         Self {
             provider_name: provider_name.to_string(),
             model: model.to_string(),
             mesh: mesh.clone(),
-            target_dht_name: format!("provider_host::{}", target_node),
+            target_dht_name: format!("provider_host::peer::{}", target_node_id),
         }
+    }
+
+    /// Typed constructor for call sites that already validated/parsed a node id.
+    pub fn from_node_id(
+        mesh: &MeshHandle,
+        target_node_id: &NodeId,
+        provider_name: &str,
+        model: &str,
+    ) -> Self {
+        Self::new(mesh, &target_node_id.to_string(), provider_name, model)
     }
 
     /// Resolve the remote `ProviderHostActor` ref from the DHT.
@@ -329,9 +340,8 @@ impl LLMProvider for MeshChatProvider {}
 
 /// Scan the mesh for any node advertising `provider_name` in its available models.
 ///
-/// Returns the hostname suffix (as used in DHT name `"provider_host::{hostname}"`)
-/// of the first node that has valid credentials for the provider, or `None` if no
-/// peer is advertising it.
+/// Returns the stable node id of the first node that has valid credentials for
+/// the provider, or `None` if no peer is advertising it.
 ///
 /// This is used by `build_provider_from_config` as a mesh-fallback (Case 3) when
 /// the provider is unavailable locally.
@@ -339,10 +349,9 @@ impl LLMProvider for MeshChatProvider {}
 /// # Implementation note
 ///
 /// This function queries each `RemoteNodeManager` via `ListAvailableModels` +
-/// `GetNodeInfo`. Both calls are made to the same peer so we obtain the real
-/// hostname without any DHT name-reverse-lookup.  The explicit `provider_node`
-/// path (Case 1) is the primary flow; this best-effort scan only runs when
-/// `provider_node` is `None`.
+/// `GetNodeInfo` and uses the reported `node_id` directly.
+/// The explicit `provider_node_id` path (Case 1) is the primary flow; this
+/// best-effort scan only runs when `provider_node_id` is `None`.
 #[tracing::instrument(
     name = "remote.mesh_provider.find_on_mesh",
     skip(mesh),
@@ -355,7 +364,7 @@ impl LLMProvider for MeshChatProvider {}
 pub(crate) async fn find_provider_on_mesh(
     mesh: &MeshHandle,
     provider_name: &str,
-) -> Option<String> {
+) -> Option<NodeId> {
     use crate::agent::remote::node_manager::{GetNodeInfo, RemoteNodeManager};
     use crate::agent::remote::{ListAvailableModels, NodeInfo};
 
@@ -390,7 +399,7 @@ pub(crate) async fn find_provider_on_mesh(
             continue;
         }
 
-        // This peer has the provider — ask for its hostname.
+        // This peer has the provider — ask for its stable node identity.
         let node_info: NodeInfo = match node_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
             Ok(info) => info,
             Err(e) => {
@@ -404,12 +413,13 @@ pub(crate) async fn find_provider_on_mesh(
         };
 
         log::info!(
-            "find_provider_on_mesh: provider '{}' found on mesh peer '{}' (mesh fallback)",
+            "find_provider_on_mesh: provider '{}' found on mesh peer '{}' ({}) (mesh fallback)",
             provider_name,
-            node_info.hostname
+            node_info.hostname,
+            node_info.node_id
         );
         tracing::Span::current().record("found", true);
-        return Some(node_info.hostname);
+        return Some(node_info.node_id);
     }
 
     tracing::Span::current().record("found", false);

@@ -37,7 +37,7 @@
 
 use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
 use crate::acp::shutdown;
-use crate::event_bus::EventBus;
+use crate::event_fanout::EventFanout;
 use crate::send_agent::ApcAgentAdapter;
 use agent_client_protocol::{AgentSideConnection, Client, SessionId, SessionNotification};
 use std::rc::Rc;
@@ -104,24 +104,24 @@ async fn run_bridge_task(
     log::info!("Client bridge task ended (channel closed)");
 }
 
-/// Forwards events from EventBus to the client bridge.
+/// Forwards events from EventFanout to the client bridge.
 ///
-/// This task subscribes to the EventBus and forwards all events to the ACP client
+/// This task subscribes to the EventFanout and forwards all events to the ACP client
 /// via the bridge. Unlike the WebSocket server, this does not filter events by
 /// session ownership because the SDK stdio server serves a single client (Zed).
 ///
 /// The forwarder automatically stops when:
-/// - The EventBus is shut down (recv returns error)
+/// - The EventFanout is shut down (recv returns error)
 /// - The bridge channel closes (notify returns error)
-#[instrument(name = "acp.event_forwarder", skip(event_bus, bridge, shutdown_tx))]
+#[instrument(name = "acp.event_forwarder", skip(event_fanout, bridge, shutdown_tx))]
 fn spawn_event_bridge_forwarder(
-    event_bus: Arc<EventBus>,
+    event_fanout: Arc<EventFanout>,
     bridge: ClientBridgeSender,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         log::info!("Event bridge forwarder started");
-        let mut events = event_bus.subscribe();
+        let mut events = event_fanout.subscribe();
 
         let mut forwarded_count = 0u64;
 
@@ -131,7 +131,7 @@ fn spawn_event_bridge_forwarder(
                     // Translate event to SessionUpdate
                     if let Some(update) = crate::acp::shared::translate_event_to_update(&event) {
                         let notification = SessionNotification::new(
-                            SessionId::from(event.session_id.clone()),
+                            SessionId::from(event.session_id().to_owned()),
                             update,
                         );
 
@@ -149,13 +149,13 @@ fn spawn_event_bridge_forwarder(
                         log::trace!(
                             "Forwarded event {} for session {}",
                             forwarded_count,
-                            event.session_id
+                            event.session_id()
                         );
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     log::info!(
-                        "EventBus closed after forwarding {} events, stopping forwarder",
+                        "EventFanout closed after forwarding {} events, stopping forwarder",
                         forwarded_count
                     );
                     break;
@@ -224,7 +224,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::AgentHandle>) -> anyhow::Resul
             agent.set_bridge(bridge_sender.clone());
             log::debug!("Set bridge on agent");
 
-            // 3. Collect EventBuses from agent and delegates
+            // 3. Collect EventFanouts from agent and delegates
             let event_sources = crate::acp::shared::collect_event_sources(&agent);
             log::debug!("Collected {} event source(s) for forwarding", event_sources.len());
 
@@ -232,11 +232,11 @@ pub async fn serve_stdio(agent: Arc<crate::agent::AgentHandle>) -> anyhow::Resul
             // Used by forwarders to signal when they've stopped
             let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(event_sources.len());
 
-            // 5. Spawn event bridge forwarders (one per EventBus)
+            // 5. Spawn event bridge forwarders (one per EventFanout)
             let mut forwarder_handles = Vec::new();
-            for (idx, event_bus) in event_sources.into_iter().enumerate() {
+            for (idx, event_fanout) in event_sources.into_iter().enumerate() {
                 let handle = spawn_event_bridge_forwarder(
-                    event_bus,
+                    event_fanout,
                     bridge_sender.clone(),
                     shutdown_tx.clone(),
                 );

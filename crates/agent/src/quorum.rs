@@ -1,12 +1,13 @@
 use crate::delegation::{
     AgentActorHandle, AgentInfo, AgentRegistry, DefaultAgentRegistry, DelegationOrchestrator,
 };
-use crate::event_bus::EventBus;
+use crate::event_fanout::EventFanout;
+use crate::events::EventEnvelope;
 use crate::send_agent::SendAgent;
 
 use crate::session::backend::{StorageBackend, default_agent_db_path};
 use crate::session::error::SessionError;
-use crate::session::projection::ViewStore;
+use crate::session::projection::{EventJournal, ViewStore};
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::SessionStore;
 use crate::tools::CapabilityRequirement;
@@ -15,12 +16,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 type DelegateFactory =
-    Box<dyn FnOnce(Arc<dyn SessionStore>, Arc<EventBus>) -> Arc<dyn SendAgent> + Send>;
+    Box<dyn FnOnce(Arc<dyn SessionStore>, Arc<dyn EventJournal>) -> Arc<dyn SendAgent> + Send>;
 
 type PlannerFactory = Box<
     dyn FnOnce(
             Arc<dyn SessionStore>,
-            Arc<EventBus>,
+            Arc<dyn EventJournal>,
             Arc<dyn AgentRegistry + Send + Sync>,
         ) -> Arc<dyn SendAgent>
         + Send,
@@ -43,7 +44,7 @@ pub struct DelegateAgent {
 
 pub struct AgentQuorum {
     storage: Arc<dyn StorageBackend>,
-    event_bus: Arc<EventBus>,
+    event_fanout: Arc<EventFanout>,
     registry: Arc<dyn AgentRegistry + Send + Sync>,
     planner: Arc<dyn SendAgent>,
     delegates: Vec<DelegateAgent>,
@@ -86,8 +87,14 @@ impl AgentQuorum {
             .expect("SqliteStorage required")
             .clone()
     }
-    pub fn event_bus(&self) -> Arc<EventBus> {
-        self.event_bus.clone()
+    /// Subscribe to events via the fanout (live stream of EventEnvelope).
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EventEnvelope> {
+        self.event_fanout.subscribe()
+    }
+
+    /// Access the event fanout for live event subscriptions.
+    pub fn event_fanout(&self) -> Arc<EventFanout> {
+        self.event_fanout.clone()
     }
 
     pub fn registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
@@ -105,7 +112,7 @@ impl AgentQuorum {
 
 pub struct AgentQuorumBuilder {
     storage: Arc<dyn StorageBackend>,
-    event_bus: Arc<EventBus>,
+    event_fanout: Arc<EventFanout>,
     cwd: Option<PathBuf>,
     delegate_factories: Vec<(AgentInfo, DelegateFactory)>,
     planner_factory: Option<PlannerFactory>,
@@ -127,7 +134,7 @@ impl AgentQuorumBuilder {
     pub fn new(storage: Arc<dyn StorageBackend>) -> Self {
         Self {
             storage: storage.clone(),
-            event_bus: Arc::new(EventBus::new()),
+            event_fanout: Arc::new(EventFanout::new()),
             cwd: None,
             delegate_factories: Vec::new(),
             planner_factory: None,
@@ -151,13 +158,11 @@ impl AgentQuorumBuilder {
         self
     }
 
-    /// Create builder from a storage backend (registers event observer automatically).
+    /// Create builder from a storage backend.
     pub fn from_backend(backend: Arc<dyn StorageBackend>) -> Self {
-        let event_bus = Arc::new(EventBus::new());
-        event_bus.add_observer(backend.event_observer());
         Self {
             storage: backend.clone(),
-            event_bus,
+            event_fanout: Arc::new(EventFanout::new()),
             cwd: None,
             delegate_factories: Vec::new(),
             planner_factory: None,
@@ -177,14 +182,11 @@ impl AgentQuorumBuilder {
         self
     }
 
-    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
-        self.event_bus = event_bus;
-        self
-    }
-
     pub fn add_delegate_agent<F>(mut self, info: AgentInfo, factory: F) -> Self
     where
-        F: FnOnce(Arc<dyn SessionStore>, Arc<EventBus>) -> Arc<dyn SendAgent> + Send + 'static,
+        F: FnOnce(Arc<dyn SessionStore>, Arc<dyn EventJournal>) -> Arc<dyn SendAgent>
+            + Send
+            + 'static,
     {
         self.delegate_factories.push((info, Box::new(factory)));
         self
@@ -194,7 +196,7 @@ impl AgentQuorumBuilder {
     where
         F: FnOnce(
                 Arc<dyn SessionStore>,
-                Arc<EventBus>,
+                Arc<dyn EventJournal>,
                 Arc<dyn AgentRegistry + Send + Sync>,
             ) -> Arc<dyn SendAgent>
             + Send
@@ -273,7 +275,10 @@ impl AgentQuorumBuilder {
         }
 
         for (info, factory) in self.delegate_factories {
-            let agent = factory(self.storage.session_store().clone(), self.event_bus.clone());
+            let agent = factory(
+                self.storage.session_store().clone(),
+                self.storage.event_journal().clone(),
+            );
 
             // Try to extract AgentActorHandle::Local by downcasting to AgentHandle
             let actor_handle = agent
@@ -299,7 +304,7 @@ impl AgentQuorumBuilder {
             .ok_or(AgentQuorumError::MissingPlanner)?;
         let planner = planner_factory(
             self.storage.session_store().clone(),
-            self.event_bus.clone(),
+            self.storage.event_journal().clone(),
             registry.clone(),
         );
 
@@ -310,10 +315,16 @@ impl AgentQuorumBuilder {
             use crate::tools::ToolRegistry;
             let tool_registry = Arc::new(ToolRegistry::new());
 
+            use crate::event_sink::EventSink;
+            let delegation_sink = Arc::new(EventSink::new(
+                self.storage.event_journal(),
+                self.event_fanout.clone(),
+            ));
+
             let orchestrator = Arc::new(
                 DelegationOrchestrator::new(
                     planner.clone(),
-                    self.event_bus.clone(),
+                    delegation_sink,
                     self.storage.session_store().clone(),
                     registry.clone(),
                     tool_registry,
@@ -327,10 +338,9 @@ impl AgentQuorumBuilder {
                 .with_summarizer(self.delegation_summarizer.clone()),
             );
 
-            // Note: We can't call add_observer on Arc<dyn SendAgent> directly
-            // This will be fixed when we use AgentHandle in the factories
-            // For now, skip the observer registration
-            // planner.add_observer(orchestrator.clone());
+            // Subscribe the orchestrator to the quorum's event fanout so it can
+            // react to delegation-related events (e.g. DelegationRequested).
+            let _listener_handle = orchestrator.start_listening(&self.event_fanout);
 
             Some(orchestrator)
         } else {
@@ -339,7 +349,7 @@ impl AgentQuorumBuilder {
 
         Ok(AgentQuorum {
             storage: self.storage,
-            event_bus: self.event_bus,
+            event_fanout: self.event_fanout,
             registry,
             planner,
             delegates,

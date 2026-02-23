@@ -6,8 +6,8 @@
 
 use crate::agent::AgentHandle;
 use crate::agent::core::AgentMode;
-use crate::event_bus::EventBus;
-use crate::events::{AgentEvent, AgentEventKind};
+use crate::event_fanout::EventFanout;
+use crate::events::{AgentEventKind, EventEnvelope};
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
 use agent_client_protocol::{
@@ -55,7 +55,7 @@ pub struct RpcResponse {
 /// Translate an internal agent event to a JSON-RPC notification.
 ///
 /// Returns `None` if the event should not be sent to the client.
-pub fn translate_event_to_notification(event: &AgentEvent) -> Option<serde_json::Value> {
+pub fn translate_event_to_notification(event: &EventEnvelope) -> Option<serde_json::Value> {
     // Handle ElicitationRequested specially - it's a custom notification, not a session/update
     if let AgentEventKind::ElicitationRequested {
         elicitation_id,
@@ -63,7 +63,7 @@ pub fn translate_event_to_notification(event: &AgentEvent) -> Option<serde_json:
         message,
         requested_schema,
         source,
-    } = &event.kind
+    } = event.kind()
     {
         return Some(serde_json::json!({
             "jsonrpc": "2.0",
@@ -78,7 +78,7 @@ pub fn translate_event_to_notification(event: &AgentEvent) -> Option<serde_json:
         }));
     }
 
-    let session_id = event.session_id.clone();
+    let session_id = event.session_id().to_owned();
     let update = translate_event_to_update(event)?;
 
     Some(serde_json::json!({
@@ -94,8 +94,8 @@ pub fn translate_event_to_notification(event: &AgentEvent) -> Option<serde_json:
 /// Translate an agent event to a SessionUpdate.
 ///
 /// Returns `None` if the event should not be sent to the client.
-pub fn translate_event_to_update(event: &AgentEvent) -> Option<SessionUpdate> {
-    match &event.kind {
+pub fn translate_event_to_update(event: &EventEnvelope) -> Option<SessionUpdate> {
+    match event.kind() {
         AgentEventKind::PromptReceived { content, .. } => Some(SessionUpdate::UserMessageChunk(
             ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone()))),
         )),
@@ -239,7 +239,7 @@ pub fn tool_kind_for_tool(name: &str) -> ToolKind {
 pub async fn is_event_owned(
     session_owners: &SessionOwnerMap,
     conn_id: &str,
-    event: &AgentEvent,
+    event: &EventEnvelope,
 ) -> bool {
     // Handle session forking - propagate ownership to child sessions
     if let AgentEventKind::SessionForked {
@@ -247,7 +247,7 @@ pub async fn is_event_owned(
         child_session_id,
         origin,
         ..
-    } = &event.kind
+    } = event.kind()
         && matches!(origin, ForkOrigin::Delegation)
     {
         let mut owners = session_owners.lock().await;
@@ -259,27 +259,27 @@ pub async fn is_event_owned(
     // Check if this connection owns the session
     let owners = session_owners.lock().await;
     owners
-        .get(&event.session_id)
+        .get(event.session_id())
         .map(|owner| owner == conn_id)
         .unwrap_or(false)
 }
 
-/// Collect EventBus sources from agent and all delegate agents.
+/// Collect EventFanout sources from agent and all delegate agents.
 ///
-/// This function collects the EventBus from the main agent and recursively
-/// collects EventBuses from all registered delegate agents. Each EventBus is
+/// This function collects the EventFanout from the main agent and recursively
+/// collects EventFanouts from all registered delegate agents. Each EventFanout is
 /// deduplicated by pointer address to avoid subscribing multiple times.
 ///
 /// # Arguments
-/// * `agent` - The main agent to collect EventBuses from
+/// * `agent` - The main agent to collect EventFanout sources from
 ///
 /// # Returns
-/// A vector of unique EventBus instances
-pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<EventBus>> {
+/// A vector of unique EventFanout instances
+pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<EventFanout>> {
     let mut sources = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    let primary = agent.event_bus();
+    let primary = agent.config.event_sink.fanout().clone();
     if seen.insert(Arc::as_ptr(&primary) as usize) {
         sources.push(primary);
     }
@@ -287,14 +287,14 @@ pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<EventBus>> {
     let registry = agent.agent_registry();
     for info in registry.list_agents() {
         if let Some(instance) = registry.get_agent_instance(&info.id) {
-            // Downcast to AgentHandle to get its event bus
-            if let Some(bus) = instance
+            // Downcast to AgentHandle to get its event fanout
+            if let Some(fanout) = instance
                 .as_any()
                 .downcast_ref::<AgentHandle>()
-                .map(|agent| agent.event_bus())
-                && seen.insert(Arc::as_ptr(&bus) as usize)
+                .map(|agent| agent.config.event_sink.fanout().clone())
+                && seen.insert(Arc::as_ptr(&fanout) as usize)
             {
-                sources.push(bus);
+                sources.push(fanout);
             }
         }
     }
@@ -618,16 +618,17 @@ pub async fn handle_rpc_message<S: SendAgent>(
 mod tests {
     use super::*;
     use crate::elicitation::ElicitationAction;
-    use crate::events::{AgentEventKind, EventOrigin};
+    use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
     use crate::test_utils::DelegateTestFixture;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio::sync::oneshot;
 
-    fn tool_start_event(tool_name: &str, arguments: serde_json::Value) -> AgentEvent {
-        AgentEvent {
-            seq: 1,
+    fn tool_start_event(tool_name: &str, arguments: serde_json::Value) -> EventEnvelope {
+        EventEnvelope::Durable(DurableEvent {
+            event_id: "evt-1".into(),
+            stream_seq: 1,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -637,12 +638,13 @@ mod tests {
                 tool_name: tool_name.to_string(),
                 arguments: arguments.to_string(),
             },
-        }
+        })
     }
 
-    fn tool_end_event(tool_name: &str) -> AgentEvent {
-        AgentEvent {
-            seq: 2,
+    fn tool_end_event(tool_name: &str) -> EventEnvelope {
+        EventEnvelope::Durable(DurableEvent {
+            event_id: "evt-2".into(),
+            stream_seq: 2,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -653,7 +655,7 @@ mod tests {
                 result: "{}".to_string(),
                 is_error: false,
             },
-        }
+        })
     }
 
     #[test]
@@ -704,8 +706,9 @@ mod tests {
 
     #[test]
     fn malformed_todowrite_arguments_do_not_emit_update() {
-        let event = AgentEvent {
-            seq: 1,
+        let event = EventEnvelope::Durable(DurableEvent {
+            event_id: "evt-3".into(),
+            stream_seq: 1,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -715,7 +718,7 @@ mod tests {
                 tool_name: "todowrite".to_string(),
                 arguments: "{ not-json".to_string(),
             },
-        };
+        });
 
         assert!(translate_event_to_update(&event).is_none());
     }

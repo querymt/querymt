@@ -27,7 +27,7 @@ pub struct MeshSetupResult {
     /// Wrap in `Arc` before passing to `AgentConfigBuilder::with_agent_registry`.
     pub registry: DefaultAgentRegistry,
     /// The spawned `ProviderHostActor` ref (registered in DHT as
-    /// `"provider_host::{hostname}"`).  `None` when `agent_config` was not
+    /// `"provider_host::peer::{peer_id}"`).  `None` when `agent_config` was not
     /// provided to `setup_mesh_from_config`.
     pub provider_host: Option<kameo::actor::ActorRef<ProviderHostActor>>,
 }
@@ -44,7 +44,7 @@ pub struct MeshSetupResult {
 ///   actor ref that should be registered in the DHT.  Pass `None` if the
 ///   node does not want to accept incoming session creation requests.
 /// * `agent_config` — when `Some`, a `ProviderHostActor` is spawned and
-///   registered in the DHT as `"provider_host::{hostname}"`, making this
+///   registered in the DHT as `"provider_host::peer::{peer_id}"`, making this
 ///   node's providers available to the mesh.  Pass `None` to skip.
 ///
 /// # Returns
@@ -131,7 +131,7 @@ pub async fn setup_mesh_from_config(
         use kameo::actor::Spawn;
 
         let hostname = get_hostname();
-        let dht_name = format!("provider_host::{}", hostname);
+        let dht_name = format!("provider_host::peer::{}", mesh.peer_id());
 
         let actor = ProviderHostActor::new(config);
         let actor_ref = ProviderHostActor::spawn(actor);

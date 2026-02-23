@@ -231,7 +231,7 @@ impl SessionActorRef {
     ) -> Result<SetSessionModelResponse, AcpError> {
         self.set_session_model_with_node(messages::SetSessionModel {
             req,
-            provider_node: None,
+            provider_node_id: None,
         })
         .await
     }

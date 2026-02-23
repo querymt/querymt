@@ -1,7 +1,9 @@
+use crate::agent::AgentHandle;
 use crate::agent::remote::SessionActorRef;
 use crate::agent::session_registry::SessionRegistry;
-use crate::event_bus::EventBus;
-use crate::events::{AgentEvent, AgentEventKind, EventObserver};
+use crate::event_fanout::EventFanout;
+use crate::event_sink::EventSink;
+use crate::events::{AgentEventKind, EventEnvelope};
 use crate::model::{AgentMessage, MessagePart};
 use crate::send_agent::SendAgent;
 use crate::session::domain::{Delegation, DelegationStatus, ForkOrigin, ForkPointType};
@@ -10,10 +12,8 @@ use crate::tools::ToolRegistry;
 use crate::verification::VerificationSpec;
 use crate::verification::service::{VerificationContext, VerificationService};
 use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
-use async_trait::async_trait;
 use log::{debug, error, warn};
 use querymt::chat::ChatRole;
-use querymt::error::LLMError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -230,7 +230,7 @@ impl DelegationOrchestratorConfig {
 
 pub struct DelegationOrchestrator {
     delegator: Arc<dyn SendAgent>,
-    event_bus: Arc<EventBus>,
+    event_sink: Arc<EventSink>,
     store: Arc<dyn SessionStore>,
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     tool_registry: Arc<ToolRegistry>,
@@ -245,7 +245,7 @@ pub struct DelegationOrchestrator {
 impl DelegationOrchestrator {
     pub fn new(
         delegator: Arc<dyn SendAgent>,
-        event_bus: Arc<EventBus>,
+        event_sink: Arc<EventSink>,
         store: Arc<dyn SessionStore>,
         agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
         tool_registry: Arc<ToolRegistry>,
@@ -253,7 +253,7 @@ impl DelegationOrchestrator {
     ) -> Self {
         Self {
             delegator,
-            event_bus,
+            event_sink,
             store,
             agent_registry,
             tool_registry,
@@ -303,21 +303,42 @@ impl DelegationOrchestrator {
         self.delegation_summarizer = summarizer;
         self
     }
-}
 
-#[async_trait]
-impl EventObserver for DelegationOrchestrator {
-    async fn on_event(&self, event: &AgentEvent) -> Result<(), LLMError> {
-        match &event.kind {
+    /// Start listening for events on the given `EventFanout`.
+    ///
+    /// Spawns a background task that subscribes to the fanout and dispatches
+    /// delegation-related events. Returns the `JoinHandle` for the listener task.
+    pub fn start_listening(self: &Arc<Self>, fanout: &Arc<EventFanout>) -> JoinHandle<()> {
+        let this = Arc::clone(self);
+        let mut rx = fanout.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(envelope) => {
+                        this.handle_envelope(&envelope).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("DelegationOrchestrator: lagged, skipped {} events", n);
+                    }
+                }
+            }
+        })
+    }
+
+    /// Process a single event envelope.
+    async fn handle_envelope(&self, envelope: &EventEnvelope) {
+        let session_id = envelope.session_id();
+        match envelope.kind() {
             AgentEventKind::DelegationRequested { delegation } => {
                 let delegator = self.delegator.clone();
-                let event_bus = self.event_bus.clone();
+                let event_sink = self.event_sink.clone();
                 let store = self.store.clone();
                 let tool_registry = self.tool_registry.clone();
                 let config = self.config.clone();
                 let max_parallel = self.max_parallel.clone();
                 let delegation_summarizer = self.delegation_summarizer.clone();
-                let parent_session_id = event.session_id.clone();
+                let parent_session_id = session_id.to_string();
                 let parent_session_id_for_insert = parent_session_id.clone();
                 let delegation = delegation.clone();
                 let cancel_token = CancellationToken::new();
@@ -338,7 +359,7 @@ impl EventObserver for DelegationOrchestrator {
                         Ok(permit) => permit,
                         Err(_) => {
                             fail_delegation(
-                                &event_bus,
+                                &event_sink,
                                 &delegator,
                                 &store,
                                 &config,
@@ -353,7 +374,7 @@ impl EventObserver for DelegationOrchestrator {
 
                     let ctx = DelegationContext {
                         delegator,
-                        event_bus,
+                        event_sink,
                         store,
                         tool_registry,
                         config,
@@ -379,7 +400,7 @@ impl EventObserver for DelegationOrchestrator {
                                 delegation.target_agent_id
                             );
                             fail_delegation(
-                                &ctx.event_bus,
+                                &ctx.event_sink,
                                 &ctx.delegator,
                                 &ctx.store,
                                 &ctx.config,
@@ -422,7 +443,6 @@ impl EventObserver for DelegationOrchestrator {
             }
             AgentEventKind::Cancelled => {
                 // Cancel all delegations for this session
-                let session_id = &event.session_id;
                 let mut active = self.active_delegations.lock().await;
 
                 // Find all delegations for this session
@@ -431,18 +451,14 @@ impl EventObserver for DelegationOrchestrator {
                     .filter(|(_, (parent_id, _, _))| parent_id == session_id)
                     .map(|(delegation_id, (_, cancel_token, handle))| {
                         cancel_token.cancel();
-                        // Replace the handle with a dummy handle that immediately completes
-                        // so we can take ownership of the real handle for timeout monitoring
                         let dummy_handle = tokio::spawn(async {});
                         let real_handle = std::mem::replace(handle, dummy_handle);
                         (delegation_id.clone(), real_handle)
                     })
                     .collect();
 
-                // Drop the lock before spawning watchdog tasks
                 drop(active);
 
-                // Spawn watchdog tasks to force-abort delegations that don't terminate within timeout
                 let grace_secs = self.config.cancel_grace_secs;
                 for (delegation_id, mut handle) in to_cancel {
                     tokio::spawn(async move {
@@ -460,14 +476,13 @@ impl EventObserver for DelegationOrchestrator {
             }
             _ => {}
         }
-        Ok(())
     }
 }
 
 /// Context structure to group delegation handler parameters
 struct DelegationContext {
     delegator: Arc<dyn SendAgent>,
-    event_bus: Arc<EventBus>,
+    event_sink: Arc<EventSink>,
     store: Arc<dyn SessionStore>,
     tool_registry: Arc<ToolRegistry>,
     config: DelegationOrchestratorConfig,
@@ -512,7 +527,7 @@ async fn handle_delegation_kameo(
         Err(e) => {
             let error_message = format!("Failed to create session via kameo: {}", e);
             fail_delegation(
-                &ctx.event_bus,
+                &ctx.event_sink,
                 &ctx.delegator,
                 &ctx.store,
                 &ctx.config,
@@ -525,7 +540,9 @@ async fn handle_delegation_kameo(
         }
     };
 
-    ctx.event_bus.publish(
+    emit_delegation_event(
+        &ctx.delegator,
+        &ctx.event_sink,
         &parent_session_id,
         AgentEventKind::SessionForked {
             parent_session_id: parent_session_id.clone(),
@@ -598,7 +615,9 @@ async fn handle_delegation_kameo(
                 warn!("Failed to update delegation status to Cancelled: {}", e);
             }
 
-            ctx.event_bus.publish(
+            emit_delegation_event(
+                &ctx.delegator,
+                &ctx.event_sink,
                 &parent_session_id,
                 AgentEventKind::DelegationCancelled {
                     delegation_id: delegation_id.clone(),
@@ -648,7 +667,7 @@ async fn handle_delegation_kameo(
                     "Verification failed: The changes did not pass the specified verification checks."
                         .to_string();
                 fail_delegation(
-                    &ctx.event_bus,
+                    &ctx.event_sink,
                     &ctx.delegator,
                     &ctx.store,
                     &ctx.config,
@@ -677,7 +696,9 @@ async fn handle_delegation_kameo(
                 warn!("Failed to persist delegation completion: {}", e);
             }
 
-            ctx.event_bus.publish(
+            emit_delegation_event(
+                &ctx.delegator,
+                &ctx.event_sink,
                 &parent_session_id,
                 AgentEventKind::DelegationCompleted {
                     delegation_id: delegation.public_id.clone(),
@@ -701,7 +722,7 @@ async fn handle_delegation_kameo(
         Some(Err(e)) => {
             let error_message = format!("Delegation failed: {}", e);
             fail_delegation(
-                &ctx.event_bus,
+                &ctx.event_sink,
                 &ctx.delegator,
                 &ctx.store,
                 &ctx.config,
@@ -721,7 +742,7 @@ async fn handle_delegation_kameo(
 }
 
 async fn fail_delegation(
-    event_bus: &Arc<EventBus>,
+    event_sink: &Arc<EventSink>,
     delegator: &Arc<dyn SendAgent>,
     store: &Arc<dyn SessionStore>,
     config: &DelegationOrchestratorConfig,
@@ -737,7 +758,9 @@ async fn fail_delegation(
         warn!("Failed to persist delegation failure: {}", e);
     }
 
-    event_bus.publish(
+    emit_delegation_event(
+        delegator,
+        event_sink,
         parent_session_id,
         AgentEventKind::DelegationFailed {
             delegation_id: delegation_id.to_string(),
@@ -747,6 +770,21 @@ async fn fail_delegation(
 
     if config.inject_results {
         inject_failure(delegator, parent_session_id, delegation_id, error_message).await;
+    }
+}
+
+fn emit_delegation_event(
+    delegator: &Arc<dyn SendAgent>,
+    event_sink: &Arc<EventSink>,
+    session_id: &str,
+    kind: AgentEventKind,
+) {
+    if let Some(agent_handle) = delegator.as_any().downcast_ref::<AgentHandle>() {
+        agent_handle.emit_event(session_id, kind);
+    } else {
+        // Fallback for non-AgentHandle delegators: emit as ephemeral (transport-only)
+        // since we don't have access to the agent's persistence layer here.
+        event_sink.emit_ephemeral(session_id, kind);
     }
 }
 

@@ -65,7 +65,7 @@ pub struct LLMConfig {
     /// Stored as `"_node"` key in the `params` JSON blob so no schema migration is needed.
     /// The leading underscore signals it is an internal routing field, not a provider param.
     #[serde(skip)]
-    pub provider_node: Option<String>,
+    pub provider_node_id: Option<String>,
 }
 
 /// User-managed custom model metadata persisted in storage.
@@ -229,14 +229,15 @@ pub trait SessionStore: Send + Sync {
     async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()>;
 
     /// Set the provider node for a session (None = local, Some = remote mesh node).
-    async fn set_session_provider_node(
+    async fn set_session_provider_node_id(
         &self,
         session_id: &str,
-        provider_node: Option<&str>,
+        provider_node_id: Option<&str>,
     ) -> SessionResult<()>;
 
     /// Get the provider node for a session.
-    async fn get_session_provider_node(&self, session_id: &str) -> SessionResult<Option<String>>;
+    async fn get_session_provider_node_id(&self, session_id: &str)
+    -> SessionResult<Option<String>>;
 
     /// Persist the execution configuration snapshot for a session.
     async fn set_session_execution_config(

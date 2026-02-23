@@ -22,7 +22,7 @@ use std::sync::Arc;
 pub(crate) async fn build_mcp_state(
     servers: &[McpServer],
     pending_elicitations: crate::elicitation::PendingElicitationMap,
-    event_bus: Arc<crate::event_bus::EventBus>,
+    event_sink: Arc<crate::event_sink::EventSink>,
     session_id: String,
 ) -> Result<
     (
@@ -43,7 +43,7 @@ pub(crate) async fn build_mcp_state(
         ) = start_mcp_server(
             server,
             pending_elicitations.clone(),
-            event_bus.clone(),
+            event_sink.clone(),
             session_id.clone(),
         )
         .await?;
@@ -78,7 +78,7 @@ pub(crate) async fn build_mcp_state(
 async fn start_mcp_server(
     server: &McpServer,
     pending_elicitations: crate::elicitation::PendingElicitationMap,
-    event_bus: Arc<crate::event_bus::EventBus>,
+    event_sink: Arc<crate::event_sink::EventSink>,
     session_id: String,
 ) -> Result<
     (
@@ -106,7 +106,7 @@ async fn start_mcp_server(
                 .map_err(|e| Error::internal_error().data(e.to_string()))?;
             let handler = crate::elicitation::ElicitationHandler::new(
                 pending_elicitations.clone(),
-                event_bus.clone(),
+                event_sink.clone(),
                 name.clone(),
                 session_id.clone(),
             );
@@ -133,7 +133,7 @@ async fn start_mcp_server(
             );
             let handler = crate::elicitation::ElicitationHandler::new(
                 pending_elicitations.clone(),
-                event_bus.clone(),
+                event_sink.clone(),
                 name.clone(),
                 session_id.clone(),
             );
@@ -169,7 +169,7 @@ async fn start_mcp_server(
             })?;
             let handler = crate::elicitation::ElicitationHandler::new(
                 pending_elicitations,
-                event_bus,
+                event_sink,
                 name.clone(),
                 session_id,
             );

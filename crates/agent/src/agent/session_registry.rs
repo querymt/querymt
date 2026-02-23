@@ -187,8 +187,8 @@ impl SessionRegistry {
         };
 
         // 2. Spawn a local EventRelayActor for this session.
-        //    It republishes remote events on the local event bus.
-        let relay_actor = EventRelayActor::new(self.config.event_bus.clone(), peer_label.clone());
+        //    It persists durable remote events to the journal and publishes to fanout.
+        let relay_actor = EventRelayActor::new(self.config.event_sink.clone(), peer_label.clone());
         let relay_ref = EventRelayActor::spawn(relay_actor);
         let relay_id = relay_ref.id().sequence_id();
 
@@ -275,7 +275,7 @@ impl SessionRegistry {
         let (mcp_services, mcp_tools, mcp_tool_defs) = crate::agent::protocol::build_mcp_state(
             &merged_mcp,
             self.config.pending_elicitations(),
-            self.config.event_bus.clone(),
+            self.config.event_sink.clone(),
             session_id.clone(),
         )
         .await?;
@@ -318,7 +318,7 @@ impl SessionRegistry {
                     model: llm_config.model.clone(),
                     config_id: llm_config.id,
                     context_limit,
-                    provider_node: None,
+                    provider_node_id: None,
                 },
             );
         }
@@ -413,7 +413,7 @@ impl SessionRegistry {
         let (mcp_services, mcp_tools, mcp_tool_defs) = crate::agent::protocol::build_mcp_state(
             &merged_mcp,
             self.config.pending_elicitations(),
-            self.config.event_bus.clone(),
+            self.config.event_sink.clone(),
             session_id.clone(),
         )
         .await?;
@@ -448,7 +448,7 @@ impl SessionRegistry {
                     model: llm_config.model.clone(),
                     config_id: llm_config.id,
                     context_limit,
-                    provider_node: None,
+                    provider_node_id: None,
                 },
             );
         }
@@ -554,7 +554,7 @@ impl SessionRegistry {
         let (mcp_services, mcp_tools, mcp_tool_defs) = crate::agent::protocol::build_mcp_state(
             &merged_mcp,
             self.config.pending_elicitations(),
-            self.config.event_bus.clone(),
+            self.config.event_sink.clone(),
             session_id.clone(),
         )
         .await?;
@@ -648,25 +648,18 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::agent_config::AgentConfig;
-    use crate::agent::core::{
-        AgentMode, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy, ToolConfig,
-        ToolPolicy,
-    };
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::agent::core::ToolPolicy;
     use crate::agent::session_actor::SessionActor;
-    use crate::config::RuntimeExecutionPolicy;
-    use crate::delegation::DefaultAgentRegistry;
-    use crate::event_bus::EventBus;
-    use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
+    use crate::session::backend::StorageBackend;
     use crate::session::store::SessionStore;
     use crate::test_utils::{
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
         mock_plugin_registry, mock_session,
     };
-    use crate::tools::ToolRegistry;
     use kameo::actor::Spawn;
     use querymt::LLMParams;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -705,47 +698,22 @@ mod tests {
                 .times(0..);
 
             let store: Arc<dyn SessionStore> = Arc::new(store);
-            let provider_ctx = Arc::new(crate::session::provider::SessionProvider::new(
-                Arc::new(plugin_registry),
-                store.clone(),
-                LLMParams::new().provider("mock").model("mock-model"),
-            ));
+            let storage = Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                    .await
+                    .expect("create event store"),
+            );
 
-            let config = Arc::new(AgentConfig {
-                provider: provider_ctx,
-                event_bus: Arc::new(EventBus::new()),
-                agent_registry: Arc::new(DefaultAgentRegistry::new()),
-                workspace_manager_actor: WorkspaceIndexManagerActor::new(
-                    WorkspaceIndexManagerConfig::default(),
-                ),
-                default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
-                tool_config: ToolConfig {
-                    policy: ToolPolicy::ProviderOnly,
-                    ..ToolConfig::default()
-                },
-                tool_registry: ToolRegistry::new(),
-                middleware_drivers: Vec::new(),
-                auth_methods: Vec::new(),
-                max_steps: None,
-                snapshot_policy: SnapshotPolicy::None,
-                assume_mutating: true,
-                mutating_tools: HashSet::new(),
-                max_prompt_bytes: None,
-                execution_timeout_secs: 300,
-                delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
-                delegation_wait_timeout_secs: 120,
-                delegation_cancel_grace_secs: 5,
-                execution_policy: RuntimeExecutionPolicy::default(),
-                compaction: crate::session::compaction::SessionCompaction::new(),
-                snapshot_backend: None,
-                snapshot_gc_config: crate::snapshot::GcConfig::default(),
-                delegation_context_config: DelegationContextConfig {
-                    timing: DelegationContextTiming::FirstTurnOnly,
-                    auto_inject: true,
-                },
-                pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
-                mcp_servers: Vec::new(),
-            });
+            let config = Arc::new(
+                AgentConfigBuilder::new(
+                    Arc::new(plugin_registry),
+                    store.clone(),
+                    storage.event_journal(),
+                    LLMParams::new().provider("mock").model("mock-model"),
+                )
+                .with_tool_policy(ToolPolicy::ProviderOnly)
+                .build(),
+            );
 
             Self {
                 registry: SessionRegistry::new(config),
@@ -922,43 +890,20 @@ mod tests {
         };
         let factory = Arc::new(TestProviderFactory { provider: shared });
         let (plugin_registry, _temp) = mock_plugin_registry(factory).expect("registry");
-        let provider_ctx = Arc::new(crate::session::provider::SessionProvider::new(
-            Arc::new(plugin_registry),
-            store2.clone(),
-            LLMParams::new().provider("mock").model("mock-model"),
-        ));
-        let config = Arc::new(AgentConfig {
-            provider: provider_ctx,
-            event_bus: Arc::new(EventBus::new()),
-            agent_registry: Arc::new(DefaultAgentRegistry::new()),
-            workspace_manager_actor: WorkspaceIndexManagerActor::new(
-                WorkspaceIndexManagerConfig::default(),
-            ),
-            default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
-            tool_config: ToolConfig::default(),
-            tool_registry: ToolRegistry::new(),
-            middleware_drivers: Vec::new(),
-            auth_methods: Vec::new(),
-            max_steps: None,
-            snapshot_policy: SnapshotPolicy::None,
-            assume_mutating: true,
-            mutating_tools: HashSet::new(),
-            max_prompt_bytes: None,
-            execution_timeout_secs: 300,
-            delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
-            delegation_wait_timeout_secs: 120,
-            delegation_cancel_grace_secs: 5,
-            execution_policy: RuntimeExecutionPolicy::default(),
-            compaction: crate::session::compaction::SessionCompaction::new(),
-            snapshot_backend: None,
-            snapshot_gc_config: crate::snapshot::GcConfig::default(),
-            delegation_context_config: DelegationContextConfig {
-                timing: DelegationContextTiming::FirstTurnOnly,
-                auto_inject: true,
-            },
-            pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
-            mcp_servers: Vec::new(),
-        });
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("create event store"),
+        );
+        let config = Arc::new(
+            AgentConfigBuilder::new(
+                Arc::new(plugin_registry),
+                store2.clone(),
+                storage.event_journal(),
+                LLMParams::new().provider("mock").model("mock-model"),
+            )
+            .build(),
+        );
         let registry = SessionRegistry::new(config);
 
         let req = agent_client_protocol::ForkSessionRequest::new(

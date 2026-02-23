@@ -2,12 +2,12 @@
 //!
 //! Module H: The primary broken path — using Alpha's LLM model to run prompts
 //! on Beta's session. Tests `ProviderHostActor`, `MeshChatProvider`, and
-//! `build_provider_from_config` with `provider_node`.
+//! `build_provider_from_config` with `provider_node_id`.
 //!
 //! Module I: `setup_mesh_from_config` TOML-config translation layer.
 //!
 //! Bugs documented:
-//! - **#1** — `provider_node` never written to DB during `CreateRemoteSession`
+//! - **#1** — `provider_node_id` never written to DB during `CreateRemoteSession`
 //! - **#7** — `finish_reason` Debug string mismatch (H.11)
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -16,6 +16,7 @@
 
 #[cfg(all(test, feature = "remote"))]
 mod provider_routing_integration_tests {
+    use crate::agent::remote::NodeId;
     use crate::agent::remote::RemoteNodeManager;
     use crate::agent::remote::mesh_provider::MeshChatProvider;
     use crate::agent::remote::node_manager::CreateRemoteSession;
@@ -31,13 +32,22 @@ mod provider_routing_integration_tests {
     use tokio::sync::mpsc;
     use uuid::Uuid;
 
-    // ── H.1 — Session without provider_node uses local provider ───────────────
+    fn random_node_id() -> String {
+        NodeId::from_peer_id(
+            libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id(),
+        )
+        .to_string()
+    }
+
+    // ── H.1 — Session without provider_node_id uses local provider ───────────────
 
     #[tokio::test]
-    async fn test_session_with_no_provider_node_uses_local_provider() {
+    async fn test_session_with_no_provider_node_id_uses_local_provider() {
         let f = AgentConfigFixture::new().await;
 
-        // build_provider_from_config with provider_node = None uses local registry.
+        // build_provider_from_config with provider_node_id = None uses local registry.
         let registry = f.config.provider.plugin_registry();
         let result = build_provider_from_config(
             &registry,
@@ -46,8 +56,8 @@ mod provider_routing_integration_tests {
             None,
             None,
             ProviderRouting {
-                provider_node: None, // provider_node = None → local path
-                mesh_handle: None,   // mesh_handle = None
+                provider_node_id: None, // provider_node_id = None → local path
+                mesh_handle: None,      // mesh_handle = None
                 allow_mesh_fallback: false,
             },
         )
@@ -67,10 +77,10 @@ mod provider_routing_integration_tests {
         );
     }
 
-    // ── H.2 — provider_node persists in DB ────────────────────────────────────
+    // ── H.2 — provider_node_id persists in DB ────────────────────────────────────
 
     #[tokio::test]
-    async fn test_set_session_model_with_provider_node_persists() {
+    async fn test_set_session_model_with_provider_node_id_persists() {
         let test_id = Uuid::now_v7().to_string();
         let f = ProviderRoutingFixture::new(&test_id).await;
 
@@ -89,15 +99,15 @@ mod provider_routing_integration_tests {
 
         let session_id = resp.session_id.clone();
 
-        // Write provider_node to DB via the session store.
-        let provider_node_name = format!("alpha-{}", test_id);
+        // Write provider_node_id to DB via the session store.
+        let provider_node_id_name = format!("alpha-{}", test_id);
         f.beta
             .config
             .provider
             .history_store()
-            .set_session_provider_node(&session_id, Some(&provider_node_name))
+            .set_session_provider_node_id(&session_id, Some(&provider_node_id_name))
             .await
-            .expect("set_session_provider_node");
+            .expect("set_session_provider_node_id");
 
         // Read it back.
         let stored = f
@@ -105,28 +115,27 @@ mod provider_routing_integration_tests {
             .config
             .provider
             .history_store()
-            .get_session_provider_node(&session_id)
+            .get_session_provider_node_id(&session_id)
             .await
-            .expect("get_session_provider_node");
+            .expect("get_session_provider_node_id");
 
         assert_eq!(
             stored.as_deref(),
-            Some(provider_node_name.as_str()),
-            "provider_node should persist in DB"
+            Some(provider_node_id_name.as_str()),
+            "provider_node_id should persist in DB"
         );
     }
 
-    // ── H.3 — build_provider_from_config with provider_node → MeshChatProvider ─
+    // ── H.3 — build_provider_from_config with provider_node_id → MeshChatProvider ─
 
-    /// Tests **Bug #1 root cause**: when `provider_node` is set, the session
+    /// Tests **Bug #1 root cause**: when `provider_node_id` is set, the session
     /// should use `MeshChatProvider`. This test verifies the builder path.
     #[tokio::test]
     async fn test_build_provider_for_session_uses_mesh_chat_provider() {
-        let test_id = Uuid::now_v7().to_string();
         let f = AgentConfigFixture::new().await;
         let mesh = get_test_mesh().await;
 
-        let provider_node = format!("alpha-h3-{}", test_id);
+        let provider_node_id = random_node_id();
         let registry = f.config.provider.plugin_registry();
 
         let provider = build_provider_from_config(
@@ -136,13 +145,13 @@ mod provider_routing_integration_tests {
             None,
             None,
             ProviderRouting {
-                provider_node: Some(&provider_node), // explicit remote node
+                provider_node_id: Some(&provider_node_id), // explicit remote node
                 mesh_handle: Some(mesh),
                 allow_mesh_fallback: false,
             },
         )
         .await
-        .expect("build_provider_from_config with provider_node should succeed");
+        .expect("build_provider_from_config with provider_node_id should succeed");
 
         // `build_provider_from_config` returns `Arc<dyn LLMProvider>`.
         // `type_name_of_val` only sees the trait object type, not the concrete
@@ -169,7 +178,7 @@ mod provider_routing_integration_tests {
         let test_id = Uuid::now_v7().to_string();
         let f = ProviderRoutingFixture::new(&test_id).await;
 
-        // node_name without the "provider_host::" prefix
+        // node_id suffix used with "provider_host::peer::{node_id}".
         let node_name = format!("alpha-{}", test_id);
         let provider = MeshChatProvider::new(f.mesh, &node_name, "nonexistent", "no-model");
 
@@ -186,9 +195,9 @@ mod provider_routing_integration_tests {
 
     // ── H.5 — Full end-to-end: prompt on remote session using remote provider ─
 
-    /// Documents **Bug #1**: Alpha creates a session on Beta, sets `provider_node`
+    /// Documents **Bug #1**: Alpha creates a session on Beta, sets `provider_node_id`
     /// to Alpha's hostname, then runs a prompt. Currently this fails because
-    /// `CreateRemoteSession` never writes `provider_node` to the DB.
+    /// `CreateRemoteSession` never writes `provider_node_id` to the DB.
     ///
     /// When Bug #1 is fixed, this test should pass without the workaround.
     #[tokio::test]
@@ -208,44 +217,43 @@ mod provider_routing_integration_tests {
             .await
             .expect("create session on beta");
 
-        // Bug #1 workaround: manually write provider_node to DB.
-        let provider_node_name = format!("alpha-{}", test_id);
+        // Bug #1 workaround: manually write provider_node_id to DB.
+        let provider_node_id_name = format!("alpha-{}", test_id);
         f.beta
             .config
             .provider
             .history_store()
-            .set_session_provider_node(&resp.session_id, Some(&provider_node_name))
+            .set_session_provider_node_id(&resp.session_id, Some(&provider_node_id_name))
             .await
-            .expect("set_session_provider_node");
+            .expect("set_session_provider_node_id");
 
-        // Verify provider_node was persisted.
+        // Verify provider_node_id was persisted.
         let stored = f
             .beta
             .config
             .provider
             .history_store()
-            .get_session_provider_node(&resp.session_id)
+            .get_session_provider_node_id(&resp.session_id)
             .await
-            .expect("get_session_provider_node");
+            .expect("get_session_provider_node_id");
 
         assert_eq!(
             stored.as_deref(),
-            Some(provider_node_name.as_str()),
-            "Bug #1 workaround: provider_node must be set manually"
+            Some(provider_node_id_name.as_str()),
+            "Bug #1 workaround: provider_node_id must be set manually"
         );
-        // When Bug #1 is fixed, CreateRemoteSession should set provider_node
+        // When Bug #1 is fixed, CreateRemoteSession should set provider_node_id
         // automatically and this manual step should be unnecessary.
     }
 
-    // ── H.6 — Explicit provider_node overrides local ──────────────────────────
+    // ── H.6 — Explicit provider_node_id overrides local ──────────────────────────
 
     #[tokio::test]
-    async fn test_provider_node_explicit_overrides_local() {
-        let test_id = Uuid::now_v7().to_string();
+    async fn test_provider_node_id_explicit_overrides_local() {
         let f = AgentConfigFixture::new().await;
         let mesh = get_test_mesh().await;
 
-        let provider_node = format!("remote-h6-{}", test_id);
+        let provider_node_id = random_node_id();
         let registry = f.config.provider.plugin_registry();
 
         let provider = build_provider_from_config(
@@ -255,7 +263,7 @@ mod provider_routing_integration_tests {
             None,
             None,
             ProviderRouting {
-                provider_node: Some(&provider_node),
+                provider_node_id: Some(&provider_node_id),
                 mesh_handle: Some(mesh),
                 allow_mesh_fallback: false,
             },
@@ -285,10 +293,10 @@ mod provider_routing_integration_tests {
         }
     }
 
-    // ── H.7 — provider_node = "local" uses local provider ────────────────────
+    // ── H.7 — provider_node_id = "local" uses local provider ────────────────────
 
     #[tokio::test]
-    async fn test_provider_node_local_uses_local_provider() {
+    async fn test_provider_node_id_local_uses_local_provider() {
         let f = AgentConfigFixture::new().await;
         let mesh = get_test_mesh().await;
 
@@ -300,7 +308,7 @@ mod provider_routing_integration_tests {
             None,
             None,
             ProviderRouting {
-                provider_node: Some("local"), // "local" → bypass mesh
+                provider_node_id: Some("local"), // "local" → bypass mesh
                 mesh_handle: Some(mesh),
                 allow_mesh_fallback: false,
             },
@@ -474,18 +482,19 @@ mod provider_routing_integration_tests {
 //
 //  These tests exercise the **complete path** that was previously untested:
 //
-//  session DB (sessions.provider_node)
+//  session DB (sessions.provider_node_id)
 //    → `build_provider_for_session`
-//    → `get_session_provider_node`
-//    → `build_provider_from_config` with provider_node = Some(...)
+//    → `get_session_provider_node_id`
+//    → `build_provider_from_config` with provider_node_id = Some(...)
 //    → `MeshChatProvider`
 //
 //  Previously only `build_provider_from_config` was called directly in tests,
 //  bypassing the DB read-back.  Bug: `parse_llm_config_row` always returned
-//  `provider_node: None`, so the mesh routing path was never triggered.
+//  `provider_node_id: None`, so the mesh routing path was never triggered.
 
 #[cfg(all(test, feature = "remote"))]
 mod build_provider_for_session_tests {
+    use crate::agent::remote::NodeId;
     use crate::agent::remote::provider_host::ProviderHostActor;
     use crate::agent::remote::test_helpers::fixtures::{AgentConfigFixture, get_test_mesh};
     use crate::session::backend::StorageBackend as _;
@@ -497,21 +506,28 @@ mod build_provider_for_session_tests {
     use querymt::plugin::host::PluginRegistry;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use uuid::Uuid;
 
-    // ── J.1 — build_provider_for_session with provider_node reads from DB ─────
+    fn random_node_id() -> String {
+        NodeId::from_peer_id(
+            libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id(),
+        )
+        .to_string()
+    }
 
-    /// End-to-end test: write `provider_node` to DB via `set_session_provider_node`,
+    // ── J.1 — build_provider_for_session with provider_node_id reads from DB ─────
+
+    /// End-to-end test: write `provider_node_id` to DB via `set_session_provider_node_id`,
     /// then call `build_provider_for_session` and verify it uses `MeshChatProvider`
     /// (observable via the DHT lookup error for the named DHT key).
     ///
     /// This test was previously impossible because `parse_llm_config_row` always
-    /// returned `provider_node: None`, causing `build_provider_from_config` to
+    /// returned `provider_node_id: None`, causing `build_provider_from_config` to
     /// fall through to the local provider (Case 2), which would fail with
     /// "Unknown provider: anthropic" instead of routing through the mesh.
     #[tokio::test]
-    async fn test_build_provider_for_session_reads_provider_node_from_db() {
-        let test_id = Uuid::now_v7().to_string();
+    async fn test_build_provider_for_session_reads_provider_node_id_from_db() {
         let mesh = get_test_mesh().await;
 
         // Build a SessionProvider with a mesh handle.
@@ -540,21 +556,21 @@ mod build_provider_for_session_tests {
             .expect("create session");
         let session_id = session_handle.session().public_id.clone();
 
-        // Write a fake provider_node hostname to the DB.
-        let provider_node_name = format!("alpha-j1-{}", test_id);
+        // Write a fake provider_node_id hostname to the DB.
+        let provider_node_id_name = random_node_id();
         store
-            .set_session_provider_node(&session_id, Some(&provider_node_name))
+            .set_session_provider_node_id(&session_id, Some(&provider_node_id_name))
             .await
-            .expect("set_session_provider_node");
+            .expect("set_session_provider_node_id");
 
         // Call build_provider_for_session — previously this would return
-        // "Unknown provider: anthropic" because provider_node was not read from DB.
+        // "Unknown provider: anthropic" because provider_node_id was not read from DB.
         let result = session_provider
             .build_provider_for_session(&session_id)
             .await;
 
         // The provider should be a MeshChatProvider that tries to look up
-        // "provider_host::{provider_node_name}" in the DHT and fails since
+        // "provider_host::{provider_node_id_name}" in the DHT and fails since
         // no ProviderHostActor is registered there.  The error message should
         // name the DHT key, proving mesh routing was triggered.
         let provider =
@@ -573,13 +589,13 @@ mod build_provider_for_session_tests {
         }
     }
 
-    // ── J.2 — build_provider_for_session with no provider_node uses local path ─
+    // ── J.2 — build_provider_for_session with no provider_node_id uses local path ─
 
-    /// When `provider_node` is `None` in the DB, `build_provider_for_session`
+    /// When `provider_node_id` is `None` in the DB, `build_provider_for_session`
     /// should fall through to the local provider lookup (Case 2), which fails
     /// with "Unknown provider: anthropic" since the mock registry has no providers.
     #[tokio::test]
-    async fn test_build_provider_for_session_no_provider_node_uses_local_path() {
+    async fn test_build_provider_for_session_no_provider_node_id_uses_local_path() {
         let mesh = get_test_mesh().await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -606,7 +622,7 @@ mod build_provider_for_session_tests {
             .expect("create session");
         let session_id = session_handle.session().public_id.clone();
 
-        // Do NOT write provider_node to DB — it stays None.
+        // Do NOT write provider_node_id to DB — it stays None.
 
         // Should fail with local provider lookup error (not mesh routing).
         let result = session_provider
@@ -625,17 +641,16 @@ mod build_provider_for_session_tests {
         // Must NOT route through mesh (no DHT key in error).
         assert!(
             !err_str.contains("provider_host::"),
-            "should NOT route through mesh when provider_node is None, got: {err_str}"
+            "should NOT route through mesh when provider_node_id is None, got: {err_str}"
         );
     }
 
-    // ── J.3 — cache is keyed on (config_id, provider_node) ───────────────────
+    // ── J.3 — cache is keyed on (config_id, provider_node_id) ───────────────────
 
-    /// Verify that changing `provider_node` in the DB causes a cache miss and
+    /// Verify that changing `provider_node_id` in the DB causes a cache miss and
     /// rebuilds the provider, even if `config_id` stays the same.
     #[tokio::test]
-    async fn test_build_provider_for_session_cache_keyed_on_provider_node() {
-        let test_id = Uuid::now_v7().to_string();
+    async fn test_build_provider_for_session_cache_keyed_on_provider_node_id() {
         let mesh = get_test_mesh().await;
 
         // Set up a ProviderHostActor for "alpha" so the MeshChatProvider can
@@ -643,7 +658,8 @@ mod build_provider_for_session_tests {
         let f = AgentConfigFixture::new().await;
         let actor = ProviderHostActor::new(f.config.clone());
         let actor_ref = ProviderHostActor::spawn(actor);
-        let alpha_dht = format!("provider_host::alpha-j3-{}", test_id);
+        let alpha_node_id = random_node_id();
+        let alpha_dht = format!("provider_host::peer::{}", alpha_node_id);
         mesh.register_actor(actor_ref, alpha_dht.clone()).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -670,7 +686,7 @@ mod build_provider_for_session_tests {
             .expect("create session");
         let session_id = session_handle.session().public_id.clone();
 
-        // First: set provider_node = None (local path → error "Unknown provider")
+        // First: set provider_node_id = None (local path → error "Unknown provider")
         let result1 = session_provider
             .build_provider_for_session(&session_id)
             .await;
@@ -679,14 +695,13 @@ mod build_provider_for_session_tests {
             "first call: should fail (no local 'anthropic')"
         );
 
-        // Second: set provider_node = alpha → should build a MeshChatProvider.
-        let alpha_hostname = format!("alpha-j3-{}", test_id);
+        // Second: set provider_node_id = alpha node id → should build a MeshChatProvider.
         store
-            .set_session_provider_node(&session_id, Some(&alpha_hostname))
+            .set_session_provider_node_id(&session_id, Some(&alpha_node_id))
             .await
-            .expect("set_session_provider_node");
+            .expect("set_session_provider_node_id");
 
-        // Same config_id, different provider_node → cache should miss and rebuild.
+        // Same config_id, different provider_node_id → cache should miss and rebuild.
         let provider2 = session_provider
             .build_provider_for_session(&session_id)
             .await
@@ -724,8 +739,8 @@ mod build_provider_for_session_tests {
 //     NOT propagating into `config.provider.mesh`.
 //
 //  Result: `build_provider_for_session` received `mesh_handle = None` even when
-//  `provider_node` was set, producing:
-//    "provider_node='nostromo' specified but no mesh handle available"
+//  `provider_node_id` was set, producing:
+//    "provider_node_id='nostromo' specified but no mesh handle available"
 //
 //  Fix: `SessionProvider.mesh` is now `Arc<StdMutex<Option<MeshHandle>>>` so all
 //  clones share the same cell.  `AgentHandle::set_mesh` writes into that cell via
@@ -734,6 +749,7 @@ mod build_provider_for_session_tests {
 
 #[cfg(all(test, feature = "remote"))]
 mod set_mesh_after_build_tests {
+    use crate::agent::remote::NodeId;
     use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
     use crate::session::backend::StorageBackend as _;
     use crate::session::provider::SessionProvider;
@@ -743,7 +759,15 @@ mod set_mesh_after_build_tests {
     use querymt::plugin::host::PluginRegistry;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use uuid::Uuid;
+
+    fn random_node_id() -> String {
+        NodeId::from_peer_id(
+            libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id(),
+        )
+        .to_string()
+    }
 
     // ── K.1 — set_mesh after Arc is shared makes mesh visible to build_provider ─
 
@@ -754,12 +778,11 @@ mod set_mesh_after_build_tests {
     ///   4. Call `set_mesh` on the original — ALL clones must see it.
     ///   5. Create a session via the clone and call `build_provider_for_session`.
     ///
-    /// Before the fix this returned "provider_node='...' specified but no mesh
+    /// Before the fix this returned "provider_node_id='...' specified but no mesh
     /// handle available".  After the fix it should return a `MeshChatProvider`
     /// (observable via DHT-key error).
     #[tokio::test]
     async fn test_set_mesh_after_arc_shared_propagates_to_clones() {
-        let test_id = Uuid::now_v7().to_string();
         let mesh = get_test_mesh().await;
 
         // ── Step 1-2: build SessionProvider with mesh = None, wrap in Arc ──────
@@ -796,12 +819,12 @@ mod set_mesh_after_build_tests {
             .expect("create session");
         let session_id = session_handle.session().public_id.clone();
 
-        // Write provider_node (simulates handle_set_session_model on Agent A).
-        let provider_node_name = format!("nostromo-k1-{}", test_id);
+        // Write provider_node_id (simulates handle_set_session_model on Agent A).
+        let provider_node_id_name = random_node_id();
         store
-            .set_session_provider_node(&session_id, Some(&provider_node_name))
+            .set_session_provider_node_id(&session_id, Some(&provider_node_id_name))
             .await
-            .expect("set_session_provider_node");
+            .expect("set_session_provider_node_id");
 
         // Should build a MeshChatProvider — NOT return "no mesh handle available".
         let result = remote_clone.build_provider_for_session(&session_id).await;
@@ -855,7 +878,7 @@ mod set_mesh_after_build_tests {
         session_provider.set_mesh(Some(mesh.clone()));
         session_provider.set_mesh(None);
 
-        // With mesh cleared + provider_node set → should get "no mesh handle"
+        // With mesh cleared + provider_node_id set → should get "no mesh handle"
         // error (not a DHT-key error).
         let exec_config = crate::session::store::SessionExecutionConfig::default();
         let session_handle = session_provider
@@ -864,17 +887,18 @@ mod set_mesh_after_build_tests {
             .expect("create session");
         let session_id = session_handle.session().public_id.clone();
 
+        let random_remote_node = random_node_id();
         store
-            .set_session_provider_node(&session_id, Some("some-node"))
+            .set_session_provider_node_id(&session_id, Some(&random_remote_node))
             .await
-            .expect("set_session_provider_node");
+            .expect("set_session_provider_node_id");
 
         let result = session_provider
             .build_provider_for_session(&session_id)
             .await;
         assert!(
             result.is_err(),
-            "should fail when mesh is None but provider_node is set"
+            "should fail when mesh is None but provider_node_id is set"
         );
         let msg = result.err().expect("should be err").to_string();
         assert!(
@@ -892,7 +916,6 @@ mod set_mesh_after_build_tests {
     async fn test_agent_handle_set_mesh_propagates_to_session_provider() {
         use crate::agent::agent_config_builder::AgentConfigBuilder;
 
-        let test_id = Uuid::now_v7().to_string();
         let mesh = get_test_mesh().await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -909,7 +932,9 @@ mod set_mesh_after_build_tests {
         let llm = LLMParams::new().provider("anthropic").model("claude-haiku");
 
         // Build AgentConfig the same way AgentConfigBuilder does it (no mesh).
-        let config = Arc::new(AgentConfigBuilder::new(registry, store.clone(), llm).build());
+        let config = Arc::new(
+            AgentConfigBuilder::new(registry, store.clone(), storage.event_journal(), llm).build(),
+        );
 
         // Simulate RemoteNodeManager capturing config before set_mesh is called.
         let remote_config = Arc::clone(&config);
@@ -928,11 +953,11 @@ mod set_mesh_after_build_tests {
             .expect("create session");
         let session_id = session_handle.session().public_id.clone();
 
-        let provider_node_name = format!("nostromo-k3-{}", test_id);
+        let provider_node_id_name = random_node_id();
         store
-            .set_session_provider_node(&session_id, Some(&provider_node_name))
+            .set_session_provider_node_id(&session_id, Some(&provider_node_id_name))
             .await
-            .expect("set_session_provider_node");
+            .expect("set_session_provider_node_id");
 
         // Must NOT return "no mesh handle available".
         let result = remote_config
@@ -1055,7 +1080,7 @@ mod mesh_setup_config_tests {
         let actor_ref = ProviderHostActor::spawn(actor);
 
         let hostname = format!("test-host-i5-{}", test_id);
-        let dht_name = format!("provider_host::{}", hostname);
+        let dht_name = format!("provider_host::peer::{}", hostname);
         mesh.register_actor(actor_ref.clone(), dht_name.clone())
             .await;
         let _ = actor_ref;

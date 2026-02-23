@@ -64,7 +64,7 @@ impl DelegationSummarizer {
             config.api_key.as_deref(),
             #[cfg(feature = "remote")]
             ProviderRouting {
-                provider_node: None,        // summarizer always uses local provider
+                provider_node_id: None,     // summarizer always uses local provider
                 mesh_handle: None,          // not needed for summarizer
                 allow_mesh_fallback: false, // should not hop across peers
             },

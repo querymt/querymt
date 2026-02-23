@@ -3,9 +3,10 @@
 //! Handles session creation, agent lookup, routing modes (single/broadcast),
 //! and session-related state management.
 
-use super::ServerState;
 use super::messages::{RoutingMode, UiAgentInfo, UiPromptBlock, UiServerMessage};
+use super::{ServerState, cursor_from_events};
 use crate::agent::AgentHandle;
+use crate::events::EventEnvelope;
 use crate::index::{normalize_cwd, resolve_workspace_root};
 use crate::send_agent::SendAgent;
 use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest};
@@ -178,17 +179,14 @@ pub async fn ensure_session(
     // Replay stored events for the new session (includes ProviderChanged)
     // No child sessions for a new session
     if let Ok(audit) = state.view_store.get_audit_view(&session_id, false).await {
-        let cursor_seq = audit
-            .events
-            .iter()
-            .map(|event| event.seq)
-            .max()
-            .unwrap_or(0);
+        let cursor = cursor_from_events(&audit.events);
+        let events: Vec<EventEnvelope> = audit.events.into_iter().map(Into::into).collect();
 
         {
             let mut connections = state.connections.lock().await;
             if let Some(conn) = connections.get_mut(conn_id) {
-                conn.session_cursors.insert(session_id.clone(), cursor_seq);
+                conn.session_cursors
+                    .insert(session_id.clone(), cursor.clone());
             }
         }
 
@@ -197,8 +195,8 @@ pub async fn ensure_session(
             UiServerMessage::SessionEvents {
                 session_id: session_id.clone(),
                 agent_id: agent_id.to_string(),
-                events: audit.events,
-                cursor_seq,
+                events,
+                cursor,
             },
         )
         .await;
@@ -327,7 +325,9 @@ pub fn resolve_cwd(cwd: Option<String>) -> Option<PathBuf> {
 }
 
 /// Collect event sources from the agent and its registry.
-pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<crate::event_bus::EventBus>> {
+pub fn collect_event_sources(
+    agent: &Arc<AgentHandle>,
+) -> Vec<Arc<crate::event_fanout::EventFanout>> {
     // Delegate to the shared implementation in acp/shared.rs
     crate::acp::shared::collect_event_sources(agent)
 }

@@ -1,4 +1,4 @@
-use crate::events::{AgentEvent, AgentEventKind, EventObserver};
+use crate::events::{AgentEvent, AgentEventKind, DurableEvent, EventOrigin};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::{
     Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
@@ -7,10 +7,10 @@ use crate::session::domain::{
 };
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::projection::{
-    AuditView, DefaultRedactor, EventStore, FilterExpr, PredicateOp, RecentModelEntry,
-    RecentModelsView, RedactedArtifact, RedactedProgress, RedactedTask, RedactedView,
-    RedactionPolicy, Redactor, SessionGroup, SessionListFilter, SessionListItem, SessionListView,
-    SummaryView, ViewStore,
+    AuditView, DefaultRedactor, EventJournal, FilterExpr, NewDurableEvent, PredicateOp,
+    RecentModelEntry, RecentModelsView, RedactedArtifact, RedactedProgress, RedactedTask,
+    RedactedView, RedactionPolicy, Redactor, SessionGroup, SessionListFilter, SessionListItem,
+    SessionListView, SummaryView, ViewStore,
 };
 use crate::session::repo_artifact::SqliteArtifactRepository;
 use crate::session::repo_decision::SqliteDecisionRepository;
@@ -31,7 +31,7 @@ use crate::session::store::{
 use async_trait::async_trait;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
-use querymt::error::LLMError;
+
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -43,9 +43,8 @@ use uuid::Uuid;
 ///
 /// This implementation provides all storage functionality in a single struct:
 /// - Session and message persistence (SessionStore)
-/// - Event persistence and querying (EventStore)
+/// - Durable event persistence and querying (EventJournal)
 /// - View generation for observability (ViewStore)
-/// - Event observation for the event bus (EventObserver)
 /// - Storage backend interface (StorageBackend)
 ///
 /// ## Session Isolation Guarantees
@@ -72,6 +71,12 @@ pub struct SqliteStorage {
 }
 
 impl SqliteStorage {
+    /// Expose the raw connection for test assertions (e.g. querying legacy tables).
+    #[cfg(test)]
+    pub fn conn_for_test(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
+    }
+
     pub async fn connect(path: PathBuf) -> SessionResult<Self> {
         Self::connect_with_options(path, true).await
     }
@@ -496,7 +501,7 @@ impl SessionStore for SqliteStorage {
                     &time::format_description::well_known::Rfc3339,
                 )
                 .ok(),
-                provider_node: None,
+                provider_node_id: None,
             })
         })
         .await
@@ -554,18 +559,18 @@ impl SessionStore for SqliteStorage {
         })
     }
 
-    async fn set_session_provider_node(
+    async fn set_session_provider_node_id(
         &self,
         session_id: &str,
-        provider_node: Option<&str>,
+        provider_node_id: Option<&str>,
     ) -> SessionResult<()> {
         let session_internal_id = self.resolve_session_internal_id(session_id).await?;
-        let provider_node_owned = provider_node.map(|s| s.to_string());
+        let provider_node_id_owned = provider_node_id.map(|s| s.to_string());
         self.run_blocking(move |conn| {
             conn.execute(
-                "UPDATE sessions SET provider_node = ?, updated_at = ? WHERE id = ?",
+                "UPDATE sessions SET provider_node_id = ?, updated_at = ? WHERE id = ?",
                 params![
-                    provider_node_owned,
+                    provider_node_id_owned,
                     OffsetDateTime::now_utc()
                         .format(&time::format_description::well_known::Rfc3339)
                         .unwrap_or_default(),
@@ -577,11 +582,14 @@ impl SessionStore for SqliteStorage {
         .await
     }
 
-    async fn get_session_provider_node(&self, session_id: &str) -> SessionResult<Option<String>> {
+    async fn get_session_provider_node_id(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<String>> {
         let session_internal_id = self.resolve_session_internal_id(session_id).await?;
         self.run_blocking(move |conn| {
             let result: rusqlite::Result<Option<String>> = conn.query_row(
-                "SELECT provider_node FROM sessions WHERE id = ?",
+                "SELECT provider_node_id FROM sessions WHERE id = ?",
                 params![session_internal_id],
                 |row| row.get(0),
             );
@@ -1301,55 +1309,25 @@ impl SessionStore for SqliteStorage {
 }
 
 // ============================================================================
-// EventStore implementation
+// Legacy EventStore methods — kept as inherent methods for ViewStore
 // ============================================================================
 
-#[async_trait]
-impl EventStore for SqliteStorage {
-    async fn append_event(&self, event: &AgentEvent) -> SessionResult<()> {
-        let conn_arc = self.conn.clone();
-        let event_clone = event.clone();
-
-        tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
-            let kind_json = serde_json::to_string(&event_clone.kind)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-            conn.execute(
-                "INSERT INTO events (timestamp, session_id, kind) VALUES (?, ?, ?)",
-                rusqlite::params![event_clone.timestamp, &event_clone.session_id, kind_json],
-            )?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
-    }
-
-    async fn get_session_events(&self, session_id: &str) -> SessionResult<Vec<AgentEvent>> {
+impl SqliteStorage {
+    /// Get all events for a session (reads from the `event_journal` table).
+    pub async fn get_session_events(&self, session_id: &str) -> SessionResult<Vec<AgentEvent>> {
         let session_id_str = session_id.to_string();
         let conn_arc = self.conn.clone();
 
         tokio::task::spawn_blocking(move || -> Result<Vec<AgentEvent>, rusqlite::Error> {
             let conn = conn_arc.lock().unwrap();
-            let mut stmt = conn
-                .prepare("SELECT seq, timestamp, session_id, kind FROM events WHERE session_id = ? ORDER BY seq ASC")?;
+            let mut stmt = conn.prepare(
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json \
+                 FROM event_journal WHERE session_id = ? ORDER BY stream_seq ASC",
+            )?;
 
             let events = stmt
                 .query_map([session_id_str], |row| {
-                    let kind_json: String = row.get(3)?;
-                    let kind: AgentEventKind = serde_json::from_str(&kind_json)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
-
-                    Ok(AgentEvent {
-                        seq: row.get(0)?,
-                        timestamp: row.get(1)?,
-                        session_id: row.get(2)?,
-                        origin: crate::events::EventOrigin::Local,
-                        source_node: None,
-                        kind,
-                    })
+                    parse_journal_row(row).map(|de| de.into())
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
 
@@ -1360,7 +1338,8 @@ impl EventStore for SqliteStorage {
         .map_err(SessionError::from)
     }
 
-    async fn get_events_since(
+    /// Get events since a specific sequence number (reads from the `event_journal` table).
+    pub async fn get_events_since(
         &self,
         session_id: &str,
         after_seq: u64,
@@ -1370,23 +1349,14 @@ impl EventStore for SqliteStorage {
 
         tokio::task::spawn_blocking(move || -> Result<Vec<AgentEvent>, rusqlite::Error> {
             let conn = conn_arc.lock().unwrap();
-            let mut stmt = conn
-                .prepare("SELECT seq, timestamp, session_id, kind FROM events WHERE session_id = ? AND seq > ? ORDER BY seq ASC")?;
+            let mut stmt = conn.prepare(
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json \
+                 FROM event_journal WHERE session_id = ? AND stream_seq > ? ORDER BY stream_seq ASC",
+            )?;
 
             let events = stmt
                 .query_map(rusqlite::params![session_id_str, after_seq], |row| {
-                    let kind_json: String = row.get(3)?;
-                    let kind: AgentEventKind = serde_json::from_str(&kind_json)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
-
-                    Ok(AgentEvent {
-                        seq: row.get(0)?,
-                        timestamp: row.get(1)?,
-                        session_id: row.get(2)?,
-                        origin: crate::events::EventOrigin::Local,
-                        source_node: None,
-                        kind,
-                    })
+                    parse_journal_row(row).map(|de| de.into())
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
 
@@ -1974,26 +1944,163 @@ fn evaluate_predicate(
 }
 
 // ============================================================================
-// EventObserver implementation
+// EventJournal — durable event persistence (new pipeline)
 // ============================================================================
 
 #[async_trait]
-impl EventObserver for SqliteStorage {
-    async fn on_event(&self, event: &AgentEvent) -> Result<(), LLMError> {
-        // Streaming delta events are ephemeral — they must not be written to the
-        // event store. Only AssistantMessageStored (with accumulated content) is
-        // persisted so that replays are efficient and contain complete content.
-        match &event.kind {
-            crate::events::AgentEventKind::AssistantContentDelta { .. }
-            | crate::events::AgentEventKind::AssistantThinkingDelta { .. } => return Ok(()),
-            _ => {}
-        }
+impl EventJournal for SqliteStorage {
+    async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent> {
+        let event_clone = event.clone();
+        let conn_arc = self.conn.clone();
 
-        self.append_event(event)
-            .await
-            .map_err(|e| LLMError::ProviderError(format!("Event storage failed: {}", e)))?;
-        Ok(())
+        tokio::task::spawn_blocking(move || -> Result<DurableEvent, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+
+            let kind_tag = serde_json::to_value(&event_clone.kind)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let payload_json = serde_json::to_string(&event_clone.kind)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            let origin_str = match &event_clone.origin {
+                EventOrigin::Local => "local",
+                EventOrigin::Remote => "remote",
+                EventOrigin::Unknown(s) => s.as_str(),
+            };
+
+            let event_id = Uuid::now_v7().to_string();
+            let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+
+            // Atomically allocate the next stream_seq and insert the event.
+            let stream_seq: u64 = conn.query_row(
+                "UPDATE event_journal_seq SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1",
+                [],
+                |row| row.get(0),
+            )?;
+
+            conn.execute(
+                "INSERT INTO event_journal (event_id, stream_seq, session_id, timestamp, origin, source_node, kind, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    event_id,
+                    stream_seq,
+                    event_clone.session_id,
+                    timestamp,
+                    origin_str,
+                    event_clone.source_node,
+                    kind_tag,
+                    payload_json,
+                ],
+            )?;
+
+            Ok(DurableEvent {
+                event_id,
+                stream_seq,
+                session_id: event_clone.session_id,
+                timestamp,
+                origin: event_clone.origin,
+                source_node: event_clone.source_node,
+                kind: event_clone.kind,
+            })
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
     }
+
+    async fn load_session_stream(
+        &self,
+        session_id: &str,
+        after_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        let session_id = session_id.to_string();
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            let after = after_seq.unwrap_or(0);
+            let lim = limit.unwrap_or(10_000) as i64;
+
+            let mut stmt = conn.prepare(
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json \
+                 FROM event_journal \
+                 WHERE session_id = ? AND stream_seq > ? \
+                 ORDER BY stream_seq ASC \
+                 LIMIT ?",
+            )?;
+
+            let events = stmt
+                .query_map(params![session_id, after, lim], parse_journal_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(events)
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    async fn load_global_stream(
+        &self,
+        after_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            let after = after_seq.unwrap_or(0);
+            let lim = limit.unwrap_or(10_000) as i64;
+
+            let mut stmt = conn.prepare(
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json \
+                 FROM event_journal \
+                 WHERE stream_seq > ? \
+                 ORDER BY stream_seq ASC \
+                 LIMIT ?",
+            )?;
+
+            let events = stmt
+                .query_map(params![after, lim], parse_journal_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(events)
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+}
+
+fn parse_journal_row(row: &rusqlite::Row) -> Result<DurableEvent, rusqlite::Error> {
+    let event_id: String = row.get(0)?;
+    let stream_seq: u64 = row.get(1)?;
+    let session_id: String = row.get(2)?;
+    let timestamp: i64 = row.get(3)?;
+    let origin_str: String = row.get(4)?;
+    let source_node: Option<String> = row.get(5)?;
+    let payload_json: String = row.get(6)?;
+
+    let origin = match origin_str.as_str() {
+        "local" => EventOrigin::Local,
+        "remote" => EventOrigin::Remote,
+        other => EventOrigin::Unknown(other.to_string()),
+    };
+
+    let kind: AgentEventKind =
+        serde_json::from_str(&payload_json).map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+    Ok(DurableEvent {
+        event_id,
+        stream_seq,
+        session_id,
+        timestamp,
+        origin,
+        source_node,
+        kind,
+    })
 }
 
 // ============================================================================
@@ -2028,7 +2135,7 @@ fn parse_llm_config_row(row: &rusqlite::Row<'_>) -> Result<LLMConfig, rusqlite::
         updated_at: row.get::<_, Option<String>>(6)?.and_then(|s| {
             OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).ok()
         }),
-        provider_node: None,
+        provider_node_id: None,
     })
 }
 
@@ -2039,10 +2146,16 @@ struct Migration {
     apply: MigrationFn,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: "0001_initial_reset",
-    apply: migration_0001_initial_reset,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: "0001_initial_reset",
+        apply: migration_0001_initial_reset,
+    },
+    Migration {
+        version: "0002_drop_legacy_events",
+        apply: migration_0002_drop_legacy_events,
+    },
+];
 
 fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
@@ -2110,6 +2223,17 @@ fn migration_0001_initial_reset(conn: &mut Connection) -> Result<(), rusqlite::E
     Ok(())
 }
 
+fn migration_0002_drop_legacy_events(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    // The legacy `events` table is no longer used. All event reads and writes
+    // go through the `event_journal` table exclusively.
+    conn.execute_batch(
+        r#"
+            DROP TABLE IF EXISTS events;
+        "#,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2130,17 +2254,52 @@ mod tests {
     }
 
     #[test]
+    fn migration_0002_drops_legacy_events_table() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        apply_migrations(&mut conn).expect("apply migrations");
+
+        let events_table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check events table");
+        assert_eq!(
+            events_table_count, 0,
+            "legacy events table should be dropped"
+        );
+
+        // event_journal table should still exist
+        let journal_table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='event_journal'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check event_journal table");
+        assert_eq!(journal_table_count, 1, "event_journal table should exist");
+    }
+
+    #[test]
     fn migrations_are_idempotent() {
         let mut conn = Connection::open_in_memory().expect("in-memory db");
         apply_migrations(&mut conn).expect("first migration run");
-        apply_migrations(&mut conn).expect("second migration run");
-
-        let count: i64 = conn
+        let count_after_first: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
                 row.get(0)
             })
             .expect("count migration rows");
-        assert_eq!(count, 1);
+
+        apply_migrations(&mut conn).expect("second migration run");
+        let count_after_second: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("count migration rows");
+
+        assert_eq!(count_after_first, MIGRATIONS.len() as i64);
+        assert_eq!(count_after_first, count_after_second);
     }
 
     #[tokio::test]
@@ -2219,5 +2378,246 @@ mod tests {
             .await
             .expect("get custom model after delete");
         assert!(after_delete.is_none());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // EventJournal tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    fn new_durable(session_id: &str, kind: AgentEventKind) -> NewDurableEvent {
+        NewDurableEvent {
+            session_id: session_id.to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind,
+        }
+    }
+
+    #[tokio::test]
+    async fn journal_append_durable_assigns_monotonic_seq() {
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let journal: &dyn EventJournal = &storage;
+
+        let e1 = journal
+            .append_durable(&new_durable("s1", AgentEventKind::SessionCreated))
+            .await
+            .unwrap();
+        let e2 = journal
+            .append_durable(&new_durable("s1", AgentEventKind::Cancelled))
+            .await
+            .unwrap();
+
+        assert!(
+            e2.stream_seq > e1.stream_seq,
+            "seq must be monotonically increasing"
+        );
+        assert_ne!(e1.event_id, e2.event_id, "event_ids must be unique");
+    }
+
+    #[tokio::test]
+    async fn journal_append_durable_returns_correct_fields() {
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let journal: &dyn EventJournal = &storage;
+
+        let evt = journal
+            .append_durable(&NewDurableEvent {
+                session_id: "sess-x".to_string(),
+                origin: EventOrigin::Remote,
+                source_node: Some("node-a".to_string()),
+                kind: AgentEventKind::Cancelled,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(evt.session_id, "sess-x");
+        assert!(matches!(evt.origin, EventOrigin::Remote));
+        assert_eq!(evt.source_node.as_deref(), Some("node-a"));
+        assert!(matches!(evt.kind, AgentEventKind::Cancelled));
+        assert!(evt.stream_seq >= 1);
+        assert!(!evt.event_id.is_empty());
+        assert!(evt.timestamp > 0);
+    }
+
+    #[tokio::test]
+    async fn journal_load_session_stream_returns_only_matching_session() {
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let journal: &dyn EventJournal = &storage;
+
+        journal
+            .append_durable(&new_durable("s1", AgentEventKind::SessionCreated))
+            .await
+            .unwrap();
+        journal
+            .append_durable(&new_durable("s2", AgentEventKind::SessionCreated))
+            .await
+            .unwrap();
+        journal
+            .append_durable(&new_durable("s1", AgentEventKind::Cancelled))
+            .await
+            .unwrap();
+
+        let s1_events = journal.load_session_stream("s1", None, None).await.unwrap();
+        assert_eq!(s1_events.len(), 2);
+        assert!(s1_events.iter().all(|e| e.session_id == "s1"));
+
+        let s2_events = journal.load_session_stream("s2", None, None).await.unwrap();
+        assert_eq!(s2_events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn journal_load_session_stream_respects_after_seq_cursor() {
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let journal: &dyn EventJournal = &storage;
+
+        let e1 = journal
+            .append_durable(&new_durable("s1", AgentEventKind::SessionCreated))
+            .await
+            .unwrap();
+        let _e2 = journal
+            .append_durable(&new_durable("s1", AgentEventKind::Cancelled))
+            .await
+            .unwrap();
+        let _e3 = journal
+            .append_durable(&new_durable(
+                "s1",
+                AgentEventKind::Error {
+                    message: "x".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let after_first = journal
+            .load_session_stream("s1", Some(e1.stream_seq), None)
+            .await
+            .unwrap();
+        assert_eq!(after_first.len(), 2);
+        assert!(after_first[0].stream_seq > e1.stream_seq);
+    }
+
+    #[tokio::test]
+    async fn journal_load_session_stream_respects_limit() {
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let journal: &dyn EventJournal = &storage;
+
+        for _ in 0..5 {
+            journal
+                .append_durable(&new_durable("s1", AgentEventKind::Cancelled))
+                .await
+                .unwrap();
+        }
+
+        let limited = journal
+            .load_session_stream("s1", None, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn journal_load_global_stream_returns_all_sessions() {
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let journal: &dyn EventJournal = &storage;
+
+        journal
+            .append_durable(&new_durable("s1", AgentEventKind::SessionCreated))
+            .await
+            .unwrap();
+        journal
+            .append_durable(&new_durable("s2", AgentEventKind::SessionCreated))
+            .await
+            .unwrap();
+
+        let global = journal.load_global_stream(None, None).await.unwrap();
+        assert_eq!(global.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn journal_load_global_stream_respects_cursor() {
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let journal: &dyn EventJournal = &storage;
+
+        let e1 = journal
+            .append_durable(&new_durable("s1", AgentEventKind::SessionCreated))
+            .await
+            .unwrap();
+        journal
+            .append_durable(&new_durable("s2", AgentEventKind::SessionCreated))
+            .await
+            .unwrap();
+
+        let after = journal
+            .load_global_stream(Some(e1.stream_seq), None)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].session_id, "s2");
+    }
+
+    #[tokio::test]
+    async fn journal_durable_event_never_replayed_for_ephemeral_kind() {
+        // Verify that classify_durability correctly identifies ephemeral events;
+        // the EventSink will use this to route. The journal itself doesn't filter.
+        assert_eq!(
+            crate::events::classify_durability(&AgentEventKind::AssistantContentDelta {
+                content: "x".into(),
+                message_id: "m".into(),
+            }),
+            crate::events::Durability::Ephemeral
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_empty_session_returns_empty_vec() {
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let journal: &dyn EventJournal = &storage;
+
+        let events = journal
+            .load_session_stream("nonexistent", None, None)
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn journal_ordering_is_monotonic_per_stream() {
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let journal: &dyn EventJournal = &storage;
+
+        for _ in 0..10 {
+            journal
+                .append_durable(&new_durable("s1", AgentEventKind::Cancelled))
+                .await
+                .unwrap();
+        }
+
+        let events = journal.load_session_stream("s1", None, None).await.unwrap();
+        for window in events.windows(2) {
+            assert!(
+                window[1].stream_seq > window[0].stream_seq,
+                "stream_seq must be strictly increasing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn journal_preserves_remote_origin_and_source_node() {
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let journal: &dyn EventJournal = &storage;
+
+        journal
+            .append_durable(&NewDurableEvent {
+                session_id: "s1".to_string(),
+                origin: EventOrigin::Remote,
+                source_node: Some("peer-42".to_string()),
+                kind: AgentEventKind::SessionCreated,
+            })
+            .await
+            .unwrap();
+
+        let events = journal.load_session_stream("s1", None, None).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].origin, EventOrigin::Remote));
+        assert_eq!(events[0].source_node.as_deref(), Some("peer-42"));
     }
 }

@@ -135,8 +135,7 @@ pub struct MeshHandle {
     /// Set of currently-alive peer IDs (inserted on Discovered, removed on Expired).
     /// Used as ground truth to filter stale DHT records when listing remote nodes.
     known_peers: Arc<RwLock<HashSet<PeerId>>>,
-    /// Hostname of this node, cached at bootstrap time.
-    /// Used to tag local models with a `provider_node` when routing through the mesh.
+    /// Hostname of this node, cached at bootstrap time for display-only metadata.
     local_hostname: Arc<String>,
 }
 

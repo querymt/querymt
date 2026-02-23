@@ -128,7 +128,12 @@ pub(crate) mod fixtures {
             );
             let llm = LLMParams::new().provider("mock").model("mock");
 
-            let builder = AgentConfigBuilder::new(plugin_registry, storage.session_store(), llm);
+            let builder = AgentConfigBuilder::new(
+                plugin_registry,
+                storage.session_store(),
+                storage.event_journal(),
+                llm,
+            );
             let config = Arc::new(builder.build());
 
             Self {
@@ -276,7 +281,7 @@ pub(crate) mod fixtures {
 
     // ── NodeManagerFixture ────────────────────────────────────────────────────
 
-    /// Fixture for `RemoteNodeManager` tests that do **not** require a mesh.
+    /// Fixture for `RemoteNodeManager` tests that do not require mesh registration.
     ///
     /// ```rust,ignore
     /// let f = NodeManagerFixture::new().await;
@@ -290,10 +295,25 @@ pub(crate) mod fixtures {
     }
 
     impl NodeManagerFixture {
+        /// Create a node manager fixture without mesh bootstrap.
         pub async fn new() -> Self {
             let f = AgentConfigFixture::new().await;
             let registry = Arc::new(Mutex::new(SessionRegistry::new(f.config.clone())));
             let nm = RemoteNodeManager::new(f.config.clone(), registry, None);
+            let actor_ref = RemoteNodeManager::spawn(nm);
+            Self {
+                actor_ref,
+                config: f.config,
+                _tempdir: f._tempdir,
+            }
+        }
+
+        /// Create a node manager fixture with mesh enabled.
+        pub async fn new_with_mesh() -> Self {
+            let mesh = get_test_mesh().await;
+            let f = AgentConfigFixture::new().await;
+            let registry = Arc::new(Mutex::new(SessionRegistry::new(f.config.clone())));
+            let nm = RemoteNodeManager::new(f.config.clone(), registry, Some(mesh.clone()));
             let actor_ref = RemoteNodeManager::spawn(nm);
             Self {
                 actor_ref,
@@ -389,7 +409,7 @@ pub(crate) mod fixtures {
     /// ```rust,ignore
     /// let f = ProviderRoutingFixture::new(&test_id).await;
     /// // f.provider_host_ref  — ActorRef<ProviderHostActor> for alpha
-    /// // f.provider_host_dht  — "provider_host::alpha-{test_id}"
+    /// // f.provider_host_dht  — "provider_host::peer::alpha-{test_id}"
     /// // f.beta               — MeshNodeManagerFixture
     /// // f.call_count         — Arc<Mutex<usize>> to verify mock was invoked
     /// ```
@@ -421,7 +441,7 @@ pub(crate) mod fixtures {
             let actor = ProviderHostActor::new(alpha_f.config.clone());
             let actor_ref = ProviderHostActor::spawn(actor);
 
-            let provider_host_dht = format!("provider_host::alpha-{}", test_id);
+            let provider_host_dht = format!("provider_host::peer::alpha-{}", test_id);
             mesh.register_actor(actor_ref.clone(), provider_host_dht.clone())
                 .await;
 

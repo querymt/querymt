@@ -1,17 +1,14 @@
-//! Event forwarder — observes events from a remote session and forwards them
+//! Event forwarder — subscribes to the EventFanout and forwards events
 //! to a local EventRelayActor.
 //!
-//! Lives on the **remote** machine. Registered as an `EventObserver` on the
-//! remote session's `EventBus`. When the remote session emits events, this
-//! forwarder sends them to the local `EventRelayActor` via kameo remote
-//! messaging.
+//! Lives on the **remote** machine. Subscribes to the session's `EventFanout`
+//! broadcast channel. When events are published, this forwarder sends them to
+//! the local `EventRelayActor` via kameo remote messaging.
 
 #[cfg(feature = "remote")]
-use crate::events::{AgentEvent, EventObserver};
+use crate::events::{AgentEvent, EventEnvelope};
 #[cfg(feature = "remote")]
-use async_trait::async_trait;
-#[cfg(feature = "remote")]
-use querymt::error::LLMError;
+use std::sync::Arc;
 
 #[cfg(feature = "remote")]
 use kameo::actor::RemoteActorRef;
@@ -19,65 +16,75 @@ use kameo::actor::RemoteActorRef;
 #[cfg(feature = "remote")]
 use super::event_relay::{EventRelayActor, RelayedEvent};
 
-/// Event forwarder that sends events to a remote EventRelayActor.
+/// Event forwarder that subscribes to an EventFanout and sends events to a
+/// remote EventRelayActor.
 ///
-/// This is registered as an observer on the remote session's EventBus.
-/// When events are emitted, they are forwarded to the local relay actor.
+/// Spawns a background task that reads from the fanout receiver and forwards
+/// each event to the relay actor. The task is cancelled when the returned
+/// `tokio::task::JoinHandle` is aborted or the fanout sender is dropped.
 #[cfg(feature = "remote")]
-pub struct EventForwarder {
-    /// Reference to the local EventRelayActor
-    relay_ref: RemoteActorRef<EventRelayActor>,
-    /// Label for logging/debugging
-    source_label: String,
-}
+pub struct EventForwarder;
 
 #[cfg(feature = "remote")]
 impl EventForwarder {
-    /// Create a new event forwarder that sends events to the given relay actor.
-    pub fn new(relay_ref: RemoteActorRef<EventRelayActor>, source_label: String) -> Self {
-        Self {
-            relay_ref,
-            source_label,
-        }
-    }
-}
+    /// Start forwarding events from the given fanout to the relay actor.
+    ///
+    /// Returns a `JoinHandle` that can be used to abort the forwarder task.
+    pub fn start(
+        fanout: Arc<crate::event_fanout::EventFanout>,
+        relay_ref: RemoteActorRef<EventRelayActor>,
+        source_label: String,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut rx = fanout.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(envelope) => {
+                        let event: AgentEvent = match &envelope {
+                            EventEnvelope::Durable(de) => de.clone().into(),
+                            EventEnvelope::Ephemeral(ee) => ee.clone().into(),
+                        };
+                        tracing::trace!(
+                            target: "remote::event_forwarder",
+                            source = %source_label,
+                            session_id = %event.session_id,
+                            kind = ?event.kind,
+                            "forwarding event to relay actor"
+                        );
 
-#[cfg(feature = "remote")]
-#[async_trait]
-impl EventObserver for EventForwarder {
-    async fn on_event(&self, event: &AgentEvent) -> Result<(), LLMError> {
-        tracing::trace!(
-            target: "remote::event_forwarder",
-            source = %self.source_label,
-            seq = event.seq,
-            session_id = %event.session_id,
-            kind = ?event.kind,
-            "forwarding event to relay actor"
-        );
-
-        // Forward the event to the local relay actor.
-        // Use tell (fire-and-forget) to avoid blocking the event publisher.
-        if let Err(e) = self
-            .relay_ref
-            .tell(&RelayedEvent {
-                event: event.clone(),
-            })
-            .send()
-        {
-            tracing::warn!(
-                target: "remote::event_forwarder",
-                source = %self.source_label,
-                seq = event.seq,
-                error = %e,
-                "failed to forward event to relay actor"
-            );
-            return Err(LLMError::GenericError(format!(
-                "Failed to forward event: {}",
-                e
-            )));
-        }
-
-        Ok(())
+                        if let Err(e) = relay_ref
+                            .tell(&RelayedEvent {
+                                event: event.clone(),
+                            })
+                            .send()
+                        {
+                            tracing::warn!(
+                                target: "remote::event_forwarder",
+                                source = %source_label,
+                                error = %e,
+                                "failed to forward event to relay actor"
+                            );
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            target: "remote::event_forwarder",
+                            source = %source_label,
+                            skipped = n,
+                            "forwarder lagged behind fanout"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::debug!(
+                            target: "remote::event_forwarder",
+                            source = %source_label,
+                            "fanout closed, stopping forwarder"
+                        );
+                        break;
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -89,7 +96,11 @@ pub struct EventForwarder;
 impl EventForwarder {
     /// This stub should never be constructed without the remote feature
     #[allow(dead_code)]
-    pub fn new(_relay_ref: (), _source_label: String) -> Self {
+    pub fn start(
+        _fanout: std::sync::Arc<crate::event_fanout::EventFanout>,
+        _relay_ref: (),
+        _source_label: String,
+    ) -> tokio::task::JoinHandle<()> {
         panic!("EventForwarder requires the 'remote' feature to be enabled")
     }
 }

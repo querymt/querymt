@@ -220,6 +220,7 @@ mod tests {
         let builder = AgentConfigBuilder::new(
             Arc::new(plugin_registry),
             storage.session_store(),
+            storage.event_journal(),
             llm_config,
         );
         let config = builder.build();

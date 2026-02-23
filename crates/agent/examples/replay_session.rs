@@ -43,7 +43,6 @@ use querymt::plugin::host::PluginRegistry;
 use querymt::plugin::host::native::NativeLoader;
 use querymt_agent::events::AgentEvent;
 use querymt_agent::model::MessagePart;
-use querymt_agent::session::projection::EventStore;
 #[cfg(feature = "remote")]
 use querymt_agent::session::provider::ProviderRouting;
 use querymt_agent::session::provider::build_provider_from_config;
@@ -302,8 +301,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None, // No API key override
             #[cfg(feature = "remote")]
             ProviderRouting {
-                provider_node: None, // local
-                mesh_handle: None,   // not available in example
+                provider_node_id: None, // local
+                mesh_handle: None,      // not available in example
                 allow_mesh_fallback: false,
             },
         )

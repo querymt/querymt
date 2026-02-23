@@ -39,7 +39,7 @@ pub(super) async fn transition_waiting_for_event(
     wait: &WaitCondition,
     context: &Arc<crate::middleware::ConversationContext>,
     exec_ctx: &ExecutionContext,
-    event_rx: &mut tokio::sync::broadcast::Receiver<crate::events::AgentEvent>,
+    event_rx: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
 ) -> Result<ExecutionState, anyhow::Error> {
     debug!(
         "WaitingForEvent: session={}, reason={:?}",
@@ -75,7 +75,7 @@ pub(super) async fn transition_waiting_for_event(
                         }
                     };
 
-                    if event.session_id != exec_ctx.session_id {
+                    if event.session_id() != exec_ctx.session_id {
                         continue;
                     }
 
@@ -137,7 +137,7 @@ pub(super) async fn transition_waiting_for_event(
                     }
                 };
 
-                if event.session_id != exec_ctx.session_id {
+                if event.session_id() != exec_ctx.session_id {
                     continue;
                 }
 
@@ -168,10 +168,10 @@ pub(super) async fn transition_waiting_for_event(
 
 fn match_wait_event(
     wait: &WaitCondition,
-    event: &crate::events::AgentEvent,
+    event: &crate::events::EventEnvelope,
 ) -> Option<WaitEventOutcome> {
     match wait.reason {
-        WaitReason::Delegation => match &event.kind {
+        WaitReason::Delegation => match event.kind() {
             AgentEventKind::DelegationCompleted {
                 delegation_id,
                 result,

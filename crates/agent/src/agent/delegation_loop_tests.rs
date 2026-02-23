@@ -1,23 +1,18 @@
 use crate::agent::agent_config::AgentConfig;
-use crate::agent::core::{
-    AgentMode, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy, ToolConfig,
-    ToolPolicy,
-};
+use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
-use crate::config::RuntimeExecutionPolicy;
 use crate::delegation::{
     AgentActorHandle, AgentInfo, DefaultAgentRegistry, DelegationOrchestrator,
 };
-use crate::event_bus::EventBus;
 use crate::events::StopType;
-use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
 use crate::middleware::{
     AgentStats, ConversationContext, DelegationGuardMiddleware, ExecutionState, LlmResponse,
     MiddlewareDriver,
 };
 use crate::model::{AgentMessage, MessagePart};
 use crate::send_agent::SendAgent;
+use crate::session::backend::StorageBackend;
 use crate::session::domain::{Delegation, DelegationStatus};
 use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
@@ -26,13 +21,12 @@ use crate::test_utils::{
     MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, TestPluginLoader,
     TestProviderFactory, mock_llm_config, mock_querymt_tool_call, mock_session,
 };
-use crate::tools::ToolRegistry;
 use mockall::Sequence;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
 use querymt::chat::FinishReason;
 use querymt::plugin::host::PluginRegistry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 use time::OffsetDateTime;
@@ -110,7 +104,7 @@ impl TestHarness {
             .returning(|_| Ok(None))
             .times(0..);
         store
-            .expect_get_session_provider_node()
+            .expect_get_session_provider_node_id()
             .returning(|_| Ok(None))
             .times(0..);
         store
@@ -186,44 +180,21 @@ impl TestHarness {
         }
         let agent_registry: Arc<DefaultAgentRegistry> = Arc::new(agent_registry);
 
-        let event_bus = Arc::new(EventBus::new());
-        let tool_registry = ToolRegistry::new();
+        let event_journal_storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("create event journal storage"),
+        );
 
-        let config = Arc::new(AgentConfig {
-            provider: provider_context,
-            event_bus: event_bus.clone(),
-            agent_registry: agent_registry.clone(),
-            workspace_manager_actor: WorkspaceIndexManagerActor::new(
-                WorkspaceIndexManagerConfig::default(),
-            ),
-            default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
-            tool_config: ToolConfig {
-                policy: ToolPolicy::ProviderOnly,
-                ..ToolConfig::default()
-            },
-            tool_registry: tool_registry.clone(),
-            middleware_drivers: Vec::new(),
-            auth_methods: Vec::new(),
-            max_steps: None,
-            snapshot_policy: SnapshotPolicy::None,
-            assume_mutating: true,
-            mutating_tools: HashSet::new(),
-            max_prompt_bytes: None,
-            execution_timeout_secs: 300,
-            delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
-            delegation_wait_timeout_secs: 120,
-            delegation_cancel_grace_secs: 5,
-            execution_policy: RuntimeExecutionPolicy::default(),
-            compaction: crate::session::compaction::SessionCompaction::new(),
-            snapshot_backend: None,
-            snapshot_gc_config: crate::snapshot::GcConfig::default(),
-            delegation_context_config: DelegationContextConfig {
-                timing: DelegationContextTiming::FirstTurnOnly,
-                auto_inject: true,
-            },
-            pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
-            mcp_servers: Vec::new(),
-        });
+        let config = Arc::new(
+            crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+                provider_context,
+                event_journal_storage.event_journal(),
+            )
+            .with_tool_policy(ToolPolicy::ProviderOnly)
+            .with_agent_registry_only(agent_registry.clone())
+            .build(),
+        );
 
         // Create an AgentHandle for delegation (wraps its own SessionRegistry)
         let delegator: Arc<dyn SendAgent> =
@@ -231,13 +202,13 @@ impl TestHarness {
 
         let orchestrator = Arc::new(DelegationOrchestrator::new(
             delegator,
-            event_bus.clone(),
+            config.event_sink.clone(),
             store.clone(),
             agent_registry.clone(),
-            Arc::new(tool_registry),
+            config.tool_registry_arc(),
             None,
         ));
-        config.add_observer(orchestrator);
+        let _orchestrator_handle = orchestrator.start_listening(config.event_sink.fanout());
 
         // Create a SessionRuntime for the execution context
         let session_runtime = crate::agent::core::SessionRuntime::new(
@@ -341,42 +312,22 @@ async fn build_delegate_handle(behavior: DelegateBehavior) -> Arc<crate::agent::
         delegate_store,
         LLMParams::new().provider("mock").model("mock-model"),
     ));
+    let event_journal_storage = Arc::new(
+        crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .expect("create event journal storage"),
+    );
 
-    let delegate_config = Arc::new(AgentConfig {
-        provider: delegate_session_provider,
-        event_bus: Arc::new(EventBus::new()),
-        agent_registry: Arc::new(DefaultAgentRegistry::new()),
-        workspace_manager_actor: WorkspaceIndexManagerActor::new(
-            WorkspaceIndexManagerConfig::default(),
-        ),
-        default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
-        tool_config: ToolConfig {
-            policy: ToolPolicy::ProviderOnly,
-            ..ToolConfig::default()
-        },
-        tool_registry: ToolRegistry::new(),
-        middleware_drivers: Vec::new(),
-        auth_methods: Vec::new(),
-        max_steps: Some(1),
-        snapshot_policy: SnapshotPolicy::None,
-        assume_mutating: true,
-        mutating_tools: HashSet::new(),
-        max_prompt_bytes: None,
-        execution_timeout_secs: 30,
-        delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
-        delegation_wait_timeout_secs: 120,
-        delegation_cancel_grace_secs: 5,
-        execution_policy: RuntimeExecutionPolicy::default(),
-        compaction: crate::session::compaction::SessionCompaction::new(),
-        snapshot_backend: None,
-        snapshot_gc_config: crate::snapshot::GcConfig::default(),
-        delegation_context_config: DelegationContextConfig {
-            timing: DelegationContextTiming::FirstTurnOnly,
-            auto_inject: true,
-        },
-        pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
-        mcp_servers: Vec::new(),
-    });
+    let delegate_config = Arc::new(
+        crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+            delegate_session_provider,
+            event_journal_storage.event_journal(),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly)
+        .with_max_steps(1)
+        .with_execution_timeout_secs(30)
+        .build(),
+    );
 
     // Leak the TempDir so its contents survive the test
     std::mem::forget(delegate_temp_dir);

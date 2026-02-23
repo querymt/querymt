@@ -12,7 +12,7 @@ use crate::session::domain::ForkOrigin;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::snapshot::backend::SnapshotBackend;
 use crate::snapshot::git::GitSnapshotBackend;
-use crate::test_utils::{DelegateTestFixture, empty_plugin_registry};
+use crate::test_utils::{DelegateTestFixture, TestServerState, empty_plugin_registry};
 use crate::ui::handlers::{
     handle_elicitation_response, handle_load_session, handle_ui_message, handle_undo,
 };
@@ -27,6 +27,29 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use uuid::Uuid;
+
+/// Build a default `ServerState` from an agent handle and storage backend.
+fn test_server_state(
+    handle: &Arc<crate::agent::AgentHandle>,
+    storage: &dyn StorageBackend,
+) -> super::ServerState {
+    super::ServerState {
+        agent: handle.clone(),
+        view_store: storage.view_store().expect("view store"),
+        session_store: storage.session_store(),
+        default_cwd: None,
+        event_sources: vec![],
+        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
+            crate::index::WorkspaceIndexManagerConfig::default(),
+        ),
+        model_cache: moka::future::Cache::new(100),
+        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
+    }
+}
 
 /// Helper to capture messages sent by the handler
 async fn collect_message(rx: &mut mpsc::Receiver<String>) -> Option<Value> {
@@ -53,11 +76,11 @@ async fn test_undo_handler_single_agent() -> Result<()> {
     let builder = AgentConfigBuilder::new(
         Arc::new(registry),
         storage.session_store(),
+        storage.event_journal(),
         LLMParams::new().provider("mock").model("mock"),
     )
     .with_snapshot_policy(SnapshotPolicy::Diff)
     .with_snapshot_backend(snapshot_backend.clone());
-    builder.add_observer(storage.event_observer());
 
     let config = Arc::new(builder.build());
     let handle = Arc::new(crate::agent::AgentHandle::from_config(config.clone()));
@@ -162,26 +185,9 @@ async fn test_undo_handler_single_agent() -> Result<()> {
     );
 
     // Create UI server state
-    let state = super::ServerState {
-        agent: handle,
-        view_store: storage
-            .view_store()
-            .expect("Test backend should have view store"),
-        session_store: storage.session_store(),
-        default_cwd: None,
-        event_sources: vec![],
-        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
-            crate::index::WorkspaceIndexManagerConfig::default(),
-        ),
-        model_cache: moka::future::Cache::new(100),
-        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
-    };
+    let state = test_server_state(&handle, &*storage);
 
-    // Setup connection state
+    // Setup connection with session mapping
     {
         let mut connections = state.connections.lock().await;
         connections.insert(
@@ -240,54 +246,9 @@ async fn test_undo_handler_single_agent() -> Result<()> {
 
 #[tokio::test]
 async fn test_send_state_concurrent_calls_complete() -> Result<()> {
-    let (registry, _config_dir) = empty_plugin_registry()?;
-    let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
-
-    let builder = AgentConfigBuilder::new(
-        Arc::new(registry),
-        storage.session_store(),
-        LLMParams::new().provider("mock").model("mock"),
-    );
-    builder.add_observer(storage.event_observer());
-
-    let config = Arc::new(builder.build());
-    let handle = Arc::new(crate::agent::AgentHandle::from_config(config));
-
-    let state = super::ServerState {
-        agent: handle,
-        view_store: storage.clone(),
-        session_store: storage.clone(),
-        default_cwd: None,
-
-        event_sources: vec![],
-        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
-            crate::index::WorkspaceIndexManagerConfig::default(),
-        ),
-        model_cache: moka::future::Cache::new(100),
-        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
-    };
-
-    {
-        let mut connections = state.connections.lock().await;
-        connections.insert(
-            "conn-1".to_string(),
-            super::ConnectionState {
-                routing_mode: crate::ui::messages::RoutingMode::Single,
-                active_agent_id: super::session::PRIMARY_AGENT_ID.to_string(),
-                sessions: std::collections::HashMap::new(),
-                subscribed_sessions: std::collections::HashSet::new(),
-                session_cursors: std::collections::HashMap::new(),
-                current_workspace_root: None,
-                file_index_forwarder: None,
-            },
-        );
-    }
-
-    let (tx, mut rx) = mpsc::channel(32);
+    let f = TestServerState::new().await;
+    let (tx, mut rx) = f.add_connection("conn-1").await;
+    let state = f.state;
     let first = tokio::spawn({
         let state = state.clone();
         let tx = tx.clone();
@@ -337,11 +298,11 @@ async fn test_undo_handler_cross_session() -> Result<()> {
     let builder = AgentConfigBuilder::new(
         Arc::new(registry),
         storage.session_store(),
+        storage.event_journal(),
         LLMParams::new().provider("mock").model("mock"),
     )
     .with_snapshot_policy(SnapshotPolicy::Diff)
     .with_snapshot_backend(snapshot_backend.clone());
-    builder.add_observer(storage.event_observer());
 
     let config = Arc::new(builder.build());
     let handle = Arc::new(crate::agent::AgentHandle::from_config(config.clone()));
@@ -465,22 +426,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
     );
 
     // Create UI server state
-    let state = super::ServerState {
-        agent: handle,
-        view_store: storage.clone(),
-        session_store: storage.clone(),
-        default_cwd: None,
-        event_sources: vec![],
-        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
-            crate::index::WorkspaceIndexManagerConfig::default(),
-        ),
-        model_cache: moka::future::Cache::new(100),
-        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
-    };
+    let state = test_server_state(&handle, &*storage);
 
     // Setup connection for PARENT session
     {
@@ -542,68 +488,20 @@ async fn test_undo_handler_cross_session() -> Result<()> {
 
 #[tokio::test]
 async fn test_load_session_hydrates_runtime_actor() -> Result<()> {
-    let (registry, _config_dir) = empty_plugin_registry()?;
-    let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
+    let f = TestServerState::new().await;
+    let session_id = f.agent.create_session().await;
 
-    let builder = AgentConfigBuilder::new(
-        Arc::new(registry),
-        storage.session_store(),
-        LLMParams::new().provider("mock").model("mock"),
-    );
-    builder.add_observer(storage.event_observer());
-
-    let config = Arc::new(builder.build());
-    let handle = Arc::new(crate::agent::AgentHandle::from_config(config));
-
-    let session = storage
-        .session_store()
-        .create_session(None, None, None, None)
-        .await?;
-    let session_id = session.public_id.clone();
-
-    let state = super::ServerState {
-        agent: handle.clone(),
-        view_store: storage.clone(),
-        session_store: storage.clone(),
-        default_cwd: None,
-        event_sources: vec![],
-        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
-            crate::index::WorkspaceIndexManagerConfig::default(),
-        ),
-        model_cache: moka::future::Cache::new(100),
-        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
-    };
+    let (tx, _rx) = f.add_connection("conn-load").await;
 
     {
-        let mut connections = state.connections.lock().await;
-        connections.insert(
-            "conn-load".to_string(),
-            super::ConnectionState {
-                routing_mode: crate::ui::messages::RoutingMode::Single,
-                active_agent_id: super::session::PRIMARY_AGENT_ID.to_string(),
-                sessions: std::collections::HashMap::new(),
-                subscribed_sessions: std::collections::HashSet::new(),
-                session_cursors: std::collections::HashMap::new(),
-                current_workspace_root: None,
-                file_index_forwarder: None,
-            },
-        );
-    }
-
-    {
-        let registry = handle.registry.lock().await;
+        let registry = f.agent.handle.registry.lock().await;
         assert!(registry.get(&session_id).is_none());
     }
 
-    let (tx, _rx) = mpsc::channel(16);
-    handle_load_session(&state, "conn-load", &session_id, &tx).await;
+    handle_load_session(&f.state, "conn-load", &session_id, &tx).await;
 
     let actor_loaded = {
-        let registry = handle.registry.lock().await;
+        let registry = f.agent.handle.registry.lock().await;
         registry.get(&session_id).is_some()
     };
     assert!(actor_loaded, "load_session should hydrate runtime actor");
@@ -613,56 +511,23 @@ async fn test_load_session_hydrates_runtime_actor() -> Result<()> {
 
 #[tokio::test]
 async fn test_set_session_model_hydrates_persisted_session() -> Result<()> {
-    let (registry, _config_dir) = empty_plugin_registry()?;
-    let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
-
-    let builder = AgentConfigBuilder::new(
-        Arc::new(registry),
-        storage.session_store(),
-        LLMParams::new().provider("mock").model("mock"),
-    );
-    builder.add_observer(storage.event_observer());
-
-    let config = Arc::new(builder.build());
-    let handle = Arc::new(crate::agent::AgentHandle::from_config(config));
-
-    let session = storage
-        .session_store()
-        .create_session(None, None, None, None)
-        .await?;
-    let session_id = session.public_id.clone();
-
-    let state = super::ServerState {
-        agent: handle.clone(),
-        view_store: storage.clone(),
-        session_store: storage.clone(),
-        default_cwd: None,
-        event_sources: vec![],
-        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
-            crate::index::WorkspaceIndexManagerConfig::default(),
-        ),
-        model_cache: moka::future::Cache::new(100),
-        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
-    };
+    let f = TestServerState::new().await;
+    let session_id = f.agent.create_session().await;
 
     {
-        let registry = handle.registry.lock().await;
+        let registry = f.agent.handle.registry.lock().await;
         assert!(registry.get(&session_id).is_none());
     }
 
     let (tx, mut rx) = mpsc::channel(16);
     handle_ui_message(
-        &state,
+        &f.state,
         "conn-model",
         &tx,
         UiClientMessage::SetSessionModel {
             session_id: session_id.clone(),
             model_id: "mock/new-model".to_string(),
-            node: None,
+            node_id: None,
         },
     )
     .await;
@@ -682,12 +547,14 @@ async fn test_set_session_model_hydrates_persisted_session() -> Result<()> {
     );
 
     let actor_loaded = {
-        let registry = handle.registry.lock().await;
+        let registry = f.agent.handle.registry.lock().await;
         registry.get(&session_id).is_some()
     };
     assert!(actor_loaded, "set_session_model should lazy-hydrate actor");
 
-    let llm_cfg = storage
+    let llm_cfg = f
+        .agent
+        .storage
         .session_store()
         .get_session_llm_config(&session_id)
         .await?;
@@ -700,46 +567,18 @@ async fn test_set_session_model_hydrates_persisted_session() -> Result<()> {
 
 #[tokio::test]
 async fn test_set_session_model_unknown_session_returns_not_found() -> Result<()> {
-    let (registry, _config_dir) = empty_plugin_registry()?;
-    let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
-
-    let builder = AgentConfigBuilder::new(
-        Arc::new(registry),
-        storage.session_store(),
-        LLMParams::new().provider("mock").model("mock"),
-    );
-    builder.add_observer(storage.event_observer());
-
-    let config = Arc::new(builder.build());
-    let handle = Arc::new(crate::agent::AgentHandle::from_config(config));
-
-    let state = super::ServerState {
-        agent: handle,
-        view_store: storage.clone(),
-        session_store: storage.clone(),
-        default_cwd: None,
-        event_sources: vec![],
-        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
-            crate::index::WorkspaceIndexManagerConfig::default(),
-        ),
-        model_cache: moka::future::Cache::new(100),
-        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
-    };
+    let f = TestServerState::new().await;
 
     let missing_id = "019c0000-0000-7000-8000-000000000001".to_string();
     let (tx, mut rx) = mpsc::channel(16);
     handle_ui_message(
-        &state,
+        &f.state,
         "conn-missing",
         &tx,
         UiClientMessage::SetSessionModel {
             session_id: missing_id.clone(),
             model_id: "mock/new-model".to_string(),
-            node: None,
+            node_id: None,
         },
     )
     .await;
@@ -769,26 +608,7 @@ async fn test_set_session_model_unknown_session_returns_not_found() -> Result<()
 #[tokio::test]
 async fn test_elicitation_response_routes_to_delegate_pending_map() -> Result<()> {
     let fixture = DelegateTestFixture::new().await.unwrap();
-    let state = super::ServerState {
-        agent: fixture.planner,
-        view_store: fixture
-            .planner_storage
-            .view_store()
-            .expect("ViewStore required for frontend")
-            .clone(),
-        session_store: fixture.planner_storage.session_store().clone(),
-        default_cwd: None,
-        event_sources: vec![],
-        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
-            crate::index::WorkspaceIndexManagerConfig::default(),
-        ),
-        model_cache: moka::future::Cache::new(100),
-        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
-    };
+    let state = test_server_state(&fixture.planner, &*fixture.planner_storage);
 
     let elicitation_id = "delegate-elicitation-42".to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();

@@ -33,7 +33,7 @@ mod mesh_provider_tests {
         match result {
             Err(LLMError::ProviderError(msg)) => {
                 assert!(
-                    msg.contains("provider_host::gpu-server"),
+                    msg.contains("provider_host::peer::gpu-server"),
                     "error should mention the formatted DHT name, got: {}",
                     msg
                 );
@@ -126,13 +126,14 @@ mod mesh_provider_tests {
         // Bug #2: result is Some("mock") — but "provider_host::mock" is not
         // a valid DHT registration.  When fixed, result should be Some of the
         // real hostname (e.g. "alpha-{test_id}").
-        if let Some(ref hostname) = result {
+        if let Some(ref node_id) = result {
             assert_ne!(
-                hostname, "mock",
-                "Bug #2: find_provider_on_mesh returned provider_name as hostname. \
+                node_id.to_string(),
+                "mock",
+                "Bug #2: find_provider_on_mesh returned provider_name as node id. \
                  The returned value '{}' would cause MeshChatProvider to look up \
-                 'provider_host::mock' instead of the real registration.",
-                hostname
+                 'provider_host::peer::mock' instead of a valid peer id.",
+                node_id
             );
         }
         // If None, the test passes (no peers advertising the provider).
@@ -164,14 +165,13 @@ mod mesh_provider_tests {
         let test_id = Uuid::now_v7().to_string();
         let mesh = get_test_mesh().await;
 
-        // Register a ProviderHostActor under a unique DHT name.
+        // Register a ProviderHostActor under a unique peer-id keyed DHT name.
         let f = ProviderHostFixture::new().await;
-        let dht_name = format!("provider_host::test-node-b8-{}", test_id);
+        let node_id = format!("test-node-b8-{}", test_id);
+        let dht_name = format!("provider_host::peer::{}", node_id);
         mesh.register_actor(f.actor_ref, dht_name.clone()).await;
 
-        // Strip the "provider_host::" prefix for MeshChatProvider::new().
-        let node_name = format!("test-node-b8-{}", test_id);
-        let provider = MeshChatProvider::new(mesh, &node_name, "nonexistent", "no-model");
+        let provider = MeshChatProvider::new(mesh, &node_id, "nonexistent", "no-model");
 
         // The ProviderHostActor exists in the mesh but the provider "nonexistent"
         // can't be built → should get a HandlerError wrapped as ProviderError.

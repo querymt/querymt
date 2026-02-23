@@ -12,6 +12,7 @@
 
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::core::AgentMode;
+use crate::agent::remote::NodeId;
 use agent_client_protocol::{
     ExtNotification as AcpExtNotification, ExtRequest, PromptRequest, SetSessionModelRequest,
 };
@@ -76,9 +77,9 @@ pub struct SetLlmConfig {
 #[derive(Serialize, Deserialize)]
 pub struct SetSessionModel {
     pub req: SetSessionModelRequest,
-    /// Mesh node that owns the provider. `None` = local, `Some(hostname)` = remote node.
+    /// Mesh node that owns the provider. `None` = local, `Some(peer_id)` = remote node.
     #[serde(default)]
-    pub provider_node: Option<String>,
+    pub provider_node_id: Option<NodeId>,
 }
 
 /// Set the tool policy for this session.
@@ -183,7 +184,7 @@ pub struct GetHistory;
 /// Reply: `Result<(), Error>`
 ///
 /// When handled, the session registers an `EventForwarder` on its local
-/// `EventBus` that forwards events to the specified relay actor.
+/// `EventFanout` that forwards events to the specified relay actor.
 #[derive(Serialize, Deserialize)]
 pub struct SubscribeEvents {
     pub relay_actor_id: u64,
@@ -243,7 +244,6 @@ pub struct ReadRemoteFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::SetSessionModelRequest;
 
     // ── Serialization round-trips ────────────────────────────────────────────
 
@@ -294,16 +294,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "remote")]
     fn set_session_model_serializes() {
         let req = SetSessionModelRequest::new("s1".to_string(), "anthropic/claude-3".to_string());
+        let peer_id = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
         let msg = SetSessionModel {
             req,
-            provider_node: Some("node-1".to_string()),
+            provider_node_id: Some(
+                crate::agent::remote::NodeId::parse(&peer_id).expect("valid peer id"),
+            ),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let rt: SetSessionModel = serde_json::from_str(&json).unwrap();
         assert_eq!(rt.req.session_id, "s1".into());
-        assert_eq!(rt.provider_node.as_deref(), Some("node-1"));
+        assert_eq!(
+            rt.provider_node_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some(peer_id.as_str())
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Provides a common trait for both single agents and multi-agent quorums.
 
 use crate::config::{Config, ConfigSource, load_config};
-use crate::events::AgentEvent;
+use crate::events::EventEnvelope;
 #[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
 use crate::simple::{Agent, Quorum};
@@ -24,7 +24,7 @@ pub trait ChatRunner: Send + Sync {
     async fn chat_session(&self) -> Result<Box<dyn ChatSession>>;
 
     /// Subscribe to agent events (tool calls, messages, etc.)
-    fn subscribe(&self) -> broadcast::Receiver<AgentEvent>;
+    fn subscribe(&self) -> broadcast::Receiver<EventEnvelope>;
 
     /// Register a callback for tool call events (boxed version)
     fn on_tool_call_boxed(&self, callback: Box<dyn Fn(String, Value) + Send + Sync>);
@@ -191,7 +191,7 @@ impl AgentRunner {
     }
 
     /// Subscribe to agent events (tool calls, messages, etc.)
-    pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         match self {
             AgentRunner::Single(agent) => ChatRunner::subscribe(agent),
             AgentRunner::Multi(quorum) => ChatRunner::subscribe(quorum),

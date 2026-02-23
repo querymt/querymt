@@ -24,7 +24,7 @@ mod node_manager_extended_tests {
         // SAFETY: test is single-threaded at this point; no concurrent env reads.
         unsafe { std::env::set_var("HOSTNAME", "testhost-d3") };
 
-        let f = NodeManagerFixture::new().await;
+        let f = NodeManagerFixture::new_with_mesh().await;
         let info = f
             .actor_ref
             .ask(GetNodeInfo)
@@ -45,7 +45,7 @@ mod node_manager_extended_tests {
 
     #[tokio::test]
     async fn test_destroy_session_calls_shutdown() {
-        let f = NodeManagerFixture::new().await;
+        let f = NodeManagerFixture::new_with_mesh().await;
 
         let resp = f
             .actor_ref
@@ -78,6 +78,8 @@ mod node_manager_extended_tests {
     async fn test_list_available_models_empty_when_no_credentials() {
         use crate::agent::remote::node_manager::ListAvailableModels;
 
+        // Keep one no-mesh regression path to ensure non-mesh node manager
+        // behavior remains covered in remote-feature tests.
         let f = NodeManagerFixture::new().await;
         let models = f
             .actor_ref
@@ -97,7 +99,7 @@ mod node_manager_extended_tests {
 
     #[tokio::test]
     async fn test_create_destroy_create_sequence_no_leak() {
-        let f = NodeManagerFixture::new().await;
+        let f = NodeManagerFixture::new_with_mesh().await;
 
         for _ in 0..10 {
             let resp = f
@@ -126,9 +128,9 @@ mod node_manager_extended_tests {
 
     #[tokio::test]
     async fn test_create_session_emits_provider_changed_event() {
-        let f = NodeManagerFixture::new().await;
+        let f = NodeManagerFixture::new_with_mesh().await;
 
-        let mut rx = f.config.event_bus.subscribe();
+        let mut rx = f.config.subscribe_events();
 
         let resp = f
             .actor_ref
@@ -144,8 +146,8 @@ mod node_manager_extended_tests {
 
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Ok(event)) if event.session_id == resp.session_id => {
-                    match &event.kind {
+                Ok(Ok(event)) if event.session_id() == resp.session_id => {
+                    match event.kind() {
                         AgentEventKind::SessionCreated => saw_session_created = true,
                         AgentEventKind::ProviderChanged { .. } => saw_provider_changed = true,
                         _ => {}
@@ -454,7 +456,9 @@ mod remote_session_lifecycle_integration_tests {
         let mesh = get_test_mesh().await;
 
         use crate::agent::remote::event_relay::EventRelayActor;
-        use crate::event_bus::EventBus;
+        use crate::event_fanout::EventFanout;
+        use crate::event_sink::EventSink;
+        use crate::session::backend::StorageBackend;
         use kameo::actor::Spawn;
         use std::sync::Arc;
 
@@ -471,8 +475,15 @@ mod remote_session_lifecycle_integration_tests {
 
         // Alpha sets up a relay actor and registers it in the DHT under the
         // name that SubscribeEvents will look for on Beta's session.
-        let alpha_bus = Arc::new(EventBus::new());
-        let relay = EventRelayActor::new(alpha_bus.clone(), "alpha-relay-g8".to_string());
+        let alpha_storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let alpha_journal = alpha_storage.event_journal();
+        let alpha_fanout = Arc::new(EventFanout::new());
+        let alpha_sink = Arc::new(EventSink::new(alpha_journal, alpha_fanout.clone()));
+        let relay = EventRelayActor::new(alpha_sink.clone(), "alpha-relay-g8".to_string());
         let relay_ref = EventRelayActor::spawn(relay);
 
         let relay_dht_name = format!("event_relay::{}", resp.session_id);
@@ -505,10 +516,10 @@ mod remote_session_lifecycle_integration_tests {
             .expect("set_mode");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Bug #5: if the DHT race fires, no events may arrive on alpha_bus.
+        // Bug #5: if the DHT race fires, no events may arrive on alpha fanout.
         // We document expected behaviour without asserting strictly.
-        // When fixed: assert alpha_bus has received at least one event.
-        let _ = alpha_bus.observer_count(); // just ensure no panic
+        // When fixed: assert alpha fanout has received at least one event.
+        let _ = alpha_fanout.subscriber_count(); // just ensure no panic
     }
 
     // ── G.9 ──────────────────────────────────────────────────────────────────

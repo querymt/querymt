@@ -3,7 +3,7 @@
 //! Contains all message types exchanged between the UI client and server,
 //! as well as supporting DTOs for sessions, models, and agents.
 
-use crate::events::AgentEvent;
+use crate::events::EventEnvelope;
 use crate::index::FileIndexEntry;
 use crate::session::projection::AuditView;
 use serde::{Deserialize, Serialize};
@@ -54,9 +54,12 @@ pub struct ModelEntry {
     pub provider: String,
     /// Original model identifier (for backwards compatibility)
     pub model: String,
-    /// Node label where this provider lives. `None` = local node, `Some(hostname)` = remote mesh node.
+    /// Stable node id where this provider lives. `None` = local node.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
+    pub node_id: Option<String>,
+    /// Human-readable node label for display purposes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_label: Option<String>,
     /// Model family/repo for grouping (e.g., "Qwen2.5-Coder-32B-Instruct")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
@@ -113,7 +116,7 @@ pub struct SessionSummary {
     /// Whether this session has child sessions
     pub has_children: bool,
     /// Node label where this session lives. "local" for local sessions,
-    /// peer hostname/label for remote sessions.
+    /// peer hostname/label for remote sessions (display only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
 }
@@ -121,6 +124,8 @@ pub struct SessionSummary {
 /// Information about a remote node discovered in the kameo mesh.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteNodeInfo {
+    /// Stable mesh node id (PeerId string).
+    pub id: String,
     /// Human-readable label / hostname
     pub label: String,
     /// Node capabilities
@@ -167,9 +172,9 @@ pub enum UiClientMessage {
     SetSessionModel {
         session_id: String,
         model_id: String,
-        /// Optional mesh node label that owns the provider. `None` = local.
+        /// Optional mesh node id (PeerId string) that owns the provider. `None` = local.
         #[serde(default)]
-        node: Option<String>,
+        node_id: Option<String>,
     },
     /// Get recent models from event history
     GetRecentModels {
@@ -234,13 +239,13 @@ pub enum UiClientMessage {
     ListRemoteNodes,
     /// List sessions on a specific remote node
     ListRemoteSessions {
-        /// Node label/hostname identifying the target node
-        node: String,
+        /// Stable node id (PeerId string) identifying the target node
+        node_id: String,
     },
     /// Create a new session on a specific remote node
     CreateRemoteSession {
-        /// Node label/hostname identifying the target node
-        node: String,
+        /// Stable node id (PeerId string) identifying the target node
+        node_id: String,
         /// Working directory on the remote machine (optional)
         cwd: Option<String>,
         /// Client-generated request ID for correlating the response
@@ -249,8 +254,8 @@ pub enum UiClientMessage {
     },
     /// Attach an existing remote session to the local dashboard
     AttachRemoteSession {
-        /// Node label/hostname identifying the target node
-        node: String,
+        /// Stable node id (PeerId string) identifying the target node
+        node_id: String,
         /// Session ID to attach
         session_id: String,
     },
@@ -278,6 +283,14 @@ pub struct UndoStackFrame {
     pub message_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StreamCursor {
+    #[serde(default)]
+    pub local_seq: u64,
+    #[serde(default)]
+    pub remote_seq_by_source: HashMap<String, u64>,
+}
+
 /// Messages from server to UI client.
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -301,13 +314,13 @@ pub enum UiServerMessage {
     Event {
         agent_id: String,
         session_id: String,
-        event: AgentEvent,
+        event: EventEnvelope,
     },
     SessionEvents {
         session_id: String,
         agent_id: String,
-        events: Vec<AgentEvent>,
-        cursor_seq: u64,
+        events: Vec<EventEnvelope>,
+        cursor: StreamCursor,
     },
     Error {
         message: String,
@@ -320,7 +333,7 @@ pub enum UiServerMessage {
         agent_id: String,
         audit: AuditView,
         undo_stack: Vec<UndoStackFrame>,
-        cursor_seq: u64,
+        cursor: StreamCursor,
     },
     WorkspaceIndexStatus {
         session_id: String,
@@ -391,8 +404,8 @@ pub enum UiServerMessage {
     },
     /// Sessions available on a specific remote node
     RemoteSessions {
-        /// Node label/hostname
-        node: String,
+        /// Stable node id (PeerId string)
+        node_id: String,
         /// Sessions on that node
         sessions: Vec<crate::agent::remote::RemoteSessionInfo>,
     },

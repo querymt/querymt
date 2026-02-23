@@ -410,19 +410,19 @@ pub async fn handle_delete_custom_model(
 
 /// Handle session model change request.
 ///
-/// `node` is `None` for local providers, `Some(hostname)` when the user selected
+/// `node_id` is `None` for local providers, `Some(peer_id)` when the user selected
 /// a model that lives on a remote mesh node.
 ///
-/// When the target session is **remote** and no explicit `node` is provided
+/// When the target session is **remote** and no explicit `node_id` is provided
 /// (i.e. the user picked a local-only model), we automatically set
-/// `provider_node` to the local node's hostname so the remote `SessionActor`
+/// `provider_node_id` to the local node's peer id so the remote `SessionActor`
 /// routes the LLM call back through the mesh via `MeshChatProvider` instead
 /// of trying (and failing) to resolve the provider locally on the remote node.
 pub async fn handle_set_session_model(
     state: &ServerState,
     session_id: &str,
     model_id: &str,
-    node: Option<&str>,
+    node_id: Option<&str>,
 ) -> Result<(), String> {
     use crate::agent::messages::SetSessionModel;
 
@@ -439,30 +439,33 @@ pub async fn handle_set_session_model(
     };
 
     // When the session lives on a remote node and the user selected a local
-    // model (node == None), tag the request with our own hostname so the
+    // model (node_id == None), tag the request with our own peer id so the
     // remote SessionActor will route the LLM call back to us via the mesh.
     #[cfg(feature = "remote")]
-    let effective_node: Option<String> = if node.is_some() {
-        node.map(|s| s.to_string())
+    let effective_node_id: Option<crate::agent::remote::NodeId> = if let Some(node_id) = node_id {
+        Some(
+            crate::agent::remote::NodeId::parse(node_id)
+                .map_err(|e| format!("invalid node_id '{}': {}", node_id, e))?,
+        )
     } else if session_ref.is_remote() {
         state
             .agent
             .mesh()
-            .map(|mesh| mesh.local_hostname().to_string())
+            .map(|mesh| crate::agent::remote::NodeId::from_peer_id(*mesh.peer_id()))
     } else {
         None
     };
     #[cfg(not(feature = "remote"))]
-    let effective_node: Option<String> = node.map(|s| s.to_string());
+    let effective_node_id: Option<crate::agent::remote::NodeId> = None;
 
     let req = agent_client_protocol::SetSessionModelRequest::new(
         session_id.to_string(),
         model_id.to_string(),
     );
-    // Attach the provider_node field so the SessionActor can store it in LLMConfig.
+    // Attach the provider_node_id field so the SessionActor can store it in LLMConfig.
     let msg = SetSessionModel {
         req,
-        provider_node: effective_node,
+        provider_node_id: effective_node_id,
     };
 
     session_ref
@@ -602,7 +605,8 @@ async fn fetch_catalog_models(
                 source: "catalog".to_string(),
                 provider: provider_name.to_string(),
                 model,
-                node: None,
+                node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             })
@@ -652,7 +656,8 @@ async fn fetch_cached_gguf_models(provider: &str) -> Vec<ModelEntry> {
                 source: "cached".to_string(),
                 provider: provider.to_string(),
                 model: id,
-                node: None,
+                node_id: None,
+                node_label: None,
                 family: Some(metadata.family),
                 quant: Some(metadata.quant),
             }
@@ -680,7 +685,8 @@ async fn fetch_custom_models(state: &ServerState, provider: &str) -> Vec<ModelEn
                 source: "custom".to_string(),
                 provider: m.provider,
                 model,
-                node: None,
+                node_id: None,
+                node_label: None,
                 family: m.family,
                 quant: m.quant,
             }
@@ -757,7 +763,7 @@ async fn fetch_provider_capabilities(state: &ServerState) -> Vec<ProviderCapabil
 /// and skipped — the local model list is returned regardless.
 #[cfg(feature = "remote")]
 async fn fetch_remote_models(state: &ServerState) -> Vec<ModelEntry> {
-    use crate::agent::remote::{GetNodeInfo, ListAvailableModels, RemoteNodeManager};
+    use crate::agent::remote::{GetNodeInfo, ListAvailableModels, NodeId, RemoteNodeManager};
 
     let Some(mesh) = state.agent.mesh() else {
         return Vec::new();
@@ -775,14 +781,21 @@ async fn fetch_remote_models(state: &ServerState) -> Vec<ModelEntry> {
                     continue;
                 }
 
-                // Get the node's hostname for tagging
-                let hostname = match node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
-                    Ok(info) => info.hostname,
+                // Get the node's identity/label for tagging.
+                let node_info = match node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
+                    Ok(info) => info,
                     Err(e) => {
                         log::warn!("fetch_remote_models: GetNodeInfo failed: {}", e);
                         continue;
                     }
                 };
+                if NodeId::parse(&node_info.node_id.to_string()).is_err() {
+                    log::warn!(
+                        "fetch_remote_models: ignoring node with invalid id '{}'",
+                        node_info.node_id
+                    );
+                    continue;
+                }
 
                 // Query available models
                 match node_manager_ref
@@ -791,9 +804,10 @@ async fn fetch_remote_models(state: &ServerState) -> Vec<ModelEntry> {
                 {
                     Ok(models) => {
                         log::debug!(
-                            "fetch_remote_models: got {} models from node '{}'",
+                            "fetch_remote_models: got {} models from node '{}' ({})",
                             models.len(),
-                            hostname
+                            node_info.hostname,
+                            node_info.node_id
                         );
                         for m in models {
                             all_remote.push(ModelEntry {
@@ -802,7 +816,8 @@ async fn fetch_remote_models(state: &ServerState) -> Vec<ModelEntry> {
                                 source: "catalog".to_string(),
                                 provider: m.provider,
                                 model: m.model,
-                                node: Some(hostname.clone()),
+                                node_id: Some(node_info.node_id.to_string()),
+                                node_label: Some(node_info.hostname.clone()),
                                 family: None,
                                 quant: None,
                             });
@@ -810,8 +825,9 @@ async fn fetch_remote_models(state: &ServerState) -> Vec<ModelEntry> {
                     }
                     Err(e) => {
                         log::warn!(
-                            "fetch_remote_models: ListAvailableModels failed for '{}': {}",
-                            hostname,
+                            "fetch_remote_models: ListAvailableModels failed for '{}' ({}): {}",
+                            node_info.hostname,
+                            node_info.node_id,
                             e
                         );
                     }

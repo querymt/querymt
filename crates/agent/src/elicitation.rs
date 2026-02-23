@@ -110,7 +110,7 @@ async fn take_from_pending_map(
 /// This replaces `()` as the handler in `serve_client()`.
 pub struct ElicitationHandler {
     pending: PendingElicitationMap,
-    event_bus: Arc<crate::event_bus::EventBus>,
+    event_sink: Arc<crate::event_sink::EventSink>,
     server_name: String,
     session_id: String,
 }
@@ -118,13 +118,13 @@ pub struct ElicitationHandler {
 impl ElicitationHandler {
     pub fn new(
         pending: PendingElicitationMap,
-        event_bus: Arc<crate::event_bus::EventBus>,
+        event_sink: Arc<crate::event_sink::EventSink>,
         server_name: String,
         session_id: String,
     ) -> Self {
         Self {
             pending,
-            event_bus,
+            event_sink,
             server_name,
             session_id,
         }
@@ -153,17 +153,23 @@ impl ClientHandler for ElicitationHandler {
             let schema_json =
                 serde_json::to_value(&request.requested_schema).unwrap_or(serde_json::Value::Null);
 
-            // Emit event for UI/ACP clients
-            self.event_bus.publish(
-                &self.session_id,
-                crate::events::AgentEventKind::ElicitationRequested {
-                    elicitation_id: elicitation_id.clone(),
-                    session_id: self.session_id.clone(),
-                    message: request.message,
-                    requested_schema: schema_json,
-                    source: format!("mcp:{}", self.server_name),
-                },
-            );
+            // Durable: elicitation must be visible in UI replay.
+            if let Err(err) = self
+                .event_sink
+                .emit_durable(
+                    &self.session_id,
+                    crate::events::AgentEventKind::ElicitationRequested {
+                        elicitation_id: elicitation_id.clone(),
+                        session_id: self.session_id.clone(),
+                        message: request.message,
+                        requested_schema: schema_json,
+                        source: format!("mcp:{}", self.server_name),
+                    },
+                )
+                .await
+            {
+                log::warn!("failed to emit ElicitationRequested: {}", err);
+            }
 
             // Wait for response from UI/ACP
             match rx.await {

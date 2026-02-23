@@ -24,10 +24,11 @@ mod session_stream_tests;
 #[cfg(test)]
 mod undo_handler_tests;
 
-use crate::event_bus::EventBus;
+use crate::event_fanout::EventFanout;
 use crate::index::WorkspaceIndexManagerActor;
 use crate::session::projection::ViewStore;
 use crate::session::store::SessionStore;
+use crate::ui::messages::StreamCursor;
 use axum::{
     Router,
     extract::{State, ws::WebSocketUpgrade},
@@ -54,7 +55,7 @@ pub struct UiServer {
     view_store: Arc<dyn ViewStore>,
     session_store: Arc<dyn SessionStore>,
     default_cwd: Option<PathBuf>,
-    event_sources: Vec<Arc<EventBus>>,
+    event_sources: Vec<Arc<EventFanout>>,
     connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     session_agents: Arc<Mutex<HashMap<String, String>>>,
     session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
@@ -71,7 +72,7 @@ pub(crate) struct ServerState {
     pub view_store: Arc<dyn ViewStore>,
     pub session_store: Arc<dyn SessionStore>,
     pub default_cwd: Option<PathBuf>,
-    pub event_sources: Vec<Arc<EventBus>>,
+    pub event_sources: Vec<Arc<EventFanout>>,
     pub connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     pub session_agents: Arc<Mutex<HashMap<String, String>>>,
     pub session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
@@ -105,9 +106,35 @@ pub(crate) struct ConnectionState {
     pub active_agent_id: String,
     pub sessions: HashMap<String, String>,
     pub subscribed_sessions: HashSet<String>,
-    pub session_cursors: HashMap<String, u64>,
+    pub session_cursors: HashMap<String, StreamCursor>,
     pub current_workspace_root: Option<PathBuf>,
     pub file_index_forwarder: Option<JoinHandle<()>>,
+}
+
+pub(crate) fn cursor_from_events(events: &[crate::events::AgentEvent]) -> StreamCursor {
+    let mut cursor = StreamCursor::default();
+
+    for event in events {
+        match event.origin {
+            crate::events::EventOrigin::Local => {
+                cursor.local_seq = cursor.local_seq.max(event.seq);
+            }
+            crate::events::EventOrigin::Remote => {
+                if let Some(source) = event.source_node.as_ref() {
+                    cursor
+                        .remote_seq_by_source
+                        .entry(source.clone())
+                        .and_modify(|seq| *seq = (*seq).max(event.seq))
+                        .or_insert(event.seq);
+                }
+            }
+            crate::events::EventOrigin::Unknown(_) => {
+                cursor.local_seq = cursor.local_seq.max(event.seq);
+            }
+        }
+    }
+
+    cursor
 }
 
 impl UiServer {

@@ -15,7 +15,7 @@
 //!         DedupCheckMiddleware::new()
 //!             .threshold(0.8)
 //!             .min_lines(5)
-//!             .with_event_bus(agent.event_bus())
+//!             .with_event_sink(agent.event_sink())
 //!     })
 //!     .build()
 //!     .await?;
@@ -30,7 +30,7 @@
 //! min_lines = 5
 //! ```
 
-use crate::event_bus::EventBus;
+use crate::event_sink::EventSink;
 use crate::events::AgentEventKind;
 use crate::index::workspace_actor::{FindSimilarToCode, RemoveFile, UpdateFile};
 use crate::index::{DiffPaths, IndexedFunctionEntry, SimilarFunctionMatch, WorkspaceHandle};
@@ -130,8 +130,8 @@ pub struct DedupCheckMiddleware {
     min_lines: usize,
     /// Accumulated tool results from the current batch (reset each cycle)
     pending_results: Arc<Mutex<Vec<ToolResult>>>,
-    /// Optional event bus for emitting duplicate detection events
-    event_bus: Option<Arc<EventBus>>,
+    /// Optional event sink for emitting duplicate detection events
+    event_sink: Option<Arc<EventSink>>,
     /// Guard to prevent multiple reviews in the same turn
     already_reviewed_this_turn: AtomicBool,
     /// Last context seen, used for building BeforeLlmCall state in on_turn_end
@@ -157,7 +157,7 @@ impl DedupCheckMiddleware {
             threshold: 0.8,
             min_lines: 5,
             pending_results: Arc::new(Mutex::new(Vec::new())),
-            event_bus: None,
+            event_sink: None,
             already_reviewed_this_turn: AtomicBool::new(false),
             last_context: Arc::new(Mutex::new(None)),
         }
@@ -187,9 +187,9 @@ impl DedupCheckMiddleware {
         self
     }
 
-    /// Set the event bus for emitting duplicate detection events
-    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
-        self.event_bus = Some(event_bus);
+    /// Set the event sink for emitting duplicate detection events
+    pub fn with_event_sink(mut self, event_sink: Arc<EventSink>) -> Self {
+        self.event_sink = Some(event_sink);
         self
     }
 
@@ -794,9 +794,11 @@ impl MiddlewareDriver for DedupCheckMiddleware {
             // 2. Compact warnings for the event payload (no body_text, capped matches)
             let compacted = Self::compact_warnings(&warnings);
 
-            // 3. Emit event with compacted warnings + overflow path
-            if let Some(ref event_bus) = self.event_bus {
-                event_bus.publish(
+            // 3. Emit event with compacted warnings + overflow path.
+            // Intentionally ephemeral (transport-only) because payload
+            // references temporary overflow files that won't survive restart.
+            if let Some(ref event_sink) = self.event_sink {
+                event_sink.emit_ephemeral(
                     context.session_id.as_ref(),
                     AgentEventKind::DuplicateCodeDetected {
                         warnings: compacted,
@@ -869,7 +871,7 @@ impl MiddlewareFactory for DedupCheckFactory {
             return Err(anyhow::anyhow!("Middleware disabled"));
         }
 
-        let mut mw = DedupCheckMiddleware::new().with_event_bus(agent_config.event_bus.clone());
+        let mut mw = DedupCheckMiddleware::new().with_event_sink(agent_config.event_sink.clone());
 
         if let Some(v) = config.get("threshold").and_then(|v| v.as_f64()) {
             mw = mw.threshold(v);

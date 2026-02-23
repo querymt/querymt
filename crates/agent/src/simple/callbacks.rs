@@ -1,6 +1,6 @@
 //! Event callback system for the simple API
 
-use crate::events::{AgentEvent, AgentEventKind};
+use crate::events::{AgentEventKind, EventEnvelope};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
@@ -80,7 +80,7 @@ impl EventCallbacksState {
         }
     }
 
-    pub fn ensure_listener(&self, receiver: tokio::sync::broadcast::Receiver<AgentEvent>) {
+    pub fn ensure_listener(&self, receiver: tokio::sync::broadcast::Receiver<EventEnvelope>) {
         let mut task = self.task.lock().unwrap();
         if task.is_some() {
             return;
@@ -91,14 +91,14 @@ impl EventCallbacksState {
             let mut receiver = receiver;
             loop {
                 match receiver.recv().await {
-                    Ok(event) => {
+                    Ok(envelope) => {
                         if let Some(filter) = session_filter.as_ref()
-                            && event.session_id != *filter
+                            && envelope.session_id() != *filter
                         {
                             continue;
                         }
                         if let Ok(callbacks) = callbacks.lock() {
-                            dispatch_event(&callbacks, &event);
+                            dispatch_event(&callbacks, &envelope);
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -120,8 +120,8 @@ impl Drop for EventCallbacksState {
     }
 }
 
-fn dispatch_event(callbacks: &EventCallbacks, event: &AgentEvent) {
-    match &event.kind {
+fn dispatch_event(callbacks: &EventCallbacks, event: &EventEnvelope) {
+    match event.kind() {
         AgentEventKind::ToolCallStart {
             tool_name,
             arguments,

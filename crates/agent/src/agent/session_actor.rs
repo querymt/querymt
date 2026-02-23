@@ -64,8 +64,8 @@ pub struct SessionActor {
     #[cfg(feature = "remote")]
     pub(crate) mesh: Option<crate::agent::remote::MeshHandle>,
 
-    // Tracks EventBus observer tokens by relay actor so unsubscribe can detach.
-    pub(crate) relay_observer_tokens: HashMap<u64, crate::event_bus::ObserverToken>,
+    // Tracks EventForwarder task handles by relay actor so unsubscribe can abort.
+    pub(crate) relay_forwarder_handles: HashMap<u64, tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -104,7 +104,7 @@ impl SessionActor {
             prompt_running: false,
             #[cfg(feature = "remote")]
             mesh: None,
-            relay_observer_tokens: HashMap::new(),
+            relay_forwarder_handles: HashMap::new(),
         }
     }
 
@@ -317,7 +317,7 @@ impl SessionActor {
                 model: llm_config.model.clone(),
                 config_id: llm_config.id,
                 context_limit,
-                provider_node: None,
+                provider_node_id: None,
             },
         );
         Ok(())
@@ -391,15 +391,16 @@ impl Message<SetSessionModel> for SessionActor {
             .await
             .map_err(|e| AgentError::Internal(e.to_string()))?;
 
-        // Persist the provider_node so the session knows where to route LLM calls.
+        // Persist the provider_node_id so the session knows where to route LLM calls.
+        let provider_node_id = msg.provider_node_id.as_ref().map(ToString::to_string);
         if let Err(e) = self
             .config
             .provider
             .history_store()
-            .set_session_provider_node(&session_id, msg.provider_node.as_deref())
+            .set_session_provider_node_id(&session_id, provider_node_id.as_deref())
             .await
         {
-            log::warn!("SetSessionModel: failed to persist provider_node: {}", e);
+            log::warn!("SetSessionModel: failed to persist provider_node_id: {}", e);
         }
 
         let context_limit =
@@ -413,7 +414,7 @@ impl Message<SetSessionModel> for SessionActor {
                 model: llm_config.model.clone(),
                 config_id: llm_config.id,
                 context_limit,
-                provider_node: msg.provider_node.clone(),
+                provider_node_id,
             },
         );
 
@@ -651,13 +652,12 @@ impl Message<crate::agent::messages::GetHistory> for SessionActor {
 
 /// Subscribe a remote event relay to this session's events.
 ///
-/// Phase 6: When the kameo swarm is bootstrapped, this handler:
+/// When the kameo swarm is bootstrapped, this handler:
 /// 1. Resolves `relay_actor_id` → `RemoteActorRef<EventRelayActor>` via swarm
-/// 2. Wraps it in an `EventForwarder`
-/// 3. Registers the forwarder on the local `EventBus`
+/// 2. Starts an `EventForwarder` background task subscribed to the EventFanout
 ///
 /// Without a swarm (swarm not bootstrapped), it logs and returns Ok so the
-/// message round-trips correctly for local tests and Phase 4 stub behaviour.
+/// message round-trips correctly for local tests.
 impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
     type Reply = Result<(), AgentError>;
 
@@ -678,30 +678,32 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
                     .await
                 {
                     Ok(Some(relay_ref)) => {
-                        let forwarder = std::sync::Arc::new(EventForwarder::new(
+                        // Abort previous forwarder for this relay_actor_id if any
+                        if let Some(prev_handle) =
+                            self.relay_forwarder_handles.remove(&msg.relay_actor_id)
+                        {
+                            prev_handle.abort();
+                            log::debug!(
+                                "Session {}: SubscribeEvents relay_actor_id={} — aborted previous forwarder",
+                                self.session_id,
+                                msg.relay_actor_id
+                            );
+                        }
+
+                        let fanout = self.config.event_sink.fanout().clone();
+                        let handle = EventForwarder::start(
+                            fanout,
                             relay_ref,
                             format!("session:{}", self.session_id),
-                        ));
-                        let token = self.config.event_bus.add_observer(forwarder);
-                        if let Some(previous_token) =
-                            self.relay_observer_tokens.insert(msg.relay_actor_id, token)
-                        {
-                            let removed = self.config.event_bus.remove_observer(previous_token);
-                            if !removed {
-                                warn!(
-                                    "Session {}: SubscribeEvents relay_actor_id={} replaced token {} but old observer was already missing",
-                                    self.session_id, msg.relay_actor_id, previous_token
-                                );
-                            }
-                        }
-                        let observer_count = self.config.event_bus.observer_count();
+                        );
+                        self.relay_forwarder_handles
+                            .insert(msg.relay_actor_id, handle);
+
                         log::debug!(
-                            "Session {}: SubscribeEvents — EventForwarder registered for relay '{}' (relay_actor_id={}, token={}); total observers on bus now: {}",
+                            "Session {}: SubscribeEvents — EventForwarder started for relay '{}' (relay_actor_id={})",
                             self.session_id,
                             relay_name,
                             msg.relay_actor_id,
-                            token,
-                            observer_count
                         );
                     }
                     Ok(None) => {
@@ -739,8 +741,8 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
 
 /// Unsubscribe a previously registered event relay.
 ///
-/// Phase 6: Removes the `EventForwarder` registered for `relay_actor_id` from
-/// the event bus. Without a swarm, this is a no-op (nothing was registered).
+/// Aborts the `EventForwarder` background task for `relay_actor_id`.
+/// Without a swarm, this is a no-op (nothing was registered).
 impl Message<crate::agent::messages::UnsubscribeEvents> for SessionActor {
     type Reply = Result<(), AgentError>;
 
@@ -749,23 +751,15 @@ impl Message<crate::agent::messages::UnsubscribeEvents> for SessionActor {
         msg: crate::agent::messages::UnsubscribeEvents,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Some(token) = self.relay_observer_tokens.remove(&msg.relay_actor_id) {
-            let removed = self.config.event_bus.remove_observer(token);
-            let observer_count = self.config.event_bus.observer_count();
-            if removed {
-                info!(
-                    "Session {}: UnsubscribeEvents relay_actor_id={} removed token {}; total observers now: {}",
-                    self.session_id, msg.relay_actor_id, token, observer_count
-                );
-            } else {
-                warn!(
-                    "Session {}: UnsubscribeEvents relay_actor_id={} token {} not found on bus; total observers now: {}",
-                    self.session_id, msg.relay_actor_id, token, observer_count
-                );
-            }
+        if let Some(handle) = self.relay_forwarder_handles.remove(&msg.relay_actor_id) {
+            handle.abort();
+            info!(
+                "Session {}: UnsubscribeEvents relay_actor_id={} — forwarder task aborted",
+                self.session_id, msg.relay_actor_id
+            );
         } else {
             info!(
-                "Session {}: UnsubscribeEvents relay_actor_id={} had no registered observer",
+                "Session {}: UnsubscribeEvents relay_actor_id={} had no registered forwarder",
                 self.session_id, msg.relay_actor_id
             );
         }
@@ -1421,24 +1415,17 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::agent_config::AgentConfig;
-    use crate::agent::core::{
-        AgentMode, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy, ToolConfig,
-        ToolPolicy,
-    };
-    use crate::config::RuntimeExecutionPolicy;
-    use crate::delegation::DefaultAgentRegistry;
-    use crate::event_bus::EventBus;
-    use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::agent::core::ToolPolicy;
+    use crate::session::backend::StorageBackend;
     use crate::session::store::SessionStore;
     use crate::test_utils::{
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
         mock_plugin_registry, mock_session,
     };
-    use crate::tools::ToolRegistry;
     use kameo::actor::Spawn;
     use querymt::LLMParams;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
@@ -1493,11 +1480,11 @@ mod tests {
                 .returning(|_, _| Ok(()))
                 .times(0..);
             store
-                .expect_set_session_provider_node()
+                .expect_set_session_provider_node_id()
                 .returning(|_, _| Ok(()))
                 .times(0..);
             store
-                .expect_get_session_provider_node()
+                .expect_get_session_provider_node_id()
                 .returning(|_| Ok(None))
                 .times(0..);
             store
@@ -1506,47 +1493,22 @@ mod tests {
                 .times(0..);
 
             let store: Arc<dyn SessionStore> = Arc::new(store);
-            let provider_ctx = Arc::new(crate::session::provider::SessionProvider::new(
-                Arc::new(plugin_registry),
-                store.clone(),
-                LLMParams::new().provider("mock").model("mock-model"),
-            ));
+            let storage = Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                    .await
+                    .expect("create event store"),
+            );
 
-            let config = Arc::new(AgentConfig {
-                provider: provider_ctx,
-                event_bus: Arc::new(EventBus::new()),
-                agent_registry: Arc::new(DefaultAgentRegistry::new()),
-                workspace_manager_actor: WorkspaceIndexManagerActor::new(
-                    WorkspaceIndexManagerConfig::default(),
-                ),
-                default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
-                tool_config: ToolConfig {
-                    policy: ToolPolicy::ProviderOnly,
-                    ..ToolConfig::default()
-                },
-                tool_registry: ToolRegistry::new(),
-                middleware_drivers: Vec::new(),
-                auth_methods: Vec::new(),
-                max_steps: None,
-                snapshot_policy: SnapshotPolicy::None,
-                assume_mutating: true,
-                mutating_tools: HashSet::new(),
-                max_prompt_bytes: None,
-                execution_timeout_secs: 300,
-                delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
-                delegation_wait_timeout_secs: 120,
-                delegation_cancel_grace_secs: 5,
-                execution_policy: RuntimeExecutionPolicy::default(),
-                compaction: crate::session::compaction::SessionCompaction::new(),
-                snapshot_backend: None,
-                snapshot_gc_config: crate::snapshot::GcConfig::default(),
-                delegation_context_config: DelegationContextConfig {
-                    timing: DelegationContextTiming::FirstTurnOnly,
-                    auto_inject: true,
-                },
-                pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
-                mcp_servers: Vec::new(),
-            });
+            let config = Arc::new(
+                AgentConfigBuilder::new(
+                    Arc::new(plugin_registry),
+                    store.clone(),
+                    storage.event_journal(),
+                    LLMParams::new().provider("mock").model("mock-model"),
+                )
+                .with_tool_policy(ToolPolicy::ProviderOnly)
+                .build(),
+            );
 
             let runtime = crate::agent::core::SessionRuntime::new(
                 None,
@@ -1593,26 +1555,26 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_emits_event() {
         let f = ActorFixture::new().await;
-        let mut rx = f.config.event_bus.subscribe();
+        let mut rx = f.config.event_sink.fanout().subscribe();
 
         f.actor_ref.tell(Cancel).await.expect("tell Cancel");
         // Give the actor time to process
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Look for Cancelled event
         let mut found_cancel = false;
-        while let Ok(event) = rx.try_recv() {
-            if matches!(event.kind, crate::events::AgentEventKind::Cancelled) {
+        while let Ok(envelope) = rx.try_recv() {
+            if matches!(envelope.kind(), crate::events::AgentEventKind::Cancelled) {
                 found_cancel = true;
             }
         }
-        assert!(found_cancel, "Expected Cancelled event on event bus");
+        assert!(found_cancel, "Expected Cancelled event on event fanout");
     }
 
     #[tokio::test]
     async fn test_set_mode_emits_event() {
         let f = ActorFixture::new().await;
-        let mut rx = f.config.event_bus.subscribe();
+        let mut rx = f.config.event_sink.fanout().subscribe();
 
         f.actor_ref
             .tell(SetMode {
@@ -1620,12 +1582,12 @@ mod tests {
             })
             .await
             .expect("tell SetMode");
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let mut found = false;
-        while let Ok(event) = rx.try_recv() {
-            if let crate::events::AgentEventKind::SessionModeChanged { mode } = event.kind {
-                assert_eq!(mode, AgentMode::Plan);
+        while let Ok(envelope) = rx.try_recv() {
+            if let crate::events::AgentEventKind::SessionModeChanged { mode } = envelope.kind() {
+                assert_eq!(*mode, AgentMode::Plan);
                 found = true;
             }
         }

@@ -224,43 +224,83 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
             while let Ok(event) = events.recv().await {
                 // Check if this connection is subscribed and if this event is newer than
                 // the replay cursor (prevents replay/live overlap duplicates).
-                let forward_decision = {
+                // Ephemeral events (seq=0) are never cursor-filtered — they are
+                // live-only signals that were never in the replay stream.
+                let should_forward = {
                     let mut connections = state_events.connections.lock().await;
                     if let Some(conn) = connections.get_mut(&conn_id_events) {
-                        if !conn.subscribed_sessions.contains(&event.session_id) {
-                            None
+                        if !conn.subscribed_sessions.contains(event.session_id()) {
+                            false
+                        } else if event.seq() == 0 {
+                            // Ephemeral event: always forward (never in replay).
+                            true
                         } else {
-                            let cursor_seq = conn
+                            let cursor = conn
                                 .session_cursors
-                                .get(&event.session_id)
-                                .copied()
-                                .unwrap_or(0);
-                            if event.seq <= cursor_seq {
-                                log::debug!(
-                                    "ui forwarder: dropping duplicate/overlap event conn={} session={} seq={} cursor_seq={}",
-                                    conn_id_events,
-                                    event.session_id,
-                                    event.seq,
-                                    cursor_seq
-                                );
-                                None
-                            } else {
-                                Some(cursor_seq)
+                                .get(event.session_id())
+                                .cloned()
+                                .unwrap_or_default();
+                            match event.origin() {
+                                crate::events::EventOrigin::Local
+                                | crate::events::EventOrigin::Unknown(_) => {
+                                    if event.seq() <= cursor.local_seq {
+                                        log::debug!(
+                                            "ui forwarder: dropping local duplicate/overlap event conn={} session={} seq={} cursor_local_seq={}",
+                                            conn_id_events,
+                                            event.session_id(),
+                                            event.seq(),
+                                            cursor.local_seq
+                                        );
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                }
+                                crate::events::EventOrigin::Remote => {
+                                    if let Some(source_node) = event.source_node() {
+                                        let source_cursor = cursor
+                                            .remote_seq_by_source
+                                            .get(source_node)
+                                            .copied()
+                                            .unwrap_or(0);
+                                        if event.seq() <= source_cursor {
+                                            log::debug!(
+                                                "ui forwarder: dropping remote duplicate/overlap event conn={} session={} source={} seq={} cursor_remote_seq={}",
+                                                conn_id_events,
+                                                event.session_id(),
+                                                source_node,
+                                                event.seq(),
+                                                source_cursor
+                                            );
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    } else {
+                                        log::warn!(
+                                            "ui forwarder: dropping remote event without source conn={} session={} seq={}",
+                                            conn_id_events,
+                                            event.session_id(),
+                                            event.seq(),
+                                        );
+                                        false
+                                    }
+                                }
                             }
                         }
                     } else {
-                        None
+                        false
                     }
                 };
 
-                if forward_decision.is_none() {
+                if !should_forward {
                     continue;
                 }
 
                 // React to WorkspaceIndexReady from a remote session: push status +
                 // fetch and push the file index so the UI gets it without polling.
-                if let crate::events::AgentEventKind::WorkspaceIndexReady { .. } = &event.kind {
-                    let session_id = event.session_id.clone();
+                if let crate::events::AgentEventKind::WorkspaceIndexReady { .. } = event.kind() {
+                    let session_id = event.session_id().to_owned();
 
                     // Push WorkspaceIndexStatus { ready }
                     let _ = send_message(
@@ -321,13 +361,13 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                 let agent_id = {
                     let agents = state_events.session_agents.lock().await;
                     agents
-                        .get(&event.session_id)
+                        .get(event.session_id())
                         .cloned()
                         .unwrap_or_else(|| "unknown".to_string())
                 };
 
                 if matches!(
-                    &event.kind,
+                    event.kind(),
                     crate::events::AgentEventKind::AssistantThinkingDelta { .. }
                         | crate::events::AgentEventKind::AssistantContentDelta { .. }
                         | crate::events::AgentEventKind::AssistantMessageStored { .. }
@@ -337,10 +377,10 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                     log::debug!(
                         "ui forwarder: conn={} session={} agent={} seq={} kind={:?}",
                         conn_id_events,
-                        event.session_id,
+                        event.session_id(),
                         agent_id,
-                        event.seq,
-                        event.kind
+                        event.seq(),
+                        event.kind()
                     );
                 }
 
@@ -348,7 +388,7 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                     &tx_events,
                     UiServerMessage::Event {
                         agent_id,
-                        session_id: event.session_id.clone(),
+                        session_id: event.session_id().to_owned(),
                         event: event.clone(),
                     },
                 )
@@ -361,8 +401,25 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                 {
                     let mut connections = state_events.connections.lock().await;
                     if let Some(conn) = connections.get_mut(&conn_id_events) {
-                        conn.session_cursors
-                            .insert(event.session_id.clone(), event.seq);
+                        let cursor = conn
+                            .session_cursors
+                            .entry(event.session_id().to_owned())
+                            .or_default();
+                        match event.origin() {
+                            crate::events::EventOrigin::Local
+                            | crate::events::EventOrigin::Unknown(_) => {
+                                cursor.local_seq = cursor.local_seq.max(event.seq());
+                            }
+                            crate::events::EventOrigin::Remote => {
+                                if let Some(source_node) = event.source_node() {
+                                    cursor
+                                        .remote_seq_by_source
+                                        .entry(source_node.to_owned())
+                                        .and_modify(|seq| *seq = (*seq).max(event.seq()))
+                                        .or_insert(event.seq());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -438,6 +495,7 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                                 nodes: nodes
                                     .iter()
                                     .map(|n| RemoteNodeInfo {
+                                        id: n.node_id.to_string(),
                                         label: n.hostname.clone(),
                                         capabilities: n.capabilities.clone(),
                                         active_sessions: n.active_sessions,
@@ -472,7 +530,7 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                         // Expired: push the updated (node-removed) list immediately.
                         let nodes = state.agent.list_remote_nodes().await;
 
-                        // Clear provider_node for any session that was using the
+                        // Clear provider_node_id for any session that was using the
                         // expired peer. We detect stale sessions by comparing the
                         // remote_sessions() peer_label against the set of nodes
                         // still visible after expiry.
@@ -494,11 +552,11 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                                                 model: config.model,
                                                 config_id: config.id,
                                                 context_limit: None,
-                                                provider_node: None,
+                                                provider_node_id: None,
                                             },
                                         );
                                         log::info!(
-                                            "spawn_peer_event_watcher: cleared provider_node \
+                                            "spawn_peer_event_watcher: cleared provider_node_id \
                                              for session {} (peer {} expired)",
                                             session_id,
                                             peer_label
@@ -529,6 +587,7 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                             nodes: nodes
                                 .into_iter()
                                 .map(|n| RemoteNodeInfo {
+                                    id: n.node_id.to_string(),
                                     label: n.hostname,
                                     capabilities: n.capabilities,
                                     active_sessions: n.active_sessions,
@@ -555,6 +614,7 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                                 nodes: nodes
                                     .into_iter()
                                     .map(|n| RemoteNodeInfo {
+                                        id: n.node_id.to_string(),
                                         label: n.hostname,
                                         capabilities: n.capabilities,
                                         active_sessions: n.active_sessions,
@@ -573,6 +633,7 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                         nodes: nodes
                             .into_iter()
                             .map(|n| RemoteNodeInfo {
+                                id: n.node_id.to_string(),
                                 label: n.hostname,
                                 capabilities: n.capabilities,
                                 active_sessions: n.active_sessions,

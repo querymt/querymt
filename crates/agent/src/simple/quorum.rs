@@ -13,8 +13,7 @@ use crate::agent::core::SnapshotPolicy;
 use crate::agent::core::ToolPolicy;
 use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
 use crate::delegation::AgentInfo;
-use crate::event_bus::EventBus;
-use crate::events::AgentEvent;
+
 use crate::middleware::MIDDLEWARE_REGISTRY;
 use crate::quorum::AgentQuorum;
 use crate::runner::{ChatRunner, ChatSession};
@@ -59,7 +58,7 @@ pub struct QuorumBuilder {
     #[cfg(feature = "remote")]
     pub(super) mesh: Option<crate::agent::remote::MeshHandle>,
     /// Controls whether provider lookup may fall back to mesh peers when
-    /// `provider_node` is not explicitly set.
+    /// `provider_node_id` is not explicitly set.
     #[cfg(feature = "remote")]
     pub(super) mesh_auto_fallback: bool,
 }
@@ -209,13 +208,16 @@ impl QuorumBuilder {
             let delegation_wait_policy_for_delegate = self.delegation_wait_policy.clone();
             let delegation_wait_timeout_for_delegate = self.delegation_wait_timeout_secs;
             let delegation_cancel_grace_for_delegate = self.delegation_cancel_grace_secs;
-            builder = builder.add_delegate_agent(agent_info, move |store, event_bus| {
+            builder = builder.add_delegate_agent(agent_info, move |store, event_journal| {
                 use crate::config::RuntimeExecutionPolicy;
-                let mut b =
-                    AgentConfigBuilder::new(registry.clone(), store.clone(), llm_config.clone())
-                        .with_event_bus(event_bus.clone())
-                        .with_tool_policy(ToolPolicy::BuiltInOnly)
-                        .with_snapshot_policy(snapshot_policy_for_delegate);
+                let mut b = AgentConfigBuilder::new(
+                    registry.clone(),
+                    store.clone(),
+                    event_journal.clone(),
+                    llm_config.clone(),
+                )
+                .with_tool_policy(ToolPolicy::BuiltInOnly)
+                .with_snapshot_policy(snapshot_policy_for_delegate);
 
                 if snapshot_policy_for_delegate != SnapshotPolicy::None {
                     b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
@@ -260,14 +262,14 @@ impl QuorumBuilder {
         let delegation_wait_policy_for_planner = self.delegation_wait_policy.clone();
         let delegation_wait_timeout_for_planner = self.delegation_wait_timeout_secs;
         let delegation_cancel_grace_for_planner = self.delegation_cancel_grace_secs;
-        builder = builder.with_planner(move |store, event_bus, agent_registry| {
+        builder = builder.with_planner(move |store, event_journal, agent_registry| {
             use crate::config::RuntimeExecutionPolicy;
             let mut b = AgentConfigBuilder::new(
                 registry_for_planner.clone(),
                 store.clone(),
+                event_journal.clone(),
                 planner_llm.clone(),
             )
-            .with_event_bus(event_bus.clone())
             .with_agent_registry(agent_registry)
             .with_snapshot_policy(snapshot_policy_for_planner);
 
@@ -657,7 +659,7 @@ impl ChatRunner for Quorum {
         let session_id = self.create_new_planner_session().await?;
         let session = QuorumSession::new(
             self.inner.planner(),
-            self.inner.event_bus(),
+            self.inner.event_fanout(),
             self.inner.store(),
             session_id,
             self.cwd.clone(),
@@ -665,38 +667,38 @@ impl ChatRunner for Quorum {
         Ok(Box::new(session))
     }
 
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
-        self.inner.event_bus().subscribe()
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
+        self.inner.subscribe_events()
     }
 
     fn on_tool_call_boxed(&self, callback: Box<dyn Fn(String, Value) + Send + Sync>) {
         self.callbacks.on_tool_call(callback);
         self.callbacks
-            .ensure_listener(self.inner.event_bus().subscribe());
+            .ensure_listener(self.inner.subscribe_events());
     }
 
     fn on_tool_complete_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_tool_complete(callback);
         self.callbacks
-            .ensure_listener(self.inner.event_bus().subscribe());
+            .ensure_listener(self.inner.subscribe_events());
     }
 
     fn on_message_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_message(callback);
         self.callbacks
-            .ensure_listener(self.inner.event_bus().subscribe());
+            .ensure_listener(self.inner.subscribe_events());
     }
 
     fn on_delegation_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_delegation(callback);
         self.callbacks
-            .ensure_listener(self.inner.event_bus().subscribe());
+            .ensure_listener(self.inner.subscribe_events());
     }
 
     fn on_error_boxed(&self, callback: Box<dyn Fn(String) + Send + Sync>) {
         self.callbacks.on_error(callback);
         self.callbacks
-            .ensure_listener(self.inner.event_bus().subscribe());
+            .ensure_listener(self.inner.subscribe_events());
     }
 
     #[cfg(feature = "dashboard")]
@@ -710,7 +712,7 @@ pub struct QuorumSession {
     planner: Arc<dyn SendAgent>,
     session_id: String,
     callbacks: Arc<EventCallbacksState>,
-    event_bus: Arc<EventBus>,
+    event_fanout: Arc<crate::event_fanout::EventFanout>,
     store: Arc<dyn SessionStore>,
     #[allow(dead_code)]
     cwd: Option<PathBuf>,
@@ -719,7 +721,7 @@ pub struct QuorumSession {
 impl QuorumSession {
     fn new(
         planner: Arc<dyn SendAgent>,
-        event_bus: Arc<EventBus>,
+        event_fanout: Arc<crate::event_fanout::EventFanout>,
         store: Arc<dyn SessionStore>,
         session_id: String,
         cwd: Option<PathBuf>,
@@ -729,7 +731,7 @@ impl QuorumSession {
             planner,
             session_id,
             callbacks,
-            event_bus,
+            event_fanout,
             store,
             cwd,
         }
@@ -761,22 +763,26 @@ impl ChatSession for QuorumSession {
 
     fn on_tool_call_boxed(&self, callback: Box<dyn Fn(String, Value) + Send + Sync>) {
         self.callbacks.on_tool_call(callback);
-        self.callbacks.ensure_listener(self.event_bus.subscribe());
+        self.callbacks
+            .ensure_listener(self.event_fanout.subscribe());
     }
 
     fn on_tool_complete_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_tool_complete(callback);
-        self.callbacks.ensure_listener(self.event_bus.subscribe());
+        self.callbacks
+            .ensure_listener(self.event_fanout.subscribe());
     }
 
     fn on_message_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_message(callback);
-        self.callbacks.ensure_listener(self.event_bus.subscribe());
+        self.callbacks
+            .ensure_listener(self.event_fanout.subscribe());
     }
 
     fn on_error_boxed(&self, callback: Box<dyn Fn(String) + Send + Sync>) {
         self.callbacks.on_error(callback);
-        self.callbacks.ensure_listener(self.event_bus.subscribe());
+        self.callbacks
+            .ensure_listener(self.event_fanout.subscribe());
     }
 }
 
@@ -798,65 +804,29 @@ fn parse_snapshot_policy(policy: Option<String>) -> Result<SnapshotPolicy> {
 ///
 /// `factory_config` is a snapshot of the config built so far (before middleware
 /// are appended). Middleware factories only need `compaction_config` and
-/// `event_bus` from it.
+/// `event_journal` from it.
 fn apply_middleware_from_config(
     builder: &mut AgentConfigBuilder,
     entries: &[MiddlewareEntry],
     auto_compact: bool,
 ) {
     // Build a lightweight AgentConfig snapshot that factory closures can read.
-    // We do this by constructing a minimal config with just the fields that
-    // factories actually consult (compaction_config, event_bus).
-    use crate::agent::agent_config::AgentConfig;
-    use crate::agent::core::{
-        DelegationContextConfig, DelegationContextTiming, SnapshotPolicy, ToolConfig,
-    };
+    // Middleware factories only consult compaction_config and event_journal.
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::config::RuntimeExecutionPolicy;
-    use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
-    use crate::session::compaction::SessionCompaction;
-    use crate::tools::ToolRegistry;
-    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    // Build a minimal ephemeral policy with the real compaction config so that
-    // middleware factories that inspect compaction settings see correct values.
     let ephemeral_policy = RuntimeExecutionPolicy {
         compaction: builder.compaction_config().clone(),
         ..Default::default()
     };
 
-    let factory_config = Arc::new(AgentConfig {
-        provider: builder.provider().clone(),
-        event_bus: builder.event_bus(),
-        agent_registry: builder.agent_registry(),
-        workspace_manager_actor: WorkspaceIndexManagerActor::new(
-            WorkspaceIndexManagerConfig::default(),
-        ),
-        default_mode: Arc::new(std::sync::Mutex::new(crate::agent::core::AgentMode::Build)),
-        tool_config: ToolConfig::default(),
-        tool_registry: ToolRegistry::new(),
-        middleware_drivers: Vec::new(),
-        auth_methods: Vec::new(),
-        max_steps: None,
-        snapshot_policy: SnapshotPolicy::None,
-        assume_mutating: true,
-        mutating_tools: HashSet::new(),
-        max_prompt_bytes: None,
-        execution_timeout_secs: 300,
-        delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
-        delegation_wait_timeout_secs: 120,
-        delegation_cancel_grace_secs: 5,
-        execution_policy: ephemeral_policy,
-        compaction: SessionCompaction::new(),
-        snapshot_backend: None,
-        snapshot_gc_config: crate::snapshot::GcConfig::default(),
-        delegation_context_config: DelegationContextConfig {
-            timing: DelegationContextTiming::FirstTurnOnly,
-            auto_inject: true,
-        },
-        pending_elicitations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        mcp_servers: Vec::new(),
-    });
+    let factory_config = Arc::new(
+        AgentConfigBuilder::from_provider(builder.provider().clone(), builder.event_journal())
+            .with_agent_registry(builder.agent_registry())
+            .with_execution_policy(ephemeral_policy)
+            .build(),
+    );
 
     for entry in entries {
         match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &factory_config) {

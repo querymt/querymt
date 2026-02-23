@@ -235,7 +235,7 @@ pub(super) async fn transition_call_llm(
                 ($reset_timer:expr) => {
                     if !text_buffer.is_empty() {
                         let text_delta: String = text_buffer.drain(..).collect();
-                        debug!(
+                        trace!(
                             "stream flush: session={} message_id={} text_delta_len={}",
                             session_id,
                             message_id,

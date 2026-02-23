@@ -27,7 +27,7 @@ use crate::acp::shared::{
     handle_rpc_message, is_event_owned, translate_event_to_notification,
 };
 use crate::acp::shutdown;
-use crate::event_bus::EventBus;
+use crate::event_fanout::EventFanout;
 use axum::{
     Router,
     extract::{
@@ -49,7 +49,7 @@ struct WsServerState {
     agent: Arc<crate::agent::AgentHandle>,
     pending_permissions: PermissionMap,
     pending_elicitations: PendingElicitationMap,
-    event_sources: Vec<Arc<EventBus>>,
+    event_sources: Vec<Arc<EventFanout>>,
     session_owners: SessionOwnerMap,
 }
 

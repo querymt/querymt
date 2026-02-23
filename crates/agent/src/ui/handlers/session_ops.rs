@@ -8,8 +8,9 @@ use super::super::ServerState;
 use super::super::connection::{send_error, send_message, send_state, subscribe_to_file_index};
 use super::super::mentions::{filter_index_for_cwd, filter_index_for_cwd_entries};
 use super::super::messages::{SessionGroup, SessionSummary, UiServerMessage};
-use super::super::session::PRIMARY_AGENT_ID;
+use super::super::{cursor_from_events, session::PRIMARY_AGENT_ID};
 use crate::agent::core::AgentMode;
+use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
 use crate::send_agent::SendAgent;
 use agent_client_protocol::{CancelNotification, LoadSessionRequest, SessionId};
@@ -219,12 +220,7 @@ pub async fn handle_load_session(
 
     // 5. Send loaded audit view and persisted undo stack for UI hydration
     let undo_stack = load_undo_stack(state, session_id).await;
-    let cursor_seq = audit
-        .events
-        .iter()
-        .map(|event| event.seq)
-        .max()
-        .unwrap_or(0);
+    let cursor = cursor_from_events(&audit.events);
 
     let _ = send_message(
         tx,
@@ -233,7 +229,7 @@ pub async fn handle_load_session(
             agent_id,
             audit,
             undo_stack,
-            cursor_seq,
+            cursor: cursor.clone(),
         },
     )
     .await;
@@ -243,7 +239,7 @@ pub async fn handle_load_session(
         let mut connections = state.connections.lock().await;
         if let Some(conn) = connections.get_mut(conn_id) {
             conn.session_cursors
-                .insert(session_id.to_string(), cursor_seq);
+                .insert(session_id.to_string(), cursor.clone());
         }
     }
 
@@ -426,14 +422,15 @@ pub async fn handle_subscribe_session(
         }
     };
 
-    let cursor_seq = events.iter().map(|event| event.seq).max().unwrap_or(0);
+    let cursor = cursor_from_events(&events);
+    let events: Vec<EventEnvelope> = events.into_iter().map(Into::into).collect();
 
     // 4. Track replay cursor and send replay batch
     {
         let mut connections = state.connections.lock().await;
         if let Some(conn) = connections.get_mut(conn_id) {
             conn.session_cursors
-                .insert(session_id.to_string(), cursor_seq);
+                .insert(session_id.to_string(), cursor.clone());
         }
     }
 
@@ -443,7 +440,7 @@ pub async fn handle_subscribe_session(
             session_id: session_id.to_string(),
             agent_id: resolved_agent_id,
             events,
-            cursor_seq,
+            cursor,
         },
     )
     .await;

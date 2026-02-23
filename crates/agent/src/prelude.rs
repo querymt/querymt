@@ -36,8 +36,7 @@ pub use crate::agent::{AgentHandle, SnapshotPolicy, ToolPolicy};
 pub use crate::quorum::{AgentQuorum, DelegateAgent};
 
 // Events
-pub use crate::event_bus::EventBus;
-pub use crate::events::{AgentEvent, AgentEventKind, EventObserver};
+pub use crate::events::{AgentEvent, AgentEventKind};
 
 // Delegation & Multi-agent
 pub use crate::delegation::{AgentInfo, AgentRegistry};

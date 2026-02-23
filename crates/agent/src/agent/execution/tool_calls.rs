@@ -116,7 +116,7 @@ pub(super) async fn execute_tool_call(
     let (elicitation_tx, mut elicitation_rx) =
         tokio::sync::mpsc::channel::<crate::tools::ElicitationRequest>(1);
 
-    let event_bus = config.event_bus.clone();
+    let event_sink = config.event_sink.clone();
     let session_id_clone = exec_ctx.session_id.clone();
     let pending_elicitations = config.pending_elicitations.clone();
     tokio::spawn(async move {
@@ -126,16 +126,22 @@ pub(super) async fn execute_tool_call(
                 let mut pending = pending_elicitations.lock().await;
                 pending.insert(elicitation_id.clone(), request.response_tx);
             }
-            event_bus.publish(
-                &session_id_clone,
-                crate::events::AgentEventKind::ElicitationRequested {
-                    elicitation_id,
-                    session_id: session_id_clone.clone(),
-                    message: request.message,
-                    requested_schema: request.requested_schema,
-                    source: request.source,
-                },
-            );
+            // Durable: elicitation must be visible in UI replay.
+            if let Err(err) = event_sink
+                .emit_durable(
+                    &session_id_clone,
+                    crate::events::AgentEventKind::ElicitationRequested {
+                        elicitation_id,
+                        session_id: session_id_clone.clone(),
+                        message: request.message,
+                        requested_schema: request.requested_schema,
+                        source: request.source,
+                    },
+                )
+                .await
+            {
+                log::warn!("failed to emit ElicitationRequested: {}", err);
+            }
         }
     });
 

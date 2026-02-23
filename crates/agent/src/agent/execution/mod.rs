@@ -121,7 +121,7 @@ pub(crate) async fn execute_cycle_state_machine(
     let mut state = ExecutionState::BeforeLlmCall {
         context: initial_context,
     };
-    let mut event_rx = config.event_bus.subscribe();
+    let mut event_rx = config.event_sink.fanout().subscribe();
 
     state = driver
         .run_turn_start(state, Some(&exec_ctx.runtime))

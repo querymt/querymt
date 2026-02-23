@@ -7,7 +7,7 @@
 //! API keys never leave the owning node. Only `ChatMessage`s flow in and
 //! `ProviderChatResponse` / `StreamChunkRelay` flow out.
 //!
-//! Registered in the Kademlia DHT as `"provider_host::{hostname}"`.
+//! Registered in the Kademlia DHT as `"provider_host::peer::{peer_id}"`.
 
 use crate::agent::agent_config::AgentConfig;
 use crate::error::AgentError;
@@ -224,7 +224,7 @@ impl Message<StreamChunkRelay> for StreamReceiverActor {
 /// Per-node actor that serves LLM provider calls to the mesh.
 ///
 /// Spawned once during mesh bootstrap alongside `RemoteNodeManager`.
-/// Registered in the DHT as `"provider_host::{hostname}"`.
+/// Registered in the DHT as `"provider_host::peer::{peer_id}"`.
 #[derive(Actor)]
 pub struct ProviderHostActor {
     config: Arc<AgentConfig>,
@@ -269,7 +269,7 @@ impl ProviderHostActor {
             None, // no extra params
             None, // no API key override — use local keys
             ProviderRouting {
-                provider_node: None,        // always local on the owning node
+                provider_node_id: None,     // always local on the owning node
                 mesh_handle: None,          // not needed — owning node builds directly
                 allow_mesh_fallback: false, // host should stay local-only
             },

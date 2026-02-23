@@ -13,7 +13,6 @@ use crate::agent::core::{SnapshotPolicy, ToolPolicy};
 use crate::config::{
     ExecutionPolicy, McpServerConfig, MiddlewareEntry, SingleAgentConfig, SkillsConfig,
 };
-use crate::events::AgentEvent;
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
 use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
@@ -135,8 +134,8 @@ impl AgentBuilder {
 
     /// Add a middleware to the agent using a factory closure.
     ///
-    /// The closure receives a reference to the constructed `QueryMTAgent`,
-    /// allowing access to internal state like `event_bus()`.
+    /// The closure receives a reference to the constructed `AgentHandle`,
+    /// allowing access to internal state.
     ///
     /// # Example
     ///
@@ -149,11 +148,10 @@ impl AgentBuilder {
     /// let agent = Agent::single()
     ///     .provider("openai", "gpt-4")
     ///     .cwd(".")
-    ///     .middleware(|agent| {
+    ///     .middleware(|_agent| {
     ///         DedupCheckMiddleware::new()
     ///             .threshold(0.8)
     ///             .min_lines(5)
-    ///             .with_event_bus(agent.event_bus())
     ///     })
     ///     .build()
     ///     .await?;
@@ -197,9 +195,13 @@ impl AgentBuilder {
         };
         let backend = SqliteStorage::connect(db_path).await?;
 
-        let mut builder =
-            AgentConfigBuilder::new(plugin_registry, backend.session_store(), llm_config)
-                .with_snapshot_policy(snapshot_policy);
+        let mut builder = AgentConfigBuilder::new(
+            plugin_registry,
+            backend.session_store(),
+            backend.event_journal(),
+            llm_config,
+        )
+        .with_snapshot_policy(snapshot_policy);
 
         // Phase 7: inject pre-populated agent registry (remote agents from config).
         if let Some(registry) = self.agent_registry {
@@ -212,8 +214,6 @@ impl AgentBuilder {
         if let Some(mutating_tools) = self.mutating_tools {
             builder = builder.with_mutating_tools(mutating_tools);
         }
-
-        builder.add_observer(backend.event_observer());
 
         // Initialize skills system if enabled
         if let Some(skills_config) = self.skills_config {
@@ -357,7 +357,8 @@ impl AgentBuilder {
         // Build final AgentConfig with all middleware appended
         let final_config = Arc::new(crate::agent::AgentConfig {
             provider: initial_config.provider.clone(),
-            event_bus: initial_config.event_bus.clone(),
+
+            event_sink: initial_config.event_sink.clone(),
             agent_registry: initial_config.agent_registry.clone(),
             workspace_manager_actor: initial_config.workspace_manager_actor.clone(),
             default_mode: initial_config.default_mode.clone(),
@@ -450,7 +451,7 @@ impl Agent {
         Ok(())
     }
 
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
         self.inner.subscribe_events()
     }
 
@@ -612,7 +613,7 @@ impl Agent {
     /// When `initial_registry` is `Some`, it is used as the agent registry instead of the
     /// default empty `DefaultAgentRegistry`.  When `mesh` is `Some`, the `MeshHandle` is
     /// stored on the resulting `AgentHandle` via `set_mesh()`. `mesh_auto_fallback`
-    /// controls whether `provider_node = None` may resolve providers from mesh peers.
+    /// controls whether `provider_node_id = None` may resolve providers from mesh peers.
     #[cfg(feature = "remote")]
     pub async fn from_single_config_with_registry(
         config: SingleAgentConfig,
@@ -697,7 +698,7 @@ impl ChatRunner for Agent {
         Ok(Box::new(session))
     }
 
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
         Agent::subscribe(self)
     }
 

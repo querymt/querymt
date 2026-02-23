@@ -8,6 +8,7 @@
 //! The `RemoteSessionInfo` and `NodeInfo` data types are always available
 //! (needed for UI serialization regardless of feature).
 
+use crate::agent::remote::NodeId;
 use serde::{Deserialize, Serialize};
 
 /// Metadata about a session available on a remote node.
@@ -30,6 +31,8 @@ pub struct RemoteSessionInfo {
 /// Metadata about a remote node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
+    /// Stable mesh node identifier (PeerId-backed).
+    pub node_id: NodeId,
     /// Human-readable hostname
     pub hostname: String,
     /// Node capabilities (e.g., "shell", "filesystem", "gpu")
@@ -58,6 +61,7 @@ mod remote_impl {
     use super::{AvailableModel, NodeInfo, RemoteSessionInfo};
     use crate::agent::agent_config::AgentConfig;
     use crate::agent::core::SessionRuntime;
+    use crate::agent::remote::NodeId;
     use crate::agent::remote::mesh::MeshHandle;
     use crate::agent::session_actor::SessionActor;
     use crate::agent::session_registry::SessionRegistry;
@@ -68,6 +72,7 @@ mod remote_impl {
     use kameo::remote::_internal;
     use querymt::LLMParams;
     use serde::{Deserialize, Serialize};
+
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -315,7 +320,7 @@ mod remote_impl {
                         model: llm_config.model.clone(),
                         config_id: llm_config.id,
                         context_limit,
-                        provider_node: None,
+                        provider_node_id: None,
                     },
                 );
             }
@@ -483,7 +488,14 @@ mod remote_impl {
                 .record("hostname", &hostname)
                 .record("active_sessions", active_sessions);
 
+            let node_id = self
+                .mesh
+                .as_ref()
+                .map(|m| NodeId::from_peer_id(*m.peer_id()))
+                .ok_or(AgentError::MeshNotBootstrapped)?;
+
             Ok(NodeInfo {
+                node_id,
                 hostname,
                 capabilities: vec!["shell".to_string(), "filesystem".to_string()],
                 active_sessions,

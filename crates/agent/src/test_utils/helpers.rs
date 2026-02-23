@@ -118,7 +118,7 @@ pub fn mock_llm_config() -> LLMConfig {
         params: None,
         created_at: Some(OffsetDateTime::now_utc()),
         updated_at: Some(OffsetDateTime::now_utc()),
-        provider_node: None,
+        provider_node_id: None,
     }
 }
 
@@ -188,10 +188,14 @@ impl UndoTestFixture {
         let backend = GitSnapshotBackend::with_snapshot_base(snapshot_base_path.clone());
         let backend_arc = Arc::new(backend);
 
-        let builder = AgentConfigBuilder::new(registry, storage.session_store(), llm)
-            .with_snapshot_policy(SnapshotPolicy::Diff)
-            .with_snapshot_backend(backend_arc.clone());
-        builder.add_observer(storage.event_observer());
+        let builder = AgentConfigBuilder::new(
+            registry,
+            storage.session_store(),
+            storage.event_journal(),
+            llm,
+        )
+        .with_snapshot_policy(SnapshotPolicy::Diff)
+        .with_snapshot_backend(backend_arc.clone());
 
         let config = Arc::new(builder.build());
         let handle = AgentHandle::from_config(config);
@@ -385,6 +389,7 @@ impl DelegateTestFixture {
         let delegate_builder = AgentConfigBuilder::new(
             Arc::new(delegate_registry),
             delegate_storage.session_store(),
+            delegate_storage.event_journal(),
             LLMParams::new().provider("mock").model("mock-model"),
         );
         let delegate_config = Arc::new(delegate_builder.build());
@@ -409,6 +414,7 @@ impl DelegateTestFixture {
         let builder = AgentConfigBuilder::new(
             Arc::new(planner_registry),
             planner_storage.session_store(),
+            planner_storage.event_journal(),
             LLMParams::new().provider("mock").model("mock-model"),
         )
         .with_agent_registry(Arc::new(registry));

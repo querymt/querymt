@@ -578,9 +578,9 @@ pub struct MeshTomlConfig {
     #[serde(default)]
     pub discovery: MeshDiscoveryConfig,
 
-    /// Whether `provider_node = None` may fall back to mesh provider discovery.
+    /// Whether `provider_node_id = None` may fall back to mesh provider discovery.
     ///
-    /// Default: `false` (local-only unless an explicit `provider_node` is set).
+    /// Default: `false` (local-only unless an explicit `provider_node_id` is set).
     #[serde(default)]
     pub auto_fallback: bool,
 

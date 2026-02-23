@@ -31,7 +31,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             fork_point_type TEXT,
             fork_point_ref TEXT,
             fork_instructions TEXT,
-            provider_node TEXT,
+            provider_node_id TEXT,
             FOREIGN KEY(parent_session_id) REFERENCES sessions(id) ON DELETE SET NULL,
             FOREIGN KEY(llm_config_id) REFERENCES llm_configs(id) ON DELETE SET NULL,
             FOREIGN KEY(current_intent_snapshot_id) REFERENCES intent_snapshots(id) ON DELETE SET NULL,
@@ -205,16 +205,32 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
         );
 
-        -- Events - internal audit log
-        CREATE TABLE IF NOT EXISTS events (
-            seq INTEGER PRIMARY KEY,
-            timestamp INTEGER NOT NULL,
+        -- Event journal (durable events with full envelope semantics)
+        CREATE TABLE IF NOT EXISTS event_journal (
+            event_id TEXT PRIMARY KEY,
+            stream_seq INTEGER UNIQUE NOT NULL,
             session_id TEXT NOT NULL,
-            kind TEXT NOT NULL
+            timestamp INTEGER NOT NULL,
+            origin TEXT NOT NULL DEFAULT 'local',
+            source_node TEXT,
+            kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
-        CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
-        CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_event_journal_session_seq
+            ON event_journal(session_id, stream_seq);
+        CREATE INDEX IF NOT EXISTS idx_event_journal_timestamp
+            ON event_journal(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_event_journal_origin
+            ON event_journal(origin, source_node);
+
+        -- Sequence generator for stream_seq (single-row table)
+        CREATE TABLE IF NOT EXISTS event_journal_seq (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            next_seq INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT OR IGNORE INTO event_journal_seq (id, next_seq) VALUES (1, 1);
 
         -- Revert states for undo/redo support
         CREATE TABLE IF NOT EXISTS revert_states (

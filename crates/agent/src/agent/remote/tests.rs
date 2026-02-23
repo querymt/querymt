@@ -12,7 +12,6 @@ use crate::agent::core::{AgentMode, SessionRuntime};
 use crate::agent::remote::SessionActorRef;
 use crate::agent::session_actor::SessionActor;
 use crate::agent::session_registry::SessionRegistry;
-use crate::event_bus::EventBus;
 use crate::events::{AgentEvent, AgentEventKind, EventOrigin};
 use crate::session::backend::StorageBackend;
 use crate::session::sqlite_storage::SqliteStorage;
@@ -45,7 +44,12 @@ async fn test_agent_config() -> (Arc<AgentConfig>, TempDir) {
     );
     let llm = LLMParams::new().provider("mock").model("mock");
 
-    let builder = AgentConfigBuilder::new(plugin_registry, storage.session_store(), llm);
+    let builder = AgentConfigBuilder::new(
+        plugin_registry,
+        storage.session_store(),
+        storage.event_journal(),
+        llm,
+    );
     let config = Arc::new(builder.build());
     (config, temp_dir)
 }
@@ -256,14 +260,28 @@ async fn test_registry_overwrite() {
 mod event_relay_extended {
     use super::*;
     use crate::agent::remote::event_relay::{EventRelayActor, RelayedEvent};
+    use crate::event_fanout::EventFanout;
+    use crate::event_sink::EventSink;
+
+    /// Create an EventSink backed by an in-memory journal.
+    async fn make_sink() -> Arc<EventSink> {
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let journal = storage.event_journal();
+        let fanout = Arc::new(EventFanout::new());
+        Arc::new(EventSink::new(journal, fanout))
+    }
 
     #[tokio::test]
     async fn test_relay_multiple_events() {
-        let local_bus = Arc::new(EventBus::new());
-        let relay = EventRelayActor::new(local_bus.clone(), "multi-test".to_string());
+        let sink = make_sink().await;
+        let relay = EventRelayActor::new(sink.clone(), "multi-test".to_string());
         let relay_ref = <EventRelayActor as Spawn>::spawn(relay);
 
-        let mut rx = local_bus.subscribe();
+        let mut rx = sink.fanout().subscribe();
 
         let events = vec![
             AgentEvent {
@@ -304,26 +322,43 @@ mod event_relay_extended {
                 .expect("tell should succeed");
         }
 
-        // Receive all 3 events with original metadata intact.
+        // Receive all 3 events. The relay routes through EventSink which
+        // assigns new journal stream_seq values (not the original seq).
+        // We verify: session_id preserved, events arrive in order, seq monotonic.
+        let mut received_seqs = Vec::new();
         for expected_event in &events {
             let received = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
                 .await
                 .expect("should receive within timeout")
                 .expect("recv should succeed");
 
-            assert_eq!(received.seq, expected_event.seq);
-            assert_eq!(received.timestamp, expected_event.timestamp);
-            assert_eq!(received.session_id, expected_event.session_id);
+            assert_eq!(received.session_id(), expected_event.session_id);
+            if let crate::events::EventEnvelope::Durable(de) = &received {
+                assert!(de.stream_seq >= 1, "journal-assigned seq must be >= 1");
+                received_seqs.push(de.stream_seq);
+            } else {
+                panic!("expected durable event envelope");
+            }
+        }
+
+        // Journal assigns monotonically increasing seqs.
+        for window in received_seqs.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "journal stream_seq must be monotonically increasing: {} < {}",
+                window[0],
+                window[1]
+            );
         }
     }
 
     #[tokio::test]
     async fn test_relay_preserves_session_id() {
-        let local_bus = Arc::new(EventBus::new());
-        let relay = EventRelayActor::new(local_bus.clone(), "preserve-test".to_string());
+        let sink = make_sink().await;
+        let relay = EventRelayActor::new(sink.clone(), "preserve-test".to_string());
         let relay_ref = <EventRelayActor as Spawn>::spawn(relay);
 
-        let mut rx = local_bus.subscribe();
+        let mut rx = sink.fanout().subscribe();
 
         let event = AgentEvent {
             seq: 99,
@@ -346,16 +381,16 @@ mod event_relay_extended {
             .expect("timeout")
             .expect("recv");
 
-        assert_eq!(received.session_id, "unique-session-id-xyz");
+        assert_eq!(received.session_id(), "unique-session-id-xyz");
     }
 
     #[tokio::test]
     async fn test_relay_preserves_event_kind() {
-        let local_bus = Arc::new(EventBus::new());
-        let relay = EventRelayActor::new(local_bus.clone(), "kind-test".to_string());
+        let sink = make_sink().await;
+        let relay = EventRelayActor::new(sink.clone(), "kind-test".to_string());
         let relay_ref = <EventRelayActor as Spawn>::spawn(relay);
 
-        let mut rx = local_bus.subscribe();
+        let mut rx = sink.fanout().subscribe();
 
         let event = AgentEvent {
             seq: 7,
@@ -380,7 +415,7 @@ mod event_relay_extended {
             .expect("timeout")
             .expect("recv");
 
-        match received.kind {
+        match received.kind() {
             AgentEventKind::Error { message } => {
                 assert_eq!(message, "test error");
             }
@@ -390,11 +425,11 @@ mod event_relay_extended {
 
     #[tokio::test]
     async fn test_relay_different_sessions() {
-        let local_bus = Arc::new(EventBus::new());
-        let relay = EventRelayActor::new(local_bus.clone(), "multi-session".to_string());
+        let sink = make_sink().await;
+        let relay = EventRelayActor::new(sink.clone(), "multi-session".to_string());
         let relay_ref = <EventRelayActor as Spawn>::spawn(relay);
 
-        let mut rx = local_bus.subscribe();
+        let mut rx = sink.fanout().subscribe();
 
         let event_a = AgentEvent {
             seq: 1,
@@ -435,7 +470,7 @@ mod event_relay_extended {
             .expect("timeout")
             .expect("recv");
 
-        let mut ids = vec![r1.session_id, r2.session_id];
+        let mut ids = vec![r1.session_id().to_string(), r2.session_id().to_string()];
         ids.sort();
         assert_eq!(ids, vec!["session-a", "session-b"]);
     }
@@ -451,8 +486,9 @@ mod event_forwarder_stub {
 
     #[test]
     #[should_panic(expected = "requires the 'remote' feature")]
-    fn test_stub_panics_on_construction() {
-        let _ = EventForwarder::new((), "test".to_string());
+    fn test_stub_panics_on_start() {
+        let fanout = std::sync::Arc::new(crate::event_fanout::EventFanout::new());
+        let _ = EventForwarder::start(fanout, (), "test".to_string());
     }
 }
 
@@ -467,14 +503,14 @@ mod node_manager_tests {
         CreateRemoteSession, DestroyRemoteSession, GetNodeInfo, ListRemoteSessions,
         RemoteNodeManager,
     };
+    use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
     use kameo::actor::{ActorRef, Spawn};
     use kameo::error::SendError;
     use tokio::sync::Mutex;
 
-    /// Spawn a `RemoteNodeManager` actor and return its `ActorRef`.
-    ///
-    /// The actor is spawned with no mesh (suitable for local-only tests).
-    async fn spawn_test_node_manager() -> (ActorRef<RemoteNodeManager>, Arc<AgentConfig>, TempDir) {
+    /// Spawn a `RemoteNodeManager` actor without mesh and return its `ActorRef`.
+    async fn spawn_test_node_manager_no_mesh()
+    -> (ActorRef<RemoteNodeManager>, Arc<AgentConfig>, TempDir) {
         let (config, td) = test_agent_config().await;
         let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
         let nm = RemoteNodeManager::new(config.clone(), registry, None);
@@ -482,9 +518,20 @@ mod node_manager_tests {
         (actor_ref, config, td)
     }
 
+    /// Spawn a `RemoteNodeManager` actor with mesh enabled and return its `ActorRef`.
+    async fn spawn_test_node_manager_with_mesh()
+    -> (ActorRef<RemoteNodeManager>, Arc<AgentConfig>, TempDir) {
+        let mesh = get_test_mesh().await;
+        let (config, td) = test_agent_config().await;
+        let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
+        let nm = RemoteNodeManager::new(config.clone(), registry, Some(mesh.clone()));
+        let actor_ref = RemoteNodeManager::spawn(nm);
+        (actor_ref, config, td)
+    }
+
     #[tokio::test]
     async fn test_create_session_no_cwd() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
 
         let resp = nm_ref
             .ask(CreateRemoteSession { cwd: None })
@@ -500,7 +547,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_create_session_valid_cwd() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
         let cwd_dir = TempDir::new().unwrap();
 
         let resp = nm_ref
@@ -515,7 +562,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_create_session_nonexistent_cwd() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
 
         let resp = nm_ref
             .ask(CreateRemoteSession {
@@ -529,7 +576,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_create_session_relative_cwd_rejected() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
 
         let result = nm_ref
             .ask(CreateRemoteSession {
@@ -552,7 +599,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_list_sessions_empty() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
 
         let sessions = nm_ref
             .ask(ListRemoteSessions)
@@ -564,7 +611,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_list_sessions_after_create() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
 
         let resp = nm_ref
             .ask(CreateRemoteSession { cwd: None })
@@ -580,7 +627,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_create_multiple_sessions() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
 
         let mut session_ids = Vec::new();
         for _ in 0..3 {
@@ -603,7 +650,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_destroy_session() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
 
         let resp = nm_ref
             .ask(CreateRemoteSession { cwd: None })
@@ -623,7 +670,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_destroy_nonexistent_session() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
 
         let result = nm_ref
             .ask(DestroyRemoteSession {
@@ -639,7 +686,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_get_node_info() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let info = nm_ref
             .ask(GetNodeInfo)
@@ -653,7 +700,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_get_node_info_reflects_session_count() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         for _ in 0..2 {
             nm_ref
@@ -668,9 +715,9 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_create_session_emits_events() {
-        let (nm_ref, config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, config, _td) = spawn_test_node_manager_no_mesh().await;
 
-        let mut rx = config.event_bus.subscribe();
+        let mut rx = config.subscribe_events();
 
         let resp = nm_ref
             .ask(CreateRemoteSession { cwd: None })
@@ -683,13 +730,13 @@ mod node_manager_tests {
             .expect("should receive event within timeout")
             .expect("recv");
 
-        assert_eq!(event.session_id, resp.session_id);
-        assert!(matches!(event.kind, AgentEventKind::SessionCreated));
+        assert_eq!(event.session_id(), resp.session_id);
+        assert!(matches!(event.kind(), AgentEventKind::SessionCreated));
     }
 
     #[tokio::test]
     async fn test_create_session_cwd_tracked_in_list() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
         let cwd_dir = TempDir::new().unwrap();
         let cwd_str = cwd_dir.path().to_string_lossy().to_string();
 
@@ -709,7 +756,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_destroy_then_create_reuses_slot() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
 
         // Create + destroy
         let resp1 = nm_ref

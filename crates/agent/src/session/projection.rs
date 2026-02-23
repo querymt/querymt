@@ -5,7 +5,7 @@
 //! - Redacted view (user-facing, sensitive data removed)
 //! - Summary view (quick status for UI)
 
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, AgentEventKind, DurableEvent, EventOrigin};
 use crate::session::error::SessionResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -88,21 +88,42 @@ pub enum RedactionPolicy {
     Minimal,
 }
 
-/// Event persistence and querying
+// ============================================================================
+// EventJournal — durable event persistence trait
+// ============================================================================
+
+/// Input for appending a new durable event to the journal.
+#[derive(Debug, Clone)]
+pub struct NewDurableEvent {
+    pub session_id: String,
+    pub origin: EventOrigin,
+    pub source_node: Option<String>,
+    pub kind: AgentEventKind,
+}
+
+/// Durable event journal — single source of truth for event ordering.
+///
+/// Sequence assignment is the authority of the journal implementation.
+/// Producers never set `stream_seq`; it is assigned atomically on append.
 #[async_trait]
-pub trait EventStore: Send + Sync {
-    /// Append an event to the event log
-    async fn append_event(&self, event: &AgentEvent) -> SessionResult<()>;
+pub trait EventJournal: Send + Sync {
+    /// Persist a durable event and return it with assigned `event_id` and `stream_seq`.
+    async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent>;
 
-    /// Get all events for a session
-    async fn get_session_events(&self, session_id: &str) -> SessionResult<Vec<AgentEvent>>;
-
-    /// Get events since a specific sequence number
-    async fn get_events_since(
+    /// Load the durable event stream for a session, optionally starting after a cursor.
+    async fn load_session_stream(
         &self,
         session_id: &str,
-        after_seq: u64,
-    ) -> SessionResult<Vec<AgentEvent>>;
+        after_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>>;
+
+    /// Load events across all sessions (global stream), after a given sequence.
+    async fn load_global_stream(
+        &self,
+        after_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>>;
 }
 
 /// View generation (read-only projections)

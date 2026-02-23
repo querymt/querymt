@@ -27,6 +27,7 @@ pub async fn handle_list_remote_nodes(state: &ServerState, tx: &mpsc::Sender<Str
                 nodes: nodes
                     .into_iter()
                     .map(|n| super::super::messages::RemoteNodeInfo {
+                        id: n.node_id.to_string(),
                         label: n.hostname,
                         capabilities: n.capabilities,
                         active_sessions: n.active_sessions,
@@ -45,19 +46,19 @@ pub async fn handle_list_remote_nodes(state: &ServerState, tx: &mpsc::Sender<Str
 /// List sessions on a specific remote node.
 pub async fn handle_list_remote_sessions(
     state: &ServerState,
-    node: &str,
+    node_id: &str,
     tx: &mpsc::Sender<String>,
 ) {
     #[cfg(feature = "remote")]
     {
-        let node_manager_ref = match state.agent.find_node_manager(node).await {
+        let node_manager_ref = match state.agent.find_node_manager(node_id).await {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("handle_list_remote_sessions: {}", e.message);
                 let _ = send_message(
                     tx,
                     UiServerMessage::RemoteSessions {
-                        node: node.to_string(),
+                        node_id: node_id.to_string(),
                         sessions: Vec::new(),
                     },
                 )
@@ -71,7 +72,7 @@ pub async fn handle_list_remote_sessions(
                 let _ = send_message(
                     tx,
                     UiServerMessage::RemoteSessions {
-                        node: node.to_string(),
+                        node_id: node_id.to_string(),
                         sessions,
                     },
                 )
@@ -89,7 +90,7 @@ pub async fn handle_list_remote_sessions(
         let _ = send_message(
             tx,
             UiServerMessage::RemoteSessions {
-                node: node.to_string(),
+                node_id: node_id.to_string(),
                 sessions: Vec::new(),
             },
         )
@@ -101,14 +102,14 @@ pub async fn handle_list_remote_sessions(
 pub async fn handle_create_remote_session(
     state: &ServerState,
     conn_id: &str,
-    node: &str,
+    node_id: &str,
     cwd: Option<&str>,
     request_id: Option<&str>,
     tx: &mpsc::Sender<String>,
 ) {
     #[cfg(feature = "remote")]
     {
-        let node_manager_ref = match state.agent.find_node_manager(node).await {
+        let node_manager_ref = match state.agent.find_node_manager(node_id).await {
             Ok(r) => r,
             Err(e) => {
                 let _ = send_error(tx, e.message.clone()).await;
@@ -116,13 +117,18 @@ pub async fn handle_create_remote_session(
             }
         };
 
+        let peer_label = state
+            .agent
+            .list_remote_nodes()
+            .await
+            .into_iter()
+            .find(|n| n.node_id.to_string() == node_id)
+            .map(|n| n.hostname)
+            .unwrap_or_else(|| node_id.to_string());
+
         match state
             .agent
-            .create_remote_session(
-                &node_manager_ref,
-                node.to_string(),
-                cwd.map(|s| s.to_string()),
-            )
+            .create_remote_session(&node_manager_ref, peer_label, cwd.map(|s| s.to_string()))
             .await
         {
             Ok((session_id, _session_actor_ref)) => {
@@ -175,9 +181,9 @@ pub async fn handle_create_remote_session(
                 handle_list_sessions(state, tx).await;
 
                 log::info!(
-                    "handle_create_remote_session: created session {} on node '{}'",
+                    "handle_create_remote_session: created session {} on node_id '{}'",
                     session_id,
-                    node
+                    node_id
                 );
             }
             Err(e) => {
@@ -185,7 +191,7 @@ pub async fn handle_create_remote_session(
                     tx,
                     format!(
                         "Failed to create remote session on '{}': {}",
-                        node, e.message
+                        node_id, e.message
                     ),
                 )
                 .await;
@@ -197,8 +203,8 @@ pub async fn handle_create_remote_session(
         let _ = send_error(
             tx,
             format!(
-                "create_remote_session on node '{}' requires the 'remote' feature",
-                node
+                "create_remote_session on node_id '{}' requires the 'remote' feature",
+                node_id
             ),
         )
         .await;
@@ -209,7 +215,7 @@ pub async fn handle_create_remote_session(
 pub async fn handle_attach_remote_session(
     state: &ServerState,
     conn_id: &str,
-    node: &str,
+    node_id: &str,
     session_id: &str,
     tx: &mpsc::Sender<String>,
 ) {
@@ -248,9 +254,18 @@ pub async fn handle_attach_remote_session(
             }
         };
 
+        let peer_label = state
+            .agent
+            .list_remote_nodes()
+            .await
+            .into_iter()
+            .find(|n| n.node_id.to_string() == node_id)
+            .map(|n| n.hostname)
+            .unwrap_or_else(|| node_id.to_string());
+
         let _session_actor_ref = state
             .agent
-            .attach_remote_session(session_id.to_string(), remote_ref, node.to_string())
+            .attach_remote_session(session_id.to_string(), remote_ref, peer_label)
             .await;
 
         let agent_id = super::super::session::PRIMARY_AGENT_ID.to_string();
@@ -301,9 +316,9 @@ pub async fn handle_attach_remote_session(
         handle_list_sessions(state, tx).await;
 
         log::info!(
-            "handle_attach_remote_session: attached session {} from node '{}'",
+            "handle_attach_remote_session: attached session {} from node_id '{}'",
             session_id,
-            node
+            node_id
         );
     }
     #[cfg(not(feature = "remote"))]
@@ -311,8 +326,8 @@ pub async fn handle_attach_remote_session(
         let _ = send_error(
             tx,
             format!(
-                "attach_remote_session '{}' on node '{}' requires the 'remote' feature",
-                session_id, node
+                "attach_remote_session '{}' on node_id '{}' requires the 'remote' feature",
+                session_id, node_id
             ),
         )
         .await;

@@ -9,8 +9,7 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, ClientState};
 use crate::agent::session_registry::SessionRegistry;
 use crate::delegation::AgentRegistry;
-use crate::event_bus::EventBus;
-use crate::events::{AgentEvent, EventObserver};
+
 use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::CompositeDriver;
 use crate::send_agent::SendAgent;
@@ -106,19 +105,9 @@ impl AgentHandle {
         }
     }
 
-    /// Subscribes to agent events.
-    pub fn subscribe_events(&self) -> broadcast::Receiver<AgentEvent> {
-        self.config.event_bus.subscribe()
-    }
-
-    /// Adds an event observer after agent creation.
-    pub fn add_observer(&self, observer: Arc<dyn EventObserver>) {
-        self.config.event_bus.add_observer(observer);
-    }
-
-    /// Access the underlying event bus.
-    pub fn event_bus(&self) -> Arc<EventBus> {
-        self.config.event_bus.clone()
+    /// Subscribes to agent events via the fanout (live stream).
+    pub fn subscribe_events(&self) -> broadcast::Receiver<crate::events::EventEnvelope> {
+        self.config.event_sink.fanout().subscribe()
     }
 
     /// Access the agent registry.
@@ -156,6 +145,9 @@ impl AgentHandle {
     }
 
     /// Emits an event for external observers.
+    ///
+    /// This is a detached fire-and-forget API.
+    /// FIXME: Prefer an awaited emit path for critical flows.
     pub fn emit_event(&self, session_id: &str, kind: crate::events::AgentEventKind) {
         self.config.emit_event(session_id, kind);
     }
@@ -164,8 +156,7 @@ impl AgentHandle {
     pub async fn shutdown(&self) {
         log::info!("AgentHandle: Starting graceful shutdown");
 
-        // Shutdown event bus (abort all observer tasks)
-        self.config.event_bus.shutdown().await;
+        self.config.shutdown().await;
 
         // Wait briefly for cleanup
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -272,7 +263,7 @@ impl AgentHandle {
                 model: llm_config.model.clone(),
                 config_id: llm_config.id,
                 context_limit,
-                provider_node: None,
+                provider_node_id: None,
             },
         );
         Ok(())
@@ -586,14 +577,14 @@ impl AgentHandle {
         cached_nodes
     }
 
-    /// Find a `RemoteNodeManager` by its node label (hostname).
+    /// Find a `RemoteNodeManager` by its stable node id (PeerId string).
     ///
     /// Iterates all registered `RemoteNodeManager` actors via DHT lookup and
-    /// returns the one whose `GetNodeInfo.hostname` matches the given label.
+    /// returns the one whose `GetNodeInfo.node_id` matches the given id.
     #[cfg(feature = "remote")]
     pub async fn find_node_manager(
         &self,
-        label: &str,
+        node_id: &str,
     ) -> Result<
         kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
         agent_client_protocol::Error,
@@ -634,7 +625,7 @@ impl AgentHandle {
                     let cache_key =
                         Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
                     if let Some(info) = self.get_cached_remote_node(&cache_key).await {
-                        if info.hostname == label {
+                        if info.node_id.to_string() == node_id {
                             return Ok(node_manager_ref);
                         }
                         continue;
@@ -663,7 +654,7 @@ impl AgentHandle {
                 Ok(Ok(info)) => {
                     self.insert_cached_remote_node(cache_key, info.clone())
                         .await;
-                    if info.hostname == label {
+                    if info.node_id.to_string() == node_id {
                         return Ok(node_manager_ref);
                     }
                 }
@@ -682,8 +673,8 @@ impl AgentHandle {
         Err(agent_client_protocol::Error::from(
             AgentError::RemoteSessionNotFound {
                 details: format!(
-                    "Remote node '{}' not found in the mesh. Available nodes can be listed via list_remote_nodes.",
-                    label
+                    "Remote node id '{}' not found in the mesh. Available nodes can be listed via list_remote_nodes.",
+                    node_id
                 ),
             },
         ))
@@ -992,27 +983,19 @@ impl SendAgent for AgentHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::agent_config::AgentConfig;
-    use crate::agent::core::{
-        AgentMode, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy, ToolConfig,
-        ToolPolicy,
-    };
-    use crate::config::RuntimeExecutionPolicy;
-    use crate::delegation::DefaultAgentRegistry;
-    use crate::event_bus::EventBus;
-    use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::agent::core::ToolPolicy;
     use crate::send_agent::SendAgent;
+    use crate::session::backend::StorageBackend;
     use crate::session::store::SessionStore;
     use crate::test_utils::{
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
         mock_plugin_registry, mock_session,
     };
-    use crate::tools::ToolRegistry;
     use agent_client_protocol::{
         CancelNotification, InitializeRequest, ListSessionsRequest, ProtocolVersion, SessionId,
     };
     use querymt::LLMParams;
-    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -1065,47 +1048,22 @@ mod tests {
                 .times(0..);
 
             let store: Arc<dyn SessionStore> = Arc::new(store);
-            let provider_ctx = Arc::new(crate::session::provider::SessionProvider::new(
-                Arc::new(plugin_registry),
-                store.clone(),
-                LLMParams::new().provider("mock").model("mock-model"),
-            ));
+            let storage = Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                    .await
+                    .expect("create event store"),
+            );
 
-            let config = Arc::new(AgentConfig {
-                provider: provider_ctx,
-                event_bus: Arc::new(EventBus::new()),
-                agent_registry: Arc::new(DefaultAgentRegistry::new()),
-                workspace_manager_actor: WorkspaceIndexManagerActor::new(
-                    WorkspaceIndexManagerConfig::default(),
-                ),
-                default_mode: Arc::new(std::sync::Mutex::new(AgentMode::Build)),
-                tool_config: ToolConfig {
-                    policy: ToolPolicy::ProviderOnly,
-                    ..ToolConfig::default()
-                },
-                tool_registry: ToolRegistry::new(),
-                middleware_drivers: Vec::new(),
-                auth_methods: Vec::new(),
-                max_steps: None,
-                snapshot_policy: SnapshotPolicy::None,
-                assume_mutating: true,
-                mutating_tools: HashSet::new(),
-                max_prompt_bytes: None,
-                execution_timeout_secs: 300,
-                delegation_wait_policy: crate::config::DelegationWaitPolicy::default(),
-                delegation_wait_timeout_secs: 120,
-                delegation_cancel_grace_secs: 5,
-                execution_policy: RuntimeExecutionPolicy::default(),
-                compaction: crate::session::compaction::SessionCompaction::new(),
-                snapshot_backend: None,
-                snapshot_gc_config: crate::snapshot::GcConfig::default(),
-                delegation_context_config: DelegationContextConfig {
-                    timing: DelegationContextTiming::FirstTurnOnly,
-                    auto_inject: true,
-                },
-                pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
-                mcp_servers: Vec::new(),
-            });
+            let config = Arc::new(
+                AgentConfigBuilder::new(
+                    Arc::new(plugin_registry),
+                    store.clone(),
+                    storage.event_journal(),
+                    LLMParams::new().provider("mock").model("mock-model"),
+                )
+                .with_tool_policy(ToolPolicy::ProviderOnly)
+                .build(),
+            );
 
             Self {
                 handle: AgentHandle::from_config(config),
@@ -1202,12 +1160,15 @@ mod tests {
         f.handle
             .emit_event("test-session", crate::events::AgentEventKind::Cancelled);
 
-        let event = rx.try_recv().expect("should have received event");
+        let event = tokio::time::timeout(tokio::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("should receive event in time")
+            .expect("event channel should remain open");
         assert!(matches!(
-            event.kind,
+            event.kind(),
             crate::events::AgentEventKind::Cancelled
         ));
-        assert_eq!(event.session_id, "test-session");
+        assert_eq!(event.session_id(), "test-session");
     }
 
     #[tokio::test]
@@ -1242,11 +1203,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_event_bus_accessible() {
+    async fn test_event_subscribe_works() {
         let f = HandleFixture::new().await;
-        let bus = f.handle.event_bus();
-        // Just check we can get the bus and subscribe
-        let _rx = bus.subscribe();
+        // Verify we can subscribe to events via the handle
+        let _rx = f.handle.subscribe_events();
     }
 
     #[tokio::test]
@@ -1302,6 +1262,11 @@ mod tests {
             cache_key.clone(),
             CachedNodeEntry {
                 info: crate::agent::remote::NodeInfo {
+                    node_id: crate::agent::remote::NodeId::from_peer_id(
+                        libp2p::identity::Keypair::generate_ed25519()
+                            .public()
+                            .to_peer_id(),
+                    ),
                     hostname: "node-a".to_string(),
                     capabilities: vec!["shell".to_string()],
                     active_sessions: 1,

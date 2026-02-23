@@ -14,6 +14,7 @@
 pub mod actor_ref;
 pub mod event_forwarder;
 pub mod event_relay;
+pub mod node_id;
 pub mod node_manager;
 
 #[cfg(feature = "remote")]
@@ -70,6 +71,7 @@ pub use mesh::{
 };
 #[cfg(feature = "remote")]
 pub use mesh_provider::MeshChatProvider;
+pub use node_id::NodeId;
 pub use node_manager::{AvailableModel, NodeInfo, RemoteSessionInfo};
 #[cfg(feature = "remote")]
 pub use node_manager::{

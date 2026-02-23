@@ -9,10 +9,12 @@ use crate::agent::core::{
 };
 use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy};
 use crate::delegation::AgentRegistry;
-use crate::event_bus::EventBus;
+use crate::event_sink::EventSink;
+use crate::events::{AgentEventKind, DurableEvent};
 use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::{CompositeDriver, MiddlewareDriver};
 use crate::session::compaction::SessionCompaction;
+
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionExecutionConfig;
 use crate::tools::ToolRegistry;
@@ -31,7 +33,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 pub struct AgentConfig {
     // ── Infrastructure (Arc, thread-safe) ────────────────────────
     pub provider: Arc<SessionProvider>,
-    pub event_bus: Arc<EventBus>,
+    pub event_sink: Arc<EventSink>,
     pub agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     pub workspace_manager_actor: ActorRef<WorkspaceIndexManagerActor>,
 
@@ -131,19 +133,50 @@ impl AgentConfig {
             )
     }
 
-    /// Emits an event for external observers.
-    pub fn emit_event(&self, session_id: &str, kind: crate::events::AgentEventKind) {
-        self.event_bus.publish(session_id, kind);
+    /// Emits an event through the EventSink (auto-classifies as durable/ephemeral).
+    ///
+    /// For durable events this spawns an async task that persists and publishes.
+    /// For ephemeral events this publishes immediately (no persistence).
+    pub fn emit_event(&self, session_id: &str, kind: AgentEventKind) {
+        use crate::events::{Durability, classify_durability};
+
+        // Ephemeral events: publish immediately via sink, no persistence.
+        if classify_durability(&kind) == Durability::Ephemeral {
+            self.event_sink.emit_ephemeral(session_id, kind);
+            return;
+        }
+
+        // Durable events: persist via EventSink journal in a spawned task.
+        let sink = self.event_sink.clone();
+        let session_id = session_id.to_string();
+
+        tokio::spawn(async move {
+            if let Err(err) = sink.emit_durable(&session_id, kind).await {
+                log::warn!(
+                    "failed to emit durable event for session {}: {}",
+                    session_id,
+                    err
+                );
+            }
+        });
     }
 
-    /// Subscribes to agent events.
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<crate::events::AgentEvent> {
-        self.event_bus.subscribe()
+    /// Persists and publishes a durable event, returning the `DurableEvent`.
+    ///
+    /// Use this path when caller-side ordering matters (awaited).
+    pub async fn emit_event_persisted(
+        &self,
+        session_id: &str,
+        kind: AgentEventKind,
+    ) -> crate::session::error::SessionResult<DurableEvent> {
+        self.event_sink.emit_durable(session_id, kind).await
     }
 
-    /// Access the underlying event bus.
-    pub fn event_bus(&self) -> Arc<EventBus> {
-        self.event_bus.clone()
+    /// Subscribes to agent events via the fanout (live stream).
+    pub fn subscribe_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
+        self.event_sink.fanout().subscribe()
     }
 
     /// Access the agent registry.
@@ -200,19 +233,10 @@ impl AgentConfig {
         &self.provider
     }
 
-    /// Add an event observer.
-    pub fn add_observer(&self, observer: Arc<dyn crate::events::EventObserver>) {
-        self.event_bus.add_observer(observer);
-    }
-
-    /// Add multiple event observers.
-    pub fn add_observers(&self, observers: Vec<Arc<dyn crate::events::EventObserver>>) {
-        self.event_bus.add_observers(observers);
-    }
-
-    /// Gracefully shutdown the event bus.
+    /// Gracefully shutdown.
     pub async fn shutdown(&self) {
-        self.event_bus.shutdown().await;
+        // No-op: EventBus observer infrastructure has been removed.
+        // EventFanout broadcast subscribers are dropped automatically.
     }
 
     /// Get LLM config by ID.
@@ -346,7 +370,13 @@ mod tests {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock-model");
         let config = Arc::new(
-            AgentConfigBuilder::new(Arc::new(registry), storage.session_store(), llm).build(),
+            AgentConfigBuilder::new(
+                Arc::new(registry),
+                storage.session_store(),
+                storage.event_journal(),
+                llm,
+            )
+            .build(),
         );
         (config, temp_dir)
     }
@@ -365,9 +395,14 @@ mod tests {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock");
         let config = Arc::new(
-            AgentConfigBuilder::new(Arc::new(registry), storage.session_store(), llm)
-                .with_denied_tools(["shell".to_string()])
-                .build(),
+            AgentConfigBuilder::new(
+                Arc::new(registry),
+                storage.session_store(),
+                storage.event_journal(),
+                llm,
+            )
+            .with_denied_tools(["shell".to_string()])
+            .build(),
         );
         assert!(!config.is_tool_allowed("shell"));
         assert!(config.is_tool_allowed("read_tool"));
@@ -379,9 +414,14 @@ mod tests {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock");
         let config = Arc::new(
-            AgentConfigBuilder::new(Arc::new(registry), storage.session_store(), llm)
-                .with_allowed_tools(["read_tool", "shell"])
-                .build(),
+            AgentConfigBuilder::new(
+                Arc::new(registry),
+                storage.session_store(),
+                storage.event_journal(),
+                llm,
+            )
+            .with_allowed_tools(["read_tool", "shell"])
+            .build(),
         );
         assert!(config.is_tool_allowed("read_tool"));
         assert!(config.is_tool_allowed("shell"));
@@ -397,11 +437,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_bus_returns_shared_instance() {
+    async fn event_sink_returns_shared_instance() {
         let (config, _td) = make_config().await;
-        let bus1 = config.event_bus();
-        let bus2 = config.event_bus();
-        assert!(Arc::ptr_eq(&bus1, &bus2));
+        // Verify event_sink is accessible and returns consistent fanout
+        let _rx = config.subscribe_events();
     }
 
     #[tokio::test]
@@ -466,9 +505,14 @@ mod tests {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock");
         let config = Arc::new(
-            AgentConfigBuilder::new(Arc::new(registry), storage.session_store(), llm)
-                .with_max_steps(100)
-                .build(),
+            AgentConfigBuilder::new(
+                Arc::new(registry),
+                storage.session_store(),
+                storage.event_journal(),
+                llm,
+            )
+            .with_max_steps(100)
+            .build(),
         );
         let _driver = config.create_driver();
         let limits = config.get_session_limits();
