@@ -29,6 +29,7 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
                 active_agent_id: PRIMARY_AGENT_ID.to_string(),
                 sessions: HashMap::new(),
                 subscribed_sessions: HashSet::new(),
+                session_cursors: HashMap::new(),
                 current_workspace_root: None,
                 file_index_forwarder: None,
             },
@@ -221,16 +222,38 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
         let state_events = state.clone();
         tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
-                // Check if this connection is subscribed to this session
-                let is_subscribed = {
-                    let connections = state_events.connections.lock().await;
-                    connections
-                        .get(&conn_id_events)
-                        .map(|conn| conn.subscribed_sessions.contains(&event.session_id))
-                        .unwrap_or(false)
+                // Check if this connection is subscribed and if this event is newer than
+                // the replay cursor (prevents replay/live overlap duplicates).
+                let forward_decision = {
+                    let mut connections = state_events.connections.lock().await;
+                    if let Some(conn) = connections.get_mut(&conn_id_events) {
+                        if !conn.subscribed_sessions.contains(&event.session_id) {
+                            None
+                        } else {
+                            let cursor_seq = conn
+                                .session_cursors
+                                .get(&event.session_id)
+                                .copied()
+                                .unwrap_or(0);
+                            if event.seq <= cursor_seq {
+                                log::debug!(
+                                    "ui forwarder: dropping duplicate/overlap event conn={} session={} seq={} cursor_seq={}",
+                                    conn_id_events,
+                                    event.session_id,
+                                    event.seq,
+                                    cursor_seq
+                                );
+                                None
+                            } else {
+                                Some(cursor_seq)
+                            }
+                        }
+                    } else {
+                        None
+                    }
                 };
 
-                if !is_subscribed {
+                if forward_decision.is_none() {
                     continue;
                 }
 
@@ -333,6 +356,14 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                 .is_err()
                 {
                     break;
+                }
+
+                {
+                    let mut connections = state_events.connections.lock().await;
+                    if let Some(conn) = connections.get_mut(&conn_id_events) {
+                        conn.session_cursors
+                            .insert(event.session_id.clone(), event.seq);
+                    }
                 }
             }
         });

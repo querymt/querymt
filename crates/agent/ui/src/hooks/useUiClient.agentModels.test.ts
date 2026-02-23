@@ -83,6 +83,7 @@ describe('useUiClient - agentModels tracking', () => {
           file_mentions: [],
         },
         undo_stack: [],
+        cursor_seq: 1,
       });
     });
 
@@ -132,6 +133,7 @@ describe('useUiClient - agentModels tracking', () => {
           file_mentions: [],
         },
         undo_stack: [],
+        cursor_seq: 1,
       });
     });
 
@@ -164,6 +166,7 @@ describe('useUiClient - agentModels tracking', () => {
           file_mentions: [],
         },
         undo_stack: [],
+        cursor_seq: 1,
       });
     });
 

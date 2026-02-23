@@ -578,6 +578,12 @@ pub struct MeshTomlConfig {
     #[serde(default)]
     pub discovery: MeshDiscoveryConfig,
 
+    /// Whether `provider_node = None` may fall back to mesh provider discovery.
+    ///
+    /// Default: `false` (local-only unless an explicit `provider_node` is set).
+    #[serde(default)]
+    pub auto_fallback: bool,
+
     /// Explicit peers to connect to at startup.
     #[serde(default)]
     pub peers: Vec<MeshPeerConfig>,
@@ -589,6 +595,7 @@ impl Default for MeshTomlConfig {
             enabled: false,
             listen: default_mesh_listen(),
             discovery: MeshDiscoveryConfig::default(),
+            auto_fallback: false,
             peers: Vec::new(),
         }
     }

@@ -58,6 +58,10 @@ pub struct QuorumBuilder {
     /// Optional mesh handle to store on the planner's `AgentHandle` after build (Phase 7).
     #[cfg(feature = "remote")]
     pub(super) mesh: Option<crate::agent::remote::MeshHandle>,
+    /// Controls whether provider lookup may fall back to mesh peers when
+    /// `provider_node` is not explicitly set.
+    #[cfg(feature = "remote")]
+    pub(super) mesh_auto_fallback: bool,
 }
 
 impl Default for QuorumBuilder {
@@ -84,6 +88,8 @@ impl QuorumBuilder {
             initial_registry: None,
             #[cfg(feature = "remote")]
             mesh: None,
+            #[cfg(feature = "remote")]
+            mesh_auto_fallback: false,
         }
     }
 
@@ -344,7 +350,10 @@ impl QuorumBuilder {
             .ok_or_else(|| anyhow!("Planner is not an AgentHandle"))?;
         let planner_handle = Arc::new(AgentHandle::from_config(planner_handle.config.clone()));
 
-        // Phase 7: store the mesh handle on the planner's AgentHandle.
+        // Phase 7: apply mesh routing policy and store the mesh handle.
+        #[cfg(feature = "remote")]
+        planner_handle.set_mesh_fallback(self.mesh_auto_fallback);
+
         #[cfg(feature = "remote")]
         if let Some(mesh) = self.mesh {
             planner_handle.set_mesh(mesh);
@@ -510,9 +519,11 @@ impl Quorum {
         config: QuorumConfig,
         initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
         mesh: Option<crate::agent::remote::MeshHandle>,
+        mesh_auto_fallback: bool,
     ) -> Result<Self> {
         let mut builder = Self::builder_from_quorum_config(config, initial_registry)?;
         builder.mesh = mesh;
+        builder.mesh_auto_fallback = mesh_auto_fallback;
         builder.build().await
     }
 

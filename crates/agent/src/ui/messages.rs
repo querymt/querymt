@@ -307,6 +307,7 @@ pub enum UiServerMessage {
         session_id: String,
         agent_id: String,
         events: Vec<AgentEvent>,
+        cursor_seq: u64,
     },
     Error {
         message: String,
@@ -319,6 +320,7 @@ pub enum UiServerMessage {
         agent_id: String,
         audit: AuditView,
         undo_stack: Vec<UndoStackFrame>,
+        cursor_seq: u64,
     },
     WorkspaceIndexStatus {
         session_id: String,

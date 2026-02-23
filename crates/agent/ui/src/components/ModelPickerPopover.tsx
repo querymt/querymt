@@ -559,13 +559,9 @@ export function ModelPickerPopover({
                           >
                             <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-accent-primary transition-opacity" />
                             <span className="flex-1 truncate">{model.display}</span>
-                            {group.node ? (
+                            {group.node && (
                               <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
                                 {group.node}
-                              </span>
-                            ) : (
-                              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                                local
                               </span>
                             )}
                             {isCurrent && (
@@ -592,13 +588,9 @@ export function ModelPickerPopover({
                     <span className="text-ui-secondary">
                       {selectedEntry.provider} / {selectedEntry.model}
                     </span>
-                    {selectedEntry.node ? (
+                    {selectedEntry.node && (
                       <span className="px-1 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
                         {selectedEntry.node}
-                      </span>
-                    ) : (
-                      <span className="px-1 py-0.5 rounded text-[9px] uppercase tracking-wider bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                        local
                       </span>
                     )}
                   </>

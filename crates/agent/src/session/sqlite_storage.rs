@@ -1316,13 +1316,8 @@ impl EventStore for SqliteStorage {
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
             conn.execute(
-                "INSERT INTO events (seq, timestamp, session_id, kind) VALUES (?, ?, ?, ?)",
-                rusqlite::params![
-                    event_clone.seq,
-                    event_clone.timestamp,
-                    &event_clone.session_id,
-                    kind_json
-                ],
+                "INSERT INTO events (timestamp, session_id, kind) VALUES (?, ?, ?)",
+                rusqlite::params![event_clone.timestamp, &event_clone.session_id, kind_json],
             )?;
 
             Ok(())

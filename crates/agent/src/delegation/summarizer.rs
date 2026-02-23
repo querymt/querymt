@@ -9,6 +9,8 @@ use crate::agent::utils::{render_prompt_for_display, render_prompt_for_llm};
 use crate::config::DelegationSummaryConfig;
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::error::{SessionError, SessionResult};
+#[cfg(feature = "remote")]
+use crate::session::provider::ProviderRouting;
 use crate::session::provider::build_provider_from_config;
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use querymt::LLMProvider;
@@ -61,9 +63,11 @@ impl DelegationSummarizer {
             Some(&params),
             config.api_key.as_deref(),
             #[cfg(feature = "remote")]
-            None, // provider_node: summarizer always uses local provider
-            #[cfg(feature = "remote")]
-            None, // mesh_handle: not needed for summarizer
+            ProviderRouting {
+                provider_node: None,        // summarizer always uses local provider
+                mesh_handle: None,          // not needed for summarizer
+                allow_mesh_fallback: false, // should not hop across peers
+            },
         )
         .await?;
 

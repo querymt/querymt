@@ -55,13 +55,13 @@ fn pruned_top_level_keys(before: &Value, after: &Value) -> Vec<String> {
     removed
 }
 
-/// Type alias for the provider cache: (config_id, provider_node, provider) tuple.
+/// Type alias for the provider cache: (config_id, provider_node, allow_mesh_fallback, provider) tuple.
 ///
 /// `provider_node` is stored separately from `llm_configs` (in the `sessions`
 /// table) so the same `config_id` can resolve to different providers depending
-/// on which mesh node owns the session.  Including it in the key ensures we
-/// rebuild when it changes.
-type ProviderCache = Arc<RwLock<Option<(i64, Option<String>, Arc<dyn LLMProvider>)>>>;
+/// on which mesh node owns the session. `allow_mesh_fallback` is included so
+/// toggling policy does not reuse a provider built under different routing rules.
+type ProviderCache = Arc<RwLock<Option<(i64, Option<String>, bool, Arc<dyn LLMProvider>)>>>;
 
 /// A wrapper around a `SessionStore` that resolves providers dynamically.
 ///
@@ -97,6 +97,10 @@ pub struct SessionProvider {
     /// which is called after `AgentConfigBuilder::build()`).
     #[cfg(feature = "remote")]
     mesh: Arc<StdMutex<Option<crate::agent::remote::MeshHandle>>>,
+    /// Whether to scan the mesh when a provider is missing locally and
+    /// `provider_node` is not explicitly set. Defaults to false.
+    #[cfg(feature = "remote")]
+    allow_mesh_fallback: Arc<StdMutex<bool>>,
 }
 
 impl SessionProvider {
@@ -112,6 +116,8 @@ impl SessionProvider {
             cached_provider: Arc::new(RwLock::new(None)),
             #[cfg(feature = "remote")]
             mesh: Arc::new(StdMutex::new(None)),
+            #[cfg(feature = "remote")]
+            allow_mesh_fallback: Arc::new(StdMutex::new(false)),
         }
     }
 
@@ -140,6 +146,28 @@ impl SessionProvider {
     #[cfg(feature = "remote")]
     pub fn set_mesh(&self, mesh: Option<crate::agent::remote::MeshHandle>) {
         *self.mesh.lock().unwrap_or_else(|e| e.into_inner()) = mesh;
+    }
+
+    /// Enable/disable automatic mesh fallback when `provider_node` is not set.
+    ///
+    /// When disabled (default), `provider_node = None` means local-only lookup.
+    /// When enabled, unresolved providers may be discovered on mesh peers.
+    #[cfg(feature = "remote")]
+    pub fn set_mesh_fallback(&self, enabled: bool) {
+        *self
+            .allow_mesh_fallback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = enabled;
+    }
+
+    /// Attach mesh fallback policy at construction time (consuming builder).
+    #[cfg(feature = "remote")]
+    pub fn with_mesh_fallback(self, enabled: bool) -> Self {
+        *self
+            .allow_mesh_fallback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = enabled;
+        self
     }
 
     /// Fetch an existing session by ID
@@ -228,19 +256,34 @@ impl SessionProvider {
         #[cfg(not(feature = "remote"))]
         let provider_node: Option<String> = None;
 
-        // Check cache first - fast path for same config + provider_node
+        #[cfg(feature = "remote")]
+        let allow_mesh_fallback = *self
+            .allow_mesh_fallback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        #[cfg(not(feature = "remote"))]
+        let allow_mesh_fallback = false;
+
+        // Check cache first - fast path for same config + provider_node + fallback policy
         {
             let cache = self.cached_provider.read().await;
-            if let Some((cached_config_id, cached_provider_node, cached_provider)) = cache.as_ref()
+            if let Some((
+                cached_config_id,
+                cached_provider_node,
+                cached_allow_mesh_fallback,
+                cached_provider,
+            )) = cache.as_ref()
                 && *cached_config_id == config.id
                 && cached_provider_node.as_deref() == provider_node.as_deref()
+                && *cached_allow_mesh_fallback == allow_mesh_fallback
             {
                 log::trace!(
-                    "Provider cache hit for config_id={} ({}:{}) provider_node={:?}",
+                    "Provider cache hit for config_id={} ({}:{}) provider_node={:?} allow_mesh_fallback={}",
                     config.id,
                     config.provider,
                     config.model,
                     provider_node,
+                    allow_mesh_fallback,
                 );
                 return Ok(Arc::clone(cached_provider));
             }
@@ -248,11 +291,12 @@ impl SessionProvider {
 
         // Cache miss or config/provider_node changed - build new provider
         log::debug!(
-            "Provider cache miss for config_id={} ({}:{}) provider_node={:?}, building new provider",
+            "Provider cache miss for config_id={} ({}:{}) provider_node={:?} allow_mesh_fallback={}, building new provider",
             config.id,
             config.provider,
             config.model,
             provider_node,
+            allow_mesh_fallback,
         );
 
         // Read the mesh handle outside of any async context — StdMutex must not
@@ -261,6 +305,13 @@ impl SessionProvider {
         let mesh_handle: Option<crate::agent::remote::MeshHandle> =
             self.mesh.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
+        #[cfg(feature = "remote")]
+        let routing = ProviderRouting {
+            provider_node: provider_node.as_deref(),
+            mesh_handle: mesh_handle.as_ref(),
+            allow_mesh_fallback,
+        };
+
         let provider = build_provider_from_config(
             &self.plugin_registry,
             &config.provider,
@@ -268,9 +319,7 @@ impl SessionProvider {
             config.params.as_ref(),
             None,
             #[cfg(feature = "remote")]
-            provider_node.as_deref(),
-            #[cfg(feature = "remote")]
-            mesh_handle.as_ref(),
+            routing,
         )
         .await?;
 
@@ -278,7 +327,12 @@ impl SessionProvider {
         // For GPU models (llama_cpp), this frees VRAM before loading the new model.
         {
             let mut cache = self.cached_provider.write().await;
-            *cache = Some((config.id, provider_node, Arc::clone(&provider)));
+            *cache = Some((
+                config.id,
+                provider_node,
+                allow_mesh_fallback,
+                Arc::clone(&provider),
+            ));
         }
 
         Ok(provider)
@@ -329,9 +383,11 @@ impl Clone for SessionProvider {
             history_store: Arc::clone(&self.history_store),
             initial_config: self.initial_config.clone(),
             cached_provider: Arc::clone(&self.cached_provider),
-            // Share the same Arc so all clones see set_mesh() updates.
+            // Share the same Arcs so all clones see runtime updates.
             #[cfg(feature = "remote")]
             mesh: Arc::clone(&self.mesh),
+            #[cfg(feature = "remote")]
+            allow_mesh_fallback: Arc::clone(&self.allow_mesh_fallback),
         }
     }
 }
@@ -610,24 +666,32 @@ impl SessionHandle {
 /// * `model`            — model name (e.g. `"claude-sonnet-4-20250514"`).
 /// * `params`           — optional extra params JSON blob.
 /// * `api_key_override` — override the API key resolved from env/OAuth.
-/// * `provider_node`    — when `Some`, route the call to this mesh node's `ProviderHostActor`.
-///   `None` or `"local"` → use local provider (existing behaviour).
-/// * `mesh_handle`      — required when `provider_node` is `Some` or when mesh fallback is desired.
+#[cfg(feature = "remote")]
+pub struct ProviderRouting<'a> {
+    /// When `Some`, route the call to this mesh node's `ProviderHostActor`.
+    /// `None` or `"local"` means local provider resolution.
+    pub provider_node: Option<&'a str>,
+    /// Required when `provider_node` is `Some` (except `"local"`) or when fallback is enabled.
+    pub mesh_handle: Option<&'a crate::agent::remote::MeshHandle>,
+    /// When true and `provider_node` is `None`, unresolved local providers may be discovered on mesh peers.
+    pub allow_mesh_fallback: bool,
+}
+
+/// * `routing`          — remote routing/fallback policy (remote feature only).
 pub async fn build_provider_from_config(
     plugin_registry: &PluginRegistry,
     provider_name: &str,
     model: &str,
     params: Option<&serde_json::Value>,
     api_key_override: Option<&str>,
-    #[cfg(feature = "remote")] provider_node: Option<&str>,
-    #[cfg(feature = "remote")] mesh_handle: Option<&crate::agent::remote::MeshHandle>,
+    #[cfg(feature = "remote")] routing: ProviderRouting<'_>,
 ) -> SessionResult<Arc<dyn LLMProvider>> {
     // ── Case 1: Explicit remote node requested ─────────────────────────────────
     #[cfg(feature = "remote")]
-    if let Some(node) = provider_node
+    if let Some(node) = routing.provider_node
         && node != "local"
     {
-        let mesh = mesh_handle.ok_or_else(|| {
+        let mesh = routing.mesh_handle.ok_or_else(|| {
             SessionError::InvalidOperation(format!(
                 "provider_node='{}' specified but no mesh handle available",
                 node
@@ -657,14 +721,16 @@ pub async fn build_provider_from_config(
         SessionError::InvalidOperation(format!("Unknown provider: {}", provider_name))
     })?;
 
-    // With the remote feature enabled we may fall back to the mesh (Case 3 below),
-    // so we don't error-out immediately.
+    // With the remote feature enabled we may optionally fall back to the mesh
+    // (Case 3 below), so we don't error-out immediately.
     #[cfg(feature = "remote")]
     let factory = match factory {
         Some(f) => f,
         None => {
-            // ── Case 3: Not available locally → mesh fallback ──────────────────
-            if let Some(mesh) = mesh_handle {
+            // ── Case 3: Not available locally → optional mesh fallback ─────────
+            if routing.allow_mesh_fallback
+                && let Some(mesh) = routing.mesh_handle
+            {
                 log::debug!(
                     "build_provider_from_config: provider '{}' not found locally, searching mesh",
                     provider_name

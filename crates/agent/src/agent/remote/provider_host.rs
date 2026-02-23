@@ -11,7 +11,7 @@
 
 use crate::agent::agent_config::AgentConfig;
 use crate::error::AgentError;
-use crate::session::provider::build_provider_from_config;
+use crate::session::provider::{ProviderRouting, build_provider_from_config};
 use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::remote::_internal;
@@ -268,8 +268,11 @@ impl ProviderHostActor {
             model,
             None, // no extra params
             None, // no API key override — use local keys
-            None, // provider_node: always local on the owning node
-            None, // mesh_handle: not needed — owning node builds directly
+            ProviderRouting {
+                provider_node: None,        // always local on the owning node
+                mesh_handle: None,          // not needed — owning node builds directly
+                allow_mesh_fallback: false, // host should stay local-only
+            },
         )
         .await
         .map_err(|e| {

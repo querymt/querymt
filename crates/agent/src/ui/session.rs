@@ -178,12 +178,27 @@ pub async fn ensure_session(
     // Replay stored events for the new session (includes ProviderChanged)
     // No child sessions for a new session
     if let Ok(audit) = state.view_store.get_audit_view(&session_id, false).await {
+        let cursor_seq = audit
+            .events
+            .iter()
+            .map(|event| event.seq)
+            .max()
+            .unwrap_or(0);
+
+        {
+            let mut connections = state.connections.lock().await;
+            if let Some(conn) = connections.get_mut(conn_id) {
+                conn.session_cursors.insert(session_id.clone(), cursor_seq);
+            }
+        }
+
         let _ = super::connection::send_message(
             tx,
             UiServerMessage::SessionEvents {
                 session_id: session_id.clone(),
                 agent_id: agent_id.to_string(),
                 events: audit.events,
+                cursor_seq,
             },
         )
         .await;

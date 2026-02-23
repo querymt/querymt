@@ -38,6 +38,11 @@ impl EditTool {
             return matches;
         }
 
+        // Avoid indexing past the available content lines when the search block is longer.
+        if original_lines.len() < search_lines.len() {
+            return matches;
+        }
+
         for i in 0..=(original_lines.len().saturating_sub(search_lines.len())) {
             let mut is_match = true;
 
@@ -270,6 +275,10 @@ impl EditTool {
         let content_lines: Vec<&str> = content.lines().collect();
         let find_lines: Vec<&str> = find.lines().collect();
 
+        if find_lines.is_empty() || content_lines.len() < find_lines.len() {
+            return matches;
+        }
+
         for i in 0..=(content_lines.len().saturating_sub(find_lines.len())) {
             let block = content_lines[i..i + find_lines.len()].join("\n");
             if remove_indentation(&block) == normalized_find {
@@ -301,7 +310,7 @@ impl EditTool {
         let lines: Vec<&str> = content.lines().collect();
         let find_lines: Vec<&str> = unescaped_find.lines().collect();
 
-        if find_lines.is_empty() {
+        if find_lines.is_empty() || lines.len() < find_lines.len() {
             return matches;
         }
 
@@ -336,7 +345,7 @@ impl EditTool {
         let lines: Vec<&str> = content.lines().collect();
         let find_lines: Vec<&str> = find.lines().collect();
 
-        if find_lines.is_empty() {
+        if find_lines.is_empty() || lines.len() < find_lines.len() {
             return matches;
         }
 
@@ -789,6 +798,24 @@ mod tests {
                 "Error should mention multiple occurrences"
             );
         }
+    }
+
+    #[test]
+    fn test_line_trimmed_empty_content_no_panic() {
+        let content = "";
+        let find = "hello";
+        let matches = EditTool::line_trimmed_replacer(content, find);
+        assert!(matches.is_empty(), "Expected no matches for empty content");
+    }
+
+    #[test]
+    fn test_replace_empty_content_returns_not_found() {
+        let result = EditTool::replace("", "hello", "world", false);
+        assert!(
+            result.is_err(),
+            "Expected not found error for empty content"
+        );
+        assert!(result.unwrap_err().contains("not found"));
     }
 
     // Test edge case: oldString same as newString

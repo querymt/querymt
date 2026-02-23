@@ -44,7 +44,9 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
     let view = match state
         .view_store
         .get_session_list_view(None)
-        .instrument(tracing::info_span!("ui.handle_list_sessions.get_session_list_view"))
+        .instrument(tracing::info_span!(
+            "ui.handle_list_sessions.get_session_list_view"
+        ))
         .await
     {
         Ok(view) => view,
@@ -217,6 +219,12 @@ pub async fn handle_load_session(
 
     // 5. Send loaded audit view and persisted undo stack for UI hydration
     let undo_stack = load_undo_stack(state, session_id).await;
+    let cursor_seq = audit
+        .events
+        .iter()
+        .map(|event| event.seq)
+        .max()
+        .unwrap_or(0);
 
     let _ = send_message(
         tx,
@@ -225,11 +233,21 @@ pub async fn handle_load_session(
             agent_id,
             audit,
             undo_stack,
+            cursor_seq,
         },
     )
     .await;
 
-    // 6. Send updated state
+    // 6. Seed per-connection stream cursor from replay tail
+    {
+        let mut connections = state.connections.lock().await;
+        if let Some(conn) = connections.get_mut(conn_id) {
+            conn.session_cursors
+                .insert(session_id.to_string(), cursor_seq);
+        }
+    }
+
+    // 7. Send updated state
     send_state(state, conn_id, tx).await;
 
     // 7. Subscribe to file index updates if this session has a cwd
@@ -284,7 +302,11 @@ pub(super) async fn ensure_session_loaded(
     }
 
     let req = LoadSessionRequest::new(SessionId::from(session_id.to_string()), PathBuf::new());
-    state.agent.load_session(req).await.map_err(|e| e.to_string())?;
+    state
+        .agent
+        .load_session(req)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let actor_loaded = {
         let registry = state.agent.registry.lock().await;
@@ -404,13 +426,24 @@ pub async fn handle_subscribe_session(
         }
     };
 
-    // 4. Send replay batch
+    let cursor_seq = events.iter().map(|event| event.seq).max().unwrap_or(0);
+
+    // 4. Track replay cursor and send replay batch
+    {
+        let mut connections = state.connections.lock().await;
+        if let Some(conn) = connections.get_mut(conn_id) {
+            conn.session_cursors
+                .insert(session_id.to_string(), cursor_seq);
+        }
+    }
+
     let _ = send_message(
         tx,
         UiServerMessage::SessionEvents {
             session_id: session_id.to_string(),
             agent_id: resolved_agent_id,
             events,
+            cursor_seq,
         },
     )
     .await;
@@ -421,6 +454,7 @@ pub async fn handle_unsubscribe_session(state: &ServerState, conn_id: &str, sess
     let mut connections = state.connections.lock().await;
     if let Some(conn) = connections.get_mut(conn_id) {
         conn.subscribed_sessions.remove(session_id);
+        conn.session_cursors.remove(session_id);
     }
 }
 

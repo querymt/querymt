@@ -20,6 +20,8 @@ mod session;
 pub use messages::{RoutingMode, UiAgentInfo};
 
 #[cfg(test)]
+mod session_stream_tests;
+#[cfg(test)]
 mod undo_handler_tests;
 
 use crate::event_bus::EventBus;
@@ -103,6 +105,7 @@ pub(crate) struct ConnectionState {
     pub active_agent_id: String,
     pub sessions: HashMap<String, String>,
     pub subscribed_sessions: HashSet<String>,
+    pub session_cursors: HashMap<String, u64>,
     pub current_workspace_root: Option<PathBuf>,
     pub file_index_forwarder: Option<JoinHandle<()>>,
 }

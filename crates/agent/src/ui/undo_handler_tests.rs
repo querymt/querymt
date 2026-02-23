@@ -13,12 +13,14 @@ use crate::session::sqlite_storage::SqliteStorage;
 use crate::snapshot::backend::SnapshotBackend;
 use crate::snapshot::git::GitSnapshotBackend;
 use crate::test_utils::{DelegateTestFixture, empty_plugin_registry};
-use crate::ui::handlers::{handle_elicitation_response, handle_load_session, handle_ui_message, handle_undo};
+use crate::ui::handlers::{
+    handle_elicitation_response, handle_load_session, handle_ui_message, handle_undo,
+};
+use crate::ui::messages::UiClientMessage;
 use anyhow::Result;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
 use serde_json::Value;
-use crate::ui::messages::UiClientMessage;
 use std::fs;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -191,6 +193,7 @@ async fn test_undo_handler_single_agent() -> Result<()> {
                     .into_iter()
                     .collect(),
                 subscribed_sessions: std::collections::HashSet::new(),
+                session_cursors: std::collections::HashMap::new(),
                 current_workspace_root: None,
                 file_index_forwarder: None,
             },
@@ -277,6 +280,7 @@ async fn test_send_state_concurrent_calls_complete() -> Result<()> {
                 active_agent_id: super::session::PRIMARY_AGENT_ID.to_string(),
                 sessions: std::collections::HashMap::new(),
                 subscribed_sessions: std::collections::HashSet::new(),
+                session_cursors: std::collections::HashMap::new(),
                 current_workspace_root: None,
                 file_index_forwarder: None,
             },
@@ -490,6 +494,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
                     .into_iter()
                     .collect(),
                 subscribed_sessions: std::collections::HashSet::new(),
+                session_cursors: std::collections::HashMap::new(),
                 current_workspace_root: None,
                 file_index_forwarder: None,
             },
@@ -582,6 +587,7 @@ async fn test_load_session_hydrates_runtime_actor() -> Result<()> {
                 active_agent_id: super::session::PRIMARY_AGENT_ID.to_string(),
                 sessions: std::collections::HashMap::new(),
                 subscribed_sessions: std::collections::HashSet::new(),
+                session_cursors: std::collections::HashMap::new(),
                 current_workspace_root: None,
                 file_index_forwarder: None,
             },
@@ -681,7 +687,10 @@ async fn test_set_session_model_hydrates_persisted_session() -> Result<()> {
     };
     assert!(actor_loaded, "set_session_model should lazy-hydrate actor");
 
-    let llm_cfg = storage.session_store().get_session_llm_config(&session_id).await?;
+    let llm_cfg = storage
+        .session_store()
+        .get_session_llm_config(&session_id)
+        .await?;
     let llm_cfg = llm_cfg.expect("session llm config should be set");
     assert_eq!(llm_cfg.provider, "mock");
     assert_eq!(llm_cfg.model, "new-model");
@@ -736,7 +745,8 @@ async fn test_set_session_model_unknown_session_returns_not_found() -> Result<()
     .await;
 
     let mut got_not_found = false;
-    while let Ok(Some(msg_str)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+    while let Ok(Some(msg_str)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
+    {
         let parsed: Value = serde_json::from_str(&msg_str)?;
         if parsed["type"] == "error"
             && parsed["message"]
@@ -749,7 +759,10 @@ async fn test_set_session_model_unknown_session_returns_not_found() -> Result<()
         }
     }
 
-    assert!(got_not_found, "missing session should return not found error");
+    assert!(
+        got_not_found,
+        "missing session should return not found error"
+    );
     Ok(())
 }
 

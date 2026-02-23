@@ -109,8 +109,17 @@ impl EventBus {
             for observer in observers {
                 let observer = Arc::clone(&observer);
                 let event = event.clone();
+                let observer_type = std::any::type_name_of_val(observer.as_ref()).to_string();
                 tasks_guard.spawn(async move {
-                    let _ = observer.on_event(&event).await;
+                    if let Err(err) = observer.on_event(&event).await {
+                        log::error!(
+                            "EventBus observer failure: observer={}, session_id={}, seq={}, error={}",
+                            observer_type,
+                            event.session_id,
+                            event.seq,
+                            err
+                        );
+                    }
                 });
             }
         });
@@ -179,6 +188,17 @@ mod tests {
         async fn on_event(&self, event: &AgentEvent) -> Result<(), querymt::error::LLMError> {
             self.received_events.lock().await.push(event.clone());
             Ok(())
+        }
+    }
+
+    struct FailingObserver;
+
+    #[async_trait::async_trait]
+    impl EventObserver for FailingObserver {
+        async fn on_event(&self, _event: &AgentEvent) -> Result<(), querymt::error::LLMError> {
+            Err(querymt::error::LLMError::ProviderError(
+                "observer failure".to_string(),
+            ))
         }
     }
 
@@ -380,6 +400,24 @@ mod tests {
         bus.publish("sess-shutdown", AgentEventKind::SessionCreated);
         bus.shutdown().await;
         // Should complete without hanging or panicking
+    }
+
+    #[tokio::test]
+    async fn observer_failure_does_not_block_other_observers() {
+        let bus = EventBus::new();
+        let good = Arc::new(MockObserver::new());
+        let bad = Arc::new(FailingObserver) as Arc<dyn EventObserver>;
+
+        let _good_token = bus.add_observer(good.clone());
+        let _bad_token = bus.add_observer(bad);
+
+        bus.publish("sess-fail", AgentEventKind::SessionCreated);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let received = good.get_received_events().await;
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].session_id, "sess-fail");
     }
 
     #[tokio::test]

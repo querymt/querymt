@@ -25,7 +25,7 @@ mod provider_routing_integration_tests {
     use crate::agent::remote::test_helpers::fixtures::{
         AgentConfigFixture, ProviderHostFixture, ProviderRoutingFixture, get_test_mesh,
     };
-    use crate::session::provider::build_provider_from_config;
+    use crate::session::provider::{ProviderRouting, build_provider_from_config};
     use querymt::chat::{ChatProvider, FinishReason};
     use querymt::error::LLMError;
     use tokio::sync::mpsc;
@@ -45,8 +45,11 @@ mod provider_routing_integration_tests {
             "model",
             None,
             None,
-            None, // provider_node = None → local path
-            None, // mesh_handle = None
+            ProviderRouting {
+                provider_node: None, // provider_node = None → local path
+                mesh_handle: None,   // mesh_handle = None
+                allow_mesh_fallback: false,
+            },
         )
         .await;
 
@@ -132,8 +135,11 @@ mod provider_routing_integration_tests {
             "claude-3",
             None,
             None,
-            Some(&provider_node), // explicit remote node
-            Some(mesh),
+            ProviderRouting {
+                provider_node: Some(&provider_node), // explicit remote node
+                mesh_handle: Some(mesh),
+                allow_mesh_fallback: false,
+            },
         )
         .await
         .expect("build_provider_from_config with provider_node should succeed");
@@ -248,8 +254,11 @@ mod provider_routing_integration_tests {
             "mock-model",
             None,
             None,
-            Some(&provider_node),
-            Some(mesh),
+            ProviderRouting {
+                provider_node: Some(&provider_node),
+                mesh_handle: Some(mesh),
+                allow_mesh_fallback: false,
+            },
         )
         .await
         .expect("should succeed (creates MeshChatProvider, no local plugin needed)");
@@ -290,8 +299,11 @@ mod provider_routing_integration_tests {
             "model",
             None,
             None,
-            Some("local"), // "local" → bypass mesh
-            Some(mesh),
+            ProviderRouting {
+                provider_node: Some("local"), // "local" → bypass mesh
+                mesh_handle: Some(mesh),
+                allow_mesh_fallback: false,
+            },
         )
         .await;
 

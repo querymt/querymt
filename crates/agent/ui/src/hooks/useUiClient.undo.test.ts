@@ -162,6 +162,7 @@ describe('useUiClient - undo/redo', () => {
         success: false,
         error: 'Snapshot not found',
         undo_stack: [],
+        cursor_seq: 0,
       });
     });
 
@@ -186,6 +187,7 @@ describe('useUiClient - undo/redo', () => {
         success: true,
         reverted_files: ['a.txt'],
         undo_stack: [],
+        cursor_seq: 0,
       });
     });
 
@@ -263,6 +265,7 @@ describe('useUiClient - undo/redo', () => {
         type: 'redo_result',
         success: true,
         undo_stack: [],
+        cursor_seq: 0,
       });
     });
 
@@ -608,6 +611,7 @@ describe('useUiClient - undo/redo', () => {
           file_mentions: [],
         },
         undo_stack: [],
+        cursor_seq: 0,
       });
     });
 
@@ -717,6 +721,62 @@ describe('useUiClient - undo/redo', () => {
     expect(rows[0].content).toBe('Final answer');
     expect(rows[0].thinking).toBe('Plan: step by step');
     expect(rows[0].isStreamDelta).toBeUndefined();
+  });
+
+  it('shows resumed prompt immediately after session_loaded without reload', async () => {
+    const { result } = renderHook(() => useUiClient());
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'session_loaded',
+        session_id: 'rehydrated-session',
+        agent_id: 'primary',
+        audit: {
+          session_id: 'rehydrated-session',
+          cwd: '/test',
+          events: [
+            {
+              seq: 10,
+              timestamp: 10,
+              kind: {
+                type: 'assistant_message_stored',
+                content: 'Older assistant message',
+                message_id: 'assistant-10',
+              },
+            },
+          ],
+          delegations: [],
+          file_mentions: [],
+        },
+        undo_stack: [],
+        cursor_seq: 10,
+      });
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'event',
+        session_id: 'rehydrated-session',
+        agent_id: 'primary',
+        event: {
+          seq: 11,
+          timestamp: 11,
+          kind: {
+            type: 'prompt_received',
+            content: 'resumed prompt',
+            message_id: 'prompt-11',
+          },
+        },
+      });
+    });
+
+    const rows = result.current.eventsBySession.get('rehydrated-session') ?? [];
+    expect(rows.some((row) => row.type === 'user' && row.content === 'resumed prompt')).toBe(true);
   });
 
   it('replaces live accumulator even when final message_id is missing', async () => {

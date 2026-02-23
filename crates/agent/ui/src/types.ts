@@ -379,6 +379,7 @@ export type UiServerMessage =
       session_id: string;
       agent_id: string;
       events: any[];
+      cursor_seq: number;
     }
   | {
       type: 'error';
@@ -391,6 +392,7 @@ export type UiServerMessage =
       agent_id: string;
       audit: AuditView;
       undo_stack: UndoStackFrame[];
+      cursor_seq: number;
     }
   | {
       type: 'workspace_index_status';

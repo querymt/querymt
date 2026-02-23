@@ -378,6 +378,12 @@ impl AgentHandle {
         self.config.provider.set_mesh(Some(mesh));
     }
 
+    /// Enable/disable automatic mesh fallback for unpinned provider resolution.
+    #[cfg(feature = "remote")]
+    pub fn set_mesh_fallback(&self, enabled: bool) {
+        self.config.provider.set_mesh_fallback(enabled);
+    }
+
     #[cfg(feature = "remote")]
     fn remote_node_info_timeout() -> std::time::Duration {
         let default_ms = 3_000_u64;

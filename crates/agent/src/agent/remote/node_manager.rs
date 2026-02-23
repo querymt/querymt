@@ -66,6 +66,7 @@ mod remote_impl {
     use kameo::actor::Spawn;
     use kameo::message::{Context, Message};
     use kameo::remote::_internal;
+    use querymt::LLMParams;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -161,6 +162,36 @@ mod remote_impl {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn resolve_base_url_for_provider(config: &AgentConfig, provider: &str) -> Option<String> {
+        let cfg: &LLMParams = config.provider.initial_config();
+        if cfg.provider.as_deref()? != provider {
+            return None;
+        }
+        if let Some(base_url) = &cfg.base_url {
+            return Some(base_url.clone());
+        }
+        cfg.custom
+            .as_ref()
+            .and_then(|m| m.get("base_url"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    fn resolve_model_for_provider(config: &AgentConfig, provider: &str) -> Option<String> {
+        let cfg: &LLMParams = config.provider.initial_config();
+        if cfg.provider.as_deref()? != provider {
+            return None;
+        }
+
+        cfg.model.clone().or_else(|| {
+            cfg.custom
+                .as_ref()
+                .and_then(|m| m.get("model"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
     }
 
     // ── Message handlers ──────────────────────────────────────────────────────
@@ -515,8 +546,8 @@ mod remote_impl {
                     continue;
                 }
 
-                // Resolve config for listing
-                let cfg = if let Some(http_factory) = factory.as_http() {
+                // Resolve config for listing.
+                let mut cfg = if let Some(http_factory) = factory.as_http() {
                     let api_key = if let Some(api_key_name) = http_factory.api_key_name() {
                         #[cfg(feature = "oauth")]
                         {
@@ -534,13 +565,33 @@ mod remote_impl {
                     };
 
                     if let Some(key) = api_key {
-                        serde_json::json!({"api_key": key}).to_string()
+                        serde_json::json!({"api_key": key})
                     } else {
-                        "{}".to_string()
+                        serde_json::json!({})
                     }
                 } else {
-                    "{}".to_string()
+                    serde_json::json!({})
                 };
+
+                if let Some(base_url) = resolve_base_url_for_provider(&self.config, &provider_name)
+                {
+                    cfg["base_url"] = base_url.into();
+                }
+
+                // Non-HTTP providers like llama_cpp need a model in list_models config.
+                if factory.as_http().is_none() {
+                    if let Some(model) = resolve_model_for_provider(&self.config, &provider_name) {
+                        cfg["model"] = model.into();
+                    } else {
+                        log::debug!(
+                            "ListAvailableModels: skipping provider '{}' because no configured model was found",
+                            provider_name
+                        );
+                        continue;
+                    }
+                }
+
+                let cfg = serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".to_string());
 
                 match factory.list_models(&cfg).await {
                     Ok(model_list) => {

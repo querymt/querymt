@@ -611,15 +611,19 @@ impl Agent {
     ///
     /// When `initial_registry` is `Some`, it is used as the agent registry instead of the
     /// default empty `DefaultAgentRegistry`.  When `mesh` is `Some`, the `MeshHandle` is
-    /// stored on the resulting `AgentHandle` via `set_mesh()`.
+    /// stored on the resulting `AgentHandle` via `set_mesh()`. `mesh_auto_fallback`
+    /// controls whether `provider_node = None` may resolve providers from mesh peers.
     #[cfg(feature = "remote")]
     pub async fn from_single_config_with_registry(
         config: SingleAgentConfig,
         initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
         mesh: Option<crate::agent::remote::MeshHandle>,
+        mesh_auto_fallback: bool,
     ) -> Result<Self> {
         let builder = Self::builder_from_config(config, initial_registry)?;
         let agent = builder.build().await?;
+
+        agent.inner.set_mesh_fallback(mesh_auto_fallback);
 
         if let Some(mesh) = mesh {
             agent.inner.set_mesh(mesh);

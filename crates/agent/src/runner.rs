@@ -416,10 +416,12 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
                             "Phase 7: mesh bootstrapped, {} remote agent(s) registered",
                             result.registry.list_agents().len()
                         );
+                        let auto_fallback = single_config.mesh.auto_fallback;
                         let agent = Agent::from_single_config_with_registry(
                             single_config,
                             Some(Arc::new(result.registry)),
                             Some(result.mesh),
+                            auto_fallback,
                         )
                         .await?;
                         return Ok(AgentRunner::Single(agent));
@@ -458,10 +460,12 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
                             "Phase 7: mesh bootstrapped, {} remote agent(s) registered",
                             result.registry.list_agents().len()
                         );
+                        let auto_fallback = quorum_config.mesh.auto_fallback;
                         let quorum = Quorum::from_quorum_config_with_registry(
                             quorum_config,
                             Some(Arc::new(result.registry)),
                             Some(result.mesh),
+                            auto_fallback,
                         )
                         .await?;
                         return Ok(AgentRunner::Multi(quorum));
