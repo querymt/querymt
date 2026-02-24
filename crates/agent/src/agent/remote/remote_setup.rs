@@ -115,16 +115,29 @@ pub async fn setup_mesh_from_config(
     // ── 3. Register the local RemoteNodeManager in the DHT (if provided) ──────
 
     if let Some(nm_ref) = node_manager_ref {
+        // Register under the global name so lookup_all_actors (used by
+        // list_remote_nodes) can discover this node alongside all others.
         let reg_span = tracing::info_span!(
             "remote.setup.register_node_manager",
             dht_name = super::dht_name::NODE_MANAGER
         );
-        mesh.register_actor(nm_ref, super::dht_name::NODE_MANAGER)
+        mesh.register_actor(nm_ref.clone(), super::dht_name::NODE_MANAGER)
             .instrument(reg_span)
             .await;
         log::info!(
             "Phase 7: Local RemoteNodeManager registered in DHT as '{}'",
             super::dht_name::NODE_MANAGER
+        );
+
+        // Also register under the per-peer name so find_node_manager can do a
+        // direct O(1) lookup by peer_id, bypassing the is_peer_alive gate that
+        // guards the lookup_all_actors scan. This makes create_remote_session
+        // robust against mDNS TTL expiry (30 s) on cross-machine setups.
+        let per_peer_name = super::dht_name::node_manager_for_peer(mesh.peer_id());
+        mesh.register_actor(nm_ref, per_peer_name.clone()).await;
+        log::info!(
+            "Phase 7: Local RemoteNodeManager also registered in DHT as '{}'",
+            per_peer_name
         );
     }
 

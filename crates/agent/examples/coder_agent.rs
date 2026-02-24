@@ -174,15 +174,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let node_manager_ref = RemoteNodeManager::spawn(node_manager);
 
-                // Register this node in the DHT so peers can discover it.
+                // Register under the global name so lookup_all_actors (used by
+                // list_remote_nodes) can discover this node alongside all others.
                 mesh.register_actor(
-                    node_manager_ref,
+                    node_manager_ref.clone(),
                     querymt_agent::agent::remote::dht_name::NODE_MANAGER,
                 )
                 .await;
                 eprintln!(
                     "RemoteNodeManager registered in kameo DHT as '{}'",
                     querymt_agent::agent::remote::dht_name::NODE_MANAGER
+                );
+
+                // Also register under the per-peer name so find_node_manager
+                // can do a direct O(1) DHT lookup by peer_id, bypassing the
+                // is_peer_alive gate that guards the lookup_all_actors scan.
+                // This makes create_remote_session robust against mDNS TTL
+                // expiry (30 s) on cross-machine setups.
+                let per_peer_name =
+                    querymt_agent::agent::remote::dht_name::node_manager_for_peer(mesh.peer_id());
+                mesh.register_actor(node_manager_ref, per_peer_name.clone())
+                    .await;
+                eprintln!(
+                    "RemoteNodeManager also registered in kameo DHT as '{}'",
+                    per_peer_name
                 );
 
                 // Spawn ProviderHostActor so that remote peers can proxy LLM

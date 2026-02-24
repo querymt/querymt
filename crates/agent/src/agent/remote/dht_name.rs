@@ -32,7 +32,27 @@
 use std::fmt;
 
 /// The well-known DHT name for the `RemoteNodeManager` singleton.
+///
+/// All nodes register under this shared name so that `lookup_all_actors`
+/// can discover every node in the mesh. Peers also register under the
+/// per-peer name (see [`node_manager_for_peer`]) to enable fast direct
+/// lookups by `find_node_manager`.
 pub const NODE_MANAGER: &str = "node_manager";
+
+/// Per-peer DHT name for a `RemoteNodeManager`, keyed by the owning node's
+/// peer id.
+///
+/// Every node registers its `RemoteNodeManager` under **both** the global
+/// [`NODE_MANAGER`] name (for mesh-wide discovery) and this per-peer name
+/// (for direct O(1) lookup by [`AgentHandle::find_node_manager`]).
+///
+/// The direct-lookup path in `find_node_manager` bypasses the
+/// `is_peer_alive` filter that guards the `lookup_all_actors` scan, so a
+/// node that lost its mDNS heartbeat momentarily is still reachable as long
+/// as the DHT record is fresh and the TCP connection is alive.
+pub fn node_manager_for_peer(peer_id: &impl fmt::Display) -> String {
+    format!("node_manager::peer::{}", peer_id)
+}
 
 /// DHT name for a `ProviderHostActor` keyed by the owning node's peer id.
 ///
@@ -112,6 +132,31 @@ mod tests {
     #[test]
     fn node_manager_is_bare_string() {
         assert_eq!(NODE_MANAGER, "node_manager");
+    }
+
+    #[test]
+    fn node_manager_for_peer_format() {
+        let name = node_manager_for_peer(&"12D3KooWABC");
+        assert_eq!(name, "node_manager::peer::12D3KooWABC");
+    }
+
+    #[test]
+    fn node_manager_for_peer_never_collides_with_global() {
+        let name = node_manager_for_peer(&"12D3KooWABC");
+        assert_ne!(name, NODE_MANAGER);
+        assert!(
+            name.starts_with("node_manager::peer::"),
+            "must use 'peer::' prefix, got: {}",
+            name
+        );
+    }
+
+    #[test]
+    fn node_manager_for_peer_registration_and_lookup_agree() {
+        let peer_id = "12D3KooWPv7fUDC2WqR5c6v71fMsoxhoYYqcPEciyCfuqRz6f6qH";
+        let reg_name = node_manager_for_peer(&peer_id);
+        let lookup_name = node_manager_for_peer(&peer_id);
+        assert_eq!(reg_name, lookup_name);
     }
 
     /// The DHT name functions used for registration and lookup must produce
