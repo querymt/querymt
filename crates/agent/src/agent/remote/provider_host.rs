@@ -262,12 +262,26 @@ impl ProviderHostActor {
         tracing::Span::current().record("cache_hit", false);
 
         let plugin_registry = self.config.provider.plugin_registry();
+
+        // Merge the custom parameters stored in the agent config's initial LLM
+        // params (populated from `[agent.parameters]` in the TOML) into a JSON
+        // value so that provider-specific settings — most critically the `model`
+        // override that maps a friendly name like `"qwen3-coder"` to an actual
+        // GGUF / HF path — are forwarded to `build_provider_from_config`.
+        // Without this, `build_provider_from_config` would only receive the bare
+        // model name and providers like `llama_cpp` would reject it as invalid.
+        let initial_params = self.config.provider.initial_params();
+        let params_json: Option<serde_json::Value> = initial_params
+            .custom
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok());
+
         let provider = build_provider_from_config(
             &plugin_registry,
             provider_name,
             model,
-            None, // no extra params
-            None, // no API key override — use local keys
+            params_json.as_ref(), // forward agent parameters (e.g. model path, n_ctx)
+            None,                 // no API key override — use local keys
             ProviderRouting {
                 provider_node_id: None,     // always local on the owning node
                 mesh_handle: None,          // not needed — owning node builds directly

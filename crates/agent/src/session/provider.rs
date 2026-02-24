@@ -123,6 +123,16 @@ impl SessionProvider {
         }
     }
 
+    /// Returns the initial `LLMParams` this provider was constructed with.
+    ///
+    /// Used by `ProviderHostActor` to forward the agent's custom parameters
+    /// (e.g. `model_path`, `n_ctx`) when building a local provider on behalf
+    /// of a remote mesh peer.  Without these params the friendly model name
+    /// (e.g. `"qwen3-coder"`) cannot be resolved to a real GGUF path.
+    pub fn initial_params(&self) -> &LLMParams {
+        &self.initial_config
+    }
+
     /// Attach a mesh handle at construction time (consuming builder).
     ///
     /// Use this when the mesh is available before the `SessionProvider` is

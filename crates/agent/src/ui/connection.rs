@@ -366,15 +366,17 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                         .unwrap_or_else(|| "unknown".to_string())
                 };
 
-                if matches!(
-                    event.kind(),
-                    crate::events::AgentEventKind::AssistantThinkingDelta { .. }
-                        | crate::events::AgentEventKind::AssistantContentDelta { .. }
-                        | crate::events::AgentEventKind::AssistantMessageStored { .. }
-                        | crate::events::AgentEventKind::LlmRequestStart { .. }
-                        | crate::events::AgentEventKind::LlmRequestEnd { .. }
-                ) {
-                    log::debug!(
+                if log::log_enabled!(log::Level::Trace)
+                    && matches!(
+                        event.kind(),
+                        crate::events::AgentEventKind::AssistantThinkingDelta { .. }
+                            | crate::events::AgentEventKind::AssistantContentDelta { .. }
+                            | crate::events::AgentEventKind::AssistantMessageStored { .. }
+                            | crate::events::AgentEventKind::LlmRequestStart { .. }
+                            | crate::events::AgentEventKind::LlmRequestEnd { .. }
+                    )
+                {
+                    log::trace!(
                         "ui forwarder: conn={} session={} agent={} seq={} kind={:?}",
                         conn_id_events,
                         event.session_id(),

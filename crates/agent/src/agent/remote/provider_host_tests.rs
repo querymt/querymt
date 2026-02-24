@@ -9,6 +9,160 @@
 #[cfg(all(test, feature = "remote"))]
 #[allow(clippy::module_inception)]
 mod provider_host_tests {
+    // ── A.0 — SessionProvider::initial_params() ───────────────────────────────
+    //
+    // Regression test for the bug where `ProviderHostActor::get_or_build_provider`
+    // passed `None` for the `params` argument, causing providers like `llama_cpp`
+    // to receive only the bare friendly model name (e.g. `"qwen3-coder"`) without
+    // the `[agent.parameters]` overrides (e.g. `model = "hf:owner/repo:file.gguf"`).
+    //
+    // We verify two things:
+    //   1. `SessionProvider::initial_params()` exposes the custom params.
+    //   2. When those params are present the `ProviderHostActor` forwards them:
+    //      the error it produces changes from an "invalid model format" error (old
+    //      behaviour, params == None) to an "unknown provider" error (new behaviour,
+    //      params forwarded but plugin not registered in the test registry).
+
+    #[tokio::test]
+    async fn test_session_provider_initial_params_exposed() {
+        use crate::agent::agent_config_builder::AgentConfigBuilder;
+        use crate::session::backend::StorageBackend as _;
+        use crate::session::sqlite_storage::SqliteStorage;
+        use querymt::LLMParams;
+        use querymt::plugin::host::PluginRegistry;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let config_path = temp_dir.path().join("providers.toml");
+        std::fs::write(&config_path, "providers = []\n").expect("write providers.toml");
+        let registry = Arc::new(PluginRegistry::from_path(&config_path).expect("registry"));
+
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("sqlite"),
+        );
+
+        let llm = LLMParams::new()
+            .provider("llama_cpp")
+            .model("qwen3-coder")
+            // Simulate the `[agent.parameters] model = "hf:..."` TOML entry.
+            .parameter("model", "hf:owner/repo:model.gguf")
+            .parameter("n_ctx", 32768_u64);
+
+        let config = Arc::new(
+            AgentConfigBuilder::new(
+                registry,
+                storage.session_store(),
+                storage.event_journal(),
+                llm,
+            )
+            .build(),
+        );
+
+        let params = config.provider.initial_params();
+        assert_eq!(params.provider.as_deref(), Some("llama_cpp"));
+        assert_eq!(params.model.as_deref(), Some("qwen3-coder"));
+
+        let custom = params
+            .custom
+            .as_ref()
+            .expect("custom params must be present");
+        assert_eq!(
+            custom.get("model").and_then(|v| v.as_str()),
+            Some("hf:owner/repo:model.gguf"),
+            "model override must be in custom params"
+        );
+        assert!(
+            custom.contains_key("n_ctx"),
+            "n_ctx must be in custom params"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_host_actor_forwards_params_to_build() {
+        // When the AgentConfig carries custom params (e.g. `model = "hf:..."`)
+        // the ProviderHostActor must forward them.  Because `llama_cpp` is not
+        // registered in the test plugin registry the call still fails, but the
+        // error must be an "unknown provider" failure — not the old
+        // "model must be a local .gguf path" parse error that occurred when
+        // params were silently dropped.
+        use crate::agent::agent_config_builder::AgentConfigBuilder;
+        use crate::agent::remote::provider_host::{ProviderChatRequest, ProviderHostActor};
+        use crate::session::backend::StorageBackend as _;
+        use crate::session::sqlite_storage::SqliteStorage;
+        use kameo::actor::Spawn;
+        use kameo::error::SendError;
+        use querymt::LLMParams;
+        use querymt::plugin::host::PluginRegistry;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let config_path = temp_dir.path().join("providers.toml");
+        std::fs::write(&config_path, "providers = []\n").expect("write providers.toml");
+        let registry = Arc::new(PluginRegistry::from_path(&config_path).expect("registry"));
+
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("sqlite"),
+        );
+
+        let llm = LLMParams::new()
+            .provider("llama_cpp")
+            .model("qwen3-coder")
+            .parameter("model", "hf:owner/repo:model.gguf")
+            .parameter("n_ctx", 32768_u64);
+
+        let config = Arc::new(
+            AgentConfigBuilder::new(
+                registry,
+                storage.session_store(),
+                storage.event_journal(),
+                llm,
+            )
+            .build(),
+        );
+
+        let actor = ProviderHostActor::new(config);
+        let actor_ref = ProviderHostActor::spawn(actor);
+
+        let req = ProviderChatRequest {
+            provider: "llama_cpp".to_string(),
+            model: "qwen3-coder".to_string(),
+            messages: vec![],
+            tools: None,
+        };
+
+        let result = actor_ref.ask(req).await;
+
+        match result {
+            Err(SendError::HandlerError(e)) => {
+                let msg = e.to_string();
+                // With the fix, params are forwarded so the provider factory is looked up.
+                // Since llama_cpp is not registered in the test registry we get
+                // "Unknown provider" — not the old "model must be a local .gguf path" error.
+                assert!(
+                    msg.contains("llama_cpp")
+                        || msg.contains("provider")
+                        || msg.contains("Unknown"),
+                    "error should mention provider lookup failure, not model format: {}",
+                    msg
+                );
+                assert!(
+                    !msg.contains("model must be a local .gguf path")
+                        && !msg.contains("<repo>:<selector>")
+                        && !msg.contains("<owner>/<repo>"),
+                    "params should have been forwarded — model parse error must not appear: {}",
+                    msg
+                );
+            }
+            Ok(_) => panic!("expected an error — llama_cpp is not registered in test registry"),
+            Err(e) => panic!("unexpected error variant: {:?}", e),
+        }
+    }
     use crate::agent::remote::provider_host::{
         ProviderChatRequest, ProviderChatResponse, StreamChunkRelay, StreamReceiverActor,
     };
