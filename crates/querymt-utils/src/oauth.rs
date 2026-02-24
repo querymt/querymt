@@ -103,10 +103,14 @@ pub trait OAuthProvider: Send + Sync {
     async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet>;
 
     /// Optionally create an API key (for providers that support it)
-    async fn create_api_key(&self, access_token: &str) -> Result<Option<String>>;
+    async fn create_api_key(&self, _access_token: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 
     /// Get the API key environment variable name (e.g., "ANTHROPIC_API_KEY")
-    fn api_key_name(&self) -> Option<&str>;
+    fn api_key_name(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// OAuth flow data returned when starting a flow
@@ -236,14 +240,6 @@ impl OAuthProvider for CodexProvider {
             refresh_token: tokens.refresh_token,
             expires_at: tokens.expires_at,
         })
-    }
-
-    async fn create_api_key(&self, _access_token: &str) -> Result<Option<String>> {
-        Ok(None)
-    }
-
-    fn api_key_name(&self) -> Option<&str> {
-        None
     }
 }
 
