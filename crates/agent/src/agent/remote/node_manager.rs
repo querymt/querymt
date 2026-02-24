@@ -579,9 +579,7 @@ mod remote_impl {
 
                 // For HTTP providers, require a credential when needed.
                 let has_credentials = if let Some(http_factory) = factory.as_http() {
-                    if !requires_api_key {
-                        true
-                    } else if oauth_token.is_some() {
+                    if !requires_api_key || oauth_token.is_some() {
                         true
                     } else if let Some(api_key_name) = http_factory.api_key_name() {
                         std::env::var(api_key_name).is_ok()
