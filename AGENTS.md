@@ -22,6 +22,8 @@
 
 ## Build, Lint, and Test Commands
 
+When running any of the commands below, prefer delegating to a subagent when available for efficiency.
+
 ### Workspace
 - Check: `cargo check`
 - Format: `cargo fmt --all`
