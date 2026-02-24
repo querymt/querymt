@@ -14,7 +14,9 @@ use querymt::{
     error::LLMError,
 };
 use serde_json::{Map, Value};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
+#[cfg(feature = "remote")]
+use std::sync::Mutex as StdMutex;
 use tokio::sync::RwLock;
 
 fn prune_config_by_schema(cfg: &Value, schema: &Value) -> Value {
@@ -55,6 +57,20 @@ fn pruned_top_level_keys(before: &Value, after: &Value) -> Vec<String> {
         .collect();
     removed.sort();
     removed
+}
+
+fn schema_requires_field(schema: &Value, field: &str) -> bool {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| required.iter().any(|v| v.as_str() == Some(field)))
+}
+
+fn config_has_nonempty_api_key(config: &Value) -> bool {
+    config
+        .get("api_key")
+        .and_then(Value::as_str)
+        .is_some_and(|key| !key.trim().is_empty())
 }
 
 /// Type alias for the provider cache: (config_id, provider_node_id, allow_mesh_fallback, provider) tuple.
@@ -774,6 +790,8 @@ pub async fn build_provider_from_config(
         }
     };
 
+    let schema: Value = serde_json::from_str(&factory.config_schema())?;
+
     // Build config JSON, starting with model
     let mut builder_config = serde_json::json!({ "model": model });
 
@@ -794,10 +812,14 @@ pub async fn build_provider_from_config(
     // The resolver enables transparent token refresh without rebuilding the provider.
     let mut _use_oauth_resolver = false;
 
-    // Get API key - try override, then OAuth (if feature enabled), then env var
-    if let Some(http_factory) = factory.as_http()
-        && let Some(env_var_name) = http_factory.api_key_name()
-    {
+    // Get API key - try override, then OAuth (if feature enabled), then env var fallback
+    // when the provider defines one.
+    if let Some(http_factory) = factory.as_http() {
+        let requires_api_key = schema_requires_field(&schema, "api_key");
+
+        #[cfg(feature = "oauth")]
+        let oauth_supported = crate::auth::get_oauth_provider(provider_name, None).is_ok();
+
         let api_key = if let Some(key) = api_key_override {
             Some(key.to_string())
         } else {
@@ -807,43 +829,82 @@ pub async fn build_provider_from_config(
 
                 log::debug!("Resolving API key for provider: {}", provider_name);
 
-                // Try OAuth tokens first
-                match get_or_refresh_token(provider_name).await {
-                    Ok(token) => {
-                        log::debug!("Using OAuth token for provider: {}", provider_name);
-                        _use_oauth_resolver = true;
-                        Some(token)
-                    }
-                    Err(e) => {
-                        // OAuth failed - fall back to environment variable
-                        log::debug!("OAuth unavailable for {}: {}", provider_name, e);
-                        log::debug!("Falling back to env var: {}", env_var_name);
-                        std::env::var(&env_var_name).ok()
+                let mut oauth_token = None;
+                if oauth_supported {
+                    match get_or_refresh_token(provider_name).await {
+                        Ok(token) => {
+                            log::debug!("Using OAuth token for provider: {}", provider_name);
+                            _use_oauth_resolver = true;
+                            oauth_token = Some(token);
+                        }
+                        Err(e) => {
+                            log::debug!("OAuth unavailable for {}: {}", provider_name, e);
+                        }
                     }
                 }
+
+                oauth_token.or_else(|| {
+                    http_factory.api_key_name().and_then(|env_var_name| {
+                        log::debug!("Falling back to env var: {}", env_var_name);
+                        std::env::var(&env_var_name).ok()
+                    })
+                })
             }
             #[cfg(not(feature = "oauth"))]
             {
-                std::env::var(&env_var_name).ok()
+                http_factory
+                    .api_key_name()
+                    .and_then(|env_var_name| std::env::var(&env_var_name).ok())
             }
         };
 
         if let Some(key) = api_key {
             builder_config["api_key"] = key.into();
-        } else {
-            // Both OAuth and env var failed
-            log::warn!(
-                "No API key found for provider '{}'. Set {} or run 'qmt auth login {}'",
-                provider_name,
-                env_var_name,
-                provider_name
-            );
+        } else if requires_api_key && !config_has_nonempty_api_key(&builder_config) {
+            #[cfg(feature = "oauth")]
+            {
+                let message = match (oauth_supported, http_factory.api_key_name()) {
+                    (true, Some(env_var_name)) => format!(
+                        "Provider '{}' requires authentication. Run 'qmt auth login {}' or set {}.",
+                        provider_name, provider_name, env_var_name
+                    ),
+                    (true, None) => format!(
+                        "Provider '{}' requires OAuth authentication. Authenticate provider using the UI or run 'qmt auth login {}'.",
+                        provider_name, provider_name
+                    ),
+                    (false, Some(env_var_name)) => format!(
+                        "Provider '{}' requires an API key. Set {}.",
+                        provider_name, env_var_name
+                    ),
+                    (false, None) => format!(
+                        "Provider '{}' requires an api_key, but no credential source is configured.",
+                        provider_name
+                    ),
+                };
+
+                return Err(SessionError::InvalidOperation(message));
+            }
+
+            #[cfg(not(feature = "oauth"))]
+            {
+                let message = match http_factory.api_key_name() {
+                    Some(env_var_name) => format!(
+                        "Provider '{}' requires an API key. Set {}.",
+                        provider_name, env_var_name
+                    ),
+                    None => format!(
+                        "Provider '{}' requires authentication, but this build has no OAuth support. Rebuild with the `oauth` feature and run 'qmt auth login {}'.",
+                        provider_name, provider_name
+                    ),
+                };
+
+                return Err(SessionError::InvalidOperation(message));
+            }
         }
     }
 
     // Prune config by provider schema to avoid providers with
     // `deny_unknown_fields` rejecting unrelated parameters.
-    let schema: Value = serde_json::from_str(&factory.config_schema())?;
     let pruned_config = prune_config_by_schema(&builder_config, &schema);
 
     let pruned_keys = pruned_top_level_keys(&builder_config, &pruned_config);
@@ -938,9 +999,48 @@ pub mod tests {
     use querymt::chat::{ChatMessage, ChatResponse, FinishReason, StreamChunk};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
+    use serde_json::json;
     use std::pin::Pin;
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
+
+    #[test]
+    fn schema_requires_field_detects_required_field() {
+        let schema = json!({
+            "type": "object",
+            "required": ["api_key", "model"]
+        });
+
+        assert!(schema_requires_field(&schema, "api_key"));
+        assert!(!schema_requires_field(&schema, "temperature"));
+    }
+
+    #[test]
+    fn schema_requires_field_handles_missing_required_array() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "model": {"type": "string"}
+            }
+        });
+
+        assert!(!schema_requires_field(&schema, "api_key"));
+    }
+
+    #[test]
+    fn config_has_nonempty_api_key_detects_present_key() {
+        let cfg = json!({"api_key": "abc123"});
+        assert!(config_has_nonempty_api_key(&cfg));
+    }
+
+    #[test]
+    fn config_has_nonempty_api_key_rejects_blank_or_missing() {
+        let blank = json!({"api_key": "   "});
+        let missing = json!({"model": "gpt-5"});
+
+        assert!(!config_has_nonempty_api_key(&blank));
+        assert!(!config_has_nonempty_api_key(&missing));
+    }
 
     /// Mock LLM provider for testing
     pub struct MockProvider {

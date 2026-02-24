@@ -199,6 +199,32 @@ mod remote_impl {
         })
     }
 
+    fn schema_requires_field(schema: &serde_json::Value, field: &str) -> bool {
+        schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|required| required.iter().any(|v| v.as_str() == Some(field)))
+    }
+
+    fn provider_requires_api_key(
+        factory: &std::sync::Arc<dyn querymt::plugin::LLMProviderFactory>,
+    ) -> bool {
+        match serde_json::from_str::<serde_json::Value>(&factory.config_schema()) {
+            Ok(schema) => schema_requires_field(&schema, "api_key"),
+            Err(err) => {
+                log::warn!(
+                    "ListAvailableModels: failed to parse config schema for provider '{}': {}",
+                    factory.name(),
+                    err
+                );
+                factory
+                    .as_http()
+                    .and_then(|http_factory| http_factory.api_key_name())
+                    .is_some()
+            }
+        }
+    }
+
     // ── Message handlers ──────────────────────────────────────────────────────
 
     impl Message<CreateRemoteSession> for RemoteNodeManager {
@@ -536,29 +562,31 @@ mod remote_impl {
 
             for factory in factories {
                 let provider_name = factory.name().to_string();
+                let requires_api_key = if factory.as_http().is_some() {
+                    provider_requires_api_key(&factory)
+                } else {
+                    false
+                };
 
-                // For HTTP providers, require a valid API key
+                #[cfg(feature = "oauth")]
+                let oauth_token = if crate::auth::get_oauth_provider(&provider_name, None).is_ok() {
+                    crate::auth::get_or_refresh_token(&provider_name).await.ok()
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "oauth"))]
+                let oauth_token: Option<String> = None;
+
+                // For HTTP providers, require a credential when needed.
                 let has_credentials = if let Some(http_factory) = factory.as_http() {
-                    if let Some(api_key_name) = http_factory.api_key_name() {
-                        // Check OAuth token first
-                        #[cfg(feature = "oauth")]
-                        {
-                            if crate::auth::get_or_refresh_token(&provider_name)
-                                .await
-                                .is_ok()
-                            {
-                                true
-                            } else {
-                                std::env::var(api_key_name).is_ok()
-                            }
-                        }
-                        #[cfg(not(feature = "oauth"))]
-                        {
-                            std::env::var(api_key_name).is_ok()
-                        }
-                    } else {
-                        // No API key required for this HTTP provider
+                    if !requires_api_key {
                         true
+                    } else if oauth_token.is_some() {
+                        true
+                    } else if let Some(api_key_name) = http_factory.api_key_name() {
+                        std::env::var(api_key_name).is_ok()
+                    } else {
+                        false
                     }
                 } else {
                     // Non-HTTP provider (e.g., local llama-cpp) — always available
@@ -571,21 +599,11 @@ mod remote_impl {
 
                 // Resolve config for listing.
                 let mut cfg = if let Some(http_factory) = factory.as_http() {
-                    let api_key = if let Some(api_key_name) = http_factory.api_key_name() {
-                        #[cfg(feature = "oauth")]
-                        {
-                            crate::auth::get_or_refresh_token(&provider_name)
-                                .await
-                                .ok()
-                                .or_else(|| std::env::var(api_key_name).ok())
-                        }
-                        #[cfg(not(feature = "oauth"))]
-                        {
-                            std::env::var(api_key_name).ok()
-                        }
-                    } else {
-                        None
-                    };
+                    let api_key = oauth_token.clone().or_else(|| {
+                        http_factory
+                            .api_key_name()
+                            .and_then(|api_key_name| std::env::var(api_key_name).ok())
+                    });
 
                     if let Some(key) = api_key {
                         serde_json::json!({"api_key": key})

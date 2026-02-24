@@ -62,19 +62,46 @@ pub(super) fn resolve_model_for_provider(state: &ServerState, provider: &str) ->
     })
 }
 
+fn schema_requires_field(schema: &Value, field: &str) -> bool {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| required.iter().any(|v| v.as_str() == Some(field)))
+}
+
+fn provider_requires_api_key(factory: &dyn LLMProviderFactory) -> bool {
+    match serde_json::from_str::<Value>(&factory.config_schema()) {
+        Ok(schema) => schema_requires_field(&schema, "api_key"),
+        Err(err) => {
+            log::warn!(
+                "fetch_catalog_models: failed to parse config schema for provider '{}': {}",
+                factory.name(),
+                err
+            );
+            factory
+                .as_http()
+                .and_then(|http_factory| http_factory.api_key_name())
+                .is_some()
+        }
+    }
+}
+
 /// Resolve API key for a provider from OAuth token store or environment variable.
 async fn resolve_provider_api_key(
     provider: &str,
     factory: &dyn HTTPLLMProviderFactory,
 ) -> Option<String> {
-    let api_key_name = factory.api_key_name()?;
     #[cfg(feature = "oauth")]
     {
-        if let Ok(token) = crate::auth::get_or_refresh_token(provider).await {
+        if crate::auth::get_oauth_provider(provider, None).is_ok()
+            && let Ok(token) = crate::auth::get_or_refresh_token(provider).await
+        {
             return Some(token);
         }
     }
-    std::env::var(api_key_name).ok()
+    factory
+        .api_key_name()
+        .and_then(|api_key_name| std::env::var(api_key_name).ok())
 }
 
 // ── Public handlers ───────────────────────────────────────────────────────────
@@ -569,10 +596,14 @@ async fn fetch_catalog_models(
     tx: &mpsc::Sender<String>,
 ) -> Vec<ModelEntry> {
     let mut cfg = if let Some(http_factory) = factory.as_http() {
+        let requires_api_key = provider_requires_api_key(factory.as_ref());
+
         if let Some(api_key) = resolve_provider_api_key(provider_name, http_factory).await {
             serde_json::json!({"api_key": api_key})
-        } else {
+        } else if requires_api_key {
             return Vec::new();
+        } else {
+            serde_json::json!({})
         }
     } else {
         serde_json::json!({})
