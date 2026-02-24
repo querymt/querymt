@@ -127,7 +127,7 @@ pub struct AgentQuorumBuilder {
     ///
     /// These are inserted into the `DefaultAgentRegistry` *before* the local delegates,
     /// so local delegates with the same ID will override remote ones.
-    preregistered: Vec<(AgentInfo, Arc<dyn SendAgent>)>,
+    preregistered: Vec<(AgentInfo, Arc<dyn SendAgent>, Option<AgentActorHandle>)>,
 }
 
 impl AgentQuorumBuilder {
@@ -154,7 +154,18 @@ impl AgentQuorumBuilder {
     /// Pre-registered entries are inserted before local delegates; local delegates
     /// with the same ID will override them.
     pub fn preregister_agent(mut self, info: AgentInfo, instance: Arc<dyn SendAgent>) -> Self {
-        self.preregistered.push((info, instance));
+        self.preregistered.push((info, instance, None));
+        self
+    }
+
+    /// Pre-register an agent with an optional kameo-native handle.
+    pub fn preregister_agent_with_handle(
+        mut self,
+        info: AgentInfo,
+        instance: Arc<dyn SendAgent>,
+        handle: Option<AgentActorHandle>,
+    ) -> Self {
+        self.preregistered.push((info, instance, handle));
         self
     }
 
@@ -266,12 +277,16 @@ impl AgentQuorumBuilder {
 
         // Phase 7: insert pre-registered agents (e.g. remote agents) first so that
         // local delegates with the same ID can override them.
-        for (info, agent) in self.preregistered {
+        for (info, agent, maybe_handle) in self.preregistered {
             log::debug!(
                 "AgentQuorumBuilder: pre-registering agent '{}' (remote/config-driven)",
                 info.id
             );
-            registry.register(info, agent);
+            if let Some(handle) = maybe_handle {
+                registry.register_with_handle(info, agent, handle);
+            } else {
+                registry.register(info, agent);
+            }
         }
 
         for (info, factory) in self.delegate_factories {
@@ -308,6 +323,12 @@ impl AgentQuorumBuilder {
             registry.clone(),
         );
 
+        let event_fanout = planner
+            .as_any()
+            .downcast_ref::<crate::agent::AgentHandle>()
+            .map(|handle| handle.config.event_sink.fanout().clone())
+            .unwrap_or_else(|| self.event_fanout.clone());
+
         let orchestrator = if self.delegation_enabled {
             // We need to get the tool_registry. For now, we'll use a default/empty one
             // This will be properly addressed when we pass AgentHandle which has tool_registry()
@@ -318,7 +339,7 @@ impl AgentQuorumBuilder {
             use crate::event_sink::EventSink;
             let delegation_sink = Arc::new(EventSink::new(
                 self.storage.event_journal(),
-                self.event_fanout.clone(),
+                event_fanout.clone(),
             ));
 
             let orchestrator = Arc::new(
@@ -340,7 +361,7 @@ impl AgentQuorumBuilder {
 
             // Subscribe the orchestrator to the quorum's event fanout so it can
             // react to delegation-related events (e.g. DelegationRequested).
-            let _listener_handle = orchestrator.start_listening(&self.event_fanout);
+            let _listener_handle = orchestrator.start_listening(&event_fanout);
 
             Some(orchestrator)
         } else {
@@ -349,12 +370,55 @@ impl AgentQuorumBuilder {
 
         Ok(AgentQuorum {
             storage: self.storage,
-            event_fanout: self.event_fanout,
+            event_fanout,
             registry,
             planner,
             delegates,
             orchestrator,
             cwd: self.cwd,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{AgentConfigBuilder, AgentHandle};
+    use crate::test_utils::empty_plugin_registry;
+    use querymt::LLMParams;
+
+    #[tokio::test]
+    async fn quorum_exposes_planner_event_fanout() {
+        let backend = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let mut builder = AgentQuorumBuilder::from_backend(backend);
+
+        let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let plugin_registry = Arc::new(plugin_registry);
+
+        builder = builder.with_planner(move |store, event_journal, agent_registry| {
+            let config = Arc::new(
+                AgentConfigBuilder::new(
+                    plugin_registry.clone(),
+                    store,
+                    event_journal,
+                    LLMParams::new().provider("mock").model("mock-model"),
+                )
+                .with_agent_registry(agent_registry)
+                .build(),
+            );
+            Arc::new(AgentHandle::from_config(config)) as Arc<dyn SendAgent>
+        });
+
+        let quorum = builder.build().unwrap();
+        let planner = quorum.planner();
+        let planner_handle = planner
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .expect("planner should be AgentHandle");
+
+        assert!(Arc::ptr_eq(
+            &quorum.event_fanout(),
+            planner_handle.config.event_sink.fanout()
+        ));
     }
 }

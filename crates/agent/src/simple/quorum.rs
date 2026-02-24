@@ -181,11 +181,12 @@ impl QuorumBuilder {
         if let Some(ref initial_reg) = self.initial_registry {
             for info in initial_reg.list_agents() {
                 if let Some(instance) = initial_reg.get_agent_instance(&info.id) {
+                    let handle = initial_reg.get_agent_handle(&info.id);
                     log::debug!(
                         "QuorumBuilder: pre-registering remote agent '{}' in quorum",
                         info.id
                     );
-                    builder = builder.preregister_agent(info, instance);
+                    builder = builder.preregister_agent_with_handle(info, instance, handle);
                 }
             }
         }
@@ -857,6 +858,10 @@ fn apply_middleware_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delegation::{AgentActorHandle, AgentInfo, DefaultAgentRegistry};
+    use crate::test_utils::empty_plugin_registry;
+    use querymt::LLMParams;
+    use std::sync::Arc;
 
     #[test]
     fn test_quorum_delegate_builder_system() {
@@ -904,5 +909,53 @@ mod tests {
     fn test_quorum_builder_snapshot_policy() {
         let builder = QuorumBuilder::new().with_snapshot_policy(SnapshotPolicy::Diff);
         assert_eq!(builder.snapshot_policy, SnapshotPolicy::Diff);
+    }
+
+    #[tokio::test]
+    async fn test_quorum_build_preserves_initial_registry_handles() {
+        let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let plugin_registry = Arc::new(plugin_registry);
+
+        let delegate_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let delegate_config = Arc::new(
+            AgentConfigBuilder::new(
+                plugin_registry,
+                delegate_storage.session_store(),
+                delegate_storage.event_journal(),
+                LLMParams::new().provider("mock").model("mock-model"),
+            )
+            .build(),
+        );
+        let delegate_handle = Arc::new(AgentHandle::from_config(delegate_config));
+
+        let mut initial_registry = DefaultAgentRegistry::new();
+        initial_registry.register_with_handle(
+            AgentInfo {
+                id: "remote-coder".to_string(),
+                name: "Remote Coder".to_string(),
+                description: "Remote coding agent".to_string(),
+                capabilities: vec!["coding".to_string()],
+                required_capabilities: vec![],
+                meta: None,
+            },
+            delegate_handle.clone() as Arc<dyn SendAgent>,
+            AgentActorHandle::Local {
+                config: delegate_handle.config.clone(),
+                registry: delegate_handle.registry.clone(),
+            },
+        );
+
+        let mut builder = QuorumBuilder::new().planner(|p| p.provider("mock", "mock-model"));
+        builder.initial_registry = Some(Arc::new(initial_registry));
+
+        let quorum = builder.build().await.unwrap();
+
+        assert!(
+            quorum
+                .inner()
+                .registry()
+                .get_agent_handle("remote-coder")
+                .is_some()
+        );
     }
 }
