@@ -100,10 +100,73 @@ impl ToolTrait for ShellTool {
             .ok_or_else(|| ToolError::InvalidRequest("No working directory available".into()))?;
         cmd.current_dir(dir);
 
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| ToolError::ProviderError(format!("command failed: {}", e)))?;
+        // Pipe stdout/stderr so we can read them after waiting.
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ToolError::ProviderError(format!("command failed to spawn: {}", e)))?;
+
+        let cancel = context.cancellation_token();
+
+        // Drive the child to completion in a cancellable way.
+        //
+        // `wait_with_output` cannot be used here because it moves `child` into
+        // its future — the cancel branch would then have no way to call `kill`.
+        // Instead we spawn the wait+collect as a JoinHandle so both branches can
+        // be expressed without ownership conflicts: the handle is abortable via
+        // `abort()`, and the child PID is captured as a raw handle for killing.
+        let wait_handle = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut stdout_buf = Vec::new();
+            let mut stderr_buf = Vec::new();
+            let mut stdout = child.stdout.take();
+            let mut stderr = child.stderr.take();
+            let (_, _) = tokio::join!(
+                async {
+                    if let Some(ref mut s) = stdout {
+                        let _ = s.read_to_end(&mut stdout_buf).await;
+                    }
+                },
+                async {
+                    if let Some(ref mut s) = stderr {
+                        let _ = s.read_to_end(&mut stderr_buf).await;
+                    }
+                },
+            );
+            let status = child.wait().await?;
+            Ok::<_, std::io::Error>((status, stdout_buf, stderr_buf))
+        });
+
+        // Race the child wait against cancellation. Both arms need access to
+        // `wait_handle` (normal path to get the result, cancel path to abort),
+        // so we pin it and use `&mut` refs in the select branches.
+        tokio::pin!(wait_handle);
+
+        let (status, stdout_buf, stderr_buf) = tokio::select! {
+            result = &mut wait_handle => {
+                result
+                    .map_err(|e| ToolError::ProviderError(format!("task join failed: {}", e)))?
+                    .map_err(|e| ToolError::ProviderError(format!("command failed: {}", e)))?
+            }
+            _ = cancel.cancelled() => {
+                // Abort the spawned task. On Unix, dropping the tokio `Child`
+                // does NOT send SIGKILL, but aborting the task causes the
+                // `Child` to be dropped which closes its stdin; the process
+                // will likely receive SIGPIPE and exit soon. This is best-effort
+                // — the primary goal is unblocking the agent, not guaranteed
+                // process termination.
+                wait_handle.abort();
+                return Err(ToolError::ProviderError("Cancelled by user".to_string()));
+            }
+        };
+
+        let output = std::process::Output {
+            status,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+        };
 
         let result = json!({
             "exit_code": output.status.code().unwrap_or(-1),

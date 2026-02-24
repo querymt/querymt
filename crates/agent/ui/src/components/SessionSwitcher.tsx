@@ -1,7 +1,7 @@
 import { useMemo, useRef, useEffect, useState } from 'react';
 import { Command } from 'cmdk';
 import Fuse from 'fuse.js';
-import { Plus, GitBranch, Clock } from 'lucide-react';
+import { Plus, GitBranch, Clock, Globe } from 'lucide-react';
 import { SessionGroup, SessionSummary } from '../types';
 import { useUiStore } from '../store/uiStore';
 
@@ -27,6 +27,7 @@ interface FlatSession extends SessionSummary {
   workspace: string; // cwd from the group
   isChild: boolean;
   isDelegation: boolean;
+  isRemote: boolean;
 }
 
 export function SessionSwitcher({
@@ -56,6 +57,7 @@ export function SessionSwitcher({
           workspace: cwd,
           isChild: !!session.parent_session_id,
           isDelegation: session.fork_origin === 'delegation',
+          isRemote: !!session.node,
         });
       }
     }
@@ -237,6 +239,12 @@ export function SessionSwitcher({
                               delegated
                             </span>
                           )}
+                          {session.isRemote && (
+                            <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 bg-accent-secondary/20 text-accent-secondary rounded border border-accent-secondary/30 flex-shrink-0">
+                              <Globe className="w-2.5 h-2.5" />
+                              {session.node}
+                            </span>
+                          )}
                         </div>
                         
                         {/* Metadata */}
@@ -309,6 +317,12 @@ export function SessionSwitcher({
                           {session.isDelegation && (
                             <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30 flex-shrink-0">
                               delegated
+                            </span>
+                          )}
+                          {session.isRemote && (
+                            <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 bg-accent-secondary/20 text-accent-secondary rounded border border-accent-secondary/30 flex-shrink-0">
+                              <Globe className="w-2.5 h-2.5" />
+                              {session.node}
                             </span>
                           )}
                         </div>

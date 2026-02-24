@@ -1,6 +1,7 @@
 //! Semantic edit tool for AST-aware source code search and transformation
 
 use async_trait::async_trait;
+use glob::glob;
 use ignore::WalkBuilder;
 use indexmap::IndexMap;
 use querymt::chat::{FunctionTool, Tool};
@@ -10,9 +11,10 @@ use srgn::RegexPattern;
 use srgn::find::Find;
 use srgn::scoping::Scoper;
 use srgn::scoping::langs::{TreeSitterRegex, c, csharp, go, hcl, python, rust, typescript};
+use srgn::scoping::literal::Literal;
 use srgn::scoping::regex::Regex;
 use srgn::scoping::view::ScopedViewBuilder;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 
@@ -68,6 +70,29 @@ struct TransformResults {
     files_searched: usize,
 }
 
+/// A parsed scope entry: the scope name and an optional name-filter regex (from `~` syntax).
+struct ScopeEntry {
+    name: String,
+    pattern: Option<String>,
+}
+
+impl ScopeEntry {
+    /// Parse `"struct~[tT]est"` into `ScopeEntry { name: "struct", pattern: Some("[tT]est") }`.
+    fn parse(s: &str) -> Self {
+        if let Some(idx) = s.find('~') {
+            Self {
+                name: s[..idx].to_string(),
+                pattern: Some(s[idx + 1..].to_string()),
+            }
+        } else {
+            Self {
+                name: s.to_string(),
+                pattern: None,
+            }
+        }
+    }
+}
+
 pub struct SemanticEditTool;
 
 impl Default for SemanticEditTool {
@@ -100,20 +125,21 @@ impl SemanticEditTool {
         }
     }
 
-    /// Apply language scope to the builder
+    /// Apply a single language scope entry (with optional `~` name filter) to the builder.
     fn apply_language_scope<'a>(
         language: &str,
-        scope: &str,
-        scope_pattern: Option<&str>,
+        entry: &ScopeEntry,
         builder: &mut ScopedViewBuilder<'a>,
     ) -> Result<(), ToolError> {
+        let scope = entry.name.as_str();
+        let scope_pattern = entry.pattern.as_deref();
         match language {
-            "python" => Self::apply_python_scope(scope, scope_pattern, builder),
+            "python" => Self::apply_python_scope(scope, builder),
             "rust" => Self::apply_rust_scope(scope, scope_pattern, builder),
             "go" => Self::apply_go_scope(scope, scope_pattern, builder),
-            "typescript" => Self::apply_typescript_scope(scope, scope_pattern, builder),
-            "c" => Self::apply_c_scope(scope, scope_pattern, builder),
-            "csharp" => Self::apply_csharp_scope(scope, scope_pattern, builder),
+            "typescript" => Self::apply_typescript_scope(scope, builder),
+            "c" => Self::apply_c_scope(scope, builder),
+            "csharp" => Self::apply_csharp_scope(scope, builder),
             "hcl" => Self::apply_hcl_scope(scope, scope_pattern, builder),
             _ => Err(ToolError::InvalidRequest(format!(
                 "Unsupported language: {}. Must be one of: python, rust, go, typescript, c, csharp, hcl",
@@ -124,7 +150,6 @@ impl SemanticEditTool {
 
     fn apply_python_scope<'a>(
         scope: &str,
-        _scope_pattern: Option<&str>, // Python doesn't support named patterns in srgn
         builder: &mut ScopedViewBuilder<'a>,
     ) -> Result<(), ToolError> {
         let query: Box<dyn Scoper> = match scope {
@@ -136,15 +161,37 @@ impl SemanticEditTool {
             "imports" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Imports)),
             "class" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Class)),
             "function" | "def" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Def)),
+            "async-def" => Box::new(python::CompiledQuery::from(python::PreparedQuery::AsyncDef)),
+            "methods" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Methods)),
+            "class-methods" => Box::new(python::CompiledQuery::from(
+                python::PreparedQuery::ClassMethods,
+            )),
+            "static-methods" => Box::new(python::CompiledQuery::from(
+                python::PreparedQuery::StaticMethods,
+            )),
             "function-calls" => Box::new(python::CompiledQuery::from(
                 python::PreparedQuery::FunctionCalls,
             )),
             "function-names" => Box::new(python::CompiledQuery::from(
                 python::PreparedQuery::FunctionNames,
             )),
+            "with" => Box::new(python::CompiledQuery::from(python::PreparedQuery::With)),
+            "try" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Try)),
+            "lambda" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Lambda)),
+            "globals" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Globals)),
+            "variable-identifiers" => Box::new(python::CompiledQuery::from(
+                python::PreparedQuery::VariableIdentifiers,
+            )),
+            "types" => Box::new(python::CompiledQuery::from(python::PreparedQuery::Types)),
+            "identifiers" => Box::new(python::CompiledQuery::from(
+                python::PreparedQuery::Identifiers,
+            )),
             s => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported Python scope: {}. Must be one of: comments, strings, doc-strings, imports, class, function, function-calls, function-names",
+                    "Unsupported Python scope: {}. Must be one of: async-def, class, class-methods, \
+comments, doc-strings, function, function-calls, function-names, globals, \
+identifiers, imports, lambda, methods, static-methods, strings, try, types, \
+variable-identifiers, with",
                     s
                 )));
             }
@@ -168,7 +215,7 @@ impl SemanticEditTool {
             ("struct", None) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Struct)),
             ("struct", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(rust::CompiledQuery::from(rust::PreparedQuery::StructNamed(
                     TreeSitterRegex(regex),
@@ -177,32 +224,112 @@ impl SemanticEditTool {
             ("enum", None) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Enum)),
             ("enum", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(rust::CompiledQuery::from(rust::PreparedQuery::EnumNamed(
                     TreeSitterRegex(regex),
                 )))
             }
-            ("fn" | "function", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Fn)),
+            ("fn" | "function", None) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Fn))
+            }
+            ("fn" | "function", Some(pattern)) => {
+                let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
+                })?;
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::FnNamed(
+                    TreeSitterRegex(regex),
+                )))
+            }
+            ("impl-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ImplFn)),
+            ("priv-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PrivFn)),
+            ("pub-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubFn)),
+            ("pub-crate-fn", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubCrateFn))
+            }
+            ("pub-self-fn", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubSelfFn))
+            }
+            ("pub-super-fn", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubSuperFn))
+            }
+            ("async-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::AsyncFn)),
+            ("const-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ConstFn)),
+            ("unsafe-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::UnsafeFn)),
+            ("extern-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ExternFn)),
+            ("test-fn", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::TestFn)),
             ("impl", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Impl)),
+            ("impl-type", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ImplType)),
+            ("impl-trait", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ImplTrait))
+            }
             ("trait", None) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Trait)),
             ("trait", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(rust::CompiledQuery::from(rust::PreparedQuery::TraitNamed(
                     TreeSitterRegex(regex),
                 )))
             }
+            ("mod", None) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Mod)),
+            ("mod", Some(pattern)) => {
+                let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
+                })?;
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ModNamed(
+                    TreeSitterRegex(regex),
+                )))
+            }
+            ("mod-tests", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::ModTests)),
+            ("priv-struct", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PrivStruct))
+            }
+            ("pub-struct", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubStruct))
+            }
+            ("pub-crate-struct", _) => Box::new(rust::CompiledQuery::from(
+                rust::PreparedQuery::PubCrateStruct,
+            )),
+            ("pub-self-struct", _) => Box::new(rust::CompiledQuery::from(
+                rust::PreparedQuery::PubSelfStruct,
+            )),
+            ("pub-super-struct", _) => Box::new(rust::CompiledQuery::from(
+                rust::PreparedQuery::PubSuperStruct,
+            )),
+            ("priv-enum", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PrivEnum)),
+            ("pub-crate-enum", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubCrateEnum))
+            }
+            ("pub-self-enum", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubSelfEnum))
+            }
+            ("pub-super-enum", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubSuperEnum))
+            }
+            ("enum-variant", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::EnumVariant))
+            }
             ("attribute", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Attribute)),
             ("unsafe", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Unsafe)),
             ("pub-enum", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::PubEnum)),
+            ("type-def", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::TypeDef)),
             ("type-identifier", _) => Box::new(rust::CompiledQuery::from(
                 rust::PreparedQuery::TypeIdentifier,
             )),
+            ("identifier", _) => {
+                Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Identifier))
+            }
+            ("closure", _) => Box::new(rust::CompiledQuery::from(rust::PreparedQuery::Closure)),
             (s, _) => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported Rust scope: {}. Must be one of: comments, strings, doc-comments, uses, struct, enum, function, impl, trait, attribute, unsafe, pub-enum, type-identifier",
+                    "Unsupported Rust scope: {}. Must be one of: async-fn, attribute, closure, \
+comments, const-fn, doc-comments, enum, enum-variant, extern-fn, fn, \
+identifier, impl, impl-fn, impl-trait, impl-type, mod, mod-tests, priv-enum, \
+priv-fn, priv-struct, pub-crate-enum, pub-crate-fn, pub-crate-struct, pub-enum, \
+pub-fn, pub-self-enum, pub-self-fn, pub-self-struct, pub-struct, pub-super-enum, \
+pub-super-fn, pub-super-struct, strings, struct, test-fn, trait, type-def, \
+type-identifier, unsafe, unsafe-fn, uses",
                     s
                 )));
             }
@@ -223,25 +350,54 @@ impl SemanticEditTool {
             ("struct", None) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Struct)),
             ("struct", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(go::CompiledQuery::from(go::PreparedQuery::StructNamed(
                     TreeSitterRegex(regex),
                 )))
             }
-            ("function" | "func", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Func)),
+            ("function" | "func", None) => {
+                Box::new(go::CompiledQuery::from(go::PreparedQuery::Func))
+            }
+            ("function" | "func", Some(pattern)) => {
+                let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
+                })?;
+                Box::new(go::CompiledQuery::from(go::PreparedQuery::FuncNamed(
+                    TreeSitterRegex(regex),
+                )))
+            }
             ("interface", None) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Interface)),
             ("interface", Some(pattern)) => {
                 let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
-                    ToolError::InvalidRequest(format!("Invalid scope_pattern regex: {}", e))
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
                 })?;
                 Box::new(go::CompiledQuery::from(go::PreparedQuery::InterfaceNamed(
                     TreeSitterRegex(regex),
                 )))
             }
+            ("const", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Const)),
+            ("var", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Var)),
+            ("method", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Method)),
+            ("free-func", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::FreeFunc)),
+            ("init-func", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::InitFunc)),
+            ("expression", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Expression)),
+            ("type-def", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::TypeDef)),
+            ("type-alias", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::TypeAlias)),
+            ("type-params", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::TypeParams)),
+            ("defer", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Defer)),
+            ("select", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Select)),
+            ("go", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Go)),
+            ("switch", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Switch)),
+            ("labeled", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Labeled)),
+            ("goto", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::Goto)),
+            ("struct-tags", _) => Box::new(go::CompiledQuery::from(go::PreparedQuery::StructTags)),
             (s, _) => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported Go scope: {}. Must be one of: comments, strings, imports, struct, function, interface",
+                    "Unsupported Go scope: {}. Must be one of: comments, const, defer, expression, \
+free-func, func, go, goto, imports, init-func, interface, labeled, method, \
+select, strings, struct, struct-tags, switch, type-alias, type-def, type-params, \
+var",
                     s
                 )));
             }
@@ -252,7 +408,6 @@ impl SemanticEditTool {
 
     fn apply_typescript_scope<'a>(
         scope: &str,
-        _scope_pattern: Option<&str>,
         builder: &mut ScopedViewBuilder<'a>,
     ) -> Result<(), ToolError> {
         let query: Box<dyn Scoper> = match scope {
@@ -271,12 +426,57 @@ impl SemanticEditTool {
             "function" => Box::new(typescript::CompiledQuery::from(
                 typescript::PreparedQuery::Function,
             )),
+            "async-function" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::AsyncFunction,
+            )),
+            "sync-function" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::SyncFunction,
+            )),
+            "method" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Method,
+            )),
+            "constructor" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Constructor,
+            )),
             "interface" => Box::new(typescript::CompiledQuery::from(
                 typescript::PreparedQuery::Interface,
             )),
+            "enum" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Enum,
+            )),
+            "try-catch" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::TryCatch,
+            )),
+            "var-decl" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::VarDecl,
+            )),
+            "let" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Let,
+            )),
+            "const" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Const,
+            )),
+            "var" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Var,
+            )),
+            "type-params" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::TypeParams,
+            )),
+            "type-alias" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::TypeAlias,
+            )),
+            "namespace" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Namespace,
+            )),
+            "export" => Box::new(typescript::CompiledQuery::from(
+                typescript::PreparedQuery::Export,
+            )),
             s => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported TypeScript scope: {}. Must be one of: comments, strings, imports, class, function, interface",
+                    "Unsupported TypeScript scope: {}. Must be one of: async-function, class, \
+comments, const, constructor, enum, export, function, imports, interface, let, \
+method, namespace, strings, sync-function, try-catch, type-alias, type-params, \
+var, var-decl",
                     s
                 )));
             }
@@ -287,17 +487,33 @@ impl SemanticEditTool {
 
     fn apply_c_scope<'a>(
         scope: &str,
-        _scope_pattern: Option<&str>,
         builder: &mut ScopedViewBuilder<'a>,
     ) -> Result<(), ToolError> {
         let query: Box<dyn Scoper> = match scope {
             "comments" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Comments)),
             "strings" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Strings)),
-            "function" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Function)),
+            "includes" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Includes)),
+            "type-def" => Box::new(c::CompiledQuery::from(c::PreparedQuery::TypeDef)),
+            "enum" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Enum)),
             "struct" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Struct)),
+            "union" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Union)),
+            "variable" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Variable)),
+            "function" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Function)),
+            "function-def" => Box::new(c::CompiledQuery::from(c::PreparedQuery::FunctionDef)),
+            "function-decl" => Box::new(c::CompiledQuery::from(c::PreparedQuery::FunctionDecl)),
+            "switch" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Switch)),
+            "if" => Box::new(c::CompiledQuery::from(c::PreparedQuery::If)),
+            "for" => Box::new(c::CompiledQuery::from(c::PreparedQuery::For)),
+            "while" => Box::new(c::CompiledQuery::from(c::PreparedQuery::While)),
+            "do" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Do)),
+            "identifier" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Identifier)),
+            "declaration" => Box::new(c::CompiledQuery::from(c::PreparedQuery::Declaration)),
+            "call-expression" => Box::new(c::CompiledQuery::from(c::PreparedQuery::CallExpression)),
             s => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported C scope: {}. Must be one of: comments, strings, function, struct",
+                    "Unsupported C scope: {}. Must be one of: call-expression, comments, \
+declaration, do, enum, for, function, function-decl, function-def, identifier, \
+if, includes, strings, struct, switch, type-def, union, variable, while",
                     s
                 )));
             }
@@ -308,19 +524,43 @@ impl SemanticEditTool {
 
     fn apply_csharp_scope<'a>(
         scope: &str,
-        _scope_pattern: Option<&str>,
         builder: &mut ScopedViewBuilder<'a>,
     ) -> Result<(), ToolError> {
         let query: Box<dyn Scoper> = match scope {
             "comments" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Comments)),
             "strings" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Strings)),
+            "usings" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Usings)),
+            "struct" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Struct)),
+            "enum" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Enum)),
+            "interface" => Box::new(csharp::CompiledQuery::from(
+                csharp::PreparedQuery::Interface,
+            )),
             "class" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Class)),
             "function" | "method" => {
                 Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Method))
             }
+            "constructor" => Box::new(csharp::CompiledQuery::from(
+                csharp::PreparedQuery::Constructor,
+            )),
+            "destructor" => Box::new(csharp::CompiledQuery::from(
+                csharp::PreparedQuery::Destructor,
+            )),
+            "field" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Field)),
+            "property" => Box::new(csharp::CompiledQuery::from(csharp::PreparedQuery::Property)),
+            "variable-declaration" => Box::new(csharp::CompiledQuery::from(
+                csharp::PreparedQuery::VariableDeclaration,
+            )),
+            "attribute" => Box::new(csharp::CompiledQuery::from(
+                csharp::PreparedQuery::Attribute,
+            )),
+            "identifier" => Box::new(csharp::CompiledQuery::from(
+                csharp::PreparedQuery::Identifier,
+            )),
             s => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported C# scope: {}. Must be one of: comments, strings, class, function",
+                    "Unsupported C# scope: {}. Must be one of: attribute, class, comments, \
+constructor, destructor, enum, field, function, identifier, interface, property, \
+strings, struct, usings, variable-declaration",
                     s
                 )));
             }
@@ -331,17 +571,47 @@ impl SemanticEditTool {
 
     fn apply_hcl_scope<'a>(
         scope: &str,
-        _scope_pattern: Option<&str>,
+        scope_pattern: Option<&str>,
         builder: &mut ScopedViewBuilder<'a>,
     ) -> Result<(), ToolError> {
-        let query: Box<dyn Scoper> = match scope {
-            "comments" => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Comments)),
-            "strings" => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Strings)),
-            "resource" => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Resource)),
-            "variable" => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Variable)),
-            s => {
+        let query: Box<dyn Scoper> = match (scope, scope_pattern) {
+            ("comments", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Comments)),
+            ("strings", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Strings)),
+            ("variable", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Variable)),
+            ("resource", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Resource)),
+            ("data", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Data)),
+            ("output", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Output)),
+            ("provider", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Provider)),
+            ("required-providers", None) => Box::new(hcl::CompiledQuery::from(
+                hcl::PreparedQuery::RequiredProviders,
+            )),
+            ("required-providers", Some(pattern)) => {
+                let regex = regex::bytes::Regex::new(pattern).map_err(|e| {
+                    ToolError::InvalidRequest(format!("Invalid scope ~ pattern regex: {}", e))
+                })?;
+                Box::new(hcl::CompiledQuery::from(
+                    hcl::PreparedQuery::RequiredProvidersNamed(TreeSitterRegex(regex)),
+                ))
+            }
+            ("terraform", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Terraform)),
+            ("locals", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Locals)),
+            ("module", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Module)),
+            ("variables", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::Variables)),
+            ("resource-names", _) => {
+                Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::ResourceNames))
+            }
+            ("resource-types", _) => {
+                Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::ResourceTypes))
+            }
+            ("data-names", _) => Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::DataNames)),
+            ("data-sources", _) => {
+                Box::new(hcl::CompiledQuery::from(hcl::PreparedQuery::DataSources))
+            }
+            (s, _) => {
                 return Err(ToolError::InvalidRequest(format!(
-                    "Unsupported HCL scope: {}. Must be one of: comments, strings, resource, variable",
+                    "Unsupported HCL scope: {}. Must be one of: comments, data, data-names, \
+data-sources, locals, module, output, provider, required-providers, \
+resource, resource-names, resource-types, strings, terraform, variable, variables",
                     s
                 )));
             }
@@ -388,9 +658,9 @@ impl SemanticEditTool {
     async fn process_file(
         file_path: &Path,
         language: &str,
-        scope: &str,
-        scope_pattern: Option<&str>,
+        scopes: &[ScopeEntry],
         pattern: Option<&str>,
+        literal_string: bool,
         replacement: Option<&str>,
         action: Option<&str>,
     ) -> Result<(Vec<Match>, bool), ToolError> {
@@ -404,15 +674,25 @@ impl SemanticEditTool {
         // Build scoped view
         let mut builder = ScopedViewBuilder::new(&content);
 
-        // Apply language scope
-        Self::apply_language_scope(language, scope, scope_pattern, &mut builder)?;
+        // Apply each language scope in order (AND / intersection semantics)
+        for entry in scopes {
+            Self::apply_language_scope(language, entry, &mut builder)?;
+        }
 
-        // Apply regex pattern scope if specified
+        // Apply pattern scope if specified
         if let Some(pattern_str) = pattern {
-            let regex_pattern = RegexPattern::new(pattern_str)
-                .map_err(|e| ToolError::InvalidRequest(format!("Invalid regex pattern: {}", e)))?;
-            let scoper = Regex::new(regex_pattern);
-            builder.explode(&scoper);
+            if literal_string {
+                let scoper = Literal::try_from(pattern_str.to_string()).map_err(|e| {
+                    ToolError::InvalidRequest(format!("Invalid literal pattern: {}", e))
+                })?;
+                builder.explode(&scoper);
+            } else {
+                let regex_pattern = RegexPattern::new(pattern_str).map_err(|e| {
+                    ToolError::InvalidRequest(format!("Invalid regex pattern: {}", e))
+                })?;
+                let scoper = Regex::new(regex_pattern);
+                builder.explode(&scoper);
+            }
         }
 
         // Build the view
@@ -454,9 +734,16 @@ impl SemanticEditTool {
                     "normalize" => {
                         view.normalize();
                     }
+                    "symbols" => {
+                        view.symbols();
+                    }
+                    "symbols-invert" => {
+                        view.invert_symbols();
+                    }
                     _ => {
                         return Err(ToolError::InvalidRequest(format!(
-                            "Unknown action: {}. Must be one of: delete, squeeze, upper, lower, titlecase, normalize",
+                            "Unknown action: {}. Must be one of: delete, squeeze, upper, lower, \
+titlecase, normalize, symbols, symbols-invert",
                             act
                         )));
                     }
@@ -486,6 +773,58 @@ impl SemanticEditTool {
             Ok((Vec::new(), changes_made))
         }
     }
+
+    /// Collect all files to process from a glob string relative to cwd.
+    /// Plain paths (no wildcards) are resolved normally: a directory is walked,
+    /// a file is returned directly.
+    fn collect_files(
+        glob_str: &str,
+        cwd: &Path,
+        language: &str,
+        hidden: bool,
+        gitignored: bool,
+    ) -> Result<Vec<PathBuf>, ToolError> {
+        let has_wildcard = glob_str.contains(['*', '?', '[']);
+
+        if has_wildcard {
+            // Expand glob relative to cwd
+            let pattern = cwd.join(glob_str);
+            let pattern_str = pattern.to_string_lossy();
+            let paths = glob(&pattern_str)
+                .map_err(|e| ToolError::InvalidRequest(format!("Invalid glob pattern: {}", e)))?
+                .filter_map(|res| res.ok())
+                .filter(|p| p.is_file() && Self::is_valid_for_language(p, language))
+                .collect();
+            Ok(paths)
+        } else {
+            // Treat as plain path
+            let path = cwd.join(glob_str);
+            let metadata = std::fs::metadata(&path).map_err(|e| {
+                ToolError::InvalidRequest(format!("Invalid path '{}': {}", glob_str, e))
+            })?;
+
+            if metadata.is_file() {
+                if Self::is_valid_for_language(&path, language) {
+                    Ok(vec![path])
+                } else {
+                    Ok(vec![])
+                }
+            } else {
+                // Walk directory
+                let walker = WalkBuilder::new(&path)
+                    .hidden(!hidden)
+                    .git_ignore(!gitignored)
+                    .build();
+
+                let files = walker
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.into_path())
+                    .filter(|p| p.is_file() && Self::is_valid_for_language(p, language))
+                    .collect();
+                Ok(files)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -505,21 +844,46 @@ REQUIRES: language + scope (this is for semantic operations, not plain regex)
 
 EXAMPLES:
 - Find TODOs in comments: {language: "rust", scope: "comments", pattern: "TODO"}
-- Delete all docstrings: {language: "python", scope: "doc-strings", action: "delete"}  
+- Delete all docstrings: {language: "python", scope: "doc-strings", action: "delete"}
 - Rename in functions only: {language: "go", scope: "function", pattern: "oldName", replacement: "newName"}
 - Find unsafe blocks: {language: "rust", scope: "unsafe"}
+- AND two scopes (type-identifiers inside pub enums): {language: "rust", scope: ["pub-enum", "type-identifier"], pattern: "Subgenre"}
+- Named scope filter with ~: {language: "go", scope: "struct~[tT]est"} or as array: {language: "rust", scope: ["pub-enum", "type-identifier~Subgenre"]}
+- Literal string search (special chars): {language: "python", scope: "strings", pattern: "a.b[0]", literal_string: true}
+- Convert ASCII symbols to Unicode: {language: "rust", scope: "doc-comments", action: "symbols"}
+- Revert Unicode symbols to ASCII: {language: "rust", scope: "strings", action: "symbols-invert"}
 
 SCOPES BY LANGUAGE:
-Python: comments, strings, doc-strings, imports, class, function, function-calls, function-names
-Rust: comments, strings, doc-comments, uses, struct, enum, function, impl, trait, attribute, unsafe, pub-enum, type-identifier
-Go: comments, strings, imports, struct, function, interface
-TypeScript: comments, strings, imports, class, function, interface
-C: comments, strings, function, struct
-C#: comments, strings, class, function
-HCL: comments, strings, resource, variable
+Python: async-def, class, class-methods, comments, doc-strings, function,
+  function-calls, function-names, globals, identifiers, imports, lambda,
+  methods, static-methods, strings, try, types, variable-identifiers, with
+Rust: async-fn, attribute, closure, comments, const-fn, doc-comments, enum,
+  enum-variant, extern-fn, fn, identifier, impl, impl-fn, impl-trait, impl-type,
+  mod, mod-tests, priv-enum, priv-fn, priv-struct, pub-crate-enum, pub-crate-fn,
+  pub-crate-struct, pub-enum, pub-fn, pub-self-enum, pub-self-fn, pub-self-struct,
+  pub-struct, pub-super-enum, pub-super-fn, pub-super-struct, strings, struct,
+  test-fn, trait, type-def, type-identifier, unsafe, unsafe-fn, uses
+Go: comments, const, defer, expression, free-func, func, go, goto, imports,
+  init-func, interface, labeled, method, select, strings, struct, struct-tags,
+  switch, type-alias, type-def, type-params, var
+TypeScript: async-function, class, comments, const, constructor, enum, export,
+  function, imports, interface, let, method, namespace, strings, sync-function,
+  try-catch, type-alias, type-params, var, var-decl
+C: call-expression, comments, declaration, do, enum, for, function, function-decl,
+  function-def, identifier, if, includes, strings, struct, switch, type-def,
+  union, variable, while
+C#: attribute, class, comments, constructor, destructor, enum, field, function,
+  identifier, interface, property, strings, struct, usings, variable-declaration
+HCL: comments, data, data-names, data-sources, locals, module, output, provider,
+  required-providers, resource, resource-names, resource-types, strings, terraform,
+  variable, variables
 
-Walks directories recursively, respects .gitignore. Set path to limit scope.
-Transform mode modifies files in-place."#.to_string(),
+scope supports ~ for name filtering (Rust: fn/struct/enum/trait/mod; Go: func/struct/interface; HCL: required-providers):
+  e.g. "struct~Config" matches only structs named Config
+  e.g. "fn~^handle_" matches only functions whose name starts with handle_
+Multiple scopes are ANDed (intersection): each narrows the previous result.
+
+Walks directories recursively, respects .gitignore. Set glob to limit which files are processed."#.to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -529,20 +893,30 @@ Transform mode modifies files in-place."#.to_string(),
                             "enum": ["python", "rust", "go", "typescript", "c", "csharp", "hcl"]
                         },
                         "scope": {
-                            "type": "string",
-                            "description": "Tree-sitter node type to scope to. Available scopes depend on language."
+                            "oneOf": [
+                                {
+                                    "type": "string",
+                                    "description": "Single scope. Use 'name~pattern' to filter by name (e.g. 'struct~Config')."
+                                },
+                                {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Multiple scopes ANDed together (each narrows the previous). Each entry may use 'name~pattern' syntax."
+                                }
+                            ],
+                            "description": "Tree-sitter scope(s) to narrow to. String or array of strings. Multiple scopes are intersected left-to-right."
                         },
-                        "path": {
+                        "glob": {
                             "type": "string",
-                            "description": "File or directory to process. If omitted, processes entire workspace."
-                        },
-                        "scope_pattern": {
-                            "type": "string",
-                            "description": "Optional regex pattern to filter scoped items by name. Only supported for some scopes in Rust/Go (struct, enum, trait, interface)."
+                            "description": "Glob pattern for files to process (e.g. \"src/**/*.py\", \"tests/\", \"main.rs\"). If omitted, processes entire workspace."
                         },
                         "pattern": {
                             "type": "string",
-                            "description": "Regex pattern to match within the scope. In search mode, defines what to find. In transform mode, defines what to replace/transform."
+                            "description": "Pattern to match within the scope. Regex by default; set literal_string: true for exact string matching."
+                        },
+                        "literal_string": {
+                            "type": "boolean",
+                            "description": "Treat pattern as a literal string instead of regex. Useful when pattern contains special regex characters like . [ ] ( ) *. Default: false."
                         },
                         "replacement": {
                             "type": "string",
@@ -550,16 +924,16 @@ Transform mode modifies files in-place."#.to_string(),
                         },
                         "action": {
                             "type": "string",
-                            "description": "Action to perform on matched content. Specifying this enables TRANSFORM MODE. If both replacement and action are given, replacement is applied first.",
-                            "enum": ["delete", "squeeze", "upper", "lower", "titlecase", "normalize"]
+                            "description": "Action to perform on matched content. Enables TRANSFORM MODE. If both replacement and action are given, replacement is applied first.",
+                            "enum": ["delete", "squeeze", "upper", "lower", "titlecase", "normalize", "symbols", "symbols-invert"]
                         },
                         "hidden": {
                             "type": "boolean",
-                            "description": "Include hidden files and directories. Default: false"
+                            "description": "Include hidden files and directories when walking. Default: false"
                         },
                         "gitignored": {
                             "type": "boolean",
-                            "description": "Include .gitignore'd files and directories. Default: false"
+                            "description": "Include .gitignore'd files and directories when walking. Default: false"
                         }
                     },
                     "required": ["language", "scope"]
@@ -579,14 +953,33 @@ Transform mode modifies files in-place."#.to_string(),
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidRequest("language is required".to_string()))?;
 
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidRequest("scope is required".to_string()))?;
+        // Parse scope: accept string or array, each entry may use ~ syntax
+        let scopes: Vec<ScopeEntry> = match args.get("scope") {
+            Some(Value::String(s)) => vec![ScopeEntry::parse(s)],
+            Some(Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(ScopeEntry::parse)
+                .collect(),
+            _ => {
+                return Err(ToolError::InvalidRequest(
+                    "scope is required (string or array of strings)".to_string(),
+                ));
+            }
+        };
+
+        if scopes.is_empty() {
+            return Err(ToolError::InvalidRequest(
+                "scope must not be empty".to_string(),
+            ));
+        }
 
         // Extract optional parameters
-        let scope_pattern = args.get("scope_pattern").and_then(Value::as_str);
         let pattern = args.get("pattern").and_then(Value::as_str);
+        let literal_string = args
+            .get("literal_string")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let replacement = args.get("replacement").and_then(Value::as_str);
         let action = args.get("action").and_then(Value::as_str);
         let hidden = args.get("hidden").and_then(Value::as_bool).unwrap_or(false);
@@ -598,97 +991,53 @@ Transform mode modifies files in-place."#.to_string(),
         // Determine mode
         let is_search_mode = replacement.is_none() && action.is_none();
 
-        // Resolve path (default to current working directory)
-        let path = if let Some(path_str) = args.get("path").and_then(Value::as_str) {
-            context.resolve_path(path_str)?
+        // Resolve working directory
+        let cwd = context
+            .cwd()
+            .ok_or_else(|| ToolError::InvalidRequest("No working directory set".to_string()))?
+            .to_path_buf();
+
+        // Collect files to process
+        let files: Vec<PathBuf> = if let Some(glob_str) = args.get("glob").and_then(Value::as_str) {
+            Self::collect_files(glob_str, &cwd, language, hidden, gitignored)?
         } else {
-            context
-                .cwd()
-                .ok_or_else(|| {
-                    ToolError::InvalidRequest(
-                        "No working directory set and no path specified".to_string(),
-                    )
-                })?
-                .to_path_buf()
-        };
-
-        // Check if path is a file or directory
-        let metadata: std::fs::Metadata = tokio::fs::metadata(&path)
-            .await
-            .map_err(|e| ToolError::InvalidRequest(format!("Invalid path: {}", e)))?;
-
-        let mut all_matches = Vec::new();
-        let mut modified_files = Vec::new();
-        let mut files_searched = 0;
-
-        if metadata.is_file() {
-            // Process single file
-            if Self::is_valid_for_language(&path, language) {
-                files_searched += 1;
-                let (matches, modified) = Self::process_file(
-                    &path,
-                    language,
-                    scope,
-                    scope_pattern,
-                    pattern,
-                    replacement,
-                    action,
-                )
-                .await?;
-
-                all_matches.extend(matches);
-                if modified {
-                    modified_files.push(path.to_string_lossy().to_string());
-                }
-            }
-        } else {
-            // Walk directory
-            let walker = WalkBuilder::new(&path)
+            // No glob: walk cwd
+            let walker = WalkBuilder::new(&cwd)
                 .hidden(!hidden)
                 .git_ignore(!gitignored)
                 .build();
 
-            for entry in walker {
-                let entry = entry.map_err(|e| {
-                    ToolError::ProviderError(format!("Error walking directory: {}", e))
-                })?;
+            walker
+                .filter_map(|e| e.ok())
+                .map(|e| e.into_path())
+                .filter(|p| p.is_file() && Self::is_valid_for_language(p, language))
+                .collect()
+        };
 
-                let entry_path = entry.path();
+        let mut all_matches = Vec::new();
+        let mut modified_files = Vec::new();
+        let files_searched = files.len();
 
-                // Skip if not a file
-                if !entry_path.is_file() {
-                    continue;
-                }
-
-                // Skip if not valid for this language
-                if !Self::is_valid_for_language(entry_path, language) {
-                    continue;
-                }
-
-                files_searched += 1;
-
-                // Process file
-                match Self::process_file(
-                    entry_path,
-                    language,
-                    scope,
-                    scope_pattern,
-                    pattern,
-                    replacement,
-                    action,
-                )
-                .await
-                {
-                    Ok((matches, modified)) => {
-                        all_matches.extend(matches);
-                        if modified {
-                            modified_files.push(entry_path.to_string_lossy().to_string());
-                        }
+        for file_path in &files {
+            match Self::process_file(
+                file_path,
+                language,
+                &scopes,
+                pattern,
+                literal_string,
+                replacement,
+                action,
+            )
+            .await
+            {
+                Ok((matches, modified)) => {
+                    all_matches.extend(matches);
+                    if modified {
+                        modified_files.push(file_path.to_string_lossy().to_string());
                     }
-                    Err(e) => {
-                        // Log error but continue processing other files
-                        eprintln!("Error processing {}: {}", entry_path.display(), e);
-                    }
+                }
+                Err(e) => {
+                    eprintln!("Error processing {}: {}", file_path.display(), e);
                 }
             }
         }
@@ -716,7 +1065,7 @@ Transform mode modifies files in-place."#.to_string(),
             // Convert to relative paths
             for m in &mut all_matches {
                 let rel_path = Path::new(&m.file)
-                    .strip_prefix(&path)
+                    .strip_prefix(&cwd)
                     .unwrap_or(Path::new(&m.file))
                     .display()
                     .to_string();
@@ -738,7 +1087,7 @@ Transform mode modifies files in-place."#.to_string(),
                 .into_iter()
                 .map(|f| {
                     Path::new(&f)
-                        .strip_prefix(&path)
+                        .strip_prefix(&cwd)
                         .unwrap_or(Path::new(&f))
                         .display()
                         .to_string()
@@ -782,26 +1131,21 @@ def foo():
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            "path": file_path.to_str().unwrap(),
+            "glob": file_path.to_str().unwrap(),
             "language": "python",
             "scope": "comments",
             "pattern": "TODO"
         });
 
         let result = tool.call(args, &context).await.unwrap();
-
-        // Parse as generic JSON to check the serialized format
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed["mode"], "search");
         assert_eq!(parsed["total_matches"], 1);
         assert_eq!(parsed["files_searched"], 1);
 
-        // Check that results is an object with file paths as keys
         let results = parsed["results"].as_object().unwrap();
         assert_eq!(results.len(), 1);
-
-        // Get the first (and only) file's matches
         let file_matches = results.values().next().unwrap().as_str().unwrap();
         assert!(file_matches.contains("TODO"));
     }
@@ -812,7 +1156,6 @@ def foo():
         let context =
             AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
 
-        // Create multiple Python files
         let code1 = "# TODO: first\ndef foo():\n    pass\n";
         let code2 = "# TODO: second\ndef bar():\n    pass\n";
 
@@ -825,7 +1168,6 @@ def foo():
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            "path": temp_dir.path().to_str().unwrap(),
             "language": "python",
             "scope": "comments",
             "pattern": "TODO"
@@ -856,7 +1198,7 @@ def foo():
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            "path": file_path.to_str().unwrap(),
+            "glob": file_path.to_str().unwrap(),
             "language": "python",
             "scope": "comments",
             "action": "delete"
@@ -868,7 +1210,6 @@ def foo():
         assert_eq!(parsed.mode, "transform");
         assert_eq!(parsed.total_files_modified, 1);
 
-        // Verify file was actually modified
         let modified_content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert!(!modified_content.contains("This is a comment"));
         assert!(!modified_content.contains("Another comment"));
@@ -891,7 +1232,7 @@ other = 123
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            "path": file_path.to_str().unwrap(),
+            "glob": file_path.to_str().unwrap(),
             "language": "python",
             "scope": "strings",
             "pattern": "World",
@@ -904,7 +1245,6 @@ other = 123
         assert_eq!(parsed.mode, "transform");
         assert_eq!(parsed.total_files_modified, 1);
 
-        // Verify file was actually modified
         let modified_content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert!(modified_content.contains("Hello Universe"));
     }
@@ -915,7 +1255,6 @@ other = 123
         let context =
             AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
 
-        // Create Python and non-Python files
         tokio::fs::write(temp_dir.path().join("test.py"), "# TODO\n")
             .await
             .unwrap();
@@ -925,7 +1264,6 @@ other = 123
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            "path": temp_dir.path().to_str().unwrap(),
             "language": "python",
             "scope": "comments",
             "pattern": "TODO"
@@ -934,7 +1272,6 @@ other = 123
         let result = tool.call(args, &context).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-        // Should only process the .py file
         assert_eq!(parsed["files_searched"], 1);
     }
 
@@ -951,7 +1288,6 @@ other = 123
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            // No path specified - should use workspace root
             "language": "python",
             "scope": "comments",
             "pattern": "TODO"
@@ -976,20 +1312,229 @@ other = 123
 
         let tool = SemanticEditTool::new();
         let args = json!({
-            "path": file_path.to_str().unwrap(),
+            "glob": file_path.to_str().unwrap(),
             "language": "python",
-            "scope": "comments",  // No comments in this file
+            "scope": "comments",
             "action": "delete"
         });
 
-        // Should succeed but not modify anything
         let result = tool.call(args, &context).await.unwrap();
         let parsed: TransformResults = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed.total_files_modified, 0);
 
-        // Verify file wasn't modified
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, code);
+    }
+
+    #[tokio::test]
+    async fn test_glob_pattern_filters_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        // Create src/ and tests/ subdirs
+        tokio::fs::create_dir(temp_dir.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir(temp_dir.path().join("tests"))
+            .await
+            .unwrap();
+
+        tokio::fs::write(temp_dir.path().join("src/main.py"), "# TODO src\n")
+            .await
+            .unwrap();
+        tokio::fs::write(temp_dir.path().join("tests/test_main.py"), "# TODO test\n")
+            .await
+            .unwrap();
+
+        let tool = SemanticEditTool::new();
+
+        // Glob targeting only src/
+        let args = json!({
+            "language": "python",
+            "scope": "comments",
+            "pattern": "TODO",
+            "glob": "src/**/*.py"
+        });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(parsed["files_searched"], 1);
+        assert_eq!(parsed["total_matches"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_literal_string_matches_exactly() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        // "a.b" with literal_string=false would match "a<any char>b" via regex
+        // "a.b" with literal_string=true should only match the exact string "a.b"
+        let code = r#"
+x = "a.b"
+y = "axb"
+z = "a.b.c"
+"#;
+
+        let file_path = temp_dir.path().join("test.py");
+        tokio::fs::write(&file_path, code).await.unwrap();
+
+        let tool = SemanticEditTool::new();
+        let args = json!({
+            "glob": file_path.to_str().unwrap(),
+            "language": "python",
+            "scope": "strings",
+            "pattern": "a.b",
+            "literal_string": true
+        });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        // Should match "a.b" inside the two strings that contain it, not "axb"
+        let results_obj = parsed["results"].as_object().unwrap();
+        let matches_text = results_obj.values().next().unwrap().as_str().unwrap();
+        assert!(!matches_text.contains("axb"));
+    }
+
+    #[tokio::test]
+    async fn test_multi_scope_intersection() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        // Rust: search for "Subgenre" only within pub-enum bodies, not elsewhere
+        let code = r#"
+pub enum Genre {
+    Rock(Subgenre),
+    Jazz,
+}
+
+const MOST_POPULAR_SUBGENRE: Subgenre = Subgenre::Something;
+
+pub struct Musician {
+    genres: Vec<Subgenre>,
+}
+"#;
+
+        let file_path = temp_dir.path().join("test.rs");
+        tokio::fs::write(&file_path, code).await.unwrap();
+
+        let tool = SemanticEditTool::new();
+        let args = json!({
+            "glob": file_path.to_str().unwrap(),
+            "language": "rust",
+            "scope": ["pub-enum", "type-identifier"],
+            "pattern": "Subgenre"
+        });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        // Should only find Subgenre inside the pub enum, not in the const or struct
+        assert_eq!(parsed["mode"], "search");
+        let total = parsed["total_matches"].as_u64().unwrap();
+        assert!(total >= 1, "expected at least one match inside pub-enum");
+    }
+
+    #[tokio::test]
+    async fn test_tilde_scope_pattern() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let code = r#"
+pub struct Config {
+    pub value: u32,
+}
+
+pub struct Handler {
+    pub name: String,
+}
+"#;
+
+        let file_path = temp_dir.path().join("test.rs");
+        tokio::fs::write(&file_path, code).await.unwrap();
+
+        let tool = SemanticEditTool::new();
+        // Only match structs named "Config"
+        let args = json!({
+            "glob": file_path.to_str().unwrap(),
+            "language": "rust",
+            "scope": "struct~Config"
+        });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(parsed["mode"], "search");
+        // Should only surface Config struct content, not Handler
+        if let Some(results) = parsed["results"].as_object()
+            && let Some(matches) = results.values().next().and_then(|v| v.as_str())
+        {
+            assert!(matches.contains("Config") || matches.contains("value"));
+            assert!(!matches.contains("Handler") && !matches.contains("name: String"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_symbols_action() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let code = "x = \"a != b\"\n";
+        let file_path = temp_dir.path().join("test.py");
+        tokio::fs::write(&file_path, code).await.unwrap();
+
+        let tool = SemanticEditTool::new();
+        let args = json!({
+            "glob": file_path.to_str().unwrap(),
+            "language": "python",
+            "scope": "strings",
+            "action": "symbols"
+        });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let parsed: TransformResults = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.mode, "transform");
+
+        let modified = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert!(
+            modified.contains('≠'),
+            "expected != to become ≠, got: {modified}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_symbols_invert_action() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let code = "x = \"a ≠ b\"\n";
+        let file_path = temp_dir.path().join("test.py");
+        tokio::fs::write(&file_path, code).await.unwrap();
+
+        let tool = SemanticEditTool::new();
+        let args = json!({
+            "glob": file_path.to_str().unwrap(),
+            "language": "python",
+            "scope": "strings",
+            "action": "symbols-invert"
+        });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let parsed: TransformResults = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.mode, "transform");
+
+        let modified = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert!(
+            modified.contains("!="),
+            "expected ≠ to become !=, got: {modified}"
+        );
     }
 }

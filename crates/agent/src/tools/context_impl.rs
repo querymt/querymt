@@ -6,6 +6,7 @@ use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::elicitation::{ElicitationAction, ElicitationResponse};
 use crate::tools::context::{ToolContext, ToolError};
@@ -25,6 +26,7 @@ pub struct AgentToolContext {
     cwd: Option<PathBuf>,
     agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry>>,
     elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
+    cancellation_token: CancellationToken,
 }
 
 impl AgentToolContext {
@@ -39,7 +41,14 @@ impl AgentToolContext {
             cwd,
             agent_registry,
             elicitation_tx,
+            cancellation_token: CancellationToken::new(),
         }
+    }
+
+    /// Create a context with an explicit cancellation token.
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = token;
+        self
     }
 
     /// Create a basic context for testing or simple operations
@@ -182,6 +191,10 @@ impl ToolContext for AgentToolContext {
             <dyn ToolContext>::ask_question(self, question_id, question, header, options, multiple)
                 .await
         }
+    }
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
     }
 
     fn as_any(&self) -> &dyn Any {

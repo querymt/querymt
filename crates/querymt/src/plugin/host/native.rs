@@ -24,6 +24,11 @@ impl LLMProviderFactory for NativeFactoryWrapper {
     fn name(&self) -> &str {
         self.factory_impl.name()
     }
+
+    fn supports_custom_models(&self) -> bool {
+        self.factory_impl.supports_custom_models()
+    }
+
     fn config_schema(&self) -> String {
         self.factory_impl.config_schema()
     }

@@ -17,7 +17,7 @@ async fn test_composite_driver_empty_passes_through() {
     let context = test_context("sess-1", 0);
     let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.run_turn_start(state).await.unwrap();
+    let result = composite.run_turn_start(state, None).await.unwrap();
 
     assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 }
@@ -29,7 +29,7 @@ async fn test_composite_driver_single_driver() {
     let context = test_context("sess-1", 0);
     let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.run_turn_start(state).await.unwrap();
+    let result = composite.run_turn_start(state, None).await.unwrap();
 
     assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 }
@@ -48,7 +48,7 @@ async fn test_composite_driver_chain_order() {
     let context = test_context("sess-1", 0);
     let state = ExecutionState::BeforeLlmCall { context };
 
-    composite.run_turn_start(state).await.unwrap();
+    composite.run_turn_start(state, None).await.unwrap();
 
     assert_eq!(counter1.count.load(Ordering::SeqCst), 1);
     assert_eq!(counter2.count.load(Ordering::SeqCst), 1);
@@ -71,7 +71,7 @@ async fn test_composite_driver_stopped_halts() {
     let context = test_context("sess-1", 0);
     let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.run_turn_start(state).await.unwrap();
+    let result = composite.run_turn_start(state, None).await.unwrap();
 
     assert!(matches!(result, ExecutionState::Stopped { .. }));
     assert_eq!(counter.count.load(Ordering::SeqCst), 0);
@@ -88,7 +88,7 @@ async fn test_composite_driver_complete_halts() {
     let context = test_context("sess-1", 0);
     let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.run_turn_start(state).await.unwrap();
+    let result = composite.run_turn_start(state, None).await.unwrap();
 
     assert!(matches!(result, ExecutionState::Complete));
     assert_eq!(counter.count.load(Ordering::SeqCst), 0);
@@ -105,7 +105,7 @@ async fn test_composite_driver_cancelled_halts() {
     let context = test_context("sess-1", 0);
     let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.run_turn_start(state).await.unwrap();
+    let result = composite.run_turn_start(state, None).await.unwrap();
 
     assert!(matches!(result, ExecutionState::Cancelled));
     assert_eq!(counter.count.load(Ordering::SeqCst), 0);
@@ -137,7 +137,7 @@ async fn test_composite_driver_error_propagates() {
     let context = test_context("sess-1", 0);
     let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = composite.run_turn_start(state).await;
+    let result = composite.run_turn_start(state, None).await;
 
     assert!(result.is_err());
 }
@@ -161,7 +161,7 @@ async fn test_max_steps_at_limit_stops() {
     let context = test_context("sess-1", 5);
     let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = middleware.on_step_start(state).await.unwrap();
+    let result = middleware.on_step_start(state, None).await.unwrap();
 
     assert!(matches!(
         result,
@@ -178,7 +178,7 @@ async fn test_max_steps_below_limit_continues() {
     let context = test_context("sess-1", 3);
     let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = middleware.on_step_start(state).await.unwrap();
+    let result = middleware.on_step_start(state, None).await.unwrap();
 
     assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 }
@@ -192,11 +192,11 @@ async fn test_max_steps_ignores_other_states() {
         context: context.clone(),
         tools: Arc::from([]),
     };
-    let result = middleware.on_step_start(state).await.unwrap();
+    let result = middleware.on_step_start(state, None).await.unwrap();
     assert!(matches!(result, ExecutionState::CallLlm { .. }));
 
     let state = ExecutionState::Complete;
-    let result = middleware.on_step_start(state).await.unwrap();
+    let result = middleware.on_step_start(state, None).await.unwrap();
     assert!(matches!(result, ExecutionState::Complete));
 }
 
@@ -207,13 +207,13 @@ async fn test_turn_limit_middleware() {
     // With 2 user messages, should continue (2 < 3)
     let context = test_context_with_user_messages("sess-1", 2);
     let state = ExecutionState::BeforeLlmCall { context };
-    let result = middleware.on_step_start(state).await.unwrap();
+    let result = middleware.on_step_start(state, None).await.unwrap();
     assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 
     // With 3 user messages, should stop (3 >= 3)
     let context = test_context_with_user_messages("sess-1", 3);
     let state = ExecutionState::BeforeLlmCall { context };
-    let result = middleware.on_step_start(state).await.unwrap();
+    let result = middleware.on_step_start(state, None).await.unwrap();
     assert!(matches!(result, ExecutionState::Stopped { .. }));
 }
 
@@ -236,7 +236,7 @@ async fn test_price_limit_over_budget() {
     ));
     let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = middleware.on_step_start(state).await.unwrap();
+    let result = middleware.on_step_start(state, None).await.unwrap();
 
     assert!(matches!(
         result,
@@ -266,7 +266,7 @@ async fn test_price_limit_under_budget() {
     ));
     let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = middleware.on_step_start(state).await.unwrap();
+    let result = middleware.on_step_start(state, None).await.unwrap();
 
     assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 }
@@ -292,7 +292,7 @@ async fn test_price_limit_missing_config_passes_through() {
     ));
     let state = ExecutionState::BeforeLlmCall { context };
 
-    let result = middleware.on_step_start(state).await.unwrap();
+    let result = middleware.on_step_start(state, None).await.unwrap();
 
     assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 }
@@ -307,12 +307,12 @@ async fn test_limits_middleware_combined() {
 
     let context = test_context("sess-1", 2);
     let state = ExecutionState::BeforeLlmCall { context };
-    let result = middleware.on_step_start(state).await.unwrap();
+    let result = middleware.on_step_start(state, None).await.unwrap();
     assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
 
     let context = test_context("sess-1", 10);
     let state = ExecutionState::BeforeLlmCall { context };
-    let result = middleware.on_step_start(state).await.unwrap();
+    let result = middleware.on_step_start(state, None).await.unwrap();
     assert!(matches!(result, ExecutionState::Stopped { .. }));
 }
 

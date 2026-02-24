@@ -4,6 +4,7 @@ use http::{
     Method, Request, Response,
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
+use log::debug;
 use querymt::{
     FunctionCall, ToolCall, Usage,
     chat::{
@@ -209,6 +210,7 @@ struct CodexOutput {
 struct CodexOutputContent {
     #[serde(rename = "type")]
     content_type: String,
+    #[serde(default, alias = "reasoning", alias = "reasoning_content")]
     text: Option<String>,
     tool_calls: Vec<ToolCall>,
 }
@@ -291,6 +293,31 @@ impl ChatResponse for CodexChatResponse {
             None
         } else {
             Some(pieces.join(""))
+        }
+    }
+
+    fn thinking(&self) -> Option<String> {
+        let mut thoughts = Vec::new();
+        for output in &self.output {
+            if output.output_type != "message" {
+                continue;
+            }
+            if let Some(content) = &output.content {
+                for item in content {
+                    if (item.content_type == "reasoning"
+                        || item.content_type == "reasoning_text"
+                        || item.content_type == "thinking")
+                        && let Some(text) = &item.text
+                    {
+                        thoughts.push(text.clone());
+                    }
+                }
+            }
+        }
+        if thoughts.is_empty() {
+            None
+        } else {
+            Some(thoughts.join(""))
         }
     }
 
@@ -517,10 +544,40 @@ pub fn codex_parse_stream_chunk_with_state(
             Err(_) => continue,
         };
 
+        if event.kind.contains("reasoning") || event.kind.contains("thinking") {
+            debug!(
+                "codex stream: received reasoning event kind={} has_delta={} output_index={:?} item_id={:?}",
+                event.kind,
+                event.delta.as_ref().map(|d| !d.is_empty()).unwrap_or(false),
+                event.output_index,
+                event.item_id
+            );
+        }
+
         match event.kind.as_str() {
             "response.output_text.delta" => {
                 if let Some(delta) = event.delta {
+                    debug!(
+                        "codex stream: emitting text delta len={} output_index={:?}",
+                        delta.len(),
+                        event.output_index
+                    );
                     results.push(StreamChunk::Text(delta));
+                }
+            }
+            // Codex reasoning-capable models stream thought deltas with reasoning event types.
+            "response.reasoning.delta"
+            | "response.reasoning_text.delta"
+            | "response.output_reasoning.delta" => {
+                if let Some(delta) = event.delta {
+                    debug!(
+                        "codex stream: emitting thinking delta kind={} len={} output_index={:?} item_id={:?}",
+                        event.kind,
+                        delta.len(),
+                        event.output_index,
+                        event.item_id
+                    );
+                    results.push(StreamChunk::Thinking(delta));
                 }
             }
             "response.output_item.added" | "response.output_item.done" => {
@@ -554,6 +611,7 @@ pub fn codex_parse_stream_chunk_with_state(
                 );
             }
             "response.completed" => {
+                debug!("codex stream: response.completed received");
                 if let Some(response) = event.response {
                     emit_tool_calls_from_response(&response, &mut results, tool_state_buffer);
                     if let Some(usage_value) = response.get("usage")
@@ -913,4 +971,58 @@ fn resolve_instructions<'a>(
     };
 
     Ok(instructions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CodexChatResponse, CodexToolUseState, codex_parse_stream_chunk_with_state};
+    use querymt::chat::{ChatResponse, StreamChunk};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn codex_chat_response_exposes_reasoning_as_thinking() {
+        let body = br#"{
+            "output": [{
+                "type": "message",
+                "content": [
+                    {"type": "reasoning", "text": "think 1", "tool_calls": []},
+                    {"type": "reasoning_text", "text": " + think 2", "tool_calls": []},
+                    {"type": "output_text", "text": "answer", "tool_calls": []}
+                ]
+            }]
+        }"#;
+
+        let response: CodexChatResponse = serde_json::from_slice(body).unwrap();
+        assert_eq!(response.text().as_deref(), Some("answer"));
+        assert_eq!(response.thinking().as_deref(), Some("think 1 + think 2"));
+    }
+
+    #[test]
+    fn codex_streaming_emits_thinking_deltas() {
+        let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::new()));
+        let chunk = br#"data: {"type":"response.reasoning.delta","delta":"thought "}
+
+data: {"type":"response.output_text.delta","delta":"answer"}
+
+data: {"type":"response.reasoning_text.delta","delta":"continued"}
+
+"#;
+
+        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
+        assert_eq!(events.len(), 3);
+
+        match &events[0] {
+            StreamChunk::Thinking(text) => assert_eq!(text, "thought "),
+            other => panic!("expected thinking chunk, got {other:?}"),
+        }
+        match &events[1] {
+            StreamChunk::Text(text) => assert_eq!(text, "answer"),
+            other => panic!("expected text chunk, got {other:?}"),
+        }
+        match &events[2] {
+            StreamChunk::Thinking(text) => assert_eq!(text, "continued"),
+            other => panic!("expected thinking chunk, got {other:?}"),
+        }
+    }
 }

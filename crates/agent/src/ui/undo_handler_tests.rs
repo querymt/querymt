@@ -3,9 +3,8 @@
 //! These tests validate the complete flow from UI handler through to file restoration.
 //! They simulate what happens when a user clicks "undo" in the dashboard.
 
-use crate::agent::builder::AgentBuilderExt;
-use crate::agent::core::{QueryMTAgent, SnapshotPolicy};
-use crate::delegation::{AgentInfo, DefaultAgentRegistry};
+use crate::agent::agent_config_builder::AgentConfigBuilder;
+use crate::agent::core::{SessionRuntime, SnapshotPolicy};
 use crate::elicitation::ElicitationAction;
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::backend::StorageBackend;
@@ -13,8 +12,11 @@ use crate::session::domain::ForkOrigin;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::snapshot::backend::SnapshotBackend;
 use crate::snapshot::git::GitSnapshotBackend;
-use crate::test_utils::empty_plugin_registry;
-use crate::ui::handlers::{handle_elicitation_response, handle_undo};
+use crate::test_utils::{DelegateTestFixture, TestServerState, empty_plugin_registry};
+use crate::ui::handlers::{
+    handle_elicitation_response, handle_load_session, handle_ui_message, handle_undo,
+};
+use crate::ui::messages::UiClientMessage;
 use anyhow::Result;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
@@ -23,7 +25,31 @@ use std::fs;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
+use tokio::time::Duration;
 use uuid::Uuid;
+
+/// Build a default `ServerState` from an agent handle and storage backend.
+fn test_server_state(
+    handle: &Arc<crate::agent::AgentHandle>,
+    storage: &dyn StorageBackend,
+) -> super::ServerState {
+    super::ServerState {
+        agent: handle.clone(),
+        view_store: storage.view_store().expect("view store"),
+        session_store: storage.session_store(),
+        default_cwd: None,
+        event_sources: vec![],
+        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
+            crate::index::WorkspaceIndexManagerConfig::default(),
+        ),
+        model_cache: moka::future::Cache::new(100),
+        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
+    }
+}
 
 /// Helper to capture messages sent by the handler
 async fn collect_message(rx: &mut mpsc::Receiver<String>) -> Option<Value> {
@@ -47,13 +73,17 @@ async fn test_undo_handler_single_agent() -> Result<()> {
         snapshot_base.path().to_path_buf(),
     ));
 
-    let agent = QueryMTAgent::new(
+    let builder = AgentConfigBuilder::new(
         Arc::new(registry),
         storage.session_store(),
+        storage.event_journal(),
         LLMParams::new().provider("mock").model("mock"),
     )
     .with_snapshot_policy(SnapshotPolicy::Diff)
     .with_snapshot_backend(snapshot_backend.clone());
+
+    let config = Arc::new(builder.build());
+    let handle = Arc::new(crate::agent::AgentHandle::from_config(config.clone()));
 
     // Create session with cwd
     let session = storage
@@ -62,22 +92,22 @@ async fn test_undo_handler_single_agent() -> Result<()> {
         .await?;
     let session_id = session.public_id.clone();
 
-    // Create SessionRuntime for undo to work
+    // Spawn a SessionActor for undo to work (routes through kameo)
     {
-        let runtime = Arc::new(crate::agent::core::SessionRuntime {
-            cwd: Some(worktree.path().to_path_buf()),
-            _mcp_services: std::collections::HashMap::new(),
-            mcp_tools: std::collections::HashMap::new(),
-            mcp_tool_defs: vec![],
-            permission_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            current_tools_hash: std::sync::Mutex::new(None),
-            function_index: Arc::new(tokio::sync::OnceCell::new()),
-            turn_snapshot: std::sync::Mutex::new(None),
-            turn_diffs: std::sync::Mutex::new(Default::default()),
-            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
-        let mut runtimes = agent.session_runtime.lock().await;
-        runtimes.insert(session_id.clone(), runtime);
+        let runtime = SessionRuntime::new(
+            Some(worktree.path().to_path_buf()),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            vec![],
+        );
+        let actor = crate::agent::session_actor::SessionActor::new(
+            config.clone(),
+            session_id.clone(),
+            runtime,
+        );
+        let actor_ref = kameo::actor::Spawn::spawn(actor);
+        let mut registry = handle.registry.lock().await;
+        registry.insert(session_id.clone(), actor_ref);
     }
 
     // Add user message
@@ -155,23 +185,9 @@ async fn test_undo_handler_single_agent() -> Result<()> {
     );
 
     // Create UI server state
-    let state = super::ServerState {
-        agent: Arc::new(agent),
-        view_store: storage.clone(),
-        default_cwd: None,
-        event_sources: vec![],
-        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        workspace_manager: Arc::new(crate::index::WorkspaceIndexManager::new(
-            crate::index::WorkspaceIndexManagerConfig::default(),
-        )),
-        model_cache: moka::future::Cache::new(100),
-        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
-    };
+    let state = test_server_state(&handle, &*storage);
 
-    // Setup connection state
+    // Setup connection with session mapping
     {
         let mut connections = state.connections.lock().await;
         connections.insert(
@@ -183,7 +199,9 @@ async fn test_undo_handler_single_agent() -> Result<()> {
                     .into_iter()
                     .collect(),
                 subscribed_sessions: std::collections::HashSet::new(),
+                session_cursors: std::collections::HashMap::new(),
                 current_workspace_root: None,
+                file_index_forwarder: None,
             },
         );
     }
@@ -227,6 +245,44 @@ async fn test_undo_handler_single_agent() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_send_state_concurrent_calls_complete() -> Result<()> {
+    let f = TestServerState::new().await;
+    let (tx, mut rx) = f.add_connection("conn-1").await;
+    let state = f.state;
+    let first = tokio::spawn({
+        let state = state.clone();
+        let tx = tx.clone();
+        async move { super::connection::send_state(&state, "conn-1", &tx).await }
+    });
+    let second = tokio::spawn({
+        let state = state.clone();
+        let tx = tx.clone();
+        async move { super::connection::send_state(&state, "conn-1", &tx).await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let _ = tokio::join!(first, second);
+    })
+    .await
+    .expect("concurrent send_state calls should not block");
+
+    let mut state_messages = 0;
+    for _ in 0..2 {
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("expected a state message")
+            .expect("state sender dropped unexpectedly");
+        let json: serde_json::Value = serde_json::from_str(&msg)?;
+        if json["type"] == "state" {
+            state_messages += 1;
+        }
+    }
+    assert_eq!(state_messages, 2, "expected two state messages");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_undo_handler_cross_session() -> Result<()> {
     // Setup
     let worktree = TempDir::new()?;
@@ -239,13 +295,17 @@ async fn test_undo_handler_cross_session() -> Result<()> {
         snapshot_base.path().to_path_buf(),
     ));
 
-    let agent = QueryMTAgent::new(
+    let builder = AgentConfigBuilder::new(
         Arc::new(registry),
         storage.session_store(),
+        storage.event_journal(),
         LLMParams::new().provider("mock").model("mock"),
     )
     .with_snapshot_policy(SnapshotPolicy::Diff)
     .with_snapshot_backend(snapshot_backend.clone());
+
+    let config = Arc::new(builder.build());
+    let handle = Arc::new(crate::agent::AgentHandle::from_config(config.clone()));
 
     // Create parent and child sessions
     let parent = storage
@@ -264,23 +324,29 @@ async fn test_undo_handler_cross_session() -> Result<()> {
         .await?;
     let child_id = child.public_id.clone();
 
-    // Create SessionRuntime for both parent and child
+    // Spawn SessionActors for undo to work (routes through kameo)
     {
-        let runtime = Arc::new(crate::agent::core::SessionRuntime {
-            cwd: Some(worktree.path().to_path_buf()),
-            _mcp_services: std::collections::HashMap::new(),
-            mcp_tools: std::collections::HashMap::new(),
-            mcp_tool_defs: vec![],
-            permission_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            current_tools_hash: std::sync::Mutex::new(None),
-            function_index: Arc::new(tokio::sync::OnceCell::new()),
-            turn_snapshot: std::sync::Mutex::new(None),
-            turn_diffs: std::sync::Mutex::new(Default::default()),
-            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
-        let mut runtimes = agent.session_runtime.lock().await;
-        runtimes.insert(parent_id.clone(), runtime.clone());
-        runtimes.insert(child_id.clone(), runtime);
+        let runtime = SessionRuntime::new(
+            Some(worktree.path().to_path_buf()),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            vec![],
+        );
+        let mut registry = handle.registry.lock().await;
+
+        let parent_actor = crate::agent::session_actor::SessionActor::new(
+            config.clone(),
+            parent_id.clone(),
+            runtime.clone(),
+        );
+        registry.insert(parent_id.clone(), kameo::actor::Spawn::spawn(parent_actor));
+
+        let child_actor = crate::agent::session_actor::SessionActor::new(
+            config.clone(),
+            child_id.clone(),
+            runtime,
+        );
+        registry.insert(child_id.clone(), kameo::actor::Spawn::spawn(child_actor));
     }
 
     // Add user message in parent
@@ -360,21 +426,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
     );
 
     // Create UI server state
-    let state = super::ServerState {
-        agent: Arc::new(agent),
-        view_store: storage.clone(),
-        default_cwd: None,
-        event_sources: vec![],
-        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        workspace_manager: Arc::new(crate::index::WorkspaceIndexManager::new(
-            crate::index::WorkspaceIndexManagerConfig::default(),
-        )),
-        model_cache: moka::future::Cache::new(100),
-        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
-    };
+    let state = test_server_state(&handle, &*storage);
 
     // Setup connection for PARENT session
     {
@@ -388,7 +440,9 @@ async fn test_undo_handler_cross_session() -> Result<()> {
                     .into_iter()
                     .collect(),
                 subscribed_sessions: std::collections::HashSet::new(),
+                session_cursors: std::collections::HashMap::new(),
                 current_workspace_root: None,
+                file_index_forwarder: None,
             },
         );
     }
@@ -433,57 +487,133 @@ async fn test_undo_handler_cross_session() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_elicitation_response_routes_to_delegate_pending_map() -> Result<()> {
-    let (planner_registry, _planner_cfg_dir) = empty_plugin_registry()?;
-    let planner_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
-    let planner = QueryMTAgent::new(
-        Arc::new(planner_registry),
-        planner_storage.session_store(),
-        LLMParams::new().provider("mock").model("mock"),
-    );
+async fn test_load_session_hydrates_runtime_actor() -> Result<()> {
+    let f = TestServerState::new().await;
+    let session_id = f.agent.create_session().await;
 
-    let (delegate_registry, _delegate_cfg_dir) = empty_plugin_registry()?;
-    let delegate_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
-    let delegate = Arc::new(QueryMTAgent::new(
-        Arc::new(delegate_registry),
-        delegate_storage.session_store(),
-        LLMParams::new().provider("mock").model("mock"),
-    ));
+    let (tx, _rx) = f.add_connection("conn-load").await;
 
-    let mut registry = DefaultAgentRegistry::new();
-    registry.register(
-        AgentInfo {
-            id: "coder".to_string(),
-            name: "Coder".to_string(),
-            description: "Delegate agent".to_string(),
-            capabilities: vec![],
-            required_capabilities: vec![],
-            meta: None,
-        },
-        delegate.clone(),
-    );
+    {
+        let registry = f.agent.handle.registry.lock().await;
+        assert!(registry.get(&session_id).is_none());
+    }
 
-    let planner = planner.with_agent_registry(Arc::new(registry));
+    handle_load_session(&f.state, "conn-load", &session_id, &tx).await;
 
-    let state = super::ServerState {
-        agent: Arc::new(planner),
-        view_store: planner_storage,
-        default_cwd: None,
-        event_sources: vec![],
-        connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        workspace_manager: Arc::new(crate::index::WorkspaceIndexManager::new(
-            crate::index::WorkspaceIndexManagerConfig::default(),
-        )),
-        model_cache: moka::future::Cache::new(100),
-        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
+    let actor_loaded = {
+        let registry = f.agent.handle.registry.lock().await;
+        registry.get(&session_id).is_some()
     };
+    assert!(actor_loaded, "load_session should hydrate runtime actor");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_set_session_model_hydrates_persisted_session() -> Result<()> {
+    let f = TestServerState::new().await;
+    let session_id = f.agent.create_session().await;
+
+    {
+        let registry = f.agent.handle.registry.lock().await;
+        assert!(registry.get(&session_id).is_none());
+    }
+
+    let (tx, mut rx) = mpsc::channel(16);
+    handle_ui_message(
+        &f.state,
+        "conn-model",
+        &tx,
+        UiClientMessage::SetSessionModel {
+            session_id: session_id.clone(),
+            model_id: "mock/new-model".to_string(),
+            node_id: None,
+        },
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let mut errors = Vec::new();
+    while let Ok(Some(msg_str)) = tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+        let parsed: Value = serde_json::from_str(&msg_str)?;
+        if parsed["type"] == "error" {
+            errors.push(parsed["message"].as_str().unwrap_or_default().to_string());
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "set_session_model should not emit error for persisted session: {errors:?}"
+    );
+
+    let actor_loaded = {
+        let registry = f.agent.handle.registry.lock().await;
+        registry.get(&session_id).is_some()
+    };
+    assert!(actor_loaded, "set_session_model should lazy-hydrate actor");
+
+    let llm_cfg = f
+        .agent
+        .storage
+        .session_store()
+        .get_session_llm_config(&session_id)
+        .await?;
+    let llm_cfg = llm_cfg.expect("session llm config should be set");
+    assert_eq!(llm_cfg.provider, "mock");
+    assert_eq!(llm_cfg.model, "new-model");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_set_session_model_unknown_session_returns_not_found() -> Result<()> {
+    let f = TestServerState::new().await;
+
+    let missing_id = "019c0000-0000-7000-8000-000000000001".to_string();
+    let (tx, mut rx) = mpsc::channel(16);
+    handle_ui_message(
+        &f.state,
+        "conn-missing",
+        &tx,
+        UiClientMessage::SetSessionModel {
+            session_id: missing_id.clone(),
+            model_id: "mock/new-model".to_string(),
+            node_id: None,
+        },
+    )
+    .await;
+
+    let mut got_not_found = false;
+    while let Ok(Some(msg_str)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
+    {
+        let parsed: Value = serde_json::from_str(&msg_str)?;
+        if parsed["type"] == "error"
+            && parsed["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!("Session not found: {}", missing_id))
+        {
+            got_not_found = true;
+            break;
+        }
+    }
+
+    assert!(
+        got_not_found,
+        "missing session should return not found error"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_elicitation_response_routes_to_delegate_pending_map() -> Result<()> {
+    let fixture = DelegateTestFixture::new().await.unwrap();
+    let state = test_server_state(&fixture.planner, &*fixture.planner_storage);
 
     let elicitation_id = "delegate-elicitation-42".to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    delegate
+    fixture
+        .delegate
         .pending_elicitations()
         .lock()
         .await

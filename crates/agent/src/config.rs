@@ -381,6 +381,62 @@ impl Default for SnapshotBackendConfig {
 // End Snapshot Backend Configuration
 // ============================================================================
 
+// ============================================================================
+// ExecutionPolicy — groups the 5 execution-policy configs shared across
+// AgentSettings, PlannerConfig, and DelegateConfig.
+// ============================================================================
+
+/// Execution-policy configuration shared across agent, planner, and delegate
+/// config structs.
+///
+/// In TOML this appears as a `[*.execution]` nested table, e.g.:
+/// ```toml
+/// [agent.execution.tool_output]
+/// max_lines = 2000
+///
+/// [agent.execution.compaction]
+/// auto = true
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ExecutionPolicy {
+    /// Tool output truncation settings (Layer 1)
+    pub tool_output: ToolOutputConfig,
+    /// Pruning settings — runs after every turn (Layer 2)
+    pub pruning: PruningConfig,
+    /// AI compaction settings — runs on context overflow (Layer 3)
+    pub compaction: CompactionConfig,
+    /// Snapshot backend for undo/redo support
+    pub snapshot: SnapshotBackendConfig,
+    /// Rate limit retry configuration
+    pub rate_limit: RateLimitConfig,
+}
+
+/// Runtime execution policy — the 4 configs that survive to `AgentConfig`
+/// (excludes `SnapshotBackendConfig` which is consumed at build time).
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeExecutionPolicy {
+    pub tool_output: ToolOutputConfig,
+    pub pruning: PruningConfig,
+    pub compaction: CompactionConfig,
+    pub rate_limit: RateLimitConfig,
+}
+
+impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
+    fn from(ep: &ExecutionPolicy) -> Self {
+        Self {
+            tool_output: ep.tool_output.clone(),
+            pruning: ep.pruning.clone(),
+            compaction: ep.compaction.clone(),
+            rate_limit: ep.rate_limit.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// End ExecutionPolicy
+// ============================================================================
+
 /// A single part of a system prompt, either an inline string or a file reference.
 ///
 /// In TOML configs, the `system` field accepts a mixed array of strings and
@@ -454,6 +510,129 @@ async fn resolve_system_parts(
     Ok(resolved)
 }
 
+// ============================================================================
+// Mesh & Remote Agent Configuration (Phase 7)
+// ============================================================================
+
+/// A single peer that this node should connect to in the mesh.
+///
+/// In TOML:
+/// ```toml
+/// [[mesh.peers]]
+/// name = "dev-gpu"
+/// addr = "/ip4/192.168.1.100/tcp/9000"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshPeerConfig {
+    /// Human-readable label (referenced by `[[remote_agents]]`).
+    pub name: String,
+    /// libp2p multiaddr of the peer, e.g. `"/ip4/192.168.1.100/tcp/9000"`.
+    pub addr: String,
+}
+
+/// Discovery strategy for the libp2p swarm.
+///
+/// In TOML: `discovery = "mdns"` | `"kademlia"` | `"none"`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshDiscoveryConfig {
+    /// Zero-config local-network discovery (mDNS multicast).
+    #[default]
+    Mdns,
+    /// Distributed discovery using the Kademlia DHT (for cross-subnet).
+    Kademlia,
+    /// No automatic discovery — peers are added only via `[[mesh.peers]]`.
+    None,
+}
+
+fn default_mesh_listen() -> Option<String> {
+    Some("/ip4/0.0.0.0/tcp/9000".to_string())
+}
+
+/// Configuration for the kameo libp2p mesh.
+///
+/// In TOML:
+/// ```toml
+/// [mesh]
+/// enabled = true
+/// listen = "/ip4/0.0.0.0/tcp/9000"
+/// discovery = "mdns"
+///
+/// [[mesh.peers]]
+/// name = "dev-gpu"
+/// addr = "/ip4/192.168.1.100/tcp/9000"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshTomlConfig {
+    /// Whether to start the mesh swarm at startup.  Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Multiaddr to listen on.  Default: `"/ip4/0.0.0.0/tcp/9000"`.
+    #[serde(default = "default_mesh_listen")]
+    pub listen: Option<String>,
+
+    /// Peer discovery strategy.  Default: `"mdns"`.
+    #[serde(default)]
+    pub discovery: MeshDiscoveryConfig,
+
+    /// Whether `provider_node_id = None` may fall back to mesh provider discovery.
+    ///
+    /// Default: `false` (local-only unless an explicit `provider_node_id` is set).
+    #[serde(default)]
+    pub auto_fallback: bool,
+
+    /// Explicit peers to connect to at startup.
+    #[serde(default)]
+    pub peers: Vec<MeshPeerConfig>,
+}
+
+impl Default for MeshTomlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_mesh_listen(),
+            discovery: MeshDiscoveryConfig::default(),
+            auto_fallback: false,
+            peers: Vec::new(),
+        }
+    }
+}
+
+/// A remote agent that lives on another mesh node.
+///
+/// In TOML:
+/// ```toml
+/// [[remote_agents]]
+/// id = "gpu-coder"
+/// name = "GPU Coder"
+/// description = "Coder running on GPU server"
+/// peer = "dev-gpu"            # references [[mesh.peers]] name
+/// capabilities = ["shell", "filesystem", "gpu"]
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAgentConfig {
+    /// Unique agent identifier (used in delegation target).
+    pub id: String,
+    /// Human-readable display name.
+    pub name: String,
+    /// Short description shown in the planner's delegation context.
+    #[serde(default)]
+    pub description: String,
+    /// Name of the peer in `[[mesh.peers]]` that runs this agent.
+    pub peer: String,
+    /// Capability tags (e.g., `["gpu", "shell"]`).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+// ============================================================================
+// End Mesh & Remote Agent Configuration
+// ============================================================================
+
 /// Top-level config discriminator
 #[derive(Debug)]
 pub enum Config {
@@ -470,6 +649,12 @@ pub struct SingleAgentConfig {
     pub mcp: Vec<McpServerConfig>,
     #[serde(default)]
     pub middleware: Vec<MiddlewareEntry>,
+    /// Optional kameo mesh configuration (Phase 7).
+    #[serde(default)]
+    pub mesh: MeshTomlConfig,
+    /// Remote agents registered in the mesh (Phase 7).
+    #[serde(default, rename = "remote_agents")]
+    pub remote_agents: Vec<RemoteAgentConfig>,
 }
 
 /// Raw middleware entry from TOML config
@@ -510,24 +695,22 @@ pub struct AgentSettings {
     pub system: Vec<SystemPart>,
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
-    /// Tool output truncation settings (Layer 1)
+    /// Whether to treat unknown tools as mutating.
+    #[serde(default = "default_assume_mutating")]
+    pub assume_mutating: bool,
+    /// Explicit allowlist of mutating tools.
     #[serde(default)]
-    pub tool_output: ToolOutputConfig,
-    /// Pruning settings - runs after every turn (Layer 2)
+    pub mutating_tools: Vec<String>,
+    /// Execution policy (tool output, pruning, compaction, snapshot, rate limit)
     #[serde(default)]
-    pub pruning: PruningConfig,
-    /// AI compaction settings - runs on context overflow (Layer 3)
-    #[serde(default)]
-    pub compaction: CompactionConfig,
-    /// Snapshot backend for undo/redo support
-    #[serde(default)]
-    pub snapshot: SnapshotBackendConfig,
-    /// Rate limit retry configuration
-    #[serde(default)]
-    pub rate_limit: RateLimitConfig,
+    pub execution: ExecutionPolicy,
     /// Skills system configuration
     #[serde(default)]
     pub skills: SkillsConfig,
+}
+
+fn default_assume_mutating() -> bool {
+    true
 }
 
 /// Multi-agent quorum configuration
@@ -540,6 +723,32 @@ pub struct QuorumConfig {
     pub planner: PlannerConfig,
     #[serde(default)]
     pub delegates: Vec<DelegateConfig>,
+    /// Optional kameo mesh configuration (Phase 7).
+    #[serde(default)]
+    pub mesh: MeshTomlConfig,
+    /// Remote agents registered in the mesh (Phase 7).
+    #[serde(default, rename = "remote_agents")]
+    pub remote_agents: Vec<RemoteAgentConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationWaitPolicy {
+    All,
+    #[default]
+    Any,
+}
+
+fn default_delegation_wait_timeout_secs() -> u64 {
+    120
+}
+
+fn default_delegation_cancel_grace_secs() -> u64 {
+    5
+}
+
+fn default_max_parallel_delegations() -> usize {
+    5
 }
 
 /// Quorum-level settings
@@ -556,6 +765,14 @@ pub struct QuorumSettings {
     pub snapshot_policy: Option<String>,
     /// Optional: Configure delegation summary LLM for enriching context
     pub delegation_summary: Option<DelegationSummaryConfig>,
+    #[serde(default)]
+    pub delegation_wait_policy: DelegationWaitPolicy,
+    #[serde(default = "default_delegation_wait_timeout_secs")]
+    pub delegation_wait_timeout_secs: u64,
+    #[serde(default = "default_delegation_cancel_grace_secs")]
+    pub delegation_cancel_grace_secs: u64,
+    #[serde(default = "default_max_parallel_delegations")]
+    pub max_parallel_delegations: usize,
 }
 
 fn default_true() -> bool {
@@ -581,16 +798,9 @@ pub struct PlannerConfig {
     pub parameters: Option<HashMap<String, Value>>,
     #[serde(default)]
     pub middleware: Vec<MiddlewareEntry>,
+    /// Execution policy (tool output, pruning, compaction, snapshot, rate limit)
     #[serde(default)]
-    pub tool_output: ToolOutputConfig,
-    #[serde(default)]
-    pub pruning: PruningConfig,
-    #[serde(default)]
-    pub compaction: CompactionConfig,
-    #[serde(default)]
-    pub snapshot: SnapshotBackendConfig,
-    #[serde(default)]
-    pub rate_limit: RateLimitConfig,
+    pub execution: ExecutionPolicy,
 }
 
 /// Delegate agent configuration
@@ -614,16 +824,9 @@ pub struct DelegateConfig {
     pub mcp: Vec<McpServerConfig>,
     #[serde(default)]
     pub middleware: Vec<MiddlewareEntry>,
+    /// Execution policy (tool output, pruning, compaction, snapshot, rate limit)
     #[serde(default)]
-    pub tool_output: ToolOutputConfig,
-    #[serde(default)]
-    pub pruning: PruningConfig,
-    #[serde(default)]
-    pub compaction: CompactionConfig,
-    #[serde(default)]
-    pub snapshot: SnapshotBackendConfig,
-    #[serde(default)]
-    pub rate_limit: RateLimitConfig,
+    pub execution: ExecutionPolicy,
 }
 
 /// MCP server configuration
@@ -1162,6 +1365,17 @@ mod tests {
     fn test_system_absent() {
         let agent = parse_agent("");
         assert!(agent.system.is_empty());
+        assert!(agent.assume_mutating);
+        assert!(agent.mutating_tools.is_empty());
+    }
+
+    #[test]
+    fn test_mutating_tool_settings_parse() {
+        let agent = parse_agent(
+            "assume_mutating = false\nmutating_tools = [\"edit\", \"write_file\", \"shell\"]",
+        );
+        assert!(!agent.assume_mutating);
+        assert_eq!(agent.mutating_tools, vec!["edit", "write_file", "shell"]);
     }
 
     #[test]
@@ -1524,5 +1738,85 @@ system = ["You are a test agent"]
                 .to_string()
                 .contains("DEFINITELY_MISSING_VAR")
         );
+    }
+
+    // ── MCP config tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_single_agent_config_parses_mcp_section() {
+        let toml = r#"
+[agent]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+tools = ["context7.*"]
+
+[[mcp]]
+name = "context7"
+transport = "http"
+url = "https://mcp.context7.com/mcp"
+"#;
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[allow(dead_code)]
+            agent: AgentSettings,
+            #[serde(default)]
+            mcp: Vec<McpServerConfig>,
+        }
+        let parsed: Wrapper = toml::from_str(toml).expect("TOML should parse");
+        assert_eq!(parsed.mcp.len(), 1);
+        assert!(
+            matches!(&parsed.mcp[0], McpServerConfig::Http { name, url, .. } if name == "context7" && url == "https://mcp.context7.com/mcp")
+        );
+    }
+
+    #[test]
+    fn test_mcp_http_headers_parsed() {
+        let toml = r#"
+[agent]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+tools = ["context7.*"]
+
+[[mcp]]
+name = "context7"
+transport = "http"
+url = "https://mcp.context7.com/mcp"
+[mcp.headers]
+CONTEXT7_API_KEY = "my-api-key"
+"#;
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[allow(dead_code)]
+            agent: AgentSettings,
+            #[serde(default)]
+            mcp: Vec<McpServerConfig>,
+        }
+        #[allow(dead_code)]
+        let parsed: Wrapper = toml::from_str(toml).expect("TOML should parse");
+        assert_eq!(parsed.mcp.len(), 1);
+        if let McpServerConfig::Http { headers, .. } = &parsed.mcp[0] {
+            assert_eq!(
+                headers.get("CONTEXT7_API_KEY").map(String::as_str),
+                Some("my-api-key")
+            );
+        } else {
+            panic!("Expected Http server config");
+        }
+    }
+
+    #[test]
+    fn test_mcp_env_var_interpolation_uses_braces_syntax() {
+        unsafe {
+            std::env::set_var("MCP_TEST_API_KEY", "secret-key-123");
+        }
+        // ${VAR} syntax should be interpolated
+        let toml_with_braces = r#"provider = "${MCP_TEST_API_KEY}""#;
+        let result = interpolate_env_vars(toml_with_braces).unwrap();
+        assert_eq!(result, r#"provider = "secret-key-123""#);
+
+        // $VAR syntax (no braces) should NOT be interpolated — literal string
+        let toml_without_braces = r#"provider = "$MCP_TEST_API_KEY""#;
+        let result = interpolate_env_vars(toml_without_braces).unwrap();
+        assert_eq!(result, r#"provider = "$MCP_TEST_API_KEY""#);
     }
 }

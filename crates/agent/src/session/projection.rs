@@ -5,7 +5,7 @@
 //! - Redacted view (user-facing, sensitive data removed)
 //! - Summary view (quick status for UI)
 
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, AgentEventKind, DurableEvent, EventOrigin};
 use crate::session::error::SessionResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -88,21 +88,42 @@ pub enum RedactionPolicy {
     Minimal,
 }
 
-/// Event persistence and querying
+// ============================================================================
+// EventJournal — durable event persistence trait
+// ============================================================================
+
+/// Input for appending a new durable event to the journal.
+#[derive(Debug, Clone)]
+pub struct NewDurableEvent {
+    pub session_id: String,
+    pub origin: EventOrigin,
+    pub source_node: Option<String>,
+    pub kind: AgentEventKind,
+}
+
+/// Durable event journal — single source of truth for event ordering.
+///
+/// Sequence assignment is the authority of the journal implementation.
+/// Producers never set `stream_seq`; it is assigned atomically on append.
 #[async_trait]
-pub trait EventStore: Send + Sync {
-    /// Append an event to the event log
-    async fn append_event(&self, event: &AgentEvent) -> SessionResult<()>;
+pub trait EventJournal: Send + Sync {
+    /// Persist a durable event and return it with assigned `event_id` and `stream_seq`.
+    async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent>;
 
-    /// Get all events for a session
-    async fn get_session_events(&self, session_id: &str) -> SessionResult<Vec<AgentEvent>>;
-
-    /// Get events since a specific sequence number
-    async fn get_events_since(
+    /// Load the durable event stream for a session, optionally starting after a cursor.
+    async fn load_session_stream(
         &self,
         session_id: &str,
-        after_seq: u64,
-    ) -> SessionResult<Vec<AgentEvent>>;
+        after_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>>;
+
+    /// Load events across all sessions (global stream), after a given sequence.
+    async fn load_global_stream(
+        &self,
+        after_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>>;
 }
 
 /// View generation (read-only projections)
@@ -316,4 +337,232 @@ pub struct RecentModelsView {
     pub by_workspace: std::collections::HashMap<Option<String>, Vec<RecentModelEntry>>,
     #[serde(with = "time::serde::rfc3339")]
     pub generated_at: OffsetDateTime,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::OffsetDateTime;
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::now_utc()
+    }
+
+    // ── RedactionPolicy ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_redaction_policy_variants_compare() {
+        assert_eq!(RedactionPolicy::None, RedactionPolicy::None);
+        assert_ne!(RedactionPolicy::None, RedactionPolicy::Sensitive);
+        assert_ne!(RedactionPolicy::Sensitive, RedactionPolicy::Minimal);
+    }
+
+    // ── DefaultRedactor ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_default_redactor_none_policy_passes_through() {
+        let r = DefaultRedactor;
+        assert_eq!(
+            r.redact("hello world", RedactionPolicy::None),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn test_default_redactor_sensitive_redacts_keywords() {
+        let r = DefaultRedactor;
+        assert_eq!(
+            r.redact("my password is 123", RedactionPolicy::Sensitive),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            r.redact("token: abc123", RedactionPolicy::Sensitive),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            r.redact("api_key=xyz", RedactionPolicy::Sensitive),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            r.redact("secret stuff", RedactionPolicy::Sensitive),
+            "[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_default_redactor_sensitive_passes_non_sensitive() {
+        let r = DefaultRedactor;
+        let safe = "this is fine content";
+        assert_eq!(r.redact(safe, RedactionPolicy::Sensitive), safe);
+    }
+
+    #[test]
+    fn test_default_redactor_minimal_truncates_long_content() {
+        let r = DefaultRedactor;
+        let long_content = "a".repeat(200);
+        let result = r.redact(&long_content, RedactionPolicy::Minimal);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 103);
+    }
+
+    #[test]
+    fn test_default_redactor_minimal_passes_short_content() {
+        let r = DefaultRedactor;
+        let short = "short text";
+        assert_eq!(r.redact(short, RedactionPolicy::Minimal), short);
+    }
+
+    #[test]
+    fn test_default_redactor_should_include_none_policy() {
+        let r = DefaultRedactor;
+        assert!(r.should_include(FieldSensitivity::Public, RedactionPolicy::None));
+        assert!(r.should_include(FieldSensitivity::Internal, RedactionPolicy::None));
+        assert!(r.should_include(FieldSensitivity::Sensitive, RedactionPolicy::None));
+    }
+
+    #[test]
+    fn test_default_redactor_should_include_sensitive_policy() {
+        let r = DefaultRedactor;
+        assert!(r.should_include(FieldSensitivity::Public, RedactionPolicy::Sensitive));
+        assert!(r.should_include(FieldSensitivity::Internal, RedactionPolicy::Sensitive));
+        assert!(!r.should_include(FieldSensitivity::Sensitive, RedactionPolicy::Sensitive));
+    }
+
+    #[test]
+    fn test_default_redactor_should_include_minimal_policy() {
+        let r = DefaultRedactor;
+        assert!(r.should_include(FieldSensitivity::Public, RedactionPolicy::Minimal));
+        assert!(!r.should_include(FieldSensitivity::Internal, RedactionPolicy::Minimal));
+        assert!(!r.should_include(FieldSensitivity::Sensitive, RedactionPolicy::Minimal));
+    }
+
+    // ── FieldSensitivity ordering ─────────────────────────────────────────────
+
+    #[test]
+    fn test_field_sensitivity_ordering() {
+        assert!(FieldSensitivity::Public < FieldSensitivity::Internal);
+        assert!(FieldSensitivity::Internal < FieldSensitivity::Sensitive);
+        assert!(FieldSensitivity::Public < FieldSensitivity::Sensitive);
+    }
+
+    // ── View struct construction ──────────────────────────────────────────────
+    // NOTE: AuditView is intentionally not tested here.
+    // AuditView contains Vec<AgentEvent> whose serde impl chain (30+ variant enum
+    // with deeply nested domain types) overflows the rustc trait-solver (E0275)
+    // when evaluated in a lib-test compilation unit.  Coverage via integration tests.
+
+    #[test]
+    fn test_summary_view_construction() {
+        let view = SummaryView {
+            session_id: "sess-2".to_string(),
+            current_intent: Some("Build X".to_string()),
+            active_task_status: Some("active".to_string()),
+            progress_count: 5,
+            artifact_count: 2,
+            decision_count: 1,
+            last_activity: None,
+            generated_at: now(),
+        };
+        assert_eq!(view.session_id, "sess-2");
+        assert_eq!(view.progress_count, 5);
+        assert_eq!(view.artifact_count, 2);
+    }
+
+    #[test]
+    fn test_session_list_filter_default() {
+        let filter = SessionListFilter::default();
+        assert!(filter.filter.is_none());
+        assert!(filter.limit.is_none());
+        assert!(filter.offset.is_none());
+    }
+
+    #[test]
+    fn test_session_list_item_construction() {
+        let item = SessionListItem {
+            session_id: "sess-x".to_string(),
+            name: Some("My Session".to_string()),
+            cwd: Some("/home/user/project".to_string()),
+            title: None,
+            created_at: Some(now()),
+            updated_at: None,
+            parent_session_id: None,
+            fork_origin: None,
+            has_children: false,
+        };
+        assert_eq!(item.session_id, "sess-x");
+        assert!(!item.has_children);
+    }
+
+    #[test]
+    fn test_session_list_view_construction() {
+        let view = SessionListView {
+            groups: vec![],
+            total_count: 0,
+            generated_at: now(),
+        };
+        assert_eq!(view.total_count, 0);
+        assert!(view.groups.is_empty());
+    }
+
+    // ── PredicateOp serialization ─────────────────────────────────────────────
+    // NOTE: FilterExpr is a recursive type (And(Vec<FilterExpr>), Not(Box<FilterExpr>)).
+    // Calling serde_json::to_string on FilterExpr overflows the rustc trait-solver
+    // (E0275) due to infinite recursion in Serialize bound evaluation.
+    // We test construction and field access only; FilterExpr serialization is a
+    // property of the derive macro, not our logic.
+
+    #[test]
+    fn test_predicate_op_serialization() {
+        let eq_op = PredicateOp::Eq(serde_json::Value::String("test".to_string()));
+        let json = serde_json::to_string(&eq_op).unwrap();
+        assert!(json.contains("eq"));
+
+        let contains_op = PredicateOp::Contains("hello".to_string());
+        let json2 = serde_json::to_string(&contains_op).unwrap();
+        assert!(json2.contains("contains"));
+    }
+
+    #[test]
+    fn test_filter_expr_construction() {
+        // Construction only — no serde_json::to_string (see note above).
+        let expr = FilterExpr::And(vec![
+            FilterExpr::Predicate(FieldPredicate {
+                field: "status".to_string(),
+                op: PredicateOp::Eq(serde_json::json!("active")),
+            }),
+            FilterExpr::Not(Box::new(FilterExpr::Predicate(FieldPredicate {
+                field: "name".to_string(),
+                op: PredicateOp::IsNull,
+            }))),
+        ]);
+        // Verify the structure is as expected
+        if let FilterExpr::And(items) = &expr {
+            assert_eq!(items.len(), 2);
+        } else {
+            panic!("expected FilterExpr::And");
+        }
+    }
+
+    #[test]
+    fn test_redacted_view_construction() {
+        let view = RedactedView {
+            session_id: "sess-r".to_string(),
+            current_intent: Some("doing X".to_string()),
+            active_task: Some(RedactedTask {
+                id: "task-1".to_string(),
+                status: "active".to_string(),
+                expected_deliverable: Some("output.txt".to_string()),
+            }),
+            recent_progress: vec![RedactedProgress {
+                kind: "tool_call".to_string(),
+                summary: "ran shell".to_string(),
+                created_at: now(),
+            }],
+            artifacts: vec![],
+            generated_at: now(),
+        };
+        assert_eq!(view.session_id, "sess-r");
+        assert!(view.active_task.is_some());
+        assert_eq!(view.recent_progress.len(), 1);
+    }
 }

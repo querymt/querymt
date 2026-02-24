@@ -32,7 +32,6 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use super::{ExecutionState, MiddlewareDriver, Result};
 use crate::agent::core::AgentMode;
@@ -45,40 +44,38 @@ use serde::Deserialize;
 /// Stores a map of `AgentMode` → reminder string. When the agent is in a mode that
 /// has a reminder, it is injected as a user message before the LLM call.
 /// Build mode typically has no reminder (full read/write).
+///
+/// Mode is read from `ConversationContext.session_mode` (per-session).
 pub struct AgentModeMiddleware {
-    agent_mode: Arc<AtomicU8>,
     reminders: HashMap<AgentMode, String>,
 }
 
 impl AgentModeMiddleware {
     /// Create with a single plan-mode reminder (convenience constructor).
-    pub fn new(agent_mode: Arc<AtomicU8>, plan_reminder: String) -> Self {
+    pub fn new(plan_reminder: String) -> Self {
         let mut reminders = HashMap::new();
         reminders.insert(AgentMode::Plan, plan_reminder);
-        Self {
-            agent_mode,
-            reminders,
-        }
+        Self { reminders }
     }
 
     /// Create with explicit per-mode reminders.
-    pub fn with_reminders(
-        agent_mode: Arc<AtomicU8>,
-        reminders: HashMap<AgentMode, String>,
-    ) -> Self {
-        Self {
-            agent_mode,
-            reminders,
-        }
+    /// Mode is read from `ConversationContext.session_mode`.
+    pub fn with_reminders(reminders: HashMap<AgentMode, String>) -> Self {
+        Self { reminders }
     }
 }
 
 #[async_trait]
 impl MiddlewareDriver for AgentModeMiddleware {
-    async fn on_turn_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_turn_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         match state {
             ExecutionState::BeforeLlmCall { ref context } => {
-                let mode = AgentMode::from_u8(self.agent_mode.load(Ordering::Relaxed));
+                // Read mode from the per-session ConversationContext
+                let mode = context.session_mode;
 
                 if let Some(reminder) = self.reminders.get(&mode) {
                     trace!(
@@ -134,8 +131,11 @@ impl MiddlewareDriver for AgentModeMiddleware {
 /// ```
 #[derive(Debug, Deserialize)]
 struct AgentModeFactoryConfig {
-    /// Initial mode (defaults to "build")
+    /// Initial mode (defaults to "build").
+    /// Used by the builder/config layer to set `AgentConfig.default_mode`.
+    /// The factory itself only builds reminders; the mode is set per-session.
     #[serde(default = "default_mode")]
+    #[allow(dead_code)]
     default: String,
     /// Plan mode reminder (simple format, backward compat)
     #[serde(default)]
@@ -174,16 +174,13 @@ impl MiddlewareFactory for AgentModeFactory {
     fn create(
         &self,
         config: &serde_json::Value,
-        agent: &crate::agent::core::QueryMTAgent,
+        _agent_config: &crate::agent::agent_config::AgentConfig,
     ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
         let cfg: AgentModeFactoryConfig = serde_json::from_value(config.clone())?;
 
-        // Set the initial agent mode
-        let initial_mode: AgentMode = cfg
-            .default
-            .parse()
-            .map_err(|e: String| anyhow::anyhow!(e))?;
-        agent.set_agent_mode(initial_mode);
+        // Note: initial mode from config is used as the default_mode in AgentConfig.
+        // Per-session mode is set on ConversationContext by the session actor.
+        // We no longer set a global AtomicU8 here.
 
         // Build reminders map
         let mut reminders = HashMap::new();
@@ -206,10 +203,8 @@ impl MiddlewareFactory for AgentModeFactory {
             }
         }
 
-        Ok(Arc::new(AgentModeMiddleware::with_reminders(
-            agent.agent_mode_flag(),
-            reminders,
-        )))
+        // Use per-session mode path (reads from ConversationContext.session_mode)
+        Ok(Arc::new(AgentModeMiddleware::with_reminders(reminders)))
     }
 }
 
@@ -225,7 +220,7 @@ impl MiddlewareFactory for PlanModeCompatFactory {
     fn create(
         &self,
         config: &serde_json::Value,
-        agent: &crate::agent::core::QueryMTAgent,
+        _agent_config: &crate::agent::agent_config::AgentConfig,
     ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
         // Parse the old plan_mode config format
         #[derive(Debug, Deserialize)]
@@ -244,12 +239,10 @@ impl MiddlewareFactory for PlanModeCompatFactory {
 
         let cfg: LegacyConfig = serde_json::from_value(config.clone())?;
 
-        // Set initial mode based on legacy enabled flag
-        if cfg.enabled {
-            agent.set_agent_mode(AgentMode::Plan);
-        } else {
-            agent.set_agent_mode(AgentMode::Build);
-        }
+        // Note: initial mode is now set via AgentConfig.default_mode / session actor.
+        // The legacy `enabled` flag maps to the default mode being Plan vs Build,
+        // but we no longer set a global AtomicU8 here.
+        let _ = cfg.enabled; // Acknowledged but handled at agent build level
 
         let mut reminders = HashMap::new();
         reminders.insert(AgentMode::Plan, cfg.reminder);
@@ -258,10 +251,8 @@ impl MiddlewareFactory for PlanModeCompatFactory {
             cfg.review_reminder.unwrap_or_else(default_review_reminder),
         );
 
-        Ok(Arc::new(AgentModeMiddleware::with_reminders(
-            agent.agent_mode_flag(),
-            reminders,
-        )))
+        // Use per-session mode path (reads from ConversationContext.session_mode)
+        Ok(Arc::new(AgentModeMiddleware::with_reminders(reminders)))
     }
 }
 

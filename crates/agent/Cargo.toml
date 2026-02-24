@@ -1,5 +1,5 @@
 [package]
-name = "qmt-agent"
+name = "querymt-agent"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -18,16 +18,24 @@ oauth = ["querymt-utils/oauth"]
 # This mirrors the CLI's `dbus-secret-service` feature, but is wired through the agent crate.
 dbus-secret-service = ["oauth", "querymt-utils/dbus-secret-service"]
 
+# Enables kameo remote actor support for cross-machine session management.
+# Adds libp2p-based P2P networking, mDNS peer discovery, and Kademlia DHT
+# for distributed actor registry. SessionActorRef gains a Remote variant.
+remote = ["kameo/remote", "dep:libp2p"]
+
 [dependencies]
 querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
+querymt-provider-common = { path = "../provider-common" }
 querymt-utils = { path = "../querymt-utils", features = ["providers"] }
 agent-client-protocol = { version = "0.9", features = ["unstable"] }
 agent-client-protocol-schema = { version = "0.10", features = ["unstable"]}
+kameo = "0.19"
+libp2p = { version = "0.56", optional = true, default-features = false }
 async-trait.workspace = true
 anyhow = "1.0"
 thiserror = "2.0"
 log.workspace = true
-tracing = { version = "0.1", features = ["attributes"] }
+tracing = { version = "0.1", features = ["attributes", "release_max_level_debug"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1.0", features = ["full"] }
@@ -46,7 +54,9 @@ grep-regex = "0.1"
 similar = "2.7"
 strsim = "0.11"
 once_cell = "1.21"
+parking_lot = "0.12"
 moka = { version = "0.12", features = ["future"] }
+
 pathdiff = "0.2"
 patchkit = "0.2"
 gitpatch = "0.7"
@@ -82,6 +92,9 @@ similarity-core = { git = "https://github.com/querymt/similarity.git", branch = 
 similarity-rs = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
 similarity-py = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
 
+# Rust AST parsing for rich structural fingerprinting during function indexing
+syn = { version = "2", features = ["full", "visit"] }
+
 [lib]
 name = "querymt_agent"
 path = "src/lib.rs"
@@ -93,3 +106,12 @@ tempfile = "3.0"
 clap = { version = "4.5", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
+criterion = { version = "0.8", features = ["async_tokio"] }
+
+[[bench]]
+name = "agent_startup"
+harness = false
+
+[[bench]]
+name = "session_list_view"
+harness = false

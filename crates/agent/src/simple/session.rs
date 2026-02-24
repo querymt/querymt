@@ -2,7 +2,7 @@
 
 use super::callbacks::EventCallbacksState;
 use super::utils::latest_assistant_message;
-use crate::agent::core::QueryMTAgent;
+use crate::agent::AgentHandle;
 use crate::runner::ChatSession;
 use crate::send_agent::SendAgent;
 use agent_client_protocol::{ContentBlock, PromptRequest, TextContent};
@@ -13,13 +13,13 @@ use serde_json::Value;
 use std::sync::Arc;
 
 pub struct AgentSession {
-    agent: Arc<QueryMTAgent>,
+    agent: Arc<AgentHandle>,
     session_id: String,
     callbacks: Arc<EventCallbacksState>,
 }
 
 impl AgentSession {
-    pub(super) fn new(agent: Arc<QueryMTAgent>, session_id: String) -> Self {
+    pub(super) fn new(agent: Arc<AgentHandle>, session_id: String) -> Self {
         let callbacks = Arc::new(EventCallbacksState::new(Some(session_id.clone())));
         Self {
             agent,
@@ -93,6 +93,7 @@ impl AgentSession {
             .map_err(|e| anyhow!(e.to_string()))?;
         let history = self
             .agent
+            .config
             .provider
             .history_store()
             .get_history(&self.session_id)

@@ -3,6 +3,8 @@
 //! Manages WebSocket lifecycle, message send/receive loops, and forwarding
 //! agent events to connected clients.
 
+use crate::agent::core::AgentMode;
+
 use super::messages::{RoutingMode, UiClientMessage, UiServerMessage};
 use super::session::{PRIMARY_AGENT_ID, build_agent_list};
 use super::{ConnectionState, ServerState};
@@ -27,12 +29,16 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
                 active_agent_id: PRIMARY_AGENT_ID.to_string(),
                 sessions: HashMap::new(),
                 subscribed_sessions: HashSet::new(),
+                session_cursors: HashMap::new(),
                 current_workspace_root: None,
+                file_index_forwarder: None,
             },
         );
     }
 
     spawn_event_forwarders(state.clone(), conn_id.clone(), tx.clone());
+    #[cfg(feature = "remote")]
+    spawn_peer_event_watcher(state.clone(), tx.clone());
     send_state(&state, &conn_id, &tx).await;
 
     let send_task = tokio::spawn(async move {
@@ -84,7 +90,11 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
 
     {
         let mut connections = state.connections.lock().await;
-        connections.remove(&conn_id);
+        if let Some(conn) = connections.remove(&conn_id)
+            && let Some(handle) = conn.file_index_forwarder
+        {
+            handle.abort();
+        }
     }
 
     super::handlers::stop_oauth_callback_listener_for_connection(&state, &conn_id).await;
@@ -117,11 +127,45 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
     };
 
     let agents = build_agent_list(state);
-    let agent_mode = state.agent.get_agent_mode().as_str().to_string();
     let default_cwd = state
         .default_cwd
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
+
+    // Try to get mode from active session actor, fall back to default_mode
+    let agent_mode = if let Some(ref session_id) = active_session_id {
+        let session_ref = {
+            let registry = state.agent.registry.lock().await;
+            registry.get(session_id).cloned()
+        };
+
+        if let Some(session_ref) = session_ref {
+            match session_ref.get_mode().await {
+                Ok(m) => m,
+                Err(_) => state
+                    .agent
+                    .default_mode
+                    .lock()
+                    .map(|guard| *guard)
+                    .unwrap_or(AgentMode::Build),
+            }
+        } else {
+            state
+                .agent
+                .default_mode
+                .lock()
+                .map(|guard| *guard)
+                .unwrap_or(AgentMode::Build)
+        }
+    } else {
+        state
+            .agent
+            .default_mode
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or(AgentMode::Build)
+    };
+
     let _ = send_message(
         tx,
         UiServerMessage::State {
@@ -131,7 +175,7 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
             default_cwd,
             agents,
             sessions_by_agent,
-            agent_mode,
+            agent_mode: agent_mode.as_str().to_string(),
         },
     )
     .await;
@@ -145,23 +189,13 @@ pub async fn send_message(
     let message_type = message.type_name();
 
     match serde_json::to_string(&message) {
-        Ok(json) => {
-            log::debug!(
-                "send_message: sending {} (length: {})",
-                message_type,
-                json.len()
-            );
-            match tx.send(json).await {
-                Ok(_) => {
-                    log::debug!("send_message: {} sent successfully", message_type);
-                    Ok(())
-                }
-                Err(e) => {
-                    log::error!("send_message: failed to send {}: {}", message_type, e);
-                    Err(format!("Failed to send: {}", e))
-                }
+        Ok(json) => match tx.send(json).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                log::error!("send_message: failed to send {}: {}", message_type, e);
+                Err(format!("Failed to send: {}", e))
             }
-        }
+        },
         Err(err) => {
             log::error!(
                 "send_message: failed to serialize {}: {}",
@@ -188,32 +222,175 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
         let state_events = state.clone();
         tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
-                // Check if this connection is subscribed to this session
-                let is_subscribed = {
-                    let connections = state_events.connections.lock().await;
-                    connections
-                        .get(&conn_id_events)
-                        .map(|conn| conn.subscribed_sessions.contains(&event.session_id))
-                        .unwrap_or(false)
+                // Check if this connection is subscribed and if this event is newer than
+                // the replay cursor (prevents replay/live overlap duplicates).
+                // Ephemeral events (seq=0) are never cursor-filtered — they are
+                // live-only signals that were never in the replay stream.
+                let should_forward = {
+                    let mut connections = state_events.connections.lock().await;
+                    if let Some(conn) = connections.get_mut(&conn_id_events) {
+                        if !conn.subscribed_sessions.contains(event.session_id()) {
+                            false
+                        } else if event.seq() == 0 {
+                            // Ephemeral event: always forward (never in replay).
+                            true
+                        } else {
+                            let cursor = conn
+                                .session_cursors
+                                .get(event.session_id())
+                                .cloned()
+                                .unwrap_or_default();
+                            match event.origin() {
+                                crate::events::EventOrigin::Local
+                                | crate::events::EventOrigin::Unknown(_) => {
+                                    if event.seq() <= cursor.local_seq {
+                                        log::debug!(
+                                            "ui forwarder: dropping local duplicate/overlap event conn={} session={} seq={} cursor_local_seq={}",
+                                            conn_id_events,
+                                            event.session_id(),
+                                            event.seq(),
+                                            cursor.local_seq
+                                        );
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                }
+                                crate::events::EventOrigin::Remote => {
+                                    if let Some(source_node) = event.source_node() {
+                                        let source_cursor = cursor
+                                            .remote_seq_by_source
+                                            .get(source_node)
+                                            .copied()
+                                            .unwrap_or(0);
+                                        if event.seq() <= source_cursor {
+                                            log::debug!(
+                                                "ui forwarder: dropping remote duplicate/overlap event conn={} session={} source={} seq={} cursor_remote_seq={}",
+                                                conn_id_events,
+                                                event.session_id(),
+                                                source_node,
+                                                event.seq(),
+                                                source_cursor
+                                            );
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    } else {
+                                        log::warn!(
+                                            "ui forwarder: dropping remote event without source conn={} session={} seq={}",
+                                            conn_id_events,
+                                            event.session_id(),
+                                            event.seq(),
+                                        );
+                                        false
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        false
+                    }
                 };
 
-                if !is_subscribed {
+                if !should_forward {
+                    continue;
+                }
+
+                // React to WorkspaceIndexReady from a remote session: push status +
+                // fetch and push the file index so the UI gets it without polling.
+                if let crate::events::AgentEventKind::WorkspaceIndexReady { .. } = event.kind() {
+                    let session_id = event.session_id().to_owned();
+
+                    // Push WorkspaceIndexStatus { ready }
+                    let _ = send_message(
+                        &tx_events,
+                        UiServerMessage::WorkspaceIndexStatus {
+                            session_id: session_id.clone(),
+                            status: "ready".to_string(),
+                            message: None,
+                        },
+                    )
+                    .await;
+
+                    // Fetch the file index from the remote actor and push it.
+                    let actor_ref = {
+                        let registry = state_events.agent.registry.lock().await;
+                        registry.get(&session_id).cloned()
+                    };
+                    if let Some(actor_ref) = actor_ref {
+                        let cwd = {
+                            let cwds = state_events.session_cwds.lock().await;
+                            cwds.get(&session_id).cloned()
+                        };
+                        match actor_ref.get_file_index().await {
+                            Ok(resp) => {
+                                use super::mentions::filter_index_for_cwd_entries;
+                                let root = std::path::PathBuf::from(&resp.workspace_root);
+                                let files =
+                                    match cwd.as_ref().and_then(|c| c.strip_prefix(&root).ok()) {
+                                        Some(relative_cwd) => {
+                                            filter_index_for_cwd_entries(&resp.files, relative_cwd)
+                                        }
+                                        None => resp.files,
+                                    };
+                                let _ = send_message(
+                                    &tx_events,
+                                    UiServerMessage::FileIndex {
+                                        files,
+                                        generated_at: resp.generated_at,
+                                    },
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "spawn_event_forwarders: WorkspaceIndexReady for {} but \
+                                     get_file_index failed: {}",
+                                    session_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    // Don't forward the raw event to the UI — it's an internal
+                    // infrastructure event not meaningful to the frontend.
                     continue;
                 }
 
                 let agent_id = {
                     let agents = state_events.session_agents.lock().await;
                     agents
-                        .get(&event.session_id)
+                        .get(event.session_id())
                         .cloned()
                         .unwrap_or_else(|| "unknown".to_string())
                 };
+
+                if log::log_enabled!(log::Level::Trace)
+                    && matches!(
+                        event.kind(),
+                        crate::events::AgentEventKind::AssistantThinkingDelta { .. }
+                            | crate::events::AgentEventKind::AssistantContentDelta { .. }
+                            | crate::events::AgentEventKind::AssistantMessageStored { .. }
+                            | crate::events::AgentEventKind::LlmRequestStart { .. }
+                            | crate::events::AgentEventKind::LlmRequestEnd { .. }
+                    )
+                {
+                    log::trace!(
+                        "ui forwarder: conn={} session={} agent={} seq={} kind={:?}",
+                        conn_id_events,
+                        event.session_id(),
+                        agent_id,
+                        event.seq(),
+                        event.kind()
+                    );
+                }
 
                 if send_message(
                     &tx_events,
                     UiServerMessage::Event {
                         agent_id,
-                        session_id: event.session_id.clone(),
+                        session_id: event.session_id().to_owned(),
                         event: event.clone(),
                     },
                 )
@@ -222,9 +399,260 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
                 {
                     break;
                 }
+
+                {
+                    let mut connections = state_events.connections.lock().await;
+                    if let Some(conn) = connections.get_mut(&conn_id_events) {
+                        let cursor = conn
+                            .session_cursors
+                            .entry(event.session_id().to_owned())
+                            .or_default();
+                        match event.origin() {
+                            crate::events::EventOrigin::Local
+                            | crate::events::EventOrigin::Unknown(_) => {
+                                cursor.local_seq = cursor.local_seq.max(event.seq());
+                            }
+                            crate::events::EventOrigin::Remote => {
+                                if let Some(source_node) = event.source_node() {
+                                    cursor
+                                        .remote_seq_by_source
+                                        .entry(source_node.to_owned())
+                                        .and_modify(|seq| *seq = (*seq).max(event.seq()))
+                                        .or_insert(event.seq());
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
     }
+}
+
+/// Spawn a task that watches for mDNS peer discovery / expiry events and pushes
+/// an updated `remote_nodes` list to this WebSocket client whenever the mesh
+/// topology changes.
+///
+/// This replaces polling: the kameo swarm event loop emits a `PeerEvent` the
+/// instant mDNS fires, and we react immediately by re-querying the DHT and
+/// pushing the fresh node list to the client.
+#[cfg(feature = "remote")]
+pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
+    use super::messages::RemoteNodeInfo;
+    use crate::agent::remote::PeerEvent;
+
+    let Some(mesh) = state.agent.mesh() else {
+        return;
+    };
+
+    let mut rx = mesh.subscribe_peer_events();
+
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if tx.is_closed() {
+                        break;
+                    }
+
+                    // On Expired we can push the update immediately because
+                    // the node is gone and the DHT doesn't need time to settle.
+                    // On Discovered we use a retry loop: the remote node needs
+                    // time to bootstrap and register its actors in the DHT, so
+                    // we poll with exponential back-off rather than a fixed sleep.
+                    let needs_retry = match event {
+                        PeerEvent::Discovered(peer_id) => {
+                            log::debug!(
+                                "spawn_peer_event_watcher: peer discovered {peer_id}, will poll until actor is visible"
+                            );
+                            true
+                        }
+                        PeerEvent::Expired(peer_id) => {
+                            log::debug!(
+                                "spawn_peer_event_watcher: peer expired {peer_id}, refreshing remote nodes"
+                            );
+                            false
+                        }
+                    };
+
+                    if tx.is_closed() {
+                        break;
+                    }
+
+                    if needs_retry {
+                        // Exponential back-off: 500 ms, 1 s, 2 s, 4 s, 8 s.
+                        // We stop as soon as the newly discovered peer shows up
+                        // in list_remote_nodes(), giving up after ~15 s total.
+                        const DELAYS_MS: &[u64] = &[500, 1_000, 2_000, 4_000, 8_000];
+                        let mut pushed = false;
+                        for &delay_ms in DELAYS_MS {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+
+                            if tx.is_closed() {
+                                break;
+                            }
+
+                            let nodes = state.agent.list_remote_nodes().await;
+                            let msg = UiServerMessage::RemoteNodes {
+                                nodes: nodes
+                                    .iter()
+                                    .map(|n| RemoteNodeInfo {
+                                        id: n.node_id.to_string(),
+                                        label: n.hostname.clone(),
+                                        capabilities: n.capabilities.clone(),
+                                        active_sessions: n.active_sessions,
+                                    })
+                                    .collect(),
+                            };
+
+                            if send_message(&tx, msg).await.is_err() {
+                                break;
+                            }
+
+                            // Stop retrying once we can see at least one remote node
+                            // — the UI has been updated and the peer is reachable.
+                            if !nodes.is_empty() {
+                                pushed = true;
+                                break;
+                            }
+
+                            log::debug!(
+                                "spawn_peer_event_watcher: no remote nodes yet, retrying in {}ms",
+                                delay_ms * 2
+                            );
+                        }
+
+                        if !pushed {
+                            log::warn!(
+                                "spawn_peer_event_watcher: peer discovered but no remote nodes \
+                                 visible after all retries — peer may not have registered its actors yet"
+                            );
+                        }
+                    } else {
+                        // Expired: push the updated (node-removed) list immediately.
+                        let nodes = state.agent.list_remote_nodes().await;
+
+                        // Clear provider_node_id for any session that was using the
+                        // expired peer. We detect stale sessions by comparing the
+                        // remote_sessions() peer_label against the set of nodes
+                        // still visible after expiry.
+                        let available_hostnames: HashSet<&str> =
+                            nodes.iter().map(|n| n.hostname.as_str()).collect();
+                        let remote_sessions = {
+                            let registry = state.agent.registry.lock().await;
+                            registry.remote_sessions()
+                        };
+
+                        for (session_id, peer_label) in remote_sessions {
+                            if !available_hostnames.contains(peer_label.as_str()) {
+                                match state.agent.get_session_llm_config(&session_id).await {
+                                    Ok(Some(config)) => {
+                                        state.agent.emit_event(
+                                            &session_id,
+                                            crate::events::AgentEventKind::ProviderChanged {
+                                                provider: config.provider,
+                                                model: config.model,
+                                                config_id: config.id,
+                                                context_limit: None,
+                                                provider_node_id: None,
+                                            },
+                                        );
+                                        log::info!(
+                                            "spawn_peer_event_watcher: cleared provider_node_id \
+                                             for session {} (peer {} expired)",
+                                            session_id,
+                                            peer_label
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        log::debug!(
+                                            "spawn_peer_event_watcher: no LLM config for \
+                                             session {} (peer {} expired)",
+                                            session_id,
+                                            peer_label
+                                        );
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "spawn_peer_event_watcher: failed to get LLM \
+                                             config for session {} (peer {} expired): {}",
+                                            session_id,
+                                            peer_label,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        let msg = UiServerMessage::RemoteNodes {
+                            nodes: nodes
+                                .into_iter()
+                                .map(|n| RemoteNodeInfo {
+                                    id: n.node_id.to_string(),
+                                    label: n.hostname,
+                                    capabilities: n.capabilities,
+                                    active_sessions: n.active_sessions,
+                                })
+                                .collect(),
+                        };
+
+                        if send_message(&tx, msg).await.is_err() {
+                            break;
+                        }
+
+                        // Schedule a delayed re-check to catch any stale DHT
+                        // records that resolved between the immediate push and
+                        // the DHT eventually purging the expired peer.
+                        let state_delayed = state.clone();
+                        let tx_delayed = tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            if tx_delayed.is_closed() {
+                                return;
+                            }
+                            let nodes = state_delayed.agent.list_remote_nodes().await;
+                            let msg = UiServerMessage::RemoteNodes {
+                                nodes: nodes
+                                    .into_iter()
+                                    .map(|n| RemoteNodeInfo {
+                                        id: n.node_id.to_string(),
+                                        label: n.hostname,
+                                        capabilities: n.capabilities,
+                                        active_sessions: n.active_sessions,
+                                    })
+                                    .collect(),
+                            };
+                            let _ = send_message(&tx_delayed, msg).await;
+                        });
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // We missed some events — re-query immediately to catch up.
+                    log::warn!("spawn_peer_event_watcher: lagged by {n} events, re-querying");
+                    let nodes = state.agent.list_remote_nodes().await;
+                    let msg = UiServerMessage::RemoteNodes {
+                        nodes: nodes
+                            .into_iter()
+                            .map(|n| RemoteNodeInfo {
+                                id: n.node_id.to_string(),
+                                label: n.hostname,
+                                capabilities: n.capabilities,
+                                active_sessions: n.active_sessions,
+                            })
+                            .collect(),
+                    };
+                    if send_message(&tx, msg).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    // The swarm is shutting down — nothing to do.
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Subscribe to file index updates for a workspace and forward them to the WebSocket client.
@@ -238,12 +666,14 @@ pub async fn subscribe_to_file_index(
     workspace_root: std::path::PathBuf,
 ) {
     // Get the workspace and subscribe to its file index updates
-    let workspace = match state
+    let handle = match state
         .workspace_manager
-        .get_or_create(workspace_root.clone())
+        .ask(crate::index::GetOrCreate {
+            root: workspace_root.clone(),
+        })
         .await
     {
-        Ok(workspace) => workspace,
+        Ok(handle) => handle,
         Err(err) => {
             log::error!(
                 "Failed to get workspace for file index subscription: {}",
@@ -253,13 +683,116 @@ pub async fn subscribe_to_file_index(
         }
     };
 
-    let mut index_rx = workspace.file_watcher().subscribe_index();
+    // Ensure each connection has at most one active forwarder task.
+    let existing_forwarder = {
+        let mut connections = state.connections.lock().await;
+        let Some(conn) = connections.get_mut(&conn_id) else {
+            return;
+        };
 
-    // Update connection state to track which workspace we're subscribed to
+        let already_subscribed = conn.current_workspace_root.as_ref() == Some(&workspace_root)
+            && conn
+                .file_index_forwarder
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished());
+        if already_subscribed {
+            log::debug!(
+                "Connection {} is already subscribed to workspace {:?}",
+                conn_id,
+                workspace_root
+            );
+            return;
+        }
+
+        conn.current_workspace_root = Some(workspace_root.clone());
+        conn.file_index_forwarder.take()
+    };
+
+    if let Some(handle) = existing_forwarder {
+        handle.abort();
+    }
+
+    let mut index_rx = handle.file_watcher.subscribe_index();
+
+    let state_for_forward = state.clone();
+    let conn_id_for_forward = conn_id.clone();
+    let workspace_root_for_forward = workspace_root.clone();
+    let tx_for_forward = tx.clone();
+
+    // Spawn a task to forward file index updates to the client
+    let forwarder = tokio::spawn(async move {
+        while let Ok(index) = index_rx.recv().await {
+            // Get the current session's cwd to filter the index appropriately
+            let session_id = {
+                let connections = state_for_forward.connections.lock().await;
+                let conn = match connections.get(&conn_id_for_forward) {
+                    Some(conn) => conn,
+                    None => {
+                        // Connection closed, stop forwarding
+                        log::debug!(
+                            "Connection {} closed, stopping file index forwarding",
+                            conn_id_for_forward
+                        );
+                        break;
+                    }
+                };
+
+                conn.sessions.get(&conn.active_agent_id).cloned()
+            };
+
+            let session_id = match session_id {
+                Some(id) => id,
+                None => continue, // No active session, skip this update
+            };
+
+            let cwd = {
+                let cwds = state_for_forward.session_cwds.lock().await;
+                match cwds.get(&session_id).cloned() {
+                    Some(cwd) => cwd,
+                    None => continue, // No cwd for this session, skip
+                }
+            };
+
+            // Filter the index to the session's cwd
+            let relative_cwd = match cwd.strip_prefix(&workspace_root_for_forward) {
+                Ok(relative) => relative,
+                Err(_) => continue, // cwd outside workspace root, skip
+            };
+
+            let files = super::mentions::filter_index_for_cwd(&index, relative_cwd);
+
+            // Send the filtered index to the client
+            if send_message(
+                &tx_for_forward,
+                UiServerMessage::FileIndex {
+                    files,
+                    generated_at: index.generated_at,
+                },
+            )
+            .await
+            .is_err()
+            {
+                log::debug!(
+                    "Failed to send file index to connection {}, stopping forwarding",
+                    conn_id_for_forward
+                );
+                break;
+            }
+
+            log::debug!(
+                "Pushed file index update to connection {}",
+                conn_id_for_forward
+            );
+        }
+    });
+
     {
         let mut connections = state.connections.lock().await;
         if let Some(conn) = connections.get_mut(&conn_id) {
-            conn.current_workspace_root = Some(workspace_root.clone());
+            conn.file_index_forwarder = Some(forwarder);
+        } else {
+            forwarder.abort();
+            return;
         }
     }
 
@@ -269,23 +802,23 @@ pub async fn subscribe_to_file_index(
         workspace_root
     );
 
-    // IMPORTANT: Send the current index immediately to avoid subscription race condition
+    // IMPORTANT: Send the current index immediately to avoid subscription race condition.
     // When subscribing to a broadcast channel, we only receive FUTURE messages.
     // If the workspace already existed (cached), the initial index was sent before we subscribed.
     // This ensures new subscribers get the current state immediately.
-    if let Some(current_index) = workspace.file_index() {
+    if let Some(current_index) = handle.file_index() {
         // Get current session's cwd to filter the index
-        let cwd = {
+        let session_id = {
             let connections = state.connections.lock().await;
-            let conn = connections.get(&conn_id);
-            let session_id = conn.and_then(|c| c.sessions.get(&c.active_agent_id).cloned());
-
-            if let Some(session_id) = session_id {
-                let cwds = state.session_cwds.lock().await;
-                cwds.get(&session_id).cloned()
-            } else {
-                None
-            }
+            connections
+                .get(&conn_id)
+                .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
+        };
+        let cwd = if let Some(session_id) = session_id {
+            let cwds = state.session_cwds.lock().await;
+            cwds.get(&session_id).cloned()
+        } else {
+            None
         };
 
         if let Some(cwd) = cwd
@@ -313,68 +846,4 @@ pub async fn subscribe_to_file_index(
             }
         }
     }
-
-    // Spawn a task to forward file index updates to the client
-    tokio::spawn(async move {
-        while let Ok(index) = index_rx.recv().await {
-            // Get the current session's cwd to filter the index appropriately
-            let (_session_id, cwd) = {
-                let connections = state.connections.lock().await;
-                let conn = match connections.get(&conn_id) {
-                    Some(conn) => conn,
-                    None => {
-                        // Connection closed, stop forwarding
-                        log::debug!(
-                            "Connection {} closed, stopping file index forwarding",
-                            conn_id
-                        );
-                        break;
-                    }
-                };
-
-                let session_id = conn.sessions.get(&conn.active_agent_id).cloned();
-
-                let session_id = match session_id {
-                    Some(id) => id,
-                    None => continue, // No active session, skip this update
-                };
-
-                let cwds = state.session_cwds.lock().await;
-                let cwd = match cwds.get(&session_id).cloned() {
-                    Some(cwd) => cwd,
-                    None => continue, // No cwd for this session, skip
-                };
-
-                (session_id, cwd)
-            };
-
-            // Filter the index to the session's cwd
-            let relative_cwd = match cwd.strip_prefix(&workspace_root) {
-                Ok(relative) => relative,
-                Err(_) => continue, // cwd outside workspace root, skip
-            };
-
-            let files = super::mentions::filter_index_for_cwd(&index, relative_cwd);
-
-            // Send the filtered index to the client
-            if send_message(
-                &tx,
-                UiServerMessage::FileIndex {
-                    files,
-                    generated_at: index.generated_at,
-                },
-            )
-            .await
-            .is_err()
-            {
-                log::debug!(
-                    "Failed to send file index to connection {}, stopping forwarding",
-                    conn_id
-                );
-                break;
-            }
-
-            log::debug!("Pushed file index update to connection {}", conn_id);
-        }
-    });
 }

@@ -3,19 +3,17 @@ use crate::config::{DEFAULT_MAX_TOKENS, LlamaCppConfig, LlamaCppLogMode};
 use crate::context::estimate_context_memory;
 use crate::generation::{
     build_prompt, build_prompt_candidates, build_prompt_with, build_raw_prompt, generate,
-    generate_streaming,
+    generate_streaming, generate_streaming_with_thinking,
 };
 use crate::memory::MemoryEstimate;
 use crate::response::LlamaCppChatResponse;
 use crate::tools::{
-    apply_template_with_tools, generate_streaming_with_tools, generate_with_tools,
-    parse_tool_response,
+    apply_template_for_thinking, apply_template_with_tools, generate_streaming_with_tools,
+    generate_with_tools, parse_tool_response,
 };
 use async_trait::async_trait;
 use futures::Stream;
 use futures::channel::mpsc;
-use hf_hub::api::sync::ApiBuilder as SyncApiBuilder;
-use hf_hub::api::tokio::ApiBuilder as AsyncApiBuilder;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
@@ -24,6 +22,9 @@ use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, FinishReason, Tool}
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
+use querymt_provider_common::{
+    ModelRef, ModelRefError, parse_model_ref, resolve_hf_model_fast, resolve_hf_model_sync,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -35,52 +36,29 @@ pub(crate) struct LlamaCppProvider {
 }
 
 impl LlamaCppProvider {
-    /// Resolve a model path, potentially downloading from HuggingFace Hub.
+    /// Resolve a model path, potentially downloading from Hugging Face Hub.
     fn resolve_model_path(raw: &str, fast: bool) -> Result<PathBuf, LLMError> {
-        let Some(rest) = raw.strip_prefix("hf:") else {
-            return Ok(PathBuf::from(raw));
-        };
-        let mut parts = rest.splitn(2, ':');
-        let repo = parts.next().unwrap_or("").trim();
-        let file = parts.next().unwrap_or("").trim();
-        if repo.is_empty() || file.is_empty() {
-            return Err(LLMError::InvalidRequest(
-                "hf: model_path must be formatted as hf:<repo>:<file>".into(),
-            ));
-        }
-
-        // High-throughput async download when explicitly enabled and a tokio runtime is available
-        if fast {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let repo = repo.to_string();
-                let file = file.to_string();
-                let path = tokio::task::block_in_place(|| {
-                    handle.block_on(async {
-                        let api = AsyncApiBuilder::new()
-                            .with_progress(true)
-                            .high()
-                            .build()
-                            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-                        api.model(repo)
-                            .get(&file)
-                            .await
-                            .map_err(|e| LLMError::ProviderError(e.to_string()))
-                    })
-                })?;
-                return Ok(path);
+        let model_ref = parse_model_ref(raw).map_err(Self::map_model_ref_error)?;
+        match model_ref {
+            ModelRef::LocalPath(path) => Ok(path),
+            ModelRef::Hf(model) => {
+                if fast {
+                    resolve_hf_model_fast(&model).map_err(Self::map_model_ref_error)
+                } else {
+                    resolve_hf_model_sync(&model).map_err(Self::map_model_ref_error)
+                }
             }
+            ModelRef::HfRepo(repo) => Err(LLMError::InvalidRequest(format!(
+                "llama_cpp model must include a selector for Hugging Face repos: {repo}:<selector>"
+            ))),
         }
+    }
 
-        // Standard sync download (default, or fallback when no tokio runtime available)
-        let api = SyncApiBuilder::new()
-            .with_progress(true)
-            .build()
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-        let path = api
-            .model(repo.to_string())
-            .get(file)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-        Ok(path)
+    fn map_model_ref_error(err: ModelRefError) -> LLMError {
+        match err {
+            ModelRefError::Invalid(msg) => LLMError::InvalidRequest(msg),
+            ModelRefError::Download(msg) => LLMError::ProviderError(msg),
+        }
     }
 
     pub(crate) fn new(cfg: LlamaCppConfig) -> Result<Self, LLMError> {
@@ -96,8 +74,7 @@ impl LlamaCppProvider {
             LlamaCppLogMode::Tracing => send_logs_to_tracing(LogOptions::default()),
             LlamaCppLogMode::Off => backend.void_logs(),
         }
-        let model_path =
-            Self::resolve_model_path(&cfg.model_path, cfg.fast_download.unwrap_or(false))?;
+        let model_path = Self::resolve_model_path(&cfg.model, cfg.fast_download.unwrap_or(false))?;
         let model_path = Path::new(&model_path);
         if !model_path.exists() {
             return Err(LLMError::InvalidRequest(format!(
@@ -268,12 +245,45 @@ impl ChatProvider for LlamaCppProvider {
             }
         }
 
-        // Fall back to standard streaming without tools
-        let prompts = build_prompt_candidates(&self.model, &self.cfg, messages)?;
+        // No-tool streaming: try the OAI-compat path first so that
+        // `reasoning_content` deltas from thinking models are routed to
+        // `StreamChunk::Thinking` rather than being emitted raw as Text.
+        // Fall back to the plain `generate_streaming` path if the template
+        // call fails (e.g. model does not support the oaicompat API).
+        let thinking_template = apply_template_for_thinking(&self.model, &self.cfg, messages).ok();
+        let prompts = if thinking_template.is_none() {
+            build_prompt_candidates(&self.model, &self.cfg, messages)?
+        } else {
+            vec![]
+        };
         let cfg = self.cfg.clone();
         let model = Arc::clone(&self.model);
 
         thread::spawn(move || {
+            // OAI-compat thinking path
+            if let Some(template_result) = thinking_template {
+                match generate_streaming_with_thinking(
+                    &model,
+                    &cfg,
+                    &template_result,
+                    max_tokens,
+                    None,
+                    &tx,
+                ) {
+                    Ok(usage) => {
+                        let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
+                        let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Done {
+                            stop_reason: "end_turn".to_string(),
+                        }));
+                    }
+                    Err(err) => {
+                        let _ = tx.unbounded_send(Err(err));
+                    }
+                }
+                return;
+            }
+
+            // Fallback: raw token streaming (no thinking extraction)
             let mut final_usage = None;
             for (idx, prompt) in prompts.iter().enumerate() {
                 match generate_streaming(&model, &cfg, prompt, max_tokens, None, &tx) {

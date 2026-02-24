@@ -90,6 +90,14 @@ macro_rules! with_host_functions {
                 $user_data.clone(),
                 functions::qmt_yield_chunk,
             )
+            .with_function_in_namespace(
+                "extism:host/user",
+                "qmt_log",
+                [extism::PTR],
+                [],
+                $user_data.clone(),
+                functions::qmt_log,
+            )
     };
 }
 
@@ -128,6 +136,7 @@ impl ExtismFactory {
 
         let tokio_handle = tokio::runtime::Handle::current();
         let init_user_data = extism::UserData::new(functions::HostState::new(
+            "unknown".to_string(),
             Vec::<String>::new(),
             tokio_handle.clone(),
         ));
@@ -167,8 +176,11 @@ impl ExtismFactory {
             .with_allowed_hosts(allowed_hosts.clone().into_iter())
             .with_config(env_map.into_iter());
 
-        let user_data =
-            extism::UserData::new(functions::HostState::new(allowed_hosts, tokio_handle));
+        let user_data = extism::UserData::new(functions::HostState::new(
+            name.clone(),
+            allowed_hosts,
+            tokio_handle,
+        ));
         let builder = with_host_functions!(PluginBuilder::new(manifest), user_data);
 
         let plugin = Arc::new(Mutex::new(
@@ -176,6 +188,23 @@ impl ExtismFactory {
                 .build()
                 .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?,
         ));
+
+        {
+            let mut plugin_guard = plugin.lock().unwrap();
+            let max_level: usize = match log::max_level() {
+                log::LevelFilter::Off => 0,
+                log::LevelFilter::Error => 1,
+                log::LevelFilter::Warn => 2,
+                log::LevelFilter::Info => 3,
+                log::LevelFilter::Debug => 4,
+                log::LevelFilter::Trace => 5,
+            };
+            let _: () = plugin_guard
+                .call("init_logging", Json(max_level))
+                .map_err(|e| {
+                    LLMError::PluginError(format!("failed to init plugin logging: {:#}", e))
+                })?;
+        }
 
         Ok(Self {
             plugin,

@@ -50,6 +50,10 @@ impl LLMProviderFactory for MistralRSFactory {
         };
         Ok(Box::new(provider))
     }
+
+    fn supports_custom_models(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(feature = "native")]

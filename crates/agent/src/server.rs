@@ -1,7 +1,5 @@
-use crate::acp::AcpServer;
-use crate::agent::QueryMTAgent;
-use crate::session::projection::ViewStore;
 use crate::ui::UiServer;
+use crate::{acp::AcpServer, session::StorageBackend};
 use axum::{
     Router,
     http::{StatusCode, header},
@@ -17,20 +15,20 @@ use std::sync::Arc;
 struct Assets;
 
 pub struct AgentServer {
-    agent: Arc<QueryMTAgent>,
-    view_store: Arc<dyn ViewStore>,
+    agent: Arc<crate::agent::AgentHandle>,
+    storage: Arc<dyn StorageBackend>,
     default_cwd: Option<PathBuf>,
 }
 
 impl AgentServer {
     pub fn new(
-        agent: Arc<QueryMTAgent>,
-        view_store: Arc<dyn ViewStore>,
+        agent: Arc<crate::agent::AgentHandle>,
+        storage: Arc<dyn StorageBackend>,
         default_cwd: Option<PathBuf>,
     ) -> Self {
         Self {
             agent,
-            view_store,
+            storage,
             default_cwd,
         }
     }
@@ -38,7 +36,16 @@ impl AgentServer {
     pub async fn run(self, addr: &str) -> anyhow::Result<()> {
         let agent = self.agent;
         let acp_router = AcpServer::new(agent.clone()).router();
-        let ui_router = UiServer::new(agent, self.view_store, self.default_cwd).router();
+        let ui_router = UiServer::new(
+            agent.clone(),
+            self.storage
+                .view_store()
+                .expect("ViewStore is expected for UI")
+                .clone(),
+            self.storage.session_store().clone(),
+            self.default_cwd,
+        )
+        .router();
 
         let app = Router::new()
             .nest("/acp", acp_router)

@@ -257,6 +257,8 @@ struct OpenAIChatMsg {
     #[allow(dead_code)]
     role: String,
     content: Option<String>,
+    #[serde(default, alias = "reasoning", alias = "reasoning_content")]
+    thinking: Option<String>,
     tool_calls: Option<Vec<ToolCall>>,
 }
 
@@ -333,6 +335,12 @@ impl ChatResponse for OpenAIChatResponse {
         self.choices
             .first()
             .and_then(|c| c.message.tool_calls.clone())
+    }
+
+    fn thinking(&self) -> Option<String> {
+        self.choices
+            .first()
+            .and_then(|c| c.message.thinking.clone())
     }
 
     fn usage(&self) -> Option<Usage> {
@@ -1019,6 +1027,13 @@ pub struct OpenAIStreamChoice {
 pub struct OpenAIStreamDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "reasoning",
+        alias = "reasoning_content"
+    )]
+    pub thinking: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<OpenAIStreamToolCall>>,
 }
@@ -1121,6 +1136,13 @@ pub fn parse_openai_sse_chunk(
 
         // Process each choice
         for choice in &stream_chunk.choices {
+            // Handle thinking/reasoning content deltas.
+            if let Some(thinking) = &choice.delta.thinking
+                && !thinking.is_empty()
+            {
+                results.push(StreamChunk::Thinking(thinking.clone()));
+            }
+
             // Handle text content
             if let Some(content) = &choice.delta.content
                 && !content.is_empty()
@@ -1209,9 +1231,16 @@ pub fn parse_openai_sse_chunk(
 #[cfg(test)]
 mod tests {
     use http::Response;
-    use querymt::error::LLMError;
+    use querymt::{
+        chat::{ChatResponse, StreamChunk},
+        error::LLMError,
+    };
+    use std::collections::HashMap;
 
-    use super::{MultipartForm, openai_parse_list_models};
+    use super::{
+        MultipartForm, OpenAIChatResponse, OpenAIToolUseState, openai_parse_list_models,
+        parse_openai_sse_chunk,
+    };
 
     #[test]
     fn multipart_form_encodes_text_and_file_parts() {
@@ -1276,6 +1305,62 @@ mod tests {
                 assert_eq!(message, "Invalid auth token");
             }
             other => panic!("expected AuthError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_response_exposes_thinking_alias_fields() {
+        let body = br#"{
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "final",
+                    "reasoning": "step one"
+                }
+            }]
+        }"#;
+        let response: OpenAIChatResponse = serde_json::from_slice(body).unwrap();
+        assert_eq!(response.text().as_deref(), Some("final"));
+        assert_eq!(response.thinking().as_deref(), Some("step one"));
+
+        let body_with_reasoning_content = br#"{
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "final",
+                    "reasoning_content": "step two"
+                }
+            }]
+        }"#;
+        let response: OpenAIChatResponse =
+            serde_json::from_slice(body_with_reasoning_content).unwrap();
+        assert_eq!(response.thinking().as_deref(), Some("step two"));
+    }
+
+    #[test]
+    fn parse_sse_chunk_emits_thinking_and_text_deltas() {
+        let mut tool_states: HashMap<usize, OpenAIToolUseState> = HashMap::new();
+        let chunk = br#"data: {"choices":[{"index":0,"delta":{"reasoning":"thought ","content":"answer "}}]}
+
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
+
+"#;
+
+        let events = parse_openai_sse_chunk(chunk, &mut tool_states).unwrap();
+        assert_eq!(events.len(), 3);
+        match &events[0] {
+            StreamChunk::Thinking(text) => assert_eq!(text, "thought "),
+            other => panic!("expected thinking chunk, got {other:?}"),
+        }
+        match &events[1] {
+            StreamChunk::Text(text) => assert_eq!(text, "answer "),
+            other => panic!("expected text chunk, got {other:?}"),
+        }
+        match &events[2] {
+            StreamChunk::Thinking(text) => assert_eq!(text, "continued"),
+            other => panic!("expected thinking chunk, got {other:?}"),
         }
     }
 }

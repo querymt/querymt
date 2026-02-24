@@ -824,3 +824,35 @@ impl ChatMessageBuilder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::extract_thinking;
+
+    #[test]
+    fn extract_thinking_handles_multiple_blocks() {
+        let input = "start <think>reasoning 1</think> middle <think>reasoning 2</think> end";
+        let (thinking, content) = extract_thinking(input);
+
+        assert_eq!(thinking, Some("reasoning 1\n\nreasoning 2".to_string()));
+        assert_eq!(content, "start  middle  end");
+    }
+
+    #[test]
+    fn extract_thinking_handles_unclosed_block() {
+        let input = "before <think>streamed rationale still open";
+        let (thinking, content) = extract_thinking(input);
+
+        assert_eq!(thinking, Some("streamed rationale still open".to_string()));
+        assert_eq!(content, "before");
+    }
+
+    #[test]
+    fn extract_thinking_returns_original_when_no_blocks_present() {
+        let input = "plain response";
+        let (thinking, content) = extract_thinking(input);
+
+        assert_eq!(thinking, None);
+        assert_eq!(content, "plain response");
+    }
+}

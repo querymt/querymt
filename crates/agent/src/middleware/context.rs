@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use log::{debug, trace, warn};
+use parking_lot::Mutex;
 use std::sync::Arc;
 
 use super::{ExecutionState, MiddlewareDriver, Result};
@@ -12,6 +13,9 @@ use serde::Deserialize;
 #[derive(Debug, Clone)]
 pub struct ContextConfig {
     pub warn_at_percent: u32,
+    /// Percentage of the context limit at which AI compaction is triggered preemptively.
+    /// Must be greater than `warn_at_percent`. Defaults to 85.
+    pub compact_at_percent: u32,
     pub auto_compact: bool,
     /// Source for context limit - default is FromSession (dynamic)
     pub context_source: ModelInfoSource,
@@ -23,6 +27,7 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             warn_at_percent: 80,
+            compact_at_percent: 85,
             auto_compact: true,
             context_source: ModelInfoSource::FromSession,
             fallback_max_tokens: 32_000,
@@ -49,6 +54,17 @@ impl ContextConfig {
         self
     }
 
+    pub fn compact_at_percent(mut self, percent: u32) -> Self {
+        assert!(
+            self.warn_at_percent < percent,
+            "compact_at_percent ({}) must be greater than warn_at_percent ({})",
+            percent,
+            self.warn_at_percent
+        );
+        self.compact_at_percent = percent;
+        self
+    }
+
     pub fn auto_compact(mut self, enabled: bool) -> Self {
         self.auto_compact = enabled;
         self
@@ -68,8 +84,8 @@ impl ContextConfig {
 /// Middleware that handles context warnings and optional auto-compaction
 pub struct ContextMiddleware {
     config: ContextConfig,
-    warned_sessions: std::sync::Mutex<std::collections::HashSet<Arc<str>>>,
-    last_model: std::sync::Mutex<Option<(String, String)>>, // (provider, model)
+    warned_sessions: Mutex<std::collections::HashSet<Arc<str>>>,
+    last_model: Mutex<Option<(String, String)>>, // (provider, model)
 }
 
 impl ContextMiddleware {
@@ -80,8 +96,8 @@ impl ContextMiddleware {
         );
         Self {
             config,
-            warned_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
-            last_model: std::sync::Mutex::new(None),
+            warned_sessions: Mutex::new(std::collections::HashSet::new()),
+            last_model: Mutex::new(None),
         }
     }
 
@@ -109,12 +125,12 @@ impl ContextMiddleware {
 
     /// Check if provider changed and reset state if needed
     fn check_provider_changed(&self, context: &ConversationContext) {
-        let mut last = self.last_model.lock().unwrap();
+        let mut last = self.last_model.lock();
         let current = (context.provider.to_string(), context.model.to_string());
 
         if last.as_ref() != Some(&current) {
             // Provider changed - reset warned sessions
-            let mut warned = self.warned_sessions.lock().unwrap();
+            let mut warned = self.warned_sessions.lock();
             warned.clear();
             *last = Some(current.clone());
             debug!(
@@ -134,7 +150,7 @@ impl ContextMiddleware {
             return None;
         }
 
-        let mut warned = self.warned_sessions.lock().unwrap();
+        let mut warned = self.warned_sessions.lock();
         if warned.contains(session_id) {
             return None;
         }
@@ -156,7 +172,11 @@ impl ContextMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for ContextMiddleware {
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "ContextMiddleware::on_step_start entering state: {}",
             state.name()
@@ -176,15 +196,22 @@ impl MiddlewareDriver for ContextMiddleware {
 
                 let current_tokens = context.stats.context_tokens;
 
-                if self.config.auto_compact && current_tokens >= max_tokens {
+                let compact_threshold = (max_tokens as f64
+                    * (self.config.compact_at_percent.min(100) as f64 / 100.0))
+                    as usize;
+
+                if self.config.auto_compact && current_tokens >= compact_threshold {
                     debug!(
-                        "ContextMiddleware: requesting compaction, {} >= {} tokens",
-                        current_tokens, max_tokens
+                        "ContextMiddleware: requesting compaction, {} >= {} tokens ({}% of {})",
+                        current_tokens,
+                        compact_threshold,
+                        self.config.compact_at_percent,
+                        max_tokens
                     );
                     return Ok(ExecutionState::Stopped {
                         message: format!(
-                            "Context token threshold ({} / {} tokens) reached, requesting compaction",
-                            current_tokens, max_tokens
+                            "Context token threshold ({} / {} tokens, {}%) reached, requesting compaction",
+                            current_tokens, max_tokens, self.config.compact_at_percent
                         )
                         .into(),
                         stop_type: StopType::ContextThreshold,
@@ -213,9 +240,9 @@ impl MiddlewareDriver for ContextMiddleware {
 
     fn reset(&self) {
         debug!("ContextMiddleware::reset - clearing warned sessions and model cache");
-        let mut warned = self.warned_sessions.lock().unwrap();
+        let mut warned = self.warned_sessions.lock();
         warned.clear();
-        let mut last = self.last_model.lock().unwrap();
+        let mut last = self.last_model.lock();
         *last = None;
     }
 
@@ -233,6 +260,7 @@ pub struct ContextFactory;
 struct ContextFactoryConfig {
     enabled: bool,
     warn_at_percent: u32,
+    compact_at_percent: u32,
     fallback_max_tokens: usize,
 }
 
@@ -241,6 +269,7 @@ impl Default for ContextFactoryConfig {
         Self {
             enabled: true,
             warn_at_percent: 80,
+            compact_at_percent: 85,
             fallback_max_tokens: 32_000,
         }
     }
@@ -254,7 +283,7 @@ impl MiddlewareFactory for ContextFactory {
     fn create(
         &self,
         config: &serde_json::Value,
-        agent: &crate::agent::core::QueryMTAgent,
+        agent_config: &crate::agent::agent_config::AgentConfig,
     ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
         let cfg: ContextFactoryConfig = serde_json::from_value(config.clone())?;
 
@@ -262,11 +291,20 @@ impl MiddlewareFactory for ContextFactory {
             return Err(anyhow::anyhow!("Middleware disabled"));
         }
 
-        // Read auto_compact from agent's compaction_config
-        let auto_compact = agent.compaction_config.auto;
+        if cfg.warn_at_percent >= cfg.compact_at_percent {
+            return Err(anyhow::anyhow!(
+                "context middleware: warn_at_percent ({}) must be less than compact_at_percent ({})",
+                cfg.warn_at_percent,
+                cfg.compact_at_percent
+            ));
+        }
+
+        // Read auto_compact from agent config's execution policy
+        let auto_compact = agent_config.execution_policy.compaction.auto;
 
         let context_config = ContextConfig {
             warn_at_percent: cfg.warn_at_percent,
+            compact_at_percent: cfg.compact_at_percent,
             auto_compact,
             context_source: ModelInfoSource::FromSession,
             fallback_max_tokens: cfg.fallback_max_tokens,
@@ -322,6 +360,20 @@ mod tests {
             }
         }
 
+        fn with_manual_limit_compact_and_warn_percent(
+            max_tokens: usize,
+            compact_percent: u32,
+            warn_percent: u32,
+        ) -> Self {
+            Self {
+                middleware: ContextMiddleware::new(
+                    ContextConfig::with_manual_limit(max_tokens)
+                        .compact_at_percent(compact_percent)
+                        .warn_at_percent(warn_percent),
+                ),
+            }
+        }
+
         fn with_manual_limit_and_warn_percent(max_tokens: usize, warn_percent: u32) -> Self {
             Self {
                 middleware: ContextMiddleware::new(
@@ -331,7 +383,7 @@ mod tests {
         }
 
         async fn run_step(&self, state: ExecutionState) -> Result<ExecutionState> {
-            self.middleware.on_step_start(state).await
+            self.middleware.on_step_start(state, None).await
         }
     }
 
@@ -343,6 +395,7 @@ mod tests {
     fn test_context_config_default_values() {
         let config = ContextConfig::default();
         assert_eq!(config.warn_at_percent, 80);
+        assert_eq!(config.compact_at_percent, 85);
         assert!(config.auto_compact);
         assert_eq!(config.fallback_max_tokens, 32_000);
         // Verify it's FromSession
@@ -391,10 +444,12 @@ mod tests {
     fn test_context_config_builder_chaining() {
         let config = ContextConfig::default()
             .warn_at_percent(60)
+            .compact_at_percent(90)
             .auto_compact(false)
             .fallback_max_tokens(64_000);
 
         assert_eq!(config.warn_at_percent, 60);
+        assert_eq!(config.compact_at_percent, 90);
         assert!(!config.auto_compact);
         assert_eq!(config.fallback_max_tokens, 64_000);
     }
@@ -519,12 +574,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_on_step_start_at_compact_threshold_triggers_compaction() {
+        // compact_at_percent=85, limit=10000 -> threshold=8500
+        let fixture =
+            ContextMiddlewareFixture::with_manual_limit_compact_and_warn_percent(10000, 85, 70);
+        let context = test_context("test-session", 0);
+        let mut context_mut = (*context).clone();
+        // Exactly at 85% threshold
+        context_mut.stats = Arc::new(crate::middleware::AgentStats {
+            context_tokens: 8500,
+            ..Default::default()
+        });
+        let context = Arc::new(context_mut);
+
+        let state = ExecutionState::BeforeLlmCall {
+            context: context.clone(),
+        };
+
+        let result = fixture.run_step(state).await.unwrap();
+
+        assert!(
+            matches!(result, ExecutionState::Stopped { stop_type, .. }
+                                if stop_type == StopType::ContextThreshold),
+            "Should stop with ContextThreshold at compact_at_percent threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_step_start_below_compact_threshold_does_not_compact() {
+        // compact_at_percent=85, limit=10000 -> threshold=8500; tokens=8499 -> no compaction
+        let fixture =
+            ContextMiddlewareFixture::with_manual_limit_compact_and_warn_percent(10000, 85, 70);
+        let context = test_context("test-session", 0);
+        let mut context_mut = (*context).clone();
+        context_mut.stats = Arc::new(crate::middleware::AgentStats {
+            context_tokens: 8499,
+            ..Default::default()
+        });
+        let context = Arc::new(context_mut);
+
+        let state = ExecutionState::BeforeLlmCall {
+            context: context.clone(),
+        };
+
+        let result = fixture.run_step(state).await.unwrap();
+
+        assert!(
+            !matches!(result, ExecutionState::Stopped { stop_type, .. }
+                                if stop_type == StopType::ContextThreshold),
+            "Should not compact below compact_at_percent threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_step_start_warn_fires_before_compact() {
+        // warn=70%, compact=85%, limit=10000
+        // At 75% (7500 tokens): warn fires, compact does not
+        let fixture =
+            ContextMiddlewareFixture::with_manual_limit_compact_and_warn_percent(10000, 85, 70);
+        let context = test_context("test-session", 0);
+        let mut context_mut = (*context).clone();
+        context_mut.stats = Arc::new(crate::middleware::AgentStats {
+            context_tokens: 7500,
+            ..Default::default()
+        });
+        let context = Arc::new(context_mut);
+
+        let state = ExecutionState::BeforeLlmCall {
+            context: context.clone(),
+        };
+
+        let result = fixture.run_step(state).await.unwrap();
+
+        // Should inject warning, not stop for compaction
+        match result {
+            ExecutionState::BeforeLlmCall {
+                context: new_context,
+            } => {
+                assert!(
+                    new_context.messages.len() > context.messages.len(),
+                    "Should inject warning message before compact threshold"
+                );
+            }
+            ExecutionState::Stopped {
+                stop_type: StopType::ContextThreshold,
+                ..
+            } => {
+                panic!("Should not compact below compact_at_percent threshold");
+            }
+            _ => panic!("Unexpected state"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_on_step_start_at_threshold_with_auto_compact() {
         // Use manual limit so we have predictable threshold behavior
+        // Default compact_at_percent=85, limit=10000 -> threshold=8500
+        // Set tokens to 10000 (above threshold) -> should compact
         let fixture = ContextMiddlewareFixture::with_manual_limit_and_auto_compact(10000, true);
         let context = test_context("test-session", 0);
         let mut context_mut = (*context).clone();
-        // Set to 10000 tokens, which equals the manual limit -> at threshold
         context_mut.stats = Arc::new(crate::middleware::AgentStats {
             context_tokens: 10000,
             ..Default::default()
@@ -540,7 +689,7 @@ mod tests {
         assert!(
             matches!(result, ExecutionState::Stopped { stop_type, .. }
                                 if stop_type == StopType::ContextThreshold),
-            "Should stop with ContextThreshold when at limit with auto_compact=true"
+            "Should stop with ContextThreshold when above compact_at_percent with auto_compact=true"
         );
     }
 
@@ -642,7 +791,6 @@ mod tests {
                 .middleware
                 .warned_sessions
                 .lock()
-                .unwrap()
                 .contains(&session_id)
         );
 
@@ -655,7 +803,6 @@ mod tests {
                 .middleware
                 .warned_sessions
                 .lock()
-                .unwrap()
                 .contains(&session_id)
         );
     }
@@ -675,19 +822,47 @@ mod tests {
             }));
 
         // Verify it was set
-        assert!(fixture.middleware.last_model.lock().unwrap().is_some());
+        assert!(fixture.middleware.last_model.lock().is_some());
 
         // Reset
         fixture.middleware.reset();
 
         // Verify it was cleared
-        assert!(fixture.middleware.last_model.lock().unwrap().is_none());
+        assert!(fixture.middleware.last_model.lock().is_none());
     }
 
     #[test]
     fn test_middleware_name() {
         let fixture = ContextMiddlewareFixture::with_defaults();
         assert_eq!(fixture.middleware.name(), "ContextMiddleware");
+    }
+
+    #[test]
+    #[should_panic(expected = "compact_at_percent")]
+    fn test_compact_at_percent_equal_to_warn_panics() {
+        // warn=80, compact=80 -> must panic
+        ContextConfig::default()
+            .warn_at_percent(80)
+            .compact_at_percent(80);
+    }
+
+    #[test]
+    #[should_panic(expected = "compact_at_percent")]
+    fn test_compact_at_percent_less_than_warn_panics() {
+        // warn=80, compact=70 -> must panic
+        ContextConfig::default()
+            .warn_at_percent(80)
+            .compact_at_percent(70);
+    }
+
+    #[test]
+    fn test_compact_at_percent_greater_than_warn_ok() {
+        // warn=80, compact=85 -> valid
+        let config = ContextConfig::default()
+            .warn_at_percent(80)
+            .compact_at_percent(85);
+        assert_eq!(config.warn_at_percent, 80);
+        assert_eq!(config.compact_at_percent, 85);
     }
 
     #[test]
@@ -731,26 +906,12 @@ mod tests {
         // Before calling check_provider_changed with ctx2, add a warned session
         let session_id: Arc<str> = "test".into();
         fixture.middleware.should_warn(&session_id, 8000, 10000);
-        assert!(
-            !fixture
-                .middleware
-                .warned_sessions
-                .lock()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(!fixture.middleware.warned_sessions.lock().is_empty());
 
         fixture.middleware.check_provider_changed(&ctx2);
 
         // Warned sessions should be cleared on provider change
-        assert!(
-            fixture
-                .middleware
-                .warned_sessions
-                .lock()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(fixture.middleware.warned_sessions.lock().is_empty());
     }
 
     #[test]
@@ -768,12 +929,12 @@ mod tests {
 
         let session_id: Arc<str> = "test".into();
         fixture.middleware.should_warn(&session_id, 8000, 10000);
-        let warned_count_before = fixture.middleware.warned_sessions.lock().unwrap().len();
+        let warned_count_before = fixture.middleware.warned_sessions.lock().len();
 
         // Check same provider again
         fixture.middleware.check_provider_changed(&ctx1);
 
-        let warned_count_after = fixture.middleware.warned_sessions.lock().unwrap().len();
+        let warned_count_after = fixture.middleware.warned_sessions.lock().len();
 
         assert_eq!(
             warned_count_before, warned_count_after,

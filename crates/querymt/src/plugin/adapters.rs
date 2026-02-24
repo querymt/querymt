@@ -26,6 +26,10 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
         Some(self.inner.deref())
     }
 
+    fn supports_custom_models(&self) -> bool {
+        self.inner.supports_custom_models()
+    }
+
     fn config_schema(&self) -> String {
         self.inner.config_schema()
     }

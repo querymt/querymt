@@ -598,6 +598,10 @@ impl HTTPLLMProviderFactory for OllamaFactory {
         "ollama"
     }
 
+    fn supports_custom_models(&self) -> bool {
+        true
+    }
+
     fn list_models_request(&self, cfg: &str) -> Result<Request<Vec<u8>>, LLMError> {
         let cfg: Value = serde_json::from_str(cfg)?;
         let base = cfg

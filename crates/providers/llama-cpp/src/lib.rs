@@ -15,7 +15,6 @@ use querymt::LLMProvider;
 use querymt::error::LLMError;
 use querymt::plugin::{Fut, LLMProviderFactory};
 use schemars::schema_for;
-use std::path::Path;
 
 struct LlamaCppFactory;
 
@@ -39,14 +38,18 @@ impl LLMProviderFactory for LlamaCppFactory {
     fn list_models<'a>(&'a self, cfg: &str) -> Fut<'a, Result<Vec<String>, LLMError>> {
         let cfg = cfg.to_string();
         Box::pin(async move {
-            let cfg: LlamaCppConfig = serde_json::from_str(&cfg)?;
-            let model_name = cfg.model.clone().or_else(|| {
-                Path::new(&cfg.model_path)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-            });
-            Ok(vec![model_name.unwrap_or(cfg.model_path)])
+            let cfg: LlamaCppConfig = serde_json::from_str(&cfg).map_err(|err| {
+                LLMError::InvalidRequest(format!(
+                    "Invalid llama_cpp config for list_models: {}. Expected JSON with at least a 'model' field.",
+                    err
+                ))
+            })?;
+            Ok(vec![cfg.model])
         })
+    }
+
+    fn supports_custom_models(&self) -> bool {
+        true
     }
 }
 

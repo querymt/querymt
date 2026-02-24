@@ -15,7 +15,7 @@
 - Key packages:
   - `querymt` (core library)
   - `querymt-cli`
-  - `qmt-agent` (agent + optional UI under `crates/agent/ui`)
+  - `querymt-agent` (agent + optional UI under `crates/agent/ui`)
   - `querymt-service` (Axum service; bin `qmt-service`)
   - Provider crates under `crates/providers/*`
 - Toolchain: `rust-toolchain.toml` (stable + clippy + rustfmt; includes `wasm32-wasip1`).
@@ -32,11 +32,11 @@
 ### Package-scoped (preferred for iteration)
 - `cargo check -p querymt`
 - `cargo check -p querymt-cli`
-- `cargo check -p qmt-agent`
+- `cargo check -p querymt-agent`
 - `cargo check -p querymt-service`
 
 ### Agent crate (matches CI)
-- `cargo clippy -p qmt-agent --all-targets --features dashboard,oauth -- -D warnings`
+- `cargo clippy -p querymt-agent --all-targets --features dashboard,oauth -- -D warnings`
 
 ### UI (agent dashboard)
 - `cd crates/agent/ui && bun install`

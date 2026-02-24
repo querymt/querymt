@@ -54,6 +54,11 @@ pub enum MessagePart {
         summary: String,
         original_token_count: usize,
     },
+    /// User-side compaction request: paired with the following Compaction (assistant) message
+    /// to form a natural user→assistant exchange after context compaction.
+    CompactionRequest {
+        original_token_count: usize,
+    },
     /// Turn snapshot start: worktree state before turn (user prompt)
     TurnSnapshotStart {
         turn_id: String,
@@ -80,6 +85,7 @@ impl MessagePart {
             MessagePart::Patch { .. } => "patch",
             MessagePart::Snapshot { .. } => "snapshot",
             MessagePart::Compaction { .. } => "compaction",
+            MessagePart::CompactionRequest { .. } => "compaction_request",
             MessagePart::TurnSnapshotStart { .. } => "turn_snapshot_start",
             MessagePart::TurnSnapshotPatch { .. } => "turn_snapshot_patch",
         }
@@ -173,11 +179,14 @@ impl AgentMessage {
                 MessagePart::Snapshot { changed_paths, .. } => {
                     let summary = changed_paths.summary();
                     if !changed_paths.is_empty() {
-                        content.push_str(&format!("\n[System: File changes: {}]\n", summary));
+                        content.push_str(&format!("\n[System: File changes: {}]", summary));
                     }
                 }
                 MessagePart::Compaction { summary, .. } => {
-                    content.push_str(&format!("\n[Conversation summary]\n{}\n", summary));
+                    content.push_str(summary);
+                }
+                MessagePart::CompactionRequest { .. } => {
+                    content.push_str("Summarize our conversation so far.");
                 }
                 _ => {}
             }
@@ -222,5 +231,78 @@ mod tests {
 
         let chat = msg.to_chat_message();
         assert_eq!(chat.content, "display");
+    }
+
+    #[test]
+    fn to_chat_message_compaction_renders_summary_directly() {
+        let msg = AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::Compaction {
+                summary: "Summary of previous conversation".to_string(),
+                original_token_count: 5000,
+            }],
+            created_at: 0,
+            parent_message_id: None,
+        };
+
+        let chat = msg.to_chat_message();
+        assert_eq!(chat.content, "Summary of previous conversation");
+        assert_eq!(chat.role, ChatRole::Assistant);
+    }
+
+    #[test]
+    fn to_chat_message_compaction_request_renders_user_prompt() {
+        let msg = AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::CompactionRequest {
+                original_token_count: 5000,
+            }],
+            created_at: 0,
+            parent_message_id: None,
+        };
+
+        let chat = msg.to_chat_message();
+        assert_eq!(chat.content, "Summarize our conversation so far.");
+        assert_eq!(chat.role, ChatRole::User);
+    }
+
+    #[test]
+    fn to_chat_message_compaction_pair_forms_valid_exchange() {
+        let req = AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::CompactionRequest {
+                original_token_count: 5000,
+            }],
+            created_at: 0,
+            parent_message_id: None,
+        };
+        let sum = AgentMessage {
+            id: "m2".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::Compaction {
+                summary: "Here is the summary.".to_string(),
+                original_token_count: 5000,
+            }],
+            created_at: 0,
+            parent_message_id: Some("m1".to_string()),
+        };
+
+        let req_chat = req.to_chat_message();
+        let sum_chat = sum.to_chat_message();
+
+        // User message followed by assistant message — valid API exchange
+        assert_eq!(req_chat.role, ChatRole::User);
+        assert_eq!(sum_chat.role, ChatRole::Assistant);
+
+        // Neither ends with trailing whitespace
+        assert!(!req_chat.content.ends_with(char::is_whitespace));
+        assert!(!sum_chat.content.ends_with(char::is_whitespace));
     }
 }

@@ -14,7 +14,7 @@ interface HeaderStatsBarProps {
   events: EventItem[];
   globalElapsedMs: number;
   isSessionActive: boolean;
-  agentModels: Record<string, { provider?: string; model?: string; contextLimit?: number }>;
+  agentModels: Record<string, { provider?: string; model?: string; contextLimit?: number; node?: string }>;
   sessionLimits?: SessionLimits | null;
   onClick?: () => void;
 }
@@ -54,9 +54,11 @@ export function HeaderStatsBar({
     : formatTokensAbbrev(totalContextTokens);
   
   // Cost display with limit if configured
-  const costDisplay = session.limits?.max_cost_usd
-    ? `${formatCost(session.totalCostUsd)}/${formatCost(session.limits.max_cost_usd)}`
-    : formatCost(session.totalCostUsd);
+  const costDisplay = !session.hasCostData
+    ? null
+    : session.limits?.max_cost_usd
+      ? `${formatCost(session.totalCostUsd)}/${formatCost(session.limits.max_cost_usd)}`
+      : formatCost(session.totalCostUsd);
   
   // Context usage percentage for color coding
   // Use 80% as the critical threshold (matches backend ContextConfig.warn_at_percent default)
@@ -103,23 +105,27 @@ export function HeaderStatsBar({
         <span className="text-ui-secondary">{session.totalToolCalls}</span>
       </div>
       
-      <span className="text-surface-border">│</span>
-      
-      {/* Cost */}
-      <div className="flex items-center gap-1.5">
-        <DollarSign className={`w-3.5 h-3.5 ${
-          costPercent > 90 ? 'text-status-warning' : 
-          costPercent > 70 ? 'text-accent-primary' : 
-          'text-ui-muted'
-        }`} />
-        <span className={`${
-          costPercent > 90 ? 'text-status-warning' : 
-          costPercent > 70 ? 'text-accent-primary' : 
-          'text-accent-primary'
-        }`}>
-          {costDisplay}
-        </span>
-      </div>
+      {costDisplay && (
+        <>
+          <span className="text-surface-border">│</span>
+          
+          {/* Cost */}
+          <div className="flex items-center gap-1.5">
+            <DollarSign className={`w-3.5 h-3.5 ${
+              costPercent > 90 ? 'text-status-warning' : 
+              costPercent > 70 ? 'text-accent-primary' : 
+              'text-ui-muted'
+            }`} />
+            <span className={`${
+              costPercent > 90 ? 'text-status-warning' : 
+              costPercent > 70 ? 'text-accent-primary' : 
+              'text-accent-primary'
+            }`}>
+              {costDisplay}
+            </span>
+          </div>
+        </>
+      )}
     </div>
   );
 }

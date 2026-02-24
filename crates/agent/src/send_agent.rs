@@ -5,7 +5,7 @@
 /// multi-threaded contexts without blocking.
 ///
 /// This trait is used internally for:
-/// 1. The core `QueryMTAgent` implementation (which is `Send + Sync`)
+/// 1. The `AgentHandle` facade (which is `Send + Sync`)
 /// 2. Proxies that wrap ACP SDK Clients for delegation
 /// 3. The agent registry to store heterogeneous agents
 ///
@@ -116,151 +116,6 @@ pub trait SendAgent: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
 }
 
-/// ApcClientProxy wraps an ACP SDK Client and implements SendAgent.
-///
-/// This proxy enables delegation to agents (local or remote) via the ACP protocol
-/// while maintaining the `Send + Sync` guarantees required for thread-safe operation.
-///
-/// ## Usage
-///
-/// ```ignore
-/// use std::sync::Arc;
-/// use agent_client_protocol::Client;
-/// use crate::send_agent::ApcClientProxy;
-///
-/// let client: Arc<dyn Client + Send + Sync> = /* ... */;
-/// let proxy = ApcClientProxy::new(client);
-///
-/// // Now you can use proxy as a SendAgent
-/// let response = proxy.prompt(request).await?;
-/// ```
-pub struct ApcClientProxy {
-    client: std::sync::Arc<dyn agent_client_protocol::Client + Send + Sync>,
-}
-
-impl ApcClientProxy {
-    /// Create a new ApcClientProxy wrapping an ACP SDK Client.
-    pub fn new(client: std::sync::Arc<dyn agent_client_protocol::Client + Send + Sync>) -> Self {
-        Self { client }
-    }
-
-    /// Get a reference to the underlying client.
-    pub fn client(&self) -> &std::sync::Arc<dyn agent_client_protocol::Client + Send + Sync> {
-        &self.client
-    }
-}
-
-/// Implement SendAgent for ApcClientProxy by forwarding to the underlying Client.
-///
-/// NOTE: This implementation is currently blocked because the `agent_client_protocol::Client`
-/// trait is `#[async_trait(?Send)]`, which means its methods cannot be called from a `Send`
-/// context. This is a fundamental design mismatch that needs to be resolved.
-///
-/// TODO: Either:
-/// 1. Find a Send version of the Client trait in the agent_client_protocol crate
-/// 2. Wrap calls in spawn_local if delegation must work with ?Send clients
-/// 3. Rethink the delegation strategy
-#[async_trait]
-impl SendAgent for ApcClientProxy {
-    async fn initialize(&self, _req: InitializeRequest) -> Result<InitializeResponse, Error> {
-        // TEMPORARY: Return unimplemented error until we resolve the ?Send issue
-        Err(Error::new(
-            -32601,
-            "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
-        ))
-    }
-
-    async fn authenticate(&self, _req: AuthenticateRequest) -> Result<AuthenticateResponse, Error> {
-        Err(Error::new(
-            -32601,
-            "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
-        ))
-    }
-
-    async fn new_session(&self, _req: NewSessionRequest) -> Result<NewSessionResponse, Error> {
-        Err(Error::new(
-            -32601,
-            "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
-        ))
-    }
-
-    async fn prompt(&self, _req: PromptRequest) -> Result<PromptResponse, Error> {
-        Err(Error::new(
-            -32601,
-            "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
-        ))
-    }
-
-    async fn cancel(&self, _notif: CancelNotification) -> Result<(), Error> {
-        Err(Error::new(
-            -32601,
-            "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
-        ))
-    }
-
-    async fn load_session(&self, _req: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
-        Err(Error::new(
-            -32601,
-            "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
-        ))
-    }
-
-    async fn list_sessions(
-        &self,
-        _req: ListSessionsRequest,
-    ) -> Result<ListSessionsResponse, Error> {
-        Err(Error::new(
-            -32601,
-            "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
-        ))
-    }
-
-    async fn fork_session(&self, _req: ForkSessionRequest) -> Result<ForkSessionResponse, Error> {
-        Err(Error::new(
-            -32601,
-            "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
-        ))
-    }
-
-    async fn resume_session(
-        &self,
-        _req: ResumeSessionRequest,
-    ) -> Result<ResumeSessionResponse, Error> {
-        Err(Error::new(
-            -32601,
-            "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
-        ))
-    }
-
-    async fn set_session_model(
-        &self,
-        _req: SetSessionModelRequest,
-    ) -> Result<SetSessionModelResponse, Error> {
-        Err(Error::new(
-            -32601,
-            "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
-        ))
-    }
-
-    async fn ext_method(&self, _req: ExtRequest) -> Result<ExtResponse, Error> {
-        Err(Error::new(
-            -32601,
-            "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
-        ))
-    }
-
-    async fn ext_notification(&self, _notif: ExtNotification) -> Result<(), Error> {
-        Err(Error::new(
-            -32601,
-            "ApcClientProxy not yet implemented - blocked on ?Send Client trait",
-        ))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
 /// ApcAgentAdapter wraps a `SendAgent` to provide `agent_client_protocol::Agent` compliance.
 ///
 /// This adapter exists at the protocol boundary, allowing a thread-safe `SendAgent`
@@ -339,5 +194,39 @@ impl<T: SendAgent> agent_client_protocol::Agent for ApcAgentAdapter<T> {
 
     async fn cancel(&self, notif: CancelNotification) -> Result<(), Error> {
         self.inner.cancel(notif).await
+    }
+
+    async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
+        self.inner.load_session(req).await
+    }
+
+    async fn list_sessions(&self, req: ListSessionsRequest) -> Result<ListSessionsResponse, Error> {
+        self.inner.list_sessions(req).await
+    }
+
+    async fn fork_session(&self, req: ForkSessionRequest) -> Result<ForkSessionResponse, Error> {
+        self.inner.fork_session(req).await
+    }
+
+    async fn resume_session(
+        &self,
+        req: ResumeSessionRequest,
+    ) -> Result<ResumeSessionResponse, Error> {
+        self.inner.resume_session(req).await
+    }
+
+    async fn set_session_model(
+        &self,
+        req: SetSessionModelRequest,
+    ) -> Result<SetSessionModelResponse, Error> {
+        self.inner.set_session_model(req).await
+    }
+
+    async fn ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+        self.inner.ext_method(req).await
+    }
+
+    async fn ext_notification(&self, notif: ExtNotification) -> Result<(), Error> {
+        self.inner.ext_notification(notif).await
     }
 }

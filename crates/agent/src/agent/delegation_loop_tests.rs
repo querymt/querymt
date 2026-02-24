@@ -1,20 +1,18 @@
-use crate::agent::core::{
-    AgentMode, DelegationContextConfig, DelegationContextTiming, QueryMTAgent, SnapshotPolicy,
-    ToolConfig, ToolPolicy,
-};
+use crate::agent::agent_config::AgentConfig;
+use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
-use crate::config::{PruningConfig, RateLimitConfig, ToolOutputConfig};
-use crate::delegation::{AgentInfo, DefaultAgentRegistry, DelegationOrchestrator};
-use crate::event_bus::EventBus;
+use crate::delegation::{
+    AgentActorHandle, AgentInfo, DefaultAgentRegistry, DelegationOrchestrator,
+};
 use crate::events::StopType;
-use crate::index::{WorkspaceIndexManager, WorkspaceIndexManagerConfig};
 use crate::middleware::{
     AgentStats, ConversationContext, DelegationGuardMiddleware, ExecutionState, LlmResponse,
     MiddlewareDriver,
 };
 use crate::model::{AgentMessage, MessagePart};
 use crate::send_agent::SendAgent;
+use crate::session::backend::StorageBackend;
 use crate::session::domain::{Delegation, DelegationStatus};
 use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
@@ -23,21 +21,13 @@ use crate::test_utils::{
     MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, TestPluginLoader,
     TestProviderFactory, mock_llm_config, mock_querymt_tool_call, mock_session,
 };
-use crate::tools::ToolRegistry;
-use agent_client_protocol::{
-    AuthenticateRequest, AuthenticateResponse, CancelNotification, Error, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ProtocolVersion, StopReason,
-};
-use async_trait::async_trait;
 use mockall::Sequence;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
 use querymt::chat::FinishReason;
 use querymt::plugin::host::PluginRegistry;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
@@ -50,116 +40,8 @@ enum DelegateBehavior {
     AlwaysFail,
 }
 
-#[derive(Debug)]
-struct StubDelegateAgent {
-    behavior: Arc<StdMutex<DelegateBehavior>>,
-    prompt_calls: AtomicUsize,
-    session_counter: AtomicUsize,
-}
-
-impl StubDelegateAgent {
-    fn new(behavior: DelegateBehavior) -> Self {
-        Self {
-            behavior: Arc::new(StdMutex::new(behavior)),
-            prompt_calls: AtomicUsize::new(0),
-            session_counter: AtomicUsize::new(0),
-        }
-    }
-}
-
-#[async_trait]
-impl SendAgent for StubDelegateAgent {
-    async fn initialize(&self, _req: InitializeRequest) -> Result<InitializeResponse, Error> {
-        Ok(InitializeResponse::new(ProtocolVersion::LATEST))
-    }
-
-    async fn authenticate(&self, _req: AuthenticateRequest) -> Result<AuthenticateResponse, Error> {
-        Ok(AuthenticateResponse::new())
-    }
-
-    async fn new_session(&self, _req: NewSessionRequest) -> Result<NewSessionResponse, Error> {
-        let count = self.session_counter.fetch_add(1, Ordering::SeqCst);
-        Ok(NewSessionResponse::new(format!(
-            "delegate-session-{}",
-            count
-        )))
-    }
-
-    async fn prompt(&self, _req: PromptRequest) -> Result<PromptResponse, Error> {
-        self.prompt_calls.fetch_add(1, Ordering::SeqCst);
-        let behavior = self.behavior.lock().unwrap().clone();
-        match behavior {
-            DelegateBehavior::AlwaysOk => Ok(PromptResponse::new(StopReason::EndTurn)),
-            DelegateBehavior::AlwaysFail => Err(Error::new(-32000, "Invalid patch: line mismatch")),
-        }
-    }
-
-    async fn cancel(&self, _notif: CancelNotification) -> Result<(), Error> {
-        Ok(())
-    }
-
-    async fn load_session(
-        &self,
-        _req: agent_client_protocol::LoadSessionRequest,
-    ) -> Result<agent_client_protocol::LoadSessionResponse, Error> {
-        Ok(agent_client_protocol::LoadSessionResponse::new())
-    }
-
-    async fn list_sessions(
-        &self,
-        _req: agent_client_protocol::ListSessionsRequest,
-    ) -> Result<agent_client_protocol::ListSessionsResponse, Error> {
-        Ok(agent_client_protocol::ListSessionsResponse::new(vec![]))
-    }
-
-    async fn fork_session(
-        &self,
-        _req: agent_client_protocol::ForkSessionRequest,
-    ) -> Result<agent_client_protocol::ForkSessionResponse, Error> {
-        Ok(agent_client_protocol::ForkSessionResponse::new(
-            "forked-session",
-        ))
-    }
-
-    async fn resume_session(
-        &self,
-        _req: agent_client_protocol::ResumeSessionRequest,
-    ) -> Result<agent_client_protocol::ResumeSessionResponse, Error> {
-        Ok(agent_client_protocol::ResumeSessionResponse::new())
-    }
-
-    async fn set_session_model(
-        &self,
-        _req: agent_client_protocol::SetSessionModelRequest,
-    ) -> Result<agent_client_protocol::SetSessionModelResponse, Error> {
-        Ok(agent_client_protocol::SetSessionModelResponse::new())
-    }
-
-    async fn ext_method(
-        &self,
-        _req: agent_client_protocol::ExtRequest,
-    ) -> Result<agent_client_protocol::ExtResponse, Error> {
-        let raw_value = serde_json::value::RawValue::from_string("null".to_string())
-            .map_err(|e| Error::new(-32000, e.to_string()))?;
-        Ok(agent_client_protocol::ExtResponse::new(Arc::from(
-            raw_value,
-        )))
-    }
-
-    async fn ext_notification(
-        &self,
-        _notif: agent_client_protocol::ExtNotification,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
 struct TestHarness {
-    agent: Arc<QueryMTAgent>,
+    config: Arc<AgentConfig>,
     exec_ctx: ExecutionContext,
     provider: Arc<Mutex<MockLlmProvider>>,
     _temp_dir: TempDir,
@@ -222,6 +104,10 @@ impl TestHarness {
             .returning(|_| Ok(None))
             .times(0..);
         store
+            .expect_get_session_provider_node_id()
+            .returning(|_| Ok(None))
+            .times(0..);
+        store
             .expect_add_message()
             .returning(|_, _| Ok(()))
             .times(0..);
@@ -236,6 +122,10 @@ impl TestHarness {
         store
             .expect_list_delegations()
             .returning(|_| Ok(vec![]))
+            .times(0..);
+        store
+            .expect_mark_tool_results_compacted()
+            .returning(|_, _| Ok(0))
             .times(0..);
         store
             .expect_create_delegation()
@@ -272,81 +162,73 @@ impl TestHarness {
             .await
             .expect("load context");
 
-        let delegate_agent = Arc::new(StubDelegateAgent::new(behavior));
+        // Create delegate agents as real AgentHandles with AgentActorHandle::Local.
+        // Each delegate gets its own in-memory SQLite store and mock LLM provider
+        // configured for the desired behavior (success/failure).
         let mut agent_registry = DefaultAgentRegistry::new();
         for id in ["agent", "agent1", "agent2"] {
-            agent_registry.register(agent_info(id), delegate_agent.clone());
+            let delegate_handle = build_delegate_handle(behavior.clone()).await;
+            let actor_handle = AgentActorHandle::Local {
+                config: delegate_handle.config.clone(),
+                registry: delegate_handle.registry.clone(),
+            };
+            agent_registry.register_with_handle(
+                agent_info(id),
+                delegate_handle as Arc<dyn SendAgent>,
+                actor_handle,
+            );
         }
         let agent_registry: Arc<DefaultAgentRegistry> = Arc::new(agent_registry);
 
-        let agent = Arc::new(QueryMTAgent {
-            provider: provider_context,
-            active_sessions: Arc::new(Mutex::new(HashMap::new())),
-            session_runtime: Arc::new(Mutex::new(HashMap::new())),
-            max_steps: None,
-            snapshot_policy: SnapshotPolicy::None,
-            assume_mutating: true,
-            mutating_tools: HashSet::new(),
-            max_prompt_bytes: None,
-            tool_config: Arc::new(StdMutex::new(ToolConfig::default())),
-            tool_registry: Arc::new(StdMutex::new(ToolRegistry::new())),
-            middleware_drivers: Arc::new(std::sync::Mutex::new(Vec::new())),
-            agent_mode: Arc::new(std::sync::atomic::AtomicU8::new(AgentMode::Build as u8)),
-            event_bus: Arc::new(EventBus::new()),
-            client_state: Arc::new(StdMutex::new(None)),
-            auth_methods: Arc::new(StdMutex::new(Vec::new())),
-            client: Arc::new(StdMutex::new(None)),
-            bridge: Arc::new(StdMutex::new(None)),
-            agent_registry: agent_registry.clone(),
-            delegation_context_config: DelegationContextConfig {
-                timing: DelegationContextTiming::FirstTurnOnly,
-                auto_inject: true,
-            },
-            workspace_index_manager: Arc::new(WorkspaceIndexManager::new(
-                WorkspaceIndexManagerConfig::default(),
-            )),
-            execution_timeout_secs: 300,
-            tool_output_config: ToolOutputConfig::default(),
-            pruning_config: PruningConfig::default(),
-            compaction_config: crate::config::CompactionConfig::default(),
-            compaction: crate::session::compaction::SessionCompaction::new(),
-            snapshot_backend: None,
-            snapshot_gc_config: crate::snapshot::GcConfig::default(),
-            pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
-            rate_limit_config: RateLimitConfig::default(),
-        });
+        let event_journal_storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("create event journal storage"),
+        );
 
-        if let Ok(mut config) = agent.tool_config.lock() {
-            config.policy = ToolPolicy::ProviderOnly;
-        }
+        let config = Arc::new(
+            crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+                provider_context,
+                event_journal_storage.event_journal(),
+            )
+            .with_tool_policy(ToolPolicy::ProviderOnly)
+            .with_agent_registry_only(agent_registry.clone())
+            .build(),
+        );
+
+        // Create an AgentHandle for delegation (wraps its own SessionRegistry)
+        let delegator: Arc<dyn SendAgent> =
+            Arc::new(crate::agent::AgentHandle::from_config(config.clone()));
 
         let orchestrator = Arc::new(DelegationOrchestrator::new(
-            agent.clone(),
+            delegator,
+            config.event_sink.clone(),
             store.clone(),
             agent_registry.clone(),
+            config.tool_registry_arc(),
             None,
         ));
-        agent.add_observer(orchestrator);
+        let _orchestrator_handle = orchestrator.start_listening(config.event_sink.fanout());
 
         // Create a SessionRuntime for the execution context
-        let session_runtime = Arc::new(crate::agent::core::SessionRuntime {
-            cwd: None,
-            _mcp_services: HashMap::new(),
-            mcp_tools: HashMap::new(),
-            mcp_tool_defs: Vec::new(),
-            permission_cache: StdMutex::new(HashMap::new()),
-            current_tools_hash: StdMutex::new(None),
-            function_index: Arc::new(tokio::sync::OnceCell::new()),
-            turn_snapshot: StdMutex::new(None),
-            turn_diffs: StdMutex::new(Default::default()),
-            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
+        let session_runtime = crate::agent::core::SessionRuntime::new(
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+        );
 
         let session_id = "sess-test".to_string();
-        let exec_ctx = ExecutionContext::new(session_id, session_runtime, runtime_context, context);
+        let exec_ctx = ExecutionContext::new(
+            session_id,
+            session_runtime,
+            runtime_context,
+            context,
+            crate::agent::core::ToolConfig::default(),
+        );
 
         Self {
-            agent,
+            config,
             exec_ctx,
             provider,
             _temp_dir: temp_dir,
@@ -354,16 +236,103 @@ impl TestHarness {
     }
 
     async fn run(&mut self) -> CycleOutcome {
-        let (_tx, rx) = tokio::sync::watch::channel(false);
-        self.agent
-            .execute_cycle_state_machine(&mut self.exec_ctx, rx)
-            .await
-            .expect("state machine")
+        crate::agent::execution::execute_cycle_state_machine(
+            &self.config,
+            &mut self.exec_ctx,
+            None,
+            crate::agent::core::AgentMode::Build,
+        )
+        .await
+        .expect("state machine")
     }
 
     async fn provider_mut(&self) -> tokio::sync::MutexGuard<'_, MockLlmProvider> {
         self.provider.lock().await
     }
+}
+
+/// Build a delegate `AgentHandle` with its own in-memory SQLite store and
+/// mock LLM provider configured for the desired behavior.
+async fn build_delegate_handle(behavior: DelegateBehavior) -> Arc<crate::agent::AgentHandle> {
+    use crate::session::sqlite_storage::SqliteStorage;
+
+    let delegate_store: Arc<dyn SessionStore> =
+        Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+
+    let delegate_provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+    {
+        let mut mock = delegate_provider.lock().await;
+        match behavior {
+            DelegateBehavior::AlwaysOk => {
+                mock.expect_chat()
+                    .times(0..)
+                    .returning(|_| Ok(Box::new(MockChatResponse::text_only("Task complete"))));
+            }
+            DelegateBehavior::AlwaysFail => {
+                mock.expect_chat().times(0..).returning(|_| {
+                    Err(querymt::error::LLMError::ProviderError(
+                        "Invalid patch: line mismatch".to_string(),
+                    ))
+                });
+            }
+        }
+        mock.expect_tools().return_const(None).times(0..);
+    }
+
+    let delegate_shared = SharedLlmProvider {
+        inner: delegate_provider,
+        tools: Vec::new().into_boxed_slice(),
+    };
+    let delegate_factory = Arc::new(TestProviderFactory {
+        provider: delegate_shared,
+    });
+
+    let delegate_temp_dir = TempDir::new().expect("temp dir");
+    let delegate_wasm_path = delegate_temp_dir.path().join("mock.wasm");
+    std::fs::write(&delegate_wasm_path, "").expect("write wasm");
+    let delegate_config_path = delegate_temp_dir.path().join("providers.toml");
+    std::fs::write(
+        &delegate_config_path,
+        format!(
+            "[[providers]]\nname = \"mock\"\npath = \"{}\"\n",
+            delegate_wasm_path.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut delegate_plugin_registry =
+        PluginRegistry::from_path(&delegate_config_path).expect("registry");
+    delegate_plugin_registry.register_loader(Box::new(TestPluginLoader {
+        factory: delegate_factory,
+    }));
+    let delegate_plugin_registry = Arc::new(delegate_plugin_registry);
+
+    let delegate_session_provider = Arc::new(crate::session::provider::SessionProvider::new(
+        delegate_plugin_registry,
+        delegate_store,
+        LLMParams::new().provider("mock").model("mock-model"),
+    ));
+    let event_journal_storage = Arc::new(
+        crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .expect("create event journal storage"),
+    );
+
+    let delegate_config = Arc::new(
+        crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+            delegate_session_provider,
+            event_journal_storage.event_journal(),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly)
+        .with_max_steps(1)
+        .with_execution_timeout_secs(30)
+        .build(),
+    );
+
+    // Leak the TempDir so its contents survive the test
+    std::mem::forget(delegate_temp_dir);
+
+    Arc::new(crate::agent::AgentHandle::from_config(delegate_config))
 }
 
 fn agent_info(id: &str) -> AgentInfo {
@@ -688,7 +657,7 @@ async fn test_delegation_guard_blocks_duplicate() {
         )),
     };
 
-    let result = middleware.on_after_llm(state).await.unwrap();
+    let result = middleware.on_after_llm(state, None).await.unwrap();
 
     assert!(matches!(
         result,
@@ -763,7 +732,7 @@ async fn test_delegation_guard_blocks_max_retries() {
         )),
     };
 
-    let result = middleware.on_after_llm(state).await.unwrap();
+    let result = middleware.on_after_llm(state, None).await.unwrap();
 
     assert!(matches!(
         result,

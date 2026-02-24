@@ -1,3 +1,4 @@
+pub mod error;
 pub mod prelude;
 pub mod simple;
 
@@ -11,7 +12,8 @@ pub mod acp;
 pub mod agent;
 pub mod delegation;
 pub mod elicitation;
-pub mod event_bus;
+pub mod event_fanout;
+pub mod event_sink;
 pub mod events;
 pub mod export;
 pub mod hash;
@@ -36,7 +38,12 @@ pub mod verification;
 #[cfg(test)]
 pub mod test_utils;
 
+// Re-export top-level error type
+pub use error::AgentError;
+
 // Re-export main agent types for backward compatibility
-pub use agent::{DelegationContextConfig, DelegationContextTiming, QueryMTAgent};
-pub use event_bus::EventBus;
+pub use agent::{AgentHandle, DelegationContextConfig, DelegationContextTiming};
 pub use quorum::{AgentQuorum, AgentQuorumBuilder, AgentQuorumError, DelegateAgent};
+
+// Re-export kameo actor types
+pub use agent::{AgentConfig, SessionActor, SessionRegistry};

@@ -14,7 +14,6 @@ fn get_provider() -> Box<dyn LLMProvider> {
         tools: None,
         tool_choice: None,
         tok_model_id: None,
-        gguf_files: None,
         hf_revision: None,
         token_source: None,
         chat_template: None,

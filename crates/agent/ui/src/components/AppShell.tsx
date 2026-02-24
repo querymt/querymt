@@ -13,6 +13,7 @@ import { ThemeSwitcher } from './ThemeSwitcher';
 import { ShortcutGateway } from './ShortcutGateway';
 import { ProviderAuthSwitcher } from './ProviderAuthSwitcher';
 import { WorkspacePathDialog } from './WorkspacePathDialog';
+import { RemoteNodeIndicator } from './RemoteNodeIndicator';
 import { copyToClipboard } from '../utils/clipboard';
 import { getModeColors, getModeDisplayName } from '../utils/modeColors';
 import {
@@ -52,17 +53,22 @@ export function AppShell() {
     activeAgentId,
     sessionsByAgent,
     allModels,
+    providerCapabilities,
     recentModelsByWorkspace,
     authProviders,
     oauthFlow,
     oauthResult,
     refreshAllModels,
     requestAuthProviders,
+    modelDownloads,
     startOAuthLogin,
     completeOAuthLogin,
     disconnectOAuth,
     clearOAuthState,
     setSessionModel,
+    addCustomModelFromHf,
+    addCustomModelFromFile,
+    deleteCustomModel,
     sessionGroups,
     thinkingBySession,
     agentMode,
@@ -71,6 +77,9 @@ export function AppShell() {
     workspacePathDialogDefaultValue,
     submitWorkspacePathDialog,
     cancelWorkspacePathDialog,
+    remoteNodes,
+    connectionErrors,
+    dismissConnectionError,
   } = useUiClientContext();
   
   const navigate = useNavigate();
@@ -426,7 +435,8 @@ export function AppShell() {
           {sessionId && (
             <div className="flex items-center gap-2">
               {/* Combined session chip with mode */}
-              <div className="flex items-center rounded-lg border border-surface-border bg-surface-canvas overflow-hidden">
+              {/* Fixed width sized for a full UUIDv7 (36 chars) + status dot + mode */}
+              <div className="flex items-center rounded-lg border border-surface-border bg-surface-canvas overflow-hidden flex-shrink-0">
                 {/* Session ID part - click to open session switcher */}
                 <button
                   type="button"
@@ -435,7 +445,7 @@ export function AppShell() {
                   className="flex items-center gap-1.5 px-3 py-1.5 hover:bg-surface-elevated/50 transition-colors group"
                 >
                   <span
-                    className={`w-2 h-2 rounded-full ${
+                    className={`w-2 h-2 rounded-full flex-shrink-0 ${
                       isSessionActive
                         ? 'bg-accent-primary animate-pulse'
                         : isConversationComplete
@@ -450,18 +460,19 @@ export function AppShell() {
                         : 'Idle'
                     }
                   />
-                  <span className="text-xs font-mono text-ui-secondary group-hover:text-accent-primary transition-colors">
-                    {String(sessionId).substring(0, 12)}...
+                  {/* Fixed-width slot sized for a full UUIDv7 (36 chars) */}
+                  <span className="text-xs font-mono text-ui-secondary group-hover:text-accent-primary transition-colors w-[22ch] truncate">
+                    {String(sessionId).substring(0, 20)}...
                   </span>
                   <span className="text-ui-muted">·</span>
                 </button>
                 
-                {/* Mode part - click to cycle mode */}
+                {/* Mode part - click to cycle mode, fixed width for largest mode name */}
                 <button
                   type="button"
                   onClick={cycleAgentMode}
                   title={`Mode: ${agentMode} (${navigator.platform.includes('Mac') ? '⌘E' : 'Ctrl+E'} to cycle)`}
-                  className="px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-surface-elevated/50"
+                  className="px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-surface-elevated/50 w-[7ch] text-center flex-shrink-0 truncate"
                   style={{ color: 'var(--mode-color)' }}
                 >
                   {getModeDisplayName(agentMode)}
@@ -485,9 +496,9 @@ export function AppShell() {
           )}
         </div>
         
-        {/* Right section */}
-        <div className="flex items-center gap-3">
-          {/* Inline stats bar (when session has events) */}
+        {/* Right section: flexible stats on the left, fixed controls pinned to the right */}
+        <div className="flex items-center gap-3 min-w-0">
+          {/* Inline stats bar (when session has events) — can grow/shrink */}
           {sessionId && (
             <HeaderStatsBar
               events={events}
@@ -498,45 +509,57 @@ export function AppShell() {
               onClick={() => setStatsDrawerOpen(!statsDrawerOpen)}
             />
           )}
-          
-          {/* Model picker */}
-          <ModelPickerPopover
-            open={modelPickerOpen}
-            onOpenChange={setModelPickerOpen}
-            connected={connected}
-            routingMode={routingMode}
-            activeAgentId={activeAgentId}
-            sessionId={sessionId}
-            sessionsByAgent={sessionsByAgent}
-            agents={agents}
-            allModels={allModels}
-            currentProvider={agentModels[activeAgentId]?.provider}
-            currentModel={agentModels[activeAgentId]?.model}
-            currentWorkspace={currentWorkspace}
-            recentModelsByWorkspace={recentModelsByWorkspace}
-            agentMode={agentMode}
-            onRefresh={refreshAllModels}
-            onSetSessionModel={setSessionModel}
-          />
 
-          {/* Dashboard theme picker */}
-          <button
-            type="button"
-            onClick={() => setThemeSwitcherOpen(true)}
-            className="h-8 w-8 inline-flex items-center justify-center rounded-lg border border-surface-border bg-surface-canvas/60 transition-colors hover:border-accent-primary/40"
-            title={`Dashboard theme: ${selectedThemeLabel} (${shortcutGatewayPrefix} then T)`}
-            aria-label="Open theme switcher"
-          >
-            <Palette className="w-3.5 h-3.5 text-accent-primary" />
-          </button>
-          
-          {/* Connection status dot */}
-          <div
-            className={`w-3 h-3 rounded-full transition-colors ${
-              connected ? 'bg-status-success' : 'bg-status-warning'
-            }`}
-            title={connected ? 'Connected' : 'Disconnected'}
-          />
+          {/* Fixed controls group — never reflows regardless of stats bar visibility */}
+          <div className="flex items-center gap-3 flex-shrink-0 ml-auto">
+            {/* Model picker — fixed width set on the trigger button itself */}
+            <ModelPickerPopover
+              open={modelPickerOpen}
+              onOpenChange={setModelPickerOpen}
+              connected={connected}
+              routingMode={routingMode}
+              activeAgentId={activeAgentId}
+              sessionId={sessionId}
+              sessionsByAgent={sessionsByAgent}
+              agents={agents}
+              allModels={allModels}
+              currentProvider={agentModels[activeAgentId]?.provider}
+              currentModel={agentModels[activeAgentId]?.model}
+              currentNode={agentModels[activeAgentId]?.node}
+              currentWorkspace={currentWorkspace}
+              recentModelsByWorkspace={recentModelsByWorkspace}
+              agentMode={agentMode}
+              onRefresh={refreshAllModels}
+              onSetSessionModel={setSessionModel}
+              providerCapabilities={providerCapabilities}
+              modelDownloads={modelDownloads}
+              onAddCustomModelFromHf={addCustomModelFromHf}
+              onAddCustomModelFromFile={addCustomModelFromFile}
+              onDeleteCustomModel={deleteCustomModel}
+            />
+
+            {/* Dashboard theme picker */}
+            <button
+              type="button"
+              onClick={() => setThemeSwitcherOpen(true)}
+              className="h-8 w-8 inline-flex items-center justify-center rounded-lg border border-surface-border bg-surface-canvas/60 transition-colors hover:border-accent-primary/40"
+              title={`Dashboard theme: ${selectedThemeLabel} (${shortcutGatewayPrefix} then T)`}
+              aria-label="Open theme switcher"
+            >
+              <Palette className="w-3.5 h-3.5 text-accent-primary" />
+            </button>
+
+            {/* Remote node mesh indicator — fixed rightmost slot before conn dot */}
+            <RemoteNodeIndicator remoteNodes={remoteNodes} />
+
+            {/* Connection status dot */}
+            <div
+              className={`w-3 h-3 rounded-full flex-shrink-0 transition-colors ${
+                connected ? 'bg-status-success' : 'bg-status-warning'
+              }`}
+              title={connected ? 'Connected' : 'Disconnected'}
+            />
+          </div>
         </div>
       </header>
       
@@ -616,6 +639,7 @@ export function AppShell() {
       <WorkspacePathDialog
         open={workspacePathDialogOpen}
         defaultValue={workspacePathDialogDefaultValue}
+        remoteNodes={remoteNodes}
         onSubmit={submitWorkspacePathDialog}
         onCancel={cancelWorkspacePathDialog}
       />
@@ -633,6 +657,28 @@ export function AppShell() {
           agentModels={agentModels}
           sessionLimits={sessionLimits}
         />
+      )}
+
+      {/* Connection error toasts */}
+      {connectionErrors.length > 0 && (
+        <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-md">
+          {connectionErrors.map((err) => (
+            <div
+              key={err.id}
+              className="flex items-start gap-2 px-4 py-3 rounded-lg border border-status-warning/40 bg-surface-elevated shadow-lg animate-fade-in"
+            >
+              <span className="text-xs text-status-warning flex-1 break-words">{err.message}</span>
+              <button
+                type="button"
+                onClick={() => dismissConnectionError(err.id)}
+                className="text-ui-muted hover:text-ui-primary transition-colors flex-shrink-0"
+                aria-label="Dismiss"
+              >
+                &times;
+              </button>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );

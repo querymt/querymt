@@ -6,7 +6,9 @@ use crate::session::domain::{
     TaskStatus,
 };
 use crate::session::error::SessionResult;
-use crate::session::store::{LLMConfig, Session, SessionExecutionConfig, SessionStore};
+use crate::session::store::{
+    CustomModel, LLMConfig, Session, SessionExecutionConfig, SessionStore,
+};
 use async_trait::async_trait;
 use mockall::mock;
 use querymt::LLMParams;
@@ -44,6 +46,15 @@ mock! {
         async fn get_llm_config(&self, id: i64) -> SessionResult<Option<LLMConfig>>;
         async fn get_session_llm_config(&self, session_id: &str) -> SessionResult<Option<LLMConfig>>;
         async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()>;
+        async fn set_session_provider_node_id<'a, 'b, 'c>(
+            &'a self,
+            session_id: &'b str,
+            provider_node_id: Option<&'c str>,
+        ) -> SessionResult<()>;
+        async fn get_session_provider_node_id<'a, 'b>(
+            &'a self,
+            session_id: &'b str,
+        ) -> SessionResult<Option<String>>;
         async fn set_session_execution_config<'a, 'b, 'c>(
             &'a self,
             session_id: &'b str,
@@ -53,6 +64,14 @@ mock! {
             &'a self,
             session_id: &'b str,
         ) -> SessionResult<Option<SessionExecutionConfig>>;
+        async fn list_custom_models(&self, provider: &str) -> SessionResult<Vec<CustomModel>>;
+        async fn get_custom_model(
+            &self,
+            provider: &str,
+            model_id: &str,
+        ) -> SessionResult<Option<CustomModel>>;
+        async fn upsert_custom_model(&self, model: &CustomModel) -> SessionResult<()>;
+        async fn delete_custom_model(&self, provider: &str, model_id: &str) -> SessionResult<()>;
         async fn set_current_intent_snapshot<'a, 'b, 'c>(
             &'a self,
             session_id: &'b str,
@@ -223,7 +242,7 @@ impl SharedLlmProvider {
 #[async_trait]
 impl querymt::chat::ChatProvider for SharedLlmProvider {
     fn supports_streaming(&self) -> bool {
-        self.inner.blocking_lock().supports_streaming()
+        false
     }
 
     async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {

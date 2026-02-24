@@ -15,6 +15,7 @@ use querymt::chat::Tool;
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::{LLMProvider, error::LLMError};
+use querymt_provider_common::{ModelRef, parse_model_ref};
 use serde::Deserialize;
 
 use crate::config::{
@@ -356,57 +357,34 @@ struct GgufSpec {
 }
 
 fn gguf_spec_from_config(cfg: &MistralRSConfig) -> Result<Option<GgufSpec>, LLMError> {
-    if let Some(files) = cfg.gguf_files.as_ref() {
-        return Ok(Some(GgufSpec {
-            model_id: cfg.model.clone(),
-            files: files.clone(),
-        }));
+    let model_ref =
+        parse_model_ref(&cfg.model).map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
+    match model_ref {
+        ModelRef::Hf(model) => Ok(Some(GgufSpec {
+            model_id: model.repo,
+            files: vec![model.file],
+        })),
+        ModelRef::LocalPath(path)
+            if cfg.model.ends_with(".gguf")
+                || path.extension().and_then(|ext| ext.to_str()) == Some("gguf") =>
+        {
+            let file = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| LLMError::InvalidRequest("invalid gguf file path".into()))?
+                .to_string();
+            let model_id = path
+                .parent()
+                .and_then(|parent| parent.to_str())
+                .unwrap_or(".")
+                .to_string();
+            Ok(Some(GgufSpec {
+                model_id,
+                files: vec![file],
+            }))
+        }
+        _ => Ok(None),
     }
-
-    if let Some((model_id, quant)) = split_model_quant(&cfg.model) {
-        let file = infer_gguf_filename(&model_id, &quant);
-        return Ok(Some(GgufSpec {
-            model_id,
-            files: vec![file],
-        }));
-    }
-
-    if cfg.model.ends_with(".gguf") {
-        let path = Path::new(&cfg.model);
-        let file = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| LLMError::InvalidRequest("invalid gguf file path".into()))?
-            .to_string();
-        let model_id = path
-            .parent()
-            .and_then(|parent| parent.to_str())
-            .unwrap_or(".")
-            .to_string();
-        return Ok(Some(GgufSpec {
-            model_id,
-            files: vec![file],
-        }));
-    }
-
-    Ok(None)
-}
-
-fn split_model_quant(model: &str) -> Option<(String, String)> {
-    let (left, right) = model.rsplit_once(':')?;
-    if left.is_empty() || right.is_empty() {
-        return None;
-    }
-    Some((left.to_string(), right.to_string()))
-}
-
-fn infer_gguf_filename(model_id: &str, quant: &str) -> String {
-    if quant.ends_with(".gguf") {
-        return quant.to_string();
-    }
-    let repo_name = model_id.rsplit('/').next().unwrap_or(model_id);
-    let base = repo_name.strip_suffix("-GGUF").unwrap_or(repo_name);
-    format!("{base}-{quant}.gguf")
 }
 
 async fn build_text_model(cfg: &MistralRSConfig) -> Result<Model, LLMError> {

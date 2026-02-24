@@ -1,6 +1,6 @@
 //! Client bridge for Send/!Send boundary crossing.
 //!
-//! This module provides types that allow a `Send + Sync` agent (like `QueryMTAgent`)
+//! This module provides types that allow a `Send + Sync` agent (like `AgentHandle`)
 //! to communicate with a `!Send` client connection (like `AgentSideConnection` from the SDK).
 //!
 //! ## Architecture
@@ -125,7 +125,7 @@ impl ClientBridgeSender {
         self.tx
             .send(ClientBridgeMessage::Notification(notification))
             .await
-            .map_err(|_| Error::new(-32000, "Client bridge closed"))
+            .map_err(|_| Error::from(crate::error::AgentError::ClientBridgeClosed))
     }
 
     /// Request permission from the client and wait for response.
@@ -150,11 +150,11 @@ impl ClientBridgeSender {
                 response_tx,
             })
             .await
-            .map_err(|_| Error::new(-32000, "Client bridge closed"))?;
+            .map_err(|_| Error::from(crate::error::AgentError::ClientBridgeClosed))?;
 
         response_rx
             .await
-            .map_err(|_| Error::new(-32000, "Permission response channel dropped"))?
+            .map_err(|_| Error::from(crate::error::AgentError::PermissionChannelDropped))?
     }
 
     /// Request elicitation from the user and wait for response.

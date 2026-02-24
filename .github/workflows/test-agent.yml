@@ -17,6 +17,9 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/test-agent.yml'
 
+env:
+  features: 'dashboard,oauth,remote'
+
 jobs:
   # Job 1: Check formatting (fast, fails first)
   format:
@@ -51,7 +54,7 @@ jobs:
         uses: swatinem/rust-cache@v2
       
       - name: Run Clippy
-        run: cargo clippy --package qmt-agent --all-targets --features dashboard,oauth -- -D warnings
+        run: cargo clippy --package querymt-agent --all-targets --features "${features}" -- -D warnings
 
   # Job 3: Run tests with coverage
   test:
@@ -69,17 +72,28 @@ jobs:
       - name: Cache Cargo dependencies
         uses: swatinem/rust-cache@v2
       
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
       
+      - name: Create coverage directory
+        run: mkdir -p ./coverage
+
       - name: Run tests with coverage
-        run: cargo tarpaulin --package qmt-agent --all-targets --features dashboard,oauth --out xml --output-dir ./coverage
+        run: |
+          cargo llvm-cov nextest \
+            --package querymt-agent \
+            --lib --tests \
+            --features "${features}" \
+            --codecov --output-path ./coverage/codecov.json
       
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/cobertura.xml
+          files: ./coverage/codecov.json
           flags: agent
           verbose: true
           fail_ci_if_error: false

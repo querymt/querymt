@@ -60,7 +60,7 @@ pub type PendingElicitationMap = Arc<Mutex<HashMap<String, oneshot::Sender<Elici
 /// This allows UI/ACP responders to resolve delegate-originated elicitations
 /// while holding only a reference to the primary agent.
 pub async fn take_pending_elicitation_sender(
-    agent: &crate::agent::QueryMTAgent,
+    agent: &crate::agent::AgentHandle,
     elicitation_id: &str,
 ) -> Option<oneshot::Sender<ElicitationResponse>> {
     if let Some(sender) = take_from_pending_map(&agent.pending_elicitations(), elicitation_id).await
@@ -78,7 +78,7 @@ pub async fn take_pending_elicitation_sender(
 
         let Some(delegate) = instance
             .as_any()
-            .downcast_ref::<crate::agent::QueryMTAgent>()
+            .downcast_ref::<crate::agent::AgentHandle>()
         else {
             continue;
         };
@@ -110,7 +110,7 @@ async fn take_from_pending_map(
 /// This replaces `()` as the handler in `serve_client()`.
 pub struct ElicitationHandler {
     pending: PendingElicitationMap,
-    event_bus: Arc<crate::event_bus::EventBus>,
+    event_sink: Arc<crate::event_sink::EventSink>,
     server_name: String,
     session_id: String,
 }
@@ -118,13 +118,13 @@ pub struct ElicitationHandler {
 impl ElicitationHandler {
     pub fn new(
         pending: PendingElicitationMap,
-        event_bus: Arc<crate::event_bus::EventBus>,
+        event_sink: Arc<crate::event_sink::EventSink>,
         server_name: String,
         session_id: String,
     ) -> Self {
         Self {
             pending,
-            event_bus,
+            event_sink,
             server_name,
             session_id,
         }
@@ -153,17 +153,23 @@ impl ClientHandler for ElicitationHandler {
             let schema_json =
                 serde_json::to_value(&request.requested_schema).unwrap_or(serde_json::Value::Null);
 
-            // Emit event for UI/ACP clients
-            self.event_bus.publish(
-                &self.session_id,
-                crate::events::AgentEventKind::ElicitationRequested {
-                    elicitation_id: elicitation_id.clone(),
-                    session_id: self.session_id.clone(),
-                    message: request.message,
-                    requested_schema: schema_json,
-                    source: format!("mcp:{}", self.server_name),
-                },
-            );
+            // Durable: elicitation must be visible in UI replay.
+            if let Err(err) = self
+                .event_sink
+                .emit_durable(
+                    &self.session_id,
+                    crate::events::AgentEventKind::ElicitationRequested {
+                        elicitation_id: elicitation_id.clone(),
+                        session_id: self.session_id.clone(),
+                        message: request.message,
+                        requested_schema: schema_json,
+                        source: format!("mcp:{}", self.server_name),
+                    },
+                )
+                .await
+            {
+                log::warn!("failed to emit ElicitationRequested: {}", err);
+            }
 
             // Wait for response from UI/ACP
             match rx.await {
@@ -187,54 +193,193 @@ impl ClientHandler for ElicitationHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::builder::AgentBuilderExt;
-    use crate::delegation::{AgentInfo, DefaultAgentRegistry};
-    use crate::session::backend::StorageBackend;
-    use crate::session::sqlite_storage::SqliteStorage;
-    use crate::test_utils::empty_plugin_registry;
-    use querymt::LLMParams;
+    use crate::test_utils::DelegateTestFixture;
+
+    // ── ElicitationAction -> rmcp::model::ElicitationAction ───────────────
+
+    #[test]
+    fn elicitation_action_accept_converts_to_rmcp_accept() {
+        let action = ElicitationAction::Accept;
+        let rmcp_action: rmcp::model::ElicitationAction = action.into();
+        assert_eq!(rmcp_action, rmcp::model::ElicitationAction::Accept);
+    }
+
+    #[test]
+    fn elicitation_action_decline_converts_to_rmcp_decline() {
+        let action = ElicitationAction::Decline;
+        let rmcp_action: rmcp::model::ElicitationAction = action.into();
+        assert_eq!(rmcp_action, rmcp::model::ElicitationAction::Decline);
+    }
+
+    #[test]
+    fn elicitation_action_cancel_converts_to_rmcp_cancel() {
+        let action = ElicitationAction::Cancel;
+        let rmcp_action: rmcp::model::ElicitationAction = action.into();
+        assert_eq!(rmcp_action, rmcp::model::ElicitationAction::Cancel);
+    }
+
+    // ── rmcp::model::ElicitationAction -> ElicitationAction ───────────────
+
+    #[test]
+    fn rmcp_accept_converts_to_elicitation_action_accept() {
+        let rmcp_action = rmcp::model::ElicitationAction::Accept;
+        let action: ElicitationAction = rmcp_action.into();
+        assert_eq!(action, ElicitationAction::Accept);
+    }
+
+    #[test]
+    fn rmcp_decline_converts_to_elicitation_action_decline() {
+        let rmcp_action = rmcp::model::ElicitationAction::Decline;
+        let action: ElicitationAction = rmcp_action.into();
+        assert_eq!(action, ElicitationAction::Decline);
+    }
+
+    #[test]
+    fn rmcp_cancel_converts_to_elicitation_action_cancel() {
+        let rmcp_action = rmcp::model::ElicitationAction::Cancel;
+        let action: ElicitationAction = rmcp_action.into();
+        assert_eq!(action, ElicitationAction::Cancel);
+    }
+
+    // ── ElicitationAction serde round-trip ─────────────────────────────────
+
+    #[test]
+    fn elicitation_action_accept_serializes_as_lowercase() {
+        let action = ElicitationAction::Accept;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, r#""accept""#);
+    }
+
+    #[test]
+    fn elicitation_action_decline_serializes_as_lowercase() {
+        let action = ElicitationAction::Decline;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, r#""decline""#);
+    }
+
+    #[test]
+    fn elicitation_action_cancel_serializes_as_lowercase() {
+        let action = ElicitationAction::Cancel;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, r#""cancel""#);
+    }
+
+    #[test]
+    fn elicitation_action_deserializes_from_lowercase() {
+        let json = r#""accept""#;
+        let action: ElicitationAction = serde_json::from_str(json).unwrap();
+        assert_eq!(action, ElicitationAction::Accept);
+
+        let json = r#""decline""#;
+        let action: ElicitationAction = serde_json::from_str(json).unwrap();
+        assert_eq!(action, ElicitationAction::Decline);
+
+        let json = r#""cancel""#;
+        let action: ElicitationAction = serde_json::from_str(json).unwrap();
+        assert_eq!(action, ElicitationAction::Cancel);
+    }
+
+    #[test]
+    fn all_elicitation_actions_round_trip() {
+        let actions = vec![
+            ElicitationAction::Accept,
+            ElicitationAction::Decline,
+            ElicitationAction::Cancel,
+        ];
+
+        for original in actions {
+            let json = serde_json::to_string(&original).unwrap();
+            let restored: ElicitationAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(original, restored);
+        }
+    }
+
+    // ── ElicitationResponse construction ───────────────────────────────────
+
+    #[test]
+    fn elicitation_response_with_content() {
+        let response = ElicitationResponse {
+            action: ElicitationAction::Accept,
+            content: Some(serde_json::json!({"answer": "yes"})),
+        };
+        assert_eq!(response.action, ElicitationAction::Accept);
+        assert!(response.content.is_some());
+        assert_eq!(response.content.unwrap()["answer"], "yes");
+    }
+
+    #[test]
+    fn elicitation_response_without_content() {
+        let response = ElicitationResponse {
+            action: ElicitationAction::Cancel,
+            content: None,
+        };
+        assert_eq!(response.action, ElicitationAction::Cancel);
+        assert!(response.content.is_none());
+    }
+
+    // ── PendingElicitationMap insert/remove lifecycle ──────────────────────
+
+    #[tokio::test]
+    async fn pending_elicitation_map_insert_and_retrieve() {
+        let map: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+
+        {
+            let mut pending = map.lock().await;
+            pending.insert("elicit-1".to_string(), tx);
+        }
+
+        let has_entry = {
+            let pending = map.lock().await;
+            pending.contains_key("elicit-1")
+        };
+
+        assert!(has_entry);
+    }
+
+    #[tokio::test]
+    async fn pending_elicitation_map_remove_on_response() {
+        let map: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+
+        {
+            let mut pending = map.lock().await;
+            pending.insert("elicit-2".to_string(), tx);
+        }
+
+        // Simulate response
+        let tx = {
+            let mut pending = map.lock().await;
+            pending.remove("elicit-2")
+        };
+
+        assert!(tx.is_some());
+
+        let response = ElicitationResponse {
+            action: ElicitationAction::Accept,
+            content: Some(serde_json::json!({"data": "test"})),
+        };
+
+        tx.unwrap().send(response).unwrap();
+
+        let received = rx.await.unwrap();
+        assert_eq!(received.action, ElicitationAction::Accept);
+    }
 
     #[tokio::test]
     async fn take_sender_resolves_delegate_pending_elicitation() {
-        let (planner_registry, _planner_cfg_dir) = empty_plugin_registry().unwrap();
-        let planner_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
-        let planner = crate::agent::QueryMTAgent::new(
-            Arc::new(planner_registry),
-            planner_storage.session_store(),
-            LLMParams::new().provider("mock").model("mock-model"),
-        );
-
-        let (delegate_registry, _delegate_cfg_dir) = empty_plugin_registry().unwrap();
-        let delegate_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
-        let delegate = Arc::new(crate::agent::QueryMTAgent::new(
-            Arc::new(delegate_registry),
-            delegate_storage.session_store(),
-            LLMParams::new().provider("mock").model("mock-model"),
-        ));
-
-        let mut registry = DefaultAgentRegistry::new();
-        registry.register(
-            AgentInfo {
-                id: "coder".to_string(),
-                name: "Coder".to_string(),
-                description: "Delegate coder".to_string(),
-                capabilities: vec![],
-                required_capabilities: vec![],
-                meta: None,
-            },
-            delegate.clone(),
-        );
-        let planner = planner.with_agent_registry(Arc::new(registry));
+        let fixture = DelegateTestFixture::new().await.unwrap();
 
         let elicitation_id = "delegate-elicitation-1".to_string();
         let (tx, rx) = oneshot::channel();
-        delegate
+        fixture
+            .delegate
             .pending_elicitations()
             .lock()
             .await
             .insert(elicitation_id.clone(), tx);
 
-        let sender = take_pending_elicitation_sender(&planner, &elicitation_id)
+        let sender = take_pending_elicitation_sender(fixture.planner.as_ref(), &elicitation_id)
             .await
             .expect("delegate pending elicitation should be resolved");
 

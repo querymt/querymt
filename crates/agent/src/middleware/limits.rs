@@ -6,6 +6,7 @@ use crate::middleware::{
 use crate::model_info::{ModelInfoSource, get_model_info};
 use async_trait::async_trait;
 use log::{debug, trace};
+use parking_lot::Mutex;
 use querymt::providers::ModelPricing;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -94,7 +95,7 @@ impl LimitsConfig {
 /// - **Price**: Calculates cumulative cost based on token usage
 pub struct LimitsMiddleware {
     config: LimitsConfig,
-    last_model: std::sync::Mutex<Option<(String, String)>>,
+    last_model: Mutex<Option<(String, String)>>,
 }
 
 impl LimitsMiddleware {
@@ -106,7 +107,7 @@ impl LimitsMiddleware {
 
         Self {
             config,
-            last_model: std::sync::Mutex::new(None),
+            last_model: Mutex::new(None),
         }
     }
 
@@ -140,7 +141,7 @@ impl LimitsMiddleware {
 
     /// Check if provider changed (for logging/debugging)
     fn check_provider_changed(&self, context: &ConversationContext) {
-        let mut last = self.last_model.lock().unwrap();
+        let mut last = self.last_model.lock();
         let current = (context.provider.to_string(), context.model.to_string());
 
         if last.as_ref() != Some(&current) {
@@ -155,7 +156,11 @@ impl LimitsMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for LimitsMiddleware {
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "LimitsMiddleware::on_step_start entering state: {}",
             state.name()
@@ -220,7 +225,7 @@ impl MiddlewareDriver for LimitsMiddleware {
 
     fn reset(&self) {
         trace!("LimitsMiddleware::reset");
-        let mut last = self.last_model.lock().unwrap();
+        let mut last = self.last_model.lock();
         *last = None;
     }
 
@@ -251,7 +256,11 @@ impl MaxStepsMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for MaxStepsMiddleware {
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "MaxStepsMiddleware::on_step_start entering state: {}",
             state.name()
@@ -324,7 +333,11 @@ impl TurnLimitMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for TurnLimitMiddleware {
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "TurnLimitMiddleware::on_step_start entering state: {}",
             state.name()
@@ -413,7 +426,11 @@ impl PriceLimitMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for PriceLimitMiddleware {
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "PriceLimitMiddleware::on_step_start entering state: {}",
             state.name()
@@ -491,10 +508,11 @@ mod tests {
             stats,
             provider: "mock".into(),
             model: "mock-model".into(),
+            session_mode: crate::agent::core::AgentMode::Build,
         });
 
         let state = ExecutionState::BeforeLlmCall { context };
-        let result = middleware.on_step_start(state).await.unwrap();
+        let result = middleware.on_step_start(state, None).await.unwrap();
 
         assert!(matches!(
             result,
@@ -518,10 +536,11 @@ mod tests {
             stats,
             provider: "mock".into(),
             model: "mock-model".into(),
+            session_mode: crate::agent::core::AgentMode::Build,
         });
 
         let state = ExecutionState::BeforeLlmCall { context };
-        let result = middleware.on_step_start(state).await.unwrap();
+        let result = middleware.on_step_start(state, None).await.unwrap();
 
         assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
     }
@@ -572,7 +591,7 @@ impl MiddlewareFactory for LimitsFactory {
     fn create(
         &self,
         config: &serde_json::Value,
-        _agent: &crate::agent::core::QueryMTAgent,
+        _agent_config: &crate::agent::agent_config::AgentConfig,
     ) -> anyhow::Result<Arc<dyn MiddlewareDriver>> {
         let cfg: LimitsFactoryConfig = serde_json::from_value(config.clone())?;
 

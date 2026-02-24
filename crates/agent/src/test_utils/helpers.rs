@@ -1,9 +1,12 @@
 //! Helper functions for creating test fixtures
 
-use crate::agent::builder::AgentBuilderExt;
-use crate::agent::core::{QueryMTAgent, SnapshotPolicy};
+use crate::agent::AgentHandle;
+use crate::agent::agent_config_builder::AgentConfigBuilder;
+use crate::agent::core::SnapshotPolicy;
+use crate::delegation::DefaultAgentRegistry;
 use crate::middleware::{AgentStats, ConversationContext, ToolCall, ToolFunction};
 use crate::model::{AgentMessage, MessagePart};
+use crate::prelude::AgentInfo;
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
 use crate::session::sqlite_storage::SqliteStorage;
@@ -115,6 +118,7 @@ pub fn mock_llm_config() -> LLMConfig {
         params: None,
         created_at: Some(OffsetDateTime::now_utc()),
         updated_at: Some(OffsetDateTime::now_utc()),
+        provider_node_id: None,
     }
 }
 
@@ -164,7 +168,7 @@ pub struct UndoTestFixture {
     pub snapshot_base: TempDir,
     pub config_dir: TempDir,
     pub storage: Arc<SqliteStorage>,
-    pub agent: QueryMTAgent,
+    pub(crate) handle: AgentHandle,
     pub backend: GitSnapshotBackend,
 }
 
@@ -184,18 +188,24 @@ impl UndoTestFixture {
         let backend = GitSnapshotBackend::with_snapshot_base(snapshot_base_path.clone());
         let backend_arc = Arc::new(backend);
 
-        let agent = QueryMTAgent::new(registry, storage.session_store(), llm)
-            .with_snapshot_policy(SnapshotPolicy::Diff)
-            .with_snapshot_backend(backend_arc.clone());
+        let builder = AgentConfigBuilder::new(
+            registry,
+            storage.session_store(),
+            storage.event_journal(),
+            llm,
+        )
+        .with_snapshot_policy(SnapshotPolicy::Diff)
+        .with_snapshot_backend(backend_arc.clone());
 
-        agent.add_observer(storage.event_observer());
+        let config = Arc::new(builder.build());
+        let handle = AgentHandle::from_config(config);
 
         Ok(Self {
             worktree,
             snapshot_base,
             config_dir,
             storage,
-            agent,
+            handle,
             backend: GitSnapshotBackend::with_snapshot_base(snapshot_base_path),
         })
     }
@@ -208,8 +218,8 @@ impl UndoTestFixture {
             .create_session(None, Some(self.worktree.path().to_path_buf()), None, None)
             .await?;
 
-        // Create SessionRuntime for undo/redo to work
-        self.create_session_runtime(&session.public_id).await;
+        // Spawn a SessionActor via the kameo registry
+        self.register_session_actor(&session.public_id).await;
 
         Ok(session.public_id)
     }
@@ -227,29 +237,29 @@ impl UndoTestFixture {
             )
             .await?;
 
-        // Create SessionRuntime for undo/redo to work
-        self.create_session_runtime(&session.public_id).await;
+        // Spawn a SessionActor via the kameo registry
+        self.register_session_actor(&session.public_id).await;
 
         Ok(session.public_id)
     }
 
-    /// Helper to create a SessionRuntime entry for a session (needed for undo/redo)
-    async fn create_session_runtime(&self, session_id: &str) {
-        let runtime = Arc::new(crate::agent::core::SessionRuntime {
-            cwd: Some(self.worktree.path().to_path_buf()),
-            _mcp_services: std::collections::HashMap::new(),
-            mcp_tools: std::collections::HashMap::new(),
-            mcp_tool_defs: vec![],
-            permission_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            current_tools_hash: std::sync::Mutex::new(None),
-            function_index: Arc::new(tokio::sync::OnceCell::new()),
-            turn_snapshot: std::sync::Mutex::new(None),
-            turn_diffs: std::sync::Mutex::new(Default::default()),
-            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
+    /// Helper to spawn a SessionActor for a session (needed for undo/redo via kameo)
+    async fn register_session_actor(&self, session_id: &str) {
+        use crate::agent::session_actor::SessionActor;
+        use kameo::actor::Spawn;
 
-        let mut runtimes = self.agent.session_runtime.lock().await;
-        runtimes.insert(session_id.to_string(), runtime);
+        let runtime = crate::agent::core::SessionRuntime::new(
+            Some(self.worktree.path().to_path_buf()),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            vec![],
+        );
+
+        let actor = SessionActor::new(self.handle.config.clone(), session_id.to_string(), runtime);
+        let actor_ref = SessionActor::spawn(actor);
+
+        let mut registry = self.handle.registry.lock().await;
+        registry.insert(session_id.to_string(), actor_ref);
     }
 
     /// Simulate a user message and return its ID
@@ -344,5 +354,79 @@ impl UndoTestFixture {
     /// Convenience: read a file from the worktree
     pub fn read_file(&self, name: &str) -> Result<String> {
         Ok(std::fs::read_to_string(self.worktree.path().join(name))?)
+    }
+
+    /// Perform undo operation via AgentHandle
+    pub async fn undo(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<crate::agent::undo::UndoResult, crate::agent::undo::UndoError> {
+        self.handle.undo(session_id, message_id).await
+    }
+
+    /// Perform redo operation via AgentHandle
+    pub async fn redo(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::agent::undo::RedoResult, crate::agent::undo::UndoError> {
+        self.handle.redo(session_id).await
+    }
+}
+
+pub struct DelegateTestFixture {
+    pub planner: Arc<AgentHandle>,
+    pub planner_storage: Arc<dyn StorageBackend>,
+    pub delegate: Arc<AgentHandle>,
+    pub delegate_storage: Arc<dyn StorageBackend>,
+}
+
+impl DelegateTestFixture {
+    /// Creates a new test fixture with snapshot support enabled.
+    pub async fn new() -> Result<Self> {
+        let (delegate_registry, _delegate_cfg_dir) = empty_plugin_registry()?;
+        let delegate_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
+        let delegate_builder = AgentConfigBuilder::new(
+            Arc::new(delegate_registry),
+            delegate_storage.session_store(),
+            delegate_storage.event_journal(),
+            LLMParams::new().provider("mock").model("mock-model"),
+        );
+        let delegate_config = Arc::new(delegate_builder.build());
+        let delegate = Arc::new(crate::agent::AgentHandle::from_config(delegate_config));
+
+        let mut registry = DefaultAgentRegistry::new();
+        registry.register(
+            AgentInfo {
+                id: "coder".to_string(),
+                name: "Coder".to_string(),
+                description: "Delegate coder".to_string(),
+                capabilities: vec![],
+                required_capabilities: vec![],
+                meta: None,
+            },
+            delegate.clone(),
+        );
+
+        let (planner_registry, _config_dir) = empty_plugin_registry()?;
+        let planner_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
+
+        let builder = AgentConfigBuilder::new(
+            Arc::new(planner_registry),
+            planner_storage.session_store(),
+            planner_storage.event_journal(),
+            LLMParams::new().provider("mock").model("mock-model"),
+        )
+        .with_agent_registry(Arc::new(registry));
+        let planner = Arc::new(crate::agent::AgentHandle::from_config(
+            builder.build().into(),
+        ));
+
+        Ok(Self {
+            planner,
+            planner_storage,
+            delegate,
+            delegate_storage,
+        })
     }
 }

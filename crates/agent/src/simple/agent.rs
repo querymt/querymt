@@ -7,20 +7,18 @@ use super::utils::{default_registry, latest_assistant_message, to_absolute_path}
 use crate::acp::AcpTransport;
 use crate::acp::stdio::serve_stdio;
 use crate::acp::websocket::serve_websocket;
-use crate::agent::builder::AgentBuilderExt;
-use crate::agent::core::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
+use crate::agent::AgentHandle;
+use crate::agent::agent_config_builder::AgentConfigBuilder;
+use crate::agent::core::{SnapshotPolicy, ToolPolicy};
 use crate::config::{
-    CompactionConfig, MiddlewareEntry, PruningConfig, RateLimitConfig, SingleAgentConfig,
-    SkillsConfig, SnapshotBackendConfig, ToolOutputConfig,
+    ExecutionPolicy, McpServerConfig, MiddlewareEntry, SingleAgentConfig, SkillsConfig,
 };
-use crate::events::AgentEvent;
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
 use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
 #[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
-use crate::session::backend::StorageBackend;
-use crate::session::projection::ViewStore;
+use crate::session::backend::{StorageBackend, default_agent_db_path};
 use crate::session::sqlite_storage::SqliteStorage;
 use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
 use anyhow::{Result, anyhow};
@@ -31,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Type alias for middleware factory closures
-type MiddlewareFactory = Box<dyn FnOnce(&QueryMTAgent) -> Arc<dyn MiddlewareDriver> + Send>;
+type MiddlewareFactory = Box<dyn FnOnce(&AgentHandle) -> Arc<dyn MiddlewareDriver> + Send>;
 
 pub struct AgentBuilder {
     pub(super) llm_config: Option<LLMParams>,
@@ -39,14 +37,16 @@ pub struct AgentBuilder {
     pub(super) cwd: Option<PathBuf>,
     pub(super) snapshot_policy: SnapshotPolicy,
     pub(super) db_path: Option<PathBuf>,
+    assume_mutating: Option<bool>,
+    mutating_tools: Option<Vec<String>>,
     middleware_factories: Vec<MiddlewareFactory>,
     middleware_entries: Vec<MiddlewareEntry>,
-    tool_output_config: Option<ToolOutputConfig>,
-    pruning_config: Option<PruningConfig>,
-    compaction_config: Option<CompactionConfig>,
-    snapshot_backend_config: Option<SnapshotBackendConfig>,
-    rate_limit_config: Option<RateLimitConfig>,
+    execution: Option<ExecutionPolicy>,
     skills_config: Option<SkillsConfig>,
+    /// MCP servers from TOML `[[mcp]]` config, attached to every new session.
+    mcp_servers: Vec<McpServerConfig>,
+    /// Optional pre-built agent registry (Phase 7: injected by `from_single_config_with_registry`).
+    pub(super) agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
 }
 
 impl Default for AgentBuilder {
@@ -63,14 +63,14 @@ impl AgentBuilder {
             cwd: None,
             snapshot_policy: SnapshotPolicy::Diff,
             db_path: None,
+            assume_mutating: None,
+            mutating_tools: None,
             middleware_factories: Vec::new(),
             middleware_entries: Vec::new(),
-            tool_output_config: None,
-            pruning_config: None,
-            compaction_config: None,
-            snapshot_backend_config: None,
-            rate_limit_config: None,
+            execution: None,
             skills_config: None,
+            mcp_servers: Vec::new(),
+            agent_registry: None,
         }
     }
 
@@ -125,15 +125,17 @@ impl AgentBuilder {
     }
 
     /// Configure rate limit retry behavior
-    pub fn rate_limit_config(mut self, config: RateLimitConfig) -> Self {
-        self.rate_limit_config = Some(config);
+    pub fn rate_limit_config(mut self, config: crate::config::RateLimitConfig) -> Self {
+        self.execution
+            .get_or_insert_with(ExecutionPolicy::default)
+            .rate_limit = config;
         self
     }
 
     /// Add a middleware to the agent using a factory closure.
     ///
-    /// The closure receives a reference to the constructed `QueryMTAgent`,
-    /// allowing access to internal state like `session_runtime()` and `event_bus()`.
+    /// The closure receives a reference to the constructed `AgentHandle`,
+    /// allowing access to internal state.
     ///
     /// # Example
     ///
@@ -146,11 +148,10 @@ impl AgentBuilder {
     /// let agent = Agent::single()
     ///     .provider("openai", "gpt-4")
     ///     .cwd(".")
-    ///     .middleware(|agent| {
-    ///         DedupCheckMiddleware::new(agent.session_runtime())
+    ///     .middleware(|_agent| {
+    ///         DedupCheckMiddleware::new()
     ///             .threshold(0.8)
     ///             .min_lines(5)
-    ///             .with_event_bus(agent.event_bus())
     ///     })
     ///     .build()
     ///     .await?;
@@ -159,7 +160,7 @@ impl AgentBuilder {
     /// ```
     pub fn middleware<F, M>(mut self, factory: F) -> Self
     where
-        F: FnOnce(&QueryMTAgent) -> M + Send + 'static,
+        F: FnOnce(&AgentHandle) -> M + Send + 'static,
         M: MiddlewareDriver + 'static,
     {
         self.middleware_factories
@@ -187,13 +188,32 @@ impl AgentBuilder {
             .llm_config
             .ok_or_else(|| anyhow!("LLM configuration is required (call .provider() first)"))?;
 
-        let registry = Arc::new(default_registry().await?);
-        let backend =
-            SqliteStorage::connect(self.db_path.unwrap_or_else(|| PathBuf::from(":memory:")))
-                .await?;
-        let mut agent = QueryMTAgent::new(registry, backend.session_store(), llm_config)
-            .with_snapshot_policy(snapshot_policy);
-        agent.add_observer(backend.event_observer());
+        let plugin_registry = Arc::new(default_registry().await?);
+        let db_path = match self.db_path {
+            Some(path) => path,
+            None => default_agent_db_path()?,
+        };
+        let backend = SqliteStorage::connect(db_path).await?;
+
+        let mut builder = AgentConfigBuilder::new(
+            plugin_registry,
+            backend.session_store(),
+            backend.event_journal(),
+            llm_config,
+        )
+        .with_snapshot_policy(snapshot_policy);
+
+        // Phase 7: inject pre-populated agent registry (remote agents from config).
+        if let Some(registry) = self.agent_registry {
+            builder = builder.with_agent_registry(registry);
+        }
+
+        if let Some(assume_mutating) = self.assume_mutating {
+            builder = builder.with_assume_mutating(assume_mutating);
+        }
+        if let Some(mutating_tools) = self.mutating_tools {
+            builder = builder.with_mutating_tools(mutating_tools);
+        }
 
         // Initialize skills system if enabled
         if let Some(skills_config) = self.skills_config {
@@ -201,41 +221,32 @@ impl AgentBuilder {
                 use crate::skills::{SkillRegistry, SkillTool, default_search_paths};
                 use std::sync::Mutex;
 
-                // Determine project root for skill discovery
                 let project_root = cwd.as_deref().unwrap_or_else(|| std::path::Path::new("."));
-
-                // Build search paths from defaults + config
                 let mut search_paths = default_search_paths(project_root);
-
-                // Add custom configured paths with highest priority
                 for custom_path in &skills_config.paths {
                     search_paths.push(crate::skills::types::SkillSource::Configured(
                         custom_path.clone(),
                     ));
                 }
 
-                // Create registry and discover skills
                 let mut skill_registry = SkillRegistry::new();
                 match skill_registry
                     .load_from_sources(&search_paths, skills_config.include_external)
                 {
                     Ok(count) => {
                         if count > 0 {
-                            // Get compatible skill names for logging
                             let compatible_skills =
                                 skill_registry.compatible_with(&skills_config.agent_id);
                             let compatible_names: Vec<_> = compatible_skills
                                 .iter()
                                 .map(|s| s.metadata.name.clone())
                                 .collect();
-
                             log::info!(
                                 "Skills system initialized: {} skills discovered, {} compatible with agent '{}'",
                                 count,
                                 compatible_names.len(),
                                 skills_config.agent_id
                             );
-
                             if !compatible_names.is_empty() {
                                 log::debug!("Compatible skills: {}", compatible_names.join(", "));
                             }
@@ -254,75 +265,70 @@ impl AgentBuilder {
                     }
                 }
 
-                // Always register the skill tool, even if no skills are discovered yet
-                // This allows the agent to use the tool, and skills can be added later
                 let registry_arc = Arc::new(Mutex::new(skill_registry));
                 let skill_tool = SkillTool::new(
                     registry_arc,
                     Some(skills_config.agent_id.clone()),
                     Arc::new(skills_config.permissions.clone()),
                 );
-
-                agent
-                    .tool_registry
-                    .lock()
-                    .unwrap()
-                    .add(Arc::new(skill_tool));
+                builder.tool_registry_mut().add(Arc::new(skill_tool));
             } else {
                 log::debug!("Skills system disabled in configuration");
             }
         }
 
         if !self.tools.is_empty() {
-            agent = agent
-                .with_tool_policy(ToolPolicy::BuiltInOnly)
+            // Use BuiltInAndProvider when MCP servers are also configured so
+            // that MCP tool definitions reach the LLM.  With BuiltInOnly the
+            // collect_tools() gate strips them out entirely.
+            let policy = if !self.mcp_servers.is_empty() {
+                ToolPolicy::BuiltInAndProvider
+            } else {
+                ToolPolicy::BuiltInOnly
+            };
+            builder = builder
+                .with_tool_policy(policy)
                 .with_allowed_tools(self.tools.clone());
         }
 
-        // Thread through config fields that were previously silently dropped
-        if let Some(config) = self.tool_output_config {
-            agent = agent.with_tool_output_config(config);
-        }
-        if let Some(config) = self.pruning_config {
-            agent = agent.with_pruning_config(config);
-        }
-        if let Some(config) = self.compaction_config {
-            agent = agent.with_compaction_config(config);
-        }
-        if let Some(config) = self.rate_limit_config {
-            agent = agent.with_rate_limit_config(config);
+        if !self.mcp_servers.is_empty() {
+            builder = builder.with_mcp_servers(self.mcp_servers.clone());
         }
 
-        // Handle snapshot backend from config
-        if let Some(snapshot_config) = self.snapshot_backend_config {
-            match snapshot_config.backend.as_str() {
+        if let Some(exec) = self.execution {
+            use crate::config::RuntimeExecutionPolicy;
+            builder = builder.with_execution_policy(RuntimeExecutionPolicy::from(&exec));
+            match exec.snapshot.backend.as_str() {
                 "git" => {
                     use crate::snapshot::git::GitSnapshotBackend;
-                    agent = agent.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+                    builder = builder.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
                 }
-                "none" | "" => {
-                    // No backend - leave as default
-                }
+                "none" | "" => {}
                 other => {
                     log::warn!("Unknown snapshot backend '{}', ignoring", other);
                 }
             }
         }
 
-        // Apply middleware factories - each factory receives the agent and returns a middleware
+        // Build initial config for middleware factories (temporary handle)
+        let initial_config = Arc::new(builder.build());
+        let temp_handle = Arc::new(AgentHandle::from_config(initial_config.clone()));
+
+        // Apply middleware factories - each factory receives the handle
+        let mut middleware_drivers: Vec<Arc<dyn MiddlewareDriver>> = Vec::new();
         for factory in self.middleware_factories {
-            let middleware = factory(&agent);
-            agent.middleware_drivers.lock().unwrap().push(middleware);
+            let middleware = factory(&temp_handle);
+            middleware_drivers.push(middleware);
         }
 
         // Apply config-based middleware entries
         for entry in &self.middleware_entries {
-            match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &agent) {
+            match MIDDLEWARE_REGISTRY.create(&entry.middleware_type, &entry.config, &initial_config)
+            {
                 Ok(middleware) => {
-                    agent.middleware_drivers.lock().unwrap().push(middleware);
+                    middleware_drivers.push(middleware);
                 }
                 Err(e) => {
-                    // Skip if middleware is disabled, otherwise fail
                     let msg = e.to_string();
                     if !msg.contains("disabled") {
                         return Err(anyhow!(
@@ -336,25 +342,53 @@ impl AgentBuilder {
         }
 
         // Auto-add ContextMiddleware if compaction.auto is true and user didn't provide one
-        if agent.compaction_config.auto {
-            let mut drivers = agent.middleware_drivers.lock().unwrap();
-            let already_has = drivers.iter().any(|d| d.name() == "ContextMiddleware");
+        if initial_config.execution_policy.compaction.auto {
+            let already_has = middleware_drivers
+                .iter()
+                .any(|d| d.name() == "ContextMiddleware");
             if !already_has {
                 log::info!("Auto-enabling ContextMiddleware for compaction");
-                let context_middleware = crate::middleware::ContextMiddleware::new(
+                middleware_drivers.push(Arc::new(crate::middleware::ContextMiddleware::new(
                     crate::middleware::ContextConfig::default().auto_compact(true),
-                );
-                drivers.push(Arc::new(context_middleware));
+                )));
             }
         }
 
-        let view_store = backend
-            .view_store()
-            .expect("SqliteStorage always provides ViewStore");
+        // Build final AgentConfig with all middleware appended
+        let final_config = Arc::new(crate::agent::AgentConfig {
+            provider: initial_config.provider.clone(),
+
+            event_sink: initial_config.event_sink.clone(),
+            agent_registry: initial_config.agent_registry.clone(),
+            workspace_manager_actor: initial_config.workspace_manager_actor.clone(),
+            default_mode: initial_config.default_mode.clone(),
+            tool_config: initial_config.tool_config.clone(),
+            tool_registry: initial_config.tool_registry.clone(),
+            middleware_drivers,
+            auth_methods: initial_config.auth_methods.clone(),
+            max_steps: initial_config.max_steps,
+            snapshot_policy: initial_config.snapshot_policy,
+            assume_mutating: initial_config.assume_mutating,
+            mutating_tools: initial_config.mutating_tools.clone(),
+            max_prompt_bytes: initial_config.max_prompt_bytes,
+            execution_timeout_secs: initial_config.execution_timeout_secs,
+            delegation_wait_policy: initial_config.delegation_wait_policy.clone(),
+            delegation_wait_timeout_secs: initial_config.delegation_wait_timeout_secs,
+            delegation_cancel_grace_secs: initial_config.delegation_cancel_grace_secs,
+            execution_policy: initial_config.execution_policy.clone(),
+            compaction: initial_config.compaction.clone(),
+            snapshot_backend: initial_config.snapshot_backend.clone(),
+            snapshot_gc_config: initial_config.snapshot_gc_config.clone(),
+            delegation_context_config: initial_config.delegation_context_config.clone(),
+            pending_elicitations: initial_config.pending_elicitations.clone(),
+            mcp_servers: initial_config.mcp_servers.clone(),
+        });
+
+        let handle = Arc::new(AgentHandle::from_config(final_config));
 
         Ok(Agent {
-            inner: Arc::new(agent),
-            view_store,
+            inner: handle,
+            storage: Arc::new(backend),
             default_session_id: Arc::new(Mutex::new(None)),
             cwd,
             callbacks: Arc::new(EventCallbacksState::new(None)),
@@ -363,9 +397,9 @@ impl AgentBuilder {
 }
 
 pub struct Agent {
-    pub(super) inner: Arc<QueryMTAgent>,
+    pub(super) inner: Arc<AgentHandle>,
     #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
-    pub(super) view_store: Arc<dyn ViewStore>,
+    pub(super) storage: Arc<dyn StorageBackend>,
     default_session_id: Arc<Mutex<Option<String>>>,
     pub(super) cwd: Option<PathBuf>,
     callbacks: Arc<EventCallbacksState>,
@@ -378,6 +412,15 @@ impl Agent {
 
     pub fn multi() -> QuorumBuilder {
         QuorumBuilder::new()
+    }
+
+    /// Access the underlying `AgentHandle` for advanced configuration.
+    ///
+    /// The handle provides access to the session registry, event bus, and agent config.
+    /// Use this when you need to interact with sessions directly or integrate with
+    /// the kameo mesh (e.g., bootstrapping `RemoteNodeManager`).
+    pub fn handle(&self) -> Arc<AgentHandle> {
+        self.inner.clone()
     }
 
     pub async fn chat(&self, prompt: &str) -> Result<String> {
@@ -408,7 +451,7 @@ impl Agent {
         Ok(())
     }
 
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
         self.inner.subscribe_events()
     }
 
@@ -464,11 +507,7 @@ impl Agent {
 
     #[cfg(feature = "dashboard")]
     pub fn dashboard(&self) -> AgentServer {
-        AgentServer::new(
-            self.inner.clone(),
-            self.view_store.clone(),
-            self.cwd.clone(),
-        )
+        AgentServer::new(self.inner.clone(), self.storage.clone(), self.cwd.clone())
     }
 
     /// Start an ACP server with the specified transport.
@@ -516,7 +555,7 @@ impl Agent {
         }
     }
 
-    pub fn inner(&self) -> Arc<QueryMTAgent> {
+    pub fn inner(&self) -> Arc<AgentHandle> {
         self.inner.clone()
     }
 
@@ -553,6 +592,7 @@ impl Agent {
             .map_err(|e| anyhow!(e.to_string()))?;
         let history = self
             .inner
+            .config
             .provider
             .history_store()
             .get_history(session_id)
@@ -563,6 +603,41 @@ impl Agent {
 
     /// Build an Agent from a single agent config
     pub async fn from_single_config(config: SingleAgentConfig) -> Result<Self> {
+        let builder = Self::builder_from_config(config, None)?;
+        builder.build().await
+    }
+
+    /// Build an Agent from a single agent config, optionally injecting a pre-populated
+    /// agent registry (Phase 7: for remote agents discovered from `[[remote_agents]]`).
+    ///
+    /// When `initial_registry` is `Some`, it is used as the agent registry instead of the
+    /// default empty `DefaultAgentRegistry`.  When `mesh` is `Some`, the `MeshHandle` is
+    /// stored on the resulting `AgentHandle` via `set_mesh()`. `mesh_auto_fallback`
+    /// controls whether `provider_node_id = None` may resolve providers from mesh peers.
+    #[cfg(feature = "remote")]
+    pub async fn from_single_config_with_registry(
+        config: SingleAgentConfig,
+        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+        mesh: Option<crate::agent::remote::MeshHandle>,
+        mesh_auto_fallback: bool,
+    ) -> Result<Self> {
+        let builder = Self::builder_from_config(config, initial_registry)?;
+        let agent = builder.build().await?;
+
+        agent.inner.set_mesh_fallback(mesh_auto_fallback);
+
+        if let Some(mesh) = mesh {
+            agent.inner.set_mesh(mesh);
+        }
+
+        Ok(agent)
+    }
+
+    /// Shared helper: configure an `AgentBuilder` from a `SingleAgentConfig`.
+    fn builder_from_config(
+        config: SingleAgentConfig,
+        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+    ) -> Result<AgentBuilder> {
         let mut builder = AgentBuilder::new()
             .provider(config.agent.provider, config.agent.model)
             .tools(config.agent.tools);
@@ -586,6 +661,13 @@ impl Agent {
         if let Some(db) = config.agent.db {
             builder.db_path = Some(db);
         }
+        builder.assume_mutating = Some(config.agent.assume_mutating);
+        builder.mutating_tools = Some(config.agent.mutating_tools);
+
+        // Inject pre-populated registry (Phase 7).
+        if let Some(registry) = initial_registry {
+            builder.agent_registry = Some(registry);
+        }
 
         // Apply middleware from config
         if !config.middleware.is_empty() {
@@ -593,14 +675,15 @@ impl Agent {
         }
 
         // Thread through config fields that were previously silently dropped
-        builder.tool_output_config = Some(config.agent.tool_output);
-        builder.pruning_config = Some(config.agent.pruning);
-        builder.compaction_config = Some(config.agent.compaction);
-        builder.snapshot_backend_config = Some(config.agent.snapshot);
-        builder.rate_limit_config = Some(config.agent.rate_limit);
+        builder.execution = Some(config.agent.execution);
         builder.skills_config = Some(config.agent.skills);
 
-        builder.build().await
+        // Wire MCP servers from TOML `[[mcp]]` config.
+        if !config.mcp.is_empty() {
+            builder.mcp_servers = config.mcp;
+        }
+
+        Ok(builder)
     }
 }
 
@@ -615,7 +698,7 @@ impl ChatRunner for Agent {
         Ok(Box::new(session))
     }
 
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
         Agent::subscribe(self)
     }
 

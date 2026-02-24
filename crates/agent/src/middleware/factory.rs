@@ -15,7 +15,7 @@
 //!
 //! The registry will look up the "dedup_check" factory and pass the config to it.
 
-use crate::agent::core::QueryMTAgent;
+use crate::agent::agent_config::AgentConfig;
 use crate::middleware::MiddlewareDriver;
 use anyhow::Result;
 use once_cell::sync::Lazy;
@@ -34,8 +34,13 @@ pub trait MiddlewareFactory: Send + Sync {
     /// Create middleware instance from raw JSON config
     ///
     /// The config value contains all fields from the TOML section except "type".
+    /// `agent_config` provides shared agent configuration and infrastructure.
     /// Returns an error if the middleware is disabled or config is invalid.
-    fn create(&self, config: &Value, agent: &QueryMTAgent) -> Result<Arc<dyn MiddlewareDriver>>;
+    fn create(
+        &self,
+        config: &Value,
+        agent_config: &AgentConfig,
+    ) -> Result<Arc<dyn MiddlewareDriver>>;
 }
 
 /// Global middleware registry (lazy singleton)
@@ -86,13 +91,13 @@ impl MiddlewareRegistry {
         &self,
         type_name: &str,
         config: &Value,
-        agent: &QueryMTAgent,
+        agent_config: &AgentConfig,
     ) -> Result<Arc<dyn MiddlewareDriver>> {
         let factory = self
             .factories
             .get(type_name)
             .ok_or_else(|| anyhow::anyhow!("Unknown middleware type: {}", type_name))?;
-        factory.create(config, agent)
+        factory.create(config, agent_config)
     }
 
     /// List all registered middleware type names

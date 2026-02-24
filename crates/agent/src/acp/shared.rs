@@ -4,15 +4,19 @@
 //! ACP server implementations, including JSON-RPC types, event translation, and
 //! RPC message handling.
 
-use crate::agent::QueryMTAgent;
-use crate::event_bus::EventBus;
-use crate::events::{AgentEvent, AgentEventKind};
+use crate::agent::AgentHandle;
+use crate::agent::core::AgentMode;
+use crate::event_fanout::EventFanout;
+use crate::events::{AgentEventKind, EventEnvelope};
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
 use agent_client_protocol::{
     Content, ContentBlock, ContentChunk, Error, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, RequestPermissionOutcome, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    PlanEntryStatus, RequestPermissionOutcome, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, TextContent,
+    ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind,
 };
 use agent_client_protocol_schema::AGENT_METHOD_NAMES;
 use serde::{Deserialize, Serialize};
@@ -51,7 +55,7 @@ pub struct RpcResponse {
 /// Translate an internal agent event to a JSON-RPC notification.
 ///
 /// Returns `None` if the event should not be sent to the client.
-pub fn translate_event_to_notification(event: &AgentEvent) -> Option<serde_json::Value> {
+pub fn translate_event_to_notification(event: &EventEnvelope) -> Option<serde_json::Value> {
     // Handle ElicitationRequested specially - it's a custom notification, not a session/update
     if let AgentEventKind::ElicitationRequested {
         elicitation_id,
@@ -59,7 +63,7 @@ pub fn translate_event_to_notification(event: &AgentEvent) -> Option<serde_json:
         message,
         requested_schema,
         source,
-    } = &event.kind
+    } = event.kind()
     {
         return Some(serde_json::json!({
             "jsonrpc": "2.0",
@@ -74,7 +78,7 @@ pub fn translate_event_to_notification(event: &AgentEvent) -> Option<serde_json:
         }));
     }
 
-    let session_id = event.session_id.clone();
+    let session_id = event.session_id().to_owned();
     let update = translate_event_to_update(event)?;
 
     Some(serde_json::json!({
@@ -90,8 +94,8 @@ pub fn translate_event_to_notification(event: &AgentEvent) -> Option<serde_json:
 /// Translate an agent event to a SessionUpdate.
 ///
 /// Returns `None` if the event should not be sent to the client.
-pub fn translate_event_to_update(event: &AgentEvent) -> Option<SessionUpdate> {
-    match &event.kind {
+pub fn translate_event_to_update(event: &EventEnvelope) -> Option<SessionUpdate> {
+    match event.kind() {
         AgentEventKind::PromptReceived { content, .. } => Some(SessionUpdate::UserMessageChunk(
             ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone()))),
         )),
@@ -103,6 +107,17 @@ pub fn translate_event_to_update(event: &AgentEvent) -> Option<SessionUpdate> {
                 ContentBlock::Text(TextContent::new(content.clone())),
             )))
         }
+        // Streaming text deltas: forward to ACP clients so they also benefit from streaming.
+        AgentEventKind::AssistantContentDelta { content, .. } => {
+            if content.is_empty() {
+                return None;
+            }
+            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                ContentBlock::Text(TextContent::new(content.clone())),
+            )))
+        }
+        // Thinking/reasoning deltas: ACP has no thinking content type yet — drop.
+        AgentEventKind::AssistantThinkingDelta { .. } => None,
         AgentEventKind::ToolCallStart {
             tool_call_id,
             tool_name,
@@ -224,7 +239,7 @@ pub fn tool_kind_for_tool(name: &str) -> ToolKind {
 pub async fn is_event_owned(
     session_owners: &SessionOwnerMap,
     conn_id: &str,
-    event: &AgentEvent,
+    event: &EventEnvelope,
 ) -> bool {
     // Handle session forking - propagate ownership to child sessions
     if let AgentEventKind::SessionForked {
@@ -232,7 +247,7 @@ pub async fn is_event_owned(
         child_session_id,
         origin,
         ..
-    } = &event.kind
+    } = event.kind()
         && matches!(origin, ForkOrigin::Delegation)
     {
         let mut owners = session_owners.lock().await;
@@ -244,45 +259,129 @@ pub async fn is_event_owned(
     // Check if this connection owns the session
     let owners = session_owners.lock().await;
     owners
-        .get(&event.session_id)
+        .get(event.session_id())
         .map(|owner| owner == conn_id)
         .unwrap_or(false)
 }
 
-/// Collect EventBus sources from agent and all delegate agents.
+/// Collect EventFanout sources from agent and all delegate agents.
 ///
-/// This function collects the EventBus from the main agent and recursively
-/// collects EventBuses from all registered delegate agents. Each EventBus is
+/// This function collects the EventFanout from the main agent and recursively
+/// collects EventFanouts from all registered delegate agents. Each EventFanout is
 /// deduplicated by pointer address to avoid subscribing multiple times.
 ///
 /// # Arguments
-/// * `agent` - The main agent to collect EventBuses from
+/// * `agent` - The main agent to collect EventFanout sources from
 ///
 /// # Returns
-/// A vector of unique EventBus instances
-pub fn collect_event_sources(agent: &Arc<QueryMTAgent>) -> Vec<Arc<EventBus>> {
+/// A vector of unique EventFanout instances
+pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<EventFanout>> {
     let mut sources = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    let primary = agent.event_bus();
+    let primary = agent.config.event_sink.fanout().clone();
     if seen.insert(Arc::as_ptr(&primary) as usize) {
         sources.push(primary);
     }
 
     let registry = agent.agent_registry();
     for info in registry.list_agents() {
-        if let Some(instance) = registry.get_agent_instance(&info.id)
-            && let Some(bus) = instance
+        if let Some(instance) = registry.get_agent_instance(&info.id) {
+            // Downcast to AgentHandle to get its event fanout
+            if let Some(fanout) = instance
                 .as_any()
-                .downcast_ref::<QueryMTAgent>()
-                .map(|agent| agent.event_bus())
-            && seen.insert(Arc::as_ptr(&bus) as usize)
-        {
-            sources.push(bus);
+                .downcast_ref::<AgentHandle>()
+                .map(|agent| agent.config.event_sink.fanout().clone())
+                && seen.insert(Arc::as_ptr(&fanout) as usize)
+            {
+                sources.push(fanout);
+            }
         }
     }
 
     sources
+}
+
+fn session_config_options(mode: AgentMode) -> Vec<SessionConfigOption> {
+    vec![
+        SessionConfigOption::select(
+            "mode",
+            "Session Mode",
+            mode.as_str(),
+            vec![
+                SessionConfigSelectOption::new("build", "Build")
+                    .description("Full read/write mode"),
+                SessionConfigSelectOption::new("plan", "Plan")
+                    .description("Read-only planning mode"),
+                SessionConfigSelectOption::new("review", "Review")
+                    .description("Read-only review mode"),
+            ],
+        )
+        .description("Controls how the agent operates for this session")
+        .category(SessionConfigOptionCategory::Mode),
+    ]
+}
+
+async fn set_mode_for_session<S: SendAgent>(
+    agent: &S,
+    session_id: &str,
+    mode: AgentMode,
+) -> Result<(), Error> {
+    let Some(handle) = agent.as_any().downcast_ref::<AgentHandle>() else {
+        return Err(Error::internal_error().data("set_mode requires AgentHandle"));
+    };
+
+    let session_ref = {
+        let registry = handle.registry.lock().await;
+        registry.get(session_id).cloned().ok_or_else(|| {
+            Error::invalid_params().data(serde_json::json!({
+                "message": "unknown session",
+                "sessionId": session_id,
+            }))
+        })?
+    };
+
+    session_ref.set_mode(mode).await.map_err(Error::from)
+}
+
+async fn handle_set_session_mode<S: SendAgent>(
+    agent: &S,
+    params: SetSessionModeRequest,
+) -> Result<serde_json::Value, Error> {
+    let mode = params.mode_id.0.parse::<AgentMode>().map_err(|e| {
+        Error::invalid_params().data(serde_json::json!({
+            "error": e,
+        }))
+    })?;
+
+    set_mode_for_session(agent, &params.session_id.0, mode).await?;
+    Ok(serde_json::to_value(SetSessionModeResponse::new()).unwrap())
+}
+
+async fn handle_set_session_config_option<S: SendAgent>(
+    agent: &S,
+    params: SetSessionConfigOptionRequest,
+) -> Result<serde_json::Value, Error> {
+    if params.config_id.0.as_ref() != "mode" {
+        return Err(Error::invalid_params().data(serde_json::json!({
+            "error": format!("Unsupported configId: {}", params.config_id.0),
+        })));
+    }
+
+    let mode = params.value.0.parse::<AgentMode>().map_err(|e| {
+        Error::invalid_params().data(serde_json::json!({
+            "error": e,
+        }))
+    })?;
+
+    set_mode_for_session(agent, &params.session_id.0, mode).await?;
+
+    Ok(
+        serde_json::to_value(SetSessionConfigOptionResponse::new(session_config_options(
+            mode,
+        )))
+        .unwrap(),
+    )
 }
 
 /// Handle an RPC request and return a response.
@@ -349,36 +448,69 @@ pub async fn handle_rpc_message<S: SendAgent>(
                 Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
             }
         },
-        m if m == AGENT_METHOD_NAMES.session_fork => {
-            log::warn!("session/fork not yet implemented");
-            Err(Error::new(-32601, "session/fork not implemented yet"))
-        }
-        m if m == AGENT_METHOD_NAMES.session_list => {
-            log::warn!("session/list not yet implemented");
-            Err(Error::new(-32601, "session/list not implemented yet"))
-        }
-        m if m == AGENT_METHOD_NAMES.session_load => {
-            log::warn!("session/load not yet implemented");
-            Err(Error::new(-32601, "session/load not implemented yet"))
-        }
-        m if m == AGENT_METHOD_NAMES.session_resume => {
-            log::warn!("session/resume not yet implemented");
-            Err(Error::new(-32601, "session/resume not implemented yet"))
-        }
+        m if m == AGENT_METHOD_NAMES.session_fork => match serde_json::from_value(req.params) {
+            Ok(params) => agent
+                .fork_session(params)
+                .await
+                .map(|r| serde_json::to_value(r).unwrap()),
+            Err(e) => {
+                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+            }
+        },
+        m if m == AGENT_METHOD_NAMES.session_list => match serde_json::from_value(req.params) {
+            Ok(params) => agent
+                .list_sessions(params)
+                .await
+                .map(|r| serde_json::to_value(r).unwrap()),
+            Err(e) => {
+                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+            }
+        },
+        m if m == AGENT_METHOD_NAMES.session_load => match serde_json::from_value(req.params) {
+            Ok(params) => {
+                let response = agent.load_session(params).await;
+                match response {
+                    Ok(r) => Ok(serde_json::to_value(r).unwrap()),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => {
+                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+            }
+        },
+        m if m == AGENT_METHOD_NAMES.session_resume => match serde_json::from_value(req.params) {
+            Ok(params) => agent
+                .resume_session(params)
+                .await
+                .map(|r| serde_json::to_value(r).unwrap()),
+            Err(e) => {
+                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+            }
+        },
         m if m == AGENT_METHOD_NAMES.session_set_config_option => {
-            log::warn!("session/set_config_option not implemented yet");
-            Err(Error::new(
-                -32601,
-                "session/set_config_option not implemented yet",
-            ))
+            match serde_json::from_value(req.params) {
+                Ok(params) => handle_set_session_config_option(agent, params).await,
+                Err(e) => {
+                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                }
+            }
         }
-        m if m == AGENT_METHOD_NAMES.session_set_mode => {
-            log::warn!("session/set_mode not yet implemented");
-            Err(Error::new(-32601, "session/set_mode not implemented yet"))
-        }
+        m if m == AGENT_METHOD_NAMES.session_set_mode => match serde_json::from_value(req.params) {
+            Ok(params) => handle_set_session_mode(agent, params).await,
+            Err(e) => {
+                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+            }
+        },
         m if m == AGENT_METHOD_NAMES.session_set_model => {
-            log::warn!("session/set_model not yet implemented");
-            Err(Error::new(-32601, "session/set_model not implemented yet"))
+            match serde_json::from_value(req.params) {
+                Ok(params) => agent
+                    .set_session_model(params)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap()),
+                Err(e) => {
+                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                }
+            }
         }
 
         "permission_result" => {
@@ -394,10 +526,8 @@ pub async fn handle_rpc_message<S: SendAgent>(
                         let _ = tx.send(params.outcome);
                         Ok(serde_json::Value::Null)
                     } else {
-                        Err(Error::new(
-                            -32000,
-                            "No pending permission for this tool_call_id",
-                        ))
+                        Err(Error::internal_error()
+                            .data("No pending permission for this tool_call_id"))
                     }
                 }
                 Err(e) => {
@@ -439,7 +569,7 @@ pub async fn handle_rpc_message<S: SendAgent>(
 
                             if tx.is_none()
                                 && let Some(query_agent) =
-                                    agent.as_any().downcast_ref::<QueryMTAgent>()
+                                    agent.as_any().downcast_ref::<AgentHandle>()
                             {
                                 tx = crate::elicitation::take_pending_elicitation_sender(
                                     query_agent,
@@ -452,10 +582,8 @@ pub async fn handle_rpc_message<S: SendAgent>(
                                 let _ = tx.send(response);
                                 Ok(serde_json::Value::Null)
                             } else {
-                                Err(Error::new(
-                                    -32000,
-                                    "No pending elicitation for this elicitation_id",
-                                ))
+                                Err(Error::internal_error()
+                                    .data("No pending elicitation for this elicitation_id"))
                             }
                         }
                         Err(e) => Err(e),
@@ -489,44 +617,45 @@ pub async fn handle_rpc_message<S: SendAgent>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::builder::AgentBuilderExt;
-    use crate::delegation::{AgentInfo, DefaultAgentRegistry};
     use crate::elicitation::ElicitationAction;
-    use crate::events::AgentEventKind;
-    use crate::session::backend::StorageBackend;
-    use crate::session::sqlite_storage::SqliteStorage;
-    use crate::test_utils::empty_plugin_registry;
-    use querymt::LLMParams;
+    use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
+    use crate::test_utils::DelegateTestFixture;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio::sync::oneshot;
 
-    fn tool_start_event(tool_name: &str, arguments: serde_json::Value) -> AgentEvent {
-        AgentEvent {
-            seq: 1,
+    fn tool_start_event(tool_name: &str, arguments: serde_json::Value) -> EventEnvelope {
+        EventEnvelope::Durable(DurableEvent {
+            event_id: "evt-1".into(),
+            stream_seq: 1,
             timestamp: 0,
             session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::ToolCallStart {
                 tool_call_id: "tc-1".to_string(),
                 tool_name: tool_name.to_string(),
                 arguments: arguments.to_string(),
             },
-        }
+        })
     }
 
-    fn tool_end_event(tool_name: &str) -> AgentEvent {
-        AgentEvent {
-            seq: 2,
+    fn tool_end_event(tool_name: &str) -> EventEnvelope {
+        EventEnvelope::Durable(DurableEvent {
+            event_id: "evt-2".into(),
+            stream_seq: 2,
             timestamp: 0,
             session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::ToolCallEnd {
                 tool_call_id: "tc-1".to_string(),
                 tool_name: tool_name.to_string(),
                 result: "{}".to_string(),
                 is_error: false,
             },
-        }
+        })
     }
 
     #[test]
@@ -577,16 +706,19 @@ mod tests {
 
     #[test]
     fn malformed_todowrite_arguments_do_not_emit_update() {
-        let event = AgentEvent {
-            seq: 1,
+        let event = EventEnvelope::Durable(DurableEvent {
+            event_id: "evt-3".into(),
+            stream_seq: 1,
             timestamp: 0,
             session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::ToolCallStart {
                 tool_call_id: "tc-1".to_string(),
                 tool_name: "todowrite".to_string(),
                 arguments: "{ not-json".to_string(),
             },
-        };
+        });
 
         assert!(translate_event_to_update(&event).is_none());
     }
@@ -612,41 +744,121 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn mode_config_option_contains_expected_shape() {
+        let options = session_config_options(AgentMode::Plan);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].id.0.as_ref(), "mode");
+        assert_eq!(options[0].category, Some(SessionConfigOptionCategory::Mode));
+
+        let select = match &options[0].kind {
+            agent_client_protocol::SessionConfigKind::Select(select) => select,
+            _ => panic!("expected select config option"),
+        };
+        assert_eq!(select.current_value.0.as_ref(), "plan");
+    }
+
+    #[test]
+    fn set_config_option_rejects_unknown_config_id() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            struct Dummy;
+
+            #[async_trait::async_trait]
+            impl SendAgent for Dummy {
+                async fn initialize(
+                    &self,
+                    _req: agent_client_protocol::InitializeRequest,
+                ) -> Result<agent_client_protocol::InitializeResponse, Error> {
+                    unreachable!()
+                }
+                async fn authenticate(
+                    &self,
+                    _req: agent_client_protocol::AuthenticateRequest,
+                ) -> Result<agent_client_protocol::AuthenticateResponse, Error> {
+                    unreachable!()
+                }
+                async fn new_session(
+                    &self,
+                    _req: agent_client_protocol::NewSessionRequest,
+                ) -> Result<agent_client_protocol::NewSessionResponse, Error> {
+                    unreachable!()
+                }
+                async fn prompt(
+                    &self,
+                    _req: agent_client_protocol::PromptRequest,
+                ) -> Result<agent_client_protocol::PromptResponse, Error> {
+                    unreachable!()
+                }
+                async fn cancel(
+                    &self,
+                    _notif: agent_client_protocol::CancelNotification,
+                ) -> Result<(), Error> {
+                    unreachable!()
+                }
+                async fn load_session(
+                    &self,
+                    _req: agent_client_protocol::LoadSessionRequest,
+                ) -> Result<agent_client_protocol::LoadSessionResponse, Error> {
+                    unreachable!()
+                }
+                async fn list_sessions(
+                    &self,
+                    _req: agent_client_protocol::ListSessionsRequest,
+                ) -> Result<agent_client_protocol::ListSessionsResponse, Error> {
+                    unreachable!()
+                }
+                async fn fork_session(
+                    &self,
+                    _req: agent_client_protocol::ForkSessionRequest,
+                ) -> Result<agent_client_protocol::ForkSessionResponse, Error> {
+                    unreachable!()
+                }
+                async fn resume_session(
+                    &self,
+                    _req: agent_client_protocol::ResumeSessionRequest,
+                ) -> Result<agent_client_protocol::ResumeSessionResponse, Error> {
+                    unreachable!()
+                }
+                async fn set_session_model(
+                    &self,
+                    _req: agent_client_protocol::SetSessionModelRequest,
+                ) -> Result<agent_client_protocol::SetSessionModelResponse, Error> {
+                    unreachable!()
+                }
+                async fn ext_method(
+                    &self,
+                    _req: agent_client_protocol::ExtRequest,
+                ) -> Result<agent_client_protocol::ExtResponse, Error> {
+                    unreachable!()
+                }
+                async fn ext_notification(
+                    &self,
+                    _notif: agent_client_protocol::ExtNotification,
+                ) -> Result<(), Error> {
+                    unreachable!()
+                }
+                fn as_any(&self) -> &dyn std::any::Any {
+                    self
+                }
+            }
+
+            let req = SetSessionConfigOptionRequest::new("s-1", "other", "plan");
+            let err = handle_set_session_config_option(&Dummy, req)
+                .await
+                .expect_err("expected invalid config id");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+        });
+    }
+
     #[tokio::test]
     async fn elicitation_result_routes_to_delegate_pending_map() {
-        let (planner_registry, _planner_cfg_dir) = empty_plugin_registry().unwrap();
-        let planner_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
-        let planner = QueryMTAgent::new(
-            Arc::new(planner_registry),
-            planner_storage.session_store(),
-            LLMParams::new().provider("mock").model("mock"),
-        );
-
-        let (delegate_registry, _delegate_cfg_dir) = empty_plugin_registry().unwrap();
-        let delegate_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
-        let delegate = Arc::new(QueryMTAgent::new(
-            Arc::new(delegate_registry),
-            delegate_storage.session_store(),
-            LLMParams::new().provider("mock").model("mock"),
-        ));
-
-        let mut registry = DefaultAgentRegistry::new();
-        registry.register(
-            AgentInfo {
-                id: "coder".to_string(),
-                name: "Coder".to_string(),
-                description: "Delegate".to_string(),
-                capabilities: vec![],
-                required_capabilities: vec![],
-                meta: None,
-            },
-            delegate.clone(),
-        );
-        let planner = planner.with_agent_registry(Arc::new(registry));
+        let fixture = DelegateTestFixture::new().await.unwrap();
 
         let elicitation_id = "delegate-elicitation-rpc".to_string();
         let (tx, rx) = oneshot::channel();
-        delegate
+        fixture
+            .delegate
             .pending_elicitations()
             .lock()
             .await
@@ -654,10 +866,10 @@ mod tests {
 
         let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
-        let pending_elicitations = planner.pending_elicitations();
+        let pending_elicitations = fixture.planner.pending_elicitations();
 
         let response = handle_rpc_message(
-            &planner,
+            fixture.planner.as_ref(),
             &session_owners,
             &pending_permissions,
             &pending_elicitations,

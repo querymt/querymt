@@ -2,6 +2,15 @@ use std::path::Path;
 
 pub const DEFAULT_READ_LIMIT: usize = 2000;
 
+/// Detect if bytes represent a supported image format.
+pub(crate) fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    let kind = infer::get(bytes)?;
+    match kind.mime_type() {
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" => Some(kind.mime_type()),
+        _ => None,
+    }
+}
+
 /// Render read output in the canonical XML-like format used by read_tool.
 pub async fn render_read_output(
     target: &Path,

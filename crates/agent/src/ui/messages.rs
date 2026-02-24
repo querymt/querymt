@@ -3,7 +3,7 @@
 //! Contains all message types exchanged between the UI client and server,
 //! as well as supporting DTOs for sessions, models, and agents.
 
-use crate::events::AgentEvent;
+use crate::events::EventEnvelope;
 use crate::index::FileIndexEntry;
 use crate::session::projection::AuditView;
 use serde::{Deserialize, Serialize};
@@ -41,11 +41,37 @@ pub enum RoutingMode {
     Broadcast,
 }
 
-/// Cached model list entry.
+/// Cached model list entry with canonical identity.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelEntry {
+    /// Canonical internal identifier (e.g., "hf:repo:file.gguf", "file:/path/to/model.gguf", or provider-specific ID)
+    pub id: String,
+    /// Human-readable display label
+    pub label: String,
+    /// Model source: "preset", "cached", "custom", "catalog"
+    pub source: String,
+    /// Provider name
     pub provider: String,
+    /// Original model identifier (for backwards compatibility)
     pub model: String,
+    /// Stable node id where this provider lives. `None` = local node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Human-readable node label for display purposes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_label: Option<String>,
+    /// Model family/repo for grouping (e.g., "Qwen2.5-Coder-32B-Instruct")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// Quantization level (e.g., "Q8_0", "Q6_K", "unknown")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quant: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderCapabilityEntry {
+    pub provider: String,
+    pub supports_custom_models: bool,
 }
 
 /// Recent model usage entry from event history.
@@ -89,6 +115,23 @@ pub struct SessionSummary {
     pub fork_origin: Option<String>,
     /// Whether this session has child sessions
     pub has_children: bool,
+    /// Node label where this session lives. "local" for local sessions,
+    /// peer hostname/label for remote sessions (display only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+}
+
+/// Information about a remote node discovered in the kameo mesh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteNodeInfo {
+    /// Stable mesh node id (PeerId string).
+    pub id: String,
+    /// Human-readable label / hostname
+    pub label: String,
+    /// Node capabilities
+    pub capabilities: Vec<String>,
+    /// Number of active sessions on the node
+    pub active_sessions: usize,
 }
 
 /// Group of sessions by working directory.
@@ -129,6 +172,9 @@ pub enum UiClientMessage {
     SetSessionModel {
         session_id: String,
         model_id: String,
+        /// Optional mesh node id (PeerId string) that owns the provider. `None` = local.
+        #[serde(default, alias = "node")]
+        node_id: Option<String>,
     },
     /// Get recent models from event history
     GetRecentModels {
@@ -189,11 +235,63 @@ pub enum UiClientMessage {
     },
     /// Get the current agent mode
     GetAgentMode,
+    /// List remote nodes discovered in the kameo mesh
+    ListRemoteNodes,
+    /// List sessions on a specific remote node
+    ListRemoteSessions {
+        /// Stable node id (PeerId string) identifying the target node
+        #[serde(alias = "node")]
+        node_id: String,
+    },
+    /// Create a new session on a specific remote node
+    CreateRemoteSession {
+        /// Stable node id (PeerId string) identifying the target node
+        #[serde(alias = "node")]
+        node_id: String,
+        /// Working directory on the remote machine (optional)
+        cwd: Option<String>,
+        /// Client-generated request ID for correlating the response
+        #[serde(default)]
+        request_id: Option<String>,
+    },
+    /// Attach an existing remote session to the local dashboard
+    AttachRemoteSession {
+        /// Stable node id (PeerId string) identifying the target node
+        #[serde(alias = "node")]
+        node_id: String,
+        /// Session ID to attach
+        session_id: String,
+    },
+    AddCustomModelFromHf {
+        provider: String,
+        repo: String,
+        filename: String,
+        #[serde(default)]
+        display_name: Option<String>,
+    },
+    AddCustomModelFromFile {
+        provider: String,
+        file_path: String,
+        #[serde(default)]
+        display_name: Option<String>,
+    },
+    DeleteCustomModel {
+        provider: String,
+        model_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UndoStackFrame {
     pub message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StreamCursor {
+    #[serde(default)]
+    pub local_seq: u64,
+    #[serde(default)]
+    pub remote_seq_by_source: HashMap<String, u64>,
 }
 
 /// Messages from server to UI client.
@@ -219,12 +317,13 @@ pub enum UiServerMessage {
     Event {
         agent_id: String,
         session_id: String,
-        event: AgentEvent,
+        event: EventEnvelope,
     },
     SessionEvents {
         session_id: String,
         agent_id: String,
-        events: Vec<AgentEvent>,
+        events: Vec<EventEnvelope>,
+        cursor: StreamCursor,
     },
     Error {
         message: String,
@@ -237,6 +336,7 @@ pub enum UiServerMessage {
         agent_id: String,
         audit: AuditView,
         undo_stack: Vec<UndoStackFrame>,
+        cursor: StreamCursor,
     },
     WorkspaceIndexStatus {
         session_id: String,
@@ -248,7 +348,10 @@ pub enum UiServerMessage {
     },
     /// Recent models from event history, grouped by workspace
     RecentModels {
-        by_workspace: HashMap<Option<String>, Vec<RecentModelEntry>>,
+        by_workspace: HashMap<String, Vec<RecentModelEntry>>,
+    },
+    ProviderCapabilities {
+        providers: Vec<ProviderCapabilityEntry>,
     },
     /// File index for autocomplete
     FileIndex {
@@ -298,6 +401,28 @@ pub enum UiServerMessage {
         success: bool,
         message: String,
     },
+    /// List of remote nodes discovered in the kameo mesh
+    RemoteNodes {
+        nodes: Vec<RemoteNodeInfo>,
+    },
+    /// Sessions available on a specific remote node
+    RemoteSessions {
+        /// Stable node id (PeerId string)
+        node_id: String,
+        /// Sessions on that node
+        sessions: Vec<crate::agent::remote::RemoteSessionInfo>,
+    },
+    ModelDownloadStatus {
+        provider: String,
+        model_id: String,
+        status: String,
+        bytes_downloaded: u64,
+        bytes_total: Option<u64>,
+        percent: Option<f32>,
+        speed_bps: Option<u64>,
+        eta_seconds: Option<u64>,
+        message: Option<String>,
+    },
 }
 
 impl UiServerMessage {
@@ -313,6 +438,7 @@ impl UiServerMessage {
             Self::WorkspaceIndexStatus { .. } => "workspace_index_status",
             Self::AllModelsList { .. } => "all_models_list",
             Self::RecentModels { .. } => "recent_models",
+            Self::ProviderCapabilities { .. } => "provider_capabilities",
             Self::FileIndex { .. } => "file_index",
             Self::LlmConfig { .. } => "llm_config",
             Self::SessionEvents { .. } => "session_events",
@@ -322,6 +448,9 @@ impl UiServerMessage {
             Self::AuthProviders { .. } => "auth_providers",
             Self::OAuthFlowStarted { .. } => "oauth_flow_started",
             Self::OAuthResult { .. } => "oauth_result",
+            Self::RemoteNodes { .. } => "remote_nodes",
+            Self::RemoteSessions { .. } => "remote_sessions",
+            Self::ModelDownloadStatus { .. } => "model_download_status",
         }
     }
 }
@@ -375,6 +504,116 @@ mod tests {
             UiClientMessage::DisconnectOAuth { provider } => assert_eq!(provider, "openai"),
             _ => panic!("expected DisconnectOAuth variant"),
         }
+    }
+
+    // ── Remote message node/node_id alias tests ──────────────────────────
+
+    #[test]
+    fn create_remote_session_accepts_node_id_field() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "create_remote_session",
+            "node_id": "peer-abc",
+            "cwd": "/tmp"
+        }))
+        .expect("node_id field should deserialize");
+
+        match msg {
+            UiClientMessage::CreateRemoteSession { node_id, cwd, .. } => {
+                assert_eq!(node_id, "peer-abc");
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+            }
+            _ => panic!("expected CreateRemoteSession"),
+        }
+    }
+
+    #[test]
+    fn create_remote_session_accepts_node_alias() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "create_remote_session",
+            "node": "peer-abc",
+            "cwd": "/tmp"
+        }))
+        .expect("node alias should deserialize to node_id");
+
+        match msg {
+            UiClientMessage::CreateRemoteSession { node_id, cwd, .. } => {
+                assert_eq!(node_id, "peer-abc");
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+            }
+            _ => panic!("expected CreateRemoteSession"),
+        }
+    }
+
+    #[test]
+    fn list_remote_sessions_accepts_node_alias() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "list_remote_sessions",
+            "node": "peer-xyz"
+        }))
+        .expect("node alias should deserialize to node_id");
+
+        match msg {
+            UiClientMessage::ListRemoteSessions { node_id } => {
+                assert_eq!(node_id, "peer-xyz");
+            }
+            _ => panic!("expected ListRemoteSessions"),
+        }
+    }
+
+    #[test]
+    fn attach_remote_session_accepts_node_alias() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "attach_remote_session",
+            "node": "peer-xyz",
+            "session_id": "sess-1"
+        }))
+        .expect("node alias should deserialize to node_id");
+
+        match msg {
+            UiClientMessage::AttachRemoteSession {
+                node_id,
+                session_id,
+            } => {
+                assert_eq!(node_id, "peer-xyz");
+                assert_eq!(session_id, "sess-1");
+            }
+            _ => panic!("expected AttachRemoteSession"),
+        }
+    }
+
+    #[test]
+    fn set_session_model_accepts_node_alias() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "set_session_model",
+            "session_id": "sess-1",
+            "model_id": "claude-3-opus",
+            "node": "peer-abc"
+        }))
+        .expect("node alias should deserialize to node_id");
+
+        match msg {
+            UiClientMessage::SetSessionModel {
+                session_id,
+                model_id,
+                node_id,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(model_id, "claude-3-opus");
+                assert_eq!(node_id.as_deref(), Some("peer-abc"));
+            }
+            _ => panic!("expected SetSessionModel"),
+        }
+    }
+
+    #[test]
+    fn remote_sessions_server_msg_serializes_node_id() {
+        let msg = UiServerMessage::RemoteSessions {
+            node_id: "peer-abc".to_string(),
+            sessions: Vec::new(),
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        assert_eq!(json["type"], "remote_sessions");
+        assert_eq!(json["node_id"], "peer-abc");
     }
 
     #[test]

@@ -4,6 +4,7 @@ members = [
     "crates/agent",
     "crates/querymt",
     "crates/cli",
+    "crates/provider-common",
     "crates/querymt-utils",
     "crates/providers/*", "crates/querymt-extism-macros",
 ]
@@ -31,4 +32,4 @@ http-serde-ext = "1.0"
 regex = "1"
 heck = "0.5"
 dirs = "6"
-hf-hub = { version = "0.4", default-features = false, features = [ "rustls-tls", "tokio", "ureq"] }
+hf-hub = { version = "0.5", default-features = false, features = [ "rustls-tls", "tokio", "ureq"] }

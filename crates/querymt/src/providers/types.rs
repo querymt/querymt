@@ -23,6 +23,9 @@ pub struct ProviderInfo {
     pub doc: Option<String>,
     #[serde(default)]
     pub models: HashMap<String, ModelInfo>,
+    /// Whether this provider supports user-managed custom models.
+    #[serde(default)]
+    pub supports_custom_models: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

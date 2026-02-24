@@ -1,8 +1,40 @@
 //! Trait definition for snapshot backends
 
-use anyhow::Result;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+/// Errors that can occur during snapshot operations.
+#[derive(Debug, Error)]
+pub enum SnapshotError {
+    /// The underlying git/VCS repository could not be opened, initialised, or
+    /// written to.
+    #[error("Snapshot repository error: {0}")]
+    Repository(String),
+
+    /// A snapshot ID (commit SHA) supplied by the caller is not valid.
+    #[error("Invalid snapshot ID: {0}")]
+    InvalidSnapshotId(String),
+
+    /// The requested snapshot could not be found in the store.
+    #[error("Snapshot not found: {0}")]
+    NotFound(String),
+
+    /// A filesystem operation (read, write, mkdir, …) failed.
+    #[error("Filesystem error: {0}")]
+    Filesystem(String),
+
+    /// The background `spawn_blocking` task panicked.
+    #[error("Snapshot task panicked")]
+    TaskPanicked,
+
+    /// Catch-all for errors that don't fit the above categories.
+    #[error("{0}")]
+    Other(String),
+}
+
+/// Convenience `Result` alias for snapshot operations.
+pub type SnapshotResult<T> = Result<T, SnapshotError>;
 
 /// Unique identifier for a snapshot (e.g., git commit SHA)
 pub type SnapshotId = String;
@@ -51,7 +83,7 @@ pub trait SnapshotBackend: Send + Sync {
     ///
     /// # Arguments
     /// * `worktree` - The root directory to snapshot
-    async fn track(&self, worktree: &Path) -> Result<SnapshotId>;
+    async fn track(&self, worktree: &Path) -> SnapshotResult<SnapshotId>;
 
     /// Compute which files changed between two snapshots
     ///
@@ -67,7 +99,7 @@ pub trait SnapshotBackend: Send + Sync {
         worktree: &Path,
         pre: &SnapshotId,
         post: &SnapshotId,
-    ) -> Result<Vec<PathBuf>>;
+    ) -> SnapshotResult<Vec<PathBuf>>;
 
     /// Restore specific files from a snapshot
     ///
@@ -80,14 +112,14 @@ pub trait SnapshotBackend: Send + Sync {
         worktree: &Path,
         snapshot: &SnapshotId,
         paths: &[PathBuf],
-    ) -> Result<()>;
+    ) -> SnapshotResult<()>;
 
     /// Restore entire worktree to a snapshot
     ///
     /// # Arguments
     /// * `worktree` - The root directory
     /// * `snapshot` - Snapshot ID to restore to
-    async fn restore(&self, worktree: &Path, snapshot: &SnapshotId) -> Result<()>;
+    async fn restore(&self, worktree: &Path, snapshot: &SnapshotId) -> SnapshotResult<()>;
 
     /// Run garbage collection to prune old snapshots
     ///
@@ -97,5 +129,5 @@ pub trait SnapshotBackend: Send + Sync {
     ///
     /// # Returns
     /// Statistics about snapshots removed and remaining
-    async fn gc(&self, worktree: &Path, config: &GcConfig) -> Result<GcResult>;
+    async fn gc(&self, worktree: &Path, config: &GcConfig) -> SnapshotResult<GcResult>;
 }

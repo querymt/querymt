@@ -2,7 +2,7 @@
 //!
 //! This example shows how to export an agent session to ATIF format.
 
-use querymt_agent::events::{AgentEvent, AgentEventKind, ExecutionMetrics};
+use querymt_agent::events::{AgentEvent, AgentEventKind, EventOrigin, ExecutionMetrics};
 use querymt_agent::export::{ATIFBuilder, AtifExportOptions};
 
 fn main() {
@@ -12,12 +12,16 @@ fn main() {
             seq: 1,
             timestamp: 1704067200, // 2024-01-01 00:00:00 UTC
             session_id: "example-session-123".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::SessionCreated,
         },
         AgentEvent {
             seq: 2,
             timestamp: 1704067201,
             session_id: "example-session-123".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::PromptReceived {
                 content: "What is the current price of GOOGL stock?".to_string(),
                 message_id: None,
@@ -27,14 +31,19 @@ fn main() {
             seq: 3,
             timestamp: 1704067202,
             session_id: "example-session-123".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::LlmRequestStart { message_count: 2 },
         },
         AgentEvent {
             seq: 4,
             timestamp: 1704067203,
             session_id: "example-session-123".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::AssistantMessageStored {
                 content: "I'll look up the current stock price for you.".to_string(),
+                thinking: None,
                 message_id: None,
             },
         },
@@ -42,6 +51,8 @@ fn main() {
             seq: 5,
             timestamp: 1704067204,
             session_id: "example-session-123".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::ToolCallStart {
                 tool_call_id: "call_abc123".to_string(),
                 tool_name: "search_stock_price".to_string(),
@@ -52,6 +63,8 @@ fn main() {
             seq: 6,
             timestamp: 1704067205,
             session_id: "example-session-123".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::ToolCallEnd {
                 tool_call_id: "call_abc123".to_string(),
                 tool_name: "search_stock_price".to_string(),
@@ -63,6 +76,8 @@ fn main() {
             seq: 7,
             timestamp: 1704067206,
             session_id: "example-session-123".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::LlmRequestEnd {
                 usage: Some(querymt::Usage {
                     input_tokens: 150,
@@ -81,14 +96,19 @@ fn main() {
             seq: 8,
             timestamp: 1704067207,
             session_id: "example-session-123".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::LlmRequestStart { message_count: 4 },
         },
         AgentEvent {
             seq: 9,
             timestamp: 1704067208,
             session_id: "example-session-123".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::AssistantMessageStored {
                 content: "The current price of Alphabet (GOOGL) is $142.50.".to_string(),
+                thinking: None,
                 message_id: None,
             },
         },
@@ -96,6 +116,8 @@ fn main() {
             seq: 10,
             timestamp: 1704067209,
             session_id: "example-session-123".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
             kind: AgentEventKind::LlmRequestEnd {
                 usage: Some(querymt::Usage {
                     input_tokens: 180,

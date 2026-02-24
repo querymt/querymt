@@ -15,9 +15,12 @@ import {
   LlmConfigDetails,
   SessionLimits,
   AuthProviderEntry,
+  ModelDownloadStatus,
   OAuthFlowState,
+  ProviderCapabilityEntry,
   OAuthResultState,
   UndoStackFrame,
+  RemoteNodeInfo,
 } from '../types';
 
 // Callback type for file index updates
@@ -35,6 +38,34 @@ type UndoState = {
   stack: UndoFrame[];
   frontierMessageId?: string;
 } | null;
+
+function findLiveAccumulatorIndex(
+  events: EventItem[],
+  messageId: string | undefined,
+  agentId: string
+): number {
+  if (messageId) {
+    const matchByMessageId = [...events].reverse().findIndex(
+      e => e.streamMessageId === messageId && e.isStreamDelta
+    );
+    if (matchByMessageId >= 0) {
+      return events.length - 1 - matchByMessageId;
+    }
+  }
+
+  const matchByAgent = [...events].reverse().findIndex(
+    e => e.isStreamDelta && e.agentId === agentId
+  );
+  return matchByAgent >= 0 ? events.length - 1 - matchByAgent : -1;
+}
+
+function nonEmptyString(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? value : undefined;
+}
 
 function buildUndoStateFromServerStack(
   undoStack: UndoStackFrame[],
@@ -102,13 +133,15 @@ export function useUiClient() {
   const [availableModes, setAvailableModes] = useState<string[]>(['build', 'plan']);
   const [sessionGroups, setSessionGroups] = useState<SessionGroup[]>([]);
   const [allModels, setAllModels] = useState<ModelEntry[]>([]);
+  const [providerCapabilities, setProviderCapabilities] = useState<Record<string, ProviderCapabilityEntry>>({});
   const [recentModelsByWorkspace, setRecentModelsByWorkspace] = useState<Record<string, RecentModelEntry[]>>({});
   const [authProviders, setAuthProviders] = useState<AuthProviderEntry[]>([]);
+  const [modelDownloads, setModelDownloads] = useState<Record<string, ModelDownloadStatus>>({});
   const [oauthFlow, setOauthFlow] = useState<OAuthFlowState | null>(null);
   const [oauthResult, setOauthResult] = useState<OAuthResultState | null>(null);
   const [sessionsByAgent, setSessionsByAgent] = useState<Record<string, string>>({});
   const [agentModels, setAgentModels] = useState<
-    Record<string, { provider?: string; model?: string; contextLimit?: number }>
+    Record<string, { provider?: string; model?: string; contextLimit?: number; node?: string }>
   >({});
   const [sessionAudit, setSessionAudit] = useState<AuditView | null>(null);
   const [thinkingAgentIds, setThinkingAgentIds] = useState<Set<string>>(new Set());
@@ -124,6 +157,8 @@ export function useUiClient() {
   const [sessionLimits, setSessionLimits] = useState<SessionLimits | null>(null);
   const [undoState, setUndoState] = useState<UndoState>(null);
   const undoStateRef = useRef<UndoState>(null);
+  const [remoteNodes, setRemoteNodes] = useState<RemoteNodeInfo[]>([]);
+  const [connectionErrors, setConnectionErrors] = useState<{ id: number; message: string }[]>([]);
   const [defaultCwd, setDefaultCwd] = useState<string | null>(null);
   const [workspacePathDialogOpen, setWorkspacePathDialogOpen] = useState(false);
   const [workspacePathDialogDefaultValue, setWorkspacePathDialogDefaultValue] = useState('');
@@ -132,7 +167,7 @@ export function useUiClient() {
   const fileIndexErrorCallbackRef = useRef<FileIndexErrorCallback | null>(null);
   const llmConfigCallbacksRef = useRef<Map<number, (config: LlmConfigDetails) => void>>(new Map());
   const pendingRequestsRef = useRef<Map<string, (sessionId: string) => void>>(new Map());
-  const workspacePathDialogResolverRef = useRef<((value: string | null) => void) | null>(null);
+  const workspacePathDialogResolverRef = useRef<((value: { cwd: string; node: string | null } | null) => void) | null>(null);
   const sessionCreatingRef = useRef(false);
 
   // Derive main session events for backward compatibility
@@ -159,6 +194,7 @@ export function useUiClient() {
       sendMessage({ type: 'init' });
       sendMessage({ type: 'list_all_models', refresh: false });
       sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
+      sendMessage({ type: 'list_remote_nodes' });
     };
 
     socket.onclose = () => {
@@ -263,6 +299,7 @@ export function useUiClient() {
                 provider: lastProvider.provider,
                 model: lastProvider.model,
                 contextLimit: lastProvider.contextLimit,
+                node: lastProvider.providerNode,
               },
             }));
           }
@@ -271,6 +308,27 @@ export function useUiClient() {
       }
       case 'event': {
         const eventKind = msg.event?.kind?.type ?? msg.event?.kind?.type_name;
+
+        if (
+          eventKind === 'llm_request_start' ||
+          eventKind === 'llm_request_end' ||
+          eventKind === 'assistant_thinking_delta' ||
+          eventKind === 'assistant_content_delta' ||
+          eventKind === 'assistant_message_stored'
+        ) {
+          const rawContent = msg.event?.kind?.content;
+          const contentLen = typeof rawContent === 'string' ? rawContent.length : 0;
+          console.debug('[useUiClient] stream event received', {
+            session_id: msg.session_id,
+            agent_id: msg.agent_id,
+            seq: msg.event?.seq,
+            event_kind: eventKind,
+            message_id: msg.event?.kind?.message_id,
+            content_len: contentLen,
+            has_thinking: typeof msg.event?.kind?.thinking === 'string' && msg.event.kind.thinking.length > 0,
+            finish_reason: msg.event?.kind?.finish_reason,
+          });
+        }
         
         // Track LLM thinking state per session
         if (eventKind === 'llm_request_start') {
@@ -341,23 +399,6 @@ export function useUiClient() {
             setUndoState(null);
             undoStateRef.current = null;
           }
-        } else if (eventKind === 'assistant_message_stored') {
-          setThinkingBySession(prev => {
-            const next = new Map(prev);
-            const sessionAgents = new Set(next.get(msg.session_id) ?? []);
-            sessionAgents.delete(msg.agent_id);
-            if (sessionAgents.size === 0) {
-              next.delete(msg.session_id);
-            } else {
-              next.set(msg.session_id, sessionAgents);
-            }
-            return next;
-          });
-          setThinkingAgentIds(prev => {
-            const next = new Set(prev);
-            next.delete(msg.agent_id);
-            return next;
-          });
         } else if (eventKind === 'error') {
           setThinkingBySession(prev => {
             const next = new Map(prev);
@@ -422,17 +463,114 @@ export function useUiClient() {
         translated.sessionId = msg.session_id;
         translated.seq = msg.event.seq;
 
-        setEventsBySession(prev => {
-          const next = new Map(prev);
-          const existing = next.get(msg.session_id) ?? [];
-          // Dedup: skip if we already have this seq
-          if (existing.length > 0 && translated.seq != null) {
-            const lastSeq = existing[existing.length - 1].seq ?? -1;
-            if (translated.seq <= lastSeq) return prev;
-          }
-          next.set(msg.session_id, [...existing, translated]);
-          return next;
-        });
+        // === STREAMING DELTA MERGE LOGIC ===
+        // Delta events are merged in-place into a single live accumulator rather
+        // than appended as separate list items. This keeps the event list clean
+        // and avoids per-token React re-renders of the full list.
+        if (
+          eventKind === 'assistant_content_delta' ||
+          eventKind === 'assistant_thinking_delta'
+        ) {
+          const messageId = msg.event?.kind?.message_id;
+          setEventsBySession(prev => {
+            const next = new Map(prev);
+            const existing = next.get(msg.session_id) ?? [];
+            const realLiveIdx = findLiveAccumulatorIndex(existing, messageId, msg.agent_id);
+
+            if (realLiveIdx >= 0) {
+              const updated = [...existing];
+              const live = updated[realLiveIdx];
+              if (eventKind === 'assistant_thinking_delta') {
+                updated[realLiveIdx] = {
+                  ...live,
+                  thinking: (live.thinking ?? '') + (translated.thinking ?? ''),
+                };
+              } else {
+                updated[realLiveIdx] = {
+                  ...live,
+                  content: live.content + translated.content,
+                };
+              }
+              next.set(msg.session_id, updated);
+              console.debug('[useUiClient] stream delta merged', {
+                session_id: msg.session_id,
+                event_kind: eventKind,
+                message_id: messageId,
+                live_index: realLiveIdx,
+                existing_len: existing.length,
+                new_content_len: updated[realLiveIdx].content.length,
+                new_thinking_len: (updated[realLiveIdx].thinking ?? '').length,
+              });
+            } else {
+              // First delta for this message — create the live accumulator entry
+              next.set(msg.session_id, [...existing, translated]);
+              console.debug('[useUiClient] stream delta created live accumulator', {
+                session_id: msg.session_id,
+                event_kind: eventKind,
+                message_id: messageId,
+                existing_len: existing.length,
+              });
+            }
+            return next;
+          });
+          // Don't fall through to the normal append path
+          break;
+        }
+
+        // === ASSISTANT MESSAGE STORED — replace live accumulator with final message ===
+        if (eventKind === 'assistant_message_stored') {
+          const messageId = msg.event?.kind?.message_id;
+          setEventsBySession(prev => {
+            const next = new Map(prev);
+            const existing = next.get(msg.session_id) ?? [];
+            const realLiveIdx = findLiveAccumulatorIndex(existing, messageId, msg.agent_id);
+
+            if (realLiveIdx >= 0) {
+              // Swap live accumulator → final message. Preserve streamed thinking if final event omitted it.
+              const updated = [...existing];
+              const live = updated[realLiveIdx];
+              updated[realLiveIdx] = {
+                ...translated,
+                thinking: nonEmptyString(translated.thinking) ?? nonEmptyString(live.thinking),
+              };
+              next.set(msg.session_id, updated);
+              console.debug('[useUiClient] final assistant message replaced live accumulator', {
+                session_id: msg.session_id,
+                message_id: messageId,
+                live_index: realLiveIdx,
+                final_content_len: updated[realLiveIdx].content.length,
+                final_thinking_len: (updated[realLiveIdx].thinking ?? '').length,
+              });
+            } else {
+              // Non-streaming provider or out-of-order final message: append if newer.
+              const lastSeq = existing.length > 0 ? (existing[existing.length - 1].seq ?? -1) : -1;
+              if (translated.seq == null || translated.seq > lastSeq) {
+                next.set(msg.session_id, [...existing, translated]);
+              }
+              console.debug('[useUiClient] final assistant message appended without live accumulator', {
+                session_id: msg.session_id,
+                message_id: messageId,
+                existing_len: existing.length,
+                translated_seq: translated.seq,
+                last_seq: lastSeq,
+              });
+            }
+            return next;
+          });
+          // Still fall through so thinking-state logic below fires
+        } else {
+          setEventsBySession(prev => {
+            const next = new Map(prev);
+            const existing = next.get(msg.session_id) ?? [];
+            // Dedup: skip if we already have this seq
+            if (existing.length > 0 && translated.seq != null) {
+              const lastSeq = existing[existing.length - 1].seq ?? -1;
+              if (translated.seq <= lastSeq) return prev;
+            }
+            next.set(msg.session_id, [...existing, translated]);
+            return next;
+          });
+        }
 
         // Provider/limits updates - only for main session
         if (msg.session_id === mainSessionId) {
@@ -451,6 +589,7 @@ export function useUiClient() {
                 provider: msg.event?.kind?.provider,
                 model: msg.event?.kind?.model,
                 contextLimit: msg.event?.kind?.context_limit,
+                node: msg.event?.kind?.provider_node ?? undefined,
               },
             }));
           }
@@ -462,7 +601,8 @@ export function useUiClient() {
       }
       case 'error': {
         console.error('UI server error:', msg.message);
-        // Reset thinking state on error - clear all agents (connection-level error)
+        // Connection-level errors have no session_id. Do not inject them into the
+        // active session timeline, otherwise provider errors can bleed across sessions.
         setThinkingAgentIds(new Set());
         // Check if this is a file index related error and notify
         if (
@@ -473,24 +613,14 @@ export function useUiClient() {
         ) {
           fileIndexErrorCallbackRef.current(msg.message);
         }
-        // Add error to main session events if we have one
-        if (mainSessionId) {
-          setEventsBySession((prev) => {
-            const next = new Map(prev);
-            const existing = next.get(mainSessionId) ?? [];
-            next.set(mainSessionId, [
-              ...existing,
-              {
-                id: `ui-error-${Date.now()}-${Math.random()}`,
-                agentId: 'system',
-                type: 'system',
-                content: msg.message,
-                timestamp: Date.now(),
-                isMessage: true,
-              },
-            ]);
-            return next;
-          });
+        // Surface error to the UI via connectionErrors state
+        {
+          const errorId = Date.now();
+          setConnectionErrors((prev) => [...prev, { id: errorId, message: msg.message }]);
+          // Auto-dismiss after 8 seconds
+          setTimeout(() => {
+            setConnectionErrors((prev) => prev.filter((e) => e.id !== errorId));
+          }, 8000);
         }
         break;
       }
@@ -538,6 +668,7 @@ export function useUiClient() {
               provider: lastProvider.provider,
               model: lastProvider.model,
               contextLimit: lastProvider.contextLimit,
+              node: lastProvider.providerNode,
             },
           });
         } else {
@@ -582,6 +713,14 @@ export function useUiClient() {
       case 'all_models_list':
         setAllModels(msg.models);
         break;
+      case 'provider_capabilities': {
+        const next: Record<string, ProviderCapabilityEntry> = {};
+        for (const entry of msg.providers) {
+          next[entry.provider] = entry;
+        }
+        setProviderCapabilities(next);
+        break;
+      }
       case 'recent_models': {
         // Convert null keys to empty string for consistent lookup
         const normalized: Record<string, RecentModelEntry[]> = {};
@@ -673,6 +812,38 @@ export function useUiClient() {
       case 'agent_mode':
         setAgentModeState(msg.mode);
         break;
+      case 'remote_nodes':
+        setRemoteNodes(msg.nodes);
+        break;
+      case 'remote_sessions':
+        // Currently used for on-demand node session listing;
+        // data is handled by the caller via callback if needed.
+        console.log('[useUiClient] remote_sessions for node:', msg.node_id, msg.sessions);
+        break;
+      case 'model_download_status': {
+        const key = `${msg.provider}:${msg.model_id}`;
+        setModelDownloads((prev) => ({
+          ...prev,
+          [key]: {
+            provider: msg.provider,
+            model_id: msg.model_id,
+            status: msg.status,
+            bytes_downloaded: msg.bytes_downloaded,
+            bytes_total: msg.bytes_total,
+            percent: msg.percent,
+            speed_bps: msg.speed_bps,
+            eta_seconds: msg.eta_seconds,
+            message: msg.message,
+          },
+        }));
+
+        if (msg.status === 'completed') {
+          setTimeout(() => {
+            sendMessage({ type: 'list_all_models', refresh: true });
+          }, 250);
+        }
+        break;
+      }
       default:
         break;
     }
@@ -697,17 +868,17 @@ export function useUiClient() {
   const requestWorkspacePath = useCallback((defaultValue: string) => {
     setWorkspacePathDialogDefaultValue(defaultValue);
     setWorkspacePathDialogOpen(true);
-    return new Promise<string | null>((resolve) => {
+    return new Promise<{ cwd: string; node: string | null } | null>((resolve) => {
       workspacePathDialogResolverRef.current = resolve;
     });
   }, []);
 
-  const submitWorkspacePathDialog = useCallback((value: string) => {
+  const submitWorkspacePathDialog = useCallback((value: string, node: string | null = null) => {
     const resolver = workspacePathDialogResolverRef.current;
     workspacePathDialogResolverRef.current = null;
     setWorkspacePathDialogOpen(false);
     if (resolver) {
-      resolver(value);
+      resolver({ cwd: value, node });
     }
   }, []);
 
@@ -723,17 +894,32 @@ export function useUiClient() {
   const newSession = useCallback(async (): Promise<string> => {
     const currentWorkspace = findCurrentWorkspace(sessionGroups, sessionId);
     const initialWorkspace = currentWorkspace ?? (sessionId ? '' : defaultCwd ?? '');
-    const input = await requestWorkspacePath(initialWorkspace);
-    if (input === null) {
+    const result = await requestWorkspacePath(initialWorkspace);
+    if (result === null) {
       throw new Error('Session creation cancelled');
     }
-    const cwd = input.trim() || initialWorkspace.trim();
+    const cwd = result.cwd.trim() || initialWorkspace.trim();
+    const node = result.node;
     const requestId = uuidv7();
     
     // Signal that session creation is in progress to prevent route sync interference.
     // Cleared by useSessionRoute once URL and state are in sync.
     sessionCreatingRef.current = true;
     
+    if (node) {
+      // Remote session: send create_remote_session with request_id.
+      // The backend responds with SessionCreated (same as local).
+      return new Promise((resolve) => {
+        pendingRequestsRef.current.set(requestId, resolve);
+        sendMessage({
+          type: 'create_remote_session',
+          node_id: node,
+          cwd: cwd.length > 0 ? cwd : null,
+          request_id: requestId,
+        });
+      });
+    }
+
     return new Promise((resolve) => {
       pendingRequestsRef.current.set(requestId, resolve);
       sendMessage({ 
@@ -766,12 +952,43 @@ export function useUiClient() {
     sendMessage({ type: 'list_all_models', refresh: true });
   }, []);
 
-  const setSessionModel = useCallback((sessionId: string, modelId: string) => {
-    sendMessage({ type: 'set_session_model', session_id: sessionId, model_id: modelId });
-    // Refresh recent models after a short delay
-    setTimeout(() => {
-      sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
-    }, 500);
+  const setSessionModel = useCallback((sessionId: string, modelId: string, node?: string) => {
+    sendMessage({ type: 'set_session_model', session_id: sessionId, model_id: modelId, node_id: node });
+    // Refresh recent models after a short delay (only for local providers)
+    if (!node) {
+      setTimeout(() => {
+        sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
+      }, 500);
+    }
+  }, []);
+
+  const addCustomModelFromHf = useCallback(
+    (provider: string, repo: string, filename: string, displayName?: string) => {
+      sendMessage({
+        type: 'add_custom_model_from_hf',
+        provider,
+        repo,
+        filename,
+        display_name: displayName,
+      });
+    },
+    []
+  );
+
+  const addCustomModelFromFile = useCallback(
+    (provider: string, filePath: string, displayName?: string) => {
+      sendMessage({
+        type: 'add_custom_model_from_file',
+        provider,
+        file_path: filePath,
+        display_name: displayName,
+      });
+    },
+    []
+  );
+
+  const deleteCustomModel = useCallback((provider: string, modelId: string) => {
+    sendMessage({ type: 'delete_custom_model', provider, model_id: modelId });
   }, []);
 
   const fetchRecentModels = useCallback(() => {
@@ -821,6 +1038,16 @@ export function useUiClient() {
   // Cancel the active session
   const cancelSession = useCallback(() => {
     sendMessage({ type: 'cancel_session' });
+  }, []);
+
+  // Refresh the list of remote nodes from the mesh
+  const listRemoteNodes = useCallback(() => {
+    sendMessage({ type: 'list_remote_nodes' });
+  }, []);
+
+  // Dismiss a connection error by id
+  const dismissConnectionError = useCallback((errorId: number) => {
+    setConnectionErrors((prev) => prev.filter((e) => e.id !== errorId));
   }, []);
 
   // Request LLM config by ID (returns cached if available, otherwise fetches)
@@ -916,6 +1143,8 @@ export function useUiClient() {
     setRoutingMode: selectRoutingMode,
     sessionGroups,
     allModels,
+    providerCapabilities,
+    modelDownloads,
     recentModelsByWorkspace,
     authProviders,
     oauthFlow,
@@ -931,6 +1160,9 @@ export function useUiClient() {
     disconnectOAuth,
     clearOAuthState,
     setSessionModel,
+    addCustomModelFromHf,
+    addCustomModelFromFile,
+    deleteCustomModel,
     sessionAudit,
     thinkingAgentId,
     thinkingAgentIds,
@@ -959,6 +1191,10 @@ export function useUiClient() {
     availableModes,
     setAgentMode,
     cycleAgentMode,
+    remoteNodes,
+    listRemoteNodes,
+    connectionErrors,
+    dismissConnectionError,
   };
 }
 
@@ -1035,9 +1271,41 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       seq: seq,
       type: 'agent',
       content: event.kind?.content ?? '',
+      thinking: event.kind?.thinking,
       timestamp,
       isMessage: true,
       messageId: event.kind?.message_id,
+      // streamMessageId matches message_id so UI can find and replace the live accumulator
+      streamMessageId: event.kind?.message_id,
+    };
+  }
+
+  if (kind === 'assistant_content_delta') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'agent',
+      content: event.kind?.content ?? '',
+      timestamp,
+      isStreamDelta: true,
+      isThinkingDelta: false,
+      streamMessageId: event.kind?.message_id,
+    };
+  }
+
+  if (kind === 'assistant_thinking_delta') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'agent',
+      content: '',
+      thinking: event.kind?.content ?? '',
+      timestamp,
+      isStreamDelta: true,
+      isThinkingDelta: true,
+      streamMessageId: event.kind?.message_id,
     };
   }
 
@@ -1118,6 +1386,7 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       model: event.kind?.model,
       contextLimit: event.kind?.context_limit,
       configId: event.kind?.config_id,
+      providerNode: event.kind?.provider_node ?? undefined,
     };
   }
 
@@ -1136,6 +1405,31 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
         requestedSchema: event.kind?.requested_schema,
         source: event.kind?.source ?? 'unknown',
       },
+    };
+  }
+
+  if (kind === 'compaction_start') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'system',
+      content: 'Context compaction started',
+      timestamp,
+      compactionTokenEstimate: event.kind?.token_estimate,
+    };
+  }
+
+  if (kind === 'compaction_end') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'system',
+      content: 'Context compacted',
+      timestamp,
+      compactionSummary: event.kind?.summary,
+      compactionSummaryLen: event.kind?.summary_len,
     };
   }
 

@@ -201,3 +201,153 @@ pub fn extract_verification_commands(expected_output: &str) -> Vec<String> {
 
     commands
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── TaskWaitOutcome construction ───────────────────────────────────────
+
+    #[test]
+    fn task_wait_outcome_completed_construction() {
+        let outcome = TaskWaitOutcome::Completed {
+            task_id: "task-1".to_string(),
+            deliverable: Some("test output".to_string()),
+        };
+        match outcome {
+            TaskWaitOutcome::Completed {
+                task_id,
+                deliverable,
+            } => {
+                assert_eq!(task_id, "task-1");
+                assert_eq!(deliverable, Some("test output".to_string()));
+            }
+            _ => panic!("expected Completed variant"),
+        }
+    }
+
+    #[test]
+    fn task_wait_outcome_cancelled_construction() {
+        let outcome = TaskWaitOutcome::Cancelled {
+            task_id: "task-2".to_string(),
+        };
+        match outcome {
+            TaskWaitOutcome::Cancelled { task_id } => {
+                assert_eq!(task_id, "task-2");
+            }
+            _ => panic!("expected Cancelled variant"),
+        }
+    }
+
+    #[test]
+    fn task_wait_outcome_cleared_construction() {
+        let outcome = TaskWaitOutcome::Cleared {
+            last_task_id: "task-3".to_string(),
+        };
+        match outcome {
+            TaskWaitOutcome::Cleared { last_task_id } => {
+                assert_eq!(last_task_id, "task-3");
+            }
+            _ => panic!("expected Cleared variant"),
+        }
+    }
+
+    #[test]
+    fn task_wait_outcome_no_task_created() {
+        let outcome = TaskWaitOutcome::NoTaskCreated;
+        assert!(matches!(outcome, TaskWaitOutcome::NoTaskCreated));
+    }
+
+    #[test]
+    fn task_wait_outcome_timed_out() {
+        let outcome = TaskWaitOutcome::TimedOut;
+        assert!(matches!(outcome, TaskWaitOutcome::TimedOut));
+    }
+
+    // ── extract_verification_commands ──────────────────────────────────────
+
+    #[test]
+    fn extract_verification_commands_empty_input() {
+        let commands = extract_verification_commands("");
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn extract_verification_commands_no_patterns() {
+        let input = "Some text without verification commands";
+        let commands = extract_verification_commands(input);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn extract_verification_commands_single_cargo_check() {
+        let input = "Please run cargo check to verify";
+        let commands = extract_verification_commands(input);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0], "cargo check to verify");
+    }
+
+    #[test]
+    fn extract_verification_commands_multiple_patterns() {
+        let input = "Run cargo test\nand then cargo build";
+        let commands = extract_verification_commands(input);
+        assert_eq!(commands.len(), 2);
+        assert!(commands.contains(&"cargo test".to_string()));
+        assert!(commands.contains(&"cargo build".to_string()));
+    }
+
+    #[test]
+    fn extract_verification_commands_with_args() {
+        let input = "Execute cargo test --lib --all-features\nThen cargo clippy -- -D warnings";
+        let commands = extract_verification_commands(input);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0], "cargo test --lib --all-features");
+        assert_eq!(commands[1], "cargo clippy -- -D warnings");
+    }
+
+    #[test]
+    fn extract_verification_commands_npm_test() {
+        let input = "Run npm test\nto verify the changes";
+        let commands = extract_verification_commands(input);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0], "npm test");
+    }
+
+    #[test]
+    fn extract_verification_commands_pytest() {
+        let input = "Execute pytest tests/unit/";
+        let commands = extract_verification_commands(input);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0], "pytest tests/unit/");
+    }
+
+    #[test]
+    fn extract_verification_commands_deduplicates() {
+        let input = "Run cargo test\nAnd cargo test again";
+        let commands = extract_verification_commands(input);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0], "cargo test");
+    }
+
+    #[test]
+    fn extract_verification_commands_all_patterns() {
+        let input = r#"
+        cargo check
+        cargo test
+        cargo build
+        cargo clippy
+        npm test
+        pytest
+        "#;
+        let commands = extract_verification_commands(input);
+        assert_eq!(commands.len(), 6);
+    }
+
+    #[test]
+    fn extract_verification_commands_trims_whitespace() {
+        let input = "  cargo check  \n  cargo test  ";
+        let commands = extract_verification_commands(input);
+        assert_eq!(commands[0], "cargo check");
+        assert_eq!(commands[1], "cargo test");
+    }
+}

@@ -52,6 +52,12 @@ pub trait LLMProviderFactory: Send + Sync {
     fn as_http(&self) -> Option<&dyn http::HTTPLLMProviderFactory> {
         None
     }
+
+    /// Whether this provider supports user-managed custom models.
+    /// Examples: llama_cpp (GGUF files), ollama (pulled models), mrs (local models)
+    fn supports_custom_models(&self) -> bool {
+        false
+    }
 }
 
 #[allow(improper_ctypes_definitions)]

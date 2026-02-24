@@ -61,6 +61,28 @@ pub struct LLMConfig {
     pub created_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub updated_at: Option<OffsetDateTime>,
+    /// Mesh node label that owns this provider. `None` = local node.
+    /// Stored as `"_node"` key in the `params` JSON blob so no schema migration is needed.
+    /// The leading underscore signals it is an internal routing field, not a provider param.
+    #[serde(skip)]
+    pub provider_node_id: Option<String>,
+}
+
+/// User-managed custom model metadata persisted in storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomModel {
+    pub provider: String,
+    pub model_id: String,
+    pub display_name: String,
+    pub config_json: serde_json::Value,
+    pub source_type: String,
+    pub source_ref: Option<String>,
+    pub family: Option<String>,
+    pub quant: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub created_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub updated_at: Option<OffsetDateTime>,
 }
 
 /// Stored session-scoped execution configuration snapshot.
@@ -206,6 +228,17 @@ pub trait SessionStore: Send + Sync {
     /// Set the LLM configuration id for a session
     async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()>;
 
+    /// Set the provider node for a session (None = local, Some = remote mesh node).
+    async fn set_session_provider_node_id(
+        &self,
+        session_id: &str,
+        provider_node_id: Option<&str>,
+    ) -> SessionResult<()>;
+
+    /// Get the provider node for a session.
+    async fn get_session_provider_node_id(&self, session_id: &str)
+    -> SessionResult<Option<String>>;
+
     /// Persist the execution configuration snapshot for a session.
     async fn set_session_execution_config(
         &self,
@@ -218,6 +251,22 @@ pub trait SessionStore: Send + Sync {
         &self,
         session_id: &str,
     ) -> SessionResult<Option<SessionExecutionConfig>>;
+
+    /// List user-managed custom models for a provider.
+    async fn list_custom_models(&self, provider: &str) -> SessionResult<Vec<CustomModel>>;
+
+    /// Get a user-managed custom model by canonical model_id.
+    async fn get_custom_model(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> SessionResult<Option<CustomModel>>;
+
+    /// Insert or update a user-managed custom model.
+    async fn upsert_custom_model(&self, model: &CustomModel) -> SessionResult<()>;
+
+    /// Delete a user-managed custom model.
+    async fn delete_custom_model(&self, provider: &str, model_id: &str) -> SessionResult<()>;
 
     // Phase 3 additions: Repository methods for domain entities
 

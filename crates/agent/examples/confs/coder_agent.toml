@@ -9,6 +9,10 @@ db = "/tmp/test.db"
 delegation = true
 verification = false
 snapshot_policy = "diff"
+delegation_wait_policy = "all"
+delegation_wait_timeout_secs = 120
+delegation_cancel_grace_secs = 5
+max_parallel_delegations = 5
 
 [planner]
 provider = "anthropic"
@@ -17,8 +21,7 @@ model = "claude-opus-4-5"
 #model = "gpt-5.2-codex"
 tools = ["delegate", "create_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "read_tool", "shell"]
 system = [
-  "You are Claude Code, Anthropic's official CLI for Claude.",
-#  { file = "../prompts/anthropic_opencode.txt" }
+  { file = "../prompts/default_system.txt" }
 ]
 
 # Middleware for planner
@@ -90,13 +93,13 @@ provider = "llama_cpp"
 model = "qwen3-coder-30b"
 description = "Specialized in implementation and code writing"
 capabilities = ["rust", "python"]
-tools = ["question", "edit", "todowrite", "todoread", "code_surgeon", "glob", "search_text", "ls", "shell", "read_tool", "write_file"]
+tools = ["question", "edit", "todowrite", "todoread", "glob", "search_text", "ls", "shell", "read_tool", "write_file"]
 system = [
   { file = "../prompts/anthropic_opencode.txt" }
 ]
 
 #[delegates.parameters]
-model_path = "hf:unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf"
+model = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf"
 n_ctx = 120000
 max_tokens = 8192
 flash_attention = "enabled"

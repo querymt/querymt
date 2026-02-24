@@ -27,8 +27,7 @@ use crate::acp::shared::{
     handle_rpc_message, is_event_owned, translate_event_to_notification,
 };
 use crate::acp::shutdown;
-use crate::agent::QueryMTAgent;
-use crate::event_bus::EventBus;
+use crate::event_fanout::EventFanout;
 use axum::{
     Router,
     extract::{
@@ -47,10 +46,10 @@ use uuid::Uuid;
 /// State for standalone WebSocket ACP server
 #[derive(Clone)]
 struct WsServerState {
-    agent: Arc<QueryMTAgent>,
+    agent: Arc<crate::agent::AgentHandle>,
     pending_permissions: PermissionMap,
     pending_elicitations: PendingElicitationMap,
-    event_sources: Vec<Arc<EventBus>>,
+    event_sources: Vec<Arc<EventFanout>>,
     session_owners: SessionOwnerMap,
 }
 
@@ -88,7 +87,10 @@ struct WsServerState {
 ///
 /// The server handles SIGTERM and SIGINT (Ctrl+C) for graceful shutdown.
 /// Active connections are gracefully closed before exit.
-pub async fn serve_websocket(agent: Arc<QueryMTAgent>, addr: &str) -> anyhow::Result<()> {
+pub async fn serve_websocket(
+    agent: Arc<crate::agent::AgentHandle>,
+    addr: &str,
+) -> anyhow::Result<()> {
     log::info!("Starting standalone WebSocket ACP server on {}", addr);
 
     // Set up bridge for ClientBridgeSender pattern

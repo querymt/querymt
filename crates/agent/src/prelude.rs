@@ -13,6 +13,9 @@
 //! # }
 //! ```
 //!
+// Error types
+pub use crate::error::AgentError;
+
 // High-level APIs
 pub use crate::simple::{
     Agent, AgentBuilder, AgentSession, DelegateConfigBuilder, PlannerConfigBuilder, Quorum,
@@ -29,12 +32,11 @@ pub use crate::runner::{
 };
 
 // Core agent types
-pub use crate::agent::{QueryMTAgent, SnapshotPolicy, ToolPolicy};
+pub use crate::agent::{AgentHandle, SnapshotPolicy, ToolPolicy};
 pub use crate::quorum::{AgentQuorum, DelegateAgent};
 
 // Events
-pub use crate::event_bus::EventBus;
-pub use crate::events::{AgentEvent, AgentEventKind, EventObserver};
+pub use crate::events::{AgentEvent, AgentEventKind};
 
 // Delegation & Multi-agent
 pub use crate::delegation::{AgentInfo, AgentRegistry};
@@ -56,5 +58,5 @@ pub use crate::tools::Tool;
 // ACP Server
 pub use crate::acp::AcpTransport;
 
-// Builder trait (for advanced use)
-pub use crate::agent::AgentBuilderExt;
+// Builder (for advanced use)
+pub use crate::agent::AgentConfigBuilder;

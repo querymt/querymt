@@ -26,9 +26,9 @@ const mockModels: ModelEntry[] = [
 ];
 
 const mockRecentModels: RecentModelEntry[] = [
-  { provider: 'anthropic', model: 'claude-3-opus', last_used_at: '2024-01-03T00:00:00Z' },
-  { provider: 'openai', model: 'gpt-4', last_used_at: '2024-01-02T00:00:00Z' },
-  { provider: 'anthropic', model: 'claude-3-haiku', last_used_at: '2024-01-01T00:00:00Z' },
+  { provider: 'anthropic', model: 'claude-3-opus', last_used: '2024-01-03T00:00:00Z', use_count: 3 },
+  { provider: 'openai', model: 'gpt-4', last_used: '2024-01-02T00:00:00Z', use_count: 2 },
+  { provider: 'anthropic', model: 'claude-3-haiku', last_used: '2024-01-01T00:00:00Z', use_count: 1 },
 ];
 
 describe('ModelPickerPopover', () => {
@@ -48,9 +48,18 @@ describe('ModelPickerPopover', () => {
     recentModelsByWorkspace: {
       '/test/workspace': mockRecentModels,
     },
+    providerCapabilities: {
+      anthropic: { provider: 'anthropic', supports_custom_models: false },
+      openai: { provider: 'openai', supports_custom_models: false },
+      llama_cpp: { provider: 'llama_cpp', supports_custom_models: true },
+    },
+    modelDownloads: {},
     agentMode: 'standard',
     onRefresh: vi.fn(),
     onSetSessionModel: vi.fn(),
+    onAddCustomModelFromHf: vi.fn(),
+    onAddCustomModelFromFile: vi.fn(),
+    onDeleteCustomModel: vi.fn(),
   };
 
   beforeEach(() => {
@@ -95,7 +104,8 @@ describe('ModelPickerPopover', () => {
 
     expect(defaultProps.onSetSessionModel).toHaveBeenCalledWith(
       'session-1',
-      'anthropic/claude-3-sonnet'
+      'anthropic/claude-3-sonnet',
+      undefined
     );
     expect(defaultProps.onOpenChange).toHaveBeenCalledWith(false);
   });
@@ -198,7 +208,8 @@ describe('ModelPickerPopover', () => {
       // Should call with the correct model ID (without the "recent:" prefix)
       expect(defaultProps.onSetSessionModel).toHaveBeenCalledWith(
         'session-1',
-        'openai/gpt-4'
+        'openai/gpt-4',
+        undefined
       );
     });
 
@@ -219,7 +230,8 @@ describe('ModelPickerPopover', () => {
       // Should call with the correct model ID
       expect(defaultProps.onSetSessionModel).toHaveBeenCalledWith(
         'session-1',
-        'anthropic/claude-3-sonnet'
+        'anthropic/claude-3-sonnet',
+        undefined
       );
     });
 
@@ -241,6 +253,108 @@ describe('ModelPickerPopover', () => {
     });
   });
 
+  describe('Custom model capability UI', () => {
+    it('shows custom model controls only for providers with supports_custom_models', () => {
+      const { rerender } = render(<ModelPickerPopover {...defaultProps} />);
+      expect(screen.queryByText(/Add custom model/i)).not.toBeInTheDocument();
+
+      rerender(
+        <ModelPickerPopover
+          {...defaultProps}
+          currentProvider="llama_cpp"
+          currentModel="model.gguf"
+          allModels={[{ provider: 'llama_cpp', model: 'model.gguf', source: 'catalog', id: 'hf:repo:model.gguf' }]}
+        />
+      );
+      expect(screen.getByText(/Add custom model \(llama_cpp\)/i)).toBeInTheDocument();
+    });
+
+    it('sends add/delete custom model actions for capability-enabled provider', async () => {
+      const user = userEvent.setup();
+      const onAddCustomModelFromHf = vi.fn();
+      const onAddCustomModelFromFile = vi.fn();
+      const onDeleteCustomModel = vi.fn();
+
+      render(
+        <ModelPickerPopover
+          {...defaultProps}
+          currentProvider="llama_cpp"
+          currentModel="model.gguf"
+          allModels={[{ provider: 'llama_cpp', model: 'model.gguf', source: 'custom', id: 'hf:repo:model.gguf' }]}
+          onAddCustomModelFromHf={onAddCustomModelFromHf}
+          onAddCustomModelFromFile={onAddCustomModelFromFile}
+          onDeleteCustomModel={onDeleteCustomModel}
+        />
+      );
+
+      await user.type(screen.getByPlaceholderText('HF repo (owner/name-GGUF)'), 'owner/repo-GGUF');
+      await user.type(screen.getByPlaceholderText('filename.gguf'), 'model.gguf');
+      await user.click(screen.getByTitle('Add from Hugging Face'));
+      expect(onAddCustomModelFromHf).toHaveBeenCalledWith('llama_cpp', 'owner/repo-GGUF', 'model.gguf', 'model.gguf');
+
+      await user.type(screen.getByPlaceholderText('/absolute/path/to/model.gguf'), '/tmp/model.gguf');
+      await user.click(screen.getByTitle('Add local GGUF file'));
+      expect(onAddCustomModelFromFile).toHaveBeenCalledWith('llama_cpp', '/tmp/model.gguf', 'model.gguf');
+
+      await user.click(screen.getByTitle('Delete selected custom model'));
+      expect(onDeleteCustomModel).toHaveBeenCalledWith('llama_cpp', 'hf:repo:model.gguf');
+    });
+
+    it('renders download status text for selected provider', () => {
+      render(
+        <ModelPickerPopover
+          {...defaultProps}
+          currentProvider="llama_cpp"
+          currentModel="model.gguf"
+          allModels={[{ provider: 'llama_cpp', model: 'model.gguf', source: 'catalog', id: 'hf:repo:model.gguf' }]}
+          modelDownloads={{
+            'llama_cpp:hf:repo:model.gguf': {
+              provider: 'llama_cpp',
+              model_id: 'hf:repo:model.gguf',
+              status: 'downloading',
+              bytes_downloaded: 10,
+              bytes_total: 100,
+              percent: 10,
+            },
+          }}
+        />
+      );
+
+      expect(screen.getByText(/downloading: hf:repo:model.gguf/i)).toBeInTheDocument();
+    });
+
+    it('sends canonical model id when selecting a custom model entry', async () => {
+      const user = userEvent.setup();
+      const onSetSessionModel = vi.fn();
+
+      render(
+        <ModelPickerPopover
+          {...defaultProps}
+          currentProvider="llama_cpp"
+          currentModel="Q8_0"
+          onSetSessionModel={onSetSessionModel}
+          allModels={[
+            {
+              provider: 'llama_cpp',
+              model: 'Q8_0',
+              id: 'hf:repo:model-Q8_0.gguf',
+              label: 'model-Q8_0.gguf',
+              source: 'custom',
+            },
+          ]}
+        />
+      );
+
+      await user.click(screen.getByText('model-Q8_0.gguf'));
+
+      expect(onSetSessionModel).toHaveBeenCalledWith(
+        'session-1',
+        'llama_cpp/hf:repo:model-Q8_0.gguf',
+        undefined,
+      );
+    });
+  });
+
   describe('Edge cases', () => {
     it('handles empty recent models list', () => {
       render(
@@ -259,7 +373,7 @@ describe('ModelPickerPopover', () => {
 
     it('handles models in recent that are no longer available', () => {
       const unavailableRecent: RecentModelEntry[] = [
-        { provider: 'old-provider', model: 'old-model', last_used_at: '2024-01-01T00:00:00Z' },
+        { provider: 'old-provider', model: 'old-model', last_used: '2024-01-01T00:00:00Z', use_count: 1 },
       ];
 
       render(
@@ -279,7 +393,8 @@ describe('ModelPickerPopover', () => {
       const manyRecentModels: RecentModelEntry[] = Array.from({ length: 10 }, (_, i) => ({
         provider: 'anthropic',
         model: `claude-${i}`,
-        last_used_at: new Date(Date.now() - i * 1000).toISOString(),
+        last_used: new Date(Date.now() - i * 1000).toISOString(),
+        use_count: i + 1,
       }));
 
       // Add these to available models

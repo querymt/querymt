@@ -50,9 +50,9 @@ name = "openai"
 path = "oci://ghcr.io/querymt/openai:latest"
 ```
 
-## Agent (`qmt-agent`)
+## Agent
 
-The `qmt-agent` crate (in `crates/agent`) is the high-level agent runtime for QueryMaTe.
+The `querymt-agent` crate (in `crates/agent`) is the high-level agent runtime for QueryMaTe.
 
 If you're new, the easiest way to try it is the `coder_agent` example at `crates/agent/examples/coder_agent.rs`.
 It loads an agent from a TOML config file and can run in two modes:

@@ -89,6 +89,8 @@ export interface EventItem {
   provider?: string;
   model?: string;
   configId?: number;  // LLM config ID from provider_changed events
+  /** Mesh node that owns the provider (from provider_changed events). Absent for local providers. */
+  providerNode?: string;
   // Execution metrics from llm_request_end events
   metrics?: ExecutionMetrics;
   // Middleware stopped event data
@@ -104,6 +106,16 @@ export interface EventItem {
   rateLimitAttempt?: number;
   rateLimitMaxAttempts?: number;
   rateLimitResume?: boolean;  // true for rate_limit_resume event
+  // Compaction event fields
+  compactionTokenEstimate?: number;   // From compaction_start: original context token count
+  compactionSummary?: string;         // From compaction_end: the AI-generated summary
+  compactionSummaryLen?: number;      // From compaction_end: summary length in chars
+  // Thinking/reasoning content (present on final assistant_message_stored if model emitted reasoning)
+  thinking?: string;
+  // Streaming delta fields (set on assistant_content_delta and assistant_thinking_delta events)
+  isStreamDelta?: boolean;    // True while this is a live streaming accumulator
+  isThinkingDelta?: boolean;  // True if accumulating thinking deltas (no text yet)
+  streamMessageId?: string;   // Links delta events to the final message_id for replacement
 }
 
 export interface RateLimitState {
@@ -136,6 +148,8 @@ export interface SessionSummary {
   parent_session_id?: string;
   fork_origin?: string;
   has_children?: boolean;
+  /** Node label where this session lives. Absent or undefined for local sessions. */
+  node?: string;
 }
 
 export interface SessionGroup {
@@ -172,6 +186,9 @@ export interface AgentStats {
 // Session-level statistics
 export interface SessionStats {
   totalCostUsd: number;
+  /** True when at least one event carried a non-null costUsd value.
+   *  False for OAuth sessions where the backend omits cost data. */
+  hasCostData: boolean;
   totalMessages: number;
   totalToolCalls: number;
   startTimestamp?: number;     // First event timestamp (for live timer calculation)
@@ -199,7 +216,9 @@ export interface AgentEvent {
 // AgentEventKind union type
 export type AgentEventKind =
   | { type: 'prompt_received'; content: string }
-  | { type: 'assistant_message_stored'; content: string }
+  | { type: 'assistant_message_stored'; content: string; thinking?: string; message_id?: string }
+  | { type: 'assistant_content_delta'; content: string; message_id: string }   // streaming text delta
+  | { type: 'assistant_thinking_delta'; content: string; message_id: string }  // streaming thinking delta
   | { type: 'tool_call_start'; tool_call_id: string; tool_name: string; arguments?: string }
   | { type: 'tool_call_end'; tool_call_id: string; tool_name: string; result?: string; is_error?: boolean }
   | { type: 'error'; message: string }
@@ -302,6 +321,14 @@ export interface DelegationGroupInfo {
   endTime?: number;
 }
 
+// Compaction data attached to a turn
+export interface TurnCompaction {
+  tokenEstimate: number;  // Original context token count before compaction
+  summary: string;        // The AI-generated compaction summary
+  summaryLen: number;     // Summary length in chars
+  timestamp: number;      // When compaction completed
+}
+
 // Turn-based grouping for conversation display
 export interface Turn {
   id: string;
@@ -316,6 +343,8 @@ export interface Turn {
   // Model info for this turn (from most recent provider_changed before/during turn)
   modelLabel?: string; // "provider / model" format
   modelConfigId?: number; // LLM config ID for fetching params
+  /** Compaction that occurred after this turn (between this turn and the next) */
+  compaction?: TurnCompaction;
 }
 
 export interface UndoStackFrame {
@@ -350,6 +379,7 @@ export type UiServerMessage =
       session_id: string;
       agent_id: string;
       events: any[];
+      cursor_seq: number;
     }
   | {
       type: 'error';
@@ -362,6 +392,7 @@ export type UiServerMessage =
       agent_id: string;
       audit: AuditView;
       undo_stack: UndoStackFrame[];
+      cursor_seq: number;
     }
   | {
       type: 'workspace_index_status';
@@ -371,6 +402,7 @@ export type UiServerMessage =
     }
   | { type: 'all_models_list'; models: ModelEntry[] }
   | { type: 'recent_models'; by_workspace: Record<string, RecentModelEntry[]> }
+  | { type: 'provider_capabilities'; providers: ProviderCapabilityEntry[] }
   | { type: 'auth_providers'; providers: AuthProviderEntry[] }
   | { type: 'oauth_flow_started'; flow_id: string; provider: string; authorization_url: string }
   | { type: 'oauth_result'; provider: string; success: boolean; message: string }
@@ -385,11 +417,30 @@ export type UiServerMessage =
       undo_stack: UndoStackFrame[];
     }
   | { type: 'redo_result'; success: boolean; message?: string | null; undo_stack: UndoStackFrame[] }
-  | { type: 'agent_mode'; mode: string };
+  | { type: 'agent_mode'; mode: string }
+  | { type: 'remote_nodes'; nodes: RemoteNodeInfo[] }
+  | { type: 'remote_sessions'; node_id: string; sessions: RemoteSessionInfo[] }
+  | ({ type: 'model_download_status' } & ModelDownloadStatus);
 
 export interface ModelEntry {
+  id?: string;
+  label?: string;
+  source?: 'preset' | 'cached' | 'custom' | 'catalog' | string;
+  family?: string;
+  quant?: string;
   provider: string;
   model: string;
+  /** Stable mesh node id (PeerId) where this provider lives. Absent for local models. */
+  node_id?: string;
+  /** Human-readable node label for display. Absent for local models. */
+  node_label?: string;
+  /** @deprecated Use node_label for display or node_id for identity. Alias for node_label. */
+  node?: string;
+}
+
+export interface ProviderCapabilityEntry {
+  provider: string;
+  supports_custom_models: boolean;
 }
 
 export interface RecentModelEntry {
@@ -397,6 +448,18 @@ export interface RecentModelEntry {
   model: string;
   last_used: string;  // ISO 8601 timestamp
   use_count: number;
+}
+
+export interface ModelDownloadStatus {
+  provider: string;
+  model_id: string;
+  status: 'queued' | 'downloading' | 'completed' | 'failed' | string;
+  bytes_downloaded: number;
+  bytes_total?: number | null;
+  percent?: number | null;
+  speed_bps?: number | null;
+  eta_seconds?: number | null;
+  message?: string | null;
 }
 
 export type OAuthStatus = 'not_authenticated' | 'expired' | 'connected';
@@ -427,6 +490,24 @@ export interface LlmConfigDetails {
   params?: Record<string, unknown> | null;
 }
 
+// Remote node/session types for mesh-based multi-node support
+export interface RemoteNodeInfo {
+  /** Stable mesh node id (PeerId string) — used as the identity for backend messages. */
+  id: string;
+  /** Human-readable label / hostname — used for display only. */
+  label: string;
+  capabilities: string[];
+  active_sessions: number;
+}
+
+export interface RemoteSessionInfo {
+  session_id: string;
+  actor_id: number;
+  cwd?: string;
+  created_at: number;
+  title?: string;
+}
+
 export type PromptBlock =
   | { type: 'text'; text: string }
   | { type: 'resource_link'; name: string; uri: string; description?: string };
@@ -440,7 +521,7 @@ export type UiClientMessage =
   | { type: 'list_sessions' }
   | { type: 'load_session'; session_id: string }
   | { type: 'list_all_models'; refresh?: boolean }
-  | { type: 'set_session_model'; session_id: string; model_id: string }
+  | { type: 'set_session_model'; session_id: string; model_id: string; node_id?: string }
   | { type: 'get_recent_models'; limit_per_workspace?: number }
   | { type: 'list_auth_providers' }
   | { type: 'start_oauth_login'; provider: string }
@@ -455,4 +536,11 @@ export type UiClientMessage =
   | { type: 'unsubscribe_session'; session_id: string }
   | { type: 'elicitation_response'; elicitation_id: string; action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> }
   | { type: 'set_agent_mode'; mode: string }
-  | { type: 'get_agent_mode' };
+  | { type: 'get_agent_mode' }
+  | { type: 'list_remote_nodes' }
+  | { type: 'list_remote_sessions'; node_id: string }
+  | { type: 'create_remote_session'; node_id: string; cwd?: string | null; request_id?: string }
+  | { type: 'attach_remote_session'; node_id: string; session_id: string }
+  | { type: 'add_custom_model_from_hf'; provider: string; repo: string; filename: string; display_name?: string }
+  | { type: 'add_custom_model_from_file'; provider: string; file_path: string; display_name?: string }
+  | { type: 'delete_custom_model'; provider: string; model_id: string };

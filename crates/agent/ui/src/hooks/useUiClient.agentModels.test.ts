@@ -83,6 +83,7 @@ describe('useUiClient - agentModels tracking', () => {
           file_mentions: [],
         },
         undo_stack: [],
+        cursor_seq: 1,
       });
     });
 
@@ -132,6 +133,7 @@ describe('useUiClient - agentModels tracking', () => {
           file_mentions: [],
         },
         undo_stack: [],
+        cursor_seq: 1,
       });
     });
 
@@ -139,5 +141,46 @@ describe('useUiClient - agentModels tracking', () => {
     expect(result.current.agentModels['primary'].provider).toBe('openai');
     expect(result.current.agentModels['primary'].model).toBe('gpt-4-turbo');
     expect(result.current.agentModels['primary'].contextLimit).toBe(128000);
+  });
+
+  it('should not append connection-level error messages into the active session timeline', async () => {
+    const { result } = renderHook(() => useUiClient());
+
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.connected).toBe(true);
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'session_loaded',
+        session_id: 'session-codex',
+        agent_id: 'primary',
+        audit: {
+          session_id: 'session-codex',
+          cwd: '/test',
+          events: [{
+            seq: 1,
+            timestamp: Date.now() / 1000,
+            kind: { type: 'provider_changed', provider: 'codex', model: 'gpt-5.3-codex' },
+          }],
+          delegations: [],
+          file_mentions: [],
+        },
+        undo_stack: [],
+        cursor_seq: 1,
+      });
+    });
+
+    const before = result.current.eventsBySession.get('session-codex') ?? [];
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'error',
+        message: 'anthropic auth failed',
+      });
+    });
+
+    const after = result.current.eventsBySession.get('session-codex') ?? [];
+    expect(after).toHaveLength(before.length);
+    expect(after.some((event) => event.content.includes('anthropic auth failed'))).toBe(false);
   });
 });

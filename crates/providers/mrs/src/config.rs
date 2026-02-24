@@ -10,7 +10,6 @@ pub struct MistralRSConfig {
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<ToolChoice>,
     pub tok_model_id: Option<String>,
-    pub gguf_files: Option<Vec<String>>,
     pub hf_revision: Option<String>,
     pub token_source: Option<String>,
     pub chat_template: Option<String>,

@@ -3,9 +3,10 @@
 //! Handles session creation, agent lookup, routing modes (single/broadcast),
 //! and session-related state management.
 
-use super::ServerState;
 use super::messages::{RoutingMode, UiAgentInfo, UiPromptBlock, UiServerMessage};
-use crate::agent::QueryMTAgent;
+use super::{ServerState, cursor_from_events};
+use crate::agent::AgentHandle;
+use crate::events::EventEnvelope;
 use crate::index::{normalize_cwd, resolve_workspace_root};
 use crate::send_agent::SendAgent;
 use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest};
@@ -57,10 +58,15 @@ pub async fn prompt_for_mode(
             let agent = agent_for_id(state, &agent_id)
                 .ok_or_else(|| format!("Unknown agent: {}", agent_id))?;
             let session_cwd = session_cwd_for(state, &session_id).await.or(cwd.cloned());
+            let session_ref = {
+                let registry = state.agent.registry.lock().await;
+                registry.get(&session_id).cloned()
+            };
             let prompt_blocks = super::mentions::build_prompt_blocks(
                 &state.workspace_manager,
                 session_cwd.as_ref(),
                 prompt,
+                session_ref.as_ref(),
             )
             .await;
             send_prompt(agent, session_id, prompt_blocks).await?;
@@ -72,10 +78,15 @@ pub async fn prompt_for_mode(
                 let agent = agent_for_id(state, &agent_id)
                     .ok_or_else(|| format!("Unknown agent: {}", agent_id))?;
                 let session_cwd = session_cwd_for(state, &session_id).await.or(cwd.cloned());
+                let session_ref = {
+                    let registry = state.agent.registry.lock().await;
+                    registry.get(&session_id).cloned()
+                };
                 let prompt_blocks = super::mentions::build_prompt_blocks(
                     &state.workspace_manager,
                     session_cwd.as_ref(),
                     prompt,
+                    session_ref.as_ref(),
                 )
                 .await;
                 send_prompt(agent, session_id, prompt_blocks).await?;
@@ -168,12 +179,24 @@ pub async fn ensure_session(
     // Replay stored events for the new session (includes ProviderChanged)
     // No child sessions for a new session
     if let Ok(audit) = state.view_store.get_audit_view(&session_id, false).await {
+        let cursor = cursor_from_events(&audit.events);
+        let events: Vec<EventEnvelope> = audit.events.into_iter().map(Into::into).collect();
+
+        {
+            let mut connections = state.connections.lock().await;
+            if let Some(conn) = connections.get_mut(conn_id) {
+                conn.session_cursors
+                    .insert(session_id.clone(), cursor.clone());
+            }
+        }
+
         let _ = super::connection::send_message(
             tx,
             UiServerMessage::SessionEvents {
                 session_id: session_id.clone(),
                 agent_id: agent_id.to_string(),
-                events: audit.events,
+                events,
+                cursor,
             },
         )
         .await;
@@ -198,7 +221,10 @@ pub async fn ensure_session(
         .await;
 
         tokio::spawn(async move {
-            let status = match manager.get_or_create(root.clone()).await {
+            let status = match manager
+                .ask(crate::index::GetOrCreate { root: root.clone() })
+                .await
+            {
                 Ok(_) => {
                     // Subscribe to file index updates for this workspace
                     super::connection::subscribe_to_file_index(
@@ -299,27 +325,9 @@ pub fn resolve_cwd(cwd: Option<String>) -> Option<PathBuf> {
 }
 
 /// Collect event sources from the agent and its registry.
-pub fn collect_event_sources(agent: &Arc<QueryMTAgent>) -> Vec<Arc<crate::event_bus::EventBus>> {
-    let mut sources = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    let primary = agent.event_bus();
-    if seen.insert(Arc::as_ptr(&primary) as usize) {
-        sources.push(primary);
-    }
-
-    let registry = agent.agent_registry();
-    for info in registry.list_agents() {
-        if let Some(instance) = registry.get_agent_instance(&info.id)
-            && let Some(bus) = instance
-                .as_any()
-                .downcast_ref::<QueryMTAgent>()
-                .map(|agent| agent.event_bus())
-            && seen.insert(Arc::as_ptr(&bus) as usize)
-        {
-            sources.push(bus);
-        }
-    }
-
-    sources
+pub fn collect_event_sources(
+    agent: &Arc<AgentHandle>,
+) -> Vec<Arc<crate::event_fanout::EventFanout>> {
+    // Delegate to the shared implementation in acp/shared.rs
+    crate::acp::shared::collect_event_sources(agent)
 }

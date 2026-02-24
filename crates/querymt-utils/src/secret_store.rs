@@ -34,7 +34,7 @@ use std::time::SystemTime;
 const DEFAULT_PROVIDER_KEY: &str = "default";
 
 /// Service name for keyring entries (shared across CLI and agent)
-const SERVICE_NAME: &str = "querymt-cli";
+const SERVICE_NAME: &str = "querymt";
 
 /// A secure storage for API keys and other sensitive information using system keyring
 #[derive(Debug)]

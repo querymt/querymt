@@ -12,6 +12,8 @@
 db = "/tmp/agent.db"
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
+assume_mutating = false
+mutating_tools = ["edit", "write_file", "shell"]
 tools = [
   # File operations
   "edit", "read_tool", "write_file",
@@ -24,31 +26,32 @@ tools = [
   # User interaction
   "question",
   # Code intelligence
-  "semantic_edit",
+#  "semantic_edit",
   "web_fetch",
+  "context7.*",
 ]
 system = [
   { file = "../prompts/default_system.txt" }
 ]
 
-[agent.snapshot]
+[agent.execution.snapshot]
 backend = "git"
 
 # Compaction: tool output truncation (Layer 1)
-[agent.tool_output]
+[agent.execution.tool_output]
 max_lines = 2000
 max_bytes = 51200
 
 # Compaction: pruning after every turn (Layer 2)
-[agent.pruning]
+[agent.execution.pruning]
 protect_tokens = 40000
 
 # Compaction: AI summary on context overflow (Layer 3)
-[agent.compaction]
+[agent.execution.compaction]
 auto = true
 
 #[agent.parameters]
-#model_path = "hf:unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf"
+#model = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q6_K_XL"
 #n_ctx = 32768
 
 # =============================================================================
@@ -120,10 +123,11 @@ max_steps = 200
 max_turns = 50
 
 # Context management with auto-compaction
-# Note: auto_compact is controlled by [agent.compaction].auto
+# Note: auto_compact is controlled by [agent.execution.compaction].auto
 [[middleware]]
 type = "context"
 warn_at_percent = 80
+compact_at_percent = 90
 fallback_max_tokens = 128000
 
 # Detect when code is similar to existing code
@@ -131,3 +135,9 @@ fallback_max_tokens = 128000
 type = "dedup_check"
 threshold = 0.85
 min_lines = 10
+
+[[mcp]]
+name = "context7"
+transport = "http"
+url = "https://mcp.context7.com/mcp"
+headers = { CONTEXT7_API_KEY = "${CONTEXT7_API_KEY}" }

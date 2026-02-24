@@ -47,11 +47,15 @@ pub use repo_task::SqliteTaskRepository;
 pub mod projection;
 
 pub use projection::{
-    AuditView, DefaultRedactor, EventStore, FieldPredicate, FieldSensitivity, FilterExpr,
-    PredicateOp, RedactedView, RedactionPolicy, Redactor, SessionGroup, SessionListFilter,
-    SessionListItem, SessionListView, SummaryView, ViewStore,
+    AuditView, DefaultRedactor, FieldPredicate, FieldSensitivity, FilterExpr, PredicateOp,
+    RedactedView, RedactionPolicy, Redactor, SessionGroup, SessionListFilter, SessionListItem,
+    SessionListView, SummaryView, ViewStore,
 };
 
 // Phase 3: Runtime integration
 pub mod runtime;
 pub use runtime::{RuntimeContext, SessionForkHelper};
+
+// Tests
+#[cfg(test)]
+mod repo_tests;

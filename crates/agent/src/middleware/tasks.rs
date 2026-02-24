@@ -3,6 +3,7 @@ use crate::session::domain::{DelegationStatus, TaskStatus};
 use crate::session::store::SessionStore;
 use async_trait::async_trait;
 use log::{debug, trace};
+use parking_lot::Mutex;
 use std::sync::Arc;
 
 /// Middleware that auto-completes tasks when:
@@ -26,7 +27,11 @@ impl TaskAutoCompletionMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for TaskAutoCompletionMiddleware {
-    async fn on_after_llm(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_after_llm(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "TaskAutoCompletionMiddleware::on_after_llm entering state: {}",
             state.name()
@@ -170,7 +175,7 @@ impl MiddlewareDriver for TaskAutoCompletionMiddleware {
 /// Helps prevent agents from calling the same tool repeatedly with identical arguments
 pub struct DuplicateToolCallMiddleware {
     store: Arc<dyn SessionStore>,
-    last_check: std::sync::Mutex<std::collections::HashMap<String, usize>>, // session_id -> last_checked_history_len
+    last_check: Mutex<std::collections::HashMap<String, usize>>, // session_id -> last_checked_history_len
 }
 
 impl DuplicateToolCallMiddleware {
@@ -178,7 +183,7 @@ impl DuplicateToolCallMiddleware {
         debug!("Creating DuplicateToolCallMiddleware");
         Self {
             store,
-            last_check: std::sync::Mutex::new(std::collections::HashMap::new()),
+            last_check: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -192,7 +197,7 @@ impl DuplicateToolCallMiddleware {
         };
 
         // Track last check to avoid re-checking same history
-        let mut last_check = self.last_check.lock().unwrap();
+        let mut last_check = self.last_check.lock();
         let last_checked_len = last_check.get(session_id).copied().unwrap_or(0);
 
         if history.len() <= last_checked_len {
@@ -242,7 +247,11 @@ impl DuplicateToolCallMiddleware {
 
 #[async_trait]
 impl MiddlewareDriver for DuplicateToolCallMiddleware {
-    async fn on_step_start(&self, state: ExecutionState) -> Result<ExecutionState> {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         trace!(
             "DuplicateToolCallMiddleware::on_step_start entering state: {}",
             state.name()
@@ -274,11 +283,102 @@ impl MiddlewareDriver for DuplicateToolCallMiddleware {
 
     fn reset(&self) {
         debug!("DuplicateToolCallMiddleware::reset - clearing last_check cache");
-        let mut last_check = self.last_check.lock().unwrap();
+        let mut last_check = self.last_check.lock();
         last_check.clear();
     }
 
     fn name(&self) -> &'static str {
         "DuplicateToolCallMiddleware"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::mocks::MockSessionStore;
+
+    // ── TaskAutoCompletionMiddleware ─────────────────────────────────────────
+
+    #[test]
+    fn task_auto_completion_name() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_get_session().never();
+        let m = TaskAutoCompletionMiddleware::new(Arc::new(mock));
+        assert_eq!(m.name(), "TaskAutoCompletionMiddleware");
+    }
+
+    #[test]
+    fn task_auto_completion_reset_does_not_panic() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_get_session().never();
+        let m = TaskAutoCompletionMiddleware::new(Arc::new(mock));
+        m.reset();
+    }
+
+    // ── DuplicateToolCallMiddleware ──────────────────────────────────────────
+
+    #[test]
+    fn duplicate_tool_call_name() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_get_history().never();
+        let m = DuplicateToolCallMiddleware::new(Arc::new(mock));
+        assert_eq!(m.name(), "DuplicateToolCallMiddleware");
+    }
+
+    #[test]
+    fn duplicate_tool_call_reset_clears_cache() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_get_history().never();
+        let m = DuplicateToolCallMiddleware::new(Arc::new(mock));
+        // Add something to last_check to test clearing
+        {
+            let mut cache = m.last_check.lock();
+            cache.insert("sess-1".to_string(), 5);
+        }
+        m.reset();
+        let cache = m.last_check.lock();
+        assert!(cache.is_empty(), "reset() should clear the cache");
+    }
+
+    #[tokio::test]
+    async fn task_auto_completion_passes_through_non_after_llm_state() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_get_session().never();
+        let m = TaskAutoCompletionMiddleware::new(Arc::new(mock));
+
+        use crate::middleware::{AgentStats, ConversationContext, ExecutionState};
+        let ctx = Arc::new(ConversationContext::new(
+            "sess-1".into(),
+            Arc::from([]),
+            Arc::new(AgentStats::default()),
+            "mock".into(),
+            "mock-model".into(),
+        ));
+        let state = ExecutionState::BeforeLlmCall { context: ctx };
+        let result = m.on_after_llm(state, None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_call_passes_through_non_before_llm_state() {
+        let mut mock = MockSessionStore::new();
+        mock.expect_get_history().never();
+        let m = DuplicateToolCallMiddleware::new(Arc::new(mock));
+
+        use crate::middleware::{AgentStats, ConversationContext, ExecutionState, LlmResponse};
+        let ctx = Arc::new(ConversationContext::new(
+            "sess-1".into(),
+            Arc::from([]),
+            Arc::new(AgentStats::default()),
+            "mock".into(),
+            "mock-model".into(),
+        ));
+        let response = Arc::new(LlmResponse::new("hi".to_string(), vec![], None, None));
+        let state = ExecutionState::AfterLlm {
+            response,
+            context: ctx,
+        };
+        let result = m.on_step_start(state, None).await;
+        assert!(result.is_ok());
     }
 }
