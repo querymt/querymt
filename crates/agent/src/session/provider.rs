@@ -893,7 +893,7 @@ pub async fn build_provider_from_config(
                         provider_name, env_var_name
                     ),
                     None => format!(
-                        "Provider '{}' requires authentication, but this build has no OAuth support. Rebuild with the `oauth` feature and run 'qmt auth login {}'.",
+                        "Provider '{}' requires authentication, but this build has no OAuth support. Use the auth UI in an OAuth-enabled build, or rebuild with the `oauth` feature and run 'qmt auth login {}'.",
                         provider_name, provider_name
                     ),
                 };
