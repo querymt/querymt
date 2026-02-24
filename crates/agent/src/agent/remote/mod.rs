@@ -12,6 +12,7 @@
 //! `ActorRef<SessionActor>`.
 
 pub mod actor_ref;
+pub mod dht_name;
 pub mod event_forwarder;
 pub mod event_relay;
 pub mod node_id;

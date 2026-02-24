@@ -224,7 +224,11 @@ mod tests {
         fs::write(&file, "one").expect("write one");
         let pre = MerkleTree::scan(dir.path());
 
-        fs::write(&file, "two").expect("write two");
+        // Use a different-length string ("two!" vs "one") so the FileFingerprint
+        // size field differs regardless of filesystem mtime granularity.
+        // On Linux CI (ext4/tmpfs), mtime resolution can be coarser than the
+        // time between two writes, causing same-size overwrites to appear unchanged.
+        fs::write(&file, "two!").expect("write two");
         let post = MerkleTree::scan_with_previous(dir.path(), Some(&pre));
         let diff = post.diff_paths(&pre);
 

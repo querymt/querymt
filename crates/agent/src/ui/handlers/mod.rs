@@ -134,7 +134,12 @@ pub async fn handle_ui_message(
             let tx = tx.clone();
             tokio::spawn(async move {
                 let cwd = resolve_cwd(None);
-                let _ = prompt_for_mode(&state, &conn_id, &prompt, cwd.as_ref(), &tx).await;
+                if let Err(err) =
+                    prompt_for_mode(&state, &conn_id, &prompt, cwd.as_ref(), &tx).await
+                {
+                    log::error!("prompt_for_mode failed: {}", err);
+                    let _ = super::connection::send_error(&tx, err).await;
+                }
                 handle_list_sessions(&state, &tx).await;
             });
         }

@@ -196,8 +196,11 @@ impl SessionRegistry {
         //    SessionActor can look it up by name and install an EventForwarder.
         let mesh_active = mesh.is_some();
         if let Some(ref mesh) = mesh {
-            mesh.register_actor(relay_ref.clone(), format!("event_relay::{}", session_id))
-                .await;
+            mesh.register_actor(
+                relay_ref.clone(),
+                crate::agent::remote::dht_name::event_relay(&session_id),
+            )
+            .await;
         } else {
             log::debug!(
                 "attach_remote_session: no mesh, DHT registration skipped for relay (session {})",

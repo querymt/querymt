@@ -35,7 +35,7 @@ mod session_actor_ref_remote_tests {
         let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime);
         let local_ref = SessionActor::spawn(actor);
 
-        let dht_name = format!("session::{}", session_id);
+        let dht_name = crate::agent::remote::dht_name::session(&session_id);
         mesh.register_actor(local_ref.clone(), dht_name.clone())
             .await;
 

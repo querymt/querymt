@@ -266,7 +266,7 @@ mod remote_impl {
             // Register in REMOTE_REGISTRY + Kademlia DHT so remote peers can
             // address the session actor by name.
             if let Some(ref mesh) = self.mesh {
-                let dht_name = format!("session::{}", session_id);
+                let dht_name = crate::agent::remote::dht_name::session(&session_id);
                 let reg_span = tracing::info_span!(
                     "remote.node_manager.dht_register_session",
                     session_id = %session_id,

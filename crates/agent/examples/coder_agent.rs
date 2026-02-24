@@ -175,29 +175,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let node_manager_ref = RemoteNodeManager::spawn(node_manager);
 
                 // Register this node in the DHT so peers can discover it.
-                mesh.register_actor(node_manager_ref, "node_manager").await;
-                eprintln!("RemoteNodeManager registered in kameo DHT as 'node_manager'");
+                mesh.register_actor(
+                    node_manager_ref,
+                    querymt_agent::agent::remote::dht_name::NODE_MANAGER,
+                )
+                .await;
+                eprintln!(
+                    "RemoteNodeManager registered in kameo DHT as '{}'",
+                    querymt_agent::agent::remote::dht_name::NODE_MANAGER
+                );
 
                 // Spawn ProviderHostActor so that remote peers can proxy LLM
                 // calls through this node's provider registry when the session's
                 // provider_node points here.
                 {
                     use querymt_agent::agent::remote::ProviderHostActor;
+                    use querymt_agent::agent::remote::dht_name;
                     let provider_host = ProviderHostActor::new(agent_handle.config.clone());
                     let provider_host_ref = ProviderHostActor::spawn(provider_host);
-                    let hostname = std::env::var("HOSTNAME")
-                        .ok()
-                        .filter(|h| !h.is_empty())
-                        .or_else(|| {
-                            std::process::Command::new("hostname")
-                                .output()
-                                .ok()
-                                .and_then(|o| String::from_utf8(o.stdout).ok())
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                        })
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let dht_name = format!("provider_host::{}", hostname);
+                    let dht_name = dht_name::provider_host(mesh.peer_id());
                     mesh.register_actor(provider_host_ref, dht_name.clone())
                         .await;
                     eprintln!("ProviderHostActor registered in kameo DHT as '{dht_name}'");

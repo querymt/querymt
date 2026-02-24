@@ -770,7 +770,8 @@ async fn fetch_remote_models(state: &ServerState) -> Vec<ModelEntry> {
     };
 
     let local_peer_id = *mesh.peer_id();
-    let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>("node_manager");
+    let mut stream =
+        mesh.lookup_all_actors::<RemoteNodeManager>(crate::agent::remote::dht_name::NODE_MANAGER);
     let mut all_remote = Vec::new();
 
     while let Some(result) = stream.next().await {

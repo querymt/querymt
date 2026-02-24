@@ -359,7 +359,8 @@ mod provider_routing_integration_tests {
         let mesh = get_test_mesh().await;
 
         let (tx, _rx) = mpsc::channel(16);
-        let stream_rx_name = format!("stream_rx::h9-{}", test_id);
+        let stream_rx_name =
+            crate::agent::remote::dht_name::stream_receiver(&format!("h9-{}", test_id));
         let receiver_actor = StreamReceiverActor::new(tx, stream_rx_name.clone());
         let receiver_ref = StreamReceiverActor::spawn(receiver_actor);
         mesh.register_actor(receiver_ref.clone(), stream_rx_name.clone())
@@ -659,7 +660,7 @@ mod build_provider_for_session_tests {
         let actor = ProviderHostActor::new(f.config.clone());
         let actor_ref = ProviderHostActor::spawn(actor);
         let alpha_node_id = random_node_id();
-        let alpha_dht = format!("provider_host::peer::{}", alpha_node_id);
+        let alpha_dht = crate::agent::remote::dht_name::provider_host(&alpha_node_id);
         mesh.register_actor(actor_ref, alpha_dht.clone()).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -1080,7 +1081,7 @@ mod mesh_setup_config_tests {
         let actor_ref = ProviderHostActor::spawn(actor);
 
         let hostname = format!("test-host-i5-{}", test_id);
-        let dht_name = format!("provider_host::peer::{}", hostname);
+        let dht_name = crate::agent::remote::dht_name::provider_host(&hostname);
         mesh.register_actor(actor_ref.clone(), dht_name.clone())
             .await;
         let _ = actor_ref;

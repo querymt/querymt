@@ -508,7 +508,8 @@ impl AgentHandle {
         let concurrency = Self::remote_node_lookup_parallelism();
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
-        let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>("node_manager");
+        let mut stream = mesh
+            .lookup_all_actors::<RemoteNodeManager>(crate::agent::remote::dht_name::NODE_MANAGER);
         let mut lookups = FuturesUnordered::new();
         let mut cached_nodes = Vec::new();
 
@@ -603,7 +604,8 @@ impl AgentHandle {
         let timeout = Self::remote_node_info_timeout();
         let concurrency = Self::remote_node_lookup_parallelism();
         let semaphore = Arc::new(Semaphore::new(concurrency));
-        let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>("node_manager");
+        let mut stream = mesh
+            .lookup_all_actors::<RemoteNodeManager>(crate::agent::remote::dht_name::NODE_MANAGER);
         let mut lookups = FuturesUnordered::new();
 
         while let Some(result) = stream.next().await {
@@ -737,7 +739,7 @@ impl AgentHandle {
         // Resolve the RemoteActorRef<SessionActor> via DHT lookup.
         // RemoteNodeManager registers the session under "session::{session_id}"
         // in its CreateRemoteSession handler once the swarm is up.
-        let dht_name = format!("session::{}", session_id);
+        let dht_name = crate::agent::remote::dht_name::session(&session_id);
         let remote_session_ref = mesh
             .lookup_actor::<SessionActor>(dht_name.clone())
             .await

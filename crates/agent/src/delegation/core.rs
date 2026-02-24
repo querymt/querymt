@@ -165,7 +165,7 @@ impl AgentActorHandle {
                     })?;
 
                 let session_id = resp.session_id.clone();
-                let dht_name = format!("session::{}", session_id);
+                let dht_name = crate::agent::remote::dht_name::session(&session_id);
                 let remote_session_ref = mesh
                     .lookup_actor::<SessionActor>(dht_name.clone())
                     .await

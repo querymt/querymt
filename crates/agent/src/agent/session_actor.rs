@@ -672,7 +672,7 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
             use crate::agent::remote::event_relay::EventRelayActor;
 
             if let Some(ref mesh) = self.mesh {
-                let relay_name = format!("event_relay::{}", self.session_id);
+                let relay_name = crate::agent::remote::dht_name::event_relay(&self.session_id);
                 match mesh
                     .lookup_actor::<EventRelayActor>(relay_name.clone())
                     .await

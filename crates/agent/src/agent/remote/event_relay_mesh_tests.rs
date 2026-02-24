@@ -42,7 +42,8 @@ mod event_relay_mesh_tests {
         let relay = EventRelayActor::new(event_sink.clone(), label.to_string());
         let relay_ref = EventRelayActor::spawn(relay);
 
-        let dht_name = format!("event_relay::{}-{}", label, test_id);
+        let dht_name =
+            crate::agent::remote::dht_name::event_relay(&format!("{}-{}", label, test_id));
         mesh.register_actor(relay_ref.clone(), dht_name.clone())
             .await;
 
@@ -226,7 +227,7 @@ mod event_relay_mesh_tests {
         let session_ref = SessionActorRef::Local(session_ref_local);
 
         // Register a relay under the name the SubscribeEvents handler looks for.
-        let relay_dht_name = format!("event_relay::{}", session_id);
+        let relay_dht_name = crate::agent::remote::dht_name::event_relay(&session_id);
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let journal = storage.event_journal();
         let fanout = Arc::new(EventFanout::new());
@@ -237,8 +238,10 @@ mod event_relay_mesh_tests {
             .await;
         let _ = relay_ref;
 
-        // Brief propagation delay.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait for DHT propagation. On CI (ubuntu-latest) under load, Kademlia
+        // propagation can take longer than on a developer laptop; 200ms is
+        // conservative enough to avoid a lookup-returns-None flake.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // SubscribeEvents with any relay_actor_id — the handler looks up
         // "event_relay::{session_id}" in the DHT.
@@ -246,7 +249,9 @@ mod event_relay_mesh_tests {
         assert!(result.is_ok(), "subscribe_events should succeed");
 
         // Give the async DHT lookup + forwarder start time to complete.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // 300ms keeps the total test time reasonable while giving the forwarder
+        // task time to be scheduled on a busy CI runner.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Verify the forwarder is working by publishing an event to the session's
         // fanout and checking it arrives at the relay.
@@ -315,7 +320,7 @@ mod event_relay_mesh_tests {
         let session_ref = SessionActorRef::Local(session_ref_local);
 
         // Register a relay so subscribe actually starts a forwarder.
-        let relay_dht_name = format!("event_relay::{}", session_id);
+        let relay_dht_name = crate::agent::remote::dht_name::event_relay(&session_id);
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let journal = storage.event_journal();
         let fanout = Arc::new(EventFanout::new());
@@ -325,10 +330,10 @@ mod event_relay_mesh_tests {
         mesh.register_actor(relay_ref.clone(), relay_dht_name).await;
         let _ = relay_ref;
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         session_ref.subscribe_events(7).await.expect("subscribe");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Unsubscribe — the forwarder task should be aborted.
         let result = session_ref.unsubscribe_events(7).await;

@@ -117,12 +117,15 @@ pub async fn setup_mesh_from_config(
     if let Some(nm_ref) = node_manager_ref {
         let reg_span = tracing::info_span!(
             "remote.setup.register_node_manager",
-            dht_name = "node_manager"
+            dht_name = super::dht_name::NODE_MANAGER
         );
-        mesh.register_actor(nm_ref, "node_manager")
+        mesh.register_actor(nm_ref, super::dht_name::NODE_MANAGER)
             .instrument(reg_span)
             .await;
-        log::info!("Phase 7: Local RemoteNodeManager registered in DHT as 'node_manager'");
+        log::info!(
+            "Phase 7: Local RemoteNodeManager registered in DHT as '{}'",
+            super::dht_name::NODE_MANAGER
+        );
     }
 
     // ── 3b. Spawn and register ProviderHostActor (if agent_config provided) ──
@@ -131,7 +134,7 @@ pub async fn setup_mesh_from_config(
         use kameo::actor::Spawn;
 
         let hostname = get_hostname();
-        let dht_name = format!("provider_host::peer::{}", mesh.peer_id());
+        let dht_name = super::dht_name::provider_host(mesh.peer_id());
 
         let actor = ProviderHostActor::new(config);
         let actor_ref = ProviderHostActor::spawn(actor);
@@ -243,7 +246,7 @@ async fn register_remote_agent(
     let lookup_timeout = std::time::Duration::from_secs(5);
     let lookup_result = tokio::time::timeout(
         lookup_timeout,
-        mesh.lookup_actor::<RemoteNodeManager>("node_manager"),
+        mesh.lookup_actor::<RemoteNodeManager>(super::dht_name::NODE_MANAGER),
     )
     .await;
 
@@ -400,7 +403,7 @@ impl RemoteAgentStub {
         // Look up remote node manager.
         let node_manager_ref = self
             .mesh
-            .lookup_actor::<RemoteNodeManager>("node_manager")
+            .lookup_actor::<RemoteNodeManager>(super::dht_name::NODE_MANAGER)
             .await
             .map_err(|e| {
                 agent_client_protocol::Error::new(
@@ -437,7 +440,7 @@ impl RemoteAgentStub {
         tracing::Span::current().record("session_id", &session_id);
 
         // Resolve the remote SessionActorRef via DHT name.
-        let dht_name = format!("session::{}", session_id);
+        let dht_name = super::dht_name::session(&session_id);
         let remote_session_ref = self
             .mesh
             .lookup_actor::<crate::agent::session_actor::SessionActor>(&dht_name)

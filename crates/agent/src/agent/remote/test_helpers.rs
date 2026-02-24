@@ -441,7 +441,8 @@ pub(crate) mod fixtures {
             let actor = ProviderHostActor::new(alpha_f.config.clone());
             let actor_ref = ProviderHostActor::spawn(actor);
 
-            let provider_host_dht = format!("provider_host::peer::alpha-{}", test_id);
+            let provider_host_dht =
+                crate::agent::remote::dht_name::provider_host(&format!("alpha-{}", test_id));
             mesh.register_actor(actor_ref.clone(), provider_host_dht.clone())
                 .await;
 

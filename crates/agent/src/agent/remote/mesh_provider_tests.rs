@@ -10,9 +10,7 @@
 #[allow(clippy::module_inception)]
 mod mesh_provider_tests {
     use crate::agent::remote::mesh_provider::{MeshChatProvider, find_provider_on_mesh};
-    use crate::agent::remote::test_helpers::fixtures::{
-        MeshNodeManagerFixture, ProviderHostFixture, get_test_mesh,
-    };
+    use crate::agent::remote::test_helpers::fixtures::{ProviderHostFixture, get_test_mesh};
     use querymt::chat::ChatProvider;
     use querymt::completion::CompletionProvider;
     use querymt::completion::CompletionRequest;
@@ -101,42 +99,40 @@ mod mesh_provider_tests {
         );
     }
 
-    // ── B.6 — Bug #2 (documented, test marked ignore) ────────────────────────
+    // ── B.6 — Bug #2 (FIXED) ─────────────────────────────────────────────────
 
-    /// Documents **Bug #2**: `find_provider_on_mesh` returns `provider_name` as
-    /// the hostname string, so the caller constructs
-    /// `"provider_host::{provider_name}"` instead of
-    /// `"provider_host::{real-hostname}"`.
+    /// **Bug #2 — FIXED.** The root cause was `coder_agent.rs` registering
+    /// `ProviderHostActor` under `"provider_host::{hostname}"` instead of
+    /// `dht_name::provider_host(peer_id)` (`"provider_host::peer::{peer_id}"`).
     ///
-    /// When this is fixed, the `#[ignore]` tag should be removed and the
-    /// assertion updated to check for the real hostname.
+    /// The fix was two-fold:
+    /// 1. Introduced `agent::remote::dht_name` module to centralise all DHT
+    ///    naming conventions, eliminating ad-hoc `format!` strings.
+    /// 2. Changed `coder_agent.rs` (and all other call sites) to use
+    ///    `dht_name::provider_host(mesh.peer_id())`.
+    ///
+    /// `find_provider_on_mesh` itself was correct — it returns `node_info.node_id`
+    /// (a PeerId), not a hostname. The bug was only on the registration side.
+    ///
+    /// This test verifies the `dht_name` API produces the correct format.
     #[tokio::test]
-    #[ignore = "TODO: fix find_provider_on_mesh hostname resolution (Bug #2)"]
-    async fn test_find_provider_on_mesh_hostname_placeholder_bug() {
-        let test_id = Uuid::now_v7().to_string();
-        let _nm = MeshNodeManagerFixture::new("b6", &test_id).await;
-        let mesh = get_test_mesh().await;
+    async fn test_dht_name_provider_host_uses_peer_id_not_hostname() {
+        use crate::agent::remote::dht_name;
 
-        // Even if a node manager is in the mesh, find_provider_on_mesh
-        // currently returns the provider_name string, not the real hostname.
-        // A correct implementation would return the hostname under which
-        // "provider_host::{hostname}" is registered.
-        let result = find_provider_on_mesh(mesh, "mock").await;
+        let peer_id = "12D3KooWPv7fUDC2WqR5c6v71fMsoxhoYYqcPEciyCfuqRz6f6qH";
+        let dht_name = dht_name::provider_host(&peer_id);
 
-        // Bug #2: result is Some("mock") — but "provider_host::mock" is not
-        // a valid DHT registration.  When fixed, result should be Some of the
-        // real hostname (e.g. "alpha-{test_id}").
-        if let Some(ref node_id) = result {
-            assert_ne!(
-                node_id.to_string(),
-                "mock",
-                "Bug #2: find_provider_on_mesh returned provider_name as node id. \
-                 The returned value '{}' would cause MeshChatProvider to look up \
-                 'provider_host::peer::mock' instead of a valid peer id.",
-                node_id
-            );
-        }
-        // If None, the test passes (no peers advertising the provider).
+        // Must use the "provider_host::peer::" prefix with peer_id.
+        assert_eq!(
+            dht_name, "provider_host::peer::12D3KooWPv7fUDC2WqR5c6v71fMsoxhoYYqcPEciyCfuqRz6f6qH",
+            "dht_name::provider_host must produce 'provider_host::peer::{{peer_id}}'"
+        );
+
+        // Must NOT contain just a hostname.
+        assert!(
+            dht_name.starts_with("provider_host::peer::"),
+            "dht_name must start with 'provider_host::peer::'"
+        );
     }
 
     // ── B.7 ──────────────────────────────────────────────────────────────────
@@ -168,7 +164,7 @@ mod mesh_provider_tests {
         // Register a ProviderHostActor under a unique peer-id keyed DHT name.
         let f = ProviderHostFixture::new().await;
         let node_id = format!("test-node-b8-{}", test_id);
-        let dht_name = format!("provider_host::peer::{}", node_id);
+        let dht_name = crate::agent::remote::dht_name::provider_host(&node_id);
         mesh.register_actor(f.actor_ref, dht_name.clone()).await;
 
         let provider = MeshChatProvider::new(mesh, &node_id, "nonexistent", "no-model");

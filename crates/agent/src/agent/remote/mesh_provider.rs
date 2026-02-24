@@ -73,7 +73,7 @@ impl MeshChatProvider {
             provider_name: provider_name.to_string(),
             model: model.to_string(),
             mesh: mesh.clone(),
-            target_dht_name: format!("provider_host::peer::{}", target_node_id),
+            target_dht_name: super::dht_name::provider_host(&target_node_id),
         }
     }
 
@@ -195,7 +195,7 @@ impl ChatProvider for MeshChatProvider {
 
         // ── 2. Spawn the ephemeral StreamReceiverActor on the local node ──────
         let request_id = Uuid::now_v7().to_string();
-        let stream_rx_name = format!("stream_rx::{}", request_id);
+        let stream_rx_name = super::dht_name::stream_receiver(&request_id);
         tracing::Span::current().record("request_id", &request_id);
 
         {
@@ -368,7 +368,7 @@ pub(crate) async fn find_provider_on_mesh(
     use crate::agent::remote::node_manager::{GetNodeInfo, RemoteNodeManager};
     use crate::agent::remote::{ListAvailableModels, NodeInfo};
 
-    let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>("node_manager");
+    let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>(super::dht_name::NODE_MANAGER);
     let mut peers_checked: u32 = 0;
 
     while let Some(node_ref_result) = stream.next().await {
