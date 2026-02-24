@@ -156,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listen: Some(mesh_addr.clone()),
             discovery: MeshDiscovery::Mdns,
             bootstrap_peers: vec![],
+            directory: querymt_agent::agent::remote::mesh::DirectoryMode::default(),
         };
 
         match bootstrap_mesh(&mesh_config).await {

@@ -296,9 +296,20 @@ mod remote_impl {
             self.session_meta
                 .insert(session_id.clone(), (created_at, msg.cwd.clone()));
 
-            // Emit SessionCreated event
-            self.config
-                .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
+            // Emit SessionCreated event — awaited so it is published to the fanout
+            // before ProviderChanged is spawned, giving subscribers a deterministic
+            // ordering guarantee (important for tests and for UI correctness).
+            if let Err(e) = self
+                .config
+                .emit_event_persisted(&session_id, crate::events::AgentEventKind::SessionCreated)
+                .await
+            {
+                log::warn!(
+                    "RemoteNodeManager: failed to emit SessionCreated for {}: {}",
+                    session_id,
+                    e
+                );
+            }
 
             // Emit ProviderChanged so the UI knows which model is active and
             // so prompt execution can find the LLM config (parity with

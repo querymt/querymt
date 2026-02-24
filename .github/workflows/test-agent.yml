@@ -74,9 +74,20 @@ jobs:
       
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
       
+      - name: Create coverage directory
+        run: mkdir -p ./coverage
+
       - name: Run tests with coverage
-        run: cargo llvm-cov --package querymt-agent --all-targets --features "${features}" --codecov --output-path ./coverage/codecov.json
+        run: |
+          cargo llvm-cov nextest \
+            --package querymt-agent \
+            --lib --tests \
+            --features "${features}" \
+            --codecov --output-path ./coverage/codecov.json
       
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5

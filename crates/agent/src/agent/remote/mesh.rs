@@ -7,7 +7,7 @@
 //! ## Quick start (local dev)
 //!
 //! ```no_run
-//! use querymt_agent::agent::remote::mesh::{MeshConfig, MeshDiscovery, bootstrap_mesh};
+//! use querymt_agent::agent::remote::mesh::{MeshConfig, MeshDiscovery, DirectoryMode, bootstrap_mesh};
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,6 +15,7 @@
 //!     listen: Some("/ip4/0.0.0.0/tcp/9000".to_string()),
 //!     discovery: MeshDiscovery::Mdns,
 //!     bootstrap_peers: vec![],
+//!     directory: DirectoryMode::default(),
 //! };
 //! let mesh = bootstrap_mesh(&config).await?;
 //! println!("Mesh peer ID: {}", mesh.peer_id());
@@ -29,6 +30,8 @@
 
 use libp2p::PeerId;
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
@@ -65,6 +68,26 @@ pub enum MeshDiscovery {
     None,
 }
 
+/// How actor lookups are performed in the mesh.
+///
+/// Set via `MeshConfig::directory`.
+#[derive(Debug, Clone, Default)]
+pub enum DirectoryMode {
+    /// Standard Kademlia DHT lookups with Phase 1b retry backoff.
+    ///
+    /// This is the default and works well for all mesh sizes.
+    #[default]
+    Kademlia,
+
+    /// Cached lookups with peer registry exchange (Phase 3).
+    ///
+    /// Maintains a local `HashMap<name, RemoteActorRef>` cache pre-warmed on
+    /// peer discovery. Recommended for small LAN meshes (2–10 nodes) where
+    /// Kademlia propagation latency is noticeable. Falls back to Kademlia on
+    /// cache miss.
+    Cached,
+}
+
 /// Configuration for the kameo mesh (libp2p swarm).
 #[derive(Debug, Clone)]
 pub struct MeshConfig {
@@ -81,6 +104,13 @@ pub struct MeshConfig {
     /// Format: multiaddr strings such as `"/ip4/192.168.1.100/tcp/9000"`.
     /// Used when mDNS is unavailable (cross-subnet) or for well-known peers.
     pub bootstrap_peers: Vec<String>,
+
+    /// How actors are discovered in the mesh.
+    ///
+    /// Defaults to [`DirectoryMode::Kademlia`]. Switch to
+    /// [`DirectoryMode::Cached`] for small LAN meshes to eliminate first-call
+    /// Kademlia latency.
+    pub directory: DirectoryMode,
 }
 
 impl Default for MeshConfig {
@@ -90,6 +120,7 @@ impl Default for MeshConfig {
             listen: Some("/ip4/0.0.0.0/tcp/9000".to_string()),
             discovery: MeshDiscovery::Mdns,
             bootstrap_peers: vec![],
+            directory: DirectoryMode::default(),
         }
     }
 }
@@ -126,7 +157,15 @@ pub enum MeshError {
 /// `broadcast::Receiver<PeerEvent>` that fires whenever mDNS discovers or
 /// loses a peer. Use this to push real-time `remote_nodes` updates to
 /// WebSocket clients without polling.
-#[derive(Clone, Debug)]
+/// Type alias for a boxed re-registration closure.
+///
+/// Each closure captures one (`ActorRef`, `name`) pair and re-runs the full
+/// `into_remote_ref() + register(name)` sequence when called.  Stored so that
+/// the event loop can re-publish all local actors whenever a new peer is
+/// discovered (Phase 1c).
+type ReRegisterFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct MeshHandle {
     peer_id: PeerId,
     /// Broadcast channel for peer lifecycle events.
@@ -137,6 +176,25 @@ pub struct MeshHandle {
     known_peers: Arc<RwLock<HashSet<PeerId>>>,
     /// Hostname of this node, cached at bootstrap time for display-only metadata.
     local_hostname: Arc<String>,
+    /// Re-registration closures for all locally-registered actors.
+    ///
+    /// Populated by `register_actor`; invoked by the event loop whenever mDNS
+    /// discovers a new peer so the new peer's Kademlia routing table is
+    /// populated immediately rather than waiting for the next republish cycle.
+    re_register_fns: Arc<RwLock<Vec<ReRegisterFn>>>,
+}
+
+impl std::fmt::Debug for MeshHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshHandle")
+            .field("peer_id", &self.peer_id)
+            .field("local_hostname", &self.local_hostname)
+            .field(
+                "re_register_fns_count",
+                &self.re_register_fns.read().map(|g| g.len()).unwrap_or(0),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl MeshHandle {
@@ -145,12 +203,14 @@ impl MeshHandle {
         peer_events_tx: broadcast::Sender<PeerEvent>,
         known_peers: Arc<RwLock<HashSet<PeerId>>>,
         local_hostname: String,
+        re_register_fns: Arc<RwLock<Vec<ReRegisterFn>>>,
     ) -> Self {
         Self {
             peer_id,
             peer_events_tx,
             known_peers,
             local_hostname: Arc::new(local_hostname),
+            re_register_fns,
         }
     }
 
@@ -190,6 +250,10 @@ impl MeshHandle {
     ///
     /// A warning is logged on DHT registration failure but the function does
     /// not return an error — the actor is still locally routable.
+    ///
+    /// Additionally stores a re-registration closure so that when a new peer
+    /// is discovered via mDNS, all locally registered actors are immediately
+    /// re-published into the new peer's Kademlia routing table (Phase 1c).
     pub async fn register_actor<A>(
         &self,
         actor_ref: kameo::actor::ActorRef<A>,
@@ -204,11 +268,44 @@ impl MeshHandle {
         } else {
             log::debug!("MeshHandle: registered '{}' in kameo DHT", name);
         }
+
+        // Store a closure for re-registration on peer discovery (Phase 1c).
+        // `into_remote_ref()` is idempotent for already-registered actors;
+        // `register()` re-publishes the provider record and DHT entry.
+        let name_clone = name.clone();
+        let actor_ref_clone = actor_ref.clone();
+        let re_register: ReRegisterFn = Arc::new(move || {
+            let name = name_clone.clone();
+            let actor_ref = actor_ref_clone.clone();
+            Box::pin(async move {
+                actor_ref.into_remote_ref().await;
+                if let Err(e) = actor_ref.register(name.clone()).await {
+                    log::warn!(
+                        "MeshHandle: re-registration of '{}' after peer discovery failed: {}",
+                        name,
+                        e
+                    );
+                } else {
+                    log::debug!(
+                        "MeshHandle: re-registered '{}' after new peer discovery",
+                        name
+                    );
+                }
+            })
+        });
+        if let Ok(mut fns) = self.re_register_fns.write() {
+            fns.push(re_register);
+        }
     }
 
     /// Look up a remote actor by its DHT name.
     ///
-    /// Returns `None` when the name is not yet registered.
+    /// Performs up to 4 attempts with exponential backoff (250 ms, 500 ms,
+    /// 1 000 ms between retries) so that transient Kademlia propagation gaps
+    /// — e.g. immediately after mDNS re-discovery — are masked transparently.
+    /// Total worst-case latency: ~1.75 s, acceptable for an LLM call.
+    ///
+    /// Returns `None` only after all attempts have missed.
     pub async fn lookup_actor<A>(
         &self,
         name: impl Into<String>,
@@ -216,7 +313,35 @@ impl MeshHandle {
     where
         A: kameo::Actor + kameo::remote::RemoteActor,
     {
-        kameo::actor::RemoteActorRef::<A>::lookup(name.into()).await
+        const BACKOFF_MS: &[u64] = &[250, 500, 1_000];
+        let name: String = name.into();
+
+        // First attempt — no delay.
+        if let Some(r) = kameo::actor::RemoteActorRef::<A>::lookup(name.clone()).await? {
+            return Ok(Some(r));
+        }
+
+        // Retry with backoff.
+        for (attempt, &delay_ms) in BACKOFF_MS.iter().enumerate() {
+            tracing::debug!(
+                attempt = attempt + 1,
+                delay_ms,
+                dht_name = %name,
+                "DHT lookup miss, retrying after backoff"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+
+            if let Some(r) = kameo::actor::RemoteActorRef::<A>::lookup(name.clone()).await? {
+                tracing::info!(
+                    attempt = attempt + 1,
+                    dht_name = %name,
+                    "DHT lookup succeeded on retry"
+                );
+                return Ok(Some(r));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Stream all remote actors registered under `name` in the DHT.
@@ -276,6 +401,12 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
     let known_peers: Arc<RwLock<HashSet<PeerId>>> = Arc::new(RwLock::new(HashSet::new()));
     let known_peers_loop = Arc::clone(&known_peers);
 
+    // Re-registration closures — populated by register_actor, consumed by the
+    // event loop on mDNS Discovered to re-publish all local actors into the
+    // new peer's Kademlia routing table immediately (Phase 1c).
+    let re_register_fns: Arc<RwLock<Vec<ReRegisterFn>>> = Arc::new(RwLock::new(Vec::new()));
+    let re_register_fns_loop = Arc::clone(&re_register_fns);
+
     // Cache hostname once at bootstrap time (same logic as RemoteNodeManager).
     let local_hostname = resolve_local_hostname();
 
@@ -320,6 +451,13 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
             })
         })
         .map_err(|e: libp2p::BehaviourBuilderError| MeshError::SwarmError(e.to_string()))?
+        .with_swarm_config(|c| {
+            // Keep connections alive for 5 minutes between prompts.
+            // libp2p's default is 60 s which causes the TCP connection to drop
+            // between prompts, leaving Kademlia with no route and returning
+            // NotFound on the next lookup.
+            c.with_idle_connection_timeout(std::time::Duration::from_secs(300))
+        })
         .build();
 
     // Register the kameo behaviour as the global ActorSwarm.
@@ -359,6 +497,22 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                                 peers.insert(peer_id);
                             }
                             let _ = peer_events_tx_loop.send(PeerEvent::Discovered(peer_id));
+
+                            // Phase 1c: re-publish all locally registered actors into
+                            // the new peer's Kademlia routing table so that lookups
+                            // from the new peer succeed immediately rather than waiting
+                            // for the next Kademlia republish cycle.
+                            let fns: Vec<ReRegisterFn> = re_register_fns_loop
+                                .read()
+                                .map(|g| g.clone())
+                                .unwrap_or_default();
+                            if !fns.is_empty() {
+                                tokio::spawn(async move {
+                                    for f in &fns {
+                                        f().await;
+                                    }
+                                });
+                            }
                         }
                     }
                 }
@@ -411,6 +565,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         peer_events_tx,
         known_peers,
         local_hostname,
+        re_register_fns,
     ))
 }
 

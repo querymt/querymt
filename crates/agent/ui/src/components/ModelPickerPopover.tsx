@@ -155,7 +155,10 @@ export function ModelPickerPopover({
   // When it closes, reset selection for a clean slate next time.
   useEffect(() => {
     if (open && currentProvider && currentModel) {
-      setSelectedValue(`${RECENT_PREFIX}${itemValue(currentProvider, currentModel)}`);
+      // For remote models, select directly in the grouped section (recent section only has
+      // local models). For local models, prefer the recent section entry.
+      const val = itemValue(currentProvider, currentModel, currentNode);
+      setSelectedValue(currentNode ? val : `${RECENT_PREFIX}${val}`);
       setTimeout(() => {
         if (commandListRef.current) {
           commandListRef.current.scrollTop = 0;
@@ -164,7 +167,7 @@ export function ModelPickerPopover({
     } else if (!open) {
       setSelectedValue('');
     }
-  }, [open, currentProvider, currentModel]);
+  }, [open, currentProvider, currentModel, currentNode]);
 
   const targetAgents = useMemo(
     () => agents.filter((agent) => sessionsByAgent[agent.id]),
@@ -472,10 +475,16 @@ export function ModelPickerPopover({
             value={selectedValue}
             onValueChange={setSelectedValue}
             className="flex flex-col flex-1 min-h-0"
-            filter={(value, search) => {
-              // value is "provider/model" or "recent:provider/model", search is the user query
+            filter={(value, search, keywords) => {
+              // value is "provider/model", "provider@node_id/model", or "recent:provider/model"
+              if (!search) return 1;
               const normalized = normalizeValue(value);
-              if (normalized.toLowerCase().includes(search.toLowerCase())) return 1;
+              // Strip "@node_id" so "ollama/llama3.2" matches "ollama@peer123/llama3.2"
+              const withoutNode = normalized.replace(/@[^/]+\//, '/');
+              const searchLower = search.toLowerCase();
+              if (withoutNode.toLowerCase().includes(searchLower)) return 1;
+              // Also check keywords (provider, model display name, node label)
+              if (keywords?.some((k) => k.toLowerCase().includes(searchLower))) return 1;
               return 0;
             }}
           >
@@ -552,7 +561,9 @@ export function ModelPickerPopover({
                       {group.models.map((model) => {
                         const val = itemValue(group.provider, model.value, group.node);
                         const isCurrent =
-                          currentProvider === group.provider && currentModel === model.value;
+                          currentProvider === group.provider &&
+                          currentModel === model.value &&
+                          (group.node ?? undefined) === (currentNode ?? undefined);
 
                         return (
                           <Command.Item

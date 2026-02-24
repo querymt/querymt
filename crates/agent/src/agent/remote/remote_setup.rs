@@ -90,6 +90,7 @@ pub async fn setup_mesh_from_config(
         } else {
             peers
         },
+        directory: crate::agent::remote::mesh::DirectoryMode::default(),
     };
     let listen_addr_str = config.listen.as_deref().unwrap_or("<auto>").to_string();
 

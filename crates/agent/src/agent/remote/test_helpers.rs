@@ -85,6 +85,7 @@ pub(crate) mod fixtures {
                             listen: Some("/ip4/127.0.0.1/tcp/0".to_string()),
                             discovery: MeshDiscovery::None,
                             bootstrap_peers: vec![],
+                            directory: crate::agent::remote::mesh::DirectoryMode::default(),
                         };
                         bootstrap_mesh(&cfg)
                             .await

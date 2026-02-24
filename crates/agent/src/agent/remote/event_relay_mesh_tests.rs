@@ -248,32 +248,54 @@ mod event_relay_mesh_tests {
         let result = session_ref.subscribe_events(1).await;
         assert!(result.is_ok(), "subscribe_events should succeed");
 
-        // Give the async DHT lookup + forwarder start time to complete.
-        // 300ms keeps the total test time reasonable while giving the forwarder
-        // task time to be scheduled on a busy CI runner.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
         // Verify the forwarder is working by publishing an event to the session's
-        // fanout and checking it arrives at the relay.
+        // fanout and checking it arrives at the relay.  We use a retry-publish
+        // loop instead of a fixed sleep so that:
+        //   • The test passes quickly on a fast laptop (first attempt usually
+        //     succeeds after the first 200 ms poll).
+        //   • The test also passes on a slow/loaded CI runner where Kademlia
+        //     propagation, the async DHT lookup inside subscribe_events, and
+        //     the forwarder task start-up all take longer than any single
+        //     hard-coded delay we could reasonably choose.
+        //
+        // Total budget: 5 s.  Each iteration waits 200 ms for the forwarder to
+        // be ready, publishes a fresh event, then gives recv() 500 ms.
         let mut rx = relay_sink.fanout().subscribe();
-        f.config
-            .event_sink
-            .fanout()
-            .publish(EventEnvelope::Durable(crate::events::DurableEvent {
-                event_id: "e-f4".into(),
-                stream_seq: 1,
-                session_id: session_id.clone(),
-                timestamp: 100,
-                origin: EventOrigin::Local,
-                source_node: None,
-                kind: AgentEventKind::SessionCreated,
-            }));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut attempt: u32 = 0;
+        loop {
+            // Wait before publishing so the forwarder task has time to be
+            // installed (and so DHT lookup inside subscribe_events can finish).
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            attempt += 1;
 
-        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
-        assert!(
-            received.is_ok(),
-            "forwarder should forward events from session fanout to relay"
-        );
+            f.config.event_sink.fanout().publish(EventEnvelope::Durable(
+                crate::events::DurableEvent {
+                    event_id: format!("e-f4-{attempt}"),
+                    stream_seq: attempt as u64,
+                    session_id: session_id.clone(),
+                    timestamp: 100,
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::SessionCreated,
+                },
+            ));
+
+            match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+                Ok(Ok(_)) => break, // forwarder is up and forwarded the event
+                _ if tokio::time::Instant::now() >= deadline => {
+                    panic!(
+                        "forwarder should forward events from session fanout to relay \
+                         (gave up after {attempt} attempts / 5 s)"
+                    );
+                }
+                _ => {
+                    // recv timed out or channel closed — forwarder not ready yet,
+                    // re-subscribe to drain any missed messages and retry.
+                    rx = relay_sink.fanout().subscribe();
+                }
+            }
+        }
     }
 
     // ── F.5 ──────────────────────────────────────────────────────────────────

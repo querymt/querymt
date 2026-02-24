@@ -25,6 +25,15 @@ pub mod mesh;
 pub mod mesh_provider;
 
 #[cfg(feature = "remote")]
+pub mod transport;
+
+#[cfg(feature = "remote")]
+pub mod registry_exchange;
+
+#[cfg(feature = "remote")]
+pub mod cached_transport;
+
+#[cfg(feature = "remote")]
 pub mod provider_host;
 
 #[cfg(feature = "remote")]
@@ -63,11 +72,13 @@ mod integration_tests;
 mod provider_routing_tests;
 
 pub use actor_ref::SessionActorRef;
+#[cfg(feature = "remote")]
+pub use cached_transport::{CachedDynMeshTransport, CachedMeshTransport};
 pub use event_forwarder::EventForwarder;
 pub use event_relay::{EventRelayActor, RelayedEvent};
 #[cfg(feature = "remote")]
 pub use mesh::{
-    MeshConfig, MeshDiscovery, MeshError, MeshHandle, PeerEvent, bootstrap_mesh,
+    DirectoryMode, MeshConfig, MeshDiscovery, MeshError, MeshHandle, PeerEvent, bootstrap_mesh,
     bootstrap_mesh_default,
 };
 #[cfg(feature = "remote")]
@@ -85,4 +96,10 @@ pub use provider_host::{
     StreamChunkRelay, StreamReceiverActor,
 };
 #[cfg(feature = "remote")]
+pub use registry_exchange::{
+    GetRegistrations, NotifyRegistration, RegistrationEntry, RegistryExchangeActor,
+};
+#[cfg(feature = "remote")]
 pub use remote_setup::{MeshSetupResult, setup_mesh_from_config};
+#[cfg(feature = "remote")]
+pub use transport::{DynMeshTransport, MeshTransport};

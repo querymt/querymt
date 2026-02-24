@@ -1,0 +1,11 @@
+[profile.default]
+# Kill any test that takes longer than 60 s (2 strikes = termination).
+# This prevents a single stuck mesh/networking test from blocking the entire
+# CI job for 90+ minutes, as was observed with the llvm-cov --all-targets run.
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Mesh and DHT tests do real libp2p I/O under coverage instrumentation and
+# legitimately need more time on loaded CI runners.
+[[profile.default.overrides]]
+filter = 'test(mesh) | test(remote) | test(relay) | test(forwarder)'
+slow-timeout = { period = "120s", terminate-after = 2 }
