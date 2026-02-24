@@ -68,14 +68,14 @@ jobs:
             bin_name: coder_agent
             archive_ext: tar.gz
             cargo_package: querymt-agent
-            cargo_features: oauth,dashboard
+            cargo_features: oauth,dashboard,remote
           - os: macos-14
             target: aarch64-apple-darwin
             binary: coder_agent
             bin_name: coder_agent
             archive_ext: tar.gz
             cargo_package: querymt-agent
-            cargo_features: oauth,dashboard
+            cargo_features: oauth,dashboard,remote
 
           # ─── Windows (Static CRT) ────────────────────────────────────────
           - os: windows-latest
@@ -96,7 +96,7 @@ jobs:
             bin_name: coder_agent.exe
             archive_ext: zip
             cargo_package: querymt-agent
-            cargo_features: oauth,dashboard
+            cargo_features: oauth,dashboard,remote
             rust_flags: "-C target-feature=+crt-static"
           - os: windows-latest
             target: aarch64-pc-windows-msvc
@@ -104,7 +104,7 @@ jobs:
             bin_name: coder_agent.exe
             archive_ext: zip
             cargo_package: querymt-agent
-            cargo_features: oauth,dashboard
+            cargo_features: oauth,dashboard,remote
             rust_flags: "-C target-feature=+crt-static"
 
     steps:
