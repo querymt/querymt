@@ -786,6 +786,27 @@ pub async fn build_provider_from_config(
         }
     }
 
+    // Merge static provider config from providers.toml [providers.config] as
+    // lowest-priority defaults. This allows provider-level settings such as
+    // `fast_download` to reach the provider's from_config() without requiring
+    // the caller to pass them as params every time.
+    // Params (above) and model always take precedence over these defaults.
+    if let Some(provider_cfg) = plugin_registry
+        .config
+        .providers
+        .iter()
+        .find(|p| p.name == provider_name)
+        && let Some(ref static_config) = provider_cfg.config
+    {
+        for (key, value) in static_config {
+            if builder_config.get(key).is_none_or(|v| v.is_null())
+                && let Ok(json_val) = serde_json::to_value(value)
+            {
+                builder_config[key] = json_val;
+            }
+        }
+    }
+
     // Apply model/provider heuristic defaults (only fills keys not already present)
     let defaults = ModelDefaults::for_model(provider_name, model);
     defaults.apply_to(&mut builder_config, "standalone");

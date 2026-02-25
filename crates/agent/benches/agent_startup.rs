@@ -3,7 +3,6 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use querymt_agent::agent::AgentHandle;
 use querymt_agent::config::ConfigSource;
 use querymt_agent::runner::{AgentRunner, from_config};
-use querymt_agent::send_agent::SendAgent;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -77,7 +76,7 @@ fn make_bench_config(provider: &str, model: &str) -> String {
         .replace("db = \"/tmp/agent2.db\"", "db = \":memory:\"")
 }
 
-fn extract_handle(runner: &AgentRunner) -> Arc<AgentHandle> {
+fn extract_handle(runner: &AgentRunner) -> Arc<dyn AgentHandle> {
     match runner {
         AgentRunner::Single(agent) => agent.handle(),
         AgentRunner::Multi(_) => panic!("expected single-agent config in benchmark"),
