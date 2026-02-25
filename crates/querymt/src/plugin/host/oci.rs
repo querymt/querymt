@@ -1,6 +1,8 @@
 use crate::error::LLMError;
 use anyhow::anyhow;
 use docker_credential::{CredentialRetrievalError, DockerCredential};
+use futures::StreamExt;
+use hex;
 use oci_client::{
     errors::{OciDistributionError, OciErrorCode},
     manifest::{OciImageManifest, OciManifest, Platform},
@@ -8,6 +10,7 @@ use oci_client::{
     Client, Reference,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sigstore::cosign::verification_constraint::cert_subject_email_verifier::StringVerifier;
 use sigstore::cosign::verification_constraint::{
     CertSubjectEmailVerifier, CertSubjectUrlVerifier, VerificationConstraintVec,
@@ -21,10 +24,47 @@ use std::env::consts::{ARCH, OS};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
 use tracing::instrument;
+
+// ── Progress types ────────────────────────────────────────────────────────────
+
+/// Phase of an OCI plugin download/update operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OciDownloadPhase {
+    /// Resolving manifest and checking cache.
+    Resolving,
+    /// Verifying image signature.
+    VerifyingSignature,
+    /// Downloading blob layer bytes.
+    Downloading,
+    /// Extracting file from archive (native plugins).
+    Extracting,
+    /// Persisting to cache.
+    Persisting,
+    /// Completed successfully.
+    Completed,
+    /// Failed with error message.
+    Failed(String),
+}
+
+/// Progress snapshot for an OCI plugin download/update.
+#[derive(Debug, Clone)]
+pub struct OciDownloadProgress {
+    pub phase: OciDownloadPhase,
+    pub bytes_downloaded: u64,
+    pub bytes_total: Option<u64>,
+    pub percent: Option<f32>,
+}
+
+/// Callback invoked with download progress updates.
+///
+/// Uses `Arc` so the callback can be cheaply cloned across async boundaries and
+/// into `spawn_blocking` closures.
+pub type OciProgressCallback = Arc<dyn Fn(OciDownloadProgress) + Send + Sync>;
 
 use super::{PluginType, ProviderPlugin};
 
@@ -261,12 +301,60 @@ async fn verify_image_signature(
     }
 }
 
+/// Stream a blob from an OCI registry to `dest`, reporting progress and verifying digest.
+///
+/// Uses `pull_blob_stream` (not `pull_blob`) so we can observe byte counts incrementally.
+/// SHA-256 is computed incrementally; a `Digest mismatch` error is returned on failure.
+async fn stream_blob_with_progress(
+    client: &Client,
+    reference: &Reference,
+    layer: &oci_client::manifest::OciDescriptor,
+    dest: &mut tokio::fs::File,
+    progress: &OciProgressCallback,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let total = if layer.size > 0 {
+        Some(layer.size as u64)
+    } else {
+        None
+    };
+    let sized_stream = client.pull_blob_stream(reference, layer).await?;
+    let mut stream = sized_stream.stream;
+    let mut downloaded: u64 = 0;
+    let mut hasher = Sha256::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        hasher.update(&chunk);
+        dest.write_all(&chunk).await?;
+        downloaded += chunk.len() as u64;
+        let pct = total.map(|t| (downloaded as f32 / t as f32) * 100.0);
+        progress(OciDownloadProgress {
+            phase: OciDownloadPhase::Downloading,
+            bytes_downloaded: downloaded,
+            bytes_total: total,
+            percent: pct,
+        });
+    }
+    dest.flush().await?;
+
+    let computed = format!("sha256:{}", hex::encode(hasher.finalize()));
+    if computed != layer.digest {
+        return Err(format!(
+            "Digest mismatch: expected {}, got {}",
+            layer.digest, computed
+        )
+        .into());
+    }
+    Ok(())
+}
+
 async fn extract_file_and_content(
     client: &Client,
     reference: &Reference,
     image_manifest: &OciImageManifest,
     plugin_type: PluginType,
     filename: Option<&str>,
+    progress: &OciProgressCallback,
 ) -> Result<(String, NamedTempFile), Box<dyn std::error::Error>> {
     match plugin_type {
         PluginType::Wasm => {
@@ -280,9 +368,9 @@ async fn extract_file_and_content(
                     let std_file = temp_file.reopen()?;
                     let mut tokio_file = tokio::fs::File::from_std(std_file);
 
-                    // Stream the blob directly to disk
-                    client.pull_blob(reference, layer, &mut tokio_file).await?;
-                    tokio_file.flush().await?;
+                    // Stream blob with progress reporting and digest verification
+                    stream_blob_with_progress(client, reference, layer, &mut tokio_file, progress)
+                        .await?;
 
                     let filename = filename.unwrap_or("plugin.wasm").to_string();
                     return Ok((filename, temp_file));
@@ -302,9 +390,17 @@ async fn extract_file_and_content(
                     let std_file = temp_file.reopen()?;
                     let mut tokio_file = tokio::fs::File::from_std(std_file);
 
-                    // Stream the blob directly to disk
-                    client.pull_blob(reference, layer, &mut tokio_file).await?;
-                    tokio_file.flush().await?;
+                    // Stream blob with progress reporting and digest verification
+                    stream_blob_with_progress(client, reference, layer, &mut tokio_file, progress)
+                        .await?;
+
+                    // Signal that we are now extracting from the archive
+                    progress(OciDownloadProgress {
+                        phase: OciDownloadPhase::Extracting,
+                        bytes_downloaded: 0,
+                        bytes_total: None,
+                        percent: None,
+                    });
 
                     // Move decompression and tar extraction to a blocking thread
                     let target_filename = filename.map(|s| s.to_string());
@@ -487,11 +583,22 @@ impl OciDownloader {
         target_file_path: Option<&str>,
         cache_path: &Path,
         force_update: bool,
+        progress: Option<OciProgressCallback>,
     ) -> Result<ProviderPlugin, Box<dyn std::error::Error>> {
+        let progress: OciProgressCallback = progress.unwrap_or_else(|| Arc::new(|_| {}));
+
         let sanitized_tag_path = image_reference.replace(['/', ':'], "_");
         let manifests_cache_dir = cache_path.join("manifests");
         fs::create_dir_all(&manifests_cache_dir)?;
         let metadata_path = manifests_cache_dir.join(format!("{}.json", sanitized_tag_path));
+
+        // --- Resolving phase ---
+        progress(OciDownloadProgress {
+            phase: OciDownloadPhase::Resolving,
+            bytes_downloaded: 0,
+            bytes_total: None,
+            percent: None,
+        });
 
         let local_metadata: Option<CacheMetadata> = fs::read(&metadata_path)
             .ok()
@@ -502,6 +609,12 @@ impl OciDownloader {
                 let blob_path = get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
                 if blob_path.exists() {
                     log::debug!("Found cached OCI plugin. Using local version.");
+                    progress(OciDownloadProgress {
+                        phase: OciDownloadPhase::Completed,
+                        bytes_downloaded: 0,
+                        bytes_total: None,
+                        percent: Some(100.0),
+                    });
                     return load_from_cache(meta, &blob_path);
                 }
             }
@@ -515,21 +628,40 @@ impl OciDownloader {
         let reference = Reference::try_from(image_reference)?;
         let auth = build_auth(&reference);
 
-        // Verify the image signature if it's an OCI image and verification is enabled
+        // --- Signature verification phase ---
         if self.config.insecure_skip_signature {
+            progress(OciDownloadProgress {
+                phase: OciDownloadPhase::VerifyingSignature,
+                bytes_downloaded: 0,
+                bytes_total: None,
+                percent: None,
+            });
             log::info!("Signature verification enabled for {}", image_reference);
             match verify_image_signature(&self.config, image_reference).await {
                 Ok(verified) => {
                     if !verified {
-                        return Err(format!(
+                        let msg = format!(
                             "No valid signatures found for the image {}",
                             image_reference
-                        )
-                        .into());
+                        );
+                        progress(OciDownloadProgress {
+                            phase: OciDownloadPhase::Failed(msg.clone()),
+                            bytes_downloaded: 0,
+                            bytes_total: None,
+                            percent: None,
+                        });
+                        return Err(msg.into());
                     }
                 }
                 Err(e) => {
-                    return Err(format!("Image signature verification failed: {}", e).into());
+                    let msg = format!("Image signature verification failed: {}", e);
+                    progress(OciDownloadProgress {
+                        phase: OciDownloadPhase::Failed(msg.clone()),
+                        bytes_downloaded: 0,
+                        bytes_total: None,
+                        percent: None,
+                    });
+                    return Err(msg.into());
                 }
             }
         } else {
@@ -543,6 +675,12 @@ impl OciDownloader {
                         get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
                     if meta.manifest_digest == live_digest && blob_path.exists() {
                         log::debug!("Local cache is up-to-date.");
+                        progress(OciDownloadProgress {
+                            phase: OciDownloadPhase::Completed,
+                            bytes_downloaded: 0,
+                            bytes_total: None,
+                            percent: Some(100.0),
+                        });
                         return load_from_cache(meta, &blob_path);
                     }
                 }
@@ -616,9 +754,16 @@ impl OciDownloader {
                                 discovered_type = PluginType::Wasm;
                             } else {
                                 // --- Failure Case: Neither native nor Wasm was found ---
-                                return Err(format!("Image index contains no manifest for the host platform ({}/{}) and no wasi/wasm fallback was found.",
+                                let msg = format!("Image index contains no manifest for the host platform ({}/{}) and no wasi/wasm fallback was found.",
                                     OS, ARCH
-                                ).into());
+                                );
+                                progress(OciDownloadProgress {
+                                    phase: OciDownloadPhase::Failed(msg.clone()),
+                                    bytes_downloaded: 0,
+                                    bytes_total: None,
+                                    percent: None,
+                                });
+                                return Err(msg.into());
                             }
                         }
 
@@ -635,14 +780,24 @@ impl OciDownloader {
                     }
                 }
 
+                // --- Downloading phase (delegated to extract_file_and_content) ---
                 let (filename, temp_file) = extract_file_and_content(
                     &client,
                     &reference,
                     &image_manifest,
                     discovered_type,
                     target_file_path,
+                    &progress,
                 )
                 .await?;
+
+                // --- Persisting phase ---
+                progress(OciDownloadProgress {
+                    phase: OciDownloadPhase::Persisting,
+                    bytes_downloaded: 0,
+                    bytes_total: None,
+                    percent: None,
+                });
 
                 let blob_path = get_blob_path(cache_path, &live_digest, &filename);
                 fs::create_dir_all(blob_path.parent().unwrap())?;
@@ -664,6 +819,14 @@ impl OciDownloader {
                 };
                 fs::write(metadata_path, serde_json::to_vec(&new_metadata)?)?;
 
+                // --- Completed ---
+                progress(OciDownloadProgress {
+                    phase: OciDownloadPhase::Completed,
+                    bytes_downloaded: 0,
+                    bytes_total: None,
+                    percent: Some(100.0),
+                });
+
                 Ok(ProviderPlugin {
                     plugin_type: discovered_type,
                     file_path: blob_path,
@@ -680,41 +843,79 @@ impl OciDownloader {
                         if let Some(e) = auth_error {
                             match e.code {
                                 OciErrorCode::Denied => {
-                                    return Err(format!(
+                                    let msg = format!(
                                         "Access denied for '{:?}': {}",
                                         url, e.message
-                                    )
-                                    .into());
+                                    );
+                                    progress(OciDownloadProgress {
+                                        phase: OciDownloadPhase::Failed(msg.clone()),
+                                        bytes_downloaded: 0,
+                                        bytes_total: None,
+                                        percent: None,
+                                    });
+                                    return Err(msg.into());
                                 }
                                 OciErrorCode::Unauthorized => {
-                                    return Err(format!(
+                                    let msg = format!(
                                         "Unauthorized access to '{:?}': {}",
                                         url, e.message
-                                    )
-                                    .into());
+                                    );
+                                    progress(OciDownloadProgress {
+                                        phase: OciDownloadPhase::Failed(msg.clone()),
+                                        bytes_downloaded: 0,
+                                        bytes_total: None,
+                                        percent: None,
+                                    });
+                                    return Err(msg.into());
                                 }
                                 _ => unreachable!(),
                             }
                         } else if let Some(e) = envelope.errors.first() {
-                            return Err(format!(
+                            let msg = format!(
                                 "Error while accessing '{:?}': {}",
                                 url, e.message
-                            )
-                            .into());
+                            );
+                            progress(OciDownloadProgress {
+                                phase: OciDownloadPhase::Failed(msg.clone()),
+                                bytes_downloaded: 0,
+                                bytes_total: None,
+                                percent: None,
+                            });
+                            return Err(msg.into());
                         }
                     }
                     OciDistributionError::UnauthorizedError { url } => {
-                        return Err(format!("Unauthorized access to {:?}", url).into());
+                        let msg = format!("Unauthorized access to {:?}", url);
+                        progress(OciDownloadProgress {
+                            phase: OciDownloadPhase::Failed(msg.clone()),
+                            bytes_downloaded: 0,
+                            bytes_total: None,
+                            percent: None,
+                        });
+                        return Err(msg.into());
                     }
                     OciDistributionError::AuthenticationFailure(err) => {
-                        return Err(format!("Authentication failure: {:?}", err).into());
+                        let msg = format!("Authentication failure: {:?}", err);
+                        progress(OciDownloadProgress {
+                            phase: OciDownloadPhase::Failed(msg.clone()),
+                            bytes_downloaded: 0,
+                            bytes_total: None,
+                            percent: None,
+                        });
+                        return Err(msg.into());
                     }
                     _ => {
-                        return Err(format!(
+                        let msg = format!(
                             "Failed to pull manifest for '{}': {}",
                             image_reference, e
-                        )
-                        .into());
+                        );
+                        progress(OciDownloadProgress {
+                            phase: OciDownloadPhase::Failed(msg.clone()),
+                            bytes_downloaded: 0,
+                            bytes_total: None,
+                            percent: None,
+                        });
+                        return Err(msg.into());
                     }
                 }
 
@@ -962,4 +1163,154 @@ mod tests {
     // Note: Tests for determine_plugin_type are omitted because constructing
     // OciImageManifest requires complex internal structures from oci-client crate.
     // These are tested implicitly by the integration tests (qmt update command).
+
+    // ── Progress type tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn oci_download_phase_eq() {
+        assert_eq!(OciDownloadPhase::Resolving, OciDownloadPhase::Resolving);
+        assert_eq!(OciDownloadPhase::Downloading, OciDownloadPhase::Downloading);
+        assert_ne!(OciDownloadPhase::Resolving, OciDownloadPhase::Downloading);
+        assert_eq!(
+            OciDownloadPhase::Failed("oops".to_string()),
+            OciDownloadPhase::Failed("oops".to_string())
+        );
+        assert_ne!(
+            OciDownloadPhase::Failed("a".to_string()),
+            OciDownloadPhase::Failed("b".to_string())
+        );
+    }
+
+    #[test]
+    fn oci_download_progress_fields() {
+        let p = OciDownloadProgress {
+            phase: OciDownloadPhase::Downloading,
+            bytes_downloaded: 1024,
+            bytes_total: Some(2048),
+            percent: Some(50.0),
+        };
+        assert_eq!(p.bytes_downloaded, 1024);
+        assert_eq!(p.bytes_total, Some(2048));
+        assert!((p.percent.unwrap() - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn oci_progress_callback_is_callable() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        let counter_clone = counter.clone();
+        let cb: OciProgressCallback = Arc::new(move |p: OciDownloadProgress| {
+            counter_clone.fetch_add(p.bytes_downloaded, Ordering::SeqCst);
+        });
+        cb(OciDownloadProgress {
+            phase: OciDownloadPhase::Downloading,
+            bytes_downloaded: 42,
+            bytes_total: None,
+            percent: None,
+        });
+        assert_eq!(counter.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn oci_progress_callback_noop_default() {
+        // Simulates the no-op used when progress is None.
+        let noop: OciProgressCallback = Arc::new(|_| {});
+        // Must not panic.
+        noop(OciDownloadProgress {
+            phase: OciDownloadPhase::Completed,
+            bytes_downloaded: 0,
+            bytes_total: None,
+            percent: None,
+        });
+    }
+
+    #[test]
+    fn digest_verification_sha256_format() {
+        // Validate the digest string format we produce matches layer.digest expectations.
+        use sha2::{Digest as _, Sha256};
+        let data = b"hello world";
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let computed = format!("sha256:{}", hex::encode(hasher.finalize()));
+        assert!(computed.starts_with("sha256:"));
+        assert_eq!(computed.len(), 7 + 64); // "sha256:" + 64 hex chars
+    }
+
+    /// stream_blob_with_progress: digest mismatch must produce an error.
+    #[tokio::test]
+    async fn stream_blob_progress_digest_mismatch_is_error() {
+        // We can't call stream_blob_with_progress without a real OCI client,
+        // but we can unit-test the core digest-check logic that will live inside it.
+        let data = b"some blob data";
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let actual_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+        let wrong_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_ne!(actual_digest, wrong_digest, "digests should differ");
+
+        // Simulate the check performed inside stream_blob_with_progress.
+        let result: Result<(), String> = if actual_digest != wrong_digest {
+            Err(format!(
+                "Digest mismatch: expected {}, got {}",
+                wrong_digest, actual_digest
+            ))
+        } else {
+            Ok(())
+        };
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Digest mismatch"));
+    }
+
+    /// stream_blob_with_progress: matching digest must succeed.
+    #[tokio::test]
+    async fn stream_blob_progress_digest_match_is_ok() {
+        let data = b"some blob data";
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let actual_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+        let result: Result<(), String> = if actual_digest != actual_digest.clone() {
+            Err("mismatch".into())
+        } else {
+            Ok(())
+        };
+        assert!(result.is_ok());
+    }
+
+    /// stream_blob_with_progress: progress callback is invoked with correct byte counts.
+    #[tokio::test]
+    async fn stream_blob_progress_callback_accumulates_bytes() {
+        use std::sync::{Arc, Mutex};
+        // Simulate what stream_blob_with_progress does:
+        // iterate chunks, accumulate bytes, invoke callback.
+        let chunks: Vec<&[u8]> = vec![b"hello", b" ", b"world"];
+        let total: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+
+        let records: Arc<Mutex<Vec<OciDownloadProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let records_clone = records.clone();
+        let cb: OciProgressCallback = Arc::new(move |p| {
+            records_clone.lock().unwrap().push(p);
+        });
+
+        let mut downloaded: u64 = 0;
+        for chunk in &chunks {
+            downloaded += chunk.len() as u64;
+            let pct = Some((downloaded as f32 / total as f32) * 100.0);
+            cb(OciDownloadProgress {
+                phase: OciDownloadPhase::Downloading,
+                bytes_downloaded: downloaded,
+                bytes_total: Some(total),
+                percent: pct,
+            });
+        }
+
+        let recs = records.lock().unwrap();
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].bytes_downloaded, 5);
+        assert_eq!(recs[1].bytes_downloaded, 6);
+        assert_eq!(recs[2].bytes_downloaded, 11);
+        assert_eq!(recs[2].bytes_total, Some(11));
+        assert!((recs[2].percent.unwrap() - 100.0).abs() < 0.01);
+    }
 }

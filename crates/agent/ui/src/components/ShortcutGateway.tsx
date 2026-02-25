@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Command } from 'cmdk';
-import { Keyboard, KeyRound, MessageSquare, Palette, Plus } from 'lucide-react';
+import { Keyboard, KeyRound, MessageSquare, Palette, Plus, RefreshCw } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
 
 interface ShortcutGatewayProps {
@@ -9,6 +9,8 @@ interface ShortcutGatewayProps {
   onStartNewSession: () => void;
   onSelectTheme: () => void;
   onAuthenticateProvider: () => void;
+  onUpdatePlugins: () => void;
+  isUpdatingPlugins?: boolean;
 }
 
 export function ShortcutGateway({
@@ -17,6 +19,8 @@ export function ShortcutGateway({
   onStartNewSession,
   onSelectTheme,
   onAuthenticateProvider,
+  onUpdatePlugins,
+  isUpdatingPlugins = false,
 }: ShortcutGatewayProps) {
   const [search, setSearch] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
@@ -82,7 +86,7 @@ export function ShortcutGateway({
             />
           </div>
 
-          <Command.List className="max-h-[280px] overflow-y-auto p-2 custom-scrollbar">
+          <Command.List className="max-h-[360px] overflow-y-auto p-2 custom-scrollbar">
             <Command.Empty className="px-4 py-6 text-sm text-center text-ui-muted">
               No shortcut commands found
             </Command.Empty>
@@ -159,6 +163,24 @@ export function ShortcutGateway({
                 </div>
                 <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
                   A
+                </kbd>
+              </Command.Item>
+
+              <Command.Item
+                value="update provider plugins"
+                keywords={['update', 'plugin', 'plugins', 'oci', 'provider', 'u']}
+                onSelect={() => onUpdatePlugins()}
+                className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
+              >
+                <div className="w-7 h-7 rounded-md border border-accent-primary/35 bg-accent-primary/10 flex items-center justify-center">
+                  <RefreshCw className={`w-3.5 h-3.5 text-accent-primary ${isUpdatingPlugins ? 'animate-spin' : ''}`} />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm text-ui-primary">Update Provider Plugins</div>
+                  <div className="text-xs text-ui-muted">Pull latest OCI plugin images from registry</div>
+                </div>
+                <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
+                  {isUpdatingPlugins ? 'Updating...' : 'U'}
                 </kbd>
               </Command.Item>
             </Command.Group>

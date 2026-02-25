@@ -33,6 +33,7 @@ pub trait PluginLoader: Send + Sync {
 }
 
 mod oci;
+pub use oci::{OciDownloadPhase, OciDownloadProgress, OciProgressCallback};
 
 #[cfg(feature = "native")]
 pub mod native;
@@ -152,7 +153,7 @@ impl PluginRegistry {
             let image_reference = provider_cfg.path.strip_prefix("oci://").unwrap();
             provider_plugin = self
                 .oci_downloader
-                .pull_and_extract(image_reference, None, &self.cache_path, false)
+                .pull_and_extract(image_reference, None, &self.cache_path, false, None)
                 .await
                 .map_err(|e| {
                     LLMError::PluginError(format!(
@@ -233,6 +234,34 @@ impl PluginRegistry {
     pub fn list(&self) -> Vec<Arc<dyn LLMProviderFactory>> {
         self.factories.read().unwrap().values().cloned().collect()
     }
+
+    /// Force-update all OCI-based provider plugins, reporting progress via callback.
+    ///
+    /// Returns a vec of `(provider_name, result)` pairs, one per OCI provider found
+    /// in the registry configuration.
+    pub async fn update_oci_plugins(
+        &self,
+        progress: Option<OciProgressCallback>,
+    ) -> Vec<(String, Result<ProviderPlugin, Box<dyn std::error::Error + Send + Sync>>)> {
+        let mut results = Vec::new();
+        for provider_cfg in &self.config.providers {
+            if let Some(image_ref) = provider_cfg.path.strip_prefix("oci://") {
+                let result = self
+                    .oci_downloader
+                    .pull_and_extract(image_ref, None, &self.cache_path, true, progress.clone())
+                    .await
+                    .map_err(|e| {
+                        // Convert the untyped error into a Send + Sync error
+                        let msg = e.to_string();
+                        let boxed: Box<dyn std::error::Error + Send + Sync> =
+                            msg.into();
+                        boxed
+                    });
+                results.push((provider_cfg.name.clone(), result));
+            }
+        }
+        results
+    }
 }
 
 #[cfg(test)]
@@ -283,5 +312,86 @@ mod tests {
             "default cache dir should exist"
         );
         assert!(registry.config.providers.is_empty());
+    }
+
+    // ── Progress type re-export tests ─────────────────────────────────────────
+
+    #[test]
+    fn oci_progress_types_are_reexported() {
+        // Compile-time check: these types must be accessible from the host module.
+        let _phase: OciDownloadPhase = OciDownloadPhase::Downloading;
+        let _progress = OciDownloadProgress {
+            phase: OciDownloadPhase::Resolving,
+            bytes_downloaded: 0,
+            bytes_total: None,
+            percent: None,
+        };
+        let _cb: OciProgressCallback = std::sync::Arc::new(|_| {});
+    }
+
+    // ── update_oci_plugins tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_oci_plugins_returns_empty_for_no_oci_providers() {
+        let cache_path = unique_tmp_path("update-oci-empty");
+        let cfg = config::PluginConfig {
+            providers: Vec::new(),
+            oci: None,
+        };
+        let registry =
+            PluginRegistry::from_config_with_cache_path(cfg, cache_path).expect("registry");
+        let results = registry.update_oci_plugins(None).await;
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_oci_plugins_skips_non_oci_providers() {
+        let cache_path = unique_tmp_path("update-oci-skip");
+        let cfg = config::PluginConfig {
+            providers: vec![config::ProviderConfig {
+                name: "local-plugin".to_string(),
+                path: "/some/local/plugin.wasm".to_string(),
+                config: None,
+            }],
+            oci: None,
+        };
+        let registry =
+            PluginRegistry::from_config_with_cache_path(cfg, cache_path).expect("registry");
+        let results = registry.update_oci_plugins(None).await;
+        // Local providers are skipped; only oci:// ones are processed.
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_oci_plugins_invokes_progress_callback_for_oci_providers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let cache_path = unique_tmp_path("update-oci-cb");
+        // Use a non-resolvable fake OCI reference so pull fails quickly.
+        let cfg = config::PluginConfig {
+            providers: vec![config::ProviderConfig {
+                name: "fake-plugin".to_string(),
+                path: "oci://localhost:9999/fake/image:latest".to_string(),
+                config: None,
+            }],
+            oci: None,
+        };
+        let registry =
+            PluginRegistry::from_config_with_cache_path(cfg, cache_path).expect("registry");
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+        let cb: OciProgressCallback = Arc::new(move |_p| {
+            cc.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let results = registry.update_oci_plugins(Some(cb)).await;
+        // Should have exactly one result (the fake provider).
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "fake-plugin");
+        // The call must have failed (no real registry), but that's expected.
+        assert!(results[0].1.is_err());
+        // At minimum the Resolving callback was invoked.
+        assert!(call_count.load(Ordering::SeqCst) >= 1);
     }
 }

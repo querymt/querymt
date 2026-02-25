@@ -4,11 +4,13 @@ use colored::*;
 use querymt::{
     builder::LLMBuilder,
     mcp::{adapter::McpToolAdapter, config::Config as MCPConfig},
+    plugin::host::{OciDownloadPhase, OciDownloadProgress, OciProgressCallback},
 };
 
 use spinners::{Spinner, Spinners};
 use std::fs;
 use std::io::{self, IsTerminal};
+use std::sync::Arc;
 
 mod auth;
 mod chat;
@@ -320,18 +322,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .strip_prefix("oci://")
                             .unwrap()
                             .to_string();
+
+                        let name_for_cb = name.clone();
+                        let progress: OciProgressCallback = Arc::new(move |p: OciDownloadProgress| {
+                            match &p.phase {
+                                OciDownloadPhase::Downloading => {
+                                    if let Some(pct) = p.percent {
+                                        eprint!(
+                                            "\r  {} Downloading... {:.1}%   ",
+                                            name_for_cb, pct
+                                        );
+                                    }
+                                }
+                                OciDownloadPhase::Extracting => {
+                                    eprint!("\r  {} Extracting...          ", name_for_cb);
+                                }
+                                OciDownloadPhase::Persisting => {
+                                    eprint!("\r  {} Persisting...          ", name_for_cb);
+                                }
+                                _ => {}
+                            }
+                        });
+
                         match registry
                             .oci_downloader
-                            .pull_and_extract(&image_reference, None, &registry.cache_path, true)
+                            .pull_and_extract(
+                                &image_reference,
+                                None,
+                                &registry.cache_path,
+                                true,
+                                Some(progress),
+                            )
                             .await
                         {
                             Ok(_) => {
+                                eprint!("\r");
                                 spinner.stop_and_persist(
                                     "🚀",
                                     format!("{} has been updated.", name.bold()),
                                 );
                             }
                             Err(e) => {
+                                eprint!("\r");
                                 spinner.stop_and_persist(
                                     "💥",
                                     format!("Failed updating {}", name.bold()),

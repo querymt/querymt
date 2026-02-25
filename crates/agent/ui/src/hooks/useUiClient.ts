@@ -21,6 +21,8 @@ import {
   OAuthResultState,
   UndoStackFrame,
   RemoteNodeInfo,
+  PluginUpdateStatus,
+  PluginUpdateResult,
 } from '../types';
 
 // Callback type for file index updates
@@ -159,6 +161,9 @@ export function useUiClient() {
   const undoStateRef = useRef<UndoState>(null);
   const [remoteNodes, setRemoteNodes] = useState<RemoteNodeInfo[]>([]);
   const [connectionErrors, setConnectionErrors] = useState<{ id: number; message: string }[]>([]);
+  const [pluginUpdateStatus, setPluginUpdateStatus] = useState<Record<string, PluginUpdateStatus>>({});
+  const [pluginUpdateResults, setPluginUpdateResults] = useState<PluginUpdateResult[] | null>(null);
+  const [isUpdatingPlugins, setIsUpdatingPlugins] = useState(false);
   const [defaultCwd, setDefaultCwd] = useState<string | null>(null);
   const [workspacePathDialogOpen, setWorkspacePathDialogOpen] = useState(false);
   const [workspacePathDialogDefaultValue, setWorkspacePathDialogDefaultValue] = useState('');
@@ -844,6 +849,28 @@ export function useUiClient() {
         }
         break;
       }
+      case 'plugin_update_status': {
+        setIsUpdatingPlugins(true);
+        setPluginUpdateStatus(prev => ({
+          ...prev,
+          [msg.plugin_name]: {
+            plugin_name: msg.plugin_name,
+            image_reference: msg.image_reference,
+            phase: msg.phase,
+            bytes_downloaded: msg.bytes_downloaded,
+            bytes_total: msg.bytes_total,
+            percent: msg.percent,
+            message: msg.message,
+          },
+        }));
+        break;
+      }
+      case 'plugin_update_complete': {
+        setIsUpdatingPlugins(false);
+        setPluginUpdateResults(msg.results);
+        setTimeout(() => setPluginUpdateResults(null), 8000);
+        break;
+      }
       default:
         break;
     }
@@ -1127,6 +1154,13 @@ export function useUiClient() {
     setAgentMode(nextMode);
   }, [agentMode, setAgentMode, availableModes]);
 
+  const updatePlugins = useCallback(() => {
+    setIsUpdatingPlugins(true);
+    setPluginUpdateStatus({});
+    setPluginUpdateResults(null);
+    sendMessage({ type: 'update_plugins' });
+  }, []);
+
   return {
     events,
     eventsBySession,
@@ -1195,6 +1229,10 @@ export function useUiClient() {
     listRemoteNodes,
     connectionErrors,
     dismissConnectionError,
+    pluginUpdateStatus,
+    pluginUpdateResults,
+    isUpdatingPlugins,
+    updatePlugins,
   };
 }
 

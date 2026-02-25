@@ -11,6 +11,8 @@ describe('ShortcutGateway', () => {
     onStartNewSession: vi.fn(),
     onSelectTheme: vi.fn(),
     onAuthenticateProvider: vi.fn(),
+    onUpdatePlugins: vi.fn(),
+    isUpdatingPlugins: false,
   };
 
   beforeEach(() => {
@@ -100,5 +102,29 @@ describe('ShortcutGateway', () => {
     await user.click(authItem!);
 
     expect(defaultProps.onAuthenticateProvider).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders "Update Provider Plugins" text when open', () => {
+    render(<ShortcutGateway {...defaultProps} />);
+    expect(screen.getByText('Update Provider Plugins')).toBeInTheDocument();
+  });
+
+  it('calls onUpdatePlugins when clicking update plugins command', async () => {
+    const user = userEvent.setup();
+    render(<ShortcutGateway {...defaultProps} />);
+
+    const updateItem = screen.getByText('Update Provider Plugins').closest('[cmdk-item]');
+    expect(updateItem).toBeTruthy();
+    await user.click(updateItem!);
+
+    expect(defaultProps.onUpdatePlugins).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows updating state with spinner when isUpdatingPlugins is true', () => {
+    render(<ShortcutGateway {...defaultProps} isUpdatingPlugins={true} />);
+    const updateItem = screen.getByText('Update Provider Plugins').closest('[cmdk-item]');
+    expect(updateItem).toBeTruthy();
+    // Badge should show "Updating..." instead of "U"
+    expect(updateItem).toHaveTextContent('Updating...');
   });
 });

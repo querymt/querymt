@@ -279,11 +279,21 @@ pub enum UiClientMessage {
         provider: String,
         model_id: String,
     },
+    /// Trigger an update of all OCI provider plugins.
+    UpdatePlugins,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UndoStackFrame {
     pub message_id: String,
+}
+
+/// Result of updating a single OCI plugin, reported in `PluginUpdateComplete`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginUpdateResult {
+    pub plugin_name: String,
+    pub success: bool,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -423,6 +433,20 @@ pub enum UiServerMessage {
         eta_seconds: Option<u64>,
         message: Option<String>,
     },
+    /// Progress update for an OCI plugin update operation.
+    PluginUpdateStatus {
+        plugin_name: String,
+        image_reference: String,
+        phase: String,
+        bytes_downloaded: u64,
+        bytes_total: Option<u64>,
+        percent: Option<f32>,
+        message: Option<String>,
+    },
+    /// All OCI plugin updates have completed.
+    PluginUpdateComplete {
+        results: Vec<PluginUpdateResult>,
+    },
 }
 
 impl UiServerMessage {
@@ -451,13 +475,15 @@ impl UiServerMessage {
             Self::RemoteNodes { .. } => "remote_nodes",
             Self::RemoteSessions { .. } => "remote_sessions",
             Self::ModelDownloadStatus { .. } => "model_download_status",
+            Self::PluginUpdateStatus { .. } => "plugin_update_status",
+            Self::PluginUpdateComplete { .. } => "plugin_update_complete",
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{UiClientMessage, UiServerMessage};
+    use super::{PluginUpdateResult, UiClientMessage, UiServerMessage};
     use serde_json::json;
 
     #[test]
@@ -614,6 +640,82 @@ mod tests {
         let json = serde_json::to_value(&msg).expect("should serialize");
         assert_eq!(json["type"], "remote_sessions");
         assert_eq!(json["node_id"], "peer-abc");
+    }
+
+    // ── Plugin update message tests (RED→GREEN) ───────────────────────────────
+
+    #[test]
+    fn update_plugins_client_message_deserializes() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "update_plugins"
+        }))
+        .expect("update_plugins should deserialize");
+        assert!(matches!(msg, UiClientMessage::UpdatePlugins));
+    }
+
+    #[test]
+    fn plugin_update_status_server_message_serializes() {
+        let msg = UiServerMessage::PluginUpdateStatus {
+            plugin_name: "my-plugin".to_string(),
+            image_reference: "ghcr.io/org/plugin:latest".to_string(),
+            phase: "downloading".to_string(),
+            bytes_downloaded: 1024,
+            bytes_total: Some(4096),
+            percent: Some(25.0),
+            message: None,
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        assert_eq!(json["type"], "plugin_update_status");
+        assert_eq!(json["plugin_name"], "my-plugin");
+        assert_eq!(json["phase"], "downloading");
+        assert_eq!(json["bytes_downloaded"], 1024);
+        assert_eq!(json["bytes_total"], 4096);
+        assert!((json["percent"].as_f64().unwrap() - 25.0).abs() < 0.01);
+        assert!(json["message"].is_null());
+    }
+
+    #[test]
+    fn plugin_update_complete_server_message_serializes() {
+        let msg = UiServerMessage::PluginUpdateComplete {
+            results: vec![
+                PluginUpdateResult {
+                    plugin_name: "ok-plugin".to_string(),
+                    success: true,
+                    message: None,
+                },
+                PluginUpdateResult {
+                    plugin_name: "bad-plugin".to_string(),
+                    success: false,
+                    message: Some("network error".to_string()),
+                },
+            ],
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        assert_eq!(json["type"], "plugin_update_complete");
+        let results = json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["plugin_name"], "ok-plugin");
+        assert_eq!(results[0]["success"], true);
+        assert_eq!(results[1]["success"], false);
+        assert_eq!(results[1]["message"], "network error");
+    }
+
+    #[test]
+    fn plugin_update_status_with_failed_message_serializes() {
+        let msg = UiServerMessage::PluginUpdateStatus {
+            plugin_name: "err-plugin".to_string(),
+            image_reference: "ghcr.io/org/plugin:v1".to_string(),
+            phase: "failed".to_string(),
+            bytes_downloaded: 512,
+            bytes_total: None,
+            percent: None,
+            message: Some("connection refused".to_string()),
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        assert_eq!(json["type"], "plugin_update_status");
+        assert_eq!(json["message"], "connection refused");
+        assert!(json["bytes_total"].is_null());
+        assert!(json["percent"].is_null());
     }
 
     #[test]

@@ -10,6 +10,7 @@
 
 mod models;
 mod oauth;
+mod plugins;
 mod remote;
 mod session_ops;
 
@@ -40,6 +41,7 @@ pub use session_ops::handle_set_agent_mode;
 pub use session_ops::handle_subscribe_session;
 pub use session_ops::handle_undo;
 pub use session_ops::handle_unsubscribe_session;
+pub use plugins::handle_update_plugins;
 
 use super::ServerState;
 use super::connection::{send_error, send_state};
@@ -279,6 +281,9 @@ pub async fn handle_ui_message(
             if let Err(err) = handle_delete_custom_model(state, &provider, &model_id).await {
                 let _ = send_error(tx, err).await;
             }
+        }
+        UiClientMessage::UpdatePlugins => {
+            handle_update_plugins(state, tx).await;
         }
     }
 }

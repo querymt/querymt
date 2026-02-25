@@ -351,6 +351,22 @@ export interface UndoStackFrame {
   message_id: string;
 }
 
+export interface PluginUpdateStatus {
+  plugin_name: string;
+  image_reference: string;
+  phase: string;
+  bytes_downloaded: number;
+  bytes_total?: number | null;
+  percent?: number | null;
+  message?: string | null;
+}
+
+export interface PluginUpdateResult {
+  plugin_name: string;
+  success: boolean;
+  message?: string | null;
+}
+
 export type UiServerMessage =
   | {
       type: 'state';
@@ -420,7 +436,21 @@ export type UiServerMessage =
   | { type: 'agent_mode'; mode: string }
   | { type: 'remote_nodes'; nodes: RemoteNodeInfo[] }
   | { type: 'remote_sessions'; node_id: string; sessions: RemoteSessionInfo[] }
-  | ({ type: 'model_download_status' } & ModelDownloadStatus);
+  | ({ type: 'model_download_status' } & ModelDownloadStatus)
+  | {
+      type: 'plugin_update_status';
+      plugin_name: string;
+      image_reference: string;
+      phase: string;
+      bytes_downloaded: number;
+      bytes_total?: number | null;
+      percent?: number | null;
+      message?: string | null;
+    }
+  | {
+      type: 'plugin_update_complete';
+      results: PluginUpdateResult[];
+    };
 
 export interface ModelEntry {
   id?: string;
@@ -543,4 +573,5 @@ export type UiClientMessage =
   | { type: 'attach_remote_session'; node_id: string; session_id: string }
   | { type: 'add_custom_model_from_hf'; provider: string; repo: string; filename: string; display_name?: string }
   | { type: 'add_custom_model_from_file'; provider: string; file_path: string; display_name?: string }
-  | { type: 'delete_custom_model'; provider: string; model_id: string };
+  | { type: 'delete_custom_model'; provider: string; model_id: string }
+  | { type: 'update_plugins' };

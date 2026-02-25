@@ -11,6 +11,7 @@ import { SessionSwitcher } from './SessionSwitcher';
 import { StatsDrawer } from './StatsDrawer';
 import { ThemeSwitcher } from './ThemeSwitcher';
 import { ShortcutGateway } from './ShortcutGateway';
+import { PluginUpdateIndicator } from './PluginUpdateIndicator';
 import { ProviderAuthSwitcher } from './ProviderAuthSwitcher';
 import { WorkspacePathDialog } from './WorkspacePathDialog';
 import { RemoteNodeIndicator } from './RemoteNodeIndicator';
@@ -80,6 +81,10 @@ export function AppShell() {
     remoteNodes,
     connectionErrors,
     dismissConnectionError,
+    updatePlugins,
+    isUpdatingPlugins,
+    pluginUpdateStatus,
+    pluginUpdateResults,
   } = useUiClientContext();
   
   const navigate = useNavigate();
@@ -178,6 +183,13 @@ export function AppShell() {
         return;
       }
 
+      if (shortcutGatewayOpen && !e.altKey && !e.shiftKey && normalizedKey === 'u') {
+        e.preventDefault();
+        setShortcutGatewayOpen(false);
+        updatePlugins();
+        return;
+      }
+
       if (shortcutGatewayOpen) {
         return;
       }
@@ -219,6 +231,7 @@ export function AppShell() {
     setThemeSwitcherOpen,
     setProviderAuthOpen,
     requestAuthProviders,
+    updatePlugins,
   ]);
   
   // ESC handling: close modals first, then double-escape to cancel session
@@ -608,6 +621,11 @@ export function AppShell() {
           setProviderAuthOpen(true);
           requestAuthProviders();
         }}
+        onUpdatePlugins={() => {
+          setShortcutGatewayOpen(false);
+          updatePlugins();
+        }}
+        isUpdatingPlugins={isUpdatingPlugins}
       />
 
       <ThemeSwitcher
@@ -658,6 +676,13 @@ export function AppShell() {
           sessionLimits={sessionLimits}
         />
       )}
+
+      {/* Plugin update progress / result indicator */}
+      <PluginUpdateIndicator
+        isUpdatingPlugins={isUpdatingPlugins}
+        pluginUpdateStatus={pluginUpdateStatus}
+        pluginUpdateResults={pluginUpdateResults}
+      />
 
       {/* Connection error toasts */}
       {connectionErrors.length > 0 && (
