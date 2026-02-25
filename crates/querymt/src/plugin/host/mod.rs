@@ -242,7 +242,10 @@ impl PluginRegistry {
     pub async fn update_oci_plugins(
         &self,
         progress: Option<OciProgressCallback>,
-    ) -> Vec<(String, Result<ProviderPlugin, Box<dyn std::error::Error + Send + Sync>>)> {
+    ) -> Vec<(
+        String,
+        Result<ProviderPlugin, Box<dyn std::error::Error + Send + Sync>>,
+    )> {
         let mut results = Vec::new();
         for provider_cfg in &self.config.providers {
             if let Some(image_ref) = provider_cfg.path.strip_prefix("oci://") {
@@ -253,8 +256,7 @@ impl PluginRegistry {
                     .map_err(|e| {
                         // Convert the untyped error into a Send + Sync error
                         let msg = e.to_string();
-                        let boxed: Box<dyn std::error::Error + Send + Sync> =
-                            msg.into();
+                        let boxed: Box<dyn std::error::Error + Send + Sync> = msg.into();
                         boxed
                     });
                 results.push((provider_cfg.name.clone(), result));

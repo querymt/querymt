@@ -324,8 +324,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .to_string();
 
                         let name_for_cb = name.clone();
-                        let progress: OciProgressCallback = Arc::new(move |p: OciDownloadProgress| {
-                            match &p.phase {
+                        let progress: OciProgressCallback =
+                            Arc::new(move |p: OciDownloadProgress| match &p.phase {
                                 OciDownloadPhase::Downloading => {
                                     if let Some(pct) = p.percent {
                                         eprint!(
@@ -341,8 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     eprint!("\r  {} Persisting...          ", name_for_cb);
                                 }
                                 _ => {}
-                            }
-                        });
+                            });
 
                         match registry
                             .oci_downloader

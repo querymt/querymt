@@ -843,10 +843,8 @@ impl OciDownloader {
                         if let Some(e) = auth_error {
                             match e.code {
                                 OciErrorCode::Denied => {
-                                    let msg = format!(
-                                        "Access denied for '{:?}': {}",
-                                        url, e.message
-                                    );
+                                    let msg =
+                                        format!("Access denied for '{:?}': {}", url, e.message);
                                     progress(OciDownloadProgress {
                                         phase: OciDownloadPhase::Failed(msg.clone()),
                                         bytes_downloaded: 0,
@@ -871,10 +869,7 @@ impl OciDownloader {
                                 _ => unreachable!(),
                             }
                         } else if let Some(e) = envelope.errors.first() {
-                            let msg = format!(
-                                "Error while accessing '{:?}': {}",
-                                url, e.message
-                            );
+                            let msg = format!("Error while accessing '{:?}': {}", url, e.message);
                             progress(OciDownloadProgress {
                                 phase: OciDownloadPhase::Failed(msg.clone()),
                                 bytes_downloaded: 0,
@@ -905,10 +900,8 @@ impl OciDownloader {
                         return Err(msg.into());
                     }
                     _ => {
-                        let msg = format!(
-                            "Failed to pull manifest for '{}': {}",
-                            image_reference, e
-                        );
+                        let msg =
+                            format!("Failed to pull manifest for '{}': {}", image_reference, e);
                         progress(OciDownloadProgress {
                             phase: OciDownloadPhase::Failed(msg.clone()),
                             bytes_downloaded: 0,
@@ -1246,7 +1239,8 @@ mod tests {
         hasher.update(data);
         let actual_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
 
-        let wrong_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let wrong_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         assert_ne!(actual_digest, wrong_digest, "digests should differ");
 
         // Simulate the check performed inside stream_blob_with_progress.

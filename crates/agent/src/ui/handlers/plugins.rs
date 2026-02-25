@@ -64,7 +64,13 @@ pub async fn handle_update_plugins(state: &ServerState, tx: &mpsc::Sender<String
 
         let result = registry
             .oci_downloader
-            .pull_and_extract(&image_ref_owned, None, &registry.cache_path, true, Some(progress))
+            .pull_and_extract(
+                &image_ref_owned,
+                None,
+                &registry.cache_path,
+                true,
+                Some(progress),
+            )
             .await;
 
         results.push(PluginUpdateResult {

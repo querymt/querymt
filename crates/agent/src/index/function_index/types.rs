@@ -3,6 +3,14 @@
 use similarity_core::AstFingerprint;
 use std::path::PathBuf;
 
+/// Maximum file size (in bytes) that the function index will attempt to parse.
+///
+/// Files larger than this are skipped during indexing to avoid stack overflows
+/// in tree-sitter's recursive AST traversal. Large files (vendored single-header
+/// libraries, generated code, etc.) are unlikely to contain functions worth
+/// deduplicating and can produce ASTs deep enough to exhaust the thread stack.
+const DEFAULT_MAX_FILE_BYTES: usize = 512 * 1024; // 512 KB
+
 /// Configuration for the function index
 #[derive(Debug, Clone)]
 pub struct FunctionIndexConfig {
@@ -12,6 +20,9 @@ pub struct FunctionIndexConfig {
     pub min_function_lines: u32,
     /// Optional path for caching the index to disk
     pub cache_path: Option<PathBuf>,
+    /// Maximum source file size (in bytes) to index. Files larger than this are
+    /// skipped to prevent stack overflows from deeply nested ASTs.
+    pub max_file_bytes: usize,
 }
 
 impl Default for FunctionIndexConfig {
@@ -20,6 +31,7 @@ impl Default for FunctionIndexConfig {
             similarity_threshold: 0.8,
             min_function_lines: 5,
             cache_path: None,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
         }
     }
 }
