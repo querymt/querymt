@@ -214,9 +214,8 @@ impl DelegationOrchestrator {
 
                 // Get the agent handle for this agent — try new `get_handle` first,
                 // fall back to `get_agent_handle` for backward compatibility.
-                let target_handle: Option<Arc<dyn crate::agent::handle::AgentHandle>> = self
-                    .agent_registry
-                    .get_handle(&delegation.target_agent_id);
+                let target_handle: Option<Arc<dyn crate::agent::handle::AgentHandle>> =
+                    self.agent_registry.get_handle(&delegation.target_agent_id);
 
                 let handle = tokio::spawn(async move {
                     let _permit = match max_parallel.acquire_owned().await {
@@ -382,10 +381,7 @@ async fn execute_delegation(
 
     // 1. Create session via AgentHandle trait
     let cwd_string = ctx.config.cwd.as_ref().map(|p| p.display().to_string());
-    let (child_session_id, session_ref) = match target
-        .create_delegation_session(cwd_string)
-        .await
-    {
+    let (child_session_id, session_ref) = match target.create_delegation_session(cwd_string).await {
         Ok(result) => result,
         Err(e) => {
             let error_message = format!("Failed to create session via kameo: {}", e);
@@ -901,7 +897,11 @@ impl DefaultAgentRegistry {
     }
 
     /// Register an agent with its metadata and a unified `AgentHandle`.
-    pub fn register(&mut self, info: AgentInfo, handle: Arc<dyn crate::agent::handle::AgentHandle>) {
+    pub fn register(
+        &mut self,
+        info: AgentInfo,
+        handle: Arc<dyn crate::agent::handle::AgentHandle>,
+    ) {
         let id = info.id.clone();
         self.agents.insert(id, AgentEntry { info, handle });
     }
@@ -929,9 +929,7 @@ impl AgentRegistry for DefaultAgentRegistry {
     }
 
     fn get_handle(&self, id: &str) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
-        self.agents
-            .get(id)
-            .map(|entry| entry.handle.clone())
+        self.agents.get(id).map(|entry| entry.handle.clone())
     }
 }
 
@@ -977,19 +975,13 @@ mod tests {
             Ok(NewSessionResponse::new(format!("{}-session", self.name)))
         }
 
-        async fn prompt(
-            &self,
-            _req: PromptRequest,
-        ) -> std::result::Result<PromptResponse, Error> {
+        async fn prompt(&self, _req: PromptRequest) -> std::result::Result<PromptResponse, Error> {
             Ok(PromptResponse::new(
                 agent_client_protocol::StopReason::EndTurn,
             ))
         }
 
-        async fn cancel(
-            &self,
-            _notif: CancelNotification,
-        ) -> std::result::Result<(), Error> {
+        async fn cancel(&self, _notif: CancelNotification) -> std::result::Result<(), Error> {
             Ok(())
         }
 

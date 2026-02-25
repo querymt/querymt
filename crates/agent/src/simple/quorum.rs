@@ -14,10 +14,10 @@ use crate::agent::core::ToolPolicy;
 use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
 use crate::delegation::AgentInfo;
 
+use crate::agent::handle::AgentHandle as AgentHandleTrait;
 use crate::middleware::MIDDLEWARE_REGISTRY;
 use crate::quorum::AgentQuorum;
 use crate::runner::{ChatRunner, ChatSession};
-use crate::agent::handle::AgentHandle as AgentHandleTrait;
 #[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
 use crate::session::backend::default_agent_db_path;

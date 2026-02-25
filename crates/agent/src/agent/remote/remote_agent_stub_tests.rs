@@ -12,9 +12,7 @@ mod remote_agent_stub_tests {
     use crate::agent::handle::AgentHandle;
     use crate::agent::remote::remote_handle::RemoteAgentHandle;
     use crate::agent::remote::test_helpers::fixtures::{MeshNodeManagerFixture, get_test_mesh};
-    use agent_client_protocol::{
-        CancelNotification, NewSessionRequest, SessionId,
-    };
+    use agent_client_protocol::{CancelNotification, NewSessionRequest, SessionId};
     use std::path::PathBuf;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -24,10 +22,7 @@ mod remote_agent_stub_tests {
         peer_label: &str,
         mesh: &crate::agent::remote::mesh::MeshHandle,
     ) -> Arc<RemoteAgentHandle> {
-        Arc::new(RemoteAgentHandle::new(
-            peer_label.to_string(),
-            mesh.clone(),
-        ))
+        Arc::new(RemoteAgentHandle::new(peer_label.to_string(), mesh.clone()))
     }
 
     // ── C.1 — new_session delegates to mesh ──────────────────────────────────
@@ -89,13 +84,10 @@ mod remote_agent_stub_tests {
         let mut rx = handle.subscribe_events();
         handle.emit_event("test-session", crate::events::AgentEventKind::Cancelled);
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("recv");
+        let received = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
 
         assert_eq!(received.session_id(), "test-session");
     }

@@ -10,7 +10,9 @@ use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EphemeralEvent, EventEnvelope, EventOrigin};
 
-use agent_client_protocol::{CancelNotification, Error, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse};
+use agent_client_protocol::{
+    CancelNotification, Error, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+};
 use async_trait::async_trait;
 use std::any::Any;
 use std::collections::HashMap;
@@ -79,9 +81,7 @@ impl RemoteAgentHandle {
         let resp = node_manager
             .ask(&CreateRemoteSession { cwd })
             .await
-            .map_err(|e| {
-                Error::from(AgentError::RemoteActor(e.to_string()))
-            })?;
+            .map_err(|e| Error::from(AgentError::RemoteActor(e.to_string())))?;
 
         let session_id = resp.session_id.clone();
         let dht_name = crate::agent::remote::dht_name::session(&session_id);
@@ -119,10 +119,7 @@ impl RemoteAgentHandle {
 
 #[async_trait]
 impl AgentHandle for RemoteAgentHandle {
-    async fn new_session(
-        &self,
-        req: NewSessionRequest,
-    ) -> Result<NewSessionResponse, Error> {
+    async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse, Error> {
         let cwd = req.cwd.to_str().map(|s| s.to_string());
         let (session_id, _) = self.create_remote_session_inner(cwd).await?;
         Ok(NewSessionResponse::new(session_id))

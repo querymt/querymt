@@ -204,12 +204,10 @@ pub async fn setup_mesh_from_config(
                 );
                 // Register a unified RemoteAgentHandle that implements
                 // the AgentHandle trait for both delegation and event fanout.
-                let remote_handle = Arc::new(
-                    super::remote_handle::RemoteAgentHandle::new(
-                        remote.peer.clone(),
-                        mesh.clone(),
-                    ),
-                );
+                let remote_handle = Arc::new(super::remote_handle::RemoteAgentHandle::new(
+                    remote.peer.clone(),
+                    mesh.clone(),
+                ));
                 registry.register_handle(agent_info, remote_handle);
             }
             Err(e) => {
@@ -340,5 +338,3 @@ fn get_hostname() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
 }
-
-

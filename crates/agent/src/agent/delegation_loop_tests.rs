@@ -2,9 +2,7 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
-use crate::delegation::{
-    AgentInfo, DefaultAgentRegistry, DelegationOrchestrator,
-};
+use crate::delegation::{AgentInfo, DefaultAgentRegistry, DelegationOrchestrator};
 use crate::events::StopType;
 use crate::middleware::{
     AgentStats, ConversationContext, DelegationGuardMiddleware, ExecutionState, LlmResponse,

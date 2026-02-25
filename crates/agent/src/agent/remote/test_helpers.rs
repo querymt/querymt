@@ -483,12 +483,10 @@ pub(crate) mod fixtures {
             let mesh = get_test_mesh().await;
             let nm_fixture = MeshNodeManagerFixture::new("stub", test_id).await;
 
-            let handle = Arc::new(
-                crate::agent::remote::remote_handle::RemoteAgentHandle::new(
-                    format!("stub-{}", test_id),
-                    mesh.clone(),
-                ),
-            );
+            let handle = Arc::new(crate::agent::remote::remote_handle::RemoteAgentHandle::new(
+                format!("stub-{}", test_id),
+                mesh.clone(),
+            ));
 
             Self {
                 handle,

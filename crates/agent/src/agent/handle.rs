@@ -52,7 +52,10 @@ pub trait AgentHandle: Send + Sync {
     // --- Session management ---
 
     /// Create a new session. Returns session_id.
-    async fn new_session(&self, req: NewSessionRequest) -> std::result::Result<NewSessionResponse, Error>;
+    async fn new_session(
+        &self,
+        req: NewSessionRequest,
+    ) -> std::result::Result<NewSessionResponse, Error>;
 
     /// Send a prompt to a session.
     async fn prompt(&self, req: PromptRequest) -> std::result::Result<PromptResponse, Error>;
@@ -914,7 +917,10 @@ impl LocalAgentHandle {
 
 #[async_trait]
 impl AgentHandle for LocalAgentHandle {
-    async fn new_session(&self, req: NewSessionRequest) -> std::result::Result<NewSessionResponse, Error> {
+    async fn new_session(
+        &self,
+        req: NewSessionRequest,
+    ) -> std::result::Result<NewSessionResponse, Error> {
         SendAgent::new_session(self, req).await
     }
 
@@ -1454,7 +1460,10 @@ mod tests {
     #[cfg(feature = "remote")]
     #[test]
     fn test_remote_node_lookup_config_defaults() {
-        assert_eq!(LocalAgentHandle::remote_node_info_timeout().as_millis(), 3000);
+        assert_eq!(
+            LocalAgentHandle::remote_node_info_timeout().as_millis(),
+            3000
+        );
         assert_eq!(LocalAgentHandle::remote_node_lookup_parallelism(), 8);
         assert_eq!(LocalAgentHandle::remote_node_cache_ttl().as_millis(), 10000);
     }
