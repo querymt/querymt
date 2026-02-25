@@ -45,6 +45,7 @@ fn make_provider(model: String, mmproj_path: Option<String>) -> Box<dyn querymt:
         max_tokens: Some(100),
         temperature: None,
         top_p: None,
+        min_p: None,
         top_k: None,
         system: vec![],
         n_batch: None,
@@ -64,6 +65,7 @@ fn make_provider(model: String, mmproj_path: Option<String>) -> Box<dyn querymt:
         mmproj_threads: None,
         mmproj_use_gpu: None,
         n_ubatch: None,
+        text_only: None,
     };
     create_provider(cfg).expect("Failed to create provider")
 }
@@ -197,6 +199,7 @@ fn test_config_with_multimodal_fields() {
         max_tokens: Some(512),
         temperature: None,
         top_p: None,
+        min_p: None,
         top_k: None,
         system: vec![],
         n_batch: None,
@@ -213,6 +216,7 @@ fn test_config_with_multimodal_fields() {
         kv_cache_type_k: None,
         kv_cache_type_v: None,
         n_ubatch: None,
+        text_only: None,
     };
 
     let json = serde_json::to_string(&config).expect("serialize");

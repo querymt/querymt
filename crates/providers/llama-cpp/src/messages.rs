@@ -277,6 +277,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             top_p: None,
+            min_p: None,
             top_k: None,
             system: vec![],
             n_ctx: None,
@@ -299,6 +300,7 @@ mod tests {
             mmproj_threads: None,
             mmproj_use_gpu: None,
             n_ubatch: None,
+            text_only: None,
         }
     }
 

@@ -20,6 +20,7 @@ fn test_config_serialization() {
         max_tokens: Some(512),
         temperature: Some(0.7),
         top_p: Some(0.9),
+        min_p: Some(0.0),
         top_k: Some(40),
         system: vec!["System prompt".to_string()],
         n_ctx: Some(2048),
@@ -42,6 +43,7 @@ fn test_config_serialization() {
         mmproj_threads: Some(4),
         mmproj_use_gpu: Some(true),
         n_ubatch: Some(4096),
+        text_only: None,
     };
 
     let json = serde_json::to_string(&config).expect("Failed to serialize config");

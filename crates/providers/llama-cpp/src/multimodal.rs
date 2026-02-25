@@ -40,6 +40,11 @@ impl MultimodalContext {
         cfg: &LlamaCppConfig,
         model_hf_repo: Option<&str>,
     ) -> Result<Option<Self>, LLMError> {
+        if cfg.text_only.unwrap_or(false) {
+            log::info!("text_only mode: skipping multimodal projection loading");
+            return Ok(None);
+        }
+
         let marker = cfg
             .media_marker
             .clone()

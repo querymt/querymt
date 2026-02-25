@@ -91,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_tokens: Some(args.max_tokens),
         temperature: None,
         top_p: None,
+        min_p: None,
         top_k: None,
         system: vec![],
         n_batch: None,
@@ -109,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mmproj_threads: None,
         mmproj_use_gpu: None,
         n_ubatch: None,
+        text_only: None,
     };
 
     println!("Loading model: {}", args.model);

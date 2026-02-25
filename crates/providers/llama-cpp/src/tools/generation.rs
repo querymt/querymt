@@ -148,7 +148,15 @@ pub(crate) fn generate_with_tools(
     }
 
     let seed = cfg.seed.unwrap_or(1234);
-    let mut sampler = build_tool_sampler(model, result, temperature, seed, cfg.top_p, cfg.top_k, cfg.min_p);
+    let mut sampler = build_tool_sampler(
+        model,
+        result,
+        temperature,
+        seed,
+        cfg.top_p,
+        cfg.top_k,
+        cfg.min_p,
+    );
     let mut n_cur = tokens.len() as i32;
     let mut output_tokens = 0u32;
     let mut output = String::new();

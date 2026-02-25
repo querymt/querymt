@@ -91,6 +91,9 @@ pub struct LlamaCppConfig {
     /// files, such as Gemma 3 which uses mmproj-F16.gguf.
     ///
     /// Supports the same path formats as model_path (local paths and hf: prefix).
+    ///
+    /// To suppress mmproj loading entirely (e.g. to save VRAM when running a
+    /// VL model in text-only mode), set `text_only = true` instead.
     pub mmproj_path: Option<String>,
     /// Media marker string for identifying image/audio positions in prompts.
     ///
@@ -109,6 +112,13 @@ pub struct LlamaCppConfig {
     /// to full GPU offload on Metal/CUDA) or is `> 0`, `false` when
     /// `n_gpu_layers = 0` (CPU-only mode).
     pub mmproj_use_gpu: Option<bool>,
+    /// Force text-only mode. When `true`, the multimodal projection (mmproj)
+    /// will not be loaded even if the model supports vision/audio and an mmproj
+    /// file is available (via explicit `mmproj_path` or auto-discovery from the
+    /// Hugging Face repo). This avoids the extra VRAM cost of the projector
+    /// when you only need text generation from a VL model.
+    /// Defaults to `false`.
+    pub text_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
