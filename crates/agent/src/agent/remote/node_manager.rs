@@ -131,6 +131,13 @@ mod remote_impl {
         session_meta: HashMap<String, (i64, Option<String>)>,
         /// Mesh handle for DHT registration of newly created sessions.
         mesh: Option<MeshHandle>,
+        /// Optional fixed node name returned by `GetNodeInfo`.
+        ///
+        /// When `Some`, `GetNodeInfo` returns this value directly as `hostname`
+        /// instead of calling `get_hostname()`. Useful in tests (deterministic,
+        /// parallel-safe) and in future config-driven deployments where the
+        /// operator wants a stable name independent of the OS hostname.
+        node_name: Option<String>,
     }
 
     impl RemoteNodeManager {
@@ -145,7 +152,20 @@ mod remote_impl {
                 registry,
                 session_meta: HashMap::new(),
                 mesh,
+                node_name: None,
             }
+        }
+
+        /// Override the name returned by `GetNodeInfo` instead of reading the
+        /// OS hostname.  Returns `self` for easy chaining:
+        ///
+        /// ```rust,ignore
+        /// let nm = RemoteNodeManager::new(config, registry, mesh)
+        ///     .with_node_name("bob".to_string());
+        /// ```
+        pub fn with_node_name(mut self, name: String) -> Self {
+            self.node_name = Some(name);
+            self
         }
     }
 
@@ -488,7 +508,7 @@ mod remote_impl {
             _msg: GetNodeInfo,
             _ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            let hostname = get_hostname();
+            let hostname = self.node_name.clone().unwrap_or_else(get_hostname);
 
             let active_sessions = {
                 let registry = self.registry.lock().await;

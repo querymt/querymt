@@ -1178,3 +1178,425 @@ mod mesh_setup_config_tests {
         let _ = registry; // empty registry — no panics
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Module L — Peer delegate routing via RoutingActor
+// ═════════════════════════════════════════════════════════════════════════════
+//
+//  These tests cover the production path that the TOML config exercises:
+//
+//  [[delegates]]
+//    peer = "bob"    ← SetProviderTarget { agent_id, Peer("bob") } to RoutingActor
+//
+//  At quorum build time, the RoutingActor is populated with routes.
+//  Peer resolution happens eagerly (at build time or on PeerEvent::Discovered).
+//  At delegation time, the orchestrator reads the routing snapshot and writes
+//  provider_node_id to the session's DB row.
+//
+//  L.1 — create_delegation_session does NOT set provider_node_id (routing is orchestrator-only).
+//  L.2 — Tests resolve_peer_node_id against injected known_peers.
+//  L.3 — Tests the RoutingActor resolution flow end-to-end.
+//  L.4 — Tool → Actor → Snapshot integration (planner tool updates routing table).
+//  L.5 — Routing snapshot → orchestrator DB write path (snapshot read → provider_node_id).
+//  L.6 — Full path: tool sets route → resolve → snapshot → DB write (end-to-end).
+
+#[cfg(all(test, feature = "remote"))]
+mod peer_delegate_routing_tests {
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::agent::handle::{AgentHandle, LocalAgentHandle};
+    use crate::agent::remote::RemoteNodeManager;
+    use crate::agent::remote::dht_name;
+    use crate::agent::remote::test_helpers::fixtures::{AgentConfigFixture, get_test_mesh};
+    use crate::agent::session_registry::SessionRegistry;
+    use crate::session::backend::StorageBackend as _;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use kameo::actor::Spawn;
+    use querymt::LLMParams;
+    use querymt::plugin::host::PluginRegistry;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::Mutex;
+
+    // ── L.1 — create_delegation_session does NOT set provider_node_id ──────────
+
+    /// Verifies that `create_delegation_session` on a bare handle does NOT
+    /// write `provider_node_id` to the DB. Routing is now exclusively handled
+    /// by the RoutingActor + DelegationOrchestrator (see L.5, L.6).
+    #[tokio::test]
+    async fn test_create_delegation_session_does_not_set_provider_node_id() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let config_path = temp_dir.path().join("providers.toml");
+        std::fs::write(&config_path, "providers = []\n").expect("write providers.toml");
+        let registry = Arc::new(PluginRegistry::from_path(&config_path).expect("plugin registry"));
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("sqlite"),
+        );
+        let llm = LLMParams::new().provider("mock").model("mock");
+        let config = Arc::new(
+            AgentConfigBuilder::new(
+                registry,
+                storage.session_store(),
+                storage.event_journal(),
+                llm,
+            )
+            .build(),
+        );
+
+        let handle = LocalAgentHandle::from_config(config.clone());
+
+        let (session_id, _ref) = handle
+            .create_delegation_session(None)
+            .await
+            .expect("create_delegation_session");
+
+        let stored = config
+            .provider
+            .history_store()
+            .get_session_provider_node_id(&session_id)
+            .await
+            .expect("get_session_provider_node_id");
+
+        assert_eq!(
+            stored, None,
+            "create_delegation_session should NOT set provider_node_id — \
+             routing is handled by RoutingActor + orchestrator"
+        );
+    }
+
+    // ── L.2 — resolve_peer_node_id finds alice when injected into known_peers ───
+
+    /// Verifies that `resolve_peer_node_id("alice")` returns alice's NodeId when:
+    ///  1. Alice's RemoteNodeManager is registered under the per-peer DHT name
+    ///     and configured with `with_node_name("alice")`.
+    ///  2. Alice's PeerId is injected into `known_peers` (simulating mDNS discovery).
+    ///
+    /// No env var manipulation — `with_node_name` makes GetNodeInfo deterministic.
+    #[tokio::test]
+    async fn test_resolve_peer_node_id_finds_injected_peer() {
+        let mesh = get_test_mesh().await;
+
+        let alice_f = AgentConfigFixture::new().await;
+        let session_registry = Arc::new(Mutex::new(SessionRegistry::new(alice_f.config.clone())));
+        let alice_nm =
+            RemoteNodeManager::new(alice_f.config.clone(), session_registry, Some(mesh.clone()))
+                .with_node_name("alice".to_string());
+        let alice_nm_ref = RemoteNodeManager::spawn(alice_nm);
+
+        // Use a freshly generated keypair to get a unique PeerId for alice.
+        let alice_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let alice_peer_id = alice_keypair.public().to_peer_id();
+        let per_peer_dht = dht_name::node_manager_for_peer(&alice_peer_id.to_string());
+        mesh.register_actor(alice_nm_ref, per_peer_dht).await;
+
+        // Inject into known_peers to simulate mDNS Discovered.
+        mesh.inject_known_peer_for_test(alice_peer_id);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let result = mesh.resolve_peer_node_id("alice").await;
+
+        assert!(
+            result.is_some(),
+            "resolve_peer_node_id('alice') should return Some(node_id) \
+             when alice's RemoteNodeManager is registered and peer is in known_peers"
+        );
+    }
+
+    // ── L.3 — Full path: RoutingActor resolves peer and provides node_id ──
+
+    /// End-to-end test for the TOML `peer = "bob"` delegate path using the RoutingActor:
+    ///
+    ///   1. Bob's RemoteNodeManager is in the DHT (simulates remote node running).
+    ///   2. Bob's PeerId is in known_peers (simulates mDNS having fired).
+    ///   3. A RoutingActor is set up with a provider route for "coder" → Peer("bob").
+    ///   4. The route is resolved via MeshHandle::resolve_peer_node_id.
+    ///   5. The routing snapshot reflects the resolved node_id.
+    ///
+    /// This replaces the old test_deferred_peer_name_resolves_and_writes_provider_node_id
+    /// which tested the now-removed lazy resolution in create_delegation_session.
+    #[tokio::test]
+    async fn test_routing_actor_resolves_peer_via_mesh() {
+        use crate::agent::remote::routing::{
+            ResolvePeer, RouteTarget, RoutingActor, SetProviderTarget, new_routing_snapshot_handle,
+        };
+        use kameo::actor::Spawn as _;
+
+        let mesh = get_test_mesh().await;
+
+        // ── Set up bob's node ────────────────────────────────────────────────
+        let bob_f = AgentConfigFixture::new().await;
+        let bob_registry = Arc::new(Mutex::new(SessionRegistry::new(bob_f.config.clone())));
+        let bob_nm = RemoteNodeManager::new(bob_f.config.clone(), bob_registry, Some(mesh.clone()))
+            .with_node_name("bob".to_string());
+        let bob_nm_ref = RemoteNodeManager::spawn(bob_nm);
+
+        let bob_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let bob_peer_id = bob_keypair.public().to_peer_id();
+        let bob_per_peer_dht = dht_name::node_manager_for_peer(&bob_peer_id.to_string());
+        mesh.register_actor(bob_nm_ref, bob_per_peer_dht).await;
+
+        mesh.inject_known_peer_for_test(bob_peer_id);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // ── Set up RoutingActor with a route for "coder" → Peer("bob") ───────
+        let snapshot_handle = new_routing_snapshot_handle();
+        let actor = RoutingActor::new(snapshot_handle.clone());
+        let actor_ref = RoutingActor::spawn(actor);
+
+        actor_ref
+            .ask(SetProviderTarget {
+                agent_id: "coder".into(),
+                target: RouteTarget::Peer("bob".into()),
+            })
+            .await
+            .expect("SetProviderTarget");
+
+        // ── Resolve via mesh (same as what quorum builder does) ──────────────
+        let resolved_node_id = mesh
+            .resolve_peer_node_id("bob")
+            .await
+            .expect("resolve_peer_node_id should find bob");
+
+        let count = actor_ref
+            .ask(ResolvePeer {
+                peer_name: "bob".into(),
+                node_id: resolved_node_id.to_string(),
+            })
+            .await
+            .expect("ResolvePeer");
+
+        assert_eq!(count, 1, "should resolve exactly 1 route");
+
+        // ── Assert: routing snapshot has the resolved node_id ────────────────
+        let snap = snapshot_handle.load();
+        let policy = snap.get("coder").expect("routing entry for 'coder'");
+        assert_eq!(policy.provider_target, RouteTarget::Peer("bob".into()));
+        assert!(
+            policy.resolved_provider_node_id.is_some(),
+            "resolved_provider_node_id should be set after ResolvePeer"
+        );
+        assert_eq!(
+            policy.resolved_provider_node_id.as_deref().unwrap(),
+            &resolved_node_id.to_string(),
+            "resolved node_id should match bob's actual node_id"
+        );
+    }
+
+    // ── L.4 — Tool → Actor → Snapshot integration ───────────────────────────
+    //
+    //  Verifies the planner tool path: call `use_remote_provider` tool →
+    //  actor receives `SetProviderTarget` → snapshot is updated and readable
+    //  by downstream consumers (e.g. orchestrator).
+
+    #[tokio::test]
+    async fn test_tool_sets_provider_route_and_snapshot_is_readable() {
+        use crate::agent::remote::routing::{
+            RouteTarget, RoutingActor, new_routing_snapshot_handle,
+        };
+        use crate::tools::builtins::UseRemoteProviderTool;
+        use crate::tools::{AgentToolContext, Tool as ToolTrait};
+        use serde_json::json;
+
+        let snapshot_handle = new_routing_snapshot_handle();
+        let actor = RoutingActor::new(snapshot_handle.clone());
+        let actor_ref = RoutingActor::spawn(actor);
+        let tool = UseRemoteProviderTool::new(actor_ref);
+        let ctx = AgentToolContext::basic("l4-session".to_string(), None);
+
+        // Tool call: route "coder" provider to "gpu-box" peer.
+        let result = tool
+            .call(json!({ "agent_id": "coder", "peer_name": "gpu-box" }), &ctx)
+            .await
+            .expect("tool call should succeed");
+
+        assert!(
+            result.contains("gpu-box"),
+            "result should mention peer name"
+        );
+
+        // Snapshot should be immediately readable (lock-free via ArcSwap).
+        let snap = snapshot_handle.load();
+        let policy = snap.get("coder").expect("routing entry for 'coder'");
+        assert_eq!(
+            policy.provider_target,
+            RouteTarget::Peer("gpu-box".into()),
+            "snapshot should reflect the tool's SetProviderTarget"
+        );
+        // Not yet resolved (no ResolvePeer sent).
+        assert!(
+            policy.resolved_provider_node_id.is_none(),
+            "resolved_provider_node_id should be None until peer is resolved"
+        );
+    }
+
+    // ── L.5 — Routing snapshot → orchestrator DB write path ─────────────────
+    //
+    //  Simulates what `execute_delegation` does: reads the routing snapshot
+    //  for an agent, and if provider_target is Peer + resolved, writes
+    //  provider_node_id to the session DB row.
+
+    #[tokio::test]
+    async fn test_routing_snapshot_drives_orchestrator_db_write() {
+        use crate::agent::remote::routing::{
+            ResolvePeer, RouteTarget, RoutingActor, SetProviderTarget, new_routing_snapshot_handle,
+        };
+
+        let snapshot_handle = new_routing_snapshot_handle();
+        let actor = RoutingActor::new(snapshot_handle.clone());
+        let actor_ref = RoutingActor::spawn(actor);
+
+        // Set route and resolve it.
+        actor_ref
+            .ask(SetProviderTarget {
+                agent_id: "coder".into(),
+                target: RouteTarget::Peer("gpu-box".into()),
+            })
+            .await
+            .expect("SetProviderTarget");
+
+        actor_ref
+            .ask(ResolvePeer {
+                peer_name: "gpu-box".into(),
+                node_id: "QmFakeNodeId123".into(),
+            })
+            .await
+            .expect("ResolvePeer");
+
+        // Simulate orchestrator reading the snapshot (same logic as core.rs:425).
+        let snap = snapshot_handle.load();
+        let policy = snap.get("coder").expect("routing entry");
+
+        let provider_node_id = match &policy.provider_target {
+            RouteTarget::Peer(_) => policy.resolved_provider_node_id.clone(),
+            RouteTarget::Local => None,
+        };
+
+        assert_eq!(
+            provider_node_id.as_deref(),
+            Some("QmFakeNodeId123"),
+            "orchestrator should read resolved_provider_node_id from snapshot"
+        );
+
+        // Verify: write to in-memory SQLite (same as execute_delegation does).
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("sqlite"),
+        );
+        let store = storage.session_store();
+
+        // Create a session row.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let config_path = temp_dir.path().join("providers.toml");
+        std::fs::write(&config_path, "providers = []\n").expect("write");
+        let registry = Arc::new(
+            querymt::plugin::host::PluginRegistry::from_path(&config_path).expect("registry"),
+        );
+        use crate::session::provider::SessionProvider;
+        let session_provider = Arc::new(SessionProvider::new(
+            registry,
+            store.clone(),
+            LLMParams::new().provider("mock").model("mock"),
+        ));
+        let exec_config = crate::session::store::SessionExecutionConfig::default();
+        let session_handle = session_provider
+            .create_session(None, None, &exec_config)
+            .await
+            .expect("create session");
+        let session_id = session_handle.session().public_id.clone();
+
+        // Write provider_node_id (orchestrator path).
+        store
+            .set_session_provider_node_id(&session_id, provider_node_id.as_deref())
+            .await
+            .expect("set_session_provider_node_id");
+
+        // Read it back.
+        let stored = store
+            .get_session_provider_node_id(&session_id)
+            .await
+            .expect("get_session_provider_node_id");
+
+        assert_eq!(
+            stored.as_deref(),
+            Some("QmFakeNodeId123"),
+            "provider_node_id written by orchestrator should be readable from DB"
+        );
+    }
+
+    // ── L.6 — Full path: tool → resolve → snapshot → DB write ───────────────
+    //
+    //  End-to-end integration: uses the `route_delegation_to_peer` tool to set
+    //  a session route, then `use_remote_provider` tool to set a provider route,
+    //  resolves the peer, and verifies the snapshot contains the correct state
+    //  that the orchestrator would use.
+
+    #[tokio::test]
+    async fn test_full_tool_to_snapshot_to_db_path() {
+        use crate::agent::remote::routing::{
+            ResolvePeer, RouteTarget, RoutingActor, new_routing_snapshot_handle,
+        };
+        use crate::tools::builtins::{RouteDelegationToPeerTool, UseRemoteProviderTool};
+        use crate::tools::{AgentToolContext, Tool as ToolTrait};
+        use serde_json::json;
+
+        let snapshot_handle = new_routing_snapshot_handle();
+        let actor = RoutingActor::new(snapshot_handle.clone());
+        let actor_ref = RoutingActor::spawn(actor);
+
+        let session_tool = RouteDelegationToPeerTool::new(actor_ref.clone());
+        let provider_tool = UseRemoteProviderTool::new(actor_ref.clone());
+        let ctx = AgentToolContext::basic("l6-session".to_string(), None);
+
+        // Step 1: Planner routes "coder" session to peer "fast-node".
+        let r1 = session_tool
+            .call(
+                json!({ "agent_id": "coder", "peer_name": "fast-node" }),
+                &ctx,
+            )
+            .await
+            .expect("route session");
+        assert!(r1.contains("fast-node"));
+
+        // Step 2: Planner routes "coder" provider to peer "gpu-node".
+        let r2 = provider_tool
+            .call(
+                json!({ "agent_id": "coder", "peer_name": "gpu-node" }),
+                &ctx,
+            )
+            .await
+            .expect("route provider");
+        assert!(r2.contains("gpu-node"));
+
+        // Step 3: Resolve the provider peer (simulates PeerEvent::Discovered handler).
+        actor_ref
+            .ask(ResolvePeer {
+                peer_name: "gpu-node".into(),
+                node_id: "QmGpuNodeId456".into(),
+            })
+            .await
+            .expect("ResolvePeer");
+
+        // Step 4: Verify the snapshot has both routes correctly set.
+        let snap = snapshot_handle.load();
+        let policy = snap.get("coder").expect("routing entry for 'coder'");
+
+        assert_eq!(
+            policy.session_target,
+            RouteTarget::Peer("fast-node".into()),
+            "session_target should be Peer('fast-node')"
+        );
+        assert_eq!(
+            policy.provider_target,
+            RouteTarget::Peer("gpu-node".into()),
+            "provider_target should be Peer('gpu-node')"
+        );
+        assert_eq!(
+            policy.resolved_provider_node_id.as_deref(),
+            Some("QmGpuNodeId456"),
+            "resolved_provider_node_id should match the resolved node"
+        );
+    }
+}

@@ -103,6 +103,8 @@ pub struct DelegationOrchestrator {
     active_delegations: ActiveDelegations,
     /// Optional summarizer for generating planning context
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
+    /// Optional routing snapshot for per-agent routing decisions.
+    routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
 }
 
 impl DelegationOrchestrator {
@@ -124,6 +126,7 @@ impl DelegationOrchestrator {
             max_parallel: Arc::new(tokio::sync::Semaphore::new(5)),
             active_delegations: Arc::new(Mutex::new(HashMap::new())),
             delegation_summarizer: None,
+            routing_snapshot: None,
         }
     }
 
@@ -167,6 +170,19 @@ impl DelegationOrchestrator {
         self
     }
 
+    /// Set the routing snapshot handle for per-agent routing decisions.
+    ///
+    /// When set, the orchestrator will consult the routing table before creating
+    /// delegation sessions and write `provider_node_id` from the routing policy
+    /// to the session's DB row.
+    pub fn with_routing_snapshot(
+        mut self,
+        snapshot: crate::agent::remote::RoutingSnapshotHandle,
+    ) -> Self {
+        self.routing_snapshot = Some(snapshot);
+        self
+    }
+
     /// Start listening for events on the given `EventFanout`.
     ///
     /// Spawns a background task that subscribes to the fanout and dispatches
@@ -201,6 +217,7 @@ impl DelegationOrchestrator {
                 let config = self.config.clone();
                 let max_parallel = self.max_parallel.clone();
                 let delegation_summarizer = self.delegation_summarizer.clone();
+                let routing_snapshot = self.routing_snapshot.clone();
                 let parent_session_id = session_id.to_string();
                 let parent_session_id_for_insert = parent_session_id.clone();
                 let delegation = delegation.clone();
@@ -243,6 +260,7 @@ impl DelegationOrchestrator {
                         config,
                         active_delegations: active_delegations_for_spawn,
                         delegation_summarizer,
+                        routing_snapshot,
                     };
                     match target_handle {
                         Some(target) => {
@@ -351,6 +369,7 @@ struct DelegationContext {
     config: DelegationOrchestratorConfig,
     active_delegations: ActiveDelegations,
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
+    routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -398,6 +417,38 @@ async fn execute_delegation(
             return;
         }
     };
+
+    // 1b. Apply routing policy from the routing table (if present).
+    //     When provider_target = Peer(name) and the peer is resolved,
+    //     write the node_id to the session's DB row so SessionProvider
+    //     constructs a MeshChatProvider for this session.
+    if let Some(ref snap_handle) = ctx.routing_snapshot {
+        let snap = snap_handle.load();
+        if let Some(policy) = snap.get(&delegation.target_agent_id) {
+            use crate::agent::remote::routing::RouteTarget;
+            if let RouteTarget::Peer(_) = &policy.provider_target
+                && let Some(ref node_id) = policy.resolved_provider_node_id
+            {
+                if let Err(e) = ctx
+                    .store
+                    .set_session_provider_node_id(&child_session_id, Some(node_id.as_str()))
+                    .await
+                {
+                    warn!(
+                        "execute_delegation: failed to set provider_node_id='{}' \
+                             on session {} from routing table: {}",
+                        node_id, child_session_id, e
+                    );
+                } else {
+                    debug!(
+                        "execute_delegation: set provider_node_id='{}' on session {} \
+                             for agent '{}' from routing table",
+                        node_id, child_session_id, delegation.target_agent_id
+                    );
+                }
+            }
+        }
+    }
 
     emit_delegation_event(
         &ctx.delegator,
