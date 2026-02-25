@@ -20,6 +20,8 @@ pub struct LlamaCppConfig {
     pub temperature: Option<f32>,
     /// Top-p sampling.
     pub top_p: Option<f32>,
+    /// Min-p sampling.
+    pub min_p: Option<f32>,
     /// Top-k sampling.
     pub top_k: Option<u32>,
     /// System prompt to prepend to chat requests.

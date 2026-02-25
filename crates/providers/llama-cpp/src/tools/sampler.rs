@@ -16,6 +16,7 @@ pub(crate) fn build_tool_sampler(
     seed: u32,
     top_p: Option<f32>,
     top_k: Option<u32>,
+    min_p: Option<f32>,
 ) -> LlamaSampler {
     if let Some(ref grammar) = result.grammar {
         let grammar_sampler = if result.grammar_lazy {
@@ -63,13 +64,13 @@ pub(crate) fn build_tool_sampler(
         };
 
         if let Some(g) = grammar_sampler {
-            // Grammar + greedy only — no temp/top_p/top_k
+            // Grammar + greedy only — no temp/top_p/top_k/min_p
             return LlamaSampler::chain_simple([g, LlamaSampler::greedy()]);
         }
     }
 
     // No grammar or grammar creation failed — fall back to standard sampler
-    build_standard_sampler(temperature, seed, top_p, top_k)
+    build_standard_sampler(temperature, seed, top_p, top_k, min_p)
 }
 
 /// Build a standard sampler without grammar constraints.
@@ -78,6 +79,7 @@ pub(crate) fn build_standard_sampler(
     seed: u32,
     top_p: Option<f32>,
     top_k: Option<u32>,
+    min_p: Option<f32>,
 ) -> LlamaSampler {
     let mut samplers = Vec::new();
 
@@ -86,14 +88,20 @@ pub(crate) fn build_standard_sampler(
             samplers.push(LlamaSampler::temp(temp));
         }
     }
-    if let Some(top_p) = top_p {
-        samplers.push(LlamaSampler::top_p(top_p, 1));
-    }
     if let Some(top_k) = top_k {
         samplers.push(LlamaSampler::top_k(top_k as i32));
     }
+    if let Some(top_p) = top_p {
+        samplers.push(LlamaSampler::top_p(top_p, 1));
+    }
+    if let Some(min_p) = min_p {
+        samplers.push(LlamaSampler::min_p(min_p, 1));
+    }
 
-    let use_sampling = temperature.map_or(false, |t| t > 0.0) || top_p.is_some() || top_k.is_some();
+    let use_sampling = temperature.map_or(false, |t| t > 0.0)
+        || top_p.is_some()
+        || top_k.is_some()
+        || min_p.is_some();
     if use_sampling {
         samplers.push(LlamaSampler::dist(seed));
     } else {

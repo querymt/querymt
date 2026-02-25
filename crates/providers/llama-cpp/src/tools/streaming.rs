@@ -147,7 +147,7 @@ pub(crate) fn generate_streaming_with_tools(
         .map_err(|e| LLMError::ProviderError(format!("Failed to init streaming state: {}", e)))?;
 
     let seed = cfg.seed.unwrap_or(1234);
-    let mut sampler = build_tool_sampler(model, result, temperature, seed, cfg.top_p, cfg.top_k);
+    let mut sampler = build_tool_sampler(model, result, temperature, seed, cfg.top_p, cfg.top_k, cfg.min_p);
     let mut n_cur = tokens.len() as i32;
     let mut output_tokens = 0u32;
     let mut generated_text = String::new();

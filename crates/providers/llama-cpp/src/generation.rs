@@ -331,11 +331,12 @@ pub(crate) fn generate(
     // UNIFIED GENERATION PHASE (identical for both paths)
 
     let seed = cfg.seed.unwrap_or(1234);
-    let mut sampler = build_standard_sampler(temperature, seed, cfg.top_p, cfg.top_k);
+    let mut sampler = build_standard_sampler(temperature, seed, cfg.top_p, cfg.top_k, cfg.min_p);
     let allow_fallback = temperature.is_none()
         && cfg.temperature.is_none()
         && cfg.top_p.is_none()
-        && cfg.top_k.is_none();
+        && cfg.top_k.is_none()
+        && cfg.min_p.is_none();
     let mut fallback_used = false;
 
     let mut n_cur = n_past;
@@ -594,11 +595,12 @@ pub(crate) fn generate_streaming(
 
     // UNIFIED GENERATION PHASE (identical for both paths)
     let seed = cfg.seed.unwrap_or(1234);
-    let mut sampler = build_standard_sampler(temperature, seed, cfg.top_p, cfg.top_k);
+    let mut sampler = build_standard_sampler(temperature, seed, cfg.top_p, cfg.top_k, cfg.min_p);
     let allow_fallback = temperature.is_none()
         && cfg.temperature.is_none()
         && cfg.top_p.is_none()
-        && cfg.top_k.is_none();
+        && cfg.top_k.is_none()
+        && cfg.min_p.is_none();
     let mut fallback_used = false;
 
     let mut n_cur = n_past;
@@ -866,11 +868,12 @@ pub(crate) fn generate_streaming_with_thinking(
         .map_err(|e| LLMError::ProviderError(format!("Failed to init streaming state: {}", e)))?;
 
     let seed = cfg.seed.unwrap_or(1234);
-    let mut sampler = build_standard_sampler(temperature, seed, cfg.top_p, cfg.top_k);
+    let mut sampler = build_standard_sampler(temperature, seed, cfg.top_p, cfg.top_k, cfg.min_p);
     let allow_fallback = temperature.is_none()
         && cfg.temperature.is_none()
         && cfg.top_p.is_none()
-        && cfg.top_k.is_none();
+        && cfg.top_k.is_none()
+        && cfg.min_p.is_none();
     let mut fallback_used = false;
 
     let mut n_cur = n_past;
