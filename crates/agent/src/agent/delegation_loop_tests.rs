@@ -3,7 +3,7 @@ use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
 use crate::delegation::{
-    AgentActorHandle, AgentInfo, DefaultAgentRegistry, DelegationOrchestrator,
+    AgentInfo, DefaultAgentRegistry, DelegationOrchestrator,
 };
 use crate::events::StopType;
 use crate::middleware::{
@@ -11,7 +11,7 @@ use crate::middleware::{
     MiddlewareDriver,
 };
 use crate::model::{AgentMessage, MessagePart};
-use crate::send_agent::SendAgent;
+
 use crate::session::backend::StorageBackend;
 use crate::session::domain::{Delegation, DelegationStatus};
 use crate::session::provider::SessionHandle;
@@ -162,20 +162,15 @@ impl TestHarness {
             .await
             .expect("load context");
 
-        // Create delegate agents as real AgentHandles with AgentActorHandle::Local.
+        // Create delegate agents as real LocalAgentHandles.
         // Each delegate gets its own in-memory SQLite store and mock LLM provider
         // configured for the desired behavior (success/failure).
         let mut agent_registry = DefaultAgentRegistry::new();
         for id in ["agent", "agent1", "agent2"] {
             let delegate_handle = build_delegate_handle(behavior.clone()).await;
-            let actor_handle = AgentActorHandle::Local {
-                config: delegate_handle.config.clone(),
-                registry: delegate_handle.registry.clone(),
-            };
-            agent_registry.register_with_handle(
+            agent_registry.register_handle(
                 agent_info(id),
-                delegate_handle as Arc<dyn SendAgent>,
-                actor_handle,
+                delegate_handle as Arc<dyn crate::agent::handle::AgentHandle>,
             );
         }
         let agent_registry: Arc<DefaultAgentRegistry> = Arc::new(agent_registry);
@@ -196,9 +191,9 @@ impl TestHarness {
             .build(),
         );
 
-        // Create an AgentHandle for delegation (wraps its own SessionRegistry)
-        let delegator: Arc<dyn SendAgent> =
-            Arc::new(crate::agent::AgentHandle::from_config(config.clone()));
+        // Create a LocalAgentHandle for delegation (wraps its own SessionRegistry)
+        let delegator: Arc<dyn crate::agent::handle::AgentHandle> =
+            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone()));
 
         let orchestrator = Arc::new(DelegationOrchestrator::new(
             delegator,
@@ -253,7 +248,7 @@ impl TestHarness {
 
 /// Build a delegate `AgentHandle` with its own in-memory SQLite store and
 /// mock LLM provider configured for the desired behavior.
-async fn build_delegate_handle(behavior: DelegateBehavior) -> Arc<crate::agent::AgentHandle> {
+async fn build_delegate_handle(behavior: DelegateBehavior) -> Arc<crate::agent::LocalAgentHandle> {
     use crate::session::sqlite_storage::SqliteStorage;
 
     let delegate_store: Arc<dyn SessionStore> =
@@ -332,7 +327,7 @@ async fn build_delegate_handle(behavior: DelegateBehavior) -> Arc<crate::agent::
     // Leak the TempDir so its contents survive the test
     std::mem::forget(delegate_temp_dir);
 
-    Arc::new(crate::agent::AgentHandle::from_config(delegate_config))
+    Arc::new(crate::agent::LocalAgentHandle::from_config(delegate_config))
 }
 
 fn agent_info(id: &str) -> AgentInfo {

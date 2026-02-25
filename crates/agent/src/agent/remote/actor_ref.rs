@@ -239,7 +239,7 @@ impl SessionActorRef {
     /// Set session model with an optional provider node (for mesh-remote providers).
     ///
     /// Routes directly through the `SessionActorRef` so remote sessions work correctly,
-    /// unlike the old path that went through `RemoteAgentStub` and returned an error.
+    /// unlike the old path that went through a stub and returned an error.
     pub async fn set_session_model_with_node(
         &self,
         msg: messages::SetSessionModel,

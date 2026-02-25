@@ -46,7 +46,7 @@ use uuid::Uuid;
 /// State for standalone WebSocket ACP server
 #[derive(Clone)]
 struct WsServerState {
-    agent: Arc<crate::agent::AgentHandle>,
+    agent: Arc<crate::agent::LocalAgentHandle>,
     pending_permissions: PermissionMap,
     pending_elicitations: PendingElicitationMap,
     event_sources: Vec<Arc<EventFanout>>,
@@ -88,7 +88,7 @@ struct WsServerState {
 /// The server handles SIGTERM and SIGINT (Ctrl+C) for graceful shutdown.
 /// Active connections are gracefully closed before exit.
 pub async fn serve_websocket(
-    agent: Arc<crate::agent::AgentHandle>,
+    agent: Arc<crate::agent::LocalAgentHandle>,
     addr: &str,
 ) -> anyhow::Result<()> {
     log::info!("Starting standalone WebSocket ACP server on {}", addr);

@@ -1,9 +1,7 @@
-use crate::delegation::{
-    AgentActorHandle, AgentInfo, AgentRegistry, DefaultAgentRegistry, DelegationOrchestrator,
-};
+use crate::agent::handle::AgentHandle;
+use crate::delegation::{AgentInfo, AgentRegistry, DefaultAgentRegistry, DelegationOrchestrator};
 use crate::event_fanout::EventFanout;
 use crate::events::EventEnvelope;
-use crate::send_agent::SendAgent;
 
 use crate::session::backend::{StorageBackend, default_agent_db_path};
 use crate::session::error::SessionError;
@@ -16,14 +14,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 type DelegateFactory =
-    Box<dyn FnOnce(Arc<dyn SessionStore>, Arc<dyn EventJournal>) -> Arc<dyn SendAgent> + Send>;
+    Box<dyn FnOnce(Arc<dyn SessionStore>, Arc<dyn EventJournal>) -> Arc<dyn AgentHandle> + Send>;
 
 type PlannerFactory = Box<
     dyn FnOnce(
             Arc<dyn SessionStore>,
             Arc<dyn EventJournal>,
             Arc<dyn AgentRegistry + Send + Sync>,
-        ) -> Arc<dyn SendAgent>
+        ) -> Arc<dyn AgentHandle>
         + Send,
 >;
 
@@ -39,14 +37,14 @@ pub enum AgentQuorumError {
 
 pub struct DelegateAgent {
     pub info: AgentInfo,
-    pub agent: Arc<dyn SendAgent>,
+    pub agent: Arc<dyn AgentHandle>,
 }
 
 pub struct AgentQuorum {
     storage: Arc<dyn StorageBackend>,
     event_fanout: Arc<EventFanout>,
     registry: Arc<dyn AgentRegistry + Send + Sync>,
-    planner: Arc<dyn SendAgent>,
+    planner: Arc<dyn AgentHandle>,
     delegates: Vec<DelegateAgent>,
     orchestrator: Option<Arc<DelegationOrchestrator>>,
     cwd: Option<PathBuf>,
@@ -62,7 +60,7 @@ impl AgentQuorum {
         Ok(AgentQuorumBuilder::from_backend(Arc::new(backend)))
     }
 
-    pub fn planner(&self) -> Arc<dyn SendAgent> {
+    pub fn planner(&self) -> Arc<dyn AgentHandle> {
         self.planner.clone()
     }
 
@@ -70,7 +68,7 @@ impl AgentQuorum {
         &self.delegates
     }
 
-    pub fn delegate(&self, id: &str) -> Option<Arc<dyn SendAgent>> {
+    pub fn delegate(&self, id: &str) -> Option<Arc<dyn AgentHandle>> {
         self.delegates
             .iter()
             .find(|entry| entry.info.id == id)
@@ -127,7 +125,7 @@ pub struct AgentQuorumBuilder {
     ///
     /// These are inserted into the `DefaultAgentRegistry` *before* the local delegates,
     /// so local delegates with the same ID will override remote ones.
-    preregistered: Vec<(AgentInfo, Arc<dyn SendAgent>)>,
+    preregistered: Vec<(AgentInfo, Arc<dyn AgentHandle>)>,
 }
 
 impl AgentQuorumBuilder {
@@ -153,8 +151,8 @@ impl AgentQuorumBuilder {
     ///
     /// Pre-registered entries are inserted before local delegates; local delegates
     /// with the same ID will override them.
-    pub fn preregister_agent(mut self, info: AgentInfo, instance: Arc<dyn SendAgent>) -> Self {
-        self.preregistered.push((info, instance));
+    pub fn preregister_agent(mut self, info: AgentInfo, handle: Arc<dyn AgentHandle>) -> Self {
+        self.preregistered.push((info, handle));
         self
     }
 
@@ -184,7 +182,7 @@ impl AgentQuorumBuilder {
 
     pub fn add_delegate_agent<F>(mut self, info: AgentInfo, factory: F) -> Self
     where
-        F: FnOnce(Arc<dyn SessionStore>, Arc<dyn EventJournal>) -> Arc<dyn SendAgent>
+        F: FnOnce(Arc<dyn SessionStore>, Arc<dyn EventJournal>) -> Arc<dyn AgentHandle>
             + Send
             + 'static,
     {
@@ -198,7 +196,7 @@ impl AgentQuorumBuilder {
                 Arc<dyn SessionStore>,
                 Arc<dyn EventJournal>,
                 Arc<dyn AgentRegistry + Send + Sync>,
-            ) -> Arc<dyn SendAgent>
+            ) -> Arc<dyn AgentHandle>
             + Send
             + 'static,
     {
@@ -266,12 +264,12 @@ impl AgentQuorumBuilder {
 
         // Phase 7: insert pre-registered agents (e.g. remote agents) first so that
         // local delegates with the same ID can override them.
-        for (info, agent) in self.preregistered {
+        for (info, handle) in self.preregistered {
             log::debug!(
                 "AgentQuorumBuilder: pre-registering agent '{}' (remote/config-driven)",
                 info.id
             );
-            registry.register(info, agent);
+            registry.register_handle(info, handle);
         }
 
         for (info, factory) in self.delegate_factories {
@@ -280,20 +278,7 @@ impl AgentQuorumBuilder {
                 self.storage.event_journal().clone(),
             );
 
-            // Try to extract AgentActorHandle::Local by downcasting to AgentHandle
-            let actor_handle = agent
-                .as_any()
-                .downcast_ref::<crate::agent::AgentHandle>()
-                .map(|handle| AgentActorHandle::Local {
-                    config: handle.config.clone(),
-                    registry: handle.registry.clone(),
-                });
-
-            if let Some(handle) = actor_handle {
-                registry.register_with_handle(info.clone(), agent.clone(), handle);
-            } else {
-                registry.register(info.clone(), agent.clone());
-            }
+            registry.register_handle(info.clone(), agent.clone());
             delegates.push(DelegateAgent { info, agent });
         }
 
@@ -338,23 +323,66 @@ impl AgentQuorumBuilder {
                 .with_summarizer(self.delegation_summarizer.clone()),
             );
 
-            // Subscribe the orchestrator to the quorum's event fanout so it can
+            // Subscribe the orchestrator to the planner's event fanout so it can
             // react to delegation-related events (e.g. DelegationRequested).
-            let _listener_handle = orchestrator.start_listening(&self.event_fanout);
+            // Using planner.event_fanout() ensures the orchestrator subscribes to
+            // the same fanout that the planner emits on — fixing the PR #158 bug.
+            let planner_fanout = planner.event_fanout().clone();
+            let _listener_handle = orchestrator.start_listening(&planner_fanout);
 
             Some(orchestrator)
         } else {
             None
         };
 
+        // Use the planner's event fanout as the quorum's event fanout — this
+        // ensures all consumers see the same events the planner emits.
+        let event_fanout = planner.event_fanout().clone();
+
         Ok(AgentQuorum {
             storage: self.storage,
-            event_fanout: self.event_fanout,
+            event_fanout,
             registry,
             planner,
             delegates,
             orchestrator,
             cwd: self.cwd,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{AgentConfigBuilder, LocalAgentHandle};
+    use crate::test_utils::empty_plugin_registry;
+    use querymt::LLMParams;
+
+    #[tokio::test]
+    async fn quorum_exposes_planner_event_fanout() {
+        let backend = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let mut builder = AgentQuorumBuilder::from_backend(backend);
+
+        let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let plugin_registry = Arc::new(plugin_registry);
+
+        builder = builder.with_planner(move |store, event_journal, agent_registry| {
+            let config = Arc::new(
+                AgentConfigBuilder::new(
+                    plugin_registry.clone(),
+                    store,
+                    event_journal,
+                    LLMParams::new().provider("mock").model("mock-model"),
+                )
+                .with_agent_registry(agent_registry)
+                .build(),
+            );
+            Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>
+        });
+
+        let quorum = builder.build().unwrap();
+        let planner = quorum.planner();
+
+        assert!(Arc::ptr_eq(&quorum.event_fanout(), planner.event_fanout()));
     }
 }

@@ -1172,8 +1172,8 @@ mod mesh_setup_config_tests {
             meta: Some(serde_json::json!({ "remote": true, "peer": remote.peer })),
         };
 
-        // Without a stub to register (we don't have access to the private
-        // RemoteAgentStub here), just verify the AgentInfo builds correctly.
+        // Without a handle to register (we don't construct a RemoteAgentHandle
+        // here), just verify the AgentInfo builds correctly.
         assert_eq!(info.id, "unknown-agent");
         let _ = registry; // empty registry — no panics
     }

@@ -1,6 +1,6 @@
 //! Helper functions for creating test fixtures
 
-use crate::agent::AgentHandle;
+use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
 use crate::delegation::DefaultAgentRegistry;
@@ -393,7 +393,7 @@ impl DelegateTestFixture {
             LLMParams::new().provider("mock").model("mock-model"),
         );
         let delegate_config = Arc::new(delegate_builder.build());
-        let delegate = Arc::new(crate::agent::AgentHandle::from_config(delegate_config));
+        let delegate = Arc::new(crate::agent::LocalAgentHandle::from_config(delegate_config));
 
         let mut registry = DefaultAgentRegistry::new();
         registry.register(
@@ -418,7 +418,7 @@ impl DelegateTestFixture {
             LLMParams::new().provider("mock").model("mock-model"),
         )
         .with_agent_registry(Arc::new(registry));
-        let planner = Arc::new(crate::agent::AgentHandle::from_config(
+        let planner = Arc::new(crate::agent::LocalAgentHandle::from_config(
             builder.build().into(),
         ));
 

@@ -5,10 +5,10 @@
 
 use super::messages::{RoutingMode, UiAgentInfo, UiPromptBlock, UiServerMessage};
 use super::{ServerState, cursor_from_events};
-use crate::agent::AgentHandle;
+use crate::agent::LocalAgentHandle as AgentHandle;
+use crate::agent::handle::AgentHandle as AgentHandleTrait;
 use crate::events::EventEnvelope;
 use crate::index::{normalize_cwd, resolve_workspace_root};
-use crate::send_agent::SendAgent;
 use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -98,7 +98,7 @@ pub async fn prompt_for_mode(
 
 /// Send a prompt to a specific agent session.
 async fn send_prompt(
-    agent: Arc<dyn SendAgent>,
+    agent: Arc<dyn AgentHandleTrait>,
     session_id: String,
     prompt: Vec<ContentBlock>,
 ) -> Result<(), String> {
@@ -257,13 +257,13 @@ pub async fn ensure_session(
     Ok(session_id)
 }
 
-/// Get an agent instance by ID.
-pub fn agent_for_id(state: &ServerState, agent_id: &str) -> Option<Arc<dyn SendAgent>> {
+/// Get an agent handle by ID.
+pub fn agent_for_id(state: &ServerState, agent_id: &str) -> Option<Arc<dyn AgentHandleTrait>> {
     if agent_id == PRIMARY_AGENT_ID {
-        return Some(state.agent.clone());
+        return Some(state.agent.clone() as Arc<dyn AgentHandleTrait>);
     }
     let registry = state.agent.agent_registry();
-    registry.get_agent_instance(agent_id)
+    registry.get_handle(agent_id)
 }
 
 /// Get the current active agent ID for a connection.

@@ -38,7 +38,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 pub struct AcpServer {
-    agent: Arc<crate::agent::AgentHandle>,
+    agent: Arc<crate::agent::LocalAgentHandle>,
     pending_permissions: PermissionMap,
     pending_elicitations: PendingElicitationMap,
     event_sources: Vec<Arc<EventFanout>>,
@@ -47,7 +47,7 @@ pub struct AcpServer {
 
 #[derive(Clone)]
 struct ServerState {
-    agent: Arc<crate::agent::AgentHandle>,
+    agent: Arc<crate::agent::LocalAgentHandle>,
     pending_permissions: PermissionMap,
     pending_elicitations: PendingElicitationMap,
     event_sources: Vec<Arc<EventFanout>>,
@@ -55,7 +55,7 @@ struct ServerState {
 }
 
 impl AcpServer {
-    pub fn new(agent: Arc<crate::agent::AgentHandle>) -> Self {
+    pub fn new(agent: Arc<crate::agent::LocalAgentHandle>) -> Self {
         let event_sources = collect_event_sources(&agent);
         let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations = agent.pending_elicitations();

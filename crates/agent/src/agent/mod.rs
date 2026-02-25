@@ -41,7 +41,7 @@ pub use snapshots::SnapshotState;
 
 // Re-export kameo actor types
 pub use agent_config::AgentConfig;
-pub use handle::AgentHandle;
+pub use handle::{AgentHandle, LocalAgentHandle};
 pub use remote::SessionActorRef;
 pub use session_actor::SessionActor;
 pub use session_registry::SessionRegistry;

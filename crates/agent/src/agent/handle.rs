@@ -1,14 +1,18 @@
-//! AgentHandle facade — the public replacement for QueryMTAgent.
+//! AgentHandle trait and LocalAgentHandle concrete implementation.
 //!
-//! This lightweight struct bundles shared config, the kameo session registry,
-//! and connection-level mutable state. It is NOT an actor — just a convenient
-//! bundle that consumers hold instead of `Arc<QueryMTAgent>`.
+//! `AgentHandle` is the trait that all agent handles implement — both local
+//! and remote. `LocalAgentHandle` is the concrete implementation for local
+//! agents, bundling shared config, the kameo session registry, and
+//! connection-level mutable state.
 
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, ClientState};
+use crate::agent::remote::SessionActorRef;
 use crate::agent::session_registry::SessionRegistry;
 use crate::delegation::AgentRegistry;
+use crate::event_fanout::EventFanout;
+use crate::events::{AgentEventKind, EventEnvelope};
 
 use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::CompositeDriver;
@@ -33,6 +37,58 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, broadcast};
 #[cfg(feature = "remote")]
 use tokio::sync::{RwLock, Semaphore};
+
+// ══════════════════════════════════════════════════════════════════════════
+//  AgentHandle trait — the unified interface for local and remote agents
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Trait capturing the interface consumers actually use for agent interaction.
+///
+/// Both `LocalAgentHandle` (local agent) and `RemoteAgentHandle` (remote agent)
+/// implement this trait. The registry, quorum, delegation orchestrator, and UI
+/// all work with `Arc<dyn AgentHandle>`.
+#[async_trait]
+pub trait AgentHandle: Send + Sync {
+    // --- Session management ---
+
+    /// Create a new session. Returns session_id.
+    async fn new_session(&self, req: NewSessionRequest) -> std::result::Result<NewSessionResponse, Error>;
+
+    /// Send a prompt to a session.
+    async fn prompt(&self, req: PromptRequest) -> std::result::Result<PromptResponse, Error>;
+
+    /// Cancel an ongoing prompt.
+    async fn cancel(&self, notif: CancelNotification) -> std::result::Result<(), Error>;
+
+    /// Create a session for delegation. Returns both session_id and a
+    /// SessionActorRef for direct kameo messaging (planning context, history).
+    async fn create_delegation_session(
+        &self,
+        cwd: Option<String>,
+    ) -> std::result::Result<(String, SessionActorRef), Error>;
+
+    // --- Event system ---
+
+    /// Subscribe to agent events.
+    fn subscribe_events(&self) -> broadcast::Receiver<EventEnvelope>;
+
+    /// Get the event fanout.
+    fn event_fanout(&self) -> &Arc<EventFanout>;
+
+    /// Emit an event.
+    fn emit_event(&self, session_id: &str, kind: AgentEventKind);
+
+    // --- Registry access ---
+
+    /// Get the agent/delegation registry.
+    fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync>;
+
+    // --- Downcasting (transitional) ---
+
+    /// For downcasting to concrete types. Transitional — should be eliminated
+    /// over time by moving needed methods onto the trait.
+    fn as_any(&self) -> &dyn Any;
+}
 
 /// Lightweight facade replacing `Arc<QueryMTAgent>` for all consumers.
 ///
@@ -62,7 +118,7 @@ impl RemoteNodeMetadataCache {
     }
 }
 
-pub struct AgentHandle {
+pub struct LocalAgentHandle {
     pub config: Arc<AgentConfig>,
     pub registry: Arc<Mutex<SessionRegistry>>,
 
@@ -76,7 +132,7 @@ pub struct AgentHandle {
 
     /// Handle to the kameo mesh swarm, set after `bootstrap_mesh()` succeeds.
     /// `None` in local-only mode. Wrapped in a `Mutex` for interior mutability
-    /// so startup code can set it on the shared `Arc<AgentHandle>`.
+    /// so startup code can set it on the shared `Arc<LocalAgentHandle>`.
     #[cfg(feature = "remote")]
     pub mesh: StdMutex<Option<crate::agent::remote::MeshHandle>>,
 
@@ -84,10 +140,10 @@ pub struct AgentHandle {
     remote_node_cache: Arc<RemoteNodeMetadataCache>,
 }
 
-impl AgentHandle {
-    /// Construct an `AgentHandle` from a shared `AgentConfig`.
+impl LocalAgentHandle {
+    /// Construct a `LocalAgentHandle` from a shared `AgentConfig`.
     ///
-    /// This is the canonical way to create an `AgentHandle` after building
+    /// This is the canonical way to create a `LocalAgentHandle` after building
     /// an `AgentConfig` via `AgentConfigBuilder::build()`.
     pub fn from_config(config: Arc<AgentConfig>) -> Self {
         let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
@@ -154,14 +210,14 @@ impl AgentHandle {
 
     /// Gracefully shutdown the agent and all background tasks.
     pub async fn shutdown(&self) {
-        log::info!("AgentHandle: Starting graceful shutdown");
+        log::info!("LocalAgentHandle: Starting graceful shutdown");
 
         self.config.shutdown().await;
 
         // Wait briefly for cleanup
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        log::info!("AgentHandle: Shutdown complete");
+        log::info!("LocalAgentHandle: Shutdown complete");
     }
 
     /// Switch provider and model for a session (simple form)
@@ -852,12 +908,66 @@ impl AgentHandle {
     }
 }
 
-/// SendAgent implementation for AgentHandle
+// ══════════════════════════════════════════════════════════════════════════
+//  AgentHandle trait implementation for LocalAgentHandle
+// ══════════════════════════════════════════════════════════════════════════
+
+#[async_trait]
+impl AgentHandle for LocalAgentHandle {
+    async fn new_session(&self, req: NewSessionRequest) -> std::result::Result<NewSessionResponse, Error> {
+        SendAgent::new_session(self, req).await
+    }
+
+    async fn prompt(&self, req: PromptRequest) -> std::result::Result<PromptResponse, Error> {
+        SendAgent::prompt(self, req).await
+    }
+
+    async fn cancel(&self, notif: CancelNotification) -> std::result::Result<(), Error> {
+        SendAgent::cancel(self, notif).await
+    }
+
+    async fn create_delegation_session(
+        &self,
+        cwd: Option<String>,
+    ) -> std::result::Result<(String, SessionActorRef), Error> {
+        let cwd_path = cwd.map(std::path::PathBuf::from).unwrap_or_default();
+        let req = NewSessionRequest::new(cwd_path);
+        let mut reg = self.registry.lock().await;
+        let resp = reg.new_session(req).await?;
+        let session_id = resp.session_id.to_string();
+        let session_ref = reg.get(&session_id).cloned().ok_or_else(|| {
+            Error::internal_error().data("Session created but not found in registry")
+        })?;
+        Ok((session_id, session_ref))
+    }
+
+    fn subscribe_events(&self) -> broadcast::Receiver<EventEnvelope> {
+        self.config.event_sink.fanout().subscribe()
+    }
+
+    fn event_fanout(&self) -> &Arc<EventFanout> {
+        self.config.event_sink.fanout()
+    }
+
+    fn emit_event(&self, session_id: &str, kind: AgentEventKind) {
+        self.config.emit_event(session_id, kind);
+    }
+
+    fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
+        self.config.agent_registry.clone()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// SendAgent implementation for LocalAgentHandle
 ///
 /// All methods delegate to either the kameo session registry or the shared config.
 /// This replaces the `impl SendAgent for QueryMTAgent` from protocol.rs.
 #[async_trait]
-impl SendAgent for AgentHandle {
+impl SendAgent for LocalAgentHandle {
     async fn initialize(&self, req: InitializeRequest) -> Result<InitializeResponse, Error> {
         use agent_client_protocol::{
             AgentCapabilities, Implementation, McpCapabilities, PromptCapabilities, ProtocolVersion,
@@ -918,7 +1028,7 @@ impl SendAgent for AgentHandle {
     }
 
     async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse, Error> {
-        // Auth check stays on AgentHandle (connection-level concern)
+        // Auth check stays on LocalAgentHandle (connection-level concern)
         if let Ok(state) = self.client_state.lock()
             && let Some(state) = state.as_ref()
         {
@@ -1056,7 +1166,7 @@ mod tests {
     // ── Shared fixture ───────────────────────────────────────────────────────
 
     struct HandleFixture {
-        handle: AgentHandle,
+        handle: LocalAgentHandle,
         _temp_dir: tempfile::TempDir,
     }
 
@@ -1120,7 +1230,7 @@ mod tests {
             );
 
             Self {
-                handle: AgentHandle::from_config(config),
+                handle: LocalAgentHandle::from_config(config),
                 _temp_dir: temp_dir,
             }
         }
@@ -1167,7 +1277,7 @@ mod tests {
         let f = HandleFixture::new().await;
         let notif = CancelNotification::new(SessionId::from("no-such-session".to_string()));
         // Should not return an error — cancel for unknown sessions is a no-op
-        let result = f.handle.cancel(notif).await;
+        let result = SendAgent::cancel(&f.handle, notif).await;
         assert!(result.is_ok());
     }
 
@@ -1178,7 +1288,7 @@ mod tests {
             SessionId::from("no-such-session".to_string()),
             vec![],
         );
-        let result = f.handle.prompt(req).await;
+        let result = SendAgent::prompt(&f.handle, req).await;
         assert!(result.is_err());
     }
 
@@ -1344,9 +1454,9 @@ mod tests {
     #[cfg(feature = "remote")]
     #[test]
     fn test_remote_node_lookup_config_defaults() {
-        assert_eq!(AgentHandle::remote_node_info_timeout().as_millis(), 3000);
-        assert_eq!(AgentHandle::remote_node_lookup_parallelism(), 8);
-        assert_eq!(AgentHandle::remote_node_cache_ttl().as_millis(), 10000);
+        assert_eq!(LocalAgentHandle::remote_node_info_timeout().as_millis(), 3000);
+        assert_eq!(LocalAgentHandle::remote_node_lookup_parallelism(), 8);
+        assert_eq!(LocalAgentHandle::remote_node_cache_ttl().as_millis(), 10000);
     }
 
     // ── Registration contract tests ───────────────────────────────────────────

@@ -2,7 +2,7 @@
 
 use super::callbacks::EventCallbacksState;
 use super::utils::latest_assistant_message;
-use crate::agent::AgentHandle;
+use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::runner::ChatSession;
 use crate::send_agent::SendAgent;
 use agent_client_protocol::{ContentBlock, PromptRequest, TextContent};

@@ -60,7 +60,7 @@ pub type PendingElicitationMap = Arc<Mutex<HashMap<String, oneshot::Sender<Elici
 /// This allows UI/ACP responders to resolve delegate-originated elicitations
 /// while holding only a reference to the primary agent.
 pub async fn take_pending_elicitation_sender(
-    agent: &crate::agent::AgentHandle,
+    agent: &crate::agent::LocalAgentHandle,
     elicitation_id: &str,
 ) -> Option<oneshot::Sender<ElicitationResponse>> {
     if let Some(sender) = take_from_pending_map(&agent.pending_elicitations(), elicitation_id).await
@@ -72,13 +72,13 @@ pub async fn take_pending_elicitation_sender(
     let mut seen_agents = HashSet::new();
 
     for info in registry.list_agents() {
-        let Some(instance) = registry.get_agent_instance(&info.id) else {
+        let Some(handle) = registry.get_handle(&info.id) else {
             continue;
         };
 
-        let Some(delegate) = instance
+        let Some(delegate) = handle
             .as_any()
-            .downcast_ref::<crate::agent::AgentHandle>()
+            .downcast_ref::<crate::agent::LocalAgentHandle>()
         else {
             continue;
         };

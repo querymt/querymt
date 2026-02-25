@@ -7,7 +7,7 @@ use super::utils::{default_registry, latest_assistant_message, to_absolute_path}
 use crate::acp::AcpTransport;
 use crate::acp::stdio::serve_stdio;
 use crate::acp::websocket::serve_websocket;
-use crate::agent::AgentHandle;
+use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::{SnapshotPolicy, ToolPolicy};
 use crate::config::{

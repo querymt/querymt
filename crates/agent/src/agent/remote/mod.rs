@@ -37,6 +37,9 @@ pub mod cached_transport;
 pub mod provider_host;
 
 #[cfg(feature = "remote")]
+pub mod remote_handle;
+
+#[cfg(feature = "remote")]
 pub mod remote_setup;
 
 #[cfg(feature = "remote")]
@@ -99,6 +102,8 @@ pub use provider_host::{
 pub use registry_exchange::{
     GetRegistrations, NotifyRegistration, RegistrationEntry, RegistryExchangeActor,
 };
+#[cfg(feature = "remote")]
+pub use remote_handle::RemoteAgentHandle;
 #[cfg(feature = "remote")]
 pub use remote_setup::{MeshSetupResult, setup_mesh_from_config};
 #[cfg(feature = "remote")]

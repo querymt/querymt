@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 /// Build a default `ServerState` from an agent handle and storage backend.
 fn test_server_state(
-    handle: &Arc<crate::agent::AgentHandle>,
+    handle: &Arc<crate::agent::LocalAgentHandle>,
     storage: &dyn StorageBackend,
 ) -> super::ServerState {
     super::ServerState {
@@ -83,7 +83,7 @@ async fn test_undo_handler_single_agent() -> Result<()> {
     .with_snapshot_backend(snapshot_backend.clone());
 
     let config = Arc::new(builder.build());
-    let handle = Arc::new(crate::agent::AgentHandle::from_config(config.clone()));
+    let handle = Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone()));
 
     // Create session with cwd
     let session = storage
@@ -305,7 +305,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
     .with_snapshot_backend(snapshot_backend.clone());
 
     let config = Arc::new(builder.build());
-    let handle = Arc::new(crate::agent::AgentHandle::from_config(config.clone()));
+    let handle = Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone()));
 
     // Create parent and child sessions
     let parent = storage

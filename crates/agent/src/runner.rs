@@ -277,7 +277,7 @@ impl AgentRunner {
     /// The handle provides direct access to the session registry, event bus,
     /// and agent config — useful for integrating with the kameo mesh
     /// (e.g., bootstrapping `RemoteNodeManager` with `--mesh`).
-    pub fn handle(&self) -> std::sync::Arc<crate::agent::AgentHandle> {
+    pub fn handle(&self) -> std::sync::Arc<crate::agent::LocalAgentHandle> {
         match self {
             AgentRunner::Single(agent) => agent.handle(),
             AgentRunner::Multi(quorum) => quorum.handle(),
@@ -361,7 +361,7 @@ impl From<AgentRunner> for Box<dyn ChatRunner> {
 /// 1. Bootstrap the kameo libp2p swarm.
 /// 2. Register this node as a `RemoteNodeManager` in the DHT.
 /// 3. Pre-populate the agent registry with `AgentInfo` for each `[[remote_agents]]` entry,
-///    backed by a `RemoteAgentStub` that routes delegation calls via the mesh.
+///    backed by a `RemoteAgentHandle` that routes delegation calls via the mesh.
 ///
 /// # Example
 ///

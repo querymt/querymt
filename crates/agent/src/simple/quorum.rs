@@ -7,7 +7,7 @@ use super::utils::{
     to_absolute_path,
 };
 use crate::AgentQuorumBuilder;
-use crate::agent::AgentHandle;
+use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::SnapshotPolicy;
 use crate::agent::core::ToolPolicy;
@@ -17,7 +17,7 @@ use crate::delegation::AgentInfo;
 use crate::middleware::MIDDLEWARE_REGISTRY;
 use crate::quorum::AgentQuorum;
 use crate::runner::{ChatRunner, ChatSession};
-use crate::send_agent::SendAgent;
+use crate::agent::handle::AgentHandle as AgentHandleTrait;
 #[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
 use crate::session::backend::default_agent_db_path;
@@ -180,12 +180,12 @@ impl QuorumBuilder {
         // Phase 7: inject pre-registered remote agents into the quorum's delegate registry.
         if let Some(ref initial_reg) = self.initial_registry {
             for info in initial_reg.list_agents() {
-                if let Some(instance) = initial_reg.get_agent_instance(&info.id) {
+                if let Some(handle) = initial_reg.get_handle(&info.id) {
                     log::debug!(
                         "QuorumBuilder: pre-registering remote agent '{}' in quorum",
                         info.id
                     );
-                    builder = builder.preregister_agent(info, instance);
+                    builder = builder.preregister_agent(info, handle);
                 }
             }
         }
@@ -249,7 +249,7 @@ impl QuorumBuilder {
                 }
 
                 let config = Arc::new(b.build());
-                Arc::new(AgentHandle::from_config(config)) as Arc<dyn SendAgent>
+                Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>
             });
         }
 
@@ -302,7 +302,7 @@ impl QuorumBuilder {
             }
 
             let config = Arc::new(b.build());
-            Arc::new(AgentHandle::from_config(config)) as Arc<dyn SendAgent>
+            Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>
         });
 
         builder = builder
@@ -344,12 +344,12 @@ impl QuorumBuilder {
 
         let quorum = builder.build().map_err(|e| anyhow!(e.to_string()))?;
 
-        // Extract planner handle for dashboard use
+        // Extract planner handle for dashboard use — downcast to LocalAgentHandle
         let planner = quorum.planner();
         let planner_handle = planner
             .as_any()
             .downcast_ref::<AgentHandle>()
-            .ok_or_else(|| anyhow!("Planner is not an AgentHandle"))?;
+            .ok_or_else(|| anyhow!("Planner is not a LocalAgentHandle"))?;
         let planner_handle = Arc::new(AgentHandle::from_config(planner_handle.config.clone()));
 
         // Phase 7: apply mesh routing policy and store the mesh handle.
@@ -413,15 +413,15 @@ impl Quorum {
     /// The handle provides access to the session registry, event bus, and agent config.
     /// Use this when you need to interact with sessions directly or integrate with
     /// the kameo mesh (e.g., bootstrapping `RemoteNodeManager`).
-    pub fn handle(&self) -> Arc<crate::agent::AgentHandle> {
+    pub fn handle(&self) -> Arc<AgentHandle> {
         self.planner_handle.clone()
     }
 
-    pub fn planner(&self) -> Arc<dyn SendAgent> {
+    pub fn planner(&self) -> Arc<dyn AgentHandleTrait> {
         self.inner.planner()
     }
 
-    pub fn delegate(&self, id: &str) -> Option<Arc<dyn SendAgent>> {
+    pub fn delegate(&self, id: &str) -> Option<Arc<dyn AgentHandleTrait>> {
         self.inner.delegate(id)
     }
 
@@ -709,7 +709,7 @@ impl ChatRunner for Quorum {
 
 /// A session for interacting with a Quorum's planner agent
 pub struct QuorumSession {
-    planner: Arc<dyn SendAgent>,
+    planner: Arc<dyn AgentHandleTrait>,
     session_id: String,
     callbacks: Arc<EventCallbacksState>,
     event_fanout: Arc<crate::event_fanout::EventFanout>,
@@ -720,7 +720,7 @@ pub struct QuorumSession {
 
 impl QuorumSession {
     fn new(
-        planner: Arc<dyn SendAgent>,
+        planner: Arc<dyn AgentHandleTrait>,
         event_fanout: Arc<crate::event_fanout::EventFanout>,
         store: Arc<dyn SessionStore>,
         session_id: String,

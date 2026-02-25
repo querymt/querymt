@@ -461,38 +461,37 @@ pub(crate) mod fixtures {
         }
     }
 
-    // ── RemoteAgentStubFixture ────────────────────────────────────────────────
+    // ── RemoteAgentHandleFixture ─────────────────────────────────────────────
 
-    /// Fixture for `RemoteAgentStub` / `SendAgent` tests.
+    /// Fixture for `RemoteAgentHandle` / `AgentHandle` tests.
     ///
-    /// Creates a `RemoteNodeManager` (no mesh) and wraps it in a
-    /// `RemoteAgentStub` via the same construction path as
+    /// Creates a `RemoteNodeManager` and wraps it in a
+    /// `RemoteAgentHandle` via the same construction path as
     /// `setup_mesh_from_config`.  Tests only require local actor refs —
     /// no DHT lookup is exercised.
     #[allow(dead_code)]
-    pub struct RemoteAgentStubFixture {
-        pub stub: Arc<dyn crate::send_agent::SendAgent>,
+    pub struct RemoteAgentHandleFixture {
+        pub handle: Arc<crate::agent::remote::remote_handle::RemoteAgentHandle>,
         pub node_manager: ActorRef<RemoteNodeManager>,
         pub mesh: &'static MeshHandle,
         pub _tempdir: TempDir,
     }
 
     #[allow(dead_code)]
-    impl RemoteAgentStubFixture {
+    impl RemoteAgentHandleFixture {
         pub async fn new(test_id: &str) -> Self {
-            use crate::agent::remote::remote_setup::RemoteAgentStub;
-
             let mesh = get_test_mesh().await;
             let nm_fixture = MeshNodeManagerFixture::new("stub", test_id).await;
 
-            let stub = Arc::new(RemoteAgentStub::new_for_test(
-                format!("stub-{}", test_id),
-                format!("agent-{}", test_id),
-                mesh.clone(),
-            ));
+            let handle = Arc::new(
+                crate::agent::remote::remote_handle::RemoteAgentHandle::new(
+                    format!("stub-{}", test_id),
+                    mesh.clone(),
+                ),
+            );
 
             Self {
-                stub,
+                handle,
                 node_manager: nm_fixture.actor_ref,
                 mesh,
                 _tempdir: nm_fixture._tempdir,

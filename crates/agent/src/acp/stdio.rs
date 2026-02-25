@@ -208,7 +208,7 @@ fn spawn_event_bridge_forwarder(
 /// The server handles SIGTERM and SIGINT (Ctrl+C) for graceful shutdown.
 /// Current operations are allowed to complete before exit.
 #[instrument(name = "acp.serve_stdio", skip(agent))]
-pub async fn serve_stdio(agent: Arc<crate::agent::AgentHandle>) -> anyhow::Result<()> {
+pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::Result<()> {
     let local = tokio::task::LocalSet::new();
 
     local

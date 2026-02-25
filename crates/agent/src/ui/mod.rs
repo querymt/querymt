@@ -51,7 +51,7 @@ const MODEL_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// UI WebSocket server.
 pub struct UiServer {
-    agent: Arc<crate::agent::AgentHandle>,
+    agent: Arc<crate::agent::LocalAgentHandle>,
     view_store: Arc<dyn ViewStore>,
     session_store: Arc<dyn SessionStore>,
     default_cwd: Option<PathBuf>,
@@ -68,7 +68,7 @@ pub struct UiServer {
 /// Shared server state for request handlers.
 #[derive(Clone)]
 pub(crate) struct ServerState {
-    pub agent: Arc<crate::agent::AgentHandle>,
+    pub agent: Arc<crate::agent::LocalAgentHandle>,
     pub view_store: Arc<dyn ViewStore>,
     pub session_store: Arc<dyn SessionStore>,
     pub default_cwd: Option<PathBuf>,
@@ -140,7 +140,7 @@ pub(crate) fn cursor_from_events(events: &[crate::events::AgentEvent]) -> Stream
 impl UiServer {
     /// Create a new UI server.
     pub fn new(
-        agent: Arc<crate::agent::AgentHandle>,
+        agent: Arc<crate::agent::LocalAgentHandle>,
         view_store: Arc<dyn ViewStore>,
         session_store: Arc<dyn SessionStore>,
         default_cwd: Option<PathBuf>,

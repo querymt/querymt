@@ -42,7 +42,7 @@ pub mod test_utils;
 pub use error::AgentError;
 
 // Re-export main agent types for backward compatibility
-pub use agent::{AgentHandle, DelegationContextConfig, DelegationContextTiming};
+pub use agent::{AgentHandle, LocalAgentHandle, DelegationContextConfig, DelegationContextTiming};
 pub use quorum::{AgentQuorum, AgentQuorumBuilder, AgentQuorumError, DelegateAgent};
 
 // Re-export kameo actor types

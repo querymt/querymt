@@ -5,7 +5,7 @@
 //! - [`TestAgent`] — storage + AgentConfig + AgentHandle
 //! - [`TestServerState`] — agent + ServerState + connection helpers
 
-use crate::agent::AgentHandle;
+use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::session::backend::StorageBackend;
 use crate::session::sqlite_storage::SqliteStorage;

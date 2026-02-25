@@ -1,17 +1,13 @@
-use crate::agent::AgentHandle;
-use crate::agent::remote::SessionActorRef;
-use crate::agent::session_registry::SessionRegistry;
 use crate::event_fanout::EventFanout;
 use crate::event_sink::EventSink;
 use crate::events::{AgentEventKind, EventEnvelope};
 use crate::model::{AgentMessage, MessagePart};
-use crate::send_agent::SendAgent;
 use crate::session::domain::{Delegation, DelegationStatus, ForkOrigin, ForkPointType};
 use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
 use crate::verification::VerificationSpec;
 use crate::verification::service::{VerificationContext, VerificationService};
-use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
+use agent_client_protocol::{ContentBlock, PromptRequest, TextContent};
 use log::{debug, error, warn};
 use querymt::chat::ChatRole;
 use serde::{Deserialize, Serialize};
@@ -38,11 +34,11 @@ pub struct AgentInfo {
     pub meta: Option<serde_json::Value>,
 }
 
-/// AgentRegistry stores both agent metadata (AgentInfo) and agent instances (SendAgent).
+/// AgentRegistry stores both agent metadata (AgentInfo) and agent handles.
 ///
 /// This enables:
 /// 1. Listing available agents for delegation (via AgentInfo)
-/// 2. Actually delegating to agents (via SendAgent)
+/// 2. Actually delegating to agents (via AgentHandle)
 /// 3. Thread-safe access from multiple sessions
 pub trait AgentRegistry: Send + Sync {
     /// List all available agents (metadata only).
@@ -51,144 +47,11 @@ pub trait AgentRegistry: Send + Sync {
     /// Get agent metadata by ID.
     fn get_agent(&self, id: &str) -> Option<AgentInfo>;
 
-    /// Get an agent instance for delegation.
+    /// Get an agent handle for delegation.
     ///
-    /// Returns an Arc<dyn SendAgent> that can be used to interact with the agent
-    /// via the full ACP protocol lifecycle (initialize, new_session, prompt, etc.).
-    fn get_agent_instance(&self, id: &str) -> Option<Arc<dyn SendAgent>>;
-
-    /// Get a kameo-native handle for creating sessions directly.
-    ///
-    /// Returns an `AgentActorHandle` that can create `SessionActorRef`s without going
-    /// through the ACP `initialize()`/`new_session()` ceremony. Used by the delegation
-    /// orchestrator (Phase 5) for both local and remote delegation.
-    ///
-    /// Default implementation returns `None` — registries that don't support the
-    /// kameo-native path fall back to `get_agent_instance()`.
-    fn get_agent_handle(&self, id: &str) -> Option<AgentActorHandle> {
-        let _ = id;
-        None
-    }
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-//  AgentActorHandle — kameo-native session creation
-// ══════════════════════════════════════════════════════════════════════════
-
-/// Handle for creating sessions directly via kameo, bypassing the ACP protocol
-/// ceremony (`initialize()` + `new_session()`).
-///
-/// Used by the delegation orchestrator for both local and remote delegation.
-/// For local agents, it delegates to `SessionRegistry::new_session()`.
-/// For remote agents, it sends `CreateRemoteSession` to a `RemoteNodeManager`.
-#[derive(Clone)]
-pub enum AgentActorHandle {
-    /// Local agent — creates sessions via `SessionRegistry`.
-    Local {
-        config: Arc<crate::agent::agent_config::AgentConfig>,
-        registry: Arc<Mutex<SessionRegistry>>,
-    },
-    /// Remote agent — creates sessions via `RemoteNodeManager` looked up through the mesh.
-    ///
-    /// The `RemoteNodeManager` is resolved lazily via DHT lookup at session creation
-    /// time, so this variant can be constructed even when the peer is not yet reachable
-    /// (speculative registration).
-    #[cfg(feature = "remote")]
-    Remote {
-        peer_label: String,
-        mesh: crate::agent::remote::MeshHandle,
-    },
-}
-
-impl AgentActorHandle {
-    /// Create a session and return a `(session_id, SessionActorRef)`.
-    ///
-    /// For `Local`, this calls `SessionRegistry::new_session()` and extracts the ref.
-    /// For `Remote`, this sends `CreateRemoteSession` and attaches the session locally.
-    pub async fn create_session(
-        &self,
-        cwd: Option<String>,
-        parent_session_id: Option<&str>,
-    ) -> Result<(String, SessionActorRef), agent_client_protocol::Error> {
-        match self {
-            Self::Local { registry, .. } => {
-                let cwd_path = cwd.map(PathBuf::from).unwrap_or_default();
-                // Note: we intentionally do NOT pass `parent_session_id` to
-                // the delegate's `new_session()`.  The delegate's store is
-                // independent (often a different SQLite database or
-                // in-memory), so it cannot resolve the parent session's
-                // public_id to an internal row id.  The parent–child
-                // relationship is tracked in the *parent's* store via the
-                // `SessionForked` event emitted by `handle_delegation_kameo`.
-                let _ = parent_session_id;
-                let req = NewSessionRequest::new(cwd_path);
-                let mut reg = registry.lock().await;
-                let resp = reg.new_session(req).await?;
-                let session_id = resp.session_id.to_string();
-                let session_ref = reg.get(&session_id).cloned().ok_or_else(|| {
-                    agent_client_protocol::Error::internal_error()
-                        .data("Session created but not found in registry")
-                })?;
-                Ok((session_id, session_ref))
-            }
-            #[cfg(feature = "remote")]
-            Self::Remote { peer_label, mesh } => {
-                use crate::agent::remote::{CreateRemoteSession, RemoteNodeManager};
-                use crate::agent::session_actor::SessionActor;
-                use crate::error::AgentError;
-
-                // Lazy DHT lookup for the remote node manager
-                let node_manager = mesh
-                    .lookup_actor::<RemoteNodeManager>("node_manager")
-                    .await
-                    .map_err(|e| {
-                        agent_client_protocol::Error::from(AgentError::SwarmLookupFailed {
-                            key: "node_manager".to_string(),
-                            reason: e.to_string(),
-                        })
-                    })?
-                    .ok_or_else(|| {
-                        agent_client_protocol::Error::new(
-                            -32001,
-                            format!(
-                                "Remote peer '{}' not found in DHT (is the mesh running on that machine?)",
-                                peer_label
-                            ),
-                        )
-                    })?;
-
-                let resp = node_manager
-                    .ask(&CreateRemoteSession { cwd })
-                    .await
-                    .map_err(|e| {
-                        agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string()))
-                    })?;
-
-                let session_id = resp.session_id.clone();
-                let dht_name = crate::agent::remote::dht_name::session(&session_id);
-                let remote_session_ref = mesh
-                    .lookup_actor::<SessionActor>(dht_name.clone())
-                    .await
-                    .map_err(|e| {
-                        agent_client_protocol::Error::from(AgentError::SwarmLookupFailed {
-                            key: dht_name.clone(),
-                            reason: e.to_string(),
-                        })
-                    })?
-                    .ok_or_else(|| {
-                        agent_client_protocol::Error::from(AgentError::RemoteSessionNotFound {
-                            details: format!(
-                                "session {} not found in DHT under '{}'",
-                                session_id, dht_name
-                            ),
-                        })
-                    })?;
-
-                let session_ref = SessionActorRef::remote(remote_session_ref, peer_label.clone());
-                Ok((session_id, session_ref))
-            }
-        }
-    }
+    /// Returns an `Arc<dyn AgentHandle>` that can be used to interact with the agent
+    /// via session management, prompting, and event subscription.
+    fn get_handle(&self, id: &str) -> Option<Arc<dyn crate::agent::handle::AgentHandle>>;
 }
 
 /// Builder for verification specifications from structured verification_spec only.
@@ -229,7 +92,7 @@ impl DelegationOrchestratorConfig {
 }
 
 pub struct DelegationOrchestrator {
-    delegator: Arc<dyn SendAgent>,
+    delegator: Arc<dyn crate::agent::handle::AgentHandle>,
     event_sink: Arc<EventSink>,
     store: Arc<dyn SessionStore>,
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
@@ -244,7 +107,7 @@ pub struct DelegationOrchestrator {
 
 impl DelegationOrchestrator {
     pub fn new(
-        delegator: Arc<dyn SendAgent>,
+        delegator: Arc<dyn crate::agent::handle::AgentHandle>,
         event_sink: Arc<EventSink>,
         store: Arc<dyn SessionStore>,
         agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
@@ -349,10 +212,11 @@ impl DelegationOrchestrator {
                 let delegation_id = delegation.public_id.clone();
                 let cancel_token_clone = cancel_token.clone();
 
-                // Get the kameo-native handle for this agent
-                let agent_handle = self
+                // Get the agent handle for this agent — try new `get_handle` first,
+                // fall back to `get_agent_handle` for backward compatibility.
+                let target_handle: Option<Arc<dyn crate::agent::handle::AgentHandle>> = self
                     .agent_registry
-                    .get_agent_handle(&delegation.target_agent_id);
+                    .get_handle(&delegation.target_agent_id);
 
                 let handle = tokio::spawn(async move {
                     let _permit = match max_parallel.acquire_owned().await {
@@ -381,11 +245,11 @@ impl DelegationOrchestrator {
                         active_delegations: active_delegations_for_spawn,
                         delegation_summarizer,
                     };
-                    match agent_handle {
-                        Some(agent_handle) => {
-                            handle_delegation_kameo(
+                    match target_handle {
+                        Some(target) => {
+                            execute_delegation(
                                 ctx,
-                                agent_handle,
+                                target,
                                 parent_session_id,
                                 delegation,
                                 cancel_token,
@@ -393,10 +257,10 @@ impl DelegationOrchestrator {
                             .await;
                         }
                         None => {
-                            // No AgentActorHandle registered for this agent.
+                            // No AgentHandle registered for this agent.
                             let error_message = format!(
-                                "Agent '{}' is not registered with a kameo handle. \
-                                 Register it via register_with_handle() in the AgentRegistry.",
+                                "Agent '{}' is not registered with a handle. \
+                                 Register it via register_handle() in the AgentRegistry.",
                                 delegation.target_agent_id
                             );
                             fail_delegation(
@@ -481,7 +345,7 @@ impl DelegationOrchestrator {
 
 /// Context structure to group delegation handler parameters
 struct DelegationContext {
-    delegator: Arc<dyn SendAgent>,
+    delegator: Arc<dyn crate::agent::handle::AgentHandle>,
     event_sink: Arc<EventSink>,
     store: Arc<dyn SessionStore>,
     tool_registry: Arc<ToolRegistry>,
@@ -494,15 +358,14 @@ struct DelegationContext {
 //  Kameo-native delegation path (Phase 5)
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Handle delegation using the kameo-native path via `SessionActorRef`.
+/// Execute delegation using the `AgentHandle` trait.
 ///
-/// This bypasses the ACP `initialize()` + `new_session()` ceremony and creates
-/// sessions directly via `AgentActorHandle::create_session()`. History and
+/// This creates sessions via `AgentHandle::create_delegation_session()`. History and
 /// planning context are exchanged via kameo messages (`GetHistory`,
 /// `SetPlanningContext`), so this path works for both local and remote sessions.
-async fn handle_delegation_kameo(
+async fn execute_delegation(
     ctx: DelegationContext,
-    agent_handle: AgentActorHandle,
+    target: Arc<dyn crate::agent::handle::AgentHandle>,
     parent_session_id: String,
     delegation: Delegation,
     cancel_token: CancellationToken,
@@ -517,10 +380,10 @@ async fn handle_delegation_kameo(
         warn!("Failed to update delegation status to Running: {}", e);
     }
 
-    // 1. Create session directly via kameo — no ACP ceremony
+    // 1. Create session via AgentHandle trait
     let cwd_string = ctx.config.cwd.as_ref().map(|p| p.display().to_string());
-    let (child_session_id, session_ref) = match agent_handle
-        .create_session(cwd_string, Some(&parent_session_id))
+    let (child_session_id, session_ref) = match target
+        .create_delegation_session(cwd_string)
         .await
     {
         Ok(result) => result,
@@ -743,7 +606,7 @@ async fn handle_delegation_kameo(
 
 async fn fail_delegation(
     event_sink: &Arc<EventSink>,
-    delegator: &Arc<dyn SendAgent>,
+    delegator: &Arc<dyn crate::agent::handle::AgentHandle>,
     store: &Arc<dyn SessionStore>,
     config: &DelegationOrchestratorConfig,
     parent_session_id: &str,
@@ -774,18 +637,13 @@ async fn fail_delegation(
 }
 
 fn emit_delegation_event(
-    delegator: &Arc<dyn SendAgent>,
-    event_sink: &Arc<EventSink>,
+    delegator: &Arc<dyn crate::agent::handle::AgentHandle>,
+    _event_sink: &Arc<EventSink>,
     session_id: &str,
     kind: AgentEventKind,
 ) {
-    if let Some(agent_handle) = delegator.as_any().downcast_ref::<AgentHandle>() {
-        agent_handle.emit_event(session_id, kind);
-    } else {
-        // Fallback for non-AgentHandle delegators: emit as ephemeral (transport-only)
-        // since we don't have access to the agent's persistence layer here.
-        event_sink.emit_ephemeral(session_id, kind);
-    }
+    // emit_event is now on the AgentHandle trait — no downcast needed.
+    delegator.emit_event(session_id, kind);
 }
 
 fn build_delegation_prompt(delegation: &Delegation) -> String {
@@ -828,7 +686,7 @@ pub(crate) fn format_delegation_failure_message(delegation_id: &str, error: &str
 }
 
 async fn inject_results(
-    delegator: &Arc<dyn SendAgent>,
+    delegator: &Arc<dyn crate::agent::handle::AgentHandle>,
     session_id: &str,
     delegation_id: &str,
     summary: &str,
@@ -847,7 +705,7 @@ async fn inject_results(
 }
 
 async fn inject_failure(
-    delegator: &Arc<dyn SendAgent>,
+    delegator: &Arc<dyn crate::agent::handle::AgentHandle>,
     session_id: &str,
     delegation_id: &str,
     error: &str,
@@ -1026,15 +884,10 @@ fn extract_tool_args_preview(tool_name: &str, args_json: &str) -> String {
     }
 }
 
-/// Internal structure to hold both metadata and agent instance.
+/// Internal structure to hold both metadata and agent handle.
 struct AgentEntry {
     info: AgentInfo,
-    instance: Arc<dyn SendAgent>,
-    /// Optional kameo-native handle for direct session creation (Phase 5).
-    ///
-    /// When set, the delegation orchestrator uses this instead of going through
-    /// the `SendAgent` ACP ceremony. Set by `register_with_handle()`.
-    actor_handle: Option<AgentActorHandle>,
+    handle: Arc<dyn crate::agent::handle::AgentHandle>,
 }
 
 #[derive(Default)]
@@ -1047,36 +900,19 @@ impl DefaultAgentRegistry {
         Self::default()
     }
 
-    /// Register an agent with its metadata and instance.
-    pub fn register(&mut self, info: AgentInfo, instance: Arc<dyn SendAgent>) {
+    /// Register an agent with its metadata and a unified `AgentHandle`.
+    pub fn register(&mut self, info: AgentInfo, handle: Arc<dyn crate::agent::handle::AgentHandle>) {
         let id = info.id.clone();
-        self.agents.insert(
-            id,
-            AgentEntry {
-                info,
-                instance,
-                actor_handle: None,
-            },
-        );
+        self.agents.insert(id, AgentEntry { info, handle });
     }
 
-    /// Register an agent with both a `SendAgent` instance (for ACP consumers)
-    /// and a kameo-native `AgentActorHandle` (for Phase 5 delegation).
-    pub fn register_with_handle(
+    /// Alias for `register` — kept for backward compatibility during migration.
+    pub fn register_handle(
         &mut self,
         info: AgentInfo,
-        instance: Arc<dyn SendAgent>,
-        handle: AgentActorHandle,
+        handle: Arc<dyn crate::agent::handle::AgentHandle>,
     ) {
-        let id = info.id.clone();
-        self.agents.insert(
-            id,
-            AgentEntry {
-                info,
-                instance,
-                actor_handle: Some(handle),
-            },
-        );
+        self.register(info, handle);
     }
 }
 
@@ -1092,14 +928,10 @@ impl AgentRegistry for DefaultAgentRegistry {
         self.agents.get(id).map(|entry| entry.info.clone())
     }
 
-    fn get_agent_instance(&self, id: &str) -> Option<Arc<dyn SendAgent>> {
-        self.agents.get(id).map(|entry| entry.instance.clone())
-    }
-
-    fn get_agent_handle(&self, id: &str) -> Option<AgentActorHandle> {
+    fn get_handle(&self, id: &str) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
         self.agents
             .get(id)
-            .and_then(|entry| entry.actor_handle.clone())
+            .map(|entry| entry.handle.clone())
     }
 }
 
@@ -1110,100 +942,76 @@ impl AgentRegistry for DefaultAgentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::handle::AgentHandle;
+    use crate::agent::remote::SessionActorRef;
+    use crate::event_fanout::EventFanout;
+    use crate::events::EventEnvelope;
     use agent_client_protocol::{
-        AuthenticateRequest, AuthenticateResponse, CancelNotification, Error, ExtNotification,
-        ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
-        InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-        LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-        ProtocolVersion, ResumeSessionRequest, ResumeSessionResponse, SetSessionModelRequest,
-        SetSessionModelResponse,
+        CancelNotification, Error, NewSessionRequest, NewSessionResponse, PromptRequest,
+        PromptResponse,
     };
     use async_trait::async_trait;
 
-    // ── Minimal stub SendAgent ───────────────────────────────────────────────
+    // ── Minimal stub AgentHandle ──────────────────────────────────────────────
 
-    struct StubAgent {
+    struct StubAgentHandle {
         name: String,
+        event_fanout: Arc<EventFanout>,
     }
 
-    impl StubAgent {
+    impl StubAgentHandle {
         fn new(name: &str) -> Arc<Self> {
             Arc::new(Self {
                 name: name.to_string(),
+                event_fanout: Arc::new(EventFanout::new()),
             })
         }
     }
 
     #[async_trait]
-    impl SendAgent for StubAgent {
-        async fn initialize(&self, _req: InitializeRequest) -> Result<InitializeResponse, Error> {
-            Ok(InitializeResponse::new(ProtocolVersion::LATEST))
-        }
-
-        async fn authenticate(
+    impl AgentHandle for StubAgentHandle {
+        async fn new_session(
             &self,
-            _req: AuthenticateRequest,
-        ) -> Result<AuthenticateResponse, Error> {
-            Ok(AuthenticateResponse::new())
-        }
-
-        async fn new_session(&self, _req: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+            _req: NewSessionRequest,
+        ) -> std::result::Result<NewSessionResponse, Error> {
             Ok(NewSessionResponse::new(format!("{}-session", self.name)))
         }
 
-        async fn prompt(&self, _req: PromptRequest) -> Result<PromptResponse, Error> {
+        async fn prompt(
+            &self,
+            _req: PromptRequest,
+        ) -> std::result::Result<PromptResponse, Error> {
             Ok(PromptResponse::new(
                 agent_client_protocol::StopReason::EndTurn,
             ))
         }
 
-        async fn cancel(&self, _notif: CancelNotification) -> Result<(), Error> {
+        async fn cancel(
+            &self,
+            _notif: CancelNotification,
+        ) -> std::result::Result<(), Error> {
             Ok(())
         }
 
-        async fn load_session(
+        async fn create_delegation_session(
             &self,
-            _req: LoadSessionRequest,
-        ) -> Result<LoadSessionResponse, Error> {
-            Ok(LoadSessionResponse::new())
+            _cwd: Option<String>,
+        ) -> std::result::Result<(String, SessionActorRef), Error> {
+            Err(Error::internal_error().data("stub: not implemented"))
         }
 
-        async fn list_sessions(
-            &self,
-            _req: ListSessionsRequest,
-        ) -> Result<ListSessionsResponse, Error> {
-            Ok(ListSessionsResponse::new(vec![]))
+        fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EventEnvelope> {
+            self.event_fanout.subscribe()
         }
 
-        async fn fork_session(
-            &self,
-            _req: ForkSessionRequest,
-        ) -> Result<ForkSessionResponse, Error> {
-            Ok(ForkSessionResponse::new("fork"))
+        fn event_fanout(&self) -> &Arc<EventFanout> {
+            &self.event_fanout
         }
 
-        async fn resume_session(
-            &self,
-            _req: ResumeSessionRequest,
-        ) -> Result<ResumeSessionResponse, Error> {
-            Ok(ResumeSessionResponse::new())
-        }
+        fn emit_event(&self, _session_id: &str, _kind: AgentEventKind) {}
 
-        async fn set_session_model(
-            &self,
-            _req: SetSessionModelRequest,
-        ) -> Result<SetSessionModelResponse, Error> {
-            Ok(SetSessionModelResponse::new())
-        }
-
-        async fn ext_method(&self, _req: ExtRequest) -> Result<ExtResponse, Error> {
-            let raw = serde_json::value::RawValue::from_string("null".to_string())
-                .map_err(|e| Error::internal_error().data(e.to_string()))?;
-            Ok(ExtResponse::new(Arc::from(raw)))
-        }
-
-        async fn ext_notification(&self, _notif: ExtNotification) -> Result<(), Error> {
-            Ok(())
+        fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
+            Arc::new(DefaultAgentRegistry::new())
         }
 
         fn as_any(&self) -> &dyn std::any::Any {
@@ -1229,14 +1037,14 @@ mod tests {
         let registry = DefaultAgentRegistry::new();
         assert!(registry.list_agents().is_empty());
         assert!(registry.get_agent("any").is_none());
-        assert!(registry.get_agent_instance("any").is_none());
+        assert!(registry.get_handle("any").is_none());
     }
 
     #[test]
     fn test_register_and_list_agent() {
         let mut registry = DefaultAgentRegistry::new();
         let info = make_agent_info("agent-1");
-        let agent = StubAgent::new("agent-1");
+        let agent = StubAgentHandle::new("agent-1");
         registry.register(info, agent);
 
         let agents = registry.list_agents();
@@ -1248,8 +1056,8 @@ mod tests {
     #[test]
     fn test_get_agent_by_id() {
         let mut registry = DefaultAgentRegistry::new();
-        registry.register(make_agent_info("alpha"), StubAgent::new("alpha"));
-        registry.register(make_agent_info("beta"), StubAgent::new("beta"));
+        registry.register(make_agent_info("alpha"), StubAgentHandle::new("alpha"));
+        registry.register(make_agent_info("beta"), StubAgentHandle::new("beta"));
 
         let alpha = registry.get_agent("alpha");
         assert!(alpha.is_some());
@@ -1263,12 +1071,12 @@ mod tests {
     }
 
     #[test]
-    fn test_get_agent_instance() {
+    fn test_get_handle() {
         let mut registry = DefaultAgentRegistry::new();
-        registry.register(make_agent_info("worker"), StubAgent::new("worker"));
+        registry.register(make_agent_info("worker"), StubAgentHandle::new("worker"));
 
-        assert!(registry.get_agent_instance("worker").is_some());
-        assert!(registry.get_agent_instance("missing").is_none());
+        assert!(registry.get_handle("worker").is_some());
+        assert!(registry.get_handle("missing").is_none());
     }
 
     #[test]
@@ -1277,7 +1085,7 @@ mod tests {
         for i in 0..5 {
             registry.register(
                 make_agent_info(&format!("agent-{i}")),
-                StubAgent::new(&format!("agent-{i}")),
+                StubAgentHandle::new(&format!("agent-{i}")),
             );
         }
         assert_eq!(registry.list_agents().len(), 5);
@@ -1291,8 +1099,8 @@ mod tests {
         let mut info2 = make_agent_info("x");
         info2.description = "second".to_string();
 
-        registry.register(info1, StubAgent::new("x"));
-        registry.register(info2, StubAgent::new("x"));
+        registry.register(info1, StubAgentHandle::new("x"));
+        registry.register(info2, StubAgentHandle::new("x"));
 
         // Still only one entry
         assert_eq!(registry.list_agents().len(), 1);

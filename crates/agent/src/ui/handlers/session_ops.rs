@@ -15,6 +15,7 @@ use crate::index::resolve_workspace_root;
 use crate::send_agent::SendAgent;
 use agent_client_protocol::{CancelNotification, LoadSessionRequest, SessionId};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
@@ -366,7 +367,7 @@ pub async fn handle_cancel_session(state: &ServerState, conn_id: &str, tx: &mpsc
     };
     let agent = agent_id
         .and_then(|id| super::super::session::agent_for_id(state, &id))
-        .unwrap_or_else(|| state.agent.clone());
+        .unwrap_or_else(|| state.agent.clone() as Arc<dyn crate::agent::handle::AgentHandle>);
 
     let notif = CancelNotification::new(session_id);
     if let Err(e) = agent.cancel(notif).await {

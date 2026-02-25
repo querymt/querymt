@@ -15,14 +15,14 @@ use std::sync::Arc;
 struct Assets;
 
 pub struct AgentServer {
-    agent: Arc<crate::agent::AgentHandle>,
+    agent: Arc<crate::agent::LocalAgentHandle>,
     storage: Arc<dyn StorageBackend>,
     default_cwd: Option<PathBuf>,
 }
 
 impl AgentServer {
     pub fn new(
-        agent: Arc<crate::agent::AgentHandle>,
+        agent: Arc<crate::agent::LocalAgentHandle>,
         storage: Arc<dyn StorageBackend>,
         default_cwd: Option<PathBuf>,
     ) -> Self {

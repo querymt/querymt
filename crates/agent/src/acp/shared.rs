@@ -4,7 +4,7 @@
 //! ACP server implementations, including JSON-RPC types, event translation, and
 //! RPC message handling.
 
-use crate::agent::AgentHandle;
+use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::core::AgentMode;
 use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EventEnvelope};
@@ -286,14 +286,9 @@ pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<EventFanout>> 
 
     let registry = agent.agent_registry();
     for info in registry.list_agents() {
-        if let Some(instance) = registry.get_agent_instance(&info.id) {
-            // Downcast to AgentHandle to get its event fanout
-            if let Some(fanout) = instance
-                .as_any()
-                .downcast_ref::<AgentHandle>()
-                .map(|agent| agent.config.event_sink.fanout().clone())
-                && seen.insert(Arc::as_ptr(&fanout) as usize)
-            {
+        if let Some(handle) = registry.get_handle(&info.id) {
+            let fanout = handle.event_fanout().clone();
+            if seen.insert(Arc::as_ptr(&fanout) as usize) {
                 sources.push(fanout);
             }
         }
