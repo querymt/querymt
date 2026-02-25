@@ -4,12 +4,20 @@ mod context;
 mod generation;
 mod memory;
 mod messages;
+mod multimodal;
 mod provider;
 mod response;
 mod tools;
 
 pub use config::LlamaCppConfig;
 use provider::LlamaCppProvider;
+
+/// Create a provider directly from a config struct (useful for testing and embedding).
+pub fn create_provider(
+    cfg: LlamaCppConfig,
+) -> Result<Box<dyn querymt::LLMProvider>, querymt::error::LLMError> {
+    Ok(Box::new(LlamaCppProvider::new(cfg)?))
+}
 
 use querymt::LLMProvider;
 use querymt::error::LLMError;
@@ -55,6 +63,11 @@ impl LLMProviderFactory for LlamaCppFactory {
 
 #[cfg(feature = "native")]
 #[unsafe(no_mangle)]
+// SAFETY: While trait objects aren't technically FFI-safe, this is a well-established
+// plugin pattern where both sides of the FFI boundary are Rust code compiled with the
+// same ABI. The host process will cast this back to `Box<dyn LLMProviderFactory>` using
+// the same vtable layout. This pattern is used throughout the plugin system.
+#[allow(improper_ctypes_definitions)]
 pub extern "C" fn plugin_factory() -> *mut dyn LLMProviderFactory {
     Box::into_raw(Box::new(LlamaCppFactory)) as *mut _
 }

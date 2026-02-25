@@ -12,17 +12,24 @@ use serde_json::Value;
 /// Convert ChatMessages to JSON array for template application.
 /// This is the unified path for both tool-aware and basic conversations.
 ///
+/// Now handles images by injecting media markers and extracting media data.
+///
 /// # Arguments
 /// * `cfg` - The llama.cpp configuration containing system prompts
 /// * `messages` - The chat messages to convert
+/// * `media_marker` - Optional media marker string for image positions
 ///
 /// # Returns
-/// A JSON string representing the messages in OpenAI-compatible format
+/// A tuple of (json_string, media_count) where media_count tells the caller
+/// how many bitmaps to prepare in order.
 pub(crate) fn messages_to_json(
     cfg: &LlamaCppConfig,
     messages: &[ChatMessage],
-) -> Result<String, LLMError> {
+    media_marker: Option<&str>,
+) -> Result<(String, usize), LLMError> {
     let mut json_messages = Vec::new();
+    let mut media_count = 0;
+    let marker = media_marker.unwrap_or("");
 
     // Add system message if configured
     if !cfg.system.is_empty() {
@@ -121,17 +128,62 @@ pub(crate) fn messages_to_json(
                     }));
                 }
             }
+            MessageType::Image(_) => {
+                // Inject marker into content
+                let role = match msg.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                };
+
+                let content = if msg.content.is_empty() {
+                    // If no text, just the marker
+                    marker.to_string()
+                } else {
+                    // Prepend marker before text
+                    format!("{}\n{}", marker, msg.content)
+                };
+
+                json_messages.push(serde_json::json!({
+                    "role": role,
+                    "content": content
+                }));
+
+                media_count += 1;
+            }
+            MessageType::ImageURL(_) => {
+                // Same as Image for now (media extraction handles the difference)
+                let role = match msg.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                };
+
+                let content = if msg.content.is_empty() {
+                    marker.to_string()
+                } else {
+                    format!("{}\n{}", marker, msg.content)
+                };
+
+                json_messages.push(serde_json::json!({
+                    "role": role,
+                    "content": content
+                }));
+
+                media_count += 1;
+            }
             _ => {
-                return Err(LLMError::InvalidRequest(
-                    "Only text and tool-related messages are supported by llama.cpp provider (images not yet implemented)"
-                        .into(),
-                ));
+                return Err(LLMError::InvalidRequest(format!(
+                    "MessageType {:?} not yet supported",
+                    msg.message_type
+                )));
             }
         }
     }
 
-    serde_json::to_string(&json_messages)
-        .map_err(|e| LLMError::ProviderError(format!("Failed to serialize messages JSON: {}", e)))
+    let json = serde_json::to_string(&json_messages).map_err(|e| {
+        LLMError::ProviderError(format!("Failed to serialize messages JSON: {}", e))
+    })?;
+
+    Ok((json, media_count))
 }
 
 /// Convert ChatMessages to simple text prompt (fallback for models without templates).
@@ -147,15 +199,28 @@ pub(crate) fn messages_to_text(
     cfg: &LlamaCppConfig,
     messages: &[ChatMessage],
 ) -> Result<String, LLMError> {
+    // Check for images - not supported in text-only mode
+    if messages.iter().any(|m| {
+        matches!(
+            m.message_type,
+            MessageType::Image(_) | MessageType::ImageURL(_)
+        )
+    }) {
+        return Err(LLMError::InvalidRequest(
+            "Images not supported in text-only mode (model lacks chat template or multimodal support)".into(),
+        ));
+    }
+
     // Normalize tool messages to text for basic prompt building
     let normalized = normalize_messages_to_text(messages);
 
     // Validate that only text messages remain after normalization
     for msg in &normalized {
         if !matches!(msg.message_type, MessageType::Text) {
-            return Err(LLMError::InvalidRequest(
-                "Only text chat messages are supported by llama.cpp provider (images not yet implemented)".into(),
-            ));
+            return Err(LLMError::InvalidRequest(format!(
+                "MessageType {:?} not supported in text-only mode",
+                msg.message_type
+            )));
         }
     }
 
@@ -203,6 +268,7 @@ fn normalize_messages_to_text(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use querymt::chat::ImageMime;
     use querymt::{FunctionCall, ToolCall};
 
     fn test_config() -> LlamaCppConfig {
@@ -228,6 +294,11 @@ mod tests {
             flash_attention: None,
             kv_cache_type_k: None,
             kv_cache_type_v: None,
+            mmproj_path: None,
+            media_marker: None,
+            mmproj_threads: None,
+            mmproj_use_gpu: None,
+            n_ubatch: None,
         }
     }
 
@@ -251,9 +322,10 @@ mod tests {
             },
         ];
 
-        let result = messages_to_json(&cfg, &messages).unwrap();
+        let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
 
+        assert_eq!(media_count, 0);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["role"], "user");
         assert_eq!(parsed[0]["content"], "Hello");
@@ -274,9 +346,10 @@ mod tests {
             cache: None,
         }];
 
-        let result = messages_to_json(&cfg, &messages).unwrap();
+        let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
 
+        assert_eq!(media_count, 0);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["role"], "system");
         assert_eq!(parsed[0]["content"], "You are a helpful assistant");
@@ -294,9 +367,10 @@ mod tests {
             cache: None,
         }];
 
-        let result = messages_to_json(&cfg, &messages).unwrap();
+        let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
 
+        assert_eq!(media_count, 0);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["role"], "assistant");
         assert_eq!(parsed[0]["content"], "The answer is 42");
@@ -323,9 +397,10 @@ mod tests {
             cache: None,
         }];
 
-        let result = messages_to_json(&cfg, &messages).unwrap();
+        let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
 
+        assert_eq!(media_count, 0);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["role"], "assistant");
         assert_eq!(parsed[0]["content"], "Let me check the weather");
@@ -357,9 +432,10 @@ mod tests {
             cache: None,
         }];
 
-        let result = messages_to_json(&cfg, &messages).unwrap();
+        let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
 
+        assert_eq!(media_count, 0);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["role"], "tool");
         assert_eq!(parsed[0]["tool_call_id"], "call_123");
@@ -368,6 +444,46 @@ mod tests {
             parsed[0]["content"],
             r#"{"temperature": 22, "condition": "sunny"}"#
         );
+    }
+
+    #[test]
+    fn test_messages_to_json_with_image() {
+        let cfg = test_config();
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            message_type: MessageType::Image((ImageMime::JPEG, vec![0xFF, 0xD8, 0xFF])),
+            content: "What's in this image?".to_string(),
+            thinking: None,
+            cache: None,
+        }];
+
+        let (result, media_count) = messages_to_json(&cfg, &messages, Some("<image>")).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(media_count, 1);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["role"], "user");
+        assert_eq!(parsed[0]["content"], "<image>\nWhat's in this image?");
+    }
+
+    #[test]
+    fn test_messages_to_json_with_image_no_text() {
+        let cfg = test_config();
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            message_type: MessageType::Image((ImageMime::PNG, vec![0x89, 0x50, 0x4E, 0x47])),
+            content: "".to_string(),
+            thinking: None,
+            cache: None,
+        }];
+
+        let (result, media_count) = messages_to_json(&cfg, &messages, Some("<__media__>")).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(media_count, 1);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["role"], "user");
+        assert_eq!(parsed[0]["content"], "<__media__>");
     }
 
     #[test]

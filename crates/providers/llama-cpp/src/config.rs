@@ -29,6 +29,17 @@ pub struct LlamaCppConfig {
     pub n_ctx: Option<u32>,
     /// Batch size for llama.cpp decoding.
     pub n_batch: Option<u32>,
+    /// Physical batch size (micro-batch) for llama.cpp prompt processing.
+    ///
+    /// Vision models (Qwen-VL, LLaVA, etc.) use non-causal attention when
+    /// decoding image embeddings, which requires that all image tokens fit in
+    /// a single physical batch: `n_ubatch >= <image token count>`.
+    ///
+    /// When a multimodal projection (mmproj) is active and this value is not
+    /// set, the provider automatically uses `n_batch` as `n_ubatch` so that
+    /// any image that fits in the logical batch also fits in a single ubatch.
+    /// Set this explicitly only when you need fine-grained control.
+    pub n_ubatch: Option<u32>,
     /// Threads for evaluation.
     pub n_threads: Option<i32>,
     /// Threads for batch evaluation.
@@ -69,6 +80,33 @@ pub struct LlamaCppConfig {
     /// of some precision. Requires flash_attention to be "auto" or "enabled".
     /// Common values: "f16" (default), "q8_0" (half memory), "q4_0" (quarter).
     pub kv_cache_type_v: Option<String>,
+    /// Optional path to multimodal projection file (mmproj).
+    ///
+    /// If not set, the provider will attempt to use built-in vision
+    /// capabilities if the model supports it (detected via RopeType::Vision/MRope).
+    ///
+    /// Set this explicitly for models that require separate projection
+    /// files, such as Gemma 3 which uses mmproj-F16.gguf.
+    ///
+    /// Supports the same path formats as model_path (local paths and hf: prefix).
+    pub mmproj_path: Option<String>,
+    /// Media marker string for identifying image/audio positions in prompts.
+    ///
+    /// Defaults to "<__media__>" (llama.cpp default) if not set.
+    /// Some models require specific markers:
+    /// - Gemma 3: "<start_of_image>"
+    /// - Most others: "<__media__>" (default)
+    ///
+    /// The marker will be automatically inserted into messages containing images.
+    pub media_marker: Option<String>,
+    /// Number of threads for multimodal projection processing.
+    /// Defaults to n_threads if not set.
+    pub mmproj_threads: Option<i32>,
+    /// Whether to offload multimodal projection to GPU.
+    /// Defaults to `true` when `n_gpu_layers` is not set (llama.cpp defaults
+    /// to full GPU offload on Metal/CUDA) or is `> 0`, `false` when
+    /// `n_gpu_layers = 0` (CPU-only mode).
+    pub mmproj_use_gpu: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]

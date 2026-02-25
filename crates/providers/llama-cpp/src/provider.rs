@@ -6,6 +6,7 @@ use crate::generation::{
     generate_streaming, generate_streaming_with_thinking,
 };
 use crate::memory::MemoryEstimate;
+use crate::multimodal::MultimodalContext;
 use crate::response::LlamaCppChatResponse;
 use crate::tools::{
     apply_template_for_thinking, apply_template_with_tools, generate_streaming_with_tools,
@@ -33,6 +34,7 @@ use std::thread;
 pub(crate) struct LlamaCppProvider {
     pub(crate) model: Arc<LlamaModel>,
     pub(crate) cfg: LlamaCppConfig,
+    pub(crate) multimodal: Option<MultimodalContext>,
 }
 
 impl LlamaCppProvider {
@@ -91,9 +93,31 @@ impl LlamaCppProvider {
         let model = LlamaModel::load_from_file(&*backend, model_path, &params)
             .map_err(|e| LLMError::ProviderError(e.to_string()))?;
 
+        // Extract the HF repo name (if the model came from HF) so multimodal
+        // context can auto-discover the matching mmproj file from the same repo.
+        let model_hf_repo = match parse_model_ref(&cfg.model) {
+            Ok(ModelRef::Hf(hf_ref)) => Some(hf_ref.repo),
+            _ => None,
+        };
+
+        // Initialize multimodal support if available
+        let multimodal = MultimodalContext::new(&model, &cfg, model_hf_repo.as_deref())?;
+
+        if let Some(ref mm_ctx) = multimodal {
+            log::info!(
+                "Multimodal support enabled (marker: '{}', vision: {}, audio: {})",
+                mm_ctx.marker(),
+                mm_ctx.ctx.support_vision(),
+                mm_ctx.ctx.support_audio()
+            );
+        } else {
+            log::debug!("Multimodal support not available for this model");
+        }
+
         let provider = Self {
             model: Arc::new(model),
             cfg,
+            multimodal,
         };
 
         // Advisory memory warning at startup — never fails, just informs.
@@ -147,9 +171,41 @@ impl ChatProvider for LlamaCppProvider {
     ) -> Result<Box<dyn ChatResponse>, LLMError> {
         let max_tokens = self.cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
+        // Extract media from messages (empty vec if none)
+        let media = crate::multimodal::extract_media(messages);
+
+        // Validate: if images present but no multimodal support, error
+        if !media.is_empty() && self.multimodal.is_none() {
+            return Err(LLMError::InvalidRequest(
+                "Images provided but model does not support vision. \
+                 Please configure mmproj_path or use a vision-capable model."
+                    .into(),
+            ));
+        }
+
+        // Convert media to bitmaps (if multimodal context available)
+        let bitmaps = if let Some(ref mm_ctx) = self.multimodal {
+            media
+                .iter()
+                .map(|m| m.to_bitmap(&mm_ctx.ctx))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![]
+        };
+
+        // Get media marker (if multimodal)
+        let media_marker = self.multimodal.as_ref().map(|m| m.marker());
+
         // If tools are provided and not empty, use tool-aware generation
         if let Some(tools) = tools {
             if !tools.is_empty() {
+                // TODO: Tool-aware generation with images not yet implemented
+                if !bitmaps.is_empty() {
+                    return Err(LLMError::NotImplemented(
+                        "Tool calls with images not yet implemented".into(),
+                    ));
+                }
+
                 let template_result =
                     apply_template_with_tools(&self.model, &self.cfg, messages, tools)?;
                 let generated = generate_with_tools(
@@ -172,19 +228,47 @@ impl ChatProvider for LlamaCppProvider {
             }
         }
 
-        // Fall back to standard generation without tools
-        let (prompt, used_chat_template) = build_prompt(&self.model, &self.cfg, messages)?;
-        let mut generated = generate(&self.model, &self.cfg, &prompt, max_tokens, None)?;
+        // Standard generation (with or without images)
+        let (prompt, used_chat_template) =
+            build_prompt(&self.model, &self.cfg, messages, media_marker)?;
+
+        // Call unified generate() with optional multimodal params
+        let mut generated = generate(
+            &self.model,
+            &self.cfg,
+            &prompt,
+            max_tokens,
+            None,
+            self.multimodal.as_ref(),
+            &bitmaps,
+        )?;
+        // Fallback handling (existing logic)
         if generated.text.trim().is_empty() {
             if used_chat_template && self.cfg.use_chat_template.is_none() {
                 let (fallback_prompt, _) =
-                    build_prompt_with(&self.model, &self.cfg, messages, false)?;
-                generated = generate(&self.model, &self.cfg, &fallback_prompt, max_tokens, None)?;
+                    build_prompt_with(&self.model, &self.cfg, messages, false, media_marker)?;
+                generated = generate(
+                    &self.model,
+                    &self.cfg,
+                    &fallback_prompt,
+                    max_tokens,
+                    None,
+                    self.multimodal.as_ref(),
+                    &bitmaps,
+                )?;
             }
         }
         if generated.text.trim().is_empty() {
             let raw_prompt = build_raw_prompt(&self.cfg, messages)?;
-            generated = generate(&self.model, &self.cfg, &raw_prompt, max_tokens, None)?;
+            generated = generate(
+                &self.model,
+                &self.cfg,
+                &raw_prompt,
+                max_tokens,
+                None,
+                self.multimodal.as_ref(),
+                &bitmaps,
+            )?;
         }
         let (thinking, clean_text) = querymt::chat::extract_thinking(&generated.text);
         Ok(Box::new(LlamaCppChatResponse {
@@ -207,9 +291,38 @@ impl ChatProvider for LlamaCppProvider {
         let max_tokens = self.cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
         let (tx, rx) = mpsc::unbounded();
 
+        // Extract media from messages
+        let media = crate::multimodal::extract_media(messages);
+
+        // Validate multimodal support
+        if !media.is_empty() && self.multimodal.is_none() {
+            return Err(LLMError::InvalidRequest(
+                "Images provided but model does not support vision.".into(),
+            ));
+        }
+
+        // Convert media to bitmaps
+        let bitmaps = if let Some(ref mm_ctx) = self.multimodal {
+            media
+                .iter()
+                .map(|m| m.to_bitmap(&mm_ctx.ctx))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![]
+        };
+
+        let media_marker = self.multimodal.as_ref().map(|m| m.marker());
+
         // If tools are provided and not empty, use tool-aware streaming
         if let Some(tools) = tools {
             if !tools.is_empty() {
+                // TODO: Streaming tool calls with images not yet implemented
+                if !bitmaps.is_empty() {
+                    return Err(LLMError::NotImplemented(
+                        "Streaming tool calls with images not yet implemented".into(),
+                    ));
+                }
+
                 let template_result =
                     apply_template_with_tools(&self.model, &self.cfg, messages, tools)?;
                 let cfg = self.cfg.clone();
@@ -250,17 +363,22 @@ impl ChatProvider for LlamaCppProvider {
         // `StreamChunk::Thinking` rather than being emitted raw as Text.
         // Fall back to the plain `generate_streaming` path if the template
         // call fails (e.g. model does not support the oaicompat API).
-        let thinking_template = apply_template_for_thinking(&self.model, &self.cfg, messages).ok();
+        //
+        // Pass `media_marker` so that image placeholder tokens are injected
+        // into the prompt before the OAI-compat template is applied.
+        let thinking_template =
+            apply_template_for_thinking(&self.model, &self.cfg, messages, media_marker).ok();
         let prompts = if thinking_template.is_none() {
-            build_prompt_candidates(&self.model, &self.cfg, messages)?
+            build_prompt_candidates(&self.model, &self.cfg, messages, media_marker)?
         } else {
             vec![]
         };
         let cfg = self.cfg.clone();
         let model = Arc::clone(&self.model);
+        let multimodal = self.multimodal.clone();
 
         thread::spawn(move || {
-            // OAI-compat thinking path
+            // OAI-compat thinking path — now supports multimodal input.
             if let Some(template_result) = thinking_template {
                 match generate_streaming_with_thinking(
                     &model,
@@ -269,6 +387,8 @@ impl ChatProvider for LlamaCppProvider {
                     max_tokens,
                     None,
                     &tx,
+                    multimodal.as_ref(),
+                    &bitmaps,
                 ) {
                     Ok(usage) => {
                         let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
@@ -283,10 +403,19 @@ impl ChatProvider for LlamaCppProvider {
                 return;
             }
 
-            // Fallback: raw token streaming (no thinking extraction)
+            // Standard streaming (with or without images)
             let mut final_usage = None;
             for (idx, prompt) in prompts.iter().enumerate() {
-                match generate_streaming(&model, &cfg, prompt, max_tokens, None, &tx) {
+                match generate_streaming(
+                    &model,
+                    &cfg,
+                    prompt,
+                    max_tokens,
+                    None,
+                    &tx,
+                    multimodal.as_ref(),
+                    &bitmaps,
+                ) {
                     Ok(usage) => {
                         let should_fallback = usage.output_tokens == 0 && idx + 1 < prompts.len();
                         if should_fallback {
@@ -327,12 +456,15 @@ impl CompletionProvider for LlamaCppProvider {
             .max_tokens
             .or(self.cfg.max_tokens)
             .unwrap_or(DEFAULT_MAX_TOKENS);
+        // Completions are text-only, no multimodal support
         let generated = generate(
             &self.model,
             &self.cfg,
             &req.prompt,
             max_tokens,
             req.temperature,
+            None,
+            &[],
         )?;
         Ok(CompletionResponse {
             text: generated.text,

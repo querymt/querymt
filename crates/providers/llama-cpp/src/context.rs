@@ -31,6 +31,40 @@ pub(crate) fn resolve_n_batch(cfg: &LlamaCppConfig, n_ctx: u32) -> u32 {
         .unwrap_or_else(|| n_ctx.min(DEFAULT_N_BATCH_CAP))
 }
 
+/// Resolve the effective `n_ubatch` (physical micro-batch) value.
+///
+/// `n_ubatch` is the physical batch size used inside a single `llama_decode`
+/// call.  For text-only models the default of 512 is fine because tokens are
+/// processed causally and can be split across multiple ubatches.
+///
+/// Vision models (Qwen-VL, LLaVA, etc.) switch to **non-causal** attention
+/// while decoding image embeddings.  In non-causal mode llama.cpp requires
+/// that *all* image tokens fit inside a single ubatch.  A screenshot at
+/// typical resolution produces ~3 000 tokens for Qwen3-VL, far exceeding the
+/// 512 default.
+///
+/// Strategy (first match wins):
+/// 1. Explicit `n_ubatch` from config.
+/// 2. If a multimodal projection is active: use `n_batch`, guaranteeing that
+///    any image that fits in the logical batch also fits in one ubatch.
+/// 3. Default (llama.cpp built-in): 512.
+pub(crate) fn resolve_n_ubatch(cfg: &LlamaCppConfig, n_batch: u32, has_multimodal: bool) -> u32 {
+    if let Some(n_ubatch) = cfg.n_ubatch {
+        return n_ubatch;
+    }
+    if has_multimodal {
+        // Match n_batch so non-causal image decoding never hits the
+        // "n_ubatch >= n_tokens" assertion in llama_decode.
+        n_batch
+    } else {
+        // Let llama.cpp use its own default (512).  We signal this by not
+        // calling with_n_ubatch(), but returning 0 here lets callers decide
+        // whether to call with_n_ubatch() at all.  Use the llama.cpp default
+        // explicitly so the value is visible in logs.
+        512
+    }
+}
+
 /// Apply flash attention and KV cache quantization settings to context params.
 ///
 /// This is called from all context creation sites to ensure consistent behavior.

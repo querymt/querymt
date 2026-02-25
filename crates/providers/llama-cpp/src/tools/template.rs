@@ -44,12 +44,18 @@ pub(crate) fn convert_tools_to_json(tools: &[Tool]) -> Result<String, LLMError> 
 
 /// Build OpenAI-compatible JSON messages from ChatMessage array for tool-aware conversations.
 /// This now delegates to the unified messages module.
+///
+/// `media_marker` should be `Some(marker)` when the caller has a multimodal context
+/// and needs image placeholder tokens injected into the prompt text.  Pass `None` for
+/// tool-call paths where image support is not yet implemented.
 pub(crate) fn build_messages_json_for_tools(
     cfg: &LlamaCppConfig,
     messages: &[ChatMessage],
+    media_marker: Option<&str>,
 ) -> Result<String, LLMError> {
     // Use the unified message conversion function
-    messages::messages_to_json(cfg, messages)
+    let (json, _media_count) = messages::messages_to_json(cfg, messages, media_marker)?;
+    Ok(json)
 }
 
 /// Apply chat template without tools, but with thinking support enabled.
@@ -60,12 +66,17 @@ pub(crate) fn build_messages_json_for_tools(
 /// The caller can then use `result.streaming_state_oaicompat()` to get a state machine
 /// that routes `reasoning_content` deltas to `StreamChunk::Thinking` and `content`
 /// deltas to `StreamChunk::Text`, without any manual tag parsing.
+///
+/// `media_marker` must be `Some(marker)` when the conversation contains image messages
+/// so that placeholder tokens (e.g. `<__media__>`) are injected at the correct positions
+/// in the prompt text before MTMD tokenization.
 pub(crate) fn apply_template_for_thinking(
     model: &Arc<LlamaModel>,
     cfg: &LlamaCppConfig,
     messages: &[ChatMessage],
+    media_marker: Option<&str>,
 ) -> Result<ChatTemplateResult, LLMError> {
-    let messages_json = build_messages_json_for_tools(cfg, messages)?;
+    let messages_json = build_messages_json_for_tools(cfg, messages, media_marker)?;
 
     log::debug!(
         "Applying chat template for thinking with {} messages",
@@ -115,7 +126,8 @@ pub(crate) fn apply_template_with_tools(
     tools: &[Tool],
 ) -> Result<ChatTemplateResult, LLMError> {
     let tools_json = convert_tools_to_json(tools)?;
-    let messages_json = build_messages_json_for_tools(cfg, messages)?;
+    // Tools + images are not yet implemented, so pass None for the media marker.
+    let messages_json = build_messages_json_for_tools(cfg, messages, None)?;
 
     log::debug!(
         "Applying chat template with {} messages and {} tools",

@@ -37,6 +37,11 @@ fn test_config_serialization() {
         flash_attention: None,
         kv_cache_type_k: Some("q4_0".to_string()),
         kv_cache_type_v: Some("q4_0".to_string()),
+        mmproj_path: Some("/path/to/mmproj.gguf".to_string()),
+        media_marker: Some("<__media__>".to_string()),
+        mmproj_threads: Some(4),
+        mmproj_use_gpu: Some(true),
+        n_ubatch: Some(4096),
     };
 
     let json = serde_json::to_string(&config).expect("Failed to serialize config");
@@ -46,6 +51,14 @@ fn test_config_serialization() {
     assert_eq!(deserialized.model, "/path/to/model.gguf");
     assert_eq!(deserialized.max_tokens, Some(512));
     assert_eq!(deserialized.kv_cache_type_k, Some("q4_0".to_string()));
+    assert_eq!(
+        deserialized.mmproj_path,
+        Some("/path/to/mmproj.gguf".to_string())
+    );
+    assert_eq!(deserialized.media_marker, Some("<__media__>".to_string()));
+    assert_eq!(deserialized.mmproj_threads, Some(4));
+    assert_eq!(deserialized.mmproj_use_gpu, Some(true));
+    assert_eq!(deserialized.n_ubatch, Some(4096));
 }
 
 #[test]
