@@ -1,5 +1,6 @@
 use hf_hub::api::sync::ApiBuilder as SyncApiBuilder;
 use hf_hub::api::tokio::ApiBuilder as AsyncApiBuilder;
+use log::debug;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -304,9 +305,19 @@ pub async fn download_hf_gguf_with_progress(
         status: DownloadStatus::Starting,
     });
 
+    // 4 parallel streams saturate typical home/office bandwidth (~1 Gbps) without
+    // pinning all CPU cores. The default .high() uses num_cpus (14 on this machine)
+    // which saturates rustls TLS decryption before saturating the NIC.
+    // 100 MB chunks reduce HTTP range requests from ~800 to ~80 for an 8 GB model.
+    const CHUNK_SIZE: usize = 100_000_000;
+    debug!(
+        "download_hf_gguf_with_progress: building async API — max_files={} chunk_size={} for {}/{}",
+        FAST_DOWNLOAD_WORKER_THREADS, CHUNK_SIZE, model.repo, model.file,
+    );
     let api = AsyncApiBuilder::new()
         .with_progress(true)
-        .high()
+        .with_max_files(FAST_DOWNLOAD_WORKER_THREADS)
+        .with_chunk_size(Some(CHUNK_SIZE))
         .build()
         .map_err(|e| ModelRefError::Download(e.to_string()))?;
 
@@ -356,6 +367,10 @@ pub async fn download_hf_gguf_with_progress(
 }
 
 pub fn resolve_hf_model_sync(model: &HfModelRef) -> Result<PathBuf, ModelRefError> {
+    debug!(
+        "resolve_hf_model_sync: single-stream ureq download for {}/{}",
+        model.repo, model.file,
+    );
     let api = SyncApiBuilder::new()
         .with_progress(true)
         .build()
@@ -365,17 +380,117 @@ pub fn resolve_hf_model_sync(model: &HfModelRef) -> Result<PathBuf, ModelRefErro
         .map_err(|e| ModelRefError::Download(e.to_string()))
 }
 
+/// Number of parallel download streams used by the fast downloader.
+///
+/// Each stream runs TLS decryption independently, so this directly trades
+/// CPU cores for download throughput.
+const FAST_DOWNLOAD_WORKER_THREADS: usize = 8;
+
 pub fn resolve_hf_model_fast(model: &HfModelRef) -> Result<PathBuf, ModelRefError> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let model = model.clone();
-        return tokio::task::block_in_place(|| {
-            handle.block_on(async move {
-                download_hf_gguf_with_progress(&model, Box::new(|_| {})).await
+    // Try the host's runtime first. This works when called from a regular
+    // async binary, but fails when called from a cdylib plugin: each dylib
+    // gets its own copy of thread-local storage, so the host's tokio runtime
+    // handle is invisible here and try_current() returns Err.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            debug!(
+                "resolve_hf_model_fast: host tokio runtime found — using block_in_place path \
+                 ({}:{}, kind={:?})",
+                model.repo,
+                model.file,
+                handle.runtime_flavor(),
+            );
+            let model = model.clone();
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    download_hf_gguf_with_progress(&model, Box::new(|_| {})).await
+                })
             })
-        });
+        }
+        Err(e) => {
+            debug!(
+                "resolve_hf_model_fast: no host tokio runtime ({}) — spawning dedicated \
+                 {}-worker runtime for {}/{}",
+                e, FAST_DOWNLOAD_WORKER_THREADS, model.repo, model.file,
+            );
+            // Dylib case: spin up a dedicated multi-thread runtime so parallel chunk
+            // downloads actually run on separate threads (the sync fallback is
+            // single-threaded and pegs one CPU core on TLS decryption).
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(FAST_DOWNLOAD_WORKER_THREADS)
+                .enable_all()
+                .build()
+                .map_err(|e| ModelRefError::Download(e.to_string()))?;
+
+            rt.block_on(async { download_hf_gguf_with_progress(model, Box::new(|_| {})).await })
+        }
+    }
+}
+
+/// Preferred mmproj filenames in priority order (best quality/size tradeoff first).
+const MMPROJ_PREFERENCES: &[&str] = &["mmproj-F16.gguf", "mmproj-BF16.gguf", "mmproj-F32.gguf"];
+
+/// Discover mmproj GGUF files in a Hugging Face repo by querying the repo's file listing.
+///
+/// Queries the HF API for the repo's siblings and looks for filenames matching
+/// `mmproj*.gguf` (case-insensitive). Returns the best-matched filename according
+/// to [`MMPROJ_PREFERENCES`], or the first discovered file if none of the preferred
+/// names match.
+///
+/// Returns `Ok(None)` if no mmproj files are found or the repo cannot be queried.
+/// Errors are suppressed and returned as `Ok(None)` so that callers can treat
+/// auto-discovery as a best-effort operation.
+pub fn discover_mmproj_in_hf_repo(repo: &str) -> Result<Option<String>, ModelRefError> {
+    let api = SyncApiBuilder::new()
+        .build()
+        .map_err(|e| ModelRefError::Download(e.to_string()))?;
+
+    let info = api
+        .model(repo.to_string())
+        .info()
+        .map_err(|e| ModelRefError::Download(e.to_string()))?;
+
+    let mmproj_files: Vec<String> = info
+        .siblings
+        .iter()
+        .map(|s| s.rfilename.as_str())
+        .filter(|f| {
+            // Grab just the filename portion (repos may have subdirectories)
+            let name = f.rsplit('/').next().unwrap_or(f).to_lowercase();
+            name.starts_with("mmproj") && name.ends_with(".gguf")
+        })
+        .map(|f| f.to_string())
+        .collect();
+
+    if mmproj_files.is_empty() {
+        return Ok(None);
     }
 
-    resolve_hf_model_sync(model)
+    // Pick the best match: check preferences first, then fall back to the first found
+    for pref in MMPROJ_PREFERENCES {
+        if let Some(f) = mmproj_files
+            .iter()
+            .find(|f| f.rsplit('/').next().unwrap_or(f.as_str()) == *pref)
+        {
+            return Ok(Some(f.clone()));
+        }
+    }
+
+    Ok(Some(mmproj_files[0].clone()))
+}
+
+/// Download (or return cached path) for an mmproj file from an HF repo.
+/// Uses the sync downloader; respects `fast_download` via the `fast` flag.
+pub fn resolve_hf_mmproj(repo: &str, filename: &str, fast: bool) -> Result<PathBuf, ModelRefError> {
+    let model_ref = HfModelRef {
+        repo: repo.to_string(),
+        file: filename.to_string(),
+    };
+    if fast {
+        resolve_hf_model_fast(&model_ref)
+    } else {
+        resolve_hf_model_sync(&model_ref)
+    }
 }
 
 #[cfg(test)]
@@ -466,5 +581,25 @@ mod tests {
         let unknown = parse_gguf_metadata("model.gguf");
         assert_eq!(unknown.family, "model");
         assert_eq!(unknown.quant, "unknown");
+    }
+
+    /// Requires network access. Run with:
+    /// `cargo test -p querymt-provider-common -- --ignored discover_mmproj`
+    #[test]
+    #[ignore]
+    fn discover_mmproj_qwen3vl() {
+        let result = discover_mmproj_in_hf_repo("unsloth/Qwen3-VL-8B-Instruct-GGUF");
+        assert!(result.is_ok(), "API call failed: {:?}", result.err());
+        let file = result.unwrap();
+        assert_eq!(file.as_deref(), Some("mmproj-F16.gguf"));
+    }
+
+    #[test]
+    #[ignore]
+    fn discover_mmproj_text_only_repo() {
+        // A text-only repo should return None
+        let result = discover_mmproj_in_hf_repo("bartowski/Qwen2.5-Coder-32B-Instruct-GGUF");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }

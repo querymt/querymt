@@ -5675,6 +5675,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a588916bfdfd92e71cacef98a63d9b1f0d74d6599980d11894290e7ddefffcf7"
+
+[[package]]
 name = "inotify"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9513,8 +9519,11 @@ name = "qmt-llama-cpp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clap",
  "encoding_rs",
+ "env_logger",
  "futures",
+ "infer 0.19.0",
  "llama-cpp-2",
  "log",
  "querymt",
@@ -9719,7 +9728,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "indexmap 2.13.0",
- "infer",
+ "infer 0.16.0",
  "kameo",
  "libp2p",
  "log",
@@ -9810,6 +9819,7 @@ version = "0.0.0"
 dependencies = [
  "dirs",
  "hf-hub 0.5.0",
+ "log",
  "tokio",
 ]
 
