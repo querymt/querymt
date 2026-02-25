@@ -2464,7 +2464,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -9443,7 +9443,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "url",
@@ -9459,7 +9459,7 @@ dependencies = [
  "querymt",
  "querymt-extism-macros",
  "regex",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "url",
@@ -9476,7 +9476,7 @@ dependencies = [
  "log",
  "querymt",
  "querymt-extism-macros",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "url",
@@ -9491,7 +9491,7 @@ dependencies = [
  "http",
  "querymt",
  "querymt-extism-macros",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "url",
@@ -9508,7 +9508,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "url",
@@ -9528,7 +9528,7 @@ dependencies = [
  "log",
  "querymt",
  "querymt-provider-common",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "tokio",
@@ -9545,7 +9545,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "url",
@@ -9562,7 +9562,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "url",
@@ -9579,7 +9579,7 @@ dependencies = [
  "mistralrs",
  "querymt",
  "querymt-provider-common",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "tokio",
@@ -9596,7 +9596,7 @@ dependencies = [
  "http",
  "querymt",
  "querymt-extism-macros",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "url",
@@ -9612,7 +9612,7 @@ dependencies = [
  "http",
  "querymt",
  "querymt-extism-macros",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "url",
@@ -9628,7 +9628,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "url",
@@ -9645,7 +9645,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "url",
@@ -9684,7 +9684,7 @@ dependencies = [
  "once_cell",
  "reqwest 0.12.28",
  "rmcp",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde-value",
  "serde_json",
@@ -10938,18 +10938,6 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
-dependencies = [
- "dyn-clone",
- "schemars_derive 0.8.22",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "schemars"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cd191f9397d57d581cddd31014772520aa448f65ef991055d7f61582c65165f"
@@ -10969,21 +10957,9 @@ dependencies = [
  "chrono",
  "dyn-clone",
  "ref-cast",
- "schemars_derive 1.2.1",
+ "schemars_derive",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "schemars_derive"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde_derive_internals",
- "syn 2.0.117",
 ]
 
 [[package]]
