@@ -232,6 +232,21 @@ impl MeshHandle {
             .contains(peer_id)
     }
 
+    /// Inject a peer directly into the `known_peers` set, bypassing mDNS.
+    ///
+    /// **Test-only.** In production `known_peers` is populated exclusively by
+    /// mDNS `Discovered` events (which require real network time).  This helper
+    /// lets integration tests simulate "mDNS has fired" so that
+    /// `resolve_peer_node_id` will iterate the injected peer without waiting
+    /// for the actual mDNS timer.
+    #[cfg(test)]
+    pub fn inject_known_peer_for_test(&self, peer_id: PeerId) {
+        self.known_peers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer_id);
+    }
+
     /// Subscribe to peer lifecycle events (discovered / expired).
     ///
     /// Each call returns an independent receiver. Lagged receivers receive
@@ -350,6 +365,89 @@ impl MeshHandle {
         A: kameo::Actor + kameo::remote::RemoteActor,
     {
         kameo::actor::RemoteActorRef::<A>::lookup_all(name.into())
+    }
+
+    /// Resolve a human-readable peer name (from `[[mesh.peers]]`) to a `NodeId`.
+    ///
+    /// Iterates known (alive) peers, looks up each peer's `RemoteNodeManager`
+    /// via the per-peer DHT name (`node_manager::peer::{peer_id}`), and calls
+    /// `GetNodeInfo` to check whether the hostname matches `peer_name`.
+    ///
+    /// Returns `None` if no matching peer is found after checking all known peers.
+    ///
+    /// # Why per-peer DHT names?
+    ///
+    /// The per-peer name (`node_manager::peer::{peer_id}`) bypasses the global
+    /// Kademlia `GET_PROVIDERS` lookup that fails in 2-node meshes. It's the same
+    /// mechanism used by `MeshChatProvider` and the Model Picker, which is why
+    /// this path is reliable even immediately after `mDNS` discovery.
+    pub async fn resolve_peer_node_id(
+        &self,
+        peer_name: &str,
+    ) -> Option<crate::agent::remote::NodeId> {
+        use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
+
+        let peers: Vec<PeerId> = self
+            .known_peers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
+
+        for peer_id in peers {
+            let per_peer_name =
+                crate::agent::remote::dht_name::node_manager_for_peer(&peer_id.to_string());
+            let node_manager = match self.lookup_actor::<RemoteNodeManager>(&per_peer_name).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    log::debug!(
+                        "resolve_peer_node_id: no RemoteNodeManager under '{}'",
+                        per_peer_name
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    log::debug!(
+                        "resolve_peer_node_id: lookup error for '{}': {}",
+                        per_peer_name,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let node_info = match node_manager.ask::<GetNodeInfo>(&GetNodeInfo).await {
+                Ok(info) => info,
+                Err(e) => {
+                    log::debug!(
+                        "resolve_peer_node_id: GetNodeInfo failed for peer {}: {}",
+                        peer_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            if node_info.hostname == peer_name {
+                log::info!(
+                    "resolve_peer_node_id: resolved '{}' → node_id={}",
+                    peer_name,
+                    node_info.node_id
+                );
+                return Some(node_info.node_id);
+            }
+        }
+
+        log::debug!(
+            "resolve_peer_node_id: no peer with hostname '{}' found in {} known peers",
+            peer_name,
+            self.known_peers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+        );
+        None
     }
 }
 
@@ -591,4 +689,41 @@ fn resolve_local_hostname() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// `resolve_peer_node_id` with no known peers returns `None`.
+    ///
+    /// This is a pure unit test: no DHT or network required. The `known_peers`
+    /// set is empty so the iteration body never executes and the method must
+    /// return `None` without panicking.
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn resolve_peer_node_id_no_known_peers_returns_none() {
+        use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
+
+        let mesh = get_test_mesh().await.clone();
+        // known_peers is empty right after bootstrap (no peers discovered yet)
+        let result = mesh.resolve_peer_node_id("gpu-node").await;
+        assert!(
+            result.is_none(),
+            "expected None when no peers are known, got {:?}",
+            result
+        );
+    }
+
+    /// `resolve_peer_node_id` returns `None` for an unknown peer name even
+    /// when the mesh has known peers. This test uses the test mesh (single node)
+    /// which has no remote peers with any hostname.
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn resolve_peer_node_id_unknown_name_returns_none() {
+        use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
+
+        let mesh = get_test_mesh().await.clone();
+        let result = mesh.resolve_peer_node_id("nonexistent-peer-xyz").await;
+        assert!(result.is_none());
+    }
 }

@@ -126,6 +126,8 @@ pub struct AgentQuorumBuilder {
     /// These are inserted into the `DefaultAgentRegistry` *before* the local delegates,
     /// so local delegates with the same ID will override remote ones.
     preregistered: Vec<(AgentInfo, Arc<dyn AgentHandle>)>,
+    /// Optional routing snapshot handle for per-agent routing decisions.
+    routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
 }
 
 impl AgentQuorumBuilder {
@@ -144,6 +146,7 @@ impl AgentQuorumBuilder {
             max_parallel_delegations: NonZeroUsize::new(5).expect("non-zero default"),
             delegation_summarizer: None,
             preregistered: Vec::new(),
+            routing_snapshot: None,
         }
     }
 
@@ -172,6 +175,7 @@ impl AgentQuorumBuilder {
             max_parallel_delegations: NonZeroUsize::new(5).expect("non-zero default"),
             delegation_summarizer: None,
             preregistered: Vec::new(),
+            routing_snapshot: None,
         }
     }
 
@@ -244,6 +248,18 @@ impl AgentQuorumBuilder {
         self
     }
 
+    /// Set the routing snapshot handle for per-agent routing decisions.
+    ///
+    /// The snapshot is passed to the `DelegationOrchestrator`, which reads it
+    /// before creating each delegation session to apply routing policy.
+    pub fn with_routing_snapshot(
+        mut self,
+        snapshot: crate::agent::remote::RoutingSnapshotHandle,
+    ) -> Self {
+        self.routing_snapshot = Some(snapshot);
+        self
+    }
+
     pub fn build(self) -> Result<AgentQuorum, AgentQuorumError> {
         // Capability validation
         let mut all_required_caps = std::collections::HashSet::new();
@@ -306,22 +322,24 @@ impl AgentQuorumBuilder {
                 self.event_fanout.clone(),
             ));
 
-            let orchestrator = Arc::new(
-                DelegationOrchestrator::new(
-                    planner.clone(),
-                    delegation_sink,
-                    self.storage.session_store().clone(),
-                    registry.clone(),
-                    tool_registry,
-                    self.cwd.clone(),
-                )
-                .with_verification(self.verification_enabled)
-                .with_wait_policy(self.wait_policy.clone())
-                .with_wait_timeout_secs(self.wait_timeout_secs)
-                .with_cancel_grace_secs(self.cancel_grace_secs)
-                .with_max_parallel_delegations(self.max_parallel_delegations)
-                .with_summarizer(self.delegation_summarizer.clone()),
-            );
+            let mut orch = DelegationOrchestrator::new(
+                planner.clone(),
+                delegation_sink,
+                self.storage.session_store().clone(),
+                registry.clone(),
+                tool_registry,
+                self.cwd.clone(),
+            )
+            .with_verification(self.verification_enabled)
+            .with_wait_policy(self.wait_policy.clone())
+            .with_wait_timeout_secs(self.wait_timeout_secs)
+            .with_cancel_grace_secs(self.cancel_grace_secs)
+            .with_max_parallel_delegations(self.max_parallel_delegations)
+            .with_summarizer(self.delegation_summarizer.clone());
+            if let Some(snap) = self.routing_snapshot {
+                orch = orch.with_routing_snapshot(snap);
+            }
+            let orchestrator = Arc::new(orch);
 
             // Subscribe the orchestrator to the planner's event fanout so it can
             // react to delegation-related events (e.g. DelegationRequested).

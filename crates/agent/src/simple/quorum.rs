@@ -61,6 +61,14 @@ pub struct QuorumBuilder {
     /// `provider_node_id` is not explicitly set.
     #[cfg(feature = "remote")]
     pub(super) mesh_auto_fallback: bool,
+
+    /// Delegates that have a `peer` set in their config: `(delegate_id, peer_name)`.
+    ///
+    /// After `build()`, these are resolved to a `NodeId` via `MeshHandle::resolve_peer_node_id`
+    /// and the resulting node ID is stored on the delegate's `AgentHandle` so that
+    /// `create_delegation_session` routes LLM calls to the peer.
+    #[cfg(feature = "remote")]
+    pub(super) peer_delegates: Vec<(String, String)>,
 }
 
 impl Default for QuorumBuilder {
@@ -89,6 +97,8 @@ impl QuorumBuilder {
             mesh: None,
             #[cfg(feature = "remote")]
             mesh_auto_fallback: false,
+            #[cfg(feature = "remote")]
+            peer_delegates: Vec::new(),
         }
     }
 
@@ -253,6 +263,81 @@ impl QuorumBuilder {
             });
         }
 
+        // Create RoutingActor + snapshot handle if there are peer delegates.
+        // The snapshot is shared with the orchestrator (via AgentQuorumBuilder)
+        // for lock-free reads at delegation time. Created before the planner
+        // factory so the planner can register routing tools.
+        #[cfg(feature = "remote")]
+        let routing_actor_ref = if !self.peer_delegates.is_empty() {
+            use crate::agent::remote::routing::{
+                ResolvePeer, RouteTarget, RoutingActor, SetProviderTarget,
+                new_routing_snapshot_handle,
+            };
+            use kameo::actor::Spawn;
+
+            let snapshot_handle = new_routing_snapshot_handle();
+            let actor = RoutingActor::new(snapshot_handle.clone());
+            let actor_ref = RoutingActor::spawn(actor);
+
+            // Populate routes for each peer delegate.
+            for (delegate_id, peer_name) in &self.peer_delegates {
+                if let Err(e) = actor_ref
+                    .ask(SetProviderTarget {
+                        agent_id: delegate_id.clone(),
+                        target: RouteTarget::Peer(peer_name.clone()),
+                    })
+                    .await
+                {
+                    log::warn!(
+                        "RoutingActor: failed to set provider route for '{}': {:?}",
+                        delegate_id,
+                        e
+                    );
+                }
+
+                // Attempt eager resolution if mesh is available.
+                if let Some(ref mesh) = self.mesh {
+                    if let Some(node_id) = mesh.resolve_peer_node_id(peer_name).await {
+                        log::info!(
+                            "peer_delegate '{}': resolved peer '{}' → node_id={} (routing table)",
+                            delegate_id,
+                            peer_name,
+                            node_id
+                        );
+                        if let Err(e) = actor_ref
+                            .ask(ResolvePeer {
+                                peer_name: peer_name.clone(),
+                                node_id: node_id.to_string(),
+                            })
+                            .await
+                        {
+                            log::warn!(
+                                "RoutingActor: failed to resolve peer '{}': {:?}",
+                                peer_name,
+                                e
+                            );
+                        }
+                    } else {
+                        log::warn!(
+                            "peer_delegate '{}': peer '{}' not found in mesh at build time. \
+                             Will be resolved eagerly on PeerEvent::Discovered.",
+                            delegate_id,
+                            peer_name
+                        );
+                    }
+                }
+            }
+
+            builder = builder.with_routing_snapshot(snapshot_handle);
+            Some(actor_ref)
+        } else {
+            None
+        };
+
+        // Capture routing actor ref for the planner closure (feature-gated).
+        #[cfg(feature = "remote")]
+        let routing_actor_for_planner = routing_actor_ref.clone();
+
         let planner_llm = build_llm_config(&planner_config)?;
         let planner_tools = planner_config.tools.clone();
         let planner_middleware = planner_config.middleware.clone();
@@ -299,6 +384,21 @@ impl QuorumBuilder {
                 other => {
                     log::warn!("Unknown snapshot backend '{}' for planner, ignoring", other);
                 }
+            }
+
+            // Register routing planner tools if RoutingActor is available.
+            #[cfg(feature = "remote")]
+            if let Some(actor_ref) = routing_actor_for_planner {
+                use crate::tools::builtins::{RouteDelegationToPeerTool, UseRemoteProviderTool};
+                b.extend_tool_registry([
+                    Arc::new(RouteDelegationToPeerTool::new(actor_ref.clone()))
+                        as Arc<dyn crate::tools::Tool>,
+                    Arc::new(UseRemoteProviderTool::new(actor_ref))
+                        as Arc<dyn crate::tools::Tool>,
+                ]);
+                log::info!(
+                    "Registered routing planner tools: route_delegation_to_peer, use_remote_provider"
+                );
             }
 
             let config = Arc::new(b.build());
@@ -358,7 +458,107 @@ impl QuorumBuilder {
 
         #[cfg(feature = "remote")]
         if let Some(mesh) = self.mesh {
-            planner_handle.set_mesh(mesh);
+            planner_handle.set_mesh(mesh.clone());
+
+            // Wire peer delegates: set mesh handle on each for connectivity.
+            // Routing is handled by the RoutingActor (populated above).
+            for (delegate_id, _peer_name) in &self.peer_delegates {
+                let handle = match quorum.delegate(delegate_id) {
+                    Some(h) => h,
+                    None => {
+                        log::warn!(
+                            "peer_delegate '{}' not found in quorum — skipping mesh wiring",
+                            delegate_id
+                        );
+                        continue;
+                    }
+                };
+
+                // Always set the mesh handle so the delegate can reach the mesh.
+                handle.set_mesh_handle(mesh.clone());
+            }
+
+            // Subscribe the RoutingActor to PeerEvent for eager resolution / failover.
+            if let Some(ref actor_ref) = routing_actor_ref {
+                let peer_delegates = self.peer_delegates.clone();
+                let mesh_for_events = mesh.clone();
+                let actor_for_events = actor_ref.clone();
+                tokio::spawn(async move {
+                    use crate::agent::remote::routing::{ResolvePeer, UnresolvePeer};
+                    use crate::agent::remote::{GetNodeInfo, PeerEvent, RemoteNodeManager};
+                    let mut rx = mesh_for_events.subscribe_peer_events();
+                    loop {
+                        match rx.recv().await {
+                            Ok(PeerEvent::Discovered(peer_id)) => {
+                                // Try to resolve any unresolved peer names.
+                                let per_peer_name =
+                                    crate::agent::remote::dht_name::node_manager_for_peer(
+                                        &peer_id.to_string(),
+                                    );
+                                let node_manager = match mesh_for_events
+                                    .lookup_actor::<RemoteNodeManager>(&per_peer_name)
+                                    .await
+                                {
+                                    Ok(Some(nm)) => nm,
+                                    _ => continue,
+                                };
+                                let node_info = match node_manager
+                                    .ask::<GetNodeInfo>(&GetNodeInfo)
+                                    .await
+                                {
+                                    Ok(info) => info,
+                                    Err(e) => {
+                                        log::debug!(
+                                            "RoutingActor PeerEvent handler: GetNodeInfo failed for {}: {}",
+                                            peer_id,
+                                            e
+                                        );
+                                        continue;
+                                    }
+                                };
+                                // Check if this hostname matches any peer delegate name.
+                                for (_delegate_id, peer_name) in &peer_delegates {
+                                    if node_info.hostname == *peer_name
+                                        && let Err(e) = actor_for_events
+                                            .ask(ResolvePeer {
+                                                peer_name: peer_name.clone(),
+                                                node_id: node_info.node_id.to_string(),
+                                            })
+                                            .await
+                                    {
+                                        log::warn!(
+                                            "RoutingActor PeerEvent handler: ResolvePeer failed: {:?}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(PeerEvent::Expired(peer_id)) => {
+                                let node_id_str = peer_id.to_string();
+                                if let Err(e) = actor_for_events
+                                    .ask(UnresolvePeer {
+                                        node_id: node_id_str.clone(),
+                                    })
+                                    .await
+                                {
+                                    log::warn!(
+                                        "RoutingActor PeerEvent handler: UnresolvePeer failed for {}: {:?}",
+                                        node_id_str,
+                                        e
+                                    );
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                log::warn!(
+                                    "RoutingActor PeerEvent handler: lagged, skipped {} events",
+                                    n
+                                );
+                            }
+                        }
+                    }
+                });
+            }
         }
 
         Ok(Quorum {
@@ -599,6 +799,10 @@ impl Quorum {
 
         // Configure delegates with tool resolution
         for delegate in config.delegates {
+            // Capture peer before consuming delegate
+            #[cfg(feature = "remote")]
+            let delegate_peer = delegate.peer.clone();
+
             let mut delegate_config = AgentConfig::new(delegate.id.clone());
             let mut llm = querymt::LLMParams::new()
                 .provider(delegate.provider)
@@ -638,6 +842,14 @@ impl Quorum {
 
             delegate_config.middleware = delegate.middleware;
             delegate_config.execution = delegate.execution;
+
+            // Register peer delegate for mesh routing resolution in build()
+            #[cfg(feature = "remote")]
+            if let Some(peer_name) = delegate_peer {
+                builder
+                    .peer_delegates
+                    .push((delegate_config.id.clone(), peer_name));
+            }
 
             builder.delegates.push(delegate_config);
         }
@@ -904,5 +1116,97 @@ mod tests {
     fn test_quorum_builder_snapshot_policy() {
         let builder = QuorumBuilder::new().with_snapshot_policy(SnapshotPolicy::Diff);
         assert_eq!(builder.snapshot_policy, SnapshotPolicy::Diff);
+    }
+
+    // ── peer_delegates wiring ────────────────────────────────────────────────
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn test_builder_from_quorum_config_captures_peer_delegates() {
+        use crate::config::QuorumConfig;
+
+        let toml = r#"
+[quorum]
+cwd = "/tmp"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+
+[[delegates]]
+id = "coder"
+provider = "llama_cpp"
+model = "qwen3"
+peer = "gpu-node"
+"#;
+        let config: QuorumConfig = toml::from_str(toml).expect("parse QuorumConfig");
+        let builder =
+            Quorum::builder_from_quorum_config(config, None).expect("builder_from_quorum_config");
+
+        // The builder must have registered the peer delegate
+        assert_eq!(builder.peer_delegates.len(), 1);
+        assert_eq!(builder.peer_delegates[0].0, "coder");
+        assert_eq!(builder.peer_delegates[0].1, "gpu-node");
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn test_builder_from_quorum_config_no_peer_no_peer_delegates() {
+        let toml = r#"
+[quorum]
+cwd = "/tmp"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+
+[[delegates]]
+id = "writer"
+provider = "anthropic"
+model = "claude-haiku"
+"#;
+        let config: crate::config::QuorumConfig = toml::from_str(toml).expect("parse QuorumConfig");
+        let builder =
+            Quorum::builder_from_quorum_config(config, None).expect("builder_from_quorum_config");
+
+        assert!(builder.peer_delegates.is_empty());
+    }
+
+    /// When a delegate has `peer` set, `builder_from_quorum_config` must populate
+    /// `peer_delegates`. The `build()` method must not fail if the peer is unknown
+    /// — it should log a warning and proceed. Integration tests with a real mesh
+    /// cover the happy path (peer found → NodeId stored).
+    #[cfg(feature = "remote")]
+    #[test]
+    fn peer_delegates_populated_for_peer_field_in_delegate() {
+        let toml = r#"
+[quorum]
+cwd = "/tmp"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+peer = "gpu-node"
+
+[[delegates]]
+id = "writer"
+provider = "openai"
+model = "gpt-4"
+"#;
+        let config: crate::config::QuorumConfig = toml::from_str(toml).expect("parse QuorumConfig");
+        let builder =
+            Quorum::builder_from_quorum_config(config, None).expect("builder_from_quorum_config");
+
+        // Only "coder" has a peer
+        assert_eq!(builder.peer_delegates.len(), 1);
+        assert_eq!(builder.peer_delegates[0].0, "coder");
+        assert_eq!(builder.peer_delegates[0].1, "gpu-node");
+        // "writer" has no peer
+        assert!(!builder.peer_delegates.iter().any(|(id, _)| id == "writer"));
     }
 }

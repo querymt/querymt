@@ -340,7 +340,7 @@ impl From<AgentRunner> for Box<dyn ChatRunner> {
 /// `source` accepts either a config file path or inline TOML (`ConfigSource::Toml`).
 /// Inline TOML must contain fully inlined system prompts (no `{ file = ... }` entries).
 ///
-/// ## Phase 7: Config-Driven Mesh Bootstrap
+/// ## Config-Driven Mesh Bootstrap
 ///
 /// When the `remote` feature is enabled and the TOML config contains:
 ///
@@ -395,42 +395,43 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
 
     match config {
         Config::Single(single_config) => {
-            // Phase 7: bootstrap mesh from config if enabled (remote feature only).
+            // bootstrap mesh from config if enabled (remote feature only).
             #[cfg(feature = "remote")]
             if single_config.mesh.enabled {
                 use crate::agent::remote::remote_setup::setup_mesh_from_config;
                 use std::sync::Arc;
 
-                log::info!("Phase 7: mesh.enabled = true in config, bootstrapping mesh...");
+                log::info!("mesh.enabled = true in config, bootstrapping mesh...");
                 match setup_mesh_from_config(
                     &single_config.mesh,
                     &single_config.remote_agents,
-                    None, // RemoteNodeManager will be spawned by coder_agent or caller
-                    None, // ProviderHostActor will be spawned after AgentConfig is built
+                    None, // spawned below after AgentConfig is built
+                    None, // spawned below after AgentConfig is built
                 )
                 .await
                 {
                     Ok(result) => {
                         use crate::delegation::AgentRegistry as _;
                         log::info!(
-                            "Phase 7: mesh bootstrapped, {} remote agent(s) registered",
+                            "mesh bootstrapped, {} remote agent(s) registered",
                             result.registry.list_agents().len()
                         );
                         let auto_fallback = single_config.mesh.auto_fallback;
                         let agent = Agent::from_single_config_with_registry(
                             single_config,
                             Some(Arc::new(result.registry)),
-                            Some(result.mesh),
+                            Some(result.mesh.clone()),
                             auto_fallback,
                         )
                         .await?;
+                        // Now that we have an AgentConfig, spawn and register the
+                        // RemoteNodeManager and ProviderHostActor so remote peers can
+                        // discover this node in the DHT and create sessions here.
+                        spawn_and_register_mesh_actors(&agent.handle(), &result.mesh).await;
                         return Ok(AgentRunner::Single(agent));
                     }
                     Err(e) => {
-                        log::warn!(
-                            "Phase 7: mesh bootstrap failed: {}; continuing without mesh",
-                            e
-                        );
+                        log::warn!("mesh bootstrap failed: {}; continuing without mesh", e);
                     }
                 }
             }
@@ -439,42 +440,43 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
             Ok(AgentRunner::Single(agent))
         }
         Config::Multi(quorum_config) => {
-            // Phase 7: bootstrap mesh from config if enabled (remote feature only).
+            // bootstrap mesh from config if enabled (remote feature only).
             #[cfg(feature = "remote")]
             if quorum_config.mesh.enabled {
                 use crate::agent::remote::remote_setup::setup_mesh_from_config;
                 use std::sync::Arc;
 
-                log::info!("Phase 7: mesh.enabled = true in config, bootstrapping mesh...");
+                log::info!("mesh.enabled = true in config, bootstrapping mesh...");
                 match setup_mesh_from_config(
                     &quorum_config.mesh,
                     &quorum_config.remote_agents,
-                    None,
-                    None, // ProviderHostActor will be spawned after AgentConfig is built
+                    None, // spawned below after AgentConfig is built
+                    None, // spawned below after AgentConfig is built
                 )
                 .await
                 {
                     Ok(result) => {
                         use crate::delegation::AgentRegistry;
                         log::info!(
-                            "Phase 7: mesh bootstrapped, {} remote agent(s) registered",
+                            "mesh bootstrapped, {} remote agent(s) registered",
                             result.registry.list_agents().len()
                         );
                         let auto_fallback = quorum_config.mesh.auto_fallback;
                         let quorum = Quorum::from_quorum_config_with_registry(
                             quorum_config,
                             Some(Arc::new(result.registry)),
-                            Some(result.mesh),
+                            Some(result.mesh.clone()),
                             auto_fallback,
                         )
                         .await?;
+                        // Now that we have an AgentConfig, spawn and register the
+                        // RemoteNodeManager and ProviderHostActor so remote peers can
+                        // discover this node in the DHT and create sessions here.
+                        spawn_and_register_mesh_actors(&quorum.handle(), &result.mesh).await;
                         return Ok(AgentRunner::Multi(quorum));
                     }
                     Err(e) => {
-                        log::warn!(
-                            "Phase 7: mesh bootstrap failed: {}; continuing without mesh",
-                            e
-                        );
+                        log::warn!("mesh bootstrap failed: {}; continuing without mesh", e);
                     }
                 }
             }
@@ -483,4 +485,56 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
             Ok(AgentRunner::Multi(quorum))
         }
     }
+}
+
+/// Spawn a `RemoteNodeManager` and a `ProviderHostActor` for this node and
+/// register them in the kameo DHT so remote peers can discover and use them.
+///
+/// This is called by `from_config` immediately after the agent/quorum is built,
+/// once an `AgentConfig` is available. It replicates the registration that
+/// `coder_agent --mesh` does manually, making mesh-enabled configs self-contained.
+#[cfg(feature = "remote")]
+async fn spawn_and_register_mesh_actors(
+    handle: &crate::agent::LocalAgentHandle,
+    mesh: &crate::agent::remote::MeshHandle,
+) {
+    use crate::agent::remote::ProviderHostActor;
+    use crate::agent::remote::RemoteNodeManager;
+    use crate::agent::remote::dht_name;
+    use kameo::actor::Spawn;
+
+    // ── RemoteNodeManager ────────────────────────────────────────────────────
+    let node_manager = RemoteNodeManager::new(
+        handle.config.clone(),
+        handle.registry.clone(),
+        Some(mesh.clone()),
+    );
+    let node_manager_ref = RemoteNodeManager::spawn(node_manager);
+
+    // Register under the global name (for lookup_all_actors / list_remote_nodes).
+    mesh.register_actor(node_manager_ref.clone(), dht_name::NODE_MANAGER)
+        .await;
+    log::info!(
+        "RemoteNodeManager registered in DHT as '{}'",
+        dht_name::NODE_MANAGER
+    );
+
+    // Register under the per-peer name for O(1) direct lookup by peer_id.
+    // This is the name resolve_peer_node_id looks up — it must be present for
+    // peer delegates to route to this node.
+    let per_peer_name = dht_name::node_manager_for_peer(mesh.peer_id());
+    mesh.register_actor(node_manager_ref, per_peer_name.clone())
+        .await;
+    log::info!(
+        "RemoteNodeManager also registered in DHT as '{}'",
+        per_peer_name
+    );
+
+    // ── ProviderHostActor ────────────────────────────────────────────────────
+    let provider_host = ProviderHostActor::new(handle.config.clone());
+    let provider_host_ref = ProviderHostActor::spawn(provider_host);
+    let ph_dht_name = dht_name::provider_host(mesh.peer_id());
+    mesh.register_actor(provider_host_ref, ph_dht_name.clone())
+        .await;
+    log::info!("ProviderHostActor registered in DHT as '{}'", ph_dht_name);
 }

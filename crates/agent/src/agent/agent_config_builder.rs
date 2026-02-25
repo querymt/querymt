@@ -503,6 +503,8 @@ impl AgentConfigBuilder {
         self
     }
 
+    // ── Remote mesh routing ───────────────────────────────────────────────────
+
     // ── Internal accessors (used by simple::agent and quorum) ─────────────
 
     /// Read the current `event_journal`.

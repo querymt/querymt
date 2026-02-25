@@ -17,6 +17,7 @@ pub mod event_forwarder;
 pub mod event_relay;
 pub mod node_id;
 pub mod node_manager;
+pub mod routing;
 
 #[cfg(feature = "remote")]
 pub mod mesh;
@@ -106,5 +107,10 @@ pub use registry_exchange::{
 pub use remote_handle::RemoteAgentHandle;
 #[cfg(feature = "remote")]
 pub use remote_setup::{MeshSetupResult, setup_mesh_from_config};
+pub use routing::{
+    ClearRoute, ListRoutes, ResolvePeer, RouteConfirmation, RouteTarget, RoutingActor,
+    RoutingPolicy, RoutingSnapshot, RoutingSnapshotHandle, SetProviderTarget, SetSessionTarget,
+    UnresolvePeer, new_routing_snapshot_handle,
+};
 #[cfg(feature = "remote")]
 pub use transport::{DynMeshTransport, MeshTransport};

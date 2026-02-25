@@ -1,6 +1,6 @@
 //! Config-driven mesh bootstrap and remote agent registration.
 //!
-//! This module implements Phase 7: reading `[mesh]` and `[[remote_agents]]`
+//! This module implements reading `[mesh]` and `[[remote_agents]]`
 //! from TOML config and automatically:
 //! 1. Bootstrapping the kameo libp2p swarm.
 //! 2. Registering the local node as a `RemoteNodeManager` in the DHT.
@@ -107,10 +107,7 @@ pub async fn setup_mesh_from_config(
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
     };
     tracing::Span::current().record("peer_id", mesh.peer_id().to_string());
-    log::info!(
-        "Phase 7: Kameo mesh bootstrapped (peer_id={})",
-        mesh.peer_id()
-    );
+    log::info!("Kameo mesh bootstrapped (peer_id={})", mesh.peer_id());
 
     // ── 3. Register the local RemoteNodeManager in the DHT (if provided) ──────
 
@@ -125,7 +122,7 @@ pub async fn setup_mesh_from_config(
             .instrument(reg_span)
             .await;
         log::info!(
-            "Phase 7: Local RemoteNodeManager registered in DHT as '{}'",
+            "Local RemoteNodeManager registered in DHT as '{}'",
             super::dht_name::NODE_MANAGER
         );
 
@@ -136,7 +133,7 @@ pub async fn setup_mesh_from_config(
         let per_peer_name = super::dht_name::node_manager_for_peer(mesh.peer_id());
         mesh.register_actor(nm_ref, per_peer_name.clone()).await;
         log::info!(
-            "Phase 7: Local RemoteNodeManager also registered in DHT as '{}'",
+            "Local RemoteNodeManager also registered in DHT as '{}'",
             per_peer_name
         );
     }
@@ -161,10 +158,7 @@ pub async fn setup_mesh_from_config(
                 .instrument(reg_span)
                 .await;
         }
-        log::info!(
-            "Phase 7: ProviderHostActor registered in DHT as '{}'",
-            dht_name
-        );
+        log::info!("ProviderHostActor registered in DHT as '{}'", dht_name);
         Some(actor_ref)
     } else {
         None
@@ -187,7 +181,7 @@ pub async fn setup_mesh_from_config(
             Some(a) => *a,
             None => {
                 log::warn!(
-                    "Phase 7: remote_agent '{}' references unknown peer '{}'; skipping",
+                    "remote_agent '{}' references unknown peer '{}'; skipping",
                     remote.id,
                     remote.peer
                 );
@@ -198,7 +192,7 @@ pub async fn setup_mesh_from_config(
         match register_remote_agent(&mesh, remote, peer_addr).await {
             Ok(agent_info) => {
                 log::info!(
-                    "Phase 7: Registered remote agent '{}' (peer='{}')",
+                    "Registered remote agent '{}' (peer='{}')",
                     agent_info.id,
                     remote.peer
                 );
@@ -212,7 +206,7 @@ pub async fn setup_mesh_from_config(
             }
             Err(e) => {
                 log::warn!(
-                    "Phase 7: Could not register remote agent '{}' (peer='{}'): {}; skipping",
+                    "Could not register remote agent '{}' (peer='{}'): {}; skipping",
                     remote.id,
                     remote.peer,
                     e
@@ -266,7 +260,7 @@ async fn register_remote_agent(
                         .record("reachable", true)
                         .record("peer_hostname", &node_info.hostname);
                     log::debug!(
-                        "Phase 7: Peer '{}' reachable (hostname='{}')",
+                        "Peer '{}' reachable (hostname='{}')",
                         remote.peer,
                         node_info.hostname
                     );
@@ -274,7 +268,7 @@ async fn register_remote_agent(
                 Err(e) => {
                     tracing::Span::current().record("reachable", false);
                     log::debug!(
-                        "Phase 7: GetNodeInfo failed for peer '{}': {} (registering anyway)",
+                        "GetNodeInfo failed for peer '{}': {} (registering anyway)",
                         remote.peer,
                         e
                     );
@@ -284,7 +278,7 @@ async fn register_remote_agent(
         Ok(Ok(None)) => {
             tracing::Span::current().record("reachable", false);
             log::debug!(
-                "Phase 7: Peer '{}' not yet in DHT; registering remote agent '{}' speculatively",
+                "Peer '{}' not yet in DHT; registering remote agent '{}' speculatively",
                 remote.peer,
                 remote.id
             );
@@ -292,7 +286,7 @@ async fn register_remote_agent(
         Ok(Err(e)) => {
             tracing::Span::current().record("reachable", false);
             log::debug!(
-                "Phase 7: DHT lookup error for peer '{}': {} (registering speculatively)",
+                "DHT lookup error for peer '{}': {} (registering speculatively)",
                 remote.peer,
                 e
             );
@@ -300,7 +294,7 @@ async fn register_remote_agent(
         Err(_timeout) => {
             tracing::Span::current().record("reachable", false);
             log::debug!(
-                "Phase 7: DHT lookup timed out for peer '{}' (registering speculatively)",
+                "DHT lookup timed out for peer '{}' (registering speculatively)",
                 remote.peer,
             );
         }

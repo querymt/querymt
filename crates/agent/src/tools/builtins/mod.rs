@@ -21,6 +21,12 @@ pub mod todo;
 pub mod web_fetch;
 pub mod write_file;
 
+pub mod route_delegation_to_peer;
+pub mod use_remote_provider;
+
+pub use route_delegation_to_peer::RouteDelegationToPeerTool;
+pub use use_remote_provider::UseRemoteProviderTool;
+
 pub use apply_patch::ApplyPatchTool;
 pub use browse::BrowseTool;
 pub use create_task::CreateTaskTool;

@@ -511,7 +511,7 @@ async fn resolve_system_parts(
 }
 
 // ============================================================================
-// Mesh & Remote Agent Configuration (Phase 7)
+// Mesh & Remote Agent Configuration
 // ============================================================================
 
 /// A single peer that this node should connect to in the mesh.
@@ -649,10 +649,10 @@ pub struct SingleAgentConfig {
     pub mcp: Vec<McpServerConfig>,
     #[serde(default)]
     pub middleware: Vec<MiddlewareEntry>,
-    /// Optional kameo mesh configuration (Phase 7).
+    /// Optional kameo mesh configuration.
     #[serde(default)]
     pub mesh: MeshTomlConfig,
-    /// Remote agents registered in the mesh (Phase 7).
+    /// Remote agents registered in the mesh.
     #[serde(default, rename = "remote_agents")]
     pub remote_agents: Vec<RemoteAgentConfig>,
 }
@@ -723,10 +723,10 @@ pub struct QuorumConfig {
     pub planner: PlannerConfig,
     #[serde(default)]
     pub delegates: Vec<DelegateConfig>,
-    /// Optional kameo mesh configuration (Phase 7).
+    /// Optional kameo mesh configuration.
     #[serde(default)]
     pub mesh: MeshTomlConfig,
-    /// Remote agents registered in the mesh (Phase 7).
+    /// Remote agents registered in the mesh.
     #[serde(default, rename = "remote_agents")]
     pub remote_agents: Vec<RemoteAgentConfig>,
 }
@@ -827,6 +827,16 @@ pub struct DelegateConfig {
     /// Execution policy (tool output, pruning, compaction, snapshot, rate limit)
     #[serde(default)]
     pub execution: ExecutionPolicy,
+
+    /// Optional mesh peer name (references `[[mesh.peers]]` name).
+    ///
+    /// When set, LLM calls for this delegate are routed to the specified peer via
+    /// `MeshChatProvider` while tool execution continues to run locally on the
+    /// planner node. This is the "remote model, local session" pattern.
+    ///
+    /// Requires `[mesh] enabled = true`. Validated at startup.
+    #[serde(default)]
+    pub peer: Option<String>,
 }
 
 /// MCP server configuration
@@ -1067,6 +1077,7 @@ async fn build_config_from_toml_value(
         for delegate in &config.delegates {
             validate_mcp_servers(&delegate.mcp)?;
         }
+        validate_peer_delegates(&config.delegates, &config.mesh)?;
 
         // Step 5: Resolve system prompt file references
         match &resolution {
@@ -1168,6 +1179,26 @@ pub fn interpolate_env_vars(content: &str) -> Result<String> {
     }
 
     Ok(result.into_owned())
+}
+
+/// Validate that delegates with `peer` set require `[mesh] enabled = true`.
+///
+/// If any delegate specifies a `peer`, the mesh must be enabled — otherwise
+/// the routing cannot function and the user has a misconfiguration.
+fn validate_peer_delegates(delegates: &[DelegateConfig], mesh: &MeshTomlConfig) -> Result<()> {
+    for delegate in delegates {
+        if let Some(ref peer_name) = delegate.peer
+            && !mesh.enabled
+        {
+            return Err(anyhow!(
+                "delegate '{}' has `peer = \"{}\"` but `[mesh] enabled = false` (or mesh section absent). \
+                     Set `[mesh] enabled = true` to enable mesh-routed LLM calls.",
+                delegate.id,
+                peer_name,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validate MCP servers have unique names
@@ -1818,5 +1849,116 @@ CONTEXT7_API_KEY = "my-api-key"
         let toml_without_braces = r#"provider = "$MCP_TEST_API_KEY""#;
         let result = interpolate_env_vars(toml_without_braces).unwrap();
         assert_eq!(result, r#"provider = "$MCP_TEST_API_KEY""#);
+    }
+
+    // ── peer field validation ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_peer_without_mesh_enabled_is_error() {
+        // A delegate with `peer` set requires `[mesh] enabled = true`.
+        let toml = r#"
+[quorum]
+cwd = "/tmp"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+
+[[delegates]]
+id = "coder"
+provider = "llama_cpp"
+model = "qwen3"
+peer = "gpu-node"
+"#;
+        // mesh.enabled defaults to false, so this must fail validation
+        let result = load_config(ConfigSource::Toml(toml.to_string())).await;
+        assert!(result.is_err(), "expected error but got Ok");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("peer") && msg.contains("mesh"),
+            "error must mention 'peer' and 'mesh', got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_peer_with_mesh_enabled_is_ok() {
+        // A delegate with `peer` set is valid when `[mesh] enabled = true`.
+        let toml = r#"
+[quorum]
+cwd = "/tmp"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+
+[mesh]
+enabled = true
+
+[[delegates]]
+id = "coder"
+provider = "llama_cpp"
+model = "qwen3"
+peer = "gpu-node"
+"#;
+        let result = load_config(ConfigSource::Toml(toml.to_string())).await;
+        assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
+    }
+
+    // ── peer field on DelegateConfig ────────────────────────────────────────
+
+    fn parse_delegate(toml: &str) -> DelegateConfig {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            delegates: Vec<DelegateConfig>,
+        }
+        toml::from_str::<Wrapper>(toml)
+            .expect("Failed to parse TOML")
+            .delegates
+            .into_iter()
+            .next()
+            .expect("No delegates in TOML")
+    }
+
+    #[test]
+    fn test_delegate_config_peer_field_parses() {
+        let toml = r#"
+[[delegates]]
+id = "coder"
+provider = "llama_cpp"
+model = "qwen3"
+peer = "gpu-node"
+"#;
+        let delegate = parse_delegate(toml);
+        assert_eq!(delegate.peer, Some("gpu-node".to_string()));
+    }
+
+    #[test]
+    fn test_delegate_config_peer_field_absent_defaults_none() {
+        let toml = r#"
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+"#;
+        let delegate = parse_delegate(toml);
+        assert_eq!(delegate.peer, None);
+    }
+
+    #[test]
+    fn test_delegate_config_peer_field_does_not_break_existing_configs() {
+        // Configs without `peer` must still deserialize correctly.
+        let toml = r#"
+[[delegates]]
+id = "writer"
+provider = "anthropic"
+model = "claude-3-haiku"
+description = "Writing specialist"
+capabilities = ["writing"]
+"#;
+        let delegate = parse_delegate(toml);
+        assert_eq!(delegate.id, "writer");
+        assert_eq!(delegate.peer, None);
+        assert_eq!(delegate.description, Some("Writing specialist".to_string()));
     }
 }
