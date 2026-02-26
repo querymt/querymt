@@ -210,10 +210,6 @@ impl HTTPLLMProviderFactory for CodexFactory {
         "codex"
     }
 
-    fn api_key_name(&self) -> Option<String> {
-        Some("OPENAI_API_KEY".into())
-    }
-
     fn list_models_request(&self, _cfg: &str) -> Result<Request<Vec<u8>>, LLMError> {
         Ok(Request::builder()
             .method(Method::GET)
