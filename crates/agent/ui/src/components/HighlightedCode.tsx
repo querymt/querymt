@@ -1,5 +1,10 @@
 /**
  * Syntax highlighted code viewer using shiki
+ *
+ * A module-level cache keyed by (code, language, theme) ensures that
+ * remounted instances (e.g. when ReactMarkdown rebuilds its tree during
+ * streaming) render the previously-highlighted HTML synchronously on first
+ * paint — no loading flash or layout jump.
  */
 
 import { useEffect, useState } from 'react';
@@ -8,6 +13,25 @@ import { detectLanguage } from '../utils/languageDetection';
 import { useUiStore } from '../store/uiStore';
 import { getShikiThemeForDashboard } from '../utils/dashboardThemes';
 
+// ---- Module-level highlight cache ----
+
+const highlightCache = new Map<string, string>();
+
+// The full code string is included in the key, which duplicates it in the Map.
+// A fast hash would avoid that extra copy, but at typical scale (dozens of
+// code blocks per session) the overhead is negligible compared to the Shiki
+// HTML output stored as the value.
+function cacheKey(code: string, lang: string, theme: string): string {
+  return `${theme}\0${lang}\0${code}`;
+}
+
+/** Visible for testing — clears the highlight cache. */
+export function clearHighlightCache(): void {
+  highlightCache.clear();
+}
+
+// ---- Component ----
+
 export interface HighlightedCodeProps {
   code: string;
   filePath?: string;
@@ -15,33 +39,50 @@ export interface HighlightedCodeProps {
   lineNumbers?: boolean;
   startLine?: number;
   maxHeight?: string;
+  /** When true the code is still being streamed — skip Shiki and render plain monospace. */
+  isStreaming?: boolean;
 }
 
 export function HighlightedCode({
   code,
   filePath,
   language: providedLanguage,
-  lineNumbers = true,
-  startLine = 1,
+  lineNumbers: _lineNumbers = true,
+  startLine: _startLine = 1,
   maxHeight = '24rem',
+  isStreaming = false,
 }: HighlightedCodeProps) {
-  const [html, setHtml] = useState<string>('');
-  const [loading, setLoading] = useState(true);
   const selectedTheme = useUiStore((state) => state.selectedTheme);
   const shikiTheme = getShikiThemeForDashboard(selectedTheme);
+  const lang = providedLanguage || (filePath ? detectLanguage(filePath).language : 'plaintext');
+  const key = cacheKey(code, lang, shikiTheme);
+  const cached = highlightCache.get(key);
+
+  const [html, setHtml] = useState<string>(cached ?? '');
+  const [loading, setLoading] = useState(!cached);
 
   useEffect(() => {
+    // Skip if streaming, or if the cache already supplied the HTML.
+    if (isStreaming) return;
+
+    // Re-check cache — may have been populated by a prior mount with the same key.
+    const hit = highlightCache.get(key);
+    if (hit) {
+      setHtml(hit);
+      setLoading(false);
+      return;
+    }
+
     let cancelled = false;
 
     async function highlight() {
       try {
-        // Detect language from file path or use provided
-        const lang = providedLanguage || (filePath ? detectLanguage(filePath).language : 'plaintext');
-        
         const highlighted = await codeToHtml(code, {
           lang,
           theme: shikiTheme,
         });
+
+        highlightCache.set(key, highlighted);
 
         if (!cancelled) {
           setHtml(highlighted);
@@ -62,13 +103,28 @@ export function HighlightedCode({
     return () => {
       cancelled = true;
     };
-  }, [code, filePath, providedLanguage, lineNumbers, shikiTheme, startLine]);
+  }, [code, lang, shikiTheme, isStreaming, key]);
+
+  // While streaming, render plain monospace — zero async cost.
+  if (isStreaming) {
+    return (
+      <pre
+        className="highlighted-code-container overflow-auto font-mono text-sm p-4 text-ui-primary"
+        style={{ maxHeight }}
+      >
+        <code>{code}</code>
+      </pre>
+    );
+  }
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center p-8">
-        <div className="text-sm text-ui-muted">Highlighting code...</div>
-      </div>
+      <pre
+        className="highlighted-code-container overflow-auto font-mono text-sm p-4 text-ui-primary"
+        style={{ maxHeight }}
+      >
+        <code>{code}</code>
+      </pre>
     );
   }
 
