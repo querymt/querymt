@@ -19,6 +19,7 @@ use querymt::{
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
@@ -48,6 +49,10 @@ pub struct KimiCode {
     #[serde(skip)]
     #[schemars(skip)]
     pub key_resolver: Option<Arc<dyn ApiKeyResolver>>,
+    /// Cached Kimi device identity / OAuth config (avoids recomputing per request).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub kimi_profile: Option<kimi_auth::OAuthConfig>,
 }
 
 impl OpenAIProviderConfig for KimiCode {
@@ -142,9 +147,10 @@ impl HTTPChatProvider for KimiCode {
     ) -> Result<Request<Vec<u8>>, LLMError> {
         let mut resolved = self.clone();
         resolved.api_key = self.resolved_api_key();
+        let profile = self.profile();
         let mut request = openai_chat_request(&resolved, messages, tools)?;
         KimiCode::inject_tool_call_reasoning_content(&mut request, messages)?;
-        KimiCode::apply_kimi_agent_headers(&mut request)?;
+        KimiCode::apply_kimi_agent_headers(&mut request, &profile)?;
         Ok(request)
     }
 
@@ -200,6 +206,12 @@ impl KimiCode {
         }
     }
 
+    fn profile(&self) -> kimi_auth::OAuthConfig {
+        self.kimi_profile
+            .clone()
+            .unwrap_or_else(kimi_cli_oauth_config)
+    }
+
     fn inject_tool_call_reasoning_content(
         request: &mut Request<Vec<u8>>,
         source_messages: &[ChatMessage],
@@ -212,16 +224,20 @@ impl KimiCode {
             return Ok(());
         };
 
-        let mut reasoning_values = source_messages
-            .iter()
-            .filter_map(|msg| match (&msg.role, &msg.message_type) {
-                (ChatRole::Assistant, MessageType::ToolUse(_)) => {
-                    Some(msg.thinking.clone().unwrap_or_default())
+        // Build a lookup from tool-call ID to reasoning content from source
+        // messages.  Each assistant tool-use message may contain multiple tool
+        // calls; all of them share the same reasoning (thinking) text.
+        let mut reasoning_by_tool_id: HashMap<&str, &str> = HashMap::new();
+        for msg in source_messages {
+            if let (ChatRole::Assistant, MessageType::ToolUse(calls)) =
+                (&msg.role, &msg.message_type)
+            {
+                let thinking = msg.thinking.as_deref().unwrap_or_default();
+                for call in calls {
+                    reasoning_by_tool_id.insert(&call.id, thinking);
                 }
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .into_iter();
+            }
+        }
 
         for msg in messages {
             let Some(obj) = msg.as_object_mut() else {
@@ -237,20 +253,28 @@ impl KimiCode {
                 continue;
             }
 
-            let from_message = reasoning_values.next().unwrap_or_default();
+            // Look up reasoning by matching tool-call IDs in the serialized JSON
+            // against the source message map.
+            let from_source = obj
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .and_then(|calls| {
+                    calls.iter().find_map(|tc| {
+                        let id = tc.get("id").and_then(Value::as_str)?;
+                        let r = *reasoning_by_tool_id.get(id)?;
+                        if r.trim().is_empty() { None } else { Some(r) }
+                    })
+                });
+
             let content_fallback = obj
                 .get("content")
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_default()
-                .to_string();
+                .unwrap_or_default();
 
-            let reasoning_content =
-                KimiCode::normalize_reasoning_content(if from_message.trim().is_empty() {
-                    content_fallback
-                } else {
-                    from_message
-                });
+            let reasoning_content = KimiCode::normalize_reasoning_content(
+                from_source.unwrap_or(content_fallback).to_string(),
+            );
             obj.insert(
                 "reasoning_content".to_string(),
                 Value::String(reasoning_content),
@@ -279,27 +303,29 @@ impl KimiCode {
         }
     }
 
-    fn apply_kimi_agent_headers(request: &mut Request<Vec<u8>>) -> Result<(), LLMError> {
-        let mut set_header = |name: &'static str, value: String| -> Result<(), LLMError> {
-            let value = http::header::HeaderValue::from_str(&value).map_err(|e| {
+    fn apply_kimi_agent_headers(
+        request: &mut Request<Vec<u8>>,
+        profile: &kimi_auth::OAuthConfig,
+    ) -> Result<(), LLMError> {
+        let mut set_header = |name: &'static str, value: &str| -> Result<(), LLMError> {
+            let value = http::header::HeaderValue::from_str(value).map_err(|e| {
                 LLMError::InvalidRequest(format!("invalid header value for '{name}': {e}"))
             })?;
             request.headers_mut().insert(name, value);
             Ok(())
         };
 
-        let profile = kimi_cli_oauth_config();
-        let msh_version = profile.app_version.clone();
+        let msh_version = &profile.app_version;
         let user_agent =
             std::env::var("KIMI_USER_AGENT").unwrap_or_else(|_| format!("KimiCLI/{msh_version}"));
 
-        set_header("user-agent", user_agent)?;
-        set_header("x-msh-platform", profile.platform)?;
+        set_header("user-agent", &user_agent)?;
+        set_header("x-msh-platform", &profile.platform)?;
         set_header("x-msh-version", msh_version)?;
-        set_header("x-msh-device-name", profile.device_name)?;
-        set_header("x-msh-device-model", profile.device_model)?;
-        set_header("x-msh-os-version", profile.os_version)?;
-        set_header("x-msh-device-id", profile.device_id)?;
+        set_header("x-msh-device-name", &profile.device_name)?;
+        set_header("x-msh-device-model", &profile.device_model)?;
+        set_header("x-msh-os-version", &profile.os_version)?;
+        set_header("x-msh-device-id", &profile.device_id)?;
         Ok(())
     }
 }
@@ -338,7 +364,8 @@ impl HTTPLLMProviderFactory for KimiCodeFactory {
         }
 
         let mut request = builder.body(Vec::new())?;
-        KimiCode::apply_kimi_agent_headers(&mut request)?;
+        let profile = kimi_cli_oauth_config();
+        KimiCode::apply_kimi_agent_headers(&mut request, &profile)?;
         Ok(request)
     }
 
@@ -360,8 +387,8 @@ impl HTTPLLMProviderFactory for KimiCodeFactory {
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
-        let provider: KimiCode = serde_json::from_str(cfg)?;
-
+        let mut provider: KimiCode = serde_json::from_str(cfg)?;
+        provider.kimi_profile = Some(kimi_cli_oauth_config());
         Ok(Box::new(provider))
     }
 }
