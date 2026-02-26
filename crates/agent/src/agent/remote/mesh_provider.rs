@@ -57,6 +57,9 @@ pub struct MeshChatProvider {
     mesh: MeshHandle,
     /// DHT name of the target `ProviderHostActor`, e.g. `"provider_host::peer::<peer_id>"`.
     target_dht_name: String,
+    /// Per-session LLM parameters (system prompt, temperature, etc.) to forward
+    /// to the remote `ProviderHostActor`.
+    params: Option<serde_json::Value>,
 }
 
 impl MeshChatProvider {
@@ -74,6 +77,7 @@ impl MeshChatProvider {
             model: model.to_string(),
             mesh: mesh.clone(),
             target_dht_name: super::dht_name::provider_host(&target_node_id),
+            params: None,
         }
     }
 
@@ -85,6 +89,15 @@ impl MeshChatProvider {
         model: &str,
     ) -> Self {
         Self::new(mesh, &target_node_id.to_string(), provider_name, model)
+    }
+
+    /// Attach per-session LLM parameters to forward to the remote provider.
+    ///
+    /// These override the host's defaults for system prompt, temperature,
+    /// top_p, and other per-session config.
+    pub fn with_params(mut self, params: Option<serde_json::Value>) -> Self {
+        self.params = params;
+        self
     }
 
     /// Resolve the remote `ProviderHostActor` ref from the DHT.
@@ -148,6 +161,7 @@ impl ChatProvider for MeshChatProvider {
             model: self.model.clone(),
             messages: messages.to_vec(),
             tools: tools.map(|t| t.to_vec()),
+            params: self.params.clone(),
         };
 
         // ask() flattens Result<Result<T,E>, RemoteSendError> into Result<T, RemoteSendError<E>>
@@ -228,6 +242,7 @@ impl ChatProvider for MeshChatProvider {
             messages: messages.to_vec(),
             tools: tools.map(|t| t.to_vec()),
             stream_receiver_name: stream_rx_name.clone(),
+            params: self.params.clone(),
         };
 
         host_ref.tell(&stream_request).send().map_err(|e| {

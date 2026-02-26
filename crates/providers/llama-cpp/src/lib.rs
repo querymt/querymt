@@ -19,12 +19,22 @@ pub fn create_provider(
     Ok(Box::new(LlamaCppProvider::new(cfg)?))
 }
 
+use provider::CachedModel;
 use querymt::LLMProvider;
 use querymt::error::LLMError;
 use querymt::plugin::{Fut, LLMProviderFactory};
 use schemars::schema_for;
 
-struct LlamaCppFactory;
+struct LlamaCppFactory {
+    /// Single-slot model cache. Stores the most recently loaded model
+    /// (`Arc<LlamaModel>` + `Arc<MultimodalContext>`) keyed on hardware
+    /// params (model path, n_gpu_layers).
+    ///
+    /// Capacity = 1 matches the common case: one model on the peer,
+    /// multiple delegates sharing it with different system prompts.
+    /// If a request arrives for a different model, the old one is evicted.
+    model_cache: std::sync::Mutex<Option<CachedModel>>,
+}
 
 impl LLMProviderFactory for LlamaCppFactory {
     fn name(&self) -> &str {
@@ -39,7 +49,7 @@ impl LLMProviderFactory for LlamaCppFactory {
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
         let cfg: LlamaCppConfig = serde_json::from_str(cfg)?;
-        let provider = LlamaCppProvider::new(cfg)?;
+        let provider = LlamaCppProvider::new_with_cache(cfg, &self.model_cache)?;
         Ok(Box::new(provider))
     }
 
@@ -69,7 +79,9 @@ impl LLMProviderFactory for LlamaCppFactory {
 // the same vtable layout. This pattern is used throughout the plugin system.
 #[allow(improper_ctypes_definitions)]
 pub extern "C" fn plugin_factory() -> *mut dyn LLMProviderFactory {
-    Box::into_raw(Box::new(LlamaCppFactory)) as *mut _
+    Box::into_raw(Box::new(LlamaCppFactory {
+        model_cache: std::sync::Mutex::new(None),
+    })) as *mut _
 }
 
 /// Initialize logging from the host process.

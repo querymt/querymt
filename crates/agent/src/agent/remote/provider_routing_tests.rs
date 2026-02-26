@@ -338,6 +338,7 @@ mod provider_routing_integration_tests {
             model: "test".to_string(),
             messages: vec![],
             tools: None,
+            params: None,
         };
 
         let result = f.actor_ref.ask(req).await;
@@ -375,6 +376,7 @@ mod provider_routing_integration_tests {
             messages: vec![],
             tools: None,
             stream_receiver_name: stream_rx_name,
+            params: None,
         };
 
         // tell() — fire and forget. The handler will fail building the provider

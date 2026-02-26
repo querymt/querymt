@@ -74,6 +74,35 @@ mod mesh_provider_tests {
         );
     }
 
+    // ── B.3b — MeshChatProvider with_params ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_mesh_chat_provider_with_params() {
+        let mesh = get_test_mesh().await;
+        let params = serde_json::json!({
+            "system": ["You are a delegate."],
+            "temperature": 0.3
+        });
+        let provider = MeshChatProvider::new(mesh, "any-node", "anthropic", "claude-3")
+            .with_params(Some(params.clone()));
+
+        // We can't directly inspect private fields, but we can verify it
+        // compiles and the builder pattern works. The params are forwarded
+        // in the actual chat_with_tools call (tested via integration tests).
+        assert!(provider.supports_streaming());
+    }
+
+    // ── B.3c — MeshChatProvider with_params None ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_mesh_chat_provider_with_params_none() {
+        let mesh = get_test_mesh().await;
+        let provider =
+            MeshChatProvider::new(mesh, "any-node", "anthropic", "claude-3").with_params(None);
+
+        assert!(provider.supports_streaming());
+    }
+
     // ── B.4 ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]

@@ -722,7 +722,8 @@ pub async fn build_provider_from_config(
                 &node_id,
                 provider_name,
                 model,
-            ),
+            )
+            .with_params(params.cloned()),
         ));
     }
 
@@ -763,7 +764,8 @@ pub async fn build_provider_from_config(
                             &node_id,
                             provider_name,
                             model,
-                        ),
+                        )
+                        .with_params(params.cloned()),
                     ));
                 }
             }

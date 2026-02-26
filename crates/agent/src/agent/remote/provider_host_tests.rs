@@ -134,6 +134,7 @@ mod provider_host_tests {
             model: "qwen3-coder".to_string(),
             messages: vec![],
             tools: None,
+            params: None,
         };
 
         let result = actor_ref.ask(req).await;
@@ -338,6 +339,7 @@ mod provider_host_tests {
             model: "no-model".to_string(),
             messages: vec![],
             tools: None,
+            params: None,
         };
         let result = f.actor_ref.ask(req).await;
         // The ask returns Result<Result<ProviderChatResponse, AgentError>, SendError>
@@ -374,6 +376,7 @@ mod provider_host_tests {
             model: "no-model".to_string(),
             messages: vec![],
             tools: None,
+            params: None,
         };
 
         // Both calls fail for the same reason (provider not found).
@@ -474,6 +477,254 @@ mod provider_host_tests {
             finish_reason: None,
         };
         assert_eq!(no_text.to_string(), "[no text]");
+    }
+
+    // ── A.13 — Bug: system prompt dropped for remote delegates ─────────────
+    //
+    // `get_or_build_provider` serialised only `initial_params.custom`
+    // (the `#[serde(flatten)]` HashMap), silently dropping the dedicated
+    // `system: Vec<String>` field.  Remote/mesh delegates therefore never
+    // received their configured system prompt.
+    //
+    // This test calls the extracted helper `params_for_remote_provider`
+    // and asserts that `system` survives serialisation.
+
+    #[test]
+    fn test_params_for_remote_provider_includes_system_prompt() {
+        use crate::agent::remote::provider_host::params_for_remote_provider;
+        use querymt::LLMParams;
+
+        let llm = LLMParams::new()
+            .provider("llama_cpp")
+            .model("test-model")
+            .system("You are a code expert.")
+            .parameter("n_ctx", 32768_u64);
+
+        let params_json = params_for_remote_provider(&llm);
+
+        let obj = params_json
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .expect("params should serialize to a JSON object");
+
+        // System prompt must be forwarded.
+        let system = obj
+            .get("system")
+            .and_then(serde_json::Value::as_array)
+            .expect("system key must be present as an array");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].as_str(), Some("You are a code expert."));
+
+        // Custom params must still be forwarded.
+        assert_eq!(
+            obj.get("n_ctx").and_then(serde_json::Value::as_i64),
+            Some(32768)
+        );
+
+        // Sensitive / separately-handled fields must be excluded.
+        assert!(!obj.contains_key("provider"), "provider must be excluded");
+        assert!(!obj.contains_key("model"), "model must be excluded");
+        assert!(!obj.contains_key("api_key"), "api_key must be excluded");
+        assert!(!obj.contains_key("name"), "name must be excluded");
+    }
+
+    #[test]
+    fn test_params_for_remote_provider_empty_when_no_extra_fields() {
+        use crate::agent::remote::provider_host::params_for_remote_provider;
+        use querymt::LLMParams;
+
+        let llm = LLMParams::new().provider("openai").model("gpt-4");
+
+        let params_json = params_for_remote_provider(&llm);
+        assert!(
+            params_json.is_none(),
+            "params should be None when only provider/model are set"
+        );
+    }
+
+    #[test]
+    fn test_params_for_remote_provider_strips_api_key() {
+        use crate::agent::remote::provider_host::params_for_remote_provider;
+        use querymt::LLMParams;
+
+        let llm = LLMParams::new()
+            .provider("anthropic")
+            .model("claude-sonnet-4-20250514")
+            .api_key("sk-secret-123")
+            .system("Be helpful.");
+
+        let params_json = params_for_remote_provider(&llm);
+
+        let obj = params_json
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .expect("params should serialize to a JSON object");
+
+        assert!(
+            !obj.contains_key("api_key"),
+            "api_key must never be forwarded"
+        );
+        assert!(obj.contains_key("system"), "system should be present");
+    }
+
+    // ── A.14 — ProviderChatRequest params serde round-trip ────────────────────
+
+    #[test]
+    fn test_provider_chat_request_params_roundtrip() {
+        use crate::agent::remote::provider_host::ProviderStreamRequest;
+
+        let req = ProviderChatRequest {
+            provider: "llama_cpp".to_string(),
+            model: "test-model".to_string(),
+            messages: vec![],
+            tools: None,
+            params: Some(serde_json::json!({
+                "system": ["You are a code expert."],
+                "temperature": 0.3,
+                "n_ctx": 32768
+            })),
+        };
+
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: ProviderChatRequest = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.params.is_some());
+        let params = back.params.unwrap();
+        assert_eq!(
+            params
+                .get("system")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            params.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.3)
+        );
+
+        // Same for ProviderStreamRequest
+        let stream_req = ProviderStreamRequest {
+            provider: "llama_cpp".to_string(),
+            model: "test-model".to_string(),
+            messages: vec![],
+            tools: None,
+            stream_receiver_name: "stream_rx::test".to_string(),
+            params: Some(serde_json::json!({"system": ["prompt"]})),
+        };
+        let json = serde_json::to_string(&stream_req).expect("serialize");
+        let back: ProviderStreamRequest = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.params.is_some());
+    }
+
+    // ── A.15 — params: None backward compatibility ────────────────────────────
+
+    #[test]
+    fn test_provider_chat_request_params_none_backward_compat() {
+        // JSON without "params" field should deserialize with params = None
+        let json = r#"{"provider":"test","model":"m","messages":[],"tools":null}"#;
+        let req: ProviderChatRequest = serde_json::from_str(json).expect("deserialize");
+        assert!(
+            req.params.is_none(),
+            "missing params field should deserialize as None"
+        );
+    }
+
+    // ── A.16 — params skipped when None in serialization ──────────────────────
+
+    #[test]
+    fn test_provider_chat_request_params_none_not_serialized() {
+        let req = ProviderChatRequest {
+            provider: "test".to_string(),
+            model: "m".to_string(),
+            messages: vec![],
+            tools: None,
+            params: None,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(
+            !json.contains("\"params\""),
+            "params: None should be skipped in serialization, got: {}",
+            json
+        );
+    }
+
+    // ── A.17 — merge_params tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_merge_params_request_overrides_host_defaults() {
+        use crate::agent::remote::provider_host::merge_params;
+
+        let host = serde_json::json!({
+            "n_ctx": 32768,
+            "temperature": 0.7,
+            "model": "hf:owner/repo:model.gguf"
+        });
+        let request = serde_json::json!({
+            "system": ["You are a delegate."],
+            "temperature": 0.3
+        });
+
+        let merged = merge_params(Some(&request), Some(&host)).expect("should merge");
+        let obj = merged.as_object().expect("should be object");
+
+        // Request overrides host
+        assert_eq!(
+            obj.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.3),
+            "request temperature should override host default"
+        );
+        // Host defaults preserved
+        assert_eq!(
+            obj.get("n_ctx").and_then(|v| v.as_i64()),
+            Some(32768),
+            "host n_ctx should be preserved"
+        );
+        // Request-only fields added
+        assert!(
+            obj.contains_key("system"),
+            "system from request should be present"
+        );
+        // Host-only fields preserved
+        assert!(
+            obj.contains_key("model"),
+            "model from host should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_merge_params_strips_api_key_from_request() {
+        use crate::agent::remote::provider_host::merge_params;
+
+        let request = serde_json::json!({
+            "api_key": "sk-secret-123",
+            "system": ["prompt"]
+        });
+
+        let merged = merge_params(Some(&request), None).expect("should merge");
+        let obj = merged.as_object().expect("should be object");
+
+        assert!(
+            !obj.contains_key("api_key"),
+            "api_key must be stripped from request params"
+        );
+        assert!(
+            obj.contains_key("system"),
+            "non-sensitive fields should survive"
+        );
+    }
+
+    #[test]
+    fn test_merge_params_both_none_returns_none() {
+        use crate::agent::remote::provider_host::merge_params;
+        assert!(merge_params(None, None).is_none());
+    }
+
+    #[test]
+    fn test_merge_params_host_only() {
+        use crate::agent::remote::provider_host::merge_params;
+
+        let host = serde_json::json!({"n_ctx": 32768});
+        let merged = merge_params(None, Some(&host)).expect("should return host defaults");
+        assert_eq!(merged, host);
     }
 
     // ── A.3 supplemental — verify ToolCall round-trip ────────────────────────
