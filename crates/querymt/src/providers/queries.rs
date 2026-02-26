@@ -198,9 +198,12 @@ mod tests {
     fn test_fallback_propagates_through_helper_methods() {
         let registry = create_test_registry();
 
-        // Pricing, constraints, and capabilities should also work through fallback
         assert!(registry.get_pricing("codex", "gpt-4").is_some());
         assert!(registry.get_constraints("codex", "gpt-4").is_some());
         assert!(registry.get_capabilities("codex", "gpt-4").is_some());
+
+        assert!(registry.get_pricing("kimi-code", "kimi-k2").is_some());
+        assert!(registry.get_constraints("kimi-code", "kimi-k2").is_some());
+        assert!(registry.get_capabilities("kimi-code", "kimi-k2").is_some());
     }
 }

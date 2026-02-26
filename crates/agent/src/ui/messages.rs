@@ -92,8 +92,6 @@ pub enum OAuthStatus {
     Connected,
 }
 
-// Re-export from the canonical definition in querymt-utils (always available,
-// regardless of the `oauth` feature flag).
 pub use querymt_utils::OAuthFlowKind;
 
 /// OAuth-capable provider entry for dashboard auth UI.

@@ -464,7 +464,6 @@ async fn maybe_spawn_oauth_callback_listener(
     provider: String,
     flow_kind: OAuthFlowKind,
 ) {
-    // Only redirect-based flows need a local HTTP callback listener.
     if flow_kind != OAuthFlowKind::RedirectCode {
         return;
     }

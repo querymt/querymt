@@ -49,7 +49,6 @@ pub struct KimiCode {
     #[serde(skip)]
     #[schemars(skip)]
     pub key_resolver: Option<Arc<dyn ApiKeyResolver>>,
-    /// Cached Kimi device identity / OAuth config (avoids recomputing per request).
     #[serde(skip)]
     #[schemars(skip)]
     pub kimi_profile: Option<kimi_auth::OAuthConfig>,
@@ -224,9 +223,6 @@ impl KimiCode {
             return Ok(());
         };
 
-        // Build a lookup from tool-call ID to reasoning content from source
-        // messages.  Each assistant tool-use message may contain multiple tool
-        // calls; all of them share the same reasoning (thinking) text.
         let mut reasoning_by_tool_id: HashMap<&str, &str> = HashMap::new();
         for msg in source_messages {
             if let (ChatRole::Assistant, MessageType::ToolUse(calls)) =
@@ -243,9 +239,9 @@ impl KimiCode {
             let Some(obj) = msg.as_object_mut() else {
                 continue;
             };
-            let is_assistant = obj.get("role").and_then(Value::as_str) == Some("assistant");
-            let has_tool_calls = obj.get("tool_calls").is_some_and(|v| !v.is_null());
-            if !is_assistant || !has_tool_calls {
+            if obj.get("role").and_then(Value::as_str) != Some("assistant")
+                || !obj.get("tool_calls").is_some_and(|v| !v.is_null())
+            {
                 continue;
             }
 
@@ -253,8 +249,6 @@ impl KimiCode {
                 continue;
             }
 
-            // Look up reasoning by matching tool-call IDs in the serialized JSON
-            // against the source message map.
             let from_source = obj
                 .get("tool_calls")
                 .and_then(Value::as_array)
@@ -272,12 +266,15 @@ impl KimiCode {
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_default();
 
-            let reasoning_content = KimiCode::normalize_reasoning_content(
-                from_source.unwrap_or(content_fallback).to_string(),
-            );
+            let value = from_source.unwrap_or(content_fallback);
+            let reasoning_content = if value.trim().is_empty() {
+                "Tool call reasoning unavailable."
+            } else {
+                value
+            };
             obj.insert(
-                "reasoning_content".to_string(),
-                Value::String(reasoning_content),
+                "reasoning_content".into(),
+                Value::String(reasoning_content.into()),
             );
         }
 
@@ -292,14 +289,6 @@ impl KimiCode {
             None | Some(Value::Null) => true,
             Some(Value::String(s)) => s.trim().is_empty(),
             Some(_) => false,
-        }
-    }
-
-    fn normalize_reasoning_content(value: String) -> String {
-        if value.trim().is_empty() {
-            "Tool call reasoning unavailable.".to_string()
-        } else {
-            value
         }
     }
 
@@ -511,6 +500,80 @@ mod tests {
                 .and_then(Value::as_str),
             Some("Tool call reasoning unavailable.")
         );
+    }
+
+    #[test]
+    fn reasoning_content_matches_by_tool_call_id_not_position() {
+        let provider = test_provider();
+        let messages = vec![
+            ChatMessage::user().content("first").build(),
+            ChatMessage::assistant()
+                .tool_use(vec![ToolCall {
+                    id: "call_a".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "alpha".into(),
+                        arguments: "{}".into(),
+                    },
+                }])
+                .thinking("reasoning for alpha")
+                .build(),
+            ChatMessage::user().content("second").build(),
+            ChatMessage::assistant()
+                .tool_use(vec![ToolCall {
+                    id: "call_b".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "beta".into(),
+                        arguments: "{}".into(),
+                    },
+                }])
+                .thinking("reasoning for beta")
+                .build(),
+        ];
+
+        let request = provider.chat_request(&messages, None).unwrap();
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        let api_messages = body["messages"].as_array().unwrap();
+
+        let tool_msgs: Vec<&Value> = api_messages
+            .iter()
+            .filter(|m| {
+                m.get("role").and_then(Value::as_str) == Some("assistant")
+                    && m.get("tool_calls").is_some()
+            })
+            .collect();
+
+        assert_eq!(tool_msgs.len(), 2);
+        assert_eq!(
+            tool_msgs[0]["reasoning_content"].as_str(),
+            Some("reasoning for alpha")
+        );
+        assert_eq!(
+            tool_msgs[1]["reasoning_content"].as_str(),
+            Some("reasoning for beta")
+        );
+    }
+
+    #[test]
+    fn is_reasoning_content_missing_edge_cases() {
+        assert!(KimiCode::is_reasoning_content_missing(None));
+        assert!(KimiCode::is_reasoning_content_missing(Some(&Value::Null)));
+        assert!(KimiCode::is_reasoning_content_missing(Some(
+            &Value::String("".into())
+        )));
+        assert!(KimiCode::is_reasoning_content_missing(Some(
+            &Value::String("   ".into())
+        )));
+        assert!(!KimiCode::is_reasoning_content_missing(Some(
+            &Value::String("thinking".into())
+        )));
+        assert!(!KimiCode::is_reasoning_content_missing(Some(&Value::Bool(
+            false
+        ))));
+        assert!(!KimiCode::is_reasoning_content_missing(Some(
+            &serde_json::json!(42)
+        )));
     }
 }
 
