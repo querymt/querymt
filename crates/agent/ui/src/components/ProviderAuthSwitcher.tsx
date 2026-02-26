@@ -61,6 +61,7 @@ export function ProviderAuthSwitcher({
   const disconnectButtonRef = useRef<HTMLButtonElement>(null);
   const disconnectInFlightProviderRef = useRef<string | null>(null);
   const { focusMainInput } = useUiStore();
+  const isDevicePoll = oauthFlow?.flow_kind === 'device_poll';
 
   const close = () => {
     onOpenChange(false);
@@ -267,7 +268,7 @@ export function ProviderAuthSwitcher({
                 Continue OAuth for <span className="text-accent-primary">{oauthFlow.provider}</span>
               </div>
               <div className="text-xs text-ui-muted">
-                {oauthFlow.flow_kind === 'device_poll'
+                {isDevicePoll
                   ? 'Open the device authorization page (URL includes your device code), approve access, then click Check Authentication.'
                   : 'Open the authorization page, approve access, then paste the callback URL or authorization code below.'}
               </div>
@@ -297,12 +298,12 @@ export function ProviderAuthSwitcher({
                     ? 'Copied!'
                     : copyStatus === 'error'
                       ? 'Copy failed'
-                      : oauthFlow.flow_kind === 'device_poll'
+                      : isDevicePoll
                         ? 'Copy Device Login URL'
                         : 'Copy Authorization URL'}
                 </button>
 
-                {oauthFlow.flow_kind === 'device_poll' && (
+                {isDevicePoll && (
                   <button
                     type="button"
                     onKeyDown={stopCommandActivationPropagation}
@@ -322,7 +323,7 @@ export function ProviderAuthSwitcher({
                 )}
               </div>
 
-              {oauthFlow.flow_kind !== 'device_poll' && (
+              {!isDevicePoll && (
                 <div className="flex items-center gap-2">
                   <input
                     ref={callbackRef}

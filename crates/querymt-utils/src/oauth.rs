@@ -28,6 +28,9 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::time::Duration;
 
+// Re-export the flow kind type from the crate root (always available).
+pub use crate::OAuthFlowKind;
+
 // Re-export types that are part of the public API
 pub use anthropic_auth::{
     AsyncOAuthClient as AnthropicOAuthClient, OAuthConfig, OAuthMode, TokenSet,
@@ -107,6 +110,15 @@ pub trait OAuthProvider: Send + Sync {
 
     /// Get the API key environment variable name (e.g., "ANTHROPIC_API_KEY")
     fn api_key_name(&self) -> Option<&str>;
+
+    /// The OAuth flow interaction mode for this provider.
+    ///
+    /// Defaults to [`OAuthFlowKind::RedirectCode`]. Providers that use a device
+    /// authorization flow (e.g. Kimi Code) should override this to return
+    /// [`OAuthFlowKind::DevicePoll`].
+    fn flow_kind(&self) -> OAuthFlowKind {
+        OAuthFlowKind::RedirectCode
+    }
 }
 
 /// OAuth flow data returned when starting a flow
@@ -324,6 +336,10 @@ impl OAuthProvider for KimiCodeProvider {
 
     fn api_key_name(&self) -> Option<&str> {
         None
+    }
+
+    fn flow_kind(&self) -> OAuthFlowKind {
+        OAuthFlowKind::DevicePoll
     }
 }
 

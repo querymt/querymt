@@ -9882,6 +9882,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

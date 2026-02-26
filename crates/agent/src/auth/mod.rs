@@ -33,6 +33,7 @@
 //! ```
 
 // Re-export from querymt-utils
+pub use querymt_utils::OAuthFlowKind;
 pub use querymt_utils::oauth::{
     OAuthFlowData, OAuthMode, OAuthProvider, OAuthUI, TokenSet, anthropic_callback_server,
     authenticate, extract_code_from_query, get_oauth_provider, get_or_refresh_token,

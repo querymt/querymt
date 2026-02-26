@@ -26,7 +26,7 @@ remote = ["kameo/remote", "dep:libp2p"]
 [dependencies]
 querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
 querymt-provider-common = { path = "../provider-common" }
-querymt-utils = { path = "../querymt-utils", features = ["providers"] }
+querymt-utils = { path = "../querymt-utils", features = ["providers", "serde"] }
 agent-client-protocol = { version = "0.9", features = ["unstable"] }
 agent-client-protocol-schema = { version = "0.10", features = ["unstable"]}
 kameo = "0.19"

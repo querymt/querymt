@@ -92,15 +92,9 @@ pub enum OAuthStatus {
     Connected,
 }
 
-/// OAuth flow interaction mode.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OAuthFlowKind {
-    /// Redirect/callback flow where the user pastes callback URL or code.
-    RedirectCode,
-    /// Device flow where backend polls provider token endpoint.
-    DevicePoll,
-}
+// Re-export from the canonical definition in querymt-utils (always available,
+// regardless of the `oauth` feature flag).
+pub use querymt_utils::OAuthFlowKind;
 
 /// OAuth-capable provider entry for dashboard auth UI.
 #[derive(Debug, Clone, Serialize)]
