@@ -792,3 +792,40 @@ pub async fn get_or_refresh_token(provider: &str) -> Result<String> {
     let oauth_provider = get_oauth_provider(provider, None)?;
     get_valid_token(oauth_provider.as_ref(), &mut store).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_flow_kinds() {
+        let anthropic = AnthropicProvider::new(OAuthMode::Max);
+        assert_eq!(anthropic.flow_kind(), OAuthFlowKind::RedirectCode);
+        assert_eq!(anthropic.name(), "anthropic");
+
+        let codex = CodexProvider::new();
+        assert_eq!(codex.flow_kind(), OAuthFlowKind::RedirectCode);
+        assert_eq!(codex.name(), "codex");
+
+        let kimi = KimiCodeProvider::new();
+        assert_eq!(kimi.flow_kind(), OAuthFlowKind::DevicePoll);
+        assert_eq!(kimi.name(), "kimi-code");
+    }
+
+    #[test]
+    fn get_oauth_provider_returns_correct_flow_kinds() {
+        let anthropic = get_oauth_provider("anthropic", None).unwrap();
+        assert_eq!(anthropic.flow_kind(), OAuthFlowKind::RedirectCode);
+
+        let codex = get_oauth_provider("codex", None).unwrap();
+        assert_eq!(codex.flow_kind(), OAuthFlowKind::RedirectCode);
+
+        let kimi = get_oauth_provider("kimi-code", None).unwrap();
+        assert_eq!(kimi.flow_kind(), OAuthFlowKind::DevicePoll);
+    }
+
+    #[test]
+    fn get_oauth_provider_rejects_unknown() {
+        assert!(get_oauth_provider("unknown-provider", None).is_err());
+    }
+}

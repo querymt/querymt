@@ -735,6 +735,15 @@ mod tests {
         assert_eq!(flow_started["type"], "oauth_flow_started");
         assert_eq!(flow_started["flow_kind"], "redirect_code");
 
+        let flow_started_device = serde_json::to_value(UiServerMessage::OAuthFlowStarted {
+            flow_id: "flow-2".to_string(),
+            provider: "kimi-code".to_string(),
+            authorization_url: "https://example.com/device".to_string(),
+            flow_kind: OAuthFlowKind::DevicePoll,
+        })
+        .expect("OAuthFlowStarted (DevicePoll) should serialize");
+        assert_eq!(flow_started_device["flow_kind"], "device_poll");
+
         let result = serde_json::to_value(UiServerMessage::OAuthResult {
             provider: "openai".to_string(),
             success: true,
