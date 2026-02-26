@@ -8,7 +8,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use colored::*;
-use querymt_utils::oauth::{OAuthFlowData, OAuthProvider, OAuthUI};
+use querymt_utils::oauth::{OAuthFlowData, OAuthFlowKind, OAuthProvider, OAuthUI};
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -48,6 +48,42 @@ impl OAuthUI for ConsoleOAuthUI {
         provider: &dyn OAuthProvider,
         flow: &OAuthFlowData,
     ) -> Result<Option<(querymt_utils::oauth::TokenSet, Option<String>)>> {
+        // Device-poll flow: show URL, open browser, poll for token.
+        if provider.flow_kind() == OAuthFlowKind::DevicePoll {
+            println!(
+                "\n{} Please visit this URL to authorize:",
+                "🔐".bright_green()
+            );
+            println!("{}\n", flow.authorization_url.bright_yellow());
+
+            match open::that(&flow.authorization_url) {
+                Ok(_) => println!("{} Browser opened automatically\n", "✓".bright_green()),
+                Err(_) => println!(
+                    "{} Could not open browser automatically\n",
+                    "!".bright_yellow()
+                ),
+            }
+
+            println!("{} Waiting for device authorization...", "⏳".bright_cyan());
+            println!(
+                "   (Approve the request in your browser, then authentication will complete automatically)\n"
+            );
+
+            let tokens = provider
+                .exchange_code("", &flow.state, &flow.verifier)
+                .await?;
+
+            println!("{} Device authorization complete!", "✓".bright_green());
+
+            let api_key = provider
+                .create_api_key(&tokens.access_token)
+                .await
+                .ok()
+                .flatten();
+
+            return Ok(Some((tokens, api_key)));
+        }
+
         // Only use callback server for Codex
         if provider.name() != "codex" {
             return Ok(None);
