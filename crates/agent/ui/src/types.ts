@@ -420,7 +420,13 @@ export type UiServerMessage =
   | { type: 'recent_models'; by_workspace: Record<string, RecentModelEntry[]> }
   | { type: 'provider_capabilities'; providers: ProviderCapabilityEntry[] }
   | { type: 'auth_providers'; providers: AuthProviderEntry[] }
-  | { type: 'oauth_flow_started'; flow_id: string; provider: string; authorization_url: string }
+  | {
+      type: 'oauth_flow_started';
+      flow_id: string;
+      provider: string;
+      authorization_url: string;
+      flow_kind: OAuthFlowKind;
+    }
   | { type: 'oauth_result'; provider: string; success: boolean; message: string }
   | { type: 'file_index'; files: FileIndexEntry[]; generated_at: number }
   | { type: 'llm_config'; config_id: number; provider: string; model: string; params?: Record<string, unknown> | null }
@@ -493,6 +499,7 @@ export interface ModelDownloadStatus {
 }
 
 export type OAuthStatus = 'not_authenticated' | 'expired' | 'connected';
+export type OAuthFlowKind = 'redirect_code' | 'device_poll';
 
 export interface AuthProviderEntry {
   provider: string;
@@ -504,6 +511,7 @@ export interface OAuthFlowState {
   flow_id: string;
   provider: string;
   authorization_url: string;
+  flow_kind: OAuthFlowKind;
 }
 
 export interface OAuthResultState {

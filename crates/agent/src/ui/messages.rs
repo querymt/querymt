@@ -92,6 +92,16 @@ pub enum OAuthStatus {
     Connected,
 }
 
+/// OAuth flow interaction mode.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthFlowKind {
+    /// Redirect/callback flow where the user pastes callback URL or code.
+    RedirectCode,
+    /// Device flow where backend polls provider token endpoint.
+    DevicePoll,
+}
+
 /// OAuth-capable provider entry for dashboard auth UI.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthProviderEntry {
@@ -403,6 +413,7 @@ pub enum UiServerMessage {
         flow_id: String,
         provider: String,
         authorization_url: String,
+        flow_kind: OAuthFlowKind,
     },
     /// OAuth flow completion result
     #[serde(rename = "oauth_result")]
@@ -483,7 +494,7 @@ impl UiServerMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginUpdateResult, UiClientMessage, UiServerMessage};
+    use super::{OAuthFlowKind, PluginUpdateResult, UiClientMessage, UiServerMessage};
     use serde_json::json;
 
     #[test]
@@ -724,9 +735,11 @@ mod tests {
             flow_id: "flow-1".to_string(),
             provider: "openai".to_string(),
             authorization_url: "https://example.com".to_string(),
+            flow_kind: OAuthFlowKind::RedirectCode,
         })
         .expect("OAuthFlowStarted should serialize");
         assert_eq!(flow_started["type"], "oauth_flow_started");
+        assert_eq!(flow_started["flow_kind"], "redirect_code");
 
         let result = serde_json::to_value(UiServerMessage::OAuthResult {
             provider: "openai".to_string(),
