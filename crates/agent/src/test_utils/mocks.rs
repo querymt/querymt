@@ -35,6 +35,7 @@ mock! {
         async fn list_sessions(&self) -> SessionResult<Vec<Session>>;
         async fn delete_session(&self, session_id: &str) -> SessionResult<()>;
         async fn get_history(&self, session_id: &str) -> SessionResult<Vec<crate::model::AgentMessage>>;
+        async fn get_effective_history(&self, session_id: &str) -> SessionResult<Vec<crate::model::AgentMessage>>;
         async fn add_message(&self, session_id: &str, message: crate::model::AgentMessage) -> SessionResult<()>;
         async fn fork_session(
             &self,

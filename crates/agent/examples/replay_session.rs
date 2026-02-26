@@ -43,6 +43,7 @@ use querymt::plugin::host::PluginRegistry;
 use querymt::plugin::host::native::NativeLoader;
 use querymt_agent::events::AgentEvent;
 use querymt_agent::model::MessagePart;
+use querymt_agent::session::projection::EventJournal;
 #[cfg(feature = "remote")]
 use querymt_agent::session::provider::ProviderRouting;
 use querymt_agent::session::provider::build_provider_from_config;
@@ -357,7 +358,12 @@ async fn load_events(
     store: &SqliteStorage,
     session_id: &str,
 ) -> Result<Vec<AgentEvent>, Box<dyn std::error::Error>> {
-    let events = store.get_session_events(session_id).await?;
+    let events = store
+        .load_session_stream(session_id, None, None)
+        .await?
+        .into_iter()
+        .map(AgentEvent::from)
+        .collect();
     Ok(events)
 }
 
@@ -401,7 +407,12 @@ async fn load_tools_from_events(
 ) -> Result<Vec<querymt::chat::Tool>, Box<dyn std::error::Error>> {
     use querymt_agent::events::AgentEventKind;
 
-    let events = store.get_session_events(session_id).await?;
+    let events: Vec<AgentEvent> = store
+        .load_session_stream(session_id, None, None)
+        .await?
+        .into_iter()
+        .map(AgentEvent::from)
+        .collect();
 
     // Find the last tools_available event
     for event in events.iter().rev() {

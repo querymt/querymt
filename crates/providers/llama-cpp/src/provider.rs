@@ -30,11 +30,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
+/// Cache key for model loading — only params that affect `LlamaModel::load_from_file`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelCacheKey {
+    /// Resolved absolute path to the GGUF file.
+    pub model_path: String,
+    /// Number of GPU layers (affects Metal/CUDA offloading).
+    pub n_gpu_layers: Option<u32>,
+}
+
+/// A cached model + multimodal context, shared across provider instances.
+pub(crate) struct CachedModel {
+    pub key: ModelCacheKey,
+    pub model: Arc<LlamaModel>,
+    pub multimodal: Option<Arc<MultimodalContext>>,
+}
+
 /// The main llama.cpp provider.
 pub(crate) struct LlamaCppProvider {
     pub(crate) model: Arc<LlamaModel>,
     pub(crate) cfg: LlamaCppConfig,
-    pub(crate) multimodal: Option<MultimodalContext>,
+    pub(crate) multimodal: Option<Arc<MultimodalContext>>,
 }
 
 impl LlamaCppProvider {
@@ -101,7 +117,8 @@ impl LlamaCppProvider {
         };
 
         // Initialize multimodal support if available
-        let multimodal = MultimodalContext::new(&model, &cfg, model_hf_repo.as_deref())?;
+        let multimodal =
+            MultimodalContext::new(&model, &cfg, model_hf_repo.as_deref())?.map(Arc::new);
 
         if let Some(ref mm_ctx) = multimodal {
             log::info!(
@@ -121,6 +138,123 @@ impl LlamaCppProvider {
         };
 
         // Advisory memory warning at startup — never fails, just informs.
+        Self::log_memory_advisory(&provider);
+
+        Ok(provider)
+    }
+
+    /// Build a provider, reusing a cached model if the cache key matches.
+    ///
+    /// Model loading (`LlamaModel::load_from_file`) is the expensive operation.
+    /// The cache stores the loaded `Arc<LlamaModel>` and `Arc<MultimodalContext>`.
+    /// Each call returns a cheap provider wrapper that shares the cached model
+    /// but carries its own per-request config (system, temperature, etc.).
+    pub(crate) fn new_with_cache(
+        cfg: LlamaCppConfig,
+        cache: &std::sync::Mutex<Option<CachedModel>>,
+    ) -> Result<Self, LLMError> {
+        install_abort_callback();
+
+        let mut backend = llama_backend()?;
+        let log_mode = cfg.log.unwrap_or(LlamaCppLogMode::Off);
+        match log_mode {
+            LlamaCppLogMode::Stderr => {}
+            LlamaCppLogMode::Tracing => send_logs_to_tracing(LogOptions::default()),
+            LlamaCppLogMode::Off => backend.void_logs(),
+        }
+
+        let model_path = Self::resolve_model_path(&cfg.model, cfg.fast_download.unwrap_or(false))?;
+        let model_path_str = model_path.to_string_lossy().to_string();
+        let key = ModelCacheKey {
+            model_path: model_path_str,
+            n_gpu_layers: cfg.n_gpu_layers,
+        };
+
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(cached) = guard.as_ref() {
+            if cached.key == key {
+                // Cache hit — reuse model, attach new config
+                log::debug!("LlamaCpp model cache hit: {}", key.model_path);
+                let provider = Self {
+                    model: Arc::clone(&cached.model),
+                    cfg,
+                    multimodal: cached.multimodal.as_ref().map(Arc::clone),
+                };
+                return Ok(provider);
+            }
+            // Cache miss — different model, evict old one
+            log::info!(
+                "LlamaCpp model cache evict: {} -> {}",
+                cached.key.model_path,
+                key.model_path
+            );
+        }
+
+        // Drop the guard before expensive model loading to avoid holding the
+        // mutex for a long time (model loading can take seconds).
+        // We'll re-acquire to store the result.
+        drop(guard);
+
+        // Load new model
+        let model_path = Path::new(&key.model_path);
+        if !model_path.exists() {
+            return Err(LLMError::InvalidRequest(format!(
+                "Model path does not exist: {}",
+                model_path.display()
+            )));
+        }
+
+        let mut params = LlamaModelParams::default();
+        if let Some(n_gpu_layers) = cfg.n_gpu_layers {
+            params = params.with_n_gpu_layers(n_gpu_layers);
+        }
+
+        let model = Arc::new(
+            LlamaModel::load_from_file(&backend, model_path, &params)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?,
+        );
+
+        let model_hf_repo = match parse_model_ref(&cfg.model) {
+            Ok(ModelRef::Hf(hf_ref)) => Some(hf_ref.repo),
+            _ => None,
+        };
+
+        let multimodal =
+            MultimodalContext::new(&model, &cfg, model_hf_repo.as_deref())?.map(Arc::new);
+
+        if let Some(ref mm_ctx) = multimodal {
+            log::info!(
+                "Multimodal support enabled (marker: '{}', vision: {}, audio: {})",
+                mm_ctx.marker(),
+                mm_ctx.ctx.support_vision(),
+                mm_ctx.ctx.support_audio()
+            );
+        } else {
+            log::debug!("Multimodal support not available for this model");
+        }
+
+        // Store in cache
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(CachedModel {
+            key,
+            model: Arc::clone(&model),
+            multimodal: multimodal.as_ref().map(Arc::clone),
+        });
+
+        let provider = Self {
+            model,
+            cfg,
+            multimodal,
+        };
+
+        Self::log_memory_advisory(&provider);
+
+        Ok(provider)
+    }
+
+    /// Log advisory memory warnings at startup.
+    fn log_memory_advisory(provider: &Self) {
         if let Some(n_ctx) = provider.cfg.n_ctx {
             let est = estimate_context_memory(&provider.model, &provider.cfg, n_ctx);
             log::info!(
@@ -153,8 +287,6 @@ impl LlamaCppProvider {
                 );
             }
         }
-
-        Ok(provider)
     }
 }
 
@@ -239,7 +371,7 @@ impl ChatProvider for LlamaCppProvider {
             &prompt,
             max_tokens,
             None,
-            self.multimodal.as_ref(),
+            self.multimodal.as_deref(),
             &bitmaps,
         )?;
         // Fallback handling (existing logic)
@@ -253,7 +385,7 @@ impl ChatProvider for LlamaCppProvider {
                     &fallback_prompt,
                     max_tokens,
                     None,
-                    self.multimodal.as_ref(),
+                    self.multimodal.as_deref(),
                     &bitmaps,
                 )?;
             }
@@ -266,7 +398,7 @@ impl ChatProvider for LlamaCppProvider {
                 &raw_prompt,
                 max_tokens,
                 None,
-                self.multimodal.as_ref(),
+                self.multimodal.as_deref(),
                 &bitmaps,
             )?;
         }
@@ -387,7 +519,7 @@ impl ChatProvider for LlamaCppProvider {
                     max_tokens,
                     None,
                     &tx,
-                    multimodal.as_ref(),
+                    multimodal.as_deref(),
                     &bitmaps,
                 ) {
                     Ok(usage) => {
@@ -413,7 +545,7 @@ impl ChatProvider for LlamaCppProvider {
                     max_tokens,
                     None,
                     &tx,
-                    multimodal.as_ref(),
+                    multimodal.as_deref(),
                     &bitmaps,
                 ) {
                     Ok(usage) => {

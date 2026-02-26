@@ -77,12 +77,11 @@ pub(super) async fn run_ai_compaction(
     current_state: &ExecutionState,
 ) -> Result<ExecutionState, anyhow::Error> {
     let session_id = &exec_ctx.session_id;
-    let raw_messages = exec_ctx
+    let messages = exec_ctx
         .session_handle
-        .get_agent_history()
+        .get_effective_agent_history()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get agent history: {}", e))?;
-    let messages = crate::session::compaction::filter_to_effective_history(raw_messages);
 
     let token_estimate = messages
         .iter()
@@ -168,12 +167,11 @@ pub(super) async fn run_ai_compaction(
         },
     );
 
-    let new_messages = exec_ctx
+    let filtered_messages = exec_ctx
         .session_handle
-        .get_agent_history()
+        .get_effective_agent_history()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get new history: {}", e))?;
-    let filtered_messages = crate::session::compaction::filter_to_effective_history(new_messages);
 
     // Convert AgentMessages to ChatMessages for the ConversationContext
     let prompt_limit = exec_ctx

@@ -157,6 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             discovery: MeshDiscovery::Mdns,
             bootstrap_peers: vec![],
             directory: querymt_agent::agent::remote::mesh::DirectoryMode::default(),
+            request_timeout: std::time::Duration::from_secs(300),
         };
 
         match bootstrap_mesh(&mesh_config).await {

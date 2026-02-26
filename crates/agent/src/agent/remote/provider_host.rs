@@ -20,7 +20,6 @@ use querymt::ToolCall;
 use querymt::Usage;
 use querymt::chat::{ChatMessage, ChatResponse, FinishReason, StreamChunk, Tool};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -120,6 +119,13 @@ pub struct ProviderChatRequest {
     pub messages: Vec<ChatMessage>,
     /// Tool definitions, if any.
     pub tools: Option<Vec<Tool>>,
+    /// Per-session LLM parameters (system prompt, temperature, top_p, etc.)
+    /// forwarded from the requesting node's delegate config.
+    ///
+    /// `None` when the requesting node is an old version that doesn't send
+    /// params — the host falls back to its own `initial_params`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
 }
 
 /// Streaming provider call message (use `tell()`).
@@ -140,6 +146,10 @@ pub struct ProviderStreamRequest {
     /// DHT name of the `StreamReceiverActor` on the requesting node.
     /// Format: `"stream_rx::{request_id}"`.
     pub stream_receiver_name: String,
+    /// Per-session LLM parameters forwarded from the requesting node.
+    /// See [`ProviderChatRequest::params`] for details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
 }
 
 // ── StreamReceiverActor ───────────────────────────────────────────────────────
@@ -225,63 +235,56 @@ impl Message<StreamChunkRelay> for StreamReceiverActor {
 ///
 /// Spawned once during mesh bootstrap alongside `RemoteNodeManager`.
 /// Registered in the DHT as `"provider_host::peer::{peer_id}"`.
+///
+/// # Provider construction
+///
+/// Each request carries optional per-session `params` (system prompt,
+/// temperature, etc.) from the requesting node.  The host merges these
+/// with its own `initial_params` (hardware config like `n_ctx`,
+/// `flash_attention`, model path) and builds a fresh provider per
+/// request.  This is cheap because expensive model loading is cached
+/// at the factory level (e.g. `LlamaCppFactory` caches the loaded
+/// `Arc<LlamaModel>`).
 #[derive(Actor)]
 pub struct ProviderHostActor {
     config: Arc<AgentConfig>,
-    /// LRU-style provider cache keyed by `(provider_name, model)`.
-    /// Re-uses already-constructed providers to avoid redundant plugin loads.
-    provider_cache: HashMap<(String, String), Arc<dyn LLMProvider>>,
 }
 
 impl ProviderHostActor {
     pub fn new(config: Arc<AgentConfig>) -> Self {
-        Self {
-            config,
-            provider_cache: HashMap::new(),
-        }
+        Self { config }
     }
 
-    /// Resolve or build the provider for the given name + model.
+    /// Build a provider for a single request, merging request params with
+    /// host defaults.
+    ///
+    /// Request params (system, temperature, top_p, etc.) override host
+    /// defaults.  `api_key` is always stripped from request params —
+    /// keys never leave the owning node.
     #[tracing::instrument(
-        name = "remote.provider_host.get_or_build_provider",
-        skip(self),
-        fields(provider = %provider_name, model = %model, cache_hit = tracing::field::Empty)
+        name = "remote.provider_host.build_provider_for_request",
+        skip(self, request_params),
+        fields(provider = %provider_name, model = %model)
     )]
-    async fn get_or_build_provider(
-        &mut self,
+    async fn build_provider_for_request(
+        &self,
         provider_name: &str,
         model: &str,
+        request_params: Option<&serde_json::Value>,
     ) -> Result<Arc<dyn LLMProvider>, AgentError> {
-        let key = (provider_name.to_string(), model.to_string());
+        let host_defaults = params_for_remote_provider(self.config.provider.initial_params());
 
-        if let Some(cached) = self.provider_cache.get(&key) {
-            tracing::Span::current().record("cache_hit", true);
-            return Ok(Arc::clone(cached));
-        }
-
-        tracing::Span::current().record("cache_hit", false);
+        // Request params override host defaults
+        let merged = merge_params(request_params, host_defaults.as_ref());
 
         let plugin_registry = self.config.provider.plugin_registry();
 
-        // Merge the custom parameters stored in the agent config's initial LLM
-        // params (populated from `[agent.parameters]` in the TOML) into a JSON
-        // value so that provider-specific settings — most critically the `model`
-        // override that maps a friendly name like `"qwen3-coder"` to an actual
-        // GGUF / HF path — are forwarded to `build_provider_from_config`.
-        // Without this, `build_provider_from_config` would only receive the bare
-        // model name and providers like `llama_cpp` would reject it as invalid.
-        let initial_params = self.config.provider.initial_params();
-        let params_json: Option<serde_json::Value> = initial_params
-            .custom
-            .as_ref()
-            .and_then(|c| serde_json::to_value(c).ok());
-
-        let provider = build_provider_from_config(
+        build_provider_from_config(
             &plugin_registry,
             provider_name,
             model,
-            params_json.as_ref(), // forward agent parameters (e.g. model path, n_ctx)
-            None,                 // no API key override — use local keys
+            merged.as_ref(),
+            None, // no API key override — use local keys
             ProviderRouting {
                 provider_node_id: None,     // always local on the owning node
                 mesh_handle: None,          // not needed — owning node builds directly
@@ -294,10 +297,83 @@ impl ProviderHostActor {
                 "ProviderHostActor: failed to build provider '{}' model '{}': {}",
                 provider_name, model, e
             ))
-        })?;
+        })
+    }
+}
 
-        self.provider_cache.insert(key, Arc::clone(&provider));
-        Ok(provider)
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Serialize [`LLMParams`] for forwarding to a remote provider, excluding
+/// fields that are passed as separate arguments to
+/// [`build_provider_from_config`] (`provider`, `model`, `name`) and
+/// sensitive credentials (`api_key`) that must never leave the owning node.
+///
+/// This ensures *all* configuration — system prompt, temperature, top_p,
+/// custom provider keys, etc. — reaches the remote provider factory.
+pub(crate) fn params_for_remote_provider(params: &querymt::LLMParams) -> Option<serde_json::Value> {
+    serde_json::to_value(params).ok().and_then(|v| match v {
+        serde_json::Value::Object(mut obj) => {
+            obj.remove("api_key");
+            obj.remove("provider");
+            obj.remove("model");
+            obj.remove("name");
+            if obj.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Object(obj))
+            }
+        }
+        _ => None,
+    })
+}
+
+/// Merge per-request params (from the requesting node's delegate config)
+/// with host defaults (from this node's `initial_params`).
+///
+/// - Start with host defaults (hardware params like `n_ctx`, `flash_attention`,
+///   `kv_cache_type_k/v`, model path, etc.).
+/// - Overlay request params on top (overrides `system`, `temperature`, `top_p`,
+///   etc. with the delegate's per-session values).
+/// - `api_key` is always stripped from request params (security: keys never
+///   leave the owning node).
+///
+/// Returns `None` if neither host defaults nor request params have any fields.
+pub(crate) fn merge_params(
+    request_params: Option<&serde_json::Value>,
+    host_defaults: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (host_defaults, request_params) {
+        (None, None) => None,
+        (Some(defaults), None) => Some(defaults.clone()),
+        (None, Some(request)) => {
+            // Strip api_key from request params
+            let mut merged = request.clone();
+            if let Some(obj) = merged.as_object_mut() {
+                obj.remove("api_key");
+            }
+            if merged.as_object().is_some_and(|o| o.is_empty()) {
+                None
+            } else {
+                Some(merged)
+            }
+        }
+        (Some(defaults), Some(request)) => {
+            let mut merged = defaults.clone();
+            if let (Some(base), Some(overlay)) = (merged.as_object_mut(), request.as_object()) {
+                for (key, value) in overlay {
+                    // api_key never leaves the owning node
+                    if key == "api_key" {
+                        continue;
+                    }
+                    base.insert(key.clone(), value.clone());
+                }
+            }
+            if merged.as_object().is_some_and(|o| o.is_empty()) {
+                None
+            } else {
+                Some(merged)
+            }
+        }
     }
 }
 
@@ -314,6 +390,7 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
             model = %msg.model,
             message_count = msg.messages.len(),
             has_tools = msg.tools.is_some(),
+            has_params = msg.params.is_some(),
             tool_calls_returned = tracing::field::Empty,
             finish_reason = tracing::field::Empty,
         )
@@ -324,7 +401,7 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let provider = self
-            .get_or_build_provider(&msg.provider, &msg.model)
+            .build_provider_for_request(&msg.provider, &msg.model, msg.params.as_ref())
             .await?;
 
         let tools_slice = msg.tools.as_deref();
@@ -375,6 +452,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
             model = %msg.model,
             message_count = msg.messages.len(),
             has_tools = msg.tools.is_some(),
+            has_params = msg.params.is_some(),
             receiver_name = %msg.stream_receiver_name,
             receiver_found = tracing::field::Empty,
         )
@@ -387,7 +465,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
         use futures_util::StreamExt;
 
         let provider = self
-            .get_or_build_provider(&msg.provider, &msg.model)
+            .build_provider_for_request(&msg.provider, &msg.model, msg.params.as_ref())
             .await?;
 
         let tools_slice = msg.tools.as_deref();

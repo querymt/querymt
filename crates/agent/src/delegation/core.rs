@@ -7,7 +7,7 @@ use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
 use crate::verification::VerificationSpec;
 use crate::verification::service::{VerificationContext, VerificationService};
-use agent_client_protocol::{ContentBlock, PromptRequest, TextContent};
+use agent_client_protocol::{ContentBlock, PromptRequest, StopReason, TextContent};
 use log::{debug, error, warn};
 use querymt::chat::ChatRole;
 use serde::{Deserialize, Serialize};
@@ -467,7 +467,7 @@ async fn execute_delegation(
 
     // 2. Generate and inject planning summary via kameo message
     if let Some(ref summarizer) = ctx.delegation_summarizer {
-        match ctx.store.get_history(&parent_session_id).await {
+        match ctx.store.get_effective_history(&parent_session_id).await {
             Ok(history) => {
                 match summarizer.summarize(&history, &delegation.objective).await {
                     Ok(summary) => {
@@ -541,6 +541,30 @@ async fn execute_delegation(
     };
 
     match prompt_result {
+        Some(Ok(ref response)) if response.stop_reason != StopReason::EndTurn => {
+            // Delegate stopped prematurely (e.g. context threshold, max turns, refusal).
+            // This is NOT a successful completion — the delegate was cut short and its
+            // output is likely truncated/incomplete.
+            let error_message =
+                format!("Delegate stopped prematurely: {:?}", response.stop_reason,);
+            warn!(
+                "Delegation {} for agent '{}' stopped with {:?} instead of EndTurn",
+                delegation_id, delegation.target_agent_id, response.stop_reason,
+            );
+            fail_delegation(
+                &ctx.event_sink,
+                &ctx.delegator,
+                &ctx.store,
+                &ctx.config,
+                &parent_session_id,
+                &delegation.public_id,
+                &error_message,
+            )
+            .await;
+
+            let mut active = ctx.active_delegations.lock().await;
+            active.remove(&delegation_id);
+        }
         Some(Ok(_)) => {
             // 4. Verification (same as legacy path)
             let verification_passed = if ctx.config.run_verification {

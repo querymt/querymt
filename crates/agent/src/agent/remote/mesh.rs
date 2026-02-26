@@ -16,6 +16,7 @@
 //!     discovery: MeshDiscovery::Mdns,
 //!     bootstrap_peers: vec![],
 //!     directory: DirectoryMode::default(),
+//!     request_timeout: std::time::Duration::from_secs(300),
 //! };
 //! let mesh = bootstrap_mesh(&config).await?;
 //! println!("Mesh peer ID: {}", mesh.peer_id());
@@ -28,8 +29,8 @@
 //! Use `MeshDiscovery::None` with explicit `bootstrap_peers` addresses for
 //! deployments where mDNS multicast is not available.
 
-use libp2p::PeerId;
-use std::collections::HashSet;
+use libp2p::{Multiaddr, PeerId};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -111,6 +112,16 @@ pub struct MeshConfig {
     /// [`DirectoryMode::Cached`] for small LAN meshes to eliminate first-call
     /// Kademlia latency.
     pub directory: DirectoryMode,
+
+    /// Timeout for non-streaming mesh request-response calls.
+    ///
+    /// This controls how long a caller waits for a response to `ask()` calls
+    /// over the mesh (e.g. compaction, no-tools LLM inference).  The default
+    /// libp2p request-response timeout is only 10 s, which is far too short
+    /// for LLM inference on large contexts.
+    ///
+    /// Defaults to 300 seconds (5 minutes).
+    pub request_timeout: std::time::Duration,
 }
 
 impl Default for MeshConfig {
@@ -121,6 +132,7 @@ impl Default for MeshConfig {
             discovery: MeshDiscovery::Mdns,
             bootstrap_peers: vec![],
             directory: DirectoryMode::default(),
+            request_timeout: std::time::Duration::from_secs(300),
         }
     }
 }
@@ -171,9 +183,14 @@ pub struct MeshHandle {
     /// Broadcast channel for peer lifecycle events.
     /// Capacity 32 — more than enough for typical mesh sizes.
     peer_events_tx: broadcast::Sender<PeerEvent>,
-    /// Set of currently-alive peer IDs (inserted on Discovered, removed on Expired).
-    /// Used as ground truth to filter stale DHT records when listing remote nodes.
-    known_peers: Arc<RwLock<HashSet<PeerId>>>,
+    /// Map of currently-alive peers → their last-known multiaddrs.
+    ///
+    /// Inserted/updated on mDNS Discovered, removed on Expired.  Used as
+    /// ground truth to filter stale DHT records when listing remote nodes,
+    /// and to distinguish a genuine address change from a periodic mDNS
+    /// re-announcement of an already-connected peer (which must not trigger
+    /// the re-registration cascade or a PeerEvent).
+    known_peers: Arc<RwLock<HashMap<PeerId, HashSet<Multiaddr>>>>,
     /// Hostname of this node, cached at bootstrap time for display-only metadata.
     local_hostname: Arc<String>,
     /// Re-registration closures for all locally-registered actors.
@@ -201,7 +218,7 @@ impl MeshHandle {
     fn new(
         peer_id: PeerId,
         peer_events_tx: broadcast::Sender<PeerEvent>,
-        known_peers: Arc<RwLock<HashSet<PeerId>>>,
+        known_peers: Arc<RwLock<HashMap<PeerId, HashSet<Multiaddr>>>>,
         local_hostname: String,
         re_register_fns: Arc<RwLock<Vec<ReRegisterFn>>>,
     ) -> Self {
@@ -229,10 +246,10 @@ impl MeshHandle {
         self.known_peers
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(peer_id)
+            .contains_key(peer_id)
     }
 
-    /// Inject a peer directly into the `known_peers` set, bypassing mDNS.
+    /// Inject a peer directly into the `known_peers` map, bypassing mDNS.
     ///
     /// **Test-only.** In production `known_peers` is populated exclusively by
     /// mDNS `Discovered` events (which require real network time).  This helper
@@ -244,7 +261,8 @@ impl MeshHandle {
         self.known_peers
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(peer_id);
+            .entry(peer_id)
+            .or_default();
     }
 
     /// Subscribe to peer lifecycle events (discovered / expired).
@@ -391,7 +409,7 @@ impl MeshHandle {
             .known_peers
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
+            .keys()
             .copied()
             .collect();
 
@@ -449,6 +467,16 @@ impl MeshHandle {
         );
         None
     }
+
+    /// Return all currently-known peer IDs (alive, not expired).
+    pub fn known_peer_ids(&self) -> Vec<PeerId> {
+        self.known_peers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect()
+    }
 }
 
 /// Bootstrap the kameo mesh swarm.
@@ -496,7 +524,8 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
     let peer_events_tx_loop = peer_events_tx.clone();
 
     // Shared set of currently-alive peers, maintained by the event loop.
-    let known_peers: Arc<RwLock<HashSet<PeerId>>> = Arc::new(RwLock::new(HashSet::new()));
+    let known_peers: Arc<RwLock<HashMap<PeerId, HashSet<Multiaddr>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
     let known_peers_loop = Arc::clone(&known_peers);
 
     // Re-registration closures — populated by register_actor, consumed by the
@@ -529,8 +558,12 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         .with_quic()
         .with_behaviour(|key| {
             let local_peer_id = key.public().to_peer_id();
-            let kameo_behaviour =
-                remote::Behaviour::new(local_peer_id, remote::messaging::Config::default());
+            let kameo_behaviour = remote::Behaviour::new(
+                local_peer_id,
+                remote::messaging::Config::default()
+                    .with_request_timeout(config.request_timeout)
+                    .with_response_size_maximum(50 * 1024 * 1024),
+            );
             // Use a short TTL and query interval so disconnected peers are
             // detected promptly (~30 s) rather than waiting for the 5-minute
             // libp2p default. The query_interval drives how often we re-announce
@@ -581,58 +614,131 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         loop {
             match swarm.select_next_some().await {
                 SwarmEvent::Behaviour(MeshBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    // A single peer may be reported multiple times in the list
-                    // (once per transport address, e.g. TCP + QUIC).  Register
-                    // all addresses but emit only one PeerEvent per unique peer
-                    // so downstream watchers don't fire redundant DHT queries.
-                    let mut seen = std::collections::HashSet::new();
+                    // A single mDNS event may carry multiple (peer_id, multiaddr)
+                    // pairs — one per transport (TCP, QUIC) and one per address.
+                    // We always call add_peer_address so libp2p's peer store stays
+                    // current, but we only fire PeerEvent::Discovered + the
+                    // re-registration cascade when something genuinely changed:
+                    //
+                    //   • Peer is brand-new (not in known_peers)            → full event
+                    //   • Peer is known but gained at least one new address  → full event
+                    //     (address change: host got a new IP, VPN reconnect, etc.)
+                    //   • Peer is known and ALL addresses are already tracked → skip
+                    //     (periodic mDNS re-announcement, ~every 15 s)
+                    //
+                    // Suppressing the cascade for the third case is the fix for
+                    // in-flight LLM stream disruption: the re-registration of all
+                    // ephemeral stream_rx::* actors mid-stream caused kameo to
+                    // invalidate in-flight request routing, dropping chunks and
+                    // triggering the 60 s STREAM_CHUNK_TIMEOUT.
+                    //
+                    // Collect addresses per peer first so we can check atomically.
+                    let mut addrs_by_peer: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
                     for (peer_id, multiaddr) in list {
-                        swarm.add_peer_address(peer_id, multiaddr);
-                        if seen.insert(peer_id) {
-                            log::info!("mDNS discovered peer: {peer_id}");
-                            // Track as alive
-                            if let Ok(mut peers) = known_peers_loop.write() {
-                                peers.insert(peer_id);
-                            }
-                            let _ = peer_events_tx_loop.send(PeerEvent::Discovered(peer_id));
+                        swarm.add_peer_address(peer_id, multiaddr.clone());
+                        addrs_by_peer.entry(peer_id).or_default().push(multiaddr);
+                    }
 
-                            // Phase 1c: re-publish all locally registered actors into
-                            // the new peer's Kademlia routing table so that lookups
-                            // from the new peer succeed immediately rather than waiting
-                            // for the next Kademlia republish cycle.
-                            let fns: Vec<ReRegisterFn> = re_register_fns_loop
-                                .read()
-                                .map(|g| g.clone())
-                                .unwrap_or_default();
-                            if !fns.is_empty() {
-                                tokio::spawn(async move {
-                                    for f in &fns {
-                                        f().await;
-                                    }
-                                });
+                    for (peer_id, new_addrs) in addrs_by_peer {
+                        // Determine whether this is a new peer or an address change.
+                        let (is_new, has_new_addr) = {
+                            let peers = known_peers_loop.read().unwrap_or_else(|e| e.into_inner());
+                            match peers.get(&peer_id) {
+                                None => (true, false),
+                                Some(known_addrs) => {
+                                    let any_new =
+                                        new_addrs.iter().any(|a| !known_addrs.contains(a));
+                                    (false, any_new)
+                                }
                             }
+                        };
+
+                        // Always update the stored address set.
+                        if let Ok(mut peers) = known_peers_loop.write() {
+                            let entry = peers.entry(peer_id).or_default();
+                            for addr in &new_addrs {
+                                entry.insert(addr.clone());
+                            }
+                        }
+
+                        if is_new {
+                            log::info!("mDNS discovered peer: {peer_id}");
+                        } else if has_new_addr {
+                            log::info!(
+                                "mDNS re-discovered peer {peer_id} with new address(es): {:?}",
+                                new_addrs
+                            );
+                        } else {
+                            // Periodic re-announcement — same peer, same addresses.
+                            // Skip the cascade to avoid disrupting in-flight streams.
+                            log::debug!(
+                                "mDNS re-announced peer {peer_id} (no address change, skipping re-registration)"
+                            );
+                            continue;
+                        }
+
+                        // Genuine new peer or address change: fire event + re-register.
+                        let _ = peer_events_tx_loop.send(PeerEvent::Discovered(peer_id));
+
+                        // Phase 1c: re-publish all locally registered actors into
+                        // the new/updated peer's Kademlia routing table so that
+                        // lookups from the peer succeed immediately rather than
+                        // waiting for the next Kademlia republish cycle.
+                        let fns: Vec<ReRegisterFn> = re_register_fns_loop
+                            .read()
+                            .map(|g| g.clone())
+                            .unwrap_or_default();
+                        if !fns.is_empty() {
+                            tokio::spawn(async move {
+                                for f in &fns {
+                                    f().await;
+                                }
+                            });
                         }
                     }
                 }
                 SwarmEvent::Behaviour(MeshBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                    // Same dedup as Discovered: one event per unique peer.
-                    // Collect all addresses per peer first so we can re-add
-                    // them if the peer comes back (libp2p 0.56 has no
-                    // remove_peer_address, so we just disconnect and let mDNS
-                    // re-announce the fresh addresses on reconnect).
-                    let mut seen = std::collections::HashSet::new();
-                    for (peer_id, _multiaddr) in list {
-                        if seen.insert(peer_id) {
-                            log::info!("mDNS peer expired (went away): {peer_id}");
-                            // Remove from known-peers set so list_remote_nodes
-                            // won't try to query stale DHT records.
-                            if let Ok(mut peers) = known_peers_loop.write() {
-                                peers.remove(&peer_id);
+                    // mDNS expiry: a peer's TTL lapsed without re-announcement.
+                    // Remove the expired addresses from known_peers.  If all
+                    // addresses for a peer have expired, the peer is considered
+                    // gone: disconnect and fire PeerEvent::Expired.
+                    //
+                    // We do NOT fire Expired if only some addresses expired —
+                    // the peer may still be reachable at a remaining address.
+                    let mut addrs_by_peer: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+                    for (peer_id, multiaddr) in list {
+                        addrs_by_peer.entry(peer_id).or_default().push(multiaddr);
+                    }
+
+                    for (peer_id, expired_addrs) in addrs_by_peer {
+                        let peer_fully_gone = {
+                            let mut peers =
+                                known_peers_loop.write().unwrap_or_else(|e| e.into_inner());
+                            if let Some(known_addrs) = peers.get_mut(&peer_id) {
+                                for addr in &expired_addrs {
+                                    known_addrs.remove(addr);
+                                }
+                                if known_addrs.is_empty() {
+                                    peers.remove(&peer_id);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
                             }
+                        };
+
+                        if peer_fully_gone {
+                            log::info!("mDNS peer expired (went away): {peer_id}");
                             // Close the active connection so kameo stops trying
                             // to route messages to the dead peer.
                             let _ = swarm.disconnect_peer_id(peer_id);
                             let _ = peer_events_tx_loop.send(PeerEvent::Expired(peer_id));
+                        } else {
+                            log::debug!(
+                                "mDNS partial expiry for peer {peer_id}: some addresses expired but peer still reachable"
+                            );
                         }
                     }
                 }

@@ -205,6 +205,16 @@ pub trait SessionStore: Send + Sync {
     /// Retrieves the rich agent history (including snapshots, reasoning, etc.).
     async fn get_history(&self, session_id: &str) -> SessionResult<Vec<AgentMessage>>;
 
+    /// Retrieves the effective agent history — post-compaction, with snapshot-only
+    /// messages filtered out. This is the canonical "what matters now" view of
+    /// session messages for LLM consumption and delegation handoff.
+    async fn get_effective_history(&self, session_id: &str) -> SessionResult<Vec<AgentMessage>> {
+        let messages = self.get_history(session_id).await?;
+        Ok(crate::session::compaction::filter_to_effective_history(
+            messages,
+        ))
+    }
+
     /// Appends a rich agent message to the session.
     async fn add_message(&self, session_id: &str, message: AgentMessage) -> SessionResult<()>;
 

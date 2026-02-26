@@ -32,10 +32,98 @@ use tokio::sync::Mutex;
 
 // Mock implementations moved to crate::test_utils::mocks
 
+/// A middleware that immediately stops execution with `StepLimit`,
+/// simulating what happens when a delegate is stopped by middleware before
+/// completing its work. Uses `StepLimit` (maps to `StopReason::MaxTurnRequests`)
+/// rather than `ContextThreshold` to avoid triggering the auto-compaction loop
+/// in the execution state machine.
+struct AlwaysStopMiddleware;
+
+#[async_trait::async_trait]
+impl MiddlewareDriver for AlwaysStopMiddleware {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> crate::middleware::Result<ExecutionState> {
+        match state {
+            ExecutionState::BeforeLlmCall { ref context } => Ok(ExecutionState::Stopped {
+                message: "Step limit reached".into(),
+                stop_type: StopType::StepLimit,
+                context: Some(context.clone()),
+            }),
+            other => Ok(other),
+        }
+    }
+
+    fn reset(&self) {}
+
+    fn name(&self) -> &'static str {
+        "AlwaysStopMiddleware"
+    }
+}
+
+/// A middleware that fires `ContextThreshold` on the **first** `BeforeLlmCall`
+/// and then passes through on subsequent calls. This simulates the real
+/// `ContextMiddleware` detecting that the context window is full, which causes
+/// the execution state machine to attempt AI compaction before continuing.
+struct ContextThresholdOnceMiddleware {
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl ContextThresholdOnceMiddleware {
+    fn new() -> Self {
+        Self {
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MiddlewareDriver for ContextThresholdOnceMiddleware {
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> crate::middleware::Result<ExecutionState> {
+        match state {
+            ExecutionState::BeforeLlmCall { ref context }
+                if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+            {
+                Ok(ExecutionState::Stopped {
+                    message: "Context token threshold reached, requesting compaction".into(),
+                    stop_type: StopType::ContextThreshold,
+                    context: Some(context.clone()),
+                })
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn reset(&self) {
+        self.fired.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn name(&self) -> &'static str {
+        "ContextThresholdOnceMiddleware"
+    }
+}
+
 #[derive(Debug, Clone)]
 enum DelegateBehavior {
     AlwaysOk,
     AlwaysFail,
+    /// Delegate's execution is stopped by middleware (e.g. context threshold).
+    /// This simulates a premature stop that should be treated as a delegation failure.
+    StoppedByMiddleware,
+    /// Delegate hits ContextThreshold, auto-compaction runs and succeeds, then
+    /// the delegate resumes and completes normally. Verifies that the delegation
+    /// orchestrator sees `EndTurn` (success) when compaction recovers the session.
+    ContextThresholdCompactionSucceeds,
+    /// Delegate hits ContextThreshold, auto-compaction runs but the LLM call
+    /// fails. The state machine falls through to `Stopped(MaxTokens)`, which
+    /// the delegation orchestrator must treat as a failure.
+    ContextThresholdCompactionFails,
 }
 
 struct TestHarness {
@@ -84,9 +172,14 @@ impl TestHarness {
             .expect_get_session()
             .returning(move |_| Ok(Some(session_for_expectation.clone())))
             .times(0..);
+        let history_for_effective = history.clone();
         store
             .expect_get_history()
             .returning(move |_| Ok((*history).clone()))
+            .times(0..);
+        store
+            .expect_get_effective_history()
+            .returning(move |_| Ok((*history_for_effective).clone()))
             .times(0..);
         store
             .expect_get_session_llm_config()
@@ -268,6 +361,46 @@ async fn build_delegate_handle(behavior: DelegateBehavior) -> Arc<crate::agent::
                     ))
                 });
             }
+            DelegateBehavior::StoppedByMiddleware => {
+                // The LLM will never be called because the middleware stops execution
+                // before the LLM call. Set up a fallback that would succeed if reached.
+                mock.expect_chat()
+                    .times(0..)
+                    .returning(|_| Ok(Box::new(MockChatResponse::text_only("Task complete"))));
+            }
+            DelegateBehavior::ContextThresholdCompactionSucceeds => {
+                // ContextThresholdOnceMiddleware fires ContextThreshold on the first
+                // BeforeLlmCall. The state machine then calls run_ai_compaction which
+                // calls provider.chat() for the compaction summary. After that succeeds,
+                // the state machine loops back and the middleware passes through, so
+                // provider.chat() is called again for the normal conversation turn.
+                let mut seq = Sequence::new();
+                // 1st chat call: compaction summary
+                mock.expect_chat()
+                    .times(1)
+                    .in_sequence(&mut seq)
+                    .returning(|_| {
+                        Ok(Box::new(MockChatResponse::text_only(
+                            "Summary of previous conversation context.",
+                        )))
+                    });
+                // 2nd chat call: normal delegate completion
+                mock.expect_chat()
+                    .times(1)
+                    .in_sequence(&mut seq)
+                    .returning(|_| Ok(Box::new(MockChatResponse::text_only("Task complete"))));
+            }
+            DelegateBehavior::ContextThresholdCompactionFails => {
+                // ContextThresholdOnceMiddleware fires ContextThreshold. The state
+                // machine calls run_ai_compaction which calls provider.chat() — this
+                // fails. The state machine falls through to Stopped(MaxTokens).
+                // No retries: we set max_retries=0 in the compaction config.
+                mock.expect_chat().times(0..).returning(|_| {
+                    Err(querymt::error::LLMError::ProviderError(
+                        "Compaction LLM call failed: service unavailable".to_string(),
+                    ))
+                });
+            }
         }
         mock.expect_tools().return_const(None).times(0..);
     }
@@ -311,16 +444,43 @@ async fn build_delegate_handle(behavior: DelegateBehavior) -> Arc<crate::agent::
             .expect("create event journal storage"),
     );
 
-    let delegate_config = Arc::new(
-        crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
-            delegate_session_provider,
-            event_journal_storage.event_journal(),
-        )
-        .with_tool_policy(ToolPolicy::ProviderOnly)
-        .with_max_steps(1)
-        .with_execution_timeout_secs(30)
-        .build(),
-    );
+    let mut builder = crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+        delegate_session_provider,
+        event_journal_storage.event_journal(),
+    )
+    .with_tool_policy(ToolPolicy::ProviderOnly)
+    .with_max_steps(1)
+    .with_execution_timeout_secs(30);
+
+    if matches!(behavior, DelegateBehavior::StoppedByMiddleware) {
+        builder = builder.with_middleware(AlwaysStopMiddleware);
+    }
+
+    if matches!(
+        behavior,
+        DelegateBehavior::ContextThresholdCompactionSucceeds
+            | DelegateBehavior::ContextThresholdCompactionFails
+    ) {
+        // Install middleware that triggers ContextThreshold once, then passes through.
+        builder = builder.with_middleware(ContextThresholdOnceMiddleware::new());
+
+        // Enable auto-compaction with zero retries so the test doesn't sleep.
+        builder = builder.with_compaction_config(crate::config::CompactionConfig {
+            auto: true,
+            provider: None,
+            model: None,
+            retry: crate::config::RetryConfig {
+                max_retries: 0,
+                initial_backoff_ms: 0,
+                backoff_multiplier: 1.0,
+            },
+        });
+
+        // Allow more steps so the delegate can continue after compaction.
+        builder = builder.with_max_steps(5);
+    }
+
+    let delegate_config = Arc::new(builder.build());
 
     // Leak the TempDir so its contents survive the test
     std::mem::forget(delegate_temp_dir);
@@ -734,4 +894,230 @@ async fn test_delegation_guard_blocks_max_retries() {
             ..
         }
     ));
+}
+
+/// When a delegate is stopped by middleware (e.g. context threshold after failed
+/// compaction), the delegation should be treated as a failure — not a success
+/// with truncated output.
+#[tokio::test]
+async fn test_delegation_premature_stop_is_failure() {
+    let mut harness = TestHarness::new(vec![], DelegateBehavior::StoppedByMiddleware).await;
+    let delegate_call = mock_querymt_tool_call(
+        "call-1",
+        "delegate",
+        r#"{"target_agent_id":"agent","objective":"task"}"#,
+    );
+    let mut seq = Sequence::new();
+
+    // First LLM call: planner delegates to the agent
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_| {
+            Ok(Box::new(MockChatResponse::with_tools(
+                "Delegating task",
+                vec![delegate_call.clone()],
+            )))
+        });
+
+    // Second LLM call: planner receives the delegation failure result.
+    // The injected message should indicate failure, NOT success.
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(|messages| {
+            let last_msg = messages.last().unwrap();
+            // Must be a failure, not a "Delegation completed" success
+            assert!(
+                last_msg.content.contains("Delegation failed"),
+                "Expected 'Delegation failed' in message, got: {}",
+                last_msg.content
+            );
+            assert!(
+                last_msg.content.contains("stopped prematurely"),
+                "Expected 'stopped prematurely' in message, got: {}",
+                last_msg.content
+            );
+            Ok(Box::new(MockChatResponse::text_only(
+                "I see the delegate was stopped. Let me try differently.",
+            )))
+        });
+
+    harness
+        .provider_mut()
+        .await
+        .expect_call_tool()
+        .returning(|_, _| Ok("ok".to_string()))
+        .times(1);
+
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+}
+
+/// When a delegate hits the context threshold and auto-compaction **succeeds**,
+/// the delegate should resume execution and complete normally. The delegation
+/// orchestrator should see `StopReason::EndTurn` and mark it as a success.
+///
+/// This is the happy-path counterpart to `test_delegation_compaction_failure_is_delegation_failure`.
+#[tokio::test]
+async fn test_delegation_compaction_success_continues() {
+    let mut harness =
+        TestHarness::new(vec![], DelegateBehavior::ContextThresholdCompactionSucceeds).await;
+    let delegate_call = mock_querymt_tool_call(
+        "call-1",
+        "delegate",
+        r#"{"target_agent_id":"agent","objective":"task"}"#,
+    );
+    let mut seq = Sequence::new();
+
+    // First LLM call: planner delegates to the agent
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_| {
+            Ok(Box::new(MockChatResponse::with_tools(
+                "Delegating task",
+                vec![delegate_call.clone()],
+            )))
+        });
+
+    // Second LLM call: planner receives the delegation result.
+    // Since compaction succeeded, the delegate completed normally and the
+    // planner should see a success message, NOT a failure.
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(|messages| {
+            let last_msg = messages.last().unwrap();
+            assert!(
+                last_msg.content.contains("Delegation completed"),
+                "Expected 'Delegation completed' after successful compaction, got: {}",
+                last_msg.content
+            );
+            assert!(
+                !last_msg.content.contains("Delegation failed"),
+                "Should NOT contain 'Delegation failed' after successful compaction, got: {}",
+                last_msg.content
+            );
+            Ok(Box::new(MockChatResponse::text_only(
+                "Great, the delegate completed successfully after compaction.",
+            )))
+        });
+
+    harness
+        .provider_mut()
+        .await
+        .expect_call_tool()
+        .returning(|_, _| Ok("ok".to_string()))
+        .times(1);
+
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+}
+
+/// When a delegate hits the context threshold and auto-compaction **fails**
+/// (e.g. compaction LLM call errors out), the delegate's state machine falls
+/// through to `Stopped(MaxTokens)`. The delegation orchestrator must treat
+/// this as a failure — not silently swallow the error or report success.
+///
+/// This directly tests the bug path identified in the analysis:
+///   ContextMiddleware -> ContextThreshold -> run_ai_compaction fails ->
+///   CycleOutcome::Stopped(MaxTokens) -> PromptResponse(MaxTokens) ->
+///   execute_delegation sees stop_reason != EndTurn -> fail_delegation
+#[tokio::test]
+async fn test_delegation_compaction_failure_is_delegation_failure() {
+    let mut harness =
+        TestHarness::new(vec![], DelegateBehavior::ContextThresholdCompactionFails).await;
+    let delegate_call = mock_querymt_tool_call(
+        "call-1",
+        "delegate",
+        r#"{"target_agent_id":"agent","objective":"task"}"#,
+    );
+    let mut seq = Sequence::new();
+
+    // First LLM call: planner delegates to the agent
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_| {
+            Ok(Box::new(MockChatResponse::with_tools(
+                "Delegating task",
+                vec![delegate_call.clone()],
+            )))
+        });
+
+    // Second LLM call: planner receives the delegation failure result.
+    // The compaction LLM call failed, so the delegate was stopped with MaxTokens.
+    // The orchestrator should report this as a delegation failure.
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(|messages| {
+            let last_msg = messages.last().unwrap();
+            assert!(
+                last_msg.content.contains("Delegation failed"),
+                "Expected 'Delegation failed' after compaction failure, got: {}",
+                last_msg.content
+            );
+            assert!(
+                last_msg.content.contains("stopped prematurely"),
+                "Expected 'stopped prematurely' after compaction failure, got: {}",
+                last_msg.content
+            );
+            Ok(Box::new(MockChatResponse::text_only(
+                "The delegate failed due to compaction failure. I'll try a different approach.",
+            )))
+        });
+
+    harness
+        .provider_mut()
+        .await
+        .expect_call_tool()
+        .returning(|_, _| Ok("ok".to_string()))
+        .times(1);
+
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
 }

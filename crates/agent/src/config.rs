@@ -550,6 +550,10 @@ fn default_mesh_listen() -> Option<String> {
     Some("/ip4/0.0.0.0/tcp/9000".to_string())
 }
 
+fn default_mesh_request_timeout_secs() -> u64 {
+    300
+}
+
 /// Configuration for the kameo libp2p mesh.
 ///
 /// In TOML:
@@ -587,6 +591,12 @@ pub struct MeshTomlConfig {
     /// Explicit peers to connect to at startup.
     #[serde(default)]
     pub peers: Vec<MeshPeerConfig>,
+
+    /// Timeout in seconds for non-streaming mesh request-response calls
+    /// (e.g. compaction, no-tools LLM calls).  Default: 300 (5 minutes).
+    /// Increase for very slow models or large context windows.
+    #[serde(default = "default_mesh_request_timeout_secs")]
+    pub request_timeout_secs: u64,
 }
 
 impl Default for MeshTomlConfig {
@@ -597,6 +607,7 @@ impl Default for MeshTomlConfig {
             discovery: MeshDiscoveryConfig::default(),
             auto_fallback: false,
             peers: Vec::new(),
+            request_timeout_secs: default_mesh_request_timeout_secs(),
         }
     }
 }

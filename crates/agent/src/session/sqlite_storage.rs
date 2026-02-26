@@ -1309,66 +1309,6 @@ impl SessionStore for SqliteStorage {
 }
 
 // ============================================================================
-// Legacy EventStore methods — kept as inherent methods for ViewStore
-// ============================================================================
-
-impl SqliteStorage {
-    /// Get all events for a session (reads from the `event_journal` table).
-    pub async fn get_session_events(&self, session_id: &str) -> SessionResult<Vec<AgentEvent>> {
-        let session_id_str = session_id.to_string();
-        let conn_arc = self.conn.clone();
-
-        tokio::task::spawn_blocking(move || -> Result<Vec<AgentEvent>, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json \
-                 FROM event_journal WHERE session_id = ? ORDER BY stream_seq ASC",
-            )?;
-
-            let events = stmt
-                .query_map([session_id_str], |row| {
-                    parse_journal_row(row).map(|de| de.into())
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-
-            Ok(events)
-        })
-        .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
-    }
-
-    /// Get events since a specific sequence number (reads from the `event_journal` table).
-    pub async fn get_events_since(
-        &self,
-        session_id: &str,
-        after_seq: u64,
-    ) -> SessionResult<Vec<AgentEvent>> {
-        let session_id_str = session_id.to_string();
-        let conn_arc = self.conn.clone();
-
-        tokio::task::spawn_blocking(move || -> Result<Vec<AgentEvent>, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json \
-                 FROM event_journal WHERE session_id = ? AND stream_seq > ? ORDER BY stream_seq ASC",
-            )?;
-
-            let events = stmt
-                .query_map(rusqlite::params![session_id_str, after_seq], |row| {
-                    parse_journal_row(row).map(|de| de.into())
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-
-            Ok(events)
-        })
-        .await
-        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
-    }
-}
-
-// ============================================================================
 // ViewStore implementation
 // ============================================================================
 
@@ -1379,14 +1319,24 @@ impl ViewStore for SqliteStorage {
         session_id: &str,
         include_children: bool,
     ) -> SessionResult<AuditView> {
-        let mut events = self.get_session_events(session_id).await?;
+        let mut events: Vec<AgentEvent> = self
+            .load_session_stream(session_id, None, None)
+            .await?
+            .into_iter()
+            .map(AgentEvent::from)
+            .collect();
 
         // Include child session events (delegations) if requested
         if include_children {
             let session_repo = SqliteSessionRepository::new(self.conn.clone());
             let child_session_ids = session_repo.list_child_sessions(session_id).await?;
             for child_id in &child_session_ids {
-                let child_events = self.get_session_events(child_id).await?;
+                let child_events: Vec<AgentEvent> = self
+                    .load_session_stream(child_id, None, None)
+                    .await?
+                    .into_iter()
+                    .map(AgentEvent::from)
+                    .collect();
                 events.extend(child_events);
             }
         }
