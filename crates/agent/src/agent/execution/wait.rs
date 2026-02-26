@@ -99,25 +99,34 @@ pub(super) async fn transition_waiting_for_event(
     let mut outcomes: Vec<String> = Vec::new();
     let timeout_secs = config.delegation_wait_timeout_secs;
 
-    let timeout = async {
-        if timeout_secs == 0 {
-            std::future::pending::<()>().await;
-        } else {
-            tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
-        }
+    // Use a resettable sleep so that each delegation in the queue gets a fresh
+    // timeout window.  When max_parallel_delegations < N, queued delegations
+    // do not start executing until earlier ones finish; a one-shot timer would
+    // consume their budget while they are still waiting on the semaphore.
+    //
+    // Every time a delegation completes or fails we reset the deadline to
+    // "now + timeout_secs", so the clock only fires if *no progress* is made
+    // within the configured window.  timeout_secs == 0 means no timeout.
+    let sleep = if timeout_secs > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(timeout_secs))
+    } else {
+        // Zero-duration sleep that we immediately re-arm to far future so it
+        // never fires.  We cannot use `std::future::pending` inside pin! with
+        // the same type as a real sleep, so we use a very large deadline instead.
+        tokio::time::sleep(std::time::Duration::from_secs(u64::MAX / 2))
     };
-    tokio::pin!(timeout);
+    tokio::pin!(sleep);
 
     loop {
         tokio::select! {
             _ = exec_ctx.cancellation_token.cancelled() => {
                 return Ok(ExecutionState::Cancelled);
             }
-            _ = &mut timeout => {
+            _ = &mut sleep, if timeout_secs > 0 => {
                 let timed_out_ids: Vec<String> = pending.iter().cloned().collect();
                 cleanup_timed_out_delegations(config, exec_ctx, &timed_out_ids).await;
                 outcomes.extend(timed_out_ids.iter().map(|id| {
-                    format!("- {}: timed out after {}s (cancel requested)", id, timeout_secs)
+                    format!("- {}: timed out after {}s of inactivity (cancel requested)", id, timeout_secs)
                 }));
 
                 let message = format_wait_all_summary(&outcomes);
@@ -160,6 +169,15 @@ pub(super) async fn transition_waiting_for_event(
                     let message = format_wait_all_summary(&outcomes);
                     let new_context = inject_wait_message(config, context, exec_ctx, message).await?;
                     return Ok(ExecutionState::BeforeLlmCall { context: new_context });
+                }
+
+                // Progress was made: reset the inactivity deadline so the next
+                // queued delegation gets its own full timeout window.
+                if timeout_secs > 0 {
+                    sleep.as_mut().reset(
+                        tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(timeout_secs),
+                    );
                 }
             }
         }

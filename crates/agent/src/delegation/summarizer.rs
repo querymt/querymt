@@ -305,7 +305,8 @@ planning conversation."#
         }
         if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
             return if command.len() > 100 {
-                format!("{}...", &command[..100])
+                let end = command.floor_char_boundary(100);
+                format!("{}...", &command[..end])
             } else {
                 command.to_string()
             };
@@ -314,7 +315,8 @@ planning conversation."#
         // Fallback: truncated JSON
         let s = serde_json::to_string(input).unwrap_or_default();
         if s.len() > 200 {
-            format!("{}...", &s[..200])
+            let end = s.floor_char_boundary(200);
+            format!("{}...", &s[..end])
         } else {
             s
         }
@@ -374,8 +376,28 @@ mod tests {
             "command": long_cmd
         });
         let summary = DelegationSummarizer::summarize_tool_args(&args);
-        assert_eq!(summary.len(), 103); // 100 chars + "..."
+        // floor_char_boundary may round down, so length is <= 100 + "...".len()
+        assert!(summary.len() <= 103);
         assert!(summary.ends_with("..."));
+        // The retained prefix must itself be valid UTF-8 (no panic on indexing)
+        assert!(std::str::from_utf8(summary.trim_end_matches("...").as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn summarize_tool_args_truncates_multibyte_json() {
+        // em dash (—) is 3 bytes: 0xE2 0x80 0x94.
+        // Previously `&s[..200]` would panic when the boundary landed inside it.
+        // Build a JSON string that is > 200 bytes and contains an em dash near byte 200.
+        let filler = "x".repeat(195); // 195 ASCII bytes in JSON value
+        let args = serde_json::json!({
+            "todos": [{"id": "1", "content": format!("{}—suffix", filler)}]
+        });
+        // This must not panic.
+        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        assert!(summary.ends_with("..."));
+        assert!(summary.len() <= 203);
+        // Result must be valid UTF-8.
+        assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
     }
 
     #[test]
@@ -398,8 +420,11 @@ mod tests {
         }
         let args = serde_json::Value::Object(obj);
         let summary = DelegationSummarizer::summarize_tool_args(&args);
-        assert_eq!(summary.len(), 203); // 200 chars + "..."
+        // floor_char_boundary may round down, so length is <= 200 + "...".len()
+        assert!(summary.len() <= 203);
         assert!(summary.ends_with("..."));
+        // The retained prefix must itself be valid UTF-8 (no panic on indexing)
+        assert!(std::str::from_utf8(summary.trim_end_matches("...").as_bytes()).is_ok());
     }
 
     // ── format_conversation / prepare_llm_input ──────────────────────────────
