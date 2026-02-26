@@ -90,6 +90,7 @@ pub async fn setup_mesh_from_config(
             peers
         },
         directory: crate::agent::remote::mesh::DirectoryMode::default(),
+        request_timeout: std::time::Duration::from_secs(mesh_cfg.request_timeout_secs),
     };
     let listen_addr_str = config.listen.as_deref().unwrap_or("<auto>").to_string();
 

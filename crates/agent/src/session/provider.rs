@@ -498,41 +498,27 @@ impl SessionHandle {
             .await
     }
 
+    /// Get the effective session history (post-compaction, no snapshot-only messages)
+    pub async fn get_effective_agent_history(&self) -> SessionResult<Vec<AgentMessage>> {
+        self.provider
+            .history_store
+            .get_effective_history(&self.session.public_id)
+            .await
+    }
+
     /// Get the session history converted to standard ChatMessages for the LLM
     pub async fn history(&self) -> Vec<ChatMessage> {
-        match self.get_agent_history().await {
-            Ok(agent_msgs) => {
-                let start_index = agent_msgs
-                    .iter()
-                    .rposition(|m| {
-                        m.parts
-                            .iter()
-                            .any(|p| matches!(p, MessagePart::CompactionRequest { .. }))
-                    })
-                    .unwrap_or(0);
-                agent_msgs[start_index..]
-                    .iter()
-                    // Filter out messages that only contain snapshot metadata parts
-                    // These are for undo/redo tracking and should not be sent to the LLM
-                    // Keeping them creates empty messages that break tool_use -> tool_result sequencing
-                    .filter(|m| {
-                        m.parts.iter().any(|p| {
-                            !matches!(
-                                p,
-                                MessagePart::TurnSnapshotStart { .. }
-                                    | MessagePart::TurnSnapshotPatch { .. }
-                            )
-                        })
-                    })
-                    .map(|m| {
-                        m.to_chat_message_with_max_prompt_bytes(
-                            self.execution_config
-                                .as_ref()
-                                .and_then(|cfg| cfg.max_prompt_bytes),
-                        )
-                    })
-                    .collect()
-            }
+        match self.get_effective_agent_history().await {
+            Ok(agent_msgs) => agent_msgs
+                .iter()
+                .map(|m| {
+                    m.to_chat_message_with_max_prompt_bytes(
+                        self.execution_config
+                            .as_ref()
+                            .and_then(|cfg| cfg.max_prompt_bytes),
+                    )
+                })
+                .collect(),
             Err(err) => {
                 log::warn!("Failed to load session history: {}", err);
                 Vec::new()

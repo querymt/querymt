@@ -1058,7 +1058,8 @@ fn apply_middleware_from_config(
         }
     }
 
-    if auto_compact {
+    let has_context_middleware = entries.iter().any(|e| e.middleware_type == "context");
+    if auto_compact && !has_context_middleware {
         log::info!("Auto-enabling ContextMiddleware for compaction");
         builder.push_middleware(Arc::new(crate::middleware::ContextMiddleware::new(
             crate::middleware::ContextConfig::default().auto_compact(true),

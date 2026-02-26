@@ -7,7 +7,8 @@ use crate::agent::utils::render_prompt_for_llm;
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use anyhow::Result;
-use querymt::chat::ChatRole;
+use futures_util::StreamExt;
+use querymt::chat::{ChatRole, StreamChunk};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -141,7 +142,17 @@ impl SessionCompaction {
         chat_messages
     }
 
-    /// Call LLM with exponential backoff retry
+    /// Call LLM with exponential backoff retry.
+    ///
+    /// Prefers streaming when the provider supports it.  The streaming path
+    /// uses per-chunk timeouts (typically 60 s) instead of a single total
+    /// request-response timeout, keeping the connection alive while the model
+    /// generates the compaction summary.  This avoids the 10 s libp2p default
+    /// timeout that caused compaction failures on remote mesh nodes.
+    ///
+    /// Mesh timeout errors (remote still processing) are treated as
+    /// **non-retriable** to prevent queuing duplicate inference work on the
+    /// remote GPU.
     async fn call_with_retry(
         &self,
         messages: &[querymt::chat::ChatMessage],
@@ -163,17 +174,40 @@ impl SessionCompaction {
                 backoff_ms = (backoff_ms as f64 * retry_config.backoff_multiplier) as u64;
             }
 
-            // Note: The model is configured in the provider, we just call chat
-            match provider.chat(messages).await {
-                Ok(response) => {
-                    return Ok(response.text().unwrap_or_default());
-                }
+            // Prefer streaming to avoid mesh request-response timeout on long
+            // inference.  The streaming path uses per-chunk timeouts instead of
+            // a single total-request timeout, keeping the connection alive
+            // while the model generates.
+            let result = if provider.supports_streaming() {
+                Self::call_streaming(messages, &provider).await
+            } else {
+                provider
+                    .chat(messages)
+                    .await
+                    .map(|r| r.text().unwrap_or_default())
+            };
+
+            match result {
+                Ok(text) => return Ok(text),
                 Err(e) => {
                     log::warn!(
                         "Compaction LLM call failed (attempt {}): {}",
                         attempt + 1,
                         e
                     );
+                    // Mesh timeouts mean the remote is still processing.
+                    // Retrying would just queue more work on an already-busy
+                    // remote GPU — abort immediately.
+                    if is_mesh_timeout_error(&e) {
+                        log::warn!(
+                            "Compaction error is a mesh timeout (remote node likely still \
+                             processing). Aborting retries to avoid queuing duplicate work."
+                        );
+                        return Err(anyhow::anyhow!(
+                            "Compaction failed: mesh timeout (remote still processing): {}",
+                            e
+                        ));
+                    }
                     last_error = Some(e);
                 }
             }
@@ -184,6 +218,23 @@ impl SessionCompaction {
             retry_config.max_retries,
             last_error
         ))
+    }
+
+    /// Streaming compaction call — collects text chunks into a single string.
+    async fn call_streaming(
+        messages: &[querymt::chat::ChatMessage],
+        provider: &Arc<dyn querymt::chat::ChatProvider>,
+    ) -> std::result::Result<String, querymt::error::LLMError> {
+        let mut stream = provider.chat_stream(messages).await?;
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk? {
+                StreamChunk::Text(delta) => text.push_str(&delta),
+                StreamChunk::Done { .. } => break,
+                _ => {} // ignore Thinking, ToolUseStart, etc. for compaction
+            }
+        }
+        Ok(text)
     }
 
     /// Estimate token count for a list of messages
@@ -252,6 +303,22 @@ impl SessionCompaction {
 
         (request_msg, summary_msg)
     }
+}
+
+/// Check if an LLM error indicates a mesh timeout (remote node still processing).
+///
+/// These errors should **not** be retried because the remote GPU is still busy
+/// with the previous request.  Retrying just queues additional inference work,
+/// wasting compute and potentially causing cascading timeouts.
+///
+/// Detection relies on the string representation produced by
+/// `MeshChatProvider::chat_with_tools` when kameo's `RemoteSendError` is
+/// formatted:
+///   - `"network timeout"` — clean `OutboundFailure::Timeout`
+///   - `"Eof {"` — CBOR decode truncation when the timeout fires mid-read
+fn is_mesh_timeout_error(e: &querymt::error::LLMError) -> bool {
+    let msg = e.to_string();
+    msg.contains("network timeout") || msg.contains("Eof {")
 }
 
 /// Filter messages to return only the "effective" history after the last compaction.
@@ -988,6 +1055,108 @@ mod tests {
                 .parts
                 .iter()
                 .any(|p| matches!(p, MessagePart::Compaction { .. }))
+        );
+    }
+
+    // ========================================================================
+    // is_mesh_timeout_error tests
+    // ========================================================================
+
+    #[test]
+    fn test_mesh_timeout_network_timeout() {
+        let err = LLMError::ProviderError(
+            "MeshChatProvider: remote call to 'provider_host::peer::12D3KooW...' \
+             failed: network timeout"
+                .to_string(),
+        );
+        assert!(
+            is_mesh_timeout_error(&err),
+            "network timeout should be detected as mesh timeout"
+        );
+    }
+
+    #[test]
+    fn test_mesh_timeout_eof_error() {
+        let err = LLMError::ProviderError(
+            "MeshChatProvider: remote call to 'provider_host::peer::12D3KooW...' \
+             failed: Eof { name: \"enum\", expect: Small(1) }"
+                .to_string(),
+        );
+        assert!(
+            is_mesh_timeout_error(&err),
+            "Eof decode error should be detected as mesh timeout"
+        );
+    }
+
+    #[test]
+    fn test_mesh_timeout_dial_failure_is_not_timeout() {
+        let err = LLMError::ProviderError(
+            "MeshChatProvider: remote call to 'provider_host::peer::12D3KooW...' \
+             failed: dial failure"
+                .to_string(),
+        );
+        assert!(
+            !is_mesh_timeout_error(&err),
+            "dial failure should NOT be classified as mesh timeout"
+        );
+    }
+
+    #[test]
+    fn test_mesh_timeout_generic_error_is_not_timeout() {
+        let err = LLMError::GenericError("some other error".to_string());
+        assert!(
+            !is_mesh_timeout_error(&err),
+            "generic errors should NOT be classified as mesh timeout"
+        );
+    }
+
+    #[test]
+    fn test_mesh_timeout_connection_closed_is_not_timeout() {
+        let err = LLMError::ProviderError(
+            "MeshChatProvider: remote call to '...' failed: connection closed".to_string(),
+        );
+        assert!(
+            !is_mesh_timeout_error(&err),
+            "connection closed should NOT be classified as mesh timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_aborts_on_mesh_timeout() {
+        let service = SessionCompaction::new();
+        let messages = MessageFixture::simple_conversation("s1");
+
+        // Simulate a mesh timeout on the first attempt — should NOT retry.
+        let mock = MockCompactionProvider::new(vec![
+            Err(LLMError::ProviderError(
+                "MeshChatProvider: remote call to '...' failed: network timeout".to_string(),
+            )),
+            // This second response should never be reached.
+            Ok("should not be used".to_string()),
+        ]);
+        let mock_arc = Arc::new(mock);
+
+        let result = service
+            .process(
+                &messages,
+                mock_arc.clone(),
+                "model",
+                &RetryConfig::default(),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err(), "should fail on mesh timeout");
+        assert_eq!(
+            mock_arc.call_count(),
+            1,
+            "should NOT retry after mesh timeout — only 1 call expected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("mesh timeout"),
+            "error should mention mesh timeout, got: {}",
+            err_msg
         );
     }
 }

@@ -72,9 +72,14 @@ impl TestHarness {
             .expect_get_session()
             .returning(move |_| Ok(Some(session_for_expectation.clone())))
             .times(0..);
+        let history_for_effective = history.clone();
         store
             .expect_get_history()
             .returning(move |_| Ok((*history).clone()))
+            .times(0..);
+        store
+            .expect_get_effective_history()
+            .returning(move |_| Ok((*history_for_effective).clone()))
             .times(0..);
         store
             .expect_get_session_llm_config()
