@@ -24,6 +24,7 @@ import {
   PluginUpdateStatus,
   PluginUpdateResult,
 } from '../types';
+import { debugLog, debugTrace } from '../utils/debugLog';
 
 // Callback type for file index updates
 type FileIndexCallback = (files: FileIndexEntry[], generatedAt: number) => void;
@@ -236,7 +237,7 @@ export function useUiClient() {
   }, []);
 
   const handleServerMessage = (msg: UiServerMessage) => {
-    console.log('[useUiClient] Received message:', msg.type, msg);
+    debugLog('[useUiClient] Received message:', () => ({ type: msg.type, msg }));
     switch (msg.type) {
       case 'state':
         setAgents(msg.agents);
@@ -290,14 +291,14 @@ export function useUiClient() {
           const lastProvider = [...translated].reverse()
             .find(e => e.provider || e.model);
           if (lastProvider) {
-            console.log('[useUiClient] 🔴 session_events: Setting agentModels from replay', {
+            debugLog('[useUiClient] session_events: Setting agentModels from replay', () => ({
               session_id: msg.session_id,
               agent_id: msg.agent_id,
               provider: lastProvider.provider,
               model: lastProvider.model,
               mainSessionId,
-              eventCount: translated.length
-            });
+              eventCount: translated.length,
+            }));
             setAgentModels(prev => ({
               ...prev,
               [msg.agent_id]: {
@@ -323,7 +324,7 @@ export function useUiClient() {
         ) {
           const rawContent = msg.event?.kind?.content;
           const contentLen = typeof rawContent === 'string' ? rawContent.length : 0;
-          console.debug('[useUiClient] stream event received', {
+          debugTrace('[useUiClient] stream event received', () => ({
             session_id: msg.session_id,
             agent_id: msg.agent_id,
             seq: msg.event?.seq,
@@ -332,7 +333,7 @@ export function useUiClient() {
             content_len: contentLen,
             has_thinking: typeof msg.event?.kind?.thinking === 'string' && msg.event.kind.thinking.length > 0,
             finish_reason: msg.event?.kind?.finish_reason,
-          });
+          }));
         }
         
         // Track LLM thinking state per session
@@ -497,7 +498,7 @@ export function useUiClient() {
                 };
               }
               next.set(msg.session_id, updated);
-              console.debug('[useUiClient] stream delta merged', {
+              debugTrace('[useUiClient] stream delta merged', () => ({
                 session_id: msg.session_id,
                 event_kind: eventKind,
                 message_id: messageId,
@@ -505,16 +506,16 @@ export function useUiClient() {
                 existing_len: existing.length,
                 new_content_len: updated[realLiveIdx].content.length,
                 new_thinking_len: (updated[realLiveIdx].thinking ?? '').length,
-              });
+              }));
             } else {
               // First delta for this message — create the live accumulator entry
               next.set(msg.session_id, [...existing, translated]);
-              console.debug('[useUiClient] stream delta created live accumulator', {
+              debugTrace('[useUiClient] stream delta created live accumulator', () => ({
                 session_id: msg.session_id,
                 event_kind: eventKind,
                 message_id: messageId,
                 existing_len: existing.length,
-              });
+              }));
             }
             return next;
           });
@@ -539,26 +540,26 @@ export function useUiClient() {
                 thinking: nonEmptyString(translated.thinking) ?? nonEmptyString(live.thinking),
               };
               next.set(msg.session_id, updated);
-              console.debug('[useUiClient] final assistant message replaced live accumulator', {
+              debugTrace('[useUiClient] final assistant message replaced live accumulator', () => ({
                 session_id: msg.session_id,
                 message_id: messageId,
                 live_index: realLiveIdx,
                 final_content_len: updated[realLiveIdx].content.length,
                 final_thinking_len: (updated[realLiveIdx].thinking ?? '').length,
-              });
+              }));
             } else {
               // Non-streaming provider or out-of-order final message: append if newer.
               const lastSeq = existing.length > 0 ? (existing[existing.length - 1].seq ?? -1) : -1;
               if (translated.seq == null || translated.seq > lastSeq) {
                 next.set(msg.session_id, [...existing, translated]);
               }
-              console.debug('[useUiClient] final assistant message appended without live accumulator', {
+              debugTrace('[useUiClient] final assistant message appended without live accumulator', () => ({
                 session_id: msg.session_id,
                 message_id: messageId,
                 existing_len: existing.length,
                 translated_seq: translated.seq,
                 last_seq: lastSeq,
-              });
+              }));
             }
             return next;
           });
@@ -580,14 +581,14 @@ export function useUiClient() {
         // Provider/limits updates - only for main session
         if (msg.session_id === mainSessionId) {
           if (eventKind === 'provider_changed') {
-            console.log('[useUiClient] 🟢 provider_changed event: Setting agentModels', {
+            debugLog('[useUiClient] provider_changed event: Setting agentModels', () => ({
               session_id: msg.session_id,
               agent_id: msg.agent_id,
               provider: msg.event?.kind?.provider,
               model: msg.event?.kind?.model,
               mainSessionId,
-              seq: msg.event?.seq
-            });
+              seq: msg.event?.seq,
+            }));
             setAgentModels((prev) => ({
               ...prev,
               [msg.agent_id]: {
@@ -661,13 +662,13 @@ export function useUiClient() {
         const lastProvider = [...translated].reverse()
           .find(e => e.provider || e.model);
         if (lastProvider) {
-          console.log('[useUiClient] 🔵 session_loaded: Setting agentModels from loaded session', {
+          debugLog('[useUiClient] session_loaded: Setting agentModels from loaded session', () => ({
             session_id: msg.session_id,
             agent_id: msg.agent_id,
             provider: lastProvider.provider,
             model: lastProvider.model,
-            eventCount: translated.length
-          });
+            eventCount: translated.length,
+          }));
           setAgentModels({
             [msg.agent_id]: {
               provider: lastProvider.provider,
@@ -677,7 +678,7 @@ export function useUiClient() {
             },
           });
         } else {
-          console.log('[useUiClient] 🔵 session_loaded: Clearing agentModels (no provider info)');
+          debugLog('[useUiClient] session_loaded: Clearing agentModels (no provider info)');
           // No provider info in loaded session - clear stale model badge
           setAgentModels({});
         }
@@ -795,7 +796,7 @@ export function useUiClient() {
         });
 
         if (msg.success) {
-          console.log('[useUiClient] Undo succeeded, reverted files:', msg.reverted_files);
+          debugLog('[useUiClient] Undo succeeded', () => ({ reverted_files: msg.reverted_files }));
         } else {
           console.error('[useUiClient] Undo failed:', msg.message);
         }
@@ -809,7 +810,7 @@ export function useUiClient() {
         });
 
         if (msg.success) {
-          console.log('[useUiClient] Redo succeeded');
+          debugLog('[useUiClient] Redo succeeded');
         } else {
           console.error('[useUiClient] Redo failed:', msg.message);
         }
@@ -824,7 +825,7 @@ export function useUiClient() {
       case 'remote_sessions':
         // Currently used for on-demand node session listing;
         // data is handled by the caller via callback if needed.
-        console.log('[useUiClient] remote_sessions for node:', msg.node_id, msg.sessions);
+        debugLog('[useUiClient] remote_sessions for node:', () => ({ node_id: msg.node_id, sessions: msg.sessions }));
         break;
       case 'model_download_status': {
         const key = `${msg.provider}:${msg.model_id}`;
@@ -1049,7 +1050,7 @@ export function useUiClient() {
 
   // Register a callback for file index updates
   const setFileIndexCallback = useCallback((callback: FileIndexCallback | null) => {
-    console.log('[useUiClient] Registering file index callback:', !!callback);
+    debugLog('[useUiClient] Registering file index callback:', () => ({ hasCallback: !!callback }));
     fileIndexCallbackRef.current = callback;
   }, []);
 

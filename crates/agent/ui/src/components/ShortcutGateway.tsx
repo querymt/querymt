@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Command } from 'cmdk';
-import { Keyboard, KeyRound, MessageSquare, Palette, Plus, RefreshCw } from 'lucide-react';
+import { Bug, Keyboard, KeyRound, MessageSquare, Palette, Plus, RefreshCw } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
+import { isDebugLogEnabled, toggleDebugLog } from '../utils/debugLog';
 
 interface ShortcutGatewayProps {
   open: boolean;
@@ -181,6 +182,26 @@ export function ShortcutGateway({
                 </div>
                 <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
                   {isUpdatingPlugins ? 'Updating...' : 'U'}
+                </kbd>
+              </Command.Item>
+
+              <Command.Item
+                value="debug logging"
+                keywords={['debug', 'log', 'logging', 'console', 'verbose', 'd']}
+                onSelect={() => { toggleDebugLog(); close(); }}
+                className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
+              >
+                <div className="w-7 h-7 rounded-md border border-accent-primary/35 bg-accent-primary/10 flex items-center justify-center">
+                  <Bug className="w-3.5 h-3.5 text-accent-primary" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm text-ui-primary">Debug Logging</div>
+                  <div className="text-xs text-ui-muted">
+                    {isDebugLogEnabled() ? 'Verbose console logging is enabled' : 'Toggle verbose console logging for diagnostics'}
+                  </div>
+                </div>
+                <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
+                  {isDebugLogEnabled() ? 'On' : 'D'}
                 </kbd>
               </Command.Item>
             </Command.Group>
