@@ -26,3 +26,4 @@ url = { workspace = true }
 schemars = { workspace = true }
 http = { workspace = true }
 extism-pdk = { workspace = true, optional = true }
+log.workspace = true

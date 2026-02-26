@@ -9547,6 +9547,7 @@ dependencies = [
  "extism-pdk",
  "http",
  "kimi-auth",
+ "log",
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
