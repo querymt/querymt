@@ -10,6 +10,7 @@
 
 [agent]
 provider = "anthropic"
+#db = "/tmp/test.db"
 model = "claude-sonnet-4-5-20250929"
 assume_mutating = false
 mutating_tools = ["edit", "write_file", "shell"]
@@ -27,6 +28,7 @@ tools = [
   # Code intelligence
 #  "semantic_edit",
   "web_fetch",
+  "context7.*",
 ]
 system = [
   { file = "../prompts/default_system.txt" }
@@ -131,8 +133,8 @@ threshold = 0.85
 min_lines = 10
 
 # add Context7 as mcp
-# [[mcp]]
-# name = "context7"
-# transport = "http"
-# url = "https://mcp.context7.com/mcp"
-# headers = { CONTEXT7_API_KEY = "${CONTEXT7_API_KEY}" }
+[[mcp]]
+name = "context7"
+transport = "http"
+url = "https://mcp.context7.com/mcp"
+headers = { CONTEXT7_API_KEY = "${CONTEXT7_API_KEY}" }

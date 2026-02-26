@@ -20,6 +20,8 @@ mod session;
 pub use messages::{RoutingMode, UiAgentInfo};
 
 #[cfg(test)]
+mod mode_handler_tests;
+#[cfg(test)]
 mod session_stream_tests;
 #[cfg(test)]
 mod undo_handler_tests;

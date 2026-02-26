@@ -199,6 +199,12 @@ pub struct MeshHandle {
     /// discovers a new peer so the new peer's Kademlia routing table is
     /// populated immediately rather than waiting for the next republish cycle.
     re_register_fns: Arc<RwLock<Vec<ReRegisterFn>>>,
+    /// The actual multiaddr the swarm is listening on after OS port assignment.
+    ///
+    /// Populated from `SwarmEvent::NewListenAddr` during bootstrap. Workers
+    /// use this to dial the orchestrator as their bootstrap peer. If the
+    /// config requested port 0, this holds the OS-assigned port.
+    listen_addr: Arc<RwLock<Option<Multiaddr>>>,
 }
 
 impl std::fmt::Debug for MeshHandle {
@@ -221,6 +227,7 @@ impl MeshHandle {
         known_peers: Arc<RwLock<HashMap<PeerId, HashSet<Multiaddr>>>>,
         local_hostname: String,
         re_register_fns: Arc<RwLock<Vec<ReRegisterFn>>>,
+        listen_addr: Arc<RwLock<Option<Multiaddr>>>,
     ) -> Self {
         Self {
             peer_id,
@@ -228,6 +235,7 @@ impl MeshHandle {
             known_peers,
             local_hostname: Arc::new(local_hostname),
             re_register_fns,
+            listen_addr,
         }
     }
 
@@ -239,6 +247,28 @@ impl MeshHandle {
     /// The hostname of this node (cached at mesh bootstrap time).
     pub fn local_hostname(&self) -> &str {
         &self.local_hostname
+    }
+
+    /// The actual multiaddr the swarm bound to, including the OS-assigned port.
+    ///
+    /// Returns `None` briefly between `listen_on()` and the first
+    /// `SwarmEvent::NewListenAddr` (typically < 10 ms). Use this to pass
+    /// the orchestrator's real address to spawned workers via `--mesh-peer`.
+    pub fn listen_addr(&self) -> Option<Multiaddr> {
+        self.listen_addr
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Build the full `/ip4/.../tcp/<port>/p2p/<peer_id>` multiaddr that
+    /// workers use as their `--mesh-peer` bootstrap address.
+    ///
+    /// Returns `None` if the listen address has not been resolved yet.
+    pub fn worker_bootstrap_addr(&self) -> Option<String> {
+        let base = self.listen_addr()?;
+        // Append /p2p/<peer_id> so the worker can dial us directly.
+        Some(format!("{}/p2p/{}", base, self.peer_id))
     }
 
     /// Check whether a peer is currently known to be alive (discovered and not expired).
@@ -534,6 +564,10 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
     let re_register_fns: Arc<RwLock<Vec<ReRegisterFn>>> = Arc::new(RwLock::new(Vec::new()));
     let re_register_fns_loop = Arc::clone(&re_register_fns);
 
+    // Actual bound listen address — filled in by SwarmEvent::NewListenAddr.
+    let listen_addr_shared: Arc<RwLock<Option<Multiaddr>>> = Arc::new(RwLock::new(None));
+    let listen_addr_loop = Arc::clone(&listen_addr_shared);
+
     // Cache hostname once at bootstrap time (same logic as RemoteNodeManager).
     let local_hostname = resolve_local_hostname();
 
@@ -608,6 +642,20 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         .map_err(|e| MeshError::SwarmError(e.to_string()))?;
 
     let local_peer_id = *swarm.local_peer_id();
+
+    // ── Dial bootstrap peers ───────────────────────────────────────────────────
+    // When MeshDiscovery::None is used (e.g. sandboxed workers), mDNS is
+    // inactive so the only way to connect to the orchestrator is to dial the
+    // explicit bootstrap_peers addresses.  We must dial BEFORE moving the swarm
+    // into the event loop task because we lose ownership of `swarm` after spawn.
+    for peer_addr in &config.bootstrap_peers {
+        if let Ok(addr) = peer_addr.parse::<Multiaddr>() {
+            match swarm.dial(addr.clone()) {
+                Ok(_) => log::info!("Dialing bootstrap peer: {peer_addr}"),
+                Err(e) => log::warn!("Failed to dial bootstrap peer {peer_addr}: {e}"),
+            }
+        }
+    }
 
     // ── Swarm event loop ──────────────────────────────────────────────────────
     tokio::spawn(async move {
@@ -744,6 +792,27 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                 }
                 SwarmEvent::NewListenAddr { address, .. } => {
                     log::info!("ActorSwarm listening on {address}");
+                    // Record the first non-loopback TCP address so workers
+                    // can dial us via --mesh-peer. Prefer 127.0.0.1 TCP
+                    // (workers run on the same machine), skip QUIC and
+                    // /p2p-circuit relay addresses.
+                    let is_local_tcp = address
+                        .iter()
+                        .any(|p| matches!(p, libp2p::multiaddr::Protocol::Tcp(_)))
+                        && !address.iter().any(|p| {
+                            matches!(
+                                p,
+                                libp2p::multiaddr::Protocol::QuicV1
+                                    | libp2p::multiaddr::Protocol::P2pCircuit
+                            )
+                        });
+                    if is_local_tcp
+                        && let Ok(mut guard) = listen_addr_loop.write()
+                        && guard.is_none()
+                    {
+                        *guard = Some(address.clone());
+                        log::debug!("Recorded worker bootstrap address: {address}");
+                    }
                 }
                 _ => {}
             }
@@ -770,6 +839,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         known_peers,
         local_hostname,
         re_register_fns,
+        listen_addr_shared,
     ))
 }
 

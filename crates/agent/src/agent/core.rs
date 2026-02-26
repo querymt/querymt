@@ -104,6 +104,16 @@ type PreTurnSnapshotTask =
 /// Runtime state for an active session.
 pub struct SessionRuntime {
     pub cwd: Option<std::path::PathBuf>,
+    /// Sandbox extension manager for dynamic Build/Plan/Review mode switching.
+    ///
+    /// Present only in sandboxed worker processes. The `SessionActor` uses this
+    /// to request or release OS-level write access when the mode changes.
+    ///
+    /// Uses a trait object so the agent crate does not need to depend on the
+    /// worker crate directly. The concrete type is `ExtensionManager` from
+    /// `querymt-worker`.
+    #[cfg(feature = "sandbox")]
+    pub extension_manager: Option<std::sync::Arc<dyn querymt_sandbox::WriteAccessManager>>,
     pub _mcp_services: HashMap<
         String,
         rmcp::service::RunningService<rmcp::RoleClient, crate::elicitation::ElicitationHandler>,
@@ -157,6 +167,8 @@ impl SessionRuntime {
             pre_turn_snapshot_task: StdMutex::new(None),
             turn_diffs: StdMutex::new(Default::default()),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(feature = "sandbox")]
+            extension_manager: None,
         })
     }
 }

@@ -151,6 +151,11 @@ pub struct LocalAgentHandle {
 
     #[cfg(feature = "remote")]
     remote_node_cache: Arc<RemoteNodeMetadataCache>,
+
+    /// Manages sandboxed worker processes when the `sandbox` feature is enabled.
+    /// Each session gets its own worker process with nono sandbox enforcement.
+    #[cfg(feature = "sandbox")]
+    pub worker_manager: Arc<Mutex<crate::agent::worker_manager::WorkerManager>>,
 }
 
 impl LocalAgentHandle {
@@ -159,7 +164,21 @@ impl LocalAgentHandle {
     /// This is the canonical way to create a `LocalAgentHandle` after building
     /// an `AgentConfig` via `AgentConfigBuilder::build()`.
     pub fn from_config(config: Arc<AgentConfig>) -> Self {
-        let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
+        let _registry = SessionRegistry::new(config.clone());
+
+        // WorkerManager is created but NOT wired into the registry yet.
+        // Call `enable_sandbox()` to opt in to sandboxed session routing.
+        #[cfg(feature = "sandbox")]
+        let worker_manager = {
+            let mut wm = crate::agent::worker_manager::WorkerManager::new();
+            if let Ok(db_path) = crate::session::backend::default_agent_db_path() {
+                wm.set_db_path(db_path);
+            }
+            Arc::new(Mutex::new(wm))
+        };
+
+        let registry = Arc::new(Mutex::new(_registry));
+
         Self {
             config,
             registry,
@@ -171,6 +190,8 @@ impl LocalAgentHandle {
             mesh: StdMutex::new(None),
             #[cfg(feature = "remote")]
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
+            #[cfg(feature = "sandbox")]
+            worker_manager,
         }
     }
 
@@ -435,13 +456,56 @@ impl LocalAgentHandle {
     #[cfg(feature = "remote")]
     pub fn set_mesh(&self, mesh: crate::agent::remote::MeshHandle) {
         *self.mesh.lock().unwrap_or_else(|e| e.into_inner()) = Some(mesh.clone());
-        self.config.provider.set_mesh(Some(mesh));
+        self.config.provider.set_mesh(Some(mesh.clone()));
+
+        // Propagate mesh handle to the WorkerManager so it can pass
+        // --mesh-peer to spawned workers and perform DHT lookups.
+        #[cfg(feature = "sandbox")]
+        {
+            if let Ok(mut wm) = self.worker_manager.try_lock() {
+                wm.set_mesh(mesh);
+            }
+        }
     }
 
     /// Enable/disable automatic mesh fallback for unpinned provider resolution.
     #[cfg(feature = "remote")]
     pub fn set_mesh_fallback(&self, enabled: bool) {
         self.config.provider.set_mesh_fallback(enabled);
+    }
+
+    /// Set the database path on the WorkerManager so spawned workers
+    /// can access the shared SQLite database via `--db-path`.
+    #[cfg(feature = "sandbox")]
+    pub fn set_worker_db_path(&self, db_path: std::path::PathBuf) {
+        if let Ok(mut wm) = self.worker_manager.try_lock() {
+            wm.set_db_path(db_path);
+        }
+    }
+
+    /// Enable sandboxed session routing.
+    ///
+    /// After this call every `new_session()` spawns a `querymt-worker` child
+    /// process, applies a nono sandbox to it, and routes all session messages
+    /// through the kameo mesh to the worker.
+    ///
+    /// Requires the `sandbox` and `remote` features, and that `set_mesh()` has
+    /// already been called so the WorkerManager has an address to pass to workers.
+    ///
+    /// Optionally supply an explicit path to the worker binary. When `None`,
+    /// the binary is located next to the current executable automatically.
+    #[cfg(feature = "sandbox")]
+    pub fn enable_sandbox(&self, worker_binary: Option<std::path::PathBuf>) {
+        if let Ok(mut wm) = self.worker_manager.try_lock() {
+            if let Some(bin) = worker_binary {
+                wm.set_worker_binary(bin);
+            }
+            // Wire the WorkerManager into the SessionRegistry so new_session()
+            // routes through it.
+            if let Ok(mut reg) = self.registry.try_lock() {
+                reg.set_worker_manager(self.worker_manager.clone());
+            }
+        }
     }
 
     #[cfg(feature = "remote")]

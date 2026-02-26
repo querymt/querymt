@@ -551,6 +551,12 @@ impl Tool for EditTool {
     }
 
     async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+        if context.is_read_only() {
+            return Err(ToolError::PermissionDenied(
+                "Session is in read-only mode — file edits are not allowed".to_string(),
+            ));
+        }
+
         let file_path_str = args
             .get("filePath")
             .and_then(Value::as_str)

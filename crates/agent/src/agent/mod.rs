@@ -29,6 +29,8 @@ pub mod snapshots;
 pub mod tools;
 pub mod undo;
 pub mod utils;
+#[cfg(feature = "sandbox")]
+pub mod worker_manager;
 
 // Re-export main types for convenience
 pub use agent_config_builder::AgentConfigBuilder;
@@ -50,6 +52,8 @@ pub use session_registry::SessionRegistry;
 mod delegation_loop_tests;
 #[cfg(test)]
 mod execution_tests;
+#[cfg(all(test, feature = "sandbox"))]
+mod sandbox_integration_tests;
 #[cfg(test)]
 mod undo_integration_tests;
 #[cfg(test)]

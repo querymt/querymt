@@ -61,6 +61,12 @@ impl ToolTrait for WriteFileTool {
     }
 
     async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+        if context.is_read_only() {
+            return Err(ToolError::PermissionDenied(
+                "Session is in read-only mode — file writes are not allowed".to_string(),
+            ));
+        }
+
         let path_arg = args
             .get("path")
             .and_then(Value::as_str)

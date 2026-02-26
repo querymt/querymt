@@ -53,6 +53,11 @@ fn config_options(mode: AgentMode) -> Vec<SessionConfigOption> {
 pub struct SessionRegistry {
     pub config: Arc<AgentConfig>,
     sessions: HashMap<String, SessionActorRef>,
+    /// When set, new sessions are routed through the WorkerManager, which
+    /// spawns a sandboxed worker process for each session. The worker hosts
+    /// the SessionActor inside a nono sandbox and registers it in the mesh.
+    #[cfg(feature = "sandbox")]
+    worker_manager: Option<Arc<tokio::sync::Mutex<crate::agent::worker_manager::WorkerManager>>>,
 }
 
 impl SessionRegistry {
@@ -60,7 +65,18 @@ impl SessionRegistry {
         Self {
             config,
             sessions: HashMap::new(),
+            #[cfg(feature = "sandbox")]
+            worker_manager: None,
         }
+    }
+
+    /// Set the WorkerManager for sandboxed session routing.
+    #[cfg(feature = "sandbox")]
+    pub fn set_worker_manager(
+        &mut self,
+        wm: Arc<tokio::sync::Mutex<crate::agent::worker_manager::WorkerManager>>,
+    ) {
+        self.worker_manager = Some(wm);
     }
 
     /// Merge MCP servers from the agent config with any client-supplied servers.
@@ -177,8 +193,6 @@ impl SessionRegistry {
             peer_label,
             self.sessions.len(),
         );
-        use crate::agent::remote::{EventRelayActor, SessionActorRef};
-        use kameo::actor::Spawn;
 
         // 1. Wrap in SessionActorRef::Remote
         let session_ref = SessionActorRef::Remote {
@@ -186,56 +200,72 @@ impl SessionRegistry {
             peer_label: peer_label.clone(),
         };
 
-        // 2. Spawn a local EventRelayActor for this session.
-        //    It persists durable remote events to the journal and publishes to fanout.
-        let relay_actor = EventRelayActor::new(self.config.event_sink.clone(), peer_label.clone());
-        let relay_ref = EventRelayActor::spawn(relay_actor);
-        let relay_id = relay_ref.id().sequence_id();
-
-        // 3. Register the relay in REMOTE_REGISTRY + DHT so the remote
-        //    SessionActor can look it up by name and install an EventForwarder.
-        let mesh_active = mesh.is_some();
-        if let Some(ref mesh) = mesh {
-            mesh.register_actor(
-                relay_ref.clone(),
-                crate::agent::remote::dht_name::event_relay(&session_id),
-            )
+        // 2-4. Set up event relay (spawn relay actor, register in DHT, subscribe)
+        self.setup_event_relay(&session_id, &session_ref, &peer_label, mesh.as_ref())
             .await;
-        } else {
-            log::debug!(
-                "attach_remote_session: no mesh, DHT registration skipped for relay (session {})",
-                session_id
-            );
-        }
-
-        // 4. Send SubscribeEvents to the remote session.
-        //    The remote SubscribeEvents handler uses mesh.lookup_actor to find
-        //    the relay and install an EventForwarder on its EventBus.
-        if let Err(e) = session_ref.subscribe_events(relay_id).await {
-            log::warn!(
-                "attach_remote_session: SubscribeEvents failed for {} (event relay may not be active): {}",
-                session_id,
-                e
-            );
-        }
 
         // 5. Insert into registry
         self.sessions
             .insert(session_id.clone(), session_ref.clone());
 
+        session_ref
+    }
+
+    /// Spawn a local `EventRelayActor` for a remote session and wire it up.
+    ///
+    /// This is the shared plumbing used by both `attach_remote_session` (cross-machine
+    /// remote sessions) and `new_session` (sandbox worker sessions). It:
+    ///
+    /// 1. Spawns a local `EventRelayActor` that republishes received events into
+    ///    the orchestrator's `EventSink` (journal + fanout).
+    /// 2. Registers the relay in the DHT so the remote `SessionActor` can discover it.
+    /// 3. Sends `SubscribeEvents` to the remote session, which installs an
+    ///    `EventForwarder` that streams events from the remote fanout to the relay.
+    #[cfg(feature = "remote")]
+    async fn setup_event_relay(
+        &self,
+        session_id: &str,
+        session_ref: &SessionActorRef,
+        peer_label: &str,
+        mesh: Option<&crate::agent::remote::MeshHandle>,
+    ) {
+        use crate::agent::remote::EventRelayActor;
+        use kameo::actor::Spawn;
+
+        let relay_actor =
+            EventRelayActor::new(self.config.event_sink.clone(), peer_label.to_string());
+        let relay_ref = EventRelayActor::spawn(relay_actor);
+        let relay_id = relay_ref.id().sequence_id();
+
+        let mesh_active = mesh.is_some();
+        if let Some(mesh) = mesh {
+            mesh.register_actor(
+                relay_ref.clone(),
+                crate::agent::remote::dht_name::event_relay(session_id),
+            )
+            .await;
+        } else {
+            log::debug!(
+                "setup_event_relay: no mesh, DHT registration skipped for relay (session {})",
+                session_id
+            );
+        }
+
+        if let Err(e) = session_ref.subscribe_events(relay_id).await {
+            log::warn!(
+                "setup_event_relay: SubscribeEvents failed for {} (event relay may not be active): {}",
+                session_id,
+                e
+            );
+        }
+
         log::info!(
-            "Attached remote session {} from {} (relay_actor_id={}, event relay {})",
+            "Event relay established for session {} from {} (relay_actor_id={}, mesh {})",
             session_id,
             peer_label,
             relay_id,
-            if mesh_active {
-                "active"
-            } else {
-                "pending mesh bootstrap"
-            }
+            if mesh_active { "active" } else { "pending" }
         );
-
-        session_ref
     }
 
     /// Create a new session: build runtime, spawn SessionActor, return session_id.
@@ -295,10 +325,68 @@ impl SessionRegistry {
 
         let runtime = SessionRuntime::new(cwd.clone(), mcp_services, mcp_tools, mcp_tool_defs);
 
-        // Spawn the session actor
-        let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone());
-        let actor_ref = SessionActor::spawn(actor);
-        self.sessions.insert(session_id.clone(), actor_ref.into());
+        // Spawn the session actor — either locally or in a sandboxed worker.
+        #[cfg(feature = "sandbox")]
+        let used_worker = if let Some(ref worker_manager) = self.worker_manager {
+            // Parse the current mode from the config defaults.
+            let mode = *self
+                .config
+                .default_mode
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let session_cwd = cwd.clone().unwrap_or_default();
+
+            // Spawn the worker and grab the mesh handle while the lock is held,
+            // then release the lock before setting up the event relay.
+            let spawn_result = {
+                let mut wm = worker_manager.lock().await;
+                let result = wm.spawn_worker(&session_id, session_cwd, mode).await;
+                #[cfg(feature = "remote")]
+                let mesh = wm.mesh_handle();
+                #[cfg(not(feature = "remote"))]
+                let mesh = None::<()>;
+                (result, mesh)
+            };
+
+            match spawn_result {
+                (Ok(session_ref), mesh) => {
+                    self.sessions
+                        .insert(session_id.clone(), session_ref.clone());
+
+                    // Set up the event relay so the worker's events reach the
+                    // orchestrator's EventFanout (and thus the UI).
+                    #[cfg(feature = "remote")]
+                    self.setup_event_relay(&session_id, &session_ref, "worker", mesh.as_ref())
+                        .await;
+
+                    true
+                }
+                (Err(e), _) => {
+                    log::warn!(
+                        "Failed to spawn sandboxed worker for session {}, falling back to local: {}",
+                        session_id,
+                        e
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        #[cfg(feature = "sandbox")]
+        if !used_worker {
+            let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone());
+            let actor_ref = SessionActor::spawn(actor);
+            self.sessions.insert(session_id.clone(), actor_ref.into());
+        }
+
+        #[cfg(not(feature = "sandbox"))]
+        {
+            let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone());
+            let actor_ref = SessionActor::spawn(actor);
+            self.sessions.insert(session_id.clone(), actor_ref.into());
+        }
 
         self.config
             .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);

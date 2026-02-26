@@ -79,6 +79,21 @@ struct Cli {
     #[cfg(feature = "remote")]
     #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_MESH_ADDR)]
     mesh: Option<String>,
+
+    /// Run each session inside an OS-level nono sandbox (Landlock/Seatbelt).
+    ///
+    /// Every new session spawns a `querymt-worker` child process. The worker
+    /// applies the sandbox before executing any tools and communicates with
+    /// this orchestrator via the kameo mesh.
+    ///
+    /// Requires `--mesh` to also be set (workers join the mesh to register).
+    /// Requires the `sandbox` and `remote` cargo features.
+    ///
+    /// Example:
+    ///   --dashboard --mesh --sandbox
+    #[cfg(all(feature = "sandbox", feature = "remote"))]
+    #[arg(long, default_value = "false")]
+    sandbox: bool,
 }
 
 /// Setup logging for stdio mode - writes to stderr only to avoid corrupting stdout JSON-RPC.
@@ -218,13 +233,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Store the MeshHandle on AgentHandle so list_remote_nodes,
                 // create_remote_session, and attach_remote_session can use it.
+                // set_mesh also propagates the handle to the WorkerManager.
                 agent_handle.set_mesh(mesh);
+
+                // Activate sandboxed session routing if --sandbox was passed.
+                // Must come after set_mesh() so the WorkerManager has the
+                // mesh handle it needs to derive --mesh-peer for workers.
+                #[cfg(all(feature = "sandbox", feature = "remote"))]
+                if cli.sandbox {
+                    agent_handle.enable_sandbox(None);
+                    eprintln!("Sandbox enabled: new sessions will run in querymt-worker processes");
+                }
             }
             Err(e) => {
                 eprintln!("Warning: mesh bootstrap failed: {}", e);
                 eprintln!("Continuing without mesh networking...");
             }
         }
+    }
+
+    // Warn if --sandbox was requested without --mesh
+    #[cfg(all(feature = "sandbox", feature = "remote"))]
+    if cli.sandbox && !has_mesh {
+        eprintln!("Warning: --sandbox requires --mesh; sandbox will not be active.");
     }
 
     if is_acp {

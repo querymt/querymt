@@ -326,6 +326,22 @@ async fn set_mode_for_session<S: SendAgent>(
         return Err(Error::internal_error().data("set_mode requires AgentHandle"));
     };
 
+    // When sandbox is enabled, notify the WorkerManager about mode switches
+    // so it can update the supervisor approval backend (grant/revoke write access).
+    #[cfg(feature = "sandbox")]
+    {
+        let mut worker_mgr = handle.worker_manager.lock().await;
+        if worker_mgr.has_worker(session_id) {
+            worker_mgr
+                .switch_mode(session_id, mode)
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            // switch_mode already forwards SetMode to the SessionActor, so return
+            return Ok(());
+        }
+        // Fall through: session is not in a sandboxed worker, use direct path
+    }
+
     let session_ref = {
         let registry = handle.registry.lock().await;
         registry.get(session_id).cloned().ok_or_else(|| {

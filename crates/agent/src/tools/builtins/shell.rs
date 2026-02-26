@@ -7,6 +7,44 @@ use tokio::process::Command;
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 
+/// Inspect command output for OS-level sandbox denial signatures.
+///
+/// Returns a human-readable note when all of the following are true:
+/// - The session is in read-only mode (Plan/Review)
+/// - The command exited with a non-zero code
+/// - stderr contains a pattern produced by Landlock (Linux) or Seatbelt (macOS)
+///   when a write operation is blocked: "Operation not permitted" (EPERM) or
+///   "Permission denied" (EACCES)
+///
+/// The note is appended to the JSON result as `sandbox_note` so the agent
+/// understands why the command failed and knows to switch to Build mode.
+/// We surface a note rather than a hard error because:
+/// - The command may have produced partial output before the denied op.
+/// - "Permission denied" can also arise from ordinary file ownership issues
+///   unrelated to the sandbox — callers should see the raw stderr too.
+fn detect_sandbox_denial(stderr: &str, exit_code: i32, is_read_only: bool) -> Option<String> {
+    if !is_read_only || exit_code == 0 {
+        return None;
+    }
+
+    // Patterns emitted by the kernel when Landlock (Linux) or Seatbelt (macOS)
+    // blocks an operation. Both map to errno EACCES or EPERM respectively.
+    let has_denial =
+        stderr.contains("Operation not permitted") || stderr.contains("Permission denied");
+
+    if has_denial {
+        Some(
+            "This command failed with a permission error while the session is in \
+             read-only mode (Plan/Review). The OS sandbox may have blocked a \
+             write operation. If the command needs filesystem write access, \
+             switch to Build mode."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 pub struct ShellTool;
 
 impl Default for ShellTool {
@@ -168,11 +206,19 @@ impl ToolTrait for ShellTool {
             stderr: stderr_buf,
         };
 
-        let result = json!({
-            "exit_code": output.status.code().unwrap_or(-1),
-            "stdout": String::from_utf8_lossy(&output.stdout),
-            "stderr": String::from_utf8_lossy(&output.stderr),
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        let mut result = json!({
+            "exit_code": exit_code,
+            "stdout": stdout_str,
+            "stderr": stderr_str,
         });
+
+        if let Some(note) = detect_sandbox_denial(&stderr_str, exit_code, context.is_read_only()) {
+            result["sandbox_note"] = Value::String(note);
+        }
 
         serde_json::to_string(&result)
             .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
@@ -220,5 +266,67 @@ mod tests {
 
         assert_eq!(parsed["exit_code"], 0);
         assert!(parsed["stdout"].as_str().unwrap().contains("hello world"));
+    }
+
+    /// Read-only mode must not block commands that don't touch the filesystem.
+    #[tokio::test]
+    async fn test_shell_read_only_allows_read_commands() {
+        let temp_dir = TempDir::new().unwrap();
+        let context = AgentToolContext::basic_read_only(
+            "test".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
+        let tool = ShellTool::new();
+
+        let result = tool
+            .call(json!({ "command": "echo hello" }), &context)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(parsed["exit_code"], 0);
+        assert!(parsed["stdout"].as_str().unwrap().contains("hello"));
+        // No sandbox note for a successful, non-mutating command
+        assert!(parsed.get("sandbox_note").is_none());
+    }
+
+    // ── detect_sandbox_denial unit tests ─────────────────────────────────
+
+    #[test]
+    fn test_no_note_when_not_read_only() {
+        assert!(
+            detect_sandbox_denial("Permission denied", 1, false).is_none(),
+            "should not annotate when not in read-only mode"
+        );
+    }
+
+    #[test]
+    fn test_no_note_on_success() {
+        assert!(
+            detect_sandbox_denial("Permission denied", 0, true).is_none(),
+            "should not annotate when exit code is 0"
+        );
+    }
+
+    #[test]
+    fn test_no_note_for_unrelated_failure() {
+        assert!(
+            detect_sandbox_denial("command not found", 127, true).is_none(),
+            "should not annotate for unrelated failures"
+        );
+    }
+
+    #[test]
+    fn test_note_on_eperm_in_read_only() {
+        let note = detect_sandbox_denial("touch: file: Operation not permitted", 1, true);
+        assert!(note.is_some(), "should annotate EPERM in read-only mode");
+        assert!(note.unwrap().contains("Build mode"));
+    }
+
+    #[test]
+    fn test_note_on_eacces_in_read_only() {
+        let note = detect_sandbox_denial("bash: file.txt: Permission denied", 1, true);
+        assert!(note.is_some(), "should annotate EACCES in read-only mode");
+        assert!(note.unwrap().contains("Build mode"));
     }
 }

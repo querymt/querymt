@@ -4,22 +4,20 @@
 # a specialized coder agent for implementation tasks.
 
 [quorum]
-cwd = "."
+cwd = "/Users/wiking/qmt/querymt"
 db = "/tmp/test.db"
 delegation = true
 verification = false
 snapshot_policy = "diff"
 delegation_wait_policy = "all"
-delegation_wait_timeout_secs = 120
+delegation_wait_timeout_secs = 2400
 delegation_cancel_grace_secs = 5
-max_parallel_delegations = 5
+max_parallel_delegations = 1
 
 [planner]
 provider = "anthropic"
 model = "claude-opus-4-5"
-#provider = "codex"
-#model = "gpt-5.2-codex"
-tools = ["delegate", "create_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "read_tool", "shell"]
+tools = ["delegate", "create_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "read_tool", "shell", "web_fetch"]
 system = [
   { file = "../prompts/default_system.txt" }
 ]
@@ -50,7 +48,8 @@ exactly what it's for, and that is expected and correct.
 ## What You MUST Do
 
 1. **Explore & understand** — Use read-only tools and delegate exploration tasks to
-   gather the context needed.
+   gather the context needed. use the `explorer` agent and the `delegate` tool to
+   explore a codebase.
 2. **Plan** — Break the work into concrete, actionable implementation tasks.
 3. **Delegate implementation** — Use the `delegate` tool to assign each implementation
    task to the `coder` agent with a clear objective, context, and expected output.
@@ -85,26 +84,42 @@ Don't make large assumptions about user intent.
  
 [quorum.delegation_summary]
 provider = "anthropic"
-model = "claude-3-5-haiku-20241022"
+model = "claude-haiku-4-5-20251001"
+
+[mesh]
+enabled = true
+listen = "/ip4/0.0.0.0/tcp/9000"
+discovery = "mdns"                    # or "none" with explicit peers
+
+# Specify a direct connection to your gpu instance
+# 
+# [[mesh.peers]]
+# name = "gpu-peer"
+# addr = "/ip4/10.0.0.1/tcp/9000"
 
 [[delegates]]
 id = "coder"
 provider = "llama_cpp"
-model = "qwen3-coder-30b"
+model = "unsloth/Qwen3.5-35B-A3B-GGUF:MXFP4_MOE"
 description = "Specialized in implementation and code writing"
+peer = "nas"
 capabilities = ["rust", "python"]
 tools = ["question", "edit", "todowrite", "todoread", "glob", "search_text", "ls", "shell", "read_tool", "write_file"]
 system = [
-  { file = "../prompts/anthropic_opencode.txt" }
+  { file = "../prompts/default_system.txt" }
 ]
 
-#[delegates.parameters]
-model = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf"
-n_ctx = 120000
-max_tokens = 8192
+[delegates.parameters]
+n_ctx = 150000
+max_tokens = 4096
 flash_attention = "enabled"
 kv_cache_type_k = "q8_0"
 kv_cache_type_v = "q8_0"
+top_p = 0.95
+top_k = 20
+temperature = 0.6
+min_p = 0.0
+text_only = true
 
 # Middleware for coder delegate
 # Apply same limits as planner
@@ -115,11 +130,56 @@ max_turns = 30
 
 [[delegates.middleware]]
 type = "context"
-warn_at_percent = 70
-fallback_max_tokens = 110000
+warn_at_percent = 80
+fallback_max_tokens = 120000
 
 # Detect when code is similar to existing code
 [[delegates.middleware]]
 type = "dedup_check"
 threshold = 0.85
 min_lines = 10
+
+[[delegates]]
+id = "explorer"
+provider = "llama_cpp"
+model = "unsloth/Qwen3.5-35B-A3B-GGUF:MXFP4_MOE"
+description = "Specialized in reviewing and understanding and summarizing code."
+peer = "nas"
+capabilities = ["rust", "python"]
+tools = ["question", "todowrite", "todoread", "glob", "search_text", "ls", "shell", "read_tool"]
+system = ["""You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
+
+Your strengths:
+- Rapidly finding files using glob patterns
+- Searching code and text with powerful regex patterns
+- Reading and analyzing file contents
+
+Guidelines:
+- Use `glob` for broad file pattern matching
+- Use `search_text` for searching file contents with regex
+- Use `read_tool` when you know the specific file path you need to read
+- Use `shell` for file operations like copying, moving, or listing directory contents
+- Adapt your search approach based on the thoroughness level specified by the caller
+- Return file paths as absolute paths in your final response
+- For clear communication, avoid using emojis
+- Do not create any files, or run bash commands that modify the user's system state in any way
+
+Complete the user's search request efficiently and report your findings clearly."""
+]
+
+[delegates.parameters]
+n_ctx = 150000
+max_tokens = 4096
+flash_attention = "enabled"
+kv_cache_type_k = "q8_0"
+kv_cache_type_v = "q8_0"
+top_p = 0.95
+top_k = 20
+temperature = 0.9
+min_p = 0.0
+text_only = true
+
+[[delegates.middleware]]
+type = "context"
+warn_at_percent = 80
+fallback_max_tokens = 120000

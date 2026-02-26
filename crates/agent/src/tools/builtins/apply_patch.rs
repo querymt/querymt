@@ -69,6 +69,12 @@ impl ToolTrait for ApplyPatchTool {
     }
 
     async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+        if context.is_read_only() {
+            return Err(ToolError::PermissionDenied(
+                "Session is in read-only mode — applying patches is not allowed".to_string(),
+            ));
+        }
+
         let patch = args
             .get("patch")
             .and_then(Value::as_str)

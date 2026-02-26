@@ -182,6 +182,8 @@ impl TestHarness {
             pre_turn_snapshot_task: StdMutex::new(None),
             turn_diffs: StdMutex::new(Default::default()),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(feature = "sandbox")]
+            extension_manager: None,
         });
 
         let exec_ctx = ExecutionContext::new(

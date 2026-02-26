@@ -27,6 +27,7 @@ pub struct AgentToolContext {
     agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry>>,
     elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
     cancellation_token: CancellationToken,
+    read_only: bool,
 }
 
 impl AgentToolContext {
@@ -42,6 +43,7 @@ impl AgentToolContext {
             agent_registry,
             elicitation_tx,
             cancellation_token: CancellationToken::new(),
+            read_only: false,
         }
     }
 
@@ -51,9 +53,23 @@ impl AgentToolContext {
         self
     }
 
+    /// Mark this context as read-only (Plan/Review mode).
+    ///
+    /// Write tools check `is_read_only()` to produce clear
+    /// `PermissionDenied` errors before hitting the OS sandbox.
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
     /// Create a basic context for testing or simple operations
     pub fn basic(session_id: String, cwd: Option<PathBuf>) -> Self {
         Self::new(session_id, cwd, None, None)
+    }
+
+    /// Create a basic read-only context for testing.
+    pub fn basic_read_only(session_id: String, cwd: Option<PathBuf>) -> Self {
+        Self::new(session_id, cwd, None, None).with_read_only(true)
     }
 }
 
@@ -65,6 +81,10 @@ impl ToolContext for AgentToolContext {
 
     fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     fn agent_registry(&self) -> Option<Arc<dyn crate::delegation::AgentRegistry>> {

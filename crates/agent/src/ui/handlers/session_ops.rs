@@ -642,6 +642,44 @@ pub async fn handle_set_agent_mode(
             }
 
             let mode_set_on_actor = if let Some(ref session_id) = session_id {
+                // In sandbox mode, route mode switches through WorkerManager so
+                // the supervisor approval backend is updated (grants/revokes write
+                // access) in addition to forwarding SetMode to the SessionActor.
+                // This mirrors the ACP handler at `acp/shared.rs::set_mode_for_session`.
+                #[cfg(feature = "sandbox")]
+                {
+                    let mut worker_mgr = state.agent.worker_manager.lock().await;
+                    if worker_mgr.has_worker(session_id) {
+                        match worker_mgr.switch_mode(session_id, new_mode).await {
+                            Ok(_) => {
+                                log::info!(
+                                    "Agent mode changed on session {}: {} -> {} (via WorkerManager)",
+                                    session_id,
+                                    previous_mode,
+                                    new_mode
+                                );
+                                return send_message(
+                                    tx,
+                                    crate::ui::messages::UiServerMessage::AgentMode {
+                                        mode: new_mode.as_str().to_string(),
+                                    },
+                                )
+                                .await
+                                .unwrap_or(());
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Failed to switch mode via WorkerManager for session {}: {}. \
+                                     Falling back to direct path.",
+                                    session_id,
+                                    e
+                                );
+                                // Fall through to the direct session_ref path below.
+                            }
+                        }
+                    }
+                }
+
                 let session_ref = {
                     let registry = state.agent.registry.lock().await;
                     registry.get(session_id).cloned()
