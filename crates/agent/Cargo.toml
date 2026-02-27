@@ -60,7 +60,7 @@ moka = { version = "0.12", features = ["future"] }
 pathdiff = "0.2"
 patchkit = "0.2"
 gitpatch = "0.7"
-rmcp = { version = "0.9", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-sse-client-reqwest", "reqwest"] }
+rmcp = { version = "0.17", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-sse-client-reqwest", "reqwest"] }
 axum = { version = "0.7", features = ["macros", "ws"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 rust-embed = { version = "8.6", features = ["axum"] }
