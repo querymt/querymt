@@ -384,7 +384,7 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
 
     #[tracing::instrument(
         name = "remote.provider_host.chat",
-        skip(self, _ctx),
+        skip_all,
         fields(
             provider = %msg.provider,
             model = %msg.model,
@@ -446,7 +446,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
 
     #[tracing::instrument(
         name = "remote.provider_host.stream",
-        skip(self, _ctx),
+        skip_all,
         fields(
             provider = %msg.provider,
             model = %msg.model,
