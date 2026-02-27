@@ -276,29 +276,37 @@ pub(super) async fn ensure_session_loaded(
         return Ok(());
     }
 
-    let store_exists = state
+    let stored_session = state
         .agent
         .config
         .provider
         .history_store()
         .get_session(session_id)
         .await
-        .map_err(|e| e.to_string())?
-        .is_some();
+        .map_err(|e| e.to_string())?;
 
-    if !store_exists {
+    let Some(session) = stored_session else {
         tracing::warn!(
             op_name,
             session_id,
             registry_hit,
-            store_exists,
+            store_exists = false,
             actor_loaded = false,
             "session hydration failed: missing from store"
         );
         return Err(format!("Session not found: {}", session_id));
+    };
+
+    if let Some(cwd) = session.cwd.clone() {
+        let mut cwds = state.session_cwds.lock().await;
+        cwds.insert(session_id.to_string(), cwd);
     }
 
-    let req = LoadSessionRequest::new(SessionId::from(session_id.to_string()), PathBuf::new());
+    let store_exists = true;
+    let req = LoadSessionRequest::new(
+        SessionId::from(session_id.to_string()),
+        session.cwd.unwrap_or_else(PathBuf::new),
+    );
     state
         .agent
         .load_session(req)

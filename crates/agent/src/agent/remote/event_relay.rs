@@ -64,15 +64,6 @@ impl Message<RelayedEvent> for EventRelayActor {
             kind = ?msg.event.kind,
             "relaying event through EventSink"
         );
-        log::debug!(
-            "EventRelayActor({}): received RelayedEvent #{} — \
-             original_seq={} session={} kind={:?}",
-            self.source_label,
-            self.received,
-            msg.event.seq,
-            msg.event.session_id,
-            msg.event.kind,
-        );
 
         // Set remote provenance metadata.
         let mut event = msg.event;

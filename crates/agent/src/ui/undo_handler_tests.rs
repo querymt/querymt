@@ -489,7 +489,16 @@ async fn test_undo_handler_cross_session() -> Result<()> {
 #[tokio::test]
 async fn test_load_session_hydrates_runtime_actor() -> Result<()> {
     let f = TestServerState::new().await;
-    let session_id = f.agent.create_session().await;
+    let worktree = TempDir::new()?;
+    let canonical_worktree = fs::canonicalize(worktree.path())?;
+    fs::write(canonical_worktree.join("note.txt"), "hello from cwd")?;
+    let session = f
+        .agent
+        .storage
+        .session_store()
+        .create_session(None, Some(canonical_worktree.clone()), None, None)
+        .await?;
+    let session_id = session.public_id;
 
     let (tx, _rx) = f.add_connection("conn-load").await;
 
@@ -500,11 +509,27 @@ async fn test_load_session_hydrates_runtime_actor() -> Result<()> {
 
     handle_load_session(&f.state, "conn-load", &session_id, &tx).await;
 
-    let actor_loaded = {
+    let session_ref = {
         let registry = f.agent.handle.registry.lock().await;
-        registry.get(&session_id).is_some()
+        registry.get(&session_id).cloned()
+    }
+    .expect("load_session should hydrate runtime actor");
+
+    let cached_cwd = {
+        let cwds = f.state.session_cwds.lock().await;
+        cwds.get(&session_id).cloned()
     };
-    assert!(actor_loaded, "load_session should hydrate runtime actor");
+    assert_eq!(cached_cwd, Some(canonical_worktree.clone()));
+
+    let read = session_ref
+        .read_remote_file("note.txt".to_string(), 0, 100)
+        .await?;
+    match read {
+        crate::agent::file_proxy::ReadRemoteFileResponse::Text(content) => {
+            assert!(content.contains("hello from cwd"));
+        }
+        other => panic!("unexpected file read response: {other:?}"),
+    }
 
     Ok(())
 }
@@ -512,7 +537,16 @@ async fn test_load_session_hydrates_runtime_actor() -> Result<()> {
 #[tokio::test]
 async fn test_set_session_model_hydrates_persisted_session() -> Result<()> {
     let f = TestServerState::new().await;
-    let session_id = f.agent.create_session().await;
+    let worktree = TempDir::new()?;
+    let canonical_worktree = fs::canonicalize(worktree.path())?;
+    fs::write(canonical_worktree.join("model-test.txt"), "hydrated cwd")?;
+    let session = f
+        .agent
+        .storage
+        .session_store()
+        .create_session(None, Some(canonical_worktree.clone()), None, None)
+        .await?;
+    let session_id = session.public_id;
 
     {
         let registry = f.agent.handle.registry.lock().await;
@@ -546,11 +580,21 @@ async fn test_set_session_model_hydrates_persisted_session() -> Result<()> {
         "set_session_model should not emit error for persisted session: {errors:?}"
     );
 
-    let actor_loaded = {
+    let session_ref = {
         let registry = f.agent.handle.registry.lock().await;
-        registry.get(&session_id).is_some()
-    };
-    assert!(actor_loaded, "set_session_model should lazy-hydrate actor");
+        registry.get(&session_id).cloned()
+    }
+    .expect("set_session_model should lazy-hydrate actor");
+
+    let read = session_ref
+        .read_remote_file("model-test.txt".to_string(), 0, 100)
+        .await?;
+    match read {
+        crate::agent::file_proxy::ReadRemoteFileResponse::Text(content) => {
+            assert!(content.contains("hydrated cwd"));
+        }
+        other => panic!("unexpected file read response: {other:?}"),
+    }
 
     let llm_cfg = f
         .agent
