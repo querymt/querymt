@@ -8,7 +8,10 @@
 
 use rmcp::RoleClient;
 use rmcp::handler::client::ClientHandler;
-use rmcp::model::{ClientInfo, CreateElicitationRequestParam, CreateElicitationResult};
+use rmcp::model::{
+    ClientCapabilities, ClientInfo, CreateElicitationRequestParam, CreateElicitationResult,
+    Implementation, ProtocolVersion,
+};
 use rmcp::service::RequestContext;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -113,6 +116,7 @@ pub struct ElicitationHandler {
     event_sink: Arc<crate::event_sink::EventSink>,
     server_name: String,
     session_id: String,
+    client_impl: Implementation,
 }
 
 impl ElicitationHandler {
@@ -121,12 +125,14 @@ impl ElicitationHandler {
         event_sink: Arc<crate::event_sink::EventSink>,
         server_name: String,
         session_id: String,
+        client_impl: Implementation,
     ) -> Self {
         Self {
             pending,
             event_sink,
             server_name,
             session_id,
+            client_impl,
         }
     }
 }
@@ -186,7 +192,11 @@ impl ClientHandler for ElicitationHandler {
     }
 
     fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
+        ClientInfo {
+            protocol_version: ProtocolVersion::default(),
+            capabilities: ClientCapabilities::default(),
+            client_info: self.client_impl.clone(),
+        }
     }
 }
 

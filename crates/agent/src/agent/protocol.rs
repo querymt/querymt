@@ -6,6 +6,7 @@ use querymt::tool_decorator::CallFunctionTool;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::{
     RoleClient,
+    model::Implementation,
     service::{RunningService, serve_client},
     transport::{
         SseClientTransport, StreamableHttpClientTransport, child_process::TokioChildProcess,
@@ -24,6 +25,7 @@ pub(crate) async fn build_mcp_state(
     pending_elicitations: crate::elicitation::PendingElicitationMap,
     event_sink: Arc<crate::event_sink::EventSink>,
     session_id: String,
+    client_impl: &Implementation,
 ) -> Result<
     (
         HashMap<String, RunningService<RoleClient, crate::elicitation::ElicitationHandler>>,
@@ -45,6 +47,7 @@ pub(crate) async fn build_mcp_state(
             pending_elicitations.clone(),
             event_sink.clone(),
             session_id.clone(),
+            client_impl,
         )
         .await?;
         let peer = running.peer().clone();
@@ -80,6 +83,7 @@ async fn start_mcp_server(
     pending_elicitations: crate::elicitation::PendingElicitationMap,
     event_sink: Arc<crate::event_sink::EventSink>,
     session_id: String,
+    client_impl: &Implementation,
 ) -> Result<
     (
         String,
@@ -109,6 +113,7 @@ async fn start_mcp_server(
                 event_sink.clone(),
                 name.clone(),
                 session_id.clone(),
+                client_impl.clone(),
             );
             let running: RunningService<RoleClient, crate::elicitation::ElicitationHandler> =
                 serve_client(handler, transport).await.map_err(|e| {
@@ -136,6 +141,7 @@ async fn start_mcp_server(
                 event_sink.clone(),
                 name.clone(),
                 session_id.clone(),
+                client_impl.clone(),
             );
             let running = serve_client(handler, transport).await.map_err(|e| {
                 Error::from(AgentError::McpServerFailed {
@@ -172,6 +178,7 @@ async fn start_mcp_server(
                 event_sink,
                 name.clone(),
                 session_id,
+                client_impl.clone(),
             );
             let running = serve_client(handler, transport).await.map_err(|e| {
                 Error::from(AgentError::McpServerFailed {

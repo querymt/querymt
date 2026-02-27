@@ -2,6 +2,7 @@ use anyhow::Result;
 use http::{header::AUTHORIZATION, HeaderValue};
 use reqwest::header::HeaderMap;
 use rmcp::{
+    model::{ClientCapabilities, ClientInfo, Implementation, ProtocolVersion},
     service::{DynService, RunningService},
     transport::{
         sse_client::SseClientConfig, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -48,7 +49,13 @@ pub enum McpServerTransportConfig {
 impl McpServerTransportConfig {
     pub async fn start(
         &self,
+        client_impl: &Implementation,
     ) -> Result<RunningService<RoleClient, Box<dyn DynService<RoleClient>>>> {
+        let client_info = ClientInfo {
+            protocol_version: ProtocolVersion::default(),
+            capabilities: ClientCapabilities::default(),
+            client_info: client_impl.clone(),
+        };
         let client = match self {
             McpServerTransportConfig::Sse { url, token } => {
                 let transport = match token {
@@ -74,7 +81,7 @@ impl McpServerTransportConfig {
                     }
                     None => SseClientTransport::start(url.as_str()).await?,
                 };
-                ().into_dyn().serve(transport).await?
+                client_info.clone().into_dyn().serve(transport).await?
             }
             McpServerTransportConfig::Http { url, token } => {
                 let transport = match token {
@@ -99,7 +106,7 @@ impl McpServerTransportConfig {
                     }
                     None => StreamableHttpClientTransport::from_uri(url.clone()),
                 };
-                ().into_dyn().serve(transport).await?
+                client_info.clone().into_dyn().serve(transport).await?
             }
             McpServerTransportConfig::Stdio { command, .. }
                 if !(which(command).is_ok() || std::path::Path::new(&command).exists()) =>
@@ -119,7 +126,7 @@ impl McpServerTransportConfig {
                     .stdout(Stdio::piped())
                     .stdin(Stdio::piped());
                 let transport = rmcp::transport::child_process::TokioChildProcess::new(cmd)?;
-                ().into_dyn().serve(transport).await?
+                client_info.clone().into_dyn().serve(transport).await?
             }
         };
         log::trace!("Connected to server: {:#?}", client.peer_info());
@@ -136,10 +143,11 @@ impl Config {
 
     pub async fn create_mcp_clients(
         &self,
+        client_impl: &Implementation,
     ) -> Result<HashMap<String, RunningService<RoleClient, Box<dyn DynService<RoleClient>>>>> {
         let mut clients = HashMap::new();
         for server in &self.mcp {
-            let client = server.transport.start().await?;
+            let client = server.transport.start(client_impl).await?;
             clients.insert(server.name.clone(), client);
         }
 

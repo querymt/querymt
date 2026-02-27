@@ -421,7 +421,7 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
             .record("tool_calls_returned", tool_calls.len())
             .record("finish_reason", finish_reason.as_deref().unwrap_or("none"));
 
-        log::debug!(
+        log::trace!(
             "ProviderHostActor: non-streaming call to {}/{} complete (tool_calls={}, finish={:?})",
             msg.provider,
             msg.model,
@@ -560,7 +560,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                 }
 
                 tracing::Span::current().record("chunk_count", chunk_count);
-                log::debug!(
+                log::trace!(
                     "ProviderHostActor: streaming call to {}/{} complete ({} chunks relayed to '{}')",
                     provider_name,
                     model,

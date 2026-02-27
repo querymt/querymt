@@ -280,6 +280,13 @@ impl SessionRegistry {
             self.config.pending_elicitations(),
             self.config.event_sink.clone(),
             session_id.clone(),
+            &rmcp::model::Implementation {
+                name: "querymt-agent".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                title: None,
+                icons: None,
+                website_url: None,
+            },
         )
         .await?;
 
@@ -418,6 +425,13 @@ impl SessionRegistry {
             self.config.pending_elicitations(),
             self.config.event_sink.clone(),
             session_id.clone(),
+            &rmcp::model::Implementation {
+                name: "querymt-agent".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                title: None,
+                icons: None,
+                website_url: None,
+            },
         )
         .await?;
 
@@ -559,6 +573,13 @@ impl SessionRegistry {
             self.config.pending_elicitations(),
             self.config.event_sink.clone(),
             session_id.clone(),
+            &rmcp::model::Implementation {
+                name: "querymt-agent".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                title: None,
+                icons: None,
+                website_url: None,
+            },
         )
         .await?;
 
