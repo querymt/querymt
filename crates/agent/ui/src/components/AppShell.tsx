@@ -21,6 +21,7 @@ import {
   applyDashboardTheme,
   getDashboardThemes,
 } from '../utils/dashboardThemes';
+import { toggleDebugLog } from '../utils/debugLog';
 
 /**
  * AppShell - Main layout wrapper for all routes
@@ -187,6 +188,13 @@ export function AppShell() {
         e.preventDefault();
         setShortcutGatewayOpen(false);
         updatePlugins();
+        return;
+      }
+
+      if (shortcutGatewayOpen && !e.altKey && !e.shiftKey && normalizedKey === 'd') {
+        e.preventDefault();
+        setShortcutGatewayOpen(false);
+        toggleDebugLog();
         return;
       }
 
