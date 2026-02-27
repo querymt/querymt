@@ -214,6 +214,7 @@ impl QuorumBuilder {
             let middleware_entries = delegate.middleware.clone();
             let exec = delegate.execution.clone();
             let registry = registry.clone();
+            let delegate_agent_id = delegate.id.clone();
             let snapshot_policy_for_delegate = self.snapshot_policy;
             let delegation_wait_policy_for_delegate = self.delegation_wait_policy.clone();
             let delegation_wait_timeout_for_delegate = self.delegation_wait_timeout_secs;
@@ -226,6 +227,7 @@ impl QuorumBuilder {
                     event_journal.clone(),
                     llm_config.clone(),
                 )
+                .with_agent_id(delegate_agent_id.clone())
                 .with_tool_policy(ToolPolicy::BuiltInOnly)
                 .with_snapshot_policy(snapshot_policy_for_delegate);
 
@@ -355,6 +357,7 @@ impl QuorumBuilder {
                 event_journal.clone(),
                 planner_llm.clone(),
             )
+            .with_agent_id("planner")
             .with_agent_registry(agent_registry)
             .with_snapshot_policy(snapshot_policy_for_planner);
 

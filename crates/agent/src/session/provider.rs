@@ -14,7 +14,9 @@ use querymt::{
     error::LLMError,
 };
 use serde_json::{Map, Value};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
+#[cfg(feature = "remote")]
+use std::sync::Mutex as StdMutex;
 use tokio::sync::RwLock;
 
 fn prune_config_by_schema(cfg: &Value, schema: &Value) -> Value {
@@ -90,6 +92,10 @@ pub struct SessionProvider {
     /// Cache for the most recently used provider, keyed by LLMConfig.id
     /// Uses a single-entry cache to ensure safe VRAM management for GPU models
     cached_provider: ProviderCache,
+    /// Agent identifier used for `{{ agent_id }}` in system prompt templates.
+    /// Set at build time via `with_agent_id` so that session creation can
+    /// resolve per-agent template variables.
+    pub(crate) agent_id: Option<String>,
     /// Optional mesh handle — present when this node participates in a kameo mesh.
     /// Passed through to `build_provider_from_config` to enable `MeshChatProvider`
     /// routing and mesh-fallback discovery.
@@ -116,11 +122,19 @@ impl SessionProvider {
             history_store: store,
             initial_config,
             cached_provider: Arc::new(RwLock::new(None)),
+            agent_id: None,
             #[cfg(feature = "remote")]
             mesh: Arc::new(StdMutex::new(None)),
             #[cfg(feature = "remote")]
             allow_mesh_fallback: Arc::new(StdMutex::new(false)),
         }
+    }
+
+    /// Set the agent identifier used for `{{ agent_id }}` in system prompt
+    /// templates.  Call at build time before wrapping in `Arc`.
+    pub fn with_agent_id(mut self, id: Option<String>) -> Self {
+        self.agent_id = id;
+        self
     }
 
     /// Returns the initial `LLMParams` this provider was constructed with.
@@ -212,14 +226,31 @@ impl SessionProvider {
             .history_store
             .create_session(
                 None,
-                cwd,
+                cwd.clone(),
                 parent_session_id.map(|s| s.to_string()),
                 fork_origin,
             )
             .await?;
+
+        // Resolve session-specific template variables (cwd, datetime, …) in
+        // system prompt strings before writing the config to the database.
+        let resolved_config = {
+            let ctx = crate::template::SessionTemplateContext::build(
+                cwd.as_deref(),
+                self.initial_config.provider.as_deref(),
+                self.initial_config.model.as_deref(),
+                self.agent_id.as_deref(),
+            );
+            ctx.resolve_params(&self.initial_config).map_err(|e| {
+                SessionError::InvalidOperation(format!(
+                    "Failed to resolve system prompt templates: {e}"
+                ))
+            })?
+        };
+
         let llm_config = self
             .history_store
-            .create_or_get_llm_config(&self.initial_config)
+            .create_or_get_llm_config(&resolved_config)
             .await?;
         self.history_store
             .set_session_llm_config(&session.public_id, llm_config.id)
@@ -395,6 +426,7 @@ impl Clone for SessionProvider {
             history_store: Arc::clone(&self.history_store),
             initial_config: self.initial_config.clone(),
             cached_provider: Arc::clone(&self.cached_provider),
+            agent_id: self.agent_id.clone(),
             // Share the same Arcs so all clones see runtime updates.
             #[cfg(feature = "remote")]
             mesh: Arc::clone(&self.mesh),

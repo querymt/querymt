@@ -29,7 +29,8 @@ tools = [
   "web_fetch",
 ]
 system = [
-  { file = "../prompts/default_system.txt" }
+  { file = "../prompts/default_system.txt" },
+  { file = "../prompts/code_meta.jinja2" }
 ]
 
 [agent.execution.snapshot]

@@ -494,7 +494,11 @@ async fn resolve_system_parts(
     let mut resolved = Vec::with_capacity(parts.len());
     for part in parts {
         match part {
-            SystemPart::Inline(s) => resolved.push(s.clone()),
+            SystemPart::Inline(s) => {
+                crate::template::validate_template(s)
+                    .map_err(|e| anyhow!("Failed to validate {context} prompt template: {e}"))?;
+                resolved.push(s.clone());
+            }
             SystemPart::File { file } => {
                 let path = base_path.join(file);
                 let content = tokio::fs::read_to_string(&path)
@@ -502,6 +506,9 @@ async fn resolve_system_parts(
                     .with_context(|| format!("Failed to load {context} prompt from {path:?}"))?;
                 let content = interpolate_env_vars(&content).with_context(|| {
                     format!("Failed to interpolate env vars in {context} prompt from {path:?}")
+                })?;
+                crate::template::validate_template(&content).map_err(|e| {
+                    anyhow!("Failed to validate {context} prompt template from {path:?}: {e}")
                 })?;
                 resolved.push(content);
             }
@@ -1045,6 +1052,15 @@ fn ensure_inline_system_parts(parts: &[SystemPart], context: &str) -> Result<()>
         return Err(anyhow!(
             "{context} contains unsupported file reference '{file:?}' in inline TOML config; inline prompt text directly instead"
         ));
+    }
+
+    // Validate template syntax and variable names for all inline strings.
+    for part in parts {
+        if let SystemPart::Inline(s) = part {
+            crate::template::validate_template(s).map_err(|e| {
+                anyhow!("Failed to validate {context} inline system prompt template: {e}")
+            })?;
+        }
     }
 
     Ok(())
@@ -1971,5 +1987,83 @@ capabilities = ["writing"]
         assert_eq!(delegate.id, "writer");
         assert_eq!(delegate.peer, None);
         assert_eq!(delegate.description, Some("Writing specialist".to_string()));
+    }
+
+    // ── template validation in config loading ────────────────────────────────
+
+    /// File containing `{{ unknown_var }}` should error at load time.
+    #[tokio::test]
+    async fn test_resolve_system_parts_validates_templates_unknown_var() {
+        let (dir, file) = make_temp_prompt("Hello {{ unknown_var }}");
+        let parts = vec![SystemPart::File { file }];
+        let result = resolve_system_parts(&parts, &dir, "test").await;
+        assert!(result.is_err(), "unknown template var should error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unknown_var"),
+            "error should name the unknown variable: {msg}"
+        );
+    }
+
+    /// File with `{{ model }}` is a known var — should load without error and
+    /// the literal template string must be preserved (not resolved yet).
+    #[tokio::test]
+    async fn test_resolve_system_parts_valid_template_preserved() {
+        let (dir, file) = make_temp_prompt("You are {{ model }}");
+        let parts = vec![SystemPart::File { file }];
+        let resolved = resolve_system_parts(&parts, &dir, "test")
+            .await
+            .expect("valid template should load");
+        // The string must still contain the template literal — NOT resolved.
+        assert_eq!(resolved, vec!["You are {{ model }}"]);
+    }
+
+    /// Inline system string with `{{ bad_var }}` must error when loaded via
+    /// the `ConfigSource::Toml` path.
+    #[tokio::test]
+    async fn test_load_config_inline_template_validated() {
+        let inline = r#"
+[agent]
+provider = "test"
+model = "test-model"
+tools = []
+system = ["You are {{ bad_var }} helpful."]
+"#;
+        let result = load_config(ConfigSource::Toml(inline.to_string())).await;
+        assert!(result.is_err(), "inline unknown template var should error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("bad_var"),
+            "error should name the bad variable: {msg}"
+        );
+    }
+
+    /// Inline `{{ model }}` is a known var and must load successfully.
+    #[tokio::test]
+    async fn test_load_config_inline_valid_template() {
+        let inline = r#"
+[agent]
+provider = "test"
+model = "test-model"
+tools = []
+system = ["You are powered by {{ provider }}/{{ model }}."]
+"#;
+        let cfg = load_config(ConfigSource::Toml(inline.to_string()))
+            .await
+            .expect("valid template vars should load");
+        match cfg {
+            Config::Single(single) => {
+                let system_str = match &single.agent.system[0] {
+                    SystemPart::Inline(s) => s.as_str(),
+                    _ => panic!("expected inline"),
+                };
+                // Template must be preserved as a literal — not rendered yet.
+                assert!(
+                    system_str.contains("{{ provider }}"),
+                    "template should be preserved: {system_str}"
+                );
+            }
+            Config::Multi(_) => panic!("expected single-agent config"),
+        }
     }
 }

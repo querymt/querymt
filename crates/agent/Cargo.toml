@@ -41,7 +41,7 @@ serde_json.workspace = true
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli", "deflate"] }
 rusqlite = { version = "0.37", features = ["bundled", "uuid", "time"] }
-time = { version = "0.3", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
 uuid = { version = "1.18", features = ["v4", "v7"] }
 rapidhash = "4.2"
 ignore = "0.4.25"
@@ -68,6 +68,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 mime_guess = "2.0"
 futures-util = "0.3"
 toml = "0.9"
+minijinja = { version = "2", default-features = false, features = ["serde"] }
 regex.workspace = true
 srgn = "0.14"
 tokio-util = { version = "0.7", features = ["compat"] }

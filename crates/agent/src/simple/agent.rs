@@ -201,6 +201,7 @@ impl AgentBuilder {
             backend.event_journal(),
             llm_config,
         )
+        .with_agent_id("agent")
         .with_snapshot_policy(snapshot_policy);
 
         // Phase 7: inject pre-populated agent registry (remote agents from config).

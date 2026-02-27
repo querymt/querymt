@@ -1,0 +1,11 @@
+You are powered by {{ provider }}/{{ model }}.
+<env>
+  Is directory a git repo: {{ is_git }}
+  Platform: {{ platform }}
+  Today's date: {{ date }}
+</env>
+{% if is_git == "yes" and git_tree %}
+<directories>
+{{ git_tree }}
+</directories>
+{% endif %}

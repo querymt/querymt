@@ -4,6 +4,7 @@ pub mod simple;
 
 pub mod config;
 pub mod runner;
+pub mod template;
 
 #[cfg(feature = "oauth")]
 pub mod auth;

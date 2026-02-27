@@ -201,6 +201,18 @@ impl AgentConfigBuilder {
         }
     }
 
+    // ── Template context ──────────────────────────────────────────────────
+
+    /// Set the agent ID used for `{{ agent_id }}` template resolution in
+    /// system prompts.  Must be called before `build()` and before the
+    /// `Arc<SessionProvider>` is shared (i.e. while refcount is 1).
+    pub fn with_agent_id(mut self, id: impl Into<String>) -> Self {
+        if let Some(provider) = Arc::get_mut(&mut self.provider) {
+            provider.agent_id = Some(id.into());
+        }
+        self
+    }
+
     // ── Delegation ────────────────────────────────────────────────────────
 
     /// Sets the agent registry for delegation functionality.
