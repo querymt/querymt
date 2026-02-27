@@ -5150,6 +5150,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-link 0.2.1",
+]
+
+[[package]]
 name = "hound"
 version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6109,6 +6120,21 @@ dependencies = [
  "security-framework 3.7.0",
  "windows-sys 0.60.2",
  "zeroize",
+]
+
+[[package]]
+name = "kimi-auth"
+version = "0.1.0"
+source = "git+https://github.com/querymt/kimi-auth?tag=v0.1.0#6efe8f2712835fe903acb39f2888e2e645533e64"
+dependencies = [
+ "futures-timer",
+ "hostname",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "url",
+ "uuid 1.21.0",
 ]
 
 [[package]]
@@ -9515,6 +9541,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "qmt-kimi-code"
+version = "0.1.0"
+dependencies = [
+ "extism-pdk",
+ "http",
+ "kimi-auth",
+ "log",
+ "qmt-openai",
+ "querymt",
+ "querymt-extism-macros",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "qmt-llama-cpp"
 version = "0.1.0"
 dependencies = [
@@ -9832,6 +9875,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "keyring",
+ "kimi-auth",
  "log",
  "openai-auth",
  "opentelemetry",
@@ -9839,6 +9883,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

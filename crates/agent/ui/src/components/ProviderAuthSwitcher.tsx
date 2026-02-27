@@ -61,6 +61,7 @@ export function ProviderAuthSwitcher({
   const disconnectButtonRef = useRef<HTMLButtonElement>(null);
   const disconnectInFlightProviderRef = useRef<string | null>(null);
   const { focusMainInput } = useUiStore();
+  const isDevicePoll = oauthFlow?.flow_kind === 'device_poll';
 
   const close = () => {
     onOpenChange(false);
@@ -267,7 +268,9 @@ export function ProviderAuthSwitcher({
                 Continue OAuth for <span className="text-accent-primary">{oauthFlow.provider}</span>
               </div>
               <div className="text-xs text-ui-muted">
-                Open the authorization page, approve access, then paste the callback URL or authorization code below.
+                {isDevicePoll
+                  ? 'Open the device authorization page (URL includes your device code), approve access, then click Check Authentication.'
+                  : 'Open the authorization page, approve access, then paste the callback URL or authorization code below.'}
               </div>
 
               <div className="flex items-center gap-2">
@@ -295,46 +298,69 @@ export function ProviderAuthSwitcher({
                     ? 'Copied!'
                     : copyStatus === 'error'
                       ? 'Copy failed'
-                      : 'Copy Authorization URL'}
+                      : isDevicePoll
+                        ? 'Copy Device Login URL'
+                        : 'Copy Authorization URL'}
                 </button>
+
+                {isDevicePoll && (
+                  <button
+                    type="button"
+                    onKeyDown={stopCommandActivationPropagation}
+                    disabled={isCompleting}
+                    onClick={() => {
+                      setIsCompleting(true);
+                      onCompleteOAuthLogin(oauthFlow.flow_id, '');
+                    }}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${oauthActionFocusClasses} ${
+                      isCompleting
+                        ? 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
+                        : 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30'
+                    }`}
+                  >
+                    {isCompleting ? 'Checking...' : 'Check Authentication'}
+                  </button>
+                )}
               </div>
 
-              <div className="flex items-center gap-2">
-                <input
-                  ref={callbackRef}
-                  value={responseInput}
-                  onChange={(e) => setResponseInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault();
-                      e.stopPropagation();
-                    }
+              {!isDevicePoll && (
+                <div className="flex items-center gap-2">
+                  <input
+                    ref={callbackRef}
+                    value={responseInput}
+                    onChange={(e) => setResponseInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        e.stopPropagation();
+                      }
 
-                    if (e.key === 'Enter' && responseInput.trim() && !isCompleting) {
+                      if (e.key === 'Enter' && responseInput.trim() && !isCompleting) {
+                        setIsCompleting(true);
+                        onCompleteOAuthLogin(oauthFlow.flow_id, responseInput.trim());
+                      }
+                    }}
+                    placeholder="Paste callback URL or code"
+                    className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-3 py-2 text-xs text-ui-primary placeholder:text-ui-muted focus:border-accent-primary focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onKeyDown={stopCommandActivationPropagation}
+                    disabled={!responseInput.trim() || isCompleting}
+                    onClick={() => {
                       setIsCompleting(true);
                       onCompleteOAuthLogin(oauthFlow.flow_id, responseInput.trim());
-                    }
-                  }}
-                  placeholder="Paste callback URL or code"
-                  className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-3 py-2 text-xs text-ui-primary placeholder:text-ui-muted focus:border-accent-primary focus:outline-none"
-                />
-                <button
-                  type="button"
-                  onKeyDown={stopCommandActivationPropagation}
-                  disabled={!responseInput.trim() || isCompleting}
-                  onClick={() => {
-                    setIsCompleting(true);
-                    onCompleteOAuthLogin(oauthFlow.flow_id, responseInput.trim());
-                  }}
-                  className={`px-3 py-2 rounded-lg text-xs font-medium transition-all ${oauthActionFocusClasses} ${
-                    !responseInput.trim() || isCompleting
-                      ? 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
-                      : 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30'
-                  }`}
-                >
-                  {isCompleting ? 'Completing...' : 'Complete'}
-                </button>
-              </div>
+                    }}
+                    className={`px-3 py-2 rounded-lg text-xs font-medium transition-all ${oauthActionFocusClasses} ${
+                      !responseInput.trim() || isCompleting
+                        ? 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
+                        : 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30'
+                    }`}
+                  >
+                    {isCompleting ? 'Completing...' : 'Complete'}
+                  </button>
+                </div>
+              )}
             </div>
           )}
 

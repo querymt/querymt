@@ -743,6 +743,7 @@ export function useUiClient() {
           flow_id: msg.flow_id,
           provider: msg.provider,
           authorization_url: msg.authorization_url,
+          flow_kind: msg.flow_kind,
         });
         setOauthResult(null);
         break;

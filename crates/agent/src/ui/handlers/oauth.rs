@@ -11,6 +11,8 @@
 use super::super::PendingOAuthFlow;
 use super::super::ServerState;
 use super::super::connection::{send_error, send_message};
+#[cfg(feature = "oauth")]
+use super::super::messages::OAuthFlowKind;
 use super::super::messages::UiServerMessage;
 use super::models::{handle_list_all_models, handle_list_auth_providers};
 #[cfg(feature = "oauth")]
@@ -153,6 +155,7 @@ pub async fn handle_start_oauth_login(
                 flow_id: flow_id.clone(),
                 provider: provider_name.clone(),
                 authorization_url: flow.authorization_url,
+                flow_kind: oauth_provider.flow_kind(),
             },
         )
         .await;
@@ -163,6 +166,7 @@ pub async fn handle_start_oauth_login(
             conn_id.to_string(),
             flow_id,
             provider_name,
+            oauth_provider.flow_kind(),
         )
         .await;
     }
@@ -220,15 +224,6 @@ pub async fn handle_complete_oauth_login(
             return;
         }
 
-        let code_input = response.trim();
-        if code_input.is_empty() {
-            let _ = send_error(tx, "Authorization response is required".to_string()).await;
-            return;
-        }
-
-        let code = crate::auth::extract_code_from_query(code_input)
-            .unwrap_or_else(|| code_input.to_string());
-
         let mode = if flow.provider == "anthropic" {
             Some("max")
         } else {
@@ -248,6 +243,19 @@ pub async fn handle_complete_oauth_login(
                 .await;
                 return;
             }
+        };
+
+        let code_input = response.trim();
+        let code = match oauth_provider.flow_kind() {
+            OAuthFlowKind::RedirectCode => {
+                if code_input.is_empty() {
+                    let _ = send_error(tx, "Authorization response is required".to_string()).await;
+                    return;
+                }
+                crate::auth::extract_code_from_query(code_input)
+                    .unwrap_or_else(|| code_input.to_string())
+            }
+            OAuthFlowKind::DevicePoll => code_input.to_string(),
         };
 
         let result = async {
@@ -454,8 +462,9 @@ async fn maybe_spawn_oauth_callback_listener(
     conn_id: String,
     flow_id: String,
     provider: String,
+    flow_kind: OAuthFlowKind,
 ) {
-    if provider != "codex" && provider != "anthropic" {
+    if flow_kind != OAuthFlowKind::RedirectCode {
         return;
     }
 

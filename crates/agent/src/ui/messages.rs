@@ -92,6 +92,8 @@ pub enum OAuthStatus {
     Connected,
 }
 
+pub use querymt_utils::OAuthFlowKind;
+
 /// OAuth-capable provider entry for dashboard auth UI.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthProviderEntry {
@@ -403,6 +405,7 @@ pub enum UiServerMessage {
         flow_id: String,
         provider: String,
         authorization_url: String,
+        flow_kind: OAuthFlowKind,
     },
     /// OAuth flow completion result
     #[serde(rename = "oauth_result")]
@@ -483,7 +486,7 @@ impl UiServerMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginUpdateResult, UiClientMessage, UiServerMessage};
+    use super::{OAuthFlowKind, PluginUpdateResult, UiClientMessage, UiServerMessage};
     use serde_json::json;
 
     #[test]
@@ -724,9 +727,20 @@ mod tests {
             flow_id: "flow-1".to_string(),
             provider: "openai".to_string(),
             authorization_url: "https://example.com".to_string(),
+            flow_kind: OAuthFlowKind::RedirectCode,
         })
         .expect("OAuthFlowStarted should serialize");
         assert_eq!(flow_started["type"], "oauth_flow_started");
+        assert_eq!(flow_started["flow_kind"], "redirect_code");
+
+        let flow_started_device = serde_json::to_value(UiServerMessage::OAuthFlowStarted {
+            flow_id: "flow-2".to_string(),
+            provider: "kimi-code".to_string(),
+            authorization_url: "https://example.com/device".to_string(),
+            flow_kind: OAuthFlowKind::DevicePoll,
+        })
+        .expect("OAuthFlowStarted (DevicePoll) should serialize");
+        assert_eq!(flow_started_device["flow_kind"], "device_poll");
 
         let result = serde_json::to_value(UiServerMessage::OAuthResult {
             provider: "openai".to_string(),
