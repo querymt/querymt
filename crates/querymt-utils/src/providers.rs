@@ -35,6 +35,19 @@ pub fn config_dir() -> Result<PathBuf> {
     Ok(home.join(".qmt"))
 }
 
+/// Resolve the directory used for runtime Unix-domain sockets (`$HOME/.qmt/sockets`).
+///
+/// Creates the directory if it does not exist. Paths under this directory are
+/// short enough to fit within the `SUN_LEN` limit on all supported platforms
+/// (104 bytes on macOS, 108 bytes on Linux), unlike paths derived from
+/// `std::env::temp_dir()` which can be very long on macOS.
+pub fn socket_dir() -> Result<PathBuf> {
+    let dir = config_dir()?.join("sockets");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create socket directory: {}", dir.display()))?;
+    Ok(dir)
+}
+
 /// Find a config file in the user's home .qmt directory
 pub fn find_config_in_home(filenames: &[&str]) -> Result<PathBuf> {
     let cfg_dir = config_dir()?;

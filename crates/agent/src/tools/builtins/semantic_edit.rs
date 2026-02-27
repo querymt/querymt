@@ -991,6 +991,13 @@ Walks directories recursively, respects .gitignore. Set glob to limit which file
         // Determine mode
         let is_search_mode = replacement.is_none() && action.is_none();
 
+        // Block write operations in read-only mode (search mode is always allowed)
+        if !is_search_mode && context.is_read_only() {
+            return Err(ToolError::PermissionDenied(
+                "Session is in read-only mode — semantic edits are not allowed (search mode is still available)".to_string(),
+            ));
+        }
+
         // Resolve working directory
         let cwd = context
             .cwd()

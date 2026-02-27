@@ -214,11 +214,31 @@ impl Message<SetMode> for SessionActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: SetMode, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        #[cfg_attr(not(feature = "sandbox"), allow(unused_variables))]
+        let old_mode = self.mode;
         self.mode = msg.mode;
         self.config.emit_event(
             &self.session_id,
             AgentEventKind::SessionModeChanged { mode: msg.mode },
         );
+
+        // Trigger sandbox extension management on read-only boundary crossings.
+        //
+        // Only act when the read-only status actually changes (e.g. Build <->
+        // Plan, Build <-> Review), not for transitions within the same class
+        // (e.g. Plan -> Review). This avoids redundant token requests.
+        #[cfg(feature = "sandbox")]
+        if old_mode.is_read_only() != msg.mode.is_read_only()
+            && let Some(ref ext_mgr) = self.runtime.extension_manager
+        {
+            if msg.mode.is_read_only() {
+                // Build -> Plan/Review: revoke OS-level write access
+                ext_mgr.release_write();
+            } else {
+                // Plan/Review -> Build: request OS-level write access
+                ext_mgr.request_write();
+            }
+        }
     }
 }
 
@@ -1132,7 +1152,8 @@ async fn execute_prompt_detached(
         session_handle,
         tool_config,
     )
-    .with_cancellation_token(cancel_token.clone());
+    .with_cancellation_token(cancel_token.clone())
+    .with_read_only(mode.is_read_only());
 
     // 4. Store User Messages
     // Keep separate projections for user-visible events vs LLM replay context.

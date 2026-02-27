@@ -46,6 +46,11 @@ pub(crate) struct ExecutionContext {
     /// `SetDeniedTools`, and `SetToolPolicy` messages are honoured during execution.
     /// Falls back to `AgentConfig.tool_config` when not overridden.
     pub tool_config: ToolConfig,
+
+    /// Whether the session is in read-only mode (Plan/Review).
+    /// Propagated into `AgentToolContext` so write tools can produce
+    /// clear `PermissionDenied` errors before hitting the OS sandbox.
+    pub read_only: bool,
 }
 
 impl ExecutionContext {
@@ -64,12 +69,19 @@ impl ExecutionContext {
             session_handle,
             cancellation_token: CancellationToken::new(),
             tool_config,
+            read_only: false,
         }
     }
 
     /// Attach a cancellation token, replacing the default no-op token.
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
+        self
+    }
+
+    /// Mark this execution context as read-only (Plan/Review mode).
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
         self
     }
 
@@ -110,6 +122,7 @@ impl ExecutionContext {
             elicitation_tx,
         )
         .with_cancellation_token(self.cancellation_token.clone())
+        .with_read_only(self.read_only)
     }
 }
 

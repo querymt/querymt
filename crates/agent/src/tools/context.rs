@@ -69,6 +69,17 @@ pub trait ToolContext: Send + Sync {
     /// Access to tool-specific context extensions
     fn as_any(&self) -> &dyn Any;
 
+    /// Whether the current session is in read-only mode (Plan or Review).
+    ///
+    /// Write tools should check this and return `ToolError::PermissionDenied`
+    /// for better error messages. The OS sandbox is the hard enforcement —
+    /// this check provides a user-friendly message *before* hitting EPERM.
+    ///
+    /// Default implementation returns `false` (unrestricted).
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     /// A cancellation token that is cancelled when the session is cancelled.
     ///
     /// Tools should poll this to abort long-running work cooperatively. The

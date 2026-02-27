@@ -23,10 +23,16 @@ dbus-secret-service = ["oauth", "querymt-utils/dbus-secret-service"]
 # for distributed actor registry. SessionActorRef gains a Remote variant.
 remote = ["kameo/remote", "dep:libp2p"]
 
+# Enables OS-level capability-based sandboxing for agent sessions using nono.
+# Each session runs in an isolated worker process with filesystem and network
+# restrictions enforced by the kernel (Landlock on Linux, Seatbelt on macOS).
+sandbox = ["dep:querymt-sandbox"]
+
 [dependencies]
 querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
 querymt-provider-common = { path = "../provider-common" }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde"] }
+querymt-sandbox = { path = "../sandbox", optional = true }
 agent-client-protocol = { version = "0.9", features = ["unstable"] }
 agent-client-protocol-schema = { version = "0.10", features = ["unstable"]}
 kameo = "0.19"

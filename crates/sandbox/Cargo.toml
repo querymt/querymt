@@ -1,0 +1,13 @@
+[package]
+name = "querymt-sandbox"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "Sandbox policy library wrapping nono for querymt agent sessions"
+
+[dependencies]
+nono = "0.6"
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

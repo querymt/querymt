@@ -68,13 +68,18 @@ impl PluginRegistry {
 
     /// Creates a registry from an already-parsed config using a caller-supplied cache path.
     ///
-    /// The cache directory is created if it does not exist.
+    /// The cache directory is created if it does not exist and there are providers
+    /// configured. When the provider list is empty no cache I/O is performed, which
+    /// allows the registry to be constructed inside a sandboxed process that has no
+    /// write access to the cache directory.
     pub fn from_config_with_cache_path(
         config: PluginConfig,
         cache_path: PathBuf,
     ) -> Result<Self, LLMError> {
-        std::fs::create_dir_all(&cache_path)
-            .map_err(|e| LLMError::InvalidRequest(format!("{:#}", e)))?;
+        if !config.providers.is_empty() {
+            std::fs::create_dir_all(&cache_path)
+                .map_err(|e| LLMError::InvalidRequest(format!("{:#}", e)))?;
+        }
 
         Ok(PluginRegistry {
             loaders: HashMap::new(),
@@ -282,8 +287,8 @@ mod tests {
     }
 
     #[test]
-    fn from_config_with_cache_path_creates_dir() {
-        let cache_path = unique_tmp_path("cache-dir").join("nested");
+    fn from_config_with_cache_path_empty_providers_skips_create_dir() {
+        let cache_path = unique_tmp_path("cache-dir-empty").join("nested");
         if cache_path.exists() {
             fs::remove_dir_all(&cache_path).unwrap();
         }
@@ -293,12 +298,47 @@ mod tests {
             oci: None,
         };
 
+        // Should succeed without touching the filesystem at all.
+        let registry = PluginRegistry::from_config_with_cache_path(cfg, cache_path.clone())
+            .expect("from_config_with_cache_path should succeed with empty providers");
+
+        // Cache dir must NOT be created when there are no providers — this is the
+        // behaviour that allows sandboxed worker processes (which lack write access
+        // to the cache dir) to construct a PluginRegistry without error.
+        assert!(
+            !cache_path.exists(),
+            "cache dir must not be created when providers list is empty"
+        );
+        assert_eq!(registry.cache_path, cache_path);
+        assert!(registry.config.providers.is_empty());
+    }
+
+    #[test]
+    fn from_config_with_cache_path_creates_dir_when_providers_present() {
+        use super::config::ProviderConfig;
+
+        let cache_path = unique_tmp_path("cache-dir-providers").join("nested");
+        if cache_path.exists() {
+            fs::remove_dir_all(&cache_path).unwrap();
+        }
+
+        let cfg = PluginConfig {
+            providers: vec![ProviderConfig {
+                name: "dummy".to_string(),
+                path: "/nonexistent/dummy.wasm".to_string(),
+                config: None,
+            }],
+            oci: None,
+        };
+
         let registry = PluginRegistry::from_config_with_cache_path(cfg, cache_path.clone())
             .expect("from_config_with_cache_path should succeed");
 
-        assert!(cache_path.is_dir(), "cache dir should be created");
+        assert!(
+            cache_path.is_dir(),
+            "cache dir should be created when providers are present"
+        );
         assert_eq!(registry.cache_path, cache_path);
-        assert!(registry.config.providers.is_empty());
     }
 
     #[test]
