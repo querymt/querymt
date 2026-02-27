@@ -237,7 +237,8 @@ jobs:
 
           echo "Pushing Wasm artifact to ${IMAGE_BASE} with tags ${{ env.VERSION }} and latest"
 
-          cp "target/wasm32-wasip1/release/qmt_${{ matrix.crate }}.wasm" "plugin.wasm"
+          WASM_NAME=$(echo "qmt_${{ matrix.crate }}" | tr '-' '_')
+          cp "target/wasm32-wasip1/release/${WASM_NAME}.wasm" "plugin.wasm"
 
           oras push "${IMAGE_BASE}:${{ env.VERSION }},latest" \
             --config wasm-config.json:application/vnd.wasm.v1.config+json \
