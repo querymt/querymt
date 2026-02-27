@@ -13,6 +13,8 @@ interface MessageContentProps {
     filename?: string;
     lineNumbers?: boolean;
   };
+  /** When true the content is still being streamed — defers expensive highlighting. */
+  isStreaming?: boolean;
 }
 
 
@@ -37,7 +39,18 @@ function extractLanguage(className: string | undefined): string | undefined {
   return match?.[1];
 }
 
-export const MessageContent = memo(function MessageContent({ content, type = 'text' }: MessageContentProps) {
+/**
+ * Detect whether the last fenced code block in the markdown is still unclosed.
+ * Counts opening/closing fence delimiters (``` or ~~~); an odd count means the
+ * last fence was never closed (content is still being streamed into it).
+ * Exported for testing.
+ */
+export function isLastFenceUnclosed(markdown: string): boolean {
+  const fences = markdown.match(/^(`{3,}|~{3,})/gm);
+  return fences != null && fences.length % 2 === 1;
+}
+
+export const MessageContent = memo(function MessageContent({ content, type = 'text', isStreaming }: MessageContentProps) {
   // For now, we'll use markdown for text and pre-formatted code for others
   // In the future, we can integrate @pierre/diffs for better code/diff rendering
   
@@ -47,6 +60,14 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
     // Parse content for file mentions
     const segments = parseFileMentions(mainContent);
     const hasMentions = segments.some(seg => seg.type === 'mention');
+
+    // Per-block streaming detection: only the last code block can be
+    // in-progress during streaming (tokens always append at the end).
+    // All earlier blocks have their closing fence and can be highlighted.
+    const lastBlockIncomplete = isStreaming && isLastFenceUnclosed(mainContent);
+    const fences = mainContent.match(/^(`{3,}|~{3,})/gm);
+    const totalCodeBlocks = Math.ceil((fences?.length ?? 0) / 2);
+    let codeBlockIndex = 0;
 
     // Custom markdown components with better styling (no prose bloat)
     const markdownComponents = {
@@ -59,6 +80,8 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
           const code = extractCodeText(childProps.children ?? '');
 
           if (code.length > 0) {
+            const myIndex = codeBlockIndex++;
+            const blockIsStreaming = lastBlockIncomplete && myIndex === totalCodeBlocks - 1;
             return (
               <div className="my-3 bg-surface-canvas/70 border border-surface-border rounded-md overflow-hidden max-w-full">
                 <HighlightedCode
@@ -66,6 +89,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
                   language={extractLanguage(childProps.className)}
                   lineNumbers={false}
                   maxHeight="none"
+                  isStreaming={blockIsStreaming}
                 />
               </div>
             );

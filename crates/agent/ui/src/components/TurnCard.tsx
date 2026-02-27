@@ -341,11 +341,11 @@ export const TurnCard = memo(function TurnCard({
                       {/* Live thinking accumulator (thinking streaming in, no final text yet) */}
                       {item.event.isStreamDelta && item.event.isThinkingDelta && item.event.thinking && (
                         <div className="text-sm text-ui-muted/70 bg-surface-canvas/30 rounded px-3 py-2 border-l-2 border-accent-tertiary/30 mb-2">
-                          <MessageContent content={item.event.thinking} />
+                          <MessageContent content={item.event.thinking} isStreaming />
                         </div>
                       )}
 
-                      <MessageContent content={item.event.content} />
+                      <MessageContent content={item.event.content} isStreaming={item.event.isStreamDelta} />
                     </div>
                   );
                 } else if (item.type === 'compaction') {
