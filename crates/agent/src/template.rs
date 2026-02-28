@@ -396,7 +396,7 @@ fn get_os_version() -> String {
                 }
             }
         }
-        "Linux".to_string();
+        "Linux".to_string()
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
