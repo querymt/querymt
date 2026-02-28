@@ -12,14 +12,15 @@ import { GlitchText } from './GlitchText';
  * - SessionPicker (if sessions exist)
  */
 export function HomePage() {
-  const { selectSession, createSession } = useSessionManager();
+  const { selectSession, createSession, goHome } = useSessionManager();
   
   const { 
     connected, 
     sessionGroups, 
     sessionId,
     thinkingBySession,
-    sessionParentMap
+    sessionParentMap,
+    deleteSession,
   } = useUiClientContext();
   
   const [loading, setLoading] = useState(false);
@@ -41,6 +42,13 @@ export function HomePage() {
     selectSession(sessionId);
   };
 
+  const handleDeleteSession = (targetSessionId: string) => {
+    deleteSession(targetSessionId);
+    if (targetSessionId === sessionId) {
+      goHome();
+    }
+  };
+
   // If sessions exist, show the session picker
   if (sessionGroups.length > 0) {
     return (
@@ -48,6 +56,7 @@ export function HomePage() {
         <SessionPicker
           groups={sessionGroups}
           onSelectSession={handleSelectSession}
+          onDeleteSession={handleDeleteSession}
           onNewSession={handleNewSession}
           disabled={!connected || loading}
           activeSessionId={sessionId}

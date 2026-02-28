@@ -66,6 +66,7 @@ export function ChatView() {
     connected,
     sendPrompt,
     cancelSession,
+    deleteSession,
     agents,
     sessionGroups,
     thinkingBySession,
@@ -166,7 +167,7 @@ export function ChatView() {
   }, [sessionId]);
 
   // useSessionManager for session navigation
-  const { selectSession, createSession } = useSessionManager();
+  const { selectSession, createSession, goHome } = useSessionManager();
 
   // Process rate limit events
   useEffect(() => {
@@ -245,6 +246,13 @@ export function ChatView() {
   const handleSelectSession = useCallback((sessionId: string) => {
     selectSession(sessionId);
   }, [selectSession]);
+
+  const handleDeleteSession = useCallback((targetSessionId: string) => {
+    deleteSession(targetSessionId);
+    if (targetSessionId === sessionId) {
+      goHome();
+    }
+  }, [deleteSession, sessionId, goHome]);
 
   // Handle cancel during rate limit wait
   const handleCancelRateLimit = useCallback(() => {
@@ -715,6 +723,7 @@ export function ChatView() {
                   <SessionPicker
                     groups={sessionGroups}
                     onSelectSession={handleSelectSession}
+                    onDeleteSession={handleDeleteSession}
                     onNewSession={handleNewSession}
                     disabled={!connected || loading}
                     activeSessionId={sessionId}

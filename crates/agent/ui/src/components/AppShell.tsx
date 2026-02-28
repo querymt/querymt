@@ -43,6 +43,7 @@ export function AppShell() {
     connected,
     newSession,
     cancelSession,
+    deleteSession,
     thinkingAgentId,
     thinkingAgentIds,
     sessionId,
@@ -421,6 +422,13 @@ export function AppShell() {
   const handleSelectSession = useCallback((sessionId: string) => {
     navigate(`/session/${sessionId}`);
   }, [navigate]);
+
+  const handleDeleteSession = useCallback((targetSessionId: string) => {
+    deleteSession(targetSessionId);
+    if (targetSessionId === sessionId) {
+      navigate('/');
+    }
+  }, [deleteSession, sessionId, navigate]);
   
   // Clean up timeout on unmount
   useEffect(() => {
@@ -607,6 +615,7 @@ export function AppShell() {
         thinkingBySession={thinkingBySession}
         onNewSession={handleNewSession}
         onSelectSession={handleSelectSession}
+        onDeleteSession={handleDeleteSession}
         connected={connected}
       />
 

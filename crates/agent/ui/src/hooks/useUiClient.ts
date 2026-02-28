@@ -1069,6 +1069,10 @@ export function useUiClient() {
     sendMessage({ type: 'cancel_session' });
   }, []);
 
+  const deleteSession = useCallback((targetSessionId: string) => {
+    sendMessage({ type: 'delete_session', session_id: targetSessionId });
+  }, []);
+
   // Refresh the list of remote nodes from the mesh
   const listRemoteNodes = useCallback(() => {
     sendMessage({ type: 'list_remote_nodes' });
@@ -1172,6 +1176,7 @@ export function useUiClient() {
     newSession,
     sendPrompt,
     cancelSession,
+    deleteSession,
     agents,
     routingMode,
     activeAgentId,

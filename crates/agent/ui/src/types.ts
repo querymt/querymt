@@ -558,6 +558,7 @@ export type UiClientMessage =
   | { type: 'prompt'; prompt: PromptBlock[] }
   | { type: 'list_sessions' }
   | { type: 'load_session'; session_id: string }
+  | { type: 'delete_session'; session_id: string }
   | { type: 'list_all_models'; refresh?: boolean }
   | { type: 'set_session_model'; session_id: string; model_id: string; node_id?: string }
   | { type: 'get_recent_models'; limit_per_workspace?: number }

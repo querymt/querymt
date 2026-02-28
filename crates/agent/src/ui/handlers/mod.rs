@@ -37,6 +37,7 @@ pub use session_ops::handle_get_file_index;
 pub use session_ops::handle_get_llm_config;
 pub use session_ops::handle_list_sessions;
 pub use session_ops::handle_load_session;
+pub use session_ops::handle_delete_session;
 pub use session_ops::handle_redo;
 pub use session_ops::handle_set_agent_mode;
 pub use session_ops::handle_subscribe_session;
@@ -150,6 +151,9 @@ pub async fn handle_ui_message(
         }
         UiClientMessage::LoadSession { session_id } => {
             handle_load_session(state, conn_id, &session_id, tx).await;
+        }
+        UiClientMessage::DeleteSession { session_id } => {
+            handle_delete_session(state, conn_id, &session_id, tx).await;
         }
         UiClientMessage::ListAllModels { refresh } => {
             handle_list_all_models(state, refresh, tx).await;
