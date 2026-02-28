@@ -28,15 +28,18 @@
 use clap::ArgGroup;
 use clap::Parser;
 use querymt_agent::prelude::*;
-use std::path::PathBuf;
+use rust_embed::RustEmbed;
+use std::path::{Component, Path, PathBuf};
 
 #[cfg(feature = "dashboard")]
 const DEFAULT_DASHBOARD_ADDR: &str = "127.0.0.1:3000";
 #[cfg(feature = "remote")]
 const DEFAULT_MESH_ADDR: &str = "/ip4/0.0.0.0/tcp/9000";
 const EMBEDDED_CONFIG: &str = include_str!("confs/single_coder.toml");
-const EMBEDDED_PROMPT: &str = include_str!("prompts/default_system.txt");
-const EMBEDDED_PROMPT_REF: &str = r#"{ file = "../prompts/default_system.txt" }"#;
+
+#[derive(RustEmbed)]
+#[folder = "examples/prompts/"]
+struct EmbeddedPromptAssets;
 
 #[derive(Debug, Parser)]
 #[command(name = "coder_agent")]
@@ -100,9 +103,73 @@ fn setup_stdio_logging() {
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 }
 
-fn embedded_single_coder_config() -> String {
-    let inline_prompt = format!("'''{}'''", EMBEDDED_PROMPT);
-    EMBEDDED_CONFIG.replace(EMBEDDED_PROMPT_REF, &inline_prompt)
+fn embedded_single_coder_config() -> anyhow::Result<String> {
+    use anyhow::{Context, anyhow};
+
+    let mut value: toml::Value =
+        toml::from_str(EMBEDDED_CONFIG).context("Failed to parse embedded single_coder.toml")?;
+
+    let system = value
+        .get_mut("agent")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|agent| agent.get_mut("system"))
+        .context("Embedded single_coder.toml missing [agent].system")?;
+
+    match system {
+        toml::Value::String(_) => {}
+        toml::Value::Array(parts) => {
+            for part in parts {
+                if let toml::Value::Table(table) = part
+                    && let Some(file_ref) = table.get("file").and_then(toml::Value::as_str)
+                {
+                    let asset_key = embedded_prompt_asset_key(file_ref).ok_or_else(|| {
+                        anyhow!(
+                            "Unsupported embedded prompt path '{file_ref}' in single_coder.toml"
+                        )
+                    })?;
+
+                    let embedded = EmbeddedPromptAssets::get(&asset_key).ok_or_else(|| {
+                        anyhow!("Embedded prompt '{file_ref}' not found under examples/prompts")
+                    })?;
+
+                    let prompt =
+                        String::from_utf8(embedded.data.into_owned()).with_context(|| {
+                            format!("Embedded prompt '{file_ref}' is not valid UTF-8")
+                        })?;
+
+                    *part = toml::Value::String(prompt);
+                }
+            }
+        }
+        _ => {
+            return Err(anyhow!(
+                "Embedded single_coder.toml has unsupported [agent].system format"
+            ));
+        }
+    }
+
+    toml::to_string(&value).context("Failed to serialize embedded single_coder.toml")
+}
+
+fn embedded_prompt_asset_key(file_ref: &str) -> Option<String> {
+    let joined = Path::new("confs").join(file_ref);
+    let mut normalized_parts: Vec<String> = Vec::new();
+
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized_parts.pop()?;
+            }
+            Component::Normal(part) => {
+                normalized_parts.push(part.to_string_lossy().into_owned());
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    let normalized = normalized_parts.join("/");
+    normalized.strip_prefix("prompts/").map(str::to_owned)
 }
 
 #[tokio::main]
@@ -136,7 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         from_config(config_path).await?
     } else {
         eprintln!("Loading agent from embedded default config: single_coder.toml");
-        let embedded_config = embedded_single_coder_config();
+        let embedded_config = embedded_single_coder_config()?;
         from_config(ConfigSource::Toml(embedded_config)).await?
     };
 
@@ -248,4 +315,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_config_inlines_system_prompts_exactly() {
+        let config = embedded_single_coder_config().expect("embedded config should load");
+        let value: toml::Value =
+            toml::from_str(&config).expect("embedded config should parse as TOML");
+
+        let system = value
+            .get("agent")
+            .and_then(toml::Value::as_table)
+            .and_then(|agent| agent.get("system"))
+            .and_then(toml::Value::as_array)
+            .expect("embedded config should contain [agent].system array");
+
+        let inlined: Vec<&str> = system
+            .iter()
+            .map(|part| part.as_str().expect("system part must be an inline string"))
+            .collect();
+
+        assert_eq!(
+            inlined,
+            vec![
+                include_str!("prompts/default_system.txt"),
+                include_str!("prompts/code_meta.jinja2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn embedded_prompt_asset_key_rejects_path_escape() {
+        assert_eq!(
+            embedded_prompt_asset_key("../prompts/default_system.txt").as_deref(),
+            Some("default_system.txt")
+        );
+        assert_eq!(
+            embedded_prompt_asset_key("../prompts/code_meta.jinja2").as_deref(),
+            Some("code_meta.jinja2")
+        );
+        assert!(embedded_prompt_asset_key("../../outside.txt").is_none());
+    }
 }
