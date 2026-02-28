@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { useState } from 'react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { SessionSwitcher } from './SessionSwitcher';
 import { SessionGroup } from '../types';
@@ -41,6 +42,7 @@ describe('SessionSwitcher', () => {
     thinkingBySession: new Map(),
     onNewSession: vi.fn().mockResolvedValue(undefined),
     onSelectSession: vi.fn(),
+    onDeleteSession: vi.fn(),
     connected: true,
   };
 
@@ -236,6 +238,90 @@ describe('SessionSwitcher', () => {
     // Use getAllByText since there will be multiple timestamps
     const timestamps = screen.getAllByText(/just now|min|hour|day/i);
     expect(timestamps.length).toBeGreaterThan(0);
+  });
+
+  it('deletes selected session when pressing Delete', async () => {
+    const user = userEvent.setup();
+
+    function StatefulSessionSwitcher() {
+      const [groups, setGroups] = useState(mockGroups);
+      return (
+        <SessionSwitcher
+          {...defaultProps}
+          groups={groups}
+          onDeleteSession={(sessionId) => {
+            defaultProps.onDeleteSession(sessionId);
+            setGroups((prev) =>
+              prev.map((group) => ({
+                ...group,
+                sessions: group.sessions.filter((session) => session.session_id !== sessionId),
+              }))
+            );
+          }}
+        />
+      );
+    }
+
+    render(<StatefulSessionSwitcher />);
+
+    const input = screen.getByPlaceholderText(/search sessions/i);
+    await user.click(input);
+    await user.keyboard('{Delete}');
+
+    expect(defaultProps.onDeleteSession).toHaveBeenCalledWith('session-aaa-111');
+    expect(defaultProps.onOpenChange).not.toHaveBeenCalled();
+
+    await waitFor(() => {
+      const selectedAfterDelete = document.querySelector('[cmdk-item][data-selected="true"]') as HTMLElement | null;
+      expect(selectedAfterDelete).toBeTruthy();
+      expect(selectedAfterDelete?.textContent).toContain('Second Session');
+    });
+  });
+
+  it('focuses search input when Delete removes the last visible session', async () => {
+    const user = userEvent.setup();
+
+    function SingleSessionSwitcher() {
+      const [groups, setGroups] = useState<SessionGroup[]>([
+        {
+          cwd: '/workspace/project-1',
+          sessions: [
+            {
+              session_id: 'only-session-111',
+              title: 'Only Session',
+              updated_at: new Date().toISOString(),
+            },
+          ],
+        },
+      ]);
+
+      return (
+        <SessionSwitcher
+          {...defaultProps}
+          groups={groups}
+          onDeleteSession={(sessionId) => {
+            defaultProps.onDeleteSession(sessionId);
+            setGroups((prev) =>
+              prev.map((group) => ({
+                ...group,
+                sessions: group.sessions.filter((session) => session.session_id !== sessionId),
+              }))
+            );
+          }}
+        />
+      );
+    }
+
+    render(<SingleSessionSwitcher />);
+
+    const input = screen.getByPlaceholderText(/search sessions/i);
+    await user.click(input);
+    await user.keyboard('{Delete}');
+
+    await waitFor(() => {
+      expect(document.querySelector('[cmdk-item][data-selected="true"][data-session-id]')).toBeNull();
+    });
+    expect(document.activeElement).toBe(input);
   });
 
   it('closes when clicking outside the command palette', async () => {

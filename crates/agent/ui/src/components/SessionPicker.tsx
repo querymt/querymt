@@ -2,12 +2,13 @@ import { useState, useMemo } from 'react';
 import * as Collapsible from '@radix-ui/react-collapsible';
 import { SessionGroup, SessionSummary } from '../types';
 import { GlitchText } from './GlitchText';
-import { ChevronDown, ChevronRight, Search, Plus, Clock, GitBranch, Globe } from 'lucide-react';
+import { ChevronDown, ChevronRight, Search, Plus, Clock, GitBranch, Globe, Trash2 } from 'lucide-react';
 import { useThinkingSessionIds } from '../hooks/useThinkingSessionIds';
 
 interface SessionPickerProps {
   groups: SessionGroup[];
   onSelectSession: (sessionId: string) => void;
+  onDeleteSession: (sessionId: string, sessionLabel?: string) => void;
   onNewSession: () => void;
   disabled?: boolean;
   activeSessionId?: string | null;
@@ -15,7 +16,7 @@ interface SessionPickerProps {
   sessionParentMap?: Map<string, string>;
 }
 
-export function SessionPicker({ groups, onSelectSession, onNewSession, disabled, activeSessionId, thinkingBySession, sessionParentMap }: SessionPickerProps) {
+export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewSession, disabled, activeSessionId, thinkingBySession, sessionParentMap }: SessionPickerProps) {
   const [filterText, setFilterText] = useState('');
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set(groups.map((_, i) => `group-${i}`)));
   
@@ -88,6 +89,14 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
       return next;
     });
   };
+
+  const handleDeleteSession = (session: SessionSummary) => {
+    if (disabled) {
+      return;
+    }
+    // TODO: consider a user setting to require confirmation before deleting sessions.
+    onDeleteSession(session.session_id, session.title || session.name || session.session_id);
+  };
   
   const formatTimestamp = (timestamp?: string) => {
     if (!timestamp) return '';
@@ -116,70 +125,91 @@ export function SessionPicker({ groups, onSelectSession, onNewSession, disabled,
     const isThinking = thinkingSessionIds.has(session.session_id);
     
     return (
-      <div key={session.session_id}>
-        <button
-          onClick={() => onSelectSession(session.session_id)}
-          disabled={disabled}
-          className={`w-full text-left px-4 py-3 bg-surface-elevated/40 hover:bg-surface-elevated border ${
-            isChild ? 'border-l-2 border-l-accent-primary/60' : ''
-          } border-surface-border/35 hover:border-accent-primary/30 rounded-lg transition-all duration-200 group session-card disabled:opacity-50 disabled:cursor-not-allowed overflow-visible ${indentClass} ${
-            isActive ? 'ring-2 ring-accent-primary/35 bg-surface-elevated/60' : ''
-          }`}
-          style={{
-            animation: `session-card-entrance 0.3s ease-out ${sessionIndex * 0.05}s both`,
-            marginLeft: depth > 0 ? `${depth * 1.5}rem` : '0',
-          }}
-        >
-          {/* Title with optional child indicator */}
-          <div className="font-medium text-ui-primary mb-1 group-hover:text-accent-primary transition-colors flex items-center gap-2">
-            {isChild && (
-              <GitBranch className="w-3.5 h-3.5 text-accent-primary/70 flex-shrink-0" />
-            )}
-            <span className={isChild ? 'text-sm' : ''}>
-              {session.title || session.name || 'Untitled session'}
-            </span>
-            {isActive && (
-              <span className="flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-accent-primary animate-pulse" />
-                <span className="text-[10px] px-1.5 py-0.5 bg-accent-primary/20 text-accent-primary rounded border border-accent-primary/30">
-                  active
-                </span>
+      <div
+        key={session.session_id}
+        className={indentClass}
+        style={{ marginLeft: depth > 0 ? `${depth * 1.5}rem` : '0' }}
+      >
+        <div className="relative">
+          <button
+            onClick={() => onSelectSession(session.session_id)}
+            disabled={disabled}
+            className={`w-full text-left px-4 py-3 pr-14 bg-surface-elevated/40 hover:bg-surface-elevated border ${
+              isChild ? 'border-l-2 border-l-accent-primary/60' : ''
+            } border-surface-border/35 hover:border-accent-primary/30 rounded-lg transition-all duration-200 group session-card disabled:opacity-50 disabled:cursor-not-allowed overflow-visible ${
+              isActive ? 'ring-2 ring-accent-primary/35 bg-surface-elevated/60' : ''
+            }`}
+            style={{
+              animation: `session-card-entrance 0.3s ease-out ${sessionIndex * 0.05}s both`,
+            }}
+          >
+            {/* Title with optional child indicator */}
+            <div className="font-medium text-ui-primary mb-1 group-hover:text-accent-primary transition-colors flex items-center gap-2">
+              {isChild && (
+                <GitBranch className="w-3.5 h-3.5 text-accent-primary/70 flex-shrink-0" />
+              )}
+              <span className={isChild ? 'text-sm' : ''}>
+                {session.title || session.name || 'Untitled session'}
               </span>
-            )}
-            {isThinking && (
-              <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-accent-tertiary animate-pulse" />
+              {isActive && (
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-accent-primary animate-pulse" />
+                  <span className="text-[10px] px-1.5 py-0.5 bg-accent-primary/20 text-accent-primary rounded border border-accent-primary/30">
+                    active
+                  </span>
+                </span>
+              )}
+              {isThinking && (
+                <span className="flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-accent-tertiary animate-pulse" />
+                  <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30">
+                    thinking
+                  </span>
+                </span>
+              )}
+              {isDelegation && (
                 <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30">
-                  thinking
+                  delegated
                 </span>
+              )}
+              {session.node && (
+                <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 bg-accent-secondary/20 text-accent-secondary rounded border border-accent-secondary/30">
+                  <Globe className="w-2.5 h-2.5" />
+                  {session.node}
+                </span>
+              )}
+            </div>
+            
+            {/* Metadata */}
+            <div className="flex items-center gap-4 text-xs text-ui-muted">
+              <span className="font-mono">
+                {session.session_id.slice(0, 12)}...
               </span>
-            )}
-            {isDelegation && (
-              <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30">
-                delegated
-              </span>
-            )}
-            {session.node && (
-              <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 bg-accent-secondary/20 text-accent-secondary rounded border border-accent-secondary/30">
-                <Globe className="w-2.5 h-2.5" />
-                {session.node}
-              </span>
-            )}
-          </div>
-          
-          {/* Metadata */}
-          <div className="flex items-center gap-4 text-xs text-ui-muted">
-            <span className="font-mono">
-              {session.session_id.slice(0, 12)}...
-            </span>
-            {session.updated_at && (
-              <span className="flex items-center gap-1">
-                <Clock className="w-3 h-3" />
-                {formatTimestamp(session.updated_at)}
-              </span>
-            )}
-          </div>
-        </button>
+              {session.updated_at && (
+                <span className="flex items-center gap-1">
+                  <Clock className="w-3 h-3" />
+                  {formatTimestamp(session.updated_at)}
+                </span>
+              )}
+            </div>
+          </button>
+
+          {!session.node && (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                handleDeleteSession(session);
+              }}
+              disabled={disabled}
+              className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 rounded-md text-ui-muted hover:text-status-warning hover:bg-status-warning/10 disabled:opacity-40 disabled:cursor-not-allowed"
+              title="Delete session"
+              aria-label={`Delete session ${session.title || session.name || session.session_id}`}
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
         
         {/* Render children recursively */}
         {session.children && session.children.length > 0 && (

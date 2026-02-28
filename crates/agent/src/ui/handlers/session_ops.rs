@@ -254,6 +254,46 @@ pub async fn handle_load_session(
     }
 }
 
+/// Handle session deletion request.
+pub async fn handle_delete_session(
+    state: &ServerState,
+    conn_id: &str,
+    session_id: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    if let Err(err) = state.session_store.delete_session(session_id).await {
+        let _ = send_error(tx, format!("Failed to delete session: {}", err)).await;
+        return;
+    }
+
+    {
+        let mut registry = state.agent.registry.lock().await;
+        registry.remove(session_id);
+    }
+
+    {
+        let mut connections = state.connections.lock().await;
+        if let Some(conn) = connections.get_mut(conn_id) {
+            conn.sessions.retain(|_, sid| sid != session_id);
+            conn.subscribed_sessions.remove(session_id);
+            conn.session_cursors.remove(session_id);
+        }
+    }
+
+    {
+        let mut agents = state.session_agents.lock().await;
+        agents.remove(session_id);
+    }
+
+    {
+        let mut cwds = state.session_cwds.lock().await;
+        cwds.remove(session_id);
+    }
+
+    send_state(state, conn_id, tx).await;
+    handle_list_sessions(state, tx).await;
+}
+
 pub(super) async fn ensure_session_loaded(
     state: &ServerState,
     session_id: &str,

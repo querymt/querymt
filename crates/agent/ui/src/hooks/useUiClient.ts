@@ -162,6 +162,9 @@ export function useUiClient() {
   const undoStateRef = useRef<UndoState>(null);
   const [remoteNodes, setRemoteNodes] = useState<RemoteNodeInfo[]>([]);
   const [connectionErrors, setConnectionErrors] = useState<{ id: number; message: string }[]>([]);
+  const [sessionActionNotices, setSessionActionNotices] = useState<
+    { id: number; kind: 'success' | 'error'; message: string }[]
+  >([]);
   const [pluginUpdateStatus, setPluginUpdateStatus] = useState<Record<string, PluginUpdateStatus>>({});
   const [pluginUpdateResults, setPluginUpdateResults] = useState<PluginUpdateResult[] | null>(null);
   const [isUpdatingPlugins, setIsUpdatingPlugins] = useState(false);
@@ -173,6 +176,8 @@ export function useUiClient() {
   const fileIndexErrorCallbackRef = useRef<FileIndexErrorCallback | null>(null);
   const llmConfigCallbacksRef = useRef<Map<number, (config: LlmConfigDetails) => void>>(new Map());
   const pendingRequestsRef = useRef<Map<string, (sessionId: string) => void>>(new Map());
+  const pendingDeleteLabelsRef = useRef<Map<string, string>>(new Map());
+  const pendingLoadLabelsRef = useRef<Map<string, string>>(new Map());
   const workspacePathDialogResolverRef = useRef<((value: { cwd: string; node: string | null } | null) => void) | null>(null);
   const sessionCreatingRef = useRef(false);
 
@@ -234,6 +239,14 @@ export function useUiClient() {
         socketRef.current.close();
       }
     };
+  }, []);
+
+  const pushSessionActionNotice = useCallback((kind: 'success' | 'error', message: string) => {
+    const id = Date.now() + Math.floor(Math.random() * 1000);
+    setSessionActionNotices((prev) => [...prev, { id, kind, message }]);
+    setTimeout(() => {
+      setSessionActionNotices((prev) => prev.filter((n) => n.id !== id));
+    }, 5000);
   }, []);
 
   const handleServerMessage = (msg: UiServerMessage) => {
@@ -607,6 +620,27 @@ export function useUiClient() {
       }
       case 'error': {
         console.error('UI server error:', msg.message);
+        const isDeleteError = msg.message.includes('Failed to delete session');
+        const isLoadError = msg.message.includes('Failed to load session');
+
+        if (isDeleteError) {
+          pendingDeleteLabelsRef.current.clear();
+          pushSessionActionNotice('error', msg.message);
+          sendMessage({ type: 'list_sessions' });
+        }
+
+        if (isLoadError) {
+          const pendingLabel = Array.from(pendingLoadLabelsRef.current.values()).pop();
+          pendingLoadLabelsRef.current.clear();
+          pushSessionActionNotice(
+            'error',
+            pendingLabel
+              ? `Failed to open session: ${pendingLabel}`
+              : msg.message
+          );
+          sendMessage({ type: 'list_sessions' });
+        }
+
         // Connection-level errors have no session_id. Do not inject them into the
         // active session timeline, otherwise provider errors can bleed across sessions.
         setThinkingAgentIds(new Set());
@@ -619,8 +653,8 @@ export function useUiClient() {
         ) {
           fileIndexErrorCallbackRef.current(msg.message);
         }
-        // Surface error to the UI via connectionErrors state
-        {
+        // Surface non-session-action errors to the generic connection error toast queue
+        if (!isDeleteError && !isLoadError) {
           const errorId = Date.now();
           setConnectionErrors((prev) => [...prev, { id: errorId, message: msg.message }]);
           // Auto-dismiss after 8 seconds
@@ -630,10 +664,25 @@ export function useUiClient() {
         }
         break;
       }
-      case 'session_list':
+      case 'session_list': {
         setSessionGroups(msg.groups);
+
+        if (pendingDeleteLabelsRef.current.size > 0) {
+          const remainingSessionIds = new Set(
+            msg.groups.flatMap((group) => group.sessions.map((session) => session.session_id))
+          );
+
+          for (const [pendingId, label] of pendingDeleteLabelsRef.current.entries()) {
+            if (!remainingSessionIds.has(pendingId)) {
+              pendingDeleteLabelsRef.current.delete(pendingId);
+              pushSessionActionNotice('success', `Deleted session: ${label}`);
+            }
+          }
+        }
         break;
+      }
       case 'session_loaded': {
+        pendingLoadLabelsRef.current.delete(msg.session_id);
         setSessionId(msg.session_id);
         setMainSessionId(msg.session_id);
         setSessionAudit(msg.audit);
@@ -973,7 +1022,9 @@ export function useUiClient() {
     sendMessage({ type: 'set_routing_mode', mode });
   }, []);
 
-  const loadSession = useCallback((sessionId: string) => {
+  const loadSession = useCallback((sessionId: string, sessionLabel?: string) => {
+    const label = sessionLabel && sessionLabel.trim().length > 0 ? sessionLabel : sessionId;
+    pendingLoadLabelsRef.current.set(sessionId, label);
     sendMessage({ type: 'load_session', session_id: sessionId });
   }, []);
 
@@ -1069,6 +1120,12 @@ export function useUiClient() {
     sendMessage({ type: 'cancel_session' });
   }, []);
 
+  const deleteSession = useCallback((targetSessionId: string, sessionLabel?: string) => {
+    const label = sessionLabel && sessionLabel.trim().length > 0 ? sessionLabel : targetSessionId;
+    pendingDeleteLabelsRef.current.set(targetSessionId, label);
+    sendMessage({ type: 'delete_session', session_id: targetSessionId });
+  }, []);
+
   // Refresh the list of remote nodes from the mesh
   const listRemoteNodes = useCallback(() => {
     sendMessage({ type: 'list_remote_nodes' });
@@ -1077,6 +1134,10 @@ export function useUiClient() {
   // Dismiss a connection error by id
   const dismissConnectionError = useCallback((errorId: number) => {
     setConnectionErrors((prev) => prev.filter((e) => e.id !== errorId));
+  }, []);
+
+  const dismissSessionActionNotice = useCallback((noticeId: number) => {
+    setSessionActionNotices((prev) => prev.filter((notice) => notice.id !== noticeId));
   }, []);
 
   // Request LLM config by ID (returns cached if available, otherwise fetches)
@@ -1172,6 +1233,7 @@ export function useUiClient() {
     newSession,
     sendPrompt,
     cancelSession,
+    deleteSession,
     agents,
     routingMode,
     activeAgentId,
@@ -1231,6 +1293,8 @@ export function useUiClient() {
     listRemoteNodes,
     connectionErrors,
     dismissConnectionError,
+    sessionActionNotices,
+    dismissSessionActionNotice,
     pluginUpdateStatus,
     pluginUpdateResults,
     isUpdatingPlugins,

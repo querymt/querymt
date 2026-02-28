@@ -37,7 +37,15 @@ export interface SessionManager {
 }
 
 export function useSessionManager(): SessionManager {
-  const { sessionId: serverSessionId, loadSession, newSession, connected, sessionCreatingRef } = useUiClientContext();
+  const {
+    sessionId: serverSessionId,
+    loadSession,
+    newSession,
+    connected,
+    sessionGroups: rawSessionGroups,
+    sessionCreatingRef,
+  } = useUiClientContext();
+  const sessionGroups = rawSessionGroups ?? [];
   const { sessionId: urlSessionId } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
   const { saveAndSwitchSession } = useUiStore();
@@ -64,8 +72,16 @@ export function useSessionManager(): SessionManager {
     if (sessionCreatingRef.current) return;
     
     console.log('[useSessionManager] URL changed, loading session:', urlSessionId);
-    loadSession(urlSessionId);
-  }, [urlSessionId, serverSessionId, connected, loadSession, sessionCreatingRef]);
+    const currentGroup =
+      sessionGroups.find((group) => group.sessions.some((session) => session.session_id === urlSessionId));
+    const currentSession = currentGroup?.sessions.find((session) => session.session_id === urlSessionId);
+    const sessionLabel = currentSession ? currentSession.title || currentSession.name || currentSession.session_id : undefined;
+    if (sessionLabel) {
+      loadSession(urlSessionId, sessionLabel);
+    } else {
+      loadSession(urlSessionId);
+    }
+  }, [urlSessionId, serverSessionId, connected, loadSession, sessionGroups, sessionCreatingRef]);
   
   // --- View state save/restore on URL change ---
   // Save the previous session's view state and restore the new session's view state

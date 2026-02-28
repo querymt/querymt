@@ -1,7 +1,7 @@
 import { useMemo, useRef, useEffect, useState } from 'react';
 import { Command } from 'cmdk';
 import Fuse from 'fuse.js';
-import { Plus, GitBranch, Clock, Globe } from 'lucide-react';
+import { Plus, GitBranch, Clock, Globe, Trash2 } from 'lucide-react';
 import { SessionGroup, SessionSummary } from '../types';
 import { useUiStore } from '../store/uiStore';
 
@@ -20,6 +20,7 @@ interface SessionSwitcherProps {
   thinkingBySession: Map<string, Set<string>>;
   onNewSession: () => Promise<void>;
   onSelectSession: (sessionId: string) => void;
+  onDeleteSession: (sessionId: string, sessionLabel?: string) => void;
   connected: boolean;
 }
 
@@ -38,10 +39,12 @@ export function SessionSwitcher({
   thinkingBySession,
   onNewSession,
   onSelectSession,
+  onDeleteSession,
   connected,
 }: SessionSwitcherProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [search, setSearch] = useState('');
+  const [selectedValue, setSelectedValue] = useState('');
   const { focusMainInput } = useUiStore();
   
   // Flatten all sessions from all groups into a single searchable list
@@ -104,6 +107,26 @@ export function SessionSwitcher({
       setTimeout(() => inputRef.current?.focus(), 0);
     }
   }, [open]);
+
+  // Keep command selection on a valid item as list updates after deletes/search.
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    if (filteredSessions.length === 0) {
+      if (selectedValue !== '') {
+        setSelectedValue('');
+      }
+      inputRef.current?.focus();
+      return;
+    }
+
+    const stillValid = filteredSessions.some((session) => session.session_id === selectedValue);
+    if (!stillValid) {
+      setSelectedValue(filteredSessions[0].session_id);
+    }
+  }, [open, filteredSessions, selectedValue]);
   
   // Format timestamp helper
   const formatTimestamp = (timestamp?: string) => {
@@ -141,7 +164,48 @@ export function SessionSwitcher({
     // Return focus to the main input after creating new session
     focusMainInput();
   };
+
+  const handleDeleteSession = (sessionId: string, label: string, closeAfterDelete: boolean = true) => {
+    // TODO: consider a user setting to require confirmation before deleting sessions.
+    onDeleteSession(sessionId, label);
+    if (closeAfterDelete) {
+      onOpenChange(false);
+      focusMainInput();
+    }
+  };
+
+  const getNeighborSessionId = (sessionId: string): string => {
+    const index = filteredSessions.findIndex((session) => session.session_id === sessionId);
+    if (index < 0) {
+      return filteredSessions[0]?.session_id ?? '';
+    }
+    if (filteredSessions.length === 1) {
+      return '';
+    }
+    const fallbackIndex = index < filteredSessions.length - 1 ? index + 1 : index - 1;
+    return filteredSessions[fallbackIndex]?.session_id ?? '';
+  };
   
+  const handleDeleteKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'Delete') {
+      return;
+    }
+
+    const targetSessionId = selectedValue || filteredSessions[0]?.session_id;
+    if (!targetSessionId) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const targetSession = filteredSessions.find((session) => session.session_id === targetSessionId);
+    const sessionLabel = targetSession?.title || targetSession?.name || 'Untitled session';
+
+    setSelectedValue(getNeighborSessionId(targetSessionId));
+    handleDeleteSession(targetSessionId, sessionLabel, false);
+  };
+
   if (!open) return null;
   
   return (
@@ -167,6 +231,9 @@ export function SessionSwitcher({
         <Command
           className="w-full max-w-2xl bg-surface-elevated border-2 border-accent-primary/40 rounded-xl shadow-[0_0_40px_rgba(var(--accent-primary-rgb),0.3)] overflow-hidden animate-scale-in"
           shouldFilter={false} // We handle filtering manually with fuse.js
+          value={selectedValue}
+          onValueChange={setSelectedValue}
+          onKeyDownCapture={handleDeleteKey}
         >
           {/* Search input */}
           <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-border/60">
@@ -195,6 +262,7 @@ export function SessionSwitcher({
                 {filteredSessions.map((session) => {
                   const isActive = activeSessionId === session.session_id;
                   const isThinking = (thinkingBySession.get(session.session_id)?.size ?? 0) > 0;
+                  const sessionLabel = session.title || session.name || 'Untitled session';
                   
                   return (
                     <Command.Item
@@ -222,7 +290,7 @@ export function SessionSwitcher({
                             <GitBranch className="w-3 h-3 text-accent-primary/70 flex-shrink-0" />
                           )}
                           <span className="text-sm text-ui-primary font-medium truncate group-data-[selected=true]:text-accent-primary">
-                            {session.title || session.name || 'Untitled session'}
+                            {sessionLabel}
                           </span>
                           {isActive && (
                             <span className="text-[10px] px-1.5 py-0.5 bg-accent-primary/20 text-accent-primary rounded border border-accent-primary/30 flex-shrink-0">
@@ -263,6 +331,20 @@ export function SessionSwitcher({
                           </span>
                         </div>
                       </div>
+                      {!session.isRemote && (
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            handleDeleteSession(session.session_id, sessionLabel);
+                          }}
+                          className="self-center p-1.5 rounded-md text-ui-muted hover:text-status-warning hover:bg-status-warning/10"
+                          title="Delete session"
+                          aria-label={`Delete session ${sessionLabel}`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                     </Command.Item>
                   );
                 })}
@@ -275,6 +357,7 @@ export function SessionSwitcher({
                 {filteredSessions.map((session) => {
                   const isActive = activeSessionId === session.session_id;
                   const isThinking = (thinkingBySession.get(session.session_id)?.size ?? 0) > 0;
+                  const sessionLabel = session.title || session.name || 'Untitled session';
                   
                   return (
                     <Command.Item
@@ -302,7 +385,7 @@ export function SessionSwitcher({
                             <GitBranch className="w-3 h-3 text-accent-primary/70 flex-shrink-0" />
                           )}
                           <span className="text-sm text-ui-primary font-medium truncate group-data-[selected=true]:text-accent-primary">
-                            {session.title || session.name || 'Untitled session'}
+                            {sessionLabel}
                           </span>
                           {isActive && (
                             <span className="text-[10px] px-1.5 py-0.5 bg-accent-primary/20 text-accent-primary rounded border border-accent-primary/30 flex-shrink-0">
@@ -343,6 +426,20 @@ export function SessionSwitcher({
                           </span>
                         </div>
                       </div>
+                      {!session.isRemote && (
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            handleDeleteSession(session.session_id, sessionLabel);
+                          }}
+                          className="self-center p-1.5 rounded-md text-ui-muted hover:text-status-warning hover:bg-status-warning/10"
+                          title="Delete session"
+                          aria-label={`Delete session ${sessionLabel}`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                     </Command.Item>
                   );
                 })}

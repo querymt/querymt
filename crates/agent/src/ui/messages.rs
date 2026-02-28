@@ -167,6 +167,9 @@ pub enum UiClientMessage {
     LoadSession {
         session_id: String,
     },
+    DeleteSession {
+        session_id: String,
+    },
     ListAllModels {
         #[serde(default)]
         refresh: bool,
@@ -532,6 +535,22 @@ mod tests {
         match current {
             UiClientMessage::DisconnectOAuth { provider } => assert_eq!(provider, "openai"),
             _ => panic!("expected DisconnectOAuth variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_delete_session_tag() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "delete_session",
+            "session_id": "sess-123"
+        }))
+        .expect("delete_session should deserialize");
+
+        match msg {
+            UiClientMessage::DeleteSession { session_id } => {
+                assert_eq!(session_id, "sess-123");
+            }
+            _ => panic!("expected DeleteSession"),
         }
     }
 
