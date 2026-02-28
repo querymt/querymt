@@ -217,7 +217,10 @@ describe('TurnCard', () => {
   });
 
   it('shows undo button when canUndo is true and turn is not active', () => {
-    const turn = makeTurn({ isActive: false });
+    const turn = makeTurn({
+      isActive: false,
+      userMessage: makeRow({ type: 'user', messageId: 'msg-undo-1' }),
+    });
 
     render(<TurnCard {...defaultProps} turn={turn} canUndo={true} onUndo={vi.fn()} />);
 
@@ -225,7 +228,10 @@ describe('TurnCard', () => {
   });
 
   it('hides undo button when turn is active', () => {
-    const turn = makeTurn({ isActive: true });
+    const turn = makeTurn({
+      isActive: true,
+      userMessage: makeRow({ type: 'user', messageId: 'msg-active-1' }),
+    });
 
     render(<TurnCard {...defaultProps} turn={turn} canUndo={true} onUndo={vi.fn()} />);
 
@@ -277,7 +283,10 @@ describe('TurnCard', () => {
   it('calls onUndo when undo button clicked', async () => {
     const user = userEvent.setup();
     const onUndo = vi.fn();
-    const turn = makeTurn({ isActive: false });
+    const turn = makeTurn({
+      isActive: false,
+      userMessage: makeRow({ type: 'user', messageId: 'msg-onundo-1' }),
+    });
 
     render(<TurnCard {...defaultProps} turn={turn} canUndo={true} onUndo={onUndo} />);
 
@@ -310,10 +319,53 @@ describe('TurnCard', () => {
     expect(onRedo).toHaveBeenCalledTimes(1);
   });
 
+  it('shows fork button when turn has a user message id and is eligible', () => {
+    const turn = makeTurn({
+      isActive: false,
+      userMessage: makeRow({ type: 'user', messageId: 'msg-fork-1' }),
+    });
+
+    render(<TurnCard {...defaultProps} turn={turn} onFork={vi.fn()} />);
+
+    expect(screen.getByText('Fork')).toBeInTheDocument();
+  });
+
+  it('shows fork button when turn has assistant message id and no user message id', () => {
+    const turn = makeTurn({
+      isActive: false,
+      userMessage: makeRow({ type: 'user', messageId: undefined }),
+      agentMessages: [makeRow({ type: 'agent', messageId: 'msg-fork-agent-1' })],
+    });
+
+    render(<TurnCard {...defaultProps} turn={turn} onFork={vi.fn()} />);
+
+    expect(screen.getByText('Fork')).toBeInTheDocument();
+  });
+
+  it('calls onFork when fork button clicked', async () => {
+    const user = userEvent.setup();
+    const onFork = vi.fn();
+    const turn = makeTurn({
+      isActive: false,
+      userMessage: makeRow({ type: 'user', messageId: 'msg-fork-2' }),
+    });
+
+    render(<TurnCard {...defaultProps} turn={turn} onFork={onFork} />);
+
+    const forkButton = screen.getByText('Fork').closest('button');
+    expect(forkButton).toBeTruthy();
+    await user.click(forkButton!);
+
+    expect(onFork).toHaveBeenCalledTimes(1);
+  });
+
   // ==================== Edge Case Tests ====================
 
   it('undo button hidden when canUndo false', () => {
-    const turn = makeTurn({ isActive: false });
+    const turn = makeTurn({
+      isActive: false,
+      userMessage: makeRow({ type: 'user', messageId: 'msg-cannot-undo-1' }),
+    });
 
     render(<TurnCard {...defaultProps} turn={turn} canUndo={false} />);
 

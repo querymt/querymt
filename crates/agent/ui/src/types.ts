@@ -439,6 +439,13 @@ export type UiServerMessage =
       undo_stack: UndoStackFrame[];
     }
   | { type: 'redo_result'; success: boolean; message?: string | null; undo_stack: UndoStackFrame[] }
+  | {
+      type: 'fork_result';
+      success: boolean;
+      source_session_id?: string | null;
+      forked_session_id?: string | null;
+      message?: string | null;
+    }
   | { type: 'agent_mode'; mode: string }
   | { type: 'remote_nodes'; nodes: RemoteNodeInfo[] }
   | { type: 'remote_sessions'; node_id: string; sessions: RemoteSessionInfo[] }
@@ -571,6 +578,7 @@ export type UiClientMessage =
   | { type: 'cancel_session' }
   | { type: 'undo'; message_id: string }
   | { type: 'redo' }
+  | { type: 'fork_session'; message_id: string }
   | { type: 'subscribe_session'; session_id: string; agent_id?: string }
   | { type: 'unsubscribe_session'; session_id: string }
   | { type: 'elicitation_response'; elicitation_id: string; action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> }

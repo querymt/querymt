@@ -200,6 +200,10 @@ pub enum UiClientMessage {
     },
     /// Redo: restore filesystem to pre-undo state
     Redo,
+    /// Fork the active session at a specific message boundary.
+    ForkSession {
+        message_id: String,
+    },
     /// Subscribe to a session's event stream
     SubscribeSession {
         session_id: String,
@@ -394,6 +398,13 @@ pub enum UiServerMessage {
         message: Option<String>,
         undo_stack: Vec<UndoStackFrame>,
     },
+    /// Result of a fork operation.
+    ForkResult {
+        success: bool,
+        source_session_id: Option<String>,
+        forked_session_id: Option<String>,
+        message: Option<String>,
+    },
     /// Current agent mode notification
     AgentMode {
         mode: String,
@@ -474,6 +485,7 @@ impl UiServerMessage {
             Self::SessionEvents { .. } => "session_events",
             Self::UndoResult { .. } => "undo_result",
             Self::RedoResult { .. } => "redo_result",
+            Self::ForkResult { .. } => "fork_result",
             Self::AgentMode { .. } => "agent_mode",
             Self::AuthProviders { .. } => "auth_providers",
             Self::OAuthFlowStarted { .. } => "oauth_flow_started",
@@ -551,6 +563,22 @@ mod tests {
                 assert_eq!(session_id, "sess-123");
             }
             _ => panic!("expected DeleteSession"),
+        }
+    }
+
+    #[test]
+    fn deserializes_fork_session_tag() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "fork_session",
+            "message_id": "msg-123"
+        }))
+        .expect("fork_session should deserialize");
+
+        match msg {
+            UiClientMessage::ForkSession { message_id } => {
+                assert_eq!(message_id, "msg-123");
+            }
+            _ => panic!("expected ForkSession"),
         }
     }
 

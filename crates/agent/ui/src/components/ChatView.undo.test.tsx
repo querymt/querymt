@@ -142,6 +142,47 @@ describe('ChatView undo/redo logic', () => {
   });
 });
 
+describe('ChatView fork logic', () => {
+  it('handleFork should prefer last assistant messageId for turn boundary', () => {
+    const turn = {
+      id: 'turn-fork-1',
+      userMessage: { messageId: 'user-msg-1' },
+      agentMessages: [
+        { messageId: 'assistant-msg-1' },
+        { messageId: 'assistant-msg-2' },
+      ],
+      toolCalls: [],
+      delegations: [],
+      startTime: 0,
+      isActive: false,
+    };
+
+    const targetMessageId = [...turn.agentMessages]
+      .reverse()
+      .find((message) => !!message.messageId)?.messageId ?? turn.userMessage?.messageId;
+
+    expect(targetMessageId).toBe('assistant-msg-2');
+  });
+
+  it('handleFork should fallback to user messageId when assistant messageId missing', () => {
+    const turn = {
+      id: 'turn-fork-2',
+      userMessage: { messageId: 'user-msg-2' },
+      agentMessages: [{ messageId: undefined }],
+      toolCalls: [],
+      delegations: [],
+      startTime: 0,
+      isActive: false,
+    };
+
+    const targetMessageId = [...turn.agentMessages]
+      .reverse()
+      .find((message) => !!message.messageId)?.messageId ?? turn.userMessage?.messageId;
+
+    expect(targetMessageId).toBe('user-msg-2');
+  });
+});
+
 describe('ChatView undo button visibility logic', () => {
   it('undo candidate moves to previous tool turn after undo frontier', () => {
     const turns = [

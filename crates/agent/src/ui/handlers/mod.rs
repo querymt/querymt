@@ -33,6 +33,7 @@ pub use remote::handle_list_remote_sessions;
 pub use session_ops::handle_cancel_session;
 pub use session_ops::handle_delete_session;
 pub use session_ops::handle_elicitation_response;
+pub use session_ops::handle_fork_session;
 pub use session_ops::handle_get_agent_mode;
 pub use session_ops::handle_get_file_index;
 pub use session_ops::handle_get_llm_config;
@@ -189,6 +190,9 @@ pub async fn handle_ui_message(
         }
         UiClientMessage::Redo => {
             handle_redo(state, conn_id, tx).await;
+        }
+        UiClientMessage::ForkSession { message_id } => {
+            handle_fork_session(state, conn_id, &message_id, tx).await;
         }
         UiClientMessage::SubscribeSession {
             session_id,

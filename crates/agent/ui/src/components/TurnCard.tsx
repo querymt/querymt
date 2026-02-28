@@ -13,7 +13,7 @@ import { CompactionCard, CompactingIndicator } from './CompactionCard';
 import { getAgentShortName } from '../utils/agentNames';
 import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
-import { Undo2, Redo2, Copy, Check } from 'lucide-react';
+import { Undo2, Redo2, Copy, Check, GitBranchPlus } from 'lucide-react';
 
 export interface TurnCardProps {
   turn: Turn;
@@ -26,6 +26,7 @@ export interface TurnCardProps {
   requestLlmConfig?: (configId: number, callback: (config: LlmConfigDetails) => void) => void;
   activeView?: 'chat' | 'delegations'; // Current view - only show pinned message in chat view
   onUndo?: () => void; // Callback to undo this turn
+  onFork?: () => void; // Callback to fork this turn into a new session
   onRedo?: () => void; // Callback to redo this turn
   isUndone?: boolean; // This turn is the top confirmed undone frame (redo available)
   isUndoPending?: boolean; // This turn is the top undo frame waiting for backend confirmation
@@ -137,6 +138,7 @@ export const TurnCard = memo(function TurnCard({
   requestLlmConfig,
   activeView = 'chat',
   onUndo,
+  onFork,
   onRedo,
   isUndone = false,
   isUndoPending = false,
@@ -150,6 +152,11 @@ export const TurnCard = memo(function TurnCard({
   const agentColor = turn.agentId ? getAgentColor(turn.agentId) : undefined;
   const hasUndoOverlay = isUndone || isUndoPending || isStackedUndone;
   const canShowUndoButton = !!onUndo && canUndo && !turn.isActive && !hasUndoOverlay;
+  const canShowForkButton =
+    !!onFork &&
+    (!!turn.userMessage?.messageId || turn.agentMessages.some((message) => !!message.messageId)) &&
+    !turn.isActive &&
+    !hasUndoOverlay;
 
   // Interleave messages, tool calls, and compaction chronologically
   const interleaved = interleaveEvents(
@@ -447,17 +454,29 @@ export const TurnCard = memo(function TurnCard({
           )}
         </div>
 
-        {/* Undo button - subtly visible, fully visible on hover */}
-        {canShowUndoButton && (
-          <div className="mt-2 flex justify-end opacity-60 group-hover:opacity-100 transition-opacity">
-            <button
-              onClick={onUndo}
-              className="flex items-center gap-1.5 px-2 py-1 rounded text-xs text-ui-secondary hover:text-status-warning hover:bg-status-warning/10 border border-transparent hover:border-status-warning/40 transition-colors"
-              title="Undo changes from this turn"
-            >
-              <Undo2 className="w-3.5 h-3.5" />
-              <span>Undo</span>
-            </button>
+        {/* Turn actions - subtly visible, fully visible on hover */}
+        {(canShowUndoButton || canShowForkButton) && (
+          <div className="mt-2 flex justify-end gap-2 opacity-60 group-hover:opacity-100 transition-opacity">
+            {canShowForkButton && (
+              <button
+                onClick={onFork}
+                className="flex items-center gap-1.5 px-2 py-1 rounded text-xs text-ui-secondary hover:text-accent-primary hover:bg-accent-primary/10 border border-transparent hover:border-accent-primary/40 transition-colors"
+                title="Fork a new session from this turn"
+              >
+                <GitBranchPlus className="w-3.5 h-3.5" />
+                <span>Fork</span>
+              </button>
+            )}
+            {canShowUndoButton && (
+              <button
+                onClick={onUndo}
+                className="flex items-center gap-1.5 px-2 py-1 rounded text-xs text-ui-secondary hover:text-status-warning hover:bg-status-warning/10 border border-transparent hover:border-status-warning/40 transition-colors"
+                title="Undo changes from this turn"
+              >
+                <Undo2 className="w-3.5 h-3.5" />
+                <span>Undo</span>
+              </button>
+            )}
           </div>
         )}
 

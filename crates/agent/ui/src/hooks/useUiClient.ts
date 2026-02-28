@@ -178,6 +178,10 @@ export function useUiClient() {
   const pendingRequestsRef = useRef<Map<string, (sessionId: string) => void>>(new Map());
   const pendingDeleteLabelsRef = useRef<Map<string, string>>(new Map());
   const pendingLoadLabelsRef = useRef<Map<string, string>>(new Map());
+  const pendingForkResolverRef = useRef<{
+    resolve: (sessionId: string) => void;
+    reject: (reason?: unknown) => void;
+  } | null>(null);
   const workspacePathDialogResolverRef = useRef<((value: { cwd: string; node: string | null } | null) => void) | null>(null);
   const sessionCreatingRef = useRef(false);
 
@@ -234,6 +238,12 @@ export function useUiClient() {
       workspacePathDialogResolverRef.current = null;
       if (resolver) {
         resolver(null);
+      }
+      const pendingFork = pendingForkResolverRef.current;
+      pendingForkResolverRef.current = null;
+      if (pendingFork) {
+        sessionCreatingRef.current = false;
+        pendingFork.reject(new Error('Socket closed before fork completed'));
       }
       if (socketRef.current) {
         socketRef.current.close();
@@ -865,6 +875,24 @@ export function useUiClient() {
         }
         break;
       }
+      case 'fork_result': {
+        const pendingFork = pendingForkResolverRef.current;
+        pendingForkResolverRef.current = null;
+
+        if (msg.success && msg.forked_session_id) {
+          if (pendingFork) {
+            pendingFork.resolve(msg.forked_session_id);
+          }
+        } else {
+          const errorMessage = msg.message ?? 'Failed to fork session';
+          sessionCreatingRef.current = false;
+          if (pendingFork) {
+            pendingFork.reject(new Error(errorMessage));
+          }
+          pushSessionActionNotice('error', errorMessage);
+        }
+        break;
+      }
       case 'agent_mode':
         setAgentModeState(msg.mode);
         break;
@@ -1198,6 +1226,17 @@ export function useUiClient() {
     sendMessage({ type: 'redo' });
   }, []);
 
+  const forkSessionAtMessage = useCallback((messageId: string): Promise<string> => {
+    if (pendingForkResolverRef.current) {
+      return Promise.reject(new Error('Another fork request is already in progress'));
+    }
+
+    return new Promise((resolve, reject) => {
+      pendingForkResolverRef.current = { resolve, reject };
+      sendMessage({ type: 'fork_session', message_id: messageId });
+    });
+  }, []);
+
   const sendElicitationResponse = useCallback((
     elicitationId: string,
     action: 'accept' | 'decline' | 'cancel',
@@ -1278,6 +1317,7 @@ export function useUiClient() {
     unsubscribeSession,
     sendUndo,
     sendRedo,
+    forkSessionAtMessage,
     undoState,
     sessionCreatingRef,
     workspacePathDialogOpen,

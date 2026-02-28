@@ -13,6 +13,7 @@ use crate::agent::core::AgentMode;
 use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
 use crate::send_agent::SendAgent;
+use crate::session::domain::ForkOrigin;
 use agent_client_protocol::{CancelNotification, LoadSessionRequest, SessionId};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -592,6 +593,111 @@ pub async fn handle_redo(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<S
                     success: false,
                     message: Some(e.to_string()),
                     undo_stack,
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle fork request from the active session at a specific message boundary.
+pub async fn handle_fork_session(
+    state: &ServerState,
+    conn_id: &str,
+    message_id: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    let source_session_id = {
+        let connections = state.connections.lock().await;
+        connections
+            .get(conn_id)
+            .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
+    };
+
+    let Some(source_session_id) = source_session_id else {
+        let _ = send_message(
+            tx,
+            UiServerMessage::ForkResult {
+                success: false,
+                source_session_id: None,
+                forked_session_id: None,
+                message: Some("No active session".to_string()),
+            },
+        )
+        .await;
+        return;
+    };
+
+    match state
+        .session_store
+        .fork_session(&source_session_id, message_id, ForkOrigin::User)
+        .await
+    {
+        Ok(forked_session_id) => {
+            if let Ok(Some(forked_session)) =
+                state.session_store.get_session(&forked_session_id).await
+                && let Some(cwd) = forked_session.cwd
+            {
+                let mut cwds = state.session_cwds.lock().await;
+                cwds.insert(forked_session_id.clone(), cwd);
+            }
+
+            {
+                let mut connections = state.connections.lock().await;
+                if let Some(conn) = connections.get_mut(conn_id) {
+                    conn.sessions
+                        .insert(conn.active_agent_id.clone(), forked_session_id.clone());
+                    conn.subscribed_sessions.insert(forked_session_id.clone());
+                }
+            }
+
+            {
+                let mut agents = state.session_agents.lock().await;
+                let fallback_agent = PRIMARY_AGENT_ID.to_string();
+                let parent_agent = agents
+                    .get(&source_session_id)
+                    .cloned()
+                    .unwrap_or(fallback_agent.clone());
+                agents.insert(forked_session_id.clone(), parent_agent);
+            }
+
+            if let Err(err) = ensure_session_loaded(state, &forked_session_id, "fork_session").await
+            {
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::ForkResult {
+                        success: false,
+                        source_session_id: Some(source_session_id),
+                        forked_session_id: Some(forked_session_id),
+                        message: Some(format!("Fork created but failed to hydrate session: {err}")),
+                    },
+                )
+                .await;
+                return;
+            }
+
+            send_state(state, conn_id, tx).await;
+            handle_list_sessions(state, tx).await;
+
+            let _ = send_message(
+                tx,
+                UiServerMessage::ForkResult {
+                    success: true,
+                    source_session_id: Some(source_session_id),
+                    forked_session_id: Some(forked_session_id),
+                    message: None,
+                },
+            )
+            .await;
+        }
+        Err(err) => {
+            let _ = send_message(
+                tx,
+                UiServerMessage::ForkResult {
+                    success: false,
+                    source_session_id: Some(source_session_id),
+                    forked_session_id: None,
+                    message: Some(format!("Failed to fork session: {err}")),
                 },
             )
             .await;

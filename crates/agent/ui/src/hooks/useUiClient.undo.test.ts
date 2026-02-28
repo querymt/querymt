@@ -459,6 +459,43 @@ describe('useUiClient - undo/redo', () => {
     expect(result.current.undoState?.frontierMessageId).toBe('msg-1');
   });
 
+  // ==================== Fork flow ====================
+
+  it('forkSessionAtMessage does not arm session-creation guard and resolves on fork_result', async () => {
+    const { result } = renderHook(() => useUiClient());
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    MockWebSocket.instance!.sentMessages = [];
+    expect(result.current.sessionCreatingRef.current).toBe(false);
+
+    let forkPromise: Promise<string>;
+    await act(async () => {
+      forkPromise = result.current.forkSessionAtMessage('msg-fork-123');
+    });
+
+    expect(MockWebSocket.instance!.sentMessages).toEqual([
+      {
+        type: 'fork_session',
+        message_id: 'msg-fork-123',
+      },
+    ]);
+    expect(result.current.sessionCreatingRef.current).toBe(false);
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'fork_result',
+        success: true,
+        forked_session_id: 'child-session-1',
+      });
+    });
+
+    await expect(forkPromise!).resolves.toBe('child-session-1');
+  });
+
   // ==================== Test Suite 3a.3: Prompt Branch Commit Cleanup ====================
 
   it('undoState cleared on prompt_received for main session', async () => {

@@ -80,6 +80,7 @@ export function ChatView() {
     requestLlmConfig,
     sendUndo,
     sendRedo,
+    forkSessionAtMessage,
     undoState,
   } = useUiClientContext();
   
@@ -384,6 +385,25 @@ export function ChatView() {
     console.log('[ChatView] Redoing changes');
     sendRedo();
   }, [sendRedo]);
+
+  const handleFork = useCallback(async (turnIndex: number) => {
+    const turn = filteredTurns[turnIndex];
+    const lastAssistantMessageId = [...turn.agentMessages]
+      .reverse()
+      .find((message) => !!message.messageId)?.messageId;
+    const messageId = lastAssistantMessageId ?? turn.userMessage?.messageId;
+    if (!messageId) {
+      console.error('[ChatView] Cannot fork: no message ID found for turn', turn.id);
+      return;
+    }
+
+    try {
+      const forkedSessionId = await forkSessionAtMessage(messageId);
+      selectSession(forkedSessionId);
+    } catch (err) {
+      console.error('[ChatView] Failed to fork session:', err);
+    }
+  }, [filteredTurns, forkSessionAtMessage, selectSession]);
 
   // Handle tool click to open modal
   const handleToolClick = useCallback((event: EventRow) => {
@@ -785,6 +805,7 @@ export function ChatView() {
                     isStackedUndone={isStackedUndone}
                     revertedFiles={revertedFiles}
                     onUndo={() => handleUndo(index)}
+                    onFork={() => handleFork(index)}
                     onRedo={handleRedo}
                     isCompacting={isLastTurn && !!compactingState}
                     compactingTokenEstimate={isLastTurn ? compactingState?.tokenEstimate : undefined}

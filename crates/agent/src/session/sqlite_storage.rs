@@ -340,6 +340,7 @@ impl SessionStore for SqliteStorage {
         // Resolve source session public_id → internal i64
         let source_session_internal_id =
             self.resolve_session_internal_id(source_session_id).await?;
+        let source_session_public_id = source_session_id.to_string();
 
         // Resolve target message public_id → internal i64
         let target_message_internal_id =
@@ -352,21 +353,22 @@ impl SessionStore for SqliteStorage {
             let new_session_public_id = Uuid::now_v7().to_string();
             let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
 
-            // Get parent session llm_config_id (internal i64)
-            let parent_llm_config_id: Option<i64> = tx
+            // Inherit parent config and workspace for the forked session.
+            let (parent_llm_config_id, parent_cwd): (Option<i64>, Option<String>) = tx
                 .query_row(
-                    "SELECT llm_config_id FROM sessions WHERE id = ?",
+                    "SELECT llm_config_id, cwd FROM sessions WHERE id = ?",
                     params![source_session_internal_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?
-                .flatten();
+                .unwrap_or((None, None));
 
             tx.execute(
-                "INSERT INTO sessions (public_id, name, created_at, updated_at, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     new_session_public_id.clone(),
                     format!("Fork of session"), // Temporary name
+                    parent_cwd,
                     now.clone(),
                     now,
                     parent_llm_config_id,
@@ -380,10 +382,12 @@ impl SessionStore for SqliteStorage {
             // Get new session internal ID
             let new_session_internal_id: i64 = tx.last_insert_rowid();
 
-            // 2. Identify messages to copy (up to target_message_id internal ID)
+            // 2. Identify messages to copy (up to target_message_id internal ID).
+            // Use deterministic internal-id ordering so same-second timestamps don't truncate
+            // assistant turns unpredictably.
             let messages_to_copy = {
                 let mut stmt = tx.prepare(
-                    "SELECT id, public_id, role, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC"
+                    "SELECT id, public_id, role, created_at FROM messages WHERE session_id = ? ORDER BY id ASC"
                 )?;
 
                 let messages: Vec<(i64, String, String, i64)> = stmt.query_map(params![source_session_internal_id], |row| {
@@ -404,6 +408,61 @@ impl SessionStore for SqliteStorage {
                     }
                 }
                 to_copy
+            };
+
+            let copied_message_ids: std::collections::HashSet<String> = messages_to_copy
+                .iter()
+                .map(|(_, public_id, _, _)| public_id.clone())
+                .collect();
+
+            let conversational_events_to_copy: Vec<(String, i64, String, Option<String>, String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT event_id, timestamp, origin, source_node, kind, payload_json \
+                     FROM event_journal \
+                     WHERE session_id = ? \
+                     ORDER BY stream_seq ASC",
+                )?;
+
+                let rows: Vec<(String, i64, String, Option<String>, String, String)> = stmt
+                    .query_map(params![source_session_public_id], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                rows.into_iter()
+                    .filter(|(_, _, _, _, kind, payload_json)| {
+                        if kind == "prompt_received" {
+                            let parsed: serde_json::Value = match serde_json::from_str(payload_json) {
+                                Ok(value) => value,
+                                Err(_) => return false,
+                            };
+                            let message_id = parsed.get("message_id").and_then(|id| id.as_str());
+                            return message_id
+                                .map(|id| copied_message_ids.contains(id))
+                                .unwrap_or(false);
+                        }
+
+                        if kind == "assistant_message_stored" {
+                            let parsed: serde_json::Value = match serde_json::from_str(payload_json) {
+                                Ok(value) => value,
+                                Err(_) => return false,
+                            };
+                            let message_id = parsed.get("message_id").and_then(|id| id.as_str());
+                            return message_id
+                                .map(|id| copied_message_ids.contains(id))
+                                .unwrap_or(false);
+                        }
+
+                        false
+                    })
+                    .collect()
             };
 
             // 3. Copy messages and their parts with new UUID v7 public_ids
@@ -436,6 +495,34 @@ impl SessionStore for SqliteStorage {
                         )?;
                     }
                 }
+            }
+
+            // Copy only conversational durable events into the fork timeline.
+            // Risk/tradeoff: operational events (tool calls, llm lifecycle, provider/task/progress/
+            // delegation telemetry) are intentionally excluded because replaying them in a fork can
+            // create contradictory state and duplicate execution traces. The downside is inherited
+            // UI telemetry before the fork point is intentionally partial.
+            for (_event_id, timestamp, origin, source_node, kind, payload_json) in conversational_events_to_copy {
+                let new_event_id = Uuid::now_v7().to_string();
+                let stream_seq: u64 = tx.query_row(
+                    "UPDATE event_journal_seq SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+
+                tx.execute(
+                    "INSERT INTO event_journal (event_id, stream_seq, session_id, timestamp, origin, source_node, kind, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        new_event_id,
+                        stream_seq,
+                        new_session_public_id,
+                        timestamp,
+                        origin,
+                        source_node,
+                        kind,
+                        payload_json,
+                    ],
+                )?;
             }
 
             tx.commit()?;
