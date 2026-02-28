@@ -16,17 +16,14 @@ use crate::delegation::AgentInfo;
 
 use crate::agent::handle::AgentHandle as AgentHandleTrait;
 use crate::middleware::MIDDLEWARE_REGISTRY;
-use crate::quorum::AgentQuorum;
-use crate::runner::{ChatRunner, ChatSession};
-#[cfg(feature = "dashboard")]
-use crate::server::AgentServer;
+use crate::runner::ChatSession;
 use crate::session::backend::default_agent_db_path;
 use crate::session::store::SessionStore;
 use crate::session::{SqliteStorage, StorageBackend};
 use crate::snapshot::GitSnapshotBackend;
 use crate::tools::CapabilityRequirement;
 use crate::tools::builtins::all_builtin_tools;
-use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
+use agent_client_protocol::{ContentBlock, PromptRequest, TextContent};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -69,6 +66,9 @@ pub struct QuorumBuilder {
     /// `create_delegation_session` routes LLM calls to the peer.
     #[cfg(feature = "remote")]
     pub(super) peer_delegates: Vec<(String, String)>,
+
+    /// Optional pre-built infrastructure (plugin registry + storage).
+    pub(super) infra: Option<super::agent::AgentInfra>,
 }
 
 impl Default for QuorumBuilder {
@@ -99,6 +99,7 @@ impl QuorumBuilder {
             mesh_auto_fallback: false,
             #[cfg(feature = "remote")]
             peer_delegates: Vec::new(),
+            infra: None,
         }
     }
 
@@ -153,7 +154,22 @@ impl QuorumBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<Quorum> {
+    /// Inject custom infrastructure (plugin registry, storage).
+    ///
+    /// Required for environments without default plugin loaders (iOS, embedded).
+    /// When not called, `build()` uses platform defaults.
+    pub fn infra(mut self, infra: super::agent::AgentInfra) -> Self {
+        self.infra = Some(infra);
+        self
+    }
+
+    /// Configure delegation summarization for completed delegations.
+    pub fn delegation_summary(mut self, config: crate::config::DelegationSummaryConfig) -> Self {
+        self.delegation_summary_config = Some(config);
+        self
+    }
+
+    pub async fn build(self) -> Result<super::agent::Agent> {
         let planner_config = self
             .planner_config
             .ok_or_else(|| anyhow!("Planner configuration is required"))?;
@@ -174,13 +190,34 @@ impl QuorumBuilder {
             ));
         }
 
-        let registry = Arc::new(default_registry().await?);
-
-        let path = match self.db_path {
-            Some(path) => path,
-            None => default_agent_db_path()?,
+        let (registry, backend): (
+            Arc<querymt::plugin::host::PluginRegistry>,
+            Arc<dyn StorageBackend>,
+        ) = match self.infra {
+            Some(infra) => {
+                let storage = match infra.storage {
+                    Some(s) => s,
+                    None => {
+                        let path = match self.db_path {
+                            Some(path) => path,
+                            None => default_agent_db_path()?,
+                        };
+                        Arc::new(SqliteStorage::connect(path).await?)
+                    }
+                };
+                (infra.plugin_registry, storage)
+            }
+            None => {
+                let reg = Arc::new(default_registry().await?);
+                let path = match self.db_path {
+                    Some(path) => path,
+                    None => default_agent_db_path()?,
+                };
+                let storage = Arc::new(SqliteStorage::connect(path).await?);
+                (reg, storage)
+            }
         };
-        let backend = Arc::new(SqliteStorage::connect(path).await?);
+
         let mut builder = AgentQuorumBuilder::from_backend(backend.clone());
 
         if let Some(cwd_path) = cwd.clone() {
@@ -220,7 +257,6 @@ impl QuorumBuilder {
             let delegation_wait_timeout_for_delegate = self.delegation_wait_timeout_secs;
             let delegation_cancel_grace_for_delegate = self.delegation_cancel_grace_secs;
             builder = builder.add_delegate_agent(agent_info, move |store, event_journal| {
-                use crate::config::RuntimeExecutionPolicy;
                 let mut b = AgentConfigBuilder::new(
                     registry.clone(),
                     store.clone(),
@@ -241,24 +277,11 @@ impl QuorumBuilder {
 
                 let auto_compact = exec.compaction.auto;
                 b = b
-                    .with_execution_policy(RuntimeExecutionPolicy::from(&exec))
+                    .with_snapshot_from_execution(&exec)
                     .with_delegation_wait_policy(delegation_wait_policy_for_delegate.clone())
                     .with_delegation_wait_timeout_secs(delegation_wait_timeout_for_delegate)
                     .with_delegation_cancel_grace_secs(delegation_cancel_grace_for_delegate);
                 apply_middleware_from_config(&mut b, &middleware_entries, auto_compact);
-
-                match exec.snapshot.backend.as_str() {
-                    "git" => {
-                        b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
-                    }
-                    "none" | "" => {}
-                    other => {
-                        log::warn!(
-                            "Unknown snapshot backend '{}' for delegate, ignoring",
-                            other
-                        );
-                    }
-                }
 
                 let config = Arc::new(b.build());
                 Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>
@@ -350,7 +373,6 @@ impl QuorumBuilder {
         let delegation_wait_timeout_for_planner = self.delegation_wait_timeout_secs;
         let delegation_cancel_grace_for_planner = self.delegation_cancel_grace_secs;
         builder = builder.with_planner(move |store, event_journal, agent_registry| {
-            use crate::config::RuntimeExecutionPolicy;
             let mut b = AgentConfigBuilder::new(
                 registry_for_planner.clone(),
                 store.clone(),
@@ -373,21 +395,11 @@ impl QuorumBuilder {
 
             let auto_compact = planner_exec.compaction.auto;
             b = b
-                .with_execution_policy(RuntimeExecutionPolicy::from(&planner_exec))
+                .with_snapshot_from_execution(&planner_exec)
                 .with_delegation_wait_policy(delegation_wait_policy_for_planner.clone())
                 .with_delegation_wait_timeout_secs(delegation_wait_timeout_for_planner)
                 .with_delegation_cancel_grace_secs(delegation_cancel_grace_for_planner);
             apply_middleware_from_config(&mut b, &planner_middleware, auto_compact);
-
-            match planner_exec.snapshot.backend.as_str() {
-                "git" => {
-                    b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
-                }
-                "none" | "" => {}
-                other => {
-                    log::warn!("Unknown snapshot backend '{}' for planner, ignoring", other);
-                }
-            }
 
             // Register routing planner tools if RoutingActor is available.
             #[cfg(feature = "remote")]
@@ -564,161 +576,40 @@ impl QuorumBuilder {
             }
         }
 
-        Ok(Quorum {
-            inner: quorum,
+        Ok(super::agent::Agent {
+            inner: planner_handle,
             storage: backend,
-            planner_handle,
-            planner_session_id: Arc::new(Mutex::new(None)),
+            default_session_id: Arc::new(Mutex::new(None)),
             cwd,
             callbacks: Arc::new(EventCallbacksState::new(None)),
+            quorum: Some(quorum),
         })
     }
 }
 
-pub struct Quorum {
-    inner: AgentQuorum,
-    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
-    storage: Arc<dyn StorageBackend>,
-    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
-    planner_handle: Arc<AgentHandle>,
-    planner_session_id: Arc<Mutex<Option<String>>>,
-    cwd: Option<PathBuf>,
-    callbacks: Arc<EventCallbacksState>,
-}
-
-impl Quorum {
-    pub async fn chat(&self, prompt: &str) -> Result<String> {
-        let session_id = self.ensure_planner_session().await?;
-        let request = PromptRequest::new(
-            session_id.clone(),
-            vec![ContentBlock::Text(TextContent::new(prompt))],
-        );
-        let planner = self.inner.planner();
-        planner
-            .prompt(request)
-            .await
-            .map_err(|e| anyhow!(e.to_string()))?;
-        let history = self
-            .inner
-            .store()
-            .get_history(&session_id)
-            .await
-            .map_err(|e| anyhow!(e.to_string()))?;
-        latest_assistant_message(&history).ok_or_else(|| anyhow!("No assistant response found"))
+/// Construction helpers for multi-agent (quorum) configs.
+///
+/// These are the `from_quorum_config` family of methods, exposed on `Agent`
+/// for backward compatibility and convenience.
+impl super::agent::Agent {
+    /// Create a multi-agent from a serializable quorum config + custom infrastructure.
+    pub async fn from_quorum_config_with_infra(
+        config: QuorumConfig,
+        infra: super::agent::AgentInfra,
+    ) -> Result<Self> {
+        let mut builder = Self::builder_from_quorum_config(config, None)?;
+        builder = builder.infra(infra);
+        builder.build().await
     }
 
-    pub fn inner(&self) -> &AgentQuorum {
-        &self.inner
-    }
-
-    /// Access the planner's `AgentHandle` for advanced configuration.
-    ///
-    /// The handle provides access to the session registry, event bus, and agent config.
-    /// Use this when you need to interact with sessions directly or integrate with
-    /// the kameo mesh (e.g., bootstrapping `RemoteNodeManager`).
-    pub fn handle(&self) -> Arc<AgentHandle> {
-        self.planner_handle.clone()
-    }
-
-    pub fn planner(&self) -> Arc<dyn AgentHandleTrait> {
-        self.inner.planner()
-    }
-
-    pub fn delegate(&self, id: &str) -> Option<Arc<dyn AgentHandleTrait>> {
-        self.inner.delegate(id)
-    }
-
-    #[cfg(feature = "dashboard")]
-    pub fn dashboard(&self) -> AgentServer {
-        AgentServer::new(
-            self.planner_handle.clone(),
-            self.storage.clone(),
-            self.cwd.clone(),
-        )
-    }
-
-    /// Start an ACP server with the specified transport.
-    ///
-    /// # Arguments
-    /// * `transport` - Either "stdio" for stdin/stdout, or "ip:port" for WebSocket
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// # use querymt_agent::prelude::*;
-    /// # #[tokio::main]
-    /// # async fn main() -> anyhow::Result<()> {
-    /// let quorum = Agent::multi()
-    ///     .planner(|p| p.provider("openai", "gpt-4"))
-    ///     .build()
-    ///     .await?;
-    ///     
-    /// quorum.acp("stdio").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn acp(&self, transport: &str) -> Result<()> {
-        match transport {
-            "stdio" => crate::acp::serve_stdio(self.planner_handle.clone())
-                .await
-                .map_err(|e| anyhow!("ACP stdio error: {}", e)),
-            addr if addr.contains(':') => Err(anyhow!(
-                "WebSocket ACP not yet implemented for Quorum. Use .dashboard().run(\"{}\") for web access.",
-                addr
-            )),
-            _ => Err(anyhow!(
-                "Invalid ACP transport '{}'. Use 'stdio' or 'ip:port' format.",
-                transport
-            )),
-        }
-    }
-
-    async fn ensure_planner_session(&self) -> Result<String> {
-        if let Some(existing) = self.planner_session_id.lock().unwrap().clone() {
-            return Ok(existing);
-        }
-        let planner = self.inner.planner();
-        let request = match &self.cwd {
-            Some(cwd) => NewSessionRequest::new(cwd.clone()),
-            None => NewSessionRequest::new(PathBuf::new()),
-        };
-        let response = planner
-            .new_session(request)
-            .await
-            .map_err(|e| anyhow!(e.to_string()))?;
-        let session_id = response.session_id.to_string();
-        *self.planner_session_id.lock().unwrap() = Some(session_id.clone());
-        Ok(session_id)
-    }
-
-    async fn create_new_planner_session(&self) -> Result<String> {
-        let planner = self.inner.planner();
-        let request = match &self.cwd {
-            Some(cwd) => NewSessionRequest::new(cwd.clone()),
-            None => NewSessionRequest::new(PathBuf::new()),
-        };
-        let response = planner
-            .new_session(request)
-            .await
-            .map_err(|e| anyhow!(e.to_string()))?;
-        Ok(response.session_id.to_string())
-    }
-
-    /// Build a Quorum from a quorum config
+    /// Build an Agent from a quorum config (default infrastructure).
     pub async fn from_quorum_config(config: QuorumConfig) -> Result<Self> {
         let builder = Self::builder_from_quorum_config(config, None)?;
         builder.build().await
     }
 
-    /// Build a `Quorum` from a quorum config, optionally injecting a pre-populated
-    /// agent registry and mesh handle (Phase 7: config-driven remote agents).
-    ///
-    /// When `initial_registry` is `Some`, the remote agent entries from the registry
-    /// are pre-registered in the quorum's delegation registry *before* local delegates,
-    /// so local delegates with the same ID take precedence.
-    ///
-    /// When `mesh` is `Some`, the `MeshHandle` is stored on the planner's `AgentHandle`
-    /// via `set_mesh()` so that mesh-aware methods (`list_remote_nodes`,
-    /// `create_remote_session`, etc.) work.
+    /// Build an Agent from a quorum config, optionally injecting a pre-populated
+    /// agent registry and mesh handle (config-driven remote agents).
     #[cfg(feature = "remote")]
     pub async fn from_quorum_config_with_registry(
         config: QuorumConfig,
@@ -732,8 +623,11 @@ impl Quorum {
         builder.build().await
     }
 
-    /// Shared helper: configure a `QuorumBuilder` from a `QuorumConfig`.
-    fn builder_from_quorum_config(
+    /// Configure a `QuorumBuilder` from a `QuorumConfig`.
+    ///
+    /// Returns the builder before `build()` is called, allowing further
+    /// customization (e.g., `.infra()`).
+    pub fn builder_from_quorum_config(
         config: QuorumConfig,
         initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
     ) -> Result<QuorumBuilder> {
@@ -864,66 +758,10 @@ impl Quorum {
     }
 }
 
-#[async_trait]
-impl ChatRunner for Quorum {
-    async fn chat(&self, prompt: &str) -> Result<String> {
-        Quorum::chat(self, prompt).await
-    }
+// NOTE: ChatRunner for Agent (including multi-agent) is implemented in agent.rs.
 
-    async fn chat_session(&self) -> Result<Box<dyn ChatSession>> {
-        let session_id = self.create_new_planner_session().await?;
-        let session = QuorumSession::new(
-            self.inner.planner(),
-            self.inner.event_fanout(),
-            self.inner.store(),
-            session_id,
-            self.cwd.clone(),
-        );
-        Ok(Box::new(session))
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
-        self.inner.subscribe_events()
-    }
-
-    fn on_tool_call_boxed(&self, callback: Box<dyn Fn(String, Value) + Send + Sync>) {
-        self.callbacks.on_tool_call(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
-    }
-
-    fn on_tool_complete_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
-        self.callbacks.on_tool_complete(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
-    }
-
-    fn on_message_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
-        self.callbacks.on_message(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
-    }
-
-    fn on_delegation_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
-        self.callbacks.on_delegation(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
-    }
-
-    fn on_error_boxed(&self, callback: Box<dyn Fn(String) + Send + Sync>) {
-        self.callbacks.on_error(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
-    }
-
-    #[cfg(feature = "dashboard")]
-    fn dashboard(&self) -> AgentServer {
-        Quorum::dashboard(self)
-    }
-}
-
-/// A session for interacting with a Quorum's planner agent
-pub struct QuorumSession {
+/// A session for interacting with a multi-agent (quorum) planner agent.
+pub(super) struct QuorumSession {
     planner: Arc<dyn AgentHandleTrait>,
     session_id: String,
     callbacks: Arc<EventCallbacksState>,
@@ -934,7 +772,7 @@ pub struct QuorumSession {
 }
 
 impl QuorumSession {
-    fn new(
+    pub(super) fn new(
         planner: Arc<dyn AgentHandleTrait>,
         event_fanout: Arc<crate::event_fanout::EventFanout>,
         store: Arc<dyn SessionStore>,
@@ -1144,8 +982,8 @@ model = "qwen3"
 peer = "gpu-node"
 "#;
         let config: QuorumConfig = toml::from_str(toml).expect("parse QuorumConfig");
-        let builder =
-            Quorum::builder_from_quorum_config(config, None).expect("builder_from_quorum_config");
+        let builder = crate::api::agent::Agent::builder_from_quorum_config(config, None)
+            .expect("builder_from_quorum_config");
 
         // The builder must have registered the peer delegate
         assert_eq!(builder.peer_delegates.len(), 1);
@@ -1170,8 +1008,8 @@ provider = "anthropic"
 model = "claude-haiku"
 "#;
         let config: crate::config::QuorumConfig = toml::from_str(toml).expect("parse QuorumConfig");
-        let builder =
-            Quorum::builder_from_quorum_config(config, None).expect("builder_from_quorum_config");
+        let builder = crate::api::agent::Agent::builder_from_quorum_config(config, None)
+            .expect("builder_from_quorum_config");
 
         assert!(builder.peer_delegates.is_empty());
     }
@@ -1203,8 +1041,8 @@ provider = "openai"
 model = "gpt-4"
 "#;
         let config: crate::config::QuorumConfig = toml::from_str(toml).expect("parse QuorumConfig");
-        let builder =
-            Quorum::builder_from_quorum_config(config, None).expect("builder_from_quorum_config");
+        let builder = crate::api::agent::Agent::builder_from_quorum_config(config, None)
+            .expect("builder_from_quorum_config");
 
         // Only "coder" has a peer
         assert_eq!(builder.peer_delegates.len(), 1);

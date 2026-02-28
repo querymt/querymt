@@ -188,7 +188,7 @@ fn spawn_event_bridge_forwarder(
 /// # Example
 ///
 /// ```rust,no_run
-/// use querymt_agent::simple::Agent;
+/// use querymt_agent::api::Agent;
 /// use querymt_agent::acp::serve_stdio;
 ///
 /// #[tokio::main]

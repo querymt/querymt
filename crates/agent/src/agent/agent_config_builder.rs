@@ -571,6 +571,25 @@ impl AgentConfigBuilder {
     pub fn delegation_context_config(&self) -> &DelegationContextConfig {
         &self.delegation_context_config
     }
+
+    /// Apply execution policy and snapshot backend from an `ExecutionPolicy`.
+    ///
+    /// Sets the runtime execution policy and, if the snapshot backend is "git",
+    /// wires up a `GitSnapshotBackend`. This replaces 4+ copy-pasted match blocks.
+    pub fn with_snapshot_from_execution(mut self, exec: &crate::config::ExecutionPolicy) -> Self {
+        self = self.with_execution_policy(RuntimeExecutionPolicy::from(exec));
+        match exec.snapshot.backend.as_str() {
+            "git" => {
+                use crate::snapshot::git::GitSnapshotBackend;
+                self.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()))
+            }
+            "none" | "" => self,
+            other => {
+                log::warn!("Unknown snapshot backend '{}', ignoring", other);
+                self
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,12 +1,20 @@
-//! Commonly-used types for agent applications
+//! Commonly-used types for agent applications.
 //!
 //! ```no_run
 //! use querymt_agent::prelude::*;
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Single agent
 //! let agent = Agent::single()
-//!     .provider("openai", "gpt-4")
+//!     .provider("anthropic", "claude-sonnet-4-20250514")
+//!     .build()
+//!     .await?;
+//!
+//! // Multi-agent (same Agent type back)
+//! let agent = Agent::multi()
+//!     .planner(|p| p.provider("openai", "gpt-4"))
+//!     .delegate("coder", |d| d.provider("anthropic", "claude-sonnet-4-20250514"))
 //!     .build()
 //!     .await?;
 //! # Ok(())
@@ -17,11 +25,10 @@
 pub use crate::error::AgentError;
 
 // High-level APIs
-pub use crate::simple::{
-    Agent, AgentBuilder, AgentSession, DelegateConfigBuilder, PlannerConfigBuilder, Quorum,
+pub use crate::api::{
+    Agent, AgentBuilder, AgentInfra, AgentSession, DelegateConfigBuilder, PlannerConfigBuilder,
     QuorumBuilder,
 };
-
 // Config and runner APIs
 pub use crate::config::{
     AgentSettings, Config, ConfigSource, DelegateConfig, McpServerConfig, PlannerConfig,
