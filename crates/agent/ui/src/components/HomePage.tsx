@@ -42,8 +42,8 @@ export function HomePage() {
     selectSession(sessionId);
   };
 
-  const handleDeleteSession = (targetSessionId: string) => {
-    deleteSession(targetSessionId);
+  const handleDeleteSession = (targetSessionId: string, sessionLabel?: string) => {
+    deleteSession(targetSessionId, sessionLabel);
     if (targetSessionId === sessionId) {
       goHome();
     }

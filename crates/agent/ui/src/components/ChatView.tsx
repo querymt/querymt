@@ -247,8 +247,8 @@ export function ChatView() {
     selectSession(sessionId);
   }, [selectSession]);
 
-  const handleDeleteSession = useCallback((targetSessionId: string) => {
-    deleteSession(targetSessionId);
+  const handleDeleteSession = useCallback((targetSessionId: string, sessionLabel?: string) => {
+    deleteSession(targetSessionId, sessionLabel);
     if (targetSessionId === sessionId) {
       goHome();
     }

@@ -8,7 +8,7 @@ import { useThinkingSessionIds } from '../hooks/useThinkingSessionIds';
 interface SessionPickerProps {
   groups: SessionGroup[];
   onSelectSession: (sessionId: string) => void;
-  onDeleteSession: (sessionId: string) => void;
+  onDeleteSession: (sessionId: string, sessionLabel?: string) => void;
   onNewSession: () => void;
   disabled?: boolean;
   activeSessionId?: string | null;
@@ -95,7 +95,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
       return;
     }
     // TODO: consider a user setting to require confirmation before deleting sessions.
-    onDeleteSession(session.session_id);
+    onDeleteSession(session.session_id, session.title || session.name || session.session_id);
   };
   
   const formatTimestamp = (timestamp?: string) => {

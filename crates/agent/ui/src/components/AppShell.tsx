@@ -83,6 +83,8 @@ export function AppShell() {
     remoteNodes,
     connectionErrors,
     dismissConnectionError,
+    sessionActionNotices,
+    dismissSessionActionNotice,
     updatePlugins,
     isUpdatingPlugins,
     pluginUpdateStatus,
@@ -423,8 +425,8 @@ export function AppShell() {
     navigate(`/session/${sessionId}`);
   }, [navigate]);
 
-  const handleDeleteSession = useCallback((targetSessionId: string) => {
-    deleteSession(targetSessionId);
+  const handleDeleteSession = useCallback((targetSessionId: string, sessionLabel?: string) => {
+    deleteSession(targetSessionId, sessionLabel);
     if (targetSessionId === sessionId) {
       navigate('/');
     }
@@ -701,9 +703,35 @@ export function AppShell() {
         pluginUpdateResults={pluginUpdateResults}
       />
 
-      {/* Connection error toasts */}
-      {connectionErrors.length > 0 && (
+      {/* Session action + connection toasts */}
+      {(sessionActionNotices.length > 0 || connectionErrors.length > 0) && (
         <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-md">
+          {sessionActionNotices.map((notice) => (
+            <div
+              key={notice.id}
+              className={`flex items-start gap-2 px-4 py-3 rounded-lg border bg-surface-elevated shadow-lg animate-fade-in ${
+                notice.kind === 'success'
+                  ? 'border-status-success/40'
+                  : 'border-status-warning/40'
+              }`}
+            >
+              <span
+                className={`text-xs flex-1 break-words ${
+                  notice.kind === 'success' ? 'text-status-success' : 'text-status-warning'
+                }`}
+              >
+                {notice.message}
+              </span>
+              <button
+                type="button"
+                onClick={() => dismissSessionActionNotice(notice.id)}
+                className="text-ui-muted hover:text-ui-primary transition-colors flex-shrink-0"
+                aria-label="Dismiss"
+              >
+                &times;
+              </button>
+            </div>
+          ))}
           {connectionErrors.map((err) => (
             <div
               key={err.id}

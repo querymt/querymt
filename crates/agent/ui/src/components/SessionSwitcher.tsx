@@ -20,7 +20,7 @@ interface SessionSwitcherProps {
   thinkingBySession: Map<string, Set<string>>;
   onNewSession: () => Promise<void>;
   onSelectSession: (sessionId: string) => void;
-  onDeleteSession: (sessionId: string) => void;
+  onDeleteSession: (sessionId: string, sessionLabel?: string) => void;
   connected: boolean;
 }
 
@@ -165,9 +165,9 @@ export function SessionSwitcher({
     focusMainInput();
   };
 
-  const handleDeleteSession = (sessionId: string, _label: string, closeAfterDelete: boolean = true) => {
+  const handleDeleteSession = (sessionId: string, label: string, closeAfterDelete: boolean = true) => {
     // TODO: consider a user setting to require confirmation before deleting sessions.
-    onDeleteSession(sessionId);
+    onDeleteSession(sessionId, label);
     if (closeAfterDelete) {
       onOpenChange(false);
       focusMainInput();
@@ -191,22 +191,19 @@ export function SessionSwitcher({
       return;
     }
 
-    const selectedItem =
-      event.currentTarget.querySelector<HTMLElement>('[cmdk-item][data-selected="true"][data-session-id]') ??
-      event.currentTarget.querySelector<HTMLElement>('[cmdk-item][data-session-id]');
-    if (!selectedItem) {
+    const targetSessionId = selectedValue || filteredSessions[0]?.session_id;
+    if (!targetSessionId) {
       return;
     }
 
     event.preventDefault();
     event.stopPropagation();
 
-    const sessionId = selectedItem.dataset.sessionId;
-    const sessionLabel = selectedItem.dataset.sessionLabel ?? 'Untitled session';
-    if (sessionId) {
-      setSelectedValue(getNeighborSessionId(sessionId));
-      handleDeleteSession(sessionId, sessionLabel, false);
-    }
+    const targetSession = filteredSessions.find((session) => session.session_id === targetSessionId);
+    const sessionLabel = targetSession?.title || targetSession?.name || 'Untitled session';
+
+    setSelectedValue(getNeighborSessionId(targetSessionId));
+    handleDeleteSession(targetSessionId, sessionLabel, false);
   };
 
   if (!open) return null;
@@ -271,8 +268,6 @@ export function SessionSwitcher({
                     <Command.Item
                       key={session.session_id}
                       value={session.session_id}
-                      data-session-id={session.session_id}
-                      data-session-label={sessionLabel}
                       onSelect={() => handleSelectSession(session.session_id)}
                       className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40 group"
                     >
@@ -368,8 +363,6 @@ export function SessionSwitcher({
                     <Command.Item
                       key={session.session_id}
                       value={session.session_id}
-                      data-session-id={session.session_id}
-                      data-session-label={sessionLabel}
                       onSelect={() => handleSelectSession(session.session_id)}
                       className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40 group"
                     >
