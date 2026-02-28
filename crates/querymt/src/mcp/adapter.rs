@@ -6,7 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use jsonschema::ValidationError;
 use rmcp::model::Tool as RmcpTool;
-use rmcp::{model::CallToolRequestParam, service::ServerSink};
+use rmcp::{model::CallToolRequestParams, service::ServerSink};
 use serde_json::Value;
 use std::convert::TryFrom;
 use tracing::instrument;
@@ -119,9 +119,11 @@ impl CallFunctionTool for McpToolAdapter {
 
         let call_result = self
             .server
-            .call_tool(CallToolRequestParam {
+            .call_tool(CallToolRequestParams {
+                meta: None,
                 name: self.mcp_tool.name.clone(),
                 arguments,
+                task: None,
             })
             .await?;
         Ok(serde_json::to_string(&call_result)?)

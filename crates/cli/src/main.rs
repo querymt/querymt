@@ -452,6 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .create_mcp_clients(&querymt::mcp::Implementation {
                 name: "querymt-cli".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                description: None,
                 title: None,
                 icons: None,
                 website_url: None,

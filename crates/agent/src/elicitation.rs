@@ -9,7 +9,7 @@
 use rmcp::RoleClient;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, CreateElicitationRequestParam, CreateElicitationResult,
+    ClientCapabilities, ClientInfo, CreateElicitationRequestParams, CreateElicitationResult,
     Implementation, ProtocolVersion,
 };
 use rmcp::service::{NotificationContext, RequestContext};
@@ -151,7 +151,7 @@ impl ClientHandler for McpClientHandler {
     #[allow(clippy::manual_async_fn)]
     fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParam,
+        request: CreateElicitationRequestParams,
         _context: RequestContext<RoleClient>,
     ) -> impl std::future::Future<Output = Result<CreateElicitationResult, rmcp::ErrorData>> + Send + '_
     {
@@ -165,9 +165,20 @@ impl ClientHandler for McpClientHandler {
                 pending.insert(elicitation_id.clone(), tx);
             }
 
-            // Convert ElicitationSchema to a JSON value for the event
-            let schema_json =
-                serde_json::to_value(&request.requested_schema).unwrap_or(serde_json::Value::Null);
+            // Extract message and schema from the enum variant
+            let (message, schema_json) = match &request {
+                CreateElicitationRequestParams::FormElicitationParams {
+                    message,
+                    requested_schema,
+                    ..
+                } => (
+                    message.clone(),
+                    serde_json::to_value(requested_schema).unwrap_or(serde_json::Value::Null),
+                ),
+                CreateElicitationRequestParams::UrlElicitationParams { message, url, .. } => {
+                    (message.clone(), serde_json::json!({ "url": url }))
+                }
+            };
 
             // Durable: elicitation must be visible in UI replay.
             if let Err(err) = self
@@ -177,7 +188,7 @@ impl ClientHandler for McpClientHandler {
                     crate::events::AgentEventKind::ElicitationRequested {
                         elicitation_id: elicitation_id.clone(),
                         session_id: self.session_id.clone(),
-                        message: request.message,
+                        message,
                         requested_schema: schema_json,
                         source: format!("mcp:{}", self.server_name),
                     },
@@ -203,6 +214,7 @@ impl ClientHandler for McpClientHandler {
 
     fn get_info(&self) -> ClientInfo {
         ClientInfo {
+            meta: None,
             protocol_version: ProtocolVersion::default(),
             capabilities: ClientCapabilities::default(),
             client_info: self.client_impl.clone(),

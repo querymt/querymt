@@ -1,7 +1,7 @@
 //! Agent Client Protocol helper functions for MCP server management
 use crate::agent::core::McpToolState;
 use crate::error::AgentError;
-use agent_client_protocol::{Error, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
+use agent_client_protocol::{Error, McpServer, McpServerHttp, McpServerStdio};
 use log::warn;
 use querymt::tool_decorator::CallFunctionTool;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -10,8 +10,8 @@ use rmcp::{
     model::Implementation,
     service::{RunningService, serve_client},
     transport::{
-        SseClientTransport, StreamableHttpClientTransport, child_process::TokioChildProcess,
-        sse_client::SseClientConfig, streamable_http_client::StreamableHttpClientTransportConfig,
+        StreamableHttpClientTransport, child_process::TokioChildProcess,
+        streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
 use std::collections::HashMap;
@@ -154,44 +154,6 @@ async fn start_mcp_server(
             let running = serve_client(handler, transport).await.map_err(|e| {
                 Error::from(AgentError::McpServerFailed {
                     transport: "http".to_string(),
-                    reason: e.to_string(),
-                })
-            })?;
-            Ok((name, running))
-        }
-        McpServer::Sse(sse) => {
-            let McpServerSse {
-                name, url, headers, ..
-            } = sse.clone();
-            let client = reqwest::ClientBuilder::new()
-                .default_headers(headers_to_map(&headers)?)
-                .build()
-                .map_err(|e| Error::internal_error().data(e.to_string()))?;
-            let transport = SseClientTransport::start_with_client(
-                client,
-                SseClientConfig {
-                    sse_endpoint: url.into(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| {
-                Error::from(AgentError::McpServerFailed {
-                    transport: "sse".to_string(),
-                    reason: e.to_string(),
-                })
-            })?;
-            let handler = crate::elicitation::McpClientHandler::new(
-                pending_elicitations,
-                event_sink,
-                name.clone(),
-                session_id,
-                client_impl.clone(),
-                tool_state.clone(),
-            );
-            let running = serve_client(handler, transport).await.map_err(|e| {
-                Error::from(AgentError::McpServerFailed {
-                    transport: "sse".to_string(),
                     reason: e.to_string(),
                 })
             })?;

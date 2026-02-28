@@ -2,9 +2,7 @@
 //!
 //! Supports both single-agent and multi-agent (quorum) configurations from TOML files.
 
-use agent_client_protocol::{
-    EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
-};
+use agent_client_protocol::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerStdio};
 use anyhow::{Context, Result, anyhow};
 use regex::{Captures, Regex};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -877,13 +875,6 @@ pub enum McpServerConfig {
         #[serde(default)]
         headers: HashMap<String, String>,
     },
-    #[serde(rename_all = "snake_case")]
-    Sse {
-        name: String,
-        url: String,
-        #[serde(default)]
-        headers: HashMap<String, String>,
-    },
 }
 
 impl McpServerConfig {
@@ -892,7 +883,6 @@ impl McpServerConfig {
         match self {
             McpServerConfig::Stdio { name, .. } => name,
             McpServerConfig::Http { name, .. } => name,
-            McpServerConfig::Sse { name, .. } => name,
         }
     }
 
@@ -923,15 +913,6 @@ impl McpServerConfig {
                 );
                 McpServer::Http(server)
             }
-            McpServerConfig::Sse { name, url, headers } => {
-                let server = McpServerSse::new(name.clone(), url.clone()).headers(
-                    headers
-                        .iter()
-                        .map(|(k, v)| HttpHeader::new(k.clone(), v.clone()))
-                        .collect(),
-                );
-                McpServer::Sse(server)
-            }
         }
     }
 
@@ -949,15 +930,6 @@ impl McpServerConfig {
                     .collect(),
             },
             McpServer::Http(s) => McpServerConfig::Http {
-                name: s.name.clone(),
-                url: s.url.clone(),
-                headers: s
-                    .headers
-                    .iter()
-                    .map(|h| (h.name.clone(), h.value.clone()))
-                    .collect(),
-            },
-            McpServer::Sse(s) => McpServerConfig::Sse {
                 name: s.name.clone(),
                 url: s.url.clone(),
                 headers: s

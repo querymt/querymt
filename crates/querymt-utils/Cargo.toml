@@ -37,5 +37,5 @@ serde = { workspace = true, optional = true }
 anyhow = { version = "1.0", optional = true }
 url = { workspace = true, optional = true }
 tokio = { version = "1.0", features = ["time"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 dirs = { workspace = true, optional = true }
