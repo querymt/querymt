@@ -220,7 +220,11 @@ mod event_relay_mesh_tests {
         let f = AgentConfigFixture::new().await;
         let session_id = format!("s-f4-{}", test_id);
 
-        let runtime = SessionRuntime::new(None, HashMap::new(), HashMap::new(), Vec::new());
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
         let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
             .with_mesh(Some(mesh.clone()));
         let session_ref_local = SessionActor::spawn(actor);
@@ -308,7 +312,11 @@ mod event_relay_mesh_tests {
         let f = AgentConfigFixture::new().await;
         let session_id = format!("s-f5-{}", test_id);
 
-        let runtime = SessionRuntime::new(None, HashMap::new(), HashMap::new(), Vec::new());
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
         let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
             .with_mesh(Some(mesh.clone()));
         let session_ref_local = SessionActor::spawn(actor);
@@ -335,7 +343,11 @@ mod event_relay_mesh_tests {
         let f = AgentConfigFixture::new().await;
         let session_id = format!("s-f6-{}", test_id);
 
-        let runtime = SessionRuntime::new(None, HashMap::new(), HashMap::new(), Vec::new());
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
         let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
             .with_mesh(Some(mesh.clone()));
         let session_ref_local = SessionActor::spawn(actor);

@@ -300,8 +300,7 @@ impl TestHarness {
         let session_runtime = crate::agent::core::SessionRuntime::new(
             None,
             HashMap::new(),
-            HashMap::new(),
-            Vec::new(),
+            crate::agent::core::McpToolState::empty(),
         );
 
         let session_id = "sess-test".to_string();

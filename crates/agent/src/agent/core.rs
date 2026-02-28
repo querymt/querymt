@@ -3,7 +3,7 @@
 use agent_client_protocol::{ClientCapabilities, Implementation, ProtocolVersion};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use tokio::sync::OnceCell;
 
 /// Runtime operating mode for the agent.
@@ -97,6 +97,42 @@ pub struct ClientState {
     pub authenticated: bool,
 }
 
+/// Shared, live MCP tool state for a session.
+///
+/// Holds the tool maps and change-detection hash behind interior-mutability
+/// locks so that `McpClientHandler::on_tool_list_changed` can refresh them
+/// at any time without requiring exclusive ownership of `SessionRuntime`.
+///
+/// `tools` and `tool_defs` use `std::sync::RwLock` because all read paths are
+/// synchronous (no `.await` while the lock is held) and writes only occur on
+/// `tools/list_changed` notifications (rare).  `tools_hash` reuses the
+/// `Mutex` pattern already established by other `SessionRuntime` fields.
+pub struct McpToolState {
+    pub tools: RwLock<HashMap<String, Arc<querymt::mcp::adapter::McpToolAdapter>>>,
+    pub tool_defs: RwLock<Vec<querymt::chat::Tool>>,
+    /// Hash of the currently available tool set used for change detection.
+    /// Cleared by `McpClientHandler::on_tool_list_changed` so the next turn
+    /// unconditionally re-emits a `ToolsAvailable` event.
+    pub tools_hash: StdMutex<Option<crate::hash::RapidHash>>,
+}
+
+impl McpToolState {
+    pub fn new(
+        tools: HashMap<String, Arc<querymt::mcp::adapter::McpToolAdapter>>,
+        tool_defs: Vec<querymt::chat::Tool>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            tools: RwLock::new(tools),
+            tool_defs: RwLock::new(tool_defs),
+            tools_hash: StdMutex::new(None),
+        })
+    }
+
+    pub fn empty() -> Arc<Self> {
+        Self::new(HashMap::new(), Vec::new())
+    }
+}
+
 /// Type alias for the in-flight pre-turn snapshot task handle.
 type PreTurnSnapshotTask =
     StdMutex<Option<tokio::task::JoinHandle<(String, Result<String, String>)>>>;
@@ -106,13 +142,12 @@ pub struct SessionRuntime {
     pub cwd: Option<std::path::PathBuf>,
     pub _mcp_services: HashMap<
         String,
-        rmcp::service::RunningService<rmcp::RoleClient, crate::elicitation::ElicitationHandler>,
+        rmcp::service::RunningService<rmcp::RoleClient, crate::elicitation::McpClientHandler>,
     >,
-    pub mcp_tools: HashMap<String, Arc<querymt::mcp::adapter::McpToolAdapter>>,
-    pub mcp_tool_defs: Vec<querymt::chat::Tool>,
+    /// Live MCP tool state — refreshed in-place when a server sends
+    /// `tools/list_changed`.
+    pub mcp_tool_state: Arc<McpToolState>,
     pub permission_cache: StdMutex<HashMap<String, bool>>,
-    /// Hash of currently available tools (for change detection)
-    pub current_tools_hash: StdMutex<Option<crate::hash::RapidHash>>,
     /// Workspace handle for duplicate code detection (built asynchronously on session start)
     pub workspace_handle: Arc<OnceCell<crate::index::WorkspaceHandle>>,
     /// Turn snapshot: (turn_id, snapshot_id) taken at the start of the turn for undo/redo
@@ -140,18 +175,15 @@ impl SessionRuntime {
         cwd: Option<std::path::PathBuf>,
         mcp_services: HashMap<
             String,
-            rmcp::service::RunningService<rmcp::RoleClient, crate::elicitation::ElicitationHandler>,
+            rmcp::service::RunningService<rmcp::RoleClient, crate::elicitation::McpClientHandler>,
         >,
-        mcp_tools: HashMap<String, Arc<querymt::mcp::adapter::McpToolAdapter>>,
-        mcp_tool_defs: Vec<querymt::chat::Tool>,
+        mcp_tool_state: Arc<McpToolState>,
     ) -> Arc<Self> {
         Arc::new(Self {
             cwd,
             _mcp_services: mcp_services,
-            mcp_tools,
-            mcp_tool_defs,
+            mcp_tool_state,
             permission_cache: StdMutex::new(HashMap::new()),
-            current_tools_hash: StdMutex::new(None),
             workspace_handle: Arc::new(OnceCell::new()),
             turn_snapshot: StdMutex::new(None),
             pre_turn_snapshot_task: StdMutex::new(None),

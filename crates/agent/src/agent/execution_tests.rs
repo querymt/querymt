@@ -170,19 +170,11 @@ impl TestHarness {
         );
 
         // Create a SessionRuntime for the execution context
-        let session_runtime = Arc::new(crate::agent::core::SessionRuntime {
-            cwd: None,
-            _mcp_services: HashMap::new(),
-            mcp_tools: HashMap::new(),
-            mcp_tool_defs: Vec::new(),
-            permission_cache: StdMutex::new(HashMap::new()),
-            current_tools_hash: StdMutex::new(None),
-            workspace_handle: Arc::new(tokio::sync::OnceCell::new()),
-            turn_snapshot: StdMutex::new(None),
-            pre_turn_snapshot_task: StdMutex::new(None),
-            turn_diffs: StdMutex::new(Default::default()),
-            execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
+        let session_runtime = crate::agent::core::SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
 
         let exec_ctx = ExecutionContext::new(
             session_id.clone(),

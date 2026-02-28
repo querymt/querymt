@@ -68,7 +68,7 @@ pub(super) async fn transition_before_llm_call(
         serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
     let new_hash = crate::hash::RapidHash::new(&tools_json);
 
-    let mut current = exec_ctx.runtime.current_tools_hash.lock().unwrap();
+    let mut current = exec_ctx.runtime.mcp_tool_state.tools_hash.lock().unwrap();
     let changed = current.is_none_or(|h| h != new_hash);
     if changed {
         *current = Some(new_hash);

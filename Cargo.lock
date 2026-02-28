@@ -9778,6 +9778,7 @@ dependencies = [
  "grep",
  "grep-regex",
  "grep-searcher",
+ "iana-time-zone",
  "ignore",
  "indexmap 2.13.0",
  "infer 0.16.0",

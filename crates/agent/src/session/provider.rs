@@ -235,12 +235,27 @@ impl SessionProvider {
         // Resolve session-specific template variables (cwd, datetime, …) in
         // system prompt strings before writing the config to the database.
         let resolved_config = {
-            let ctx = crate::template::SessionTemplateContext::build(
-                cwd.as_deref(),
-                self.initial_config.provider.as_deref(),
-                self.initial_config.model.as_deref(),
-                self.agent_id.as_deref(),
-            );
+            let mut builder = crate::template::SessionTemplateContext::builder();
+            if let Some(ref p) = cwd {
+                builder = builder.cwd(p);
+            }
+            if let Some(ref p) = self.initial_config.provider {
+                builder = builder.provider(p.as_str());
+            }
+            if let Some(ref m) = self.initial_config.model {
+                builder = builder.model(m.as_str());
+            }
+            if let Some(ref id) = self.agent_id {
+                builder = builder.agent_id(id.as_str());
+            }
+            #[cfg(feature = "remote")]
+            {
+                let mesh_guard = self.mesh.lock().unwrap_or_else(|e| e.into_inner());
+                if mesh_guard.is_some() {
+                    builder = builder.has_mesh(true);
+                }
+            }
+            let ctx = builder.build();
             ctx.resolve_params(&self.initial_config).map_err(|e| {
                 SessionError::InvalidOperation(format!(
                     "Failed to resolve system prompt templates: {e}"

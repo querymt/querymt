@@ -56,7 +56,11 @@ async fn test_agent_config() -> (Arc<AgentConfig>, TempDir) {
 
 /// Spawn a `SessionActor` with default runtime and return a `SessionActorRef::Local`.
 fn spawn_test_session(config: Arc<AgentConfig>, session_id: &str) -> SessionActorRef {
-    let runtime = SessionRuntime::new(None, HashMap::new(), HashMap::new(), Vec::new());
+    let runtime = SessionRuntime::new(
+        None,
+        HashMap::new(),
+        crate::agent::core::McpToolState::empty(),
+    );
     let actor = SessionActor::new(config, session_id.to_string(), runtime);
     let actor_ref = SessionActor::spawn(actor);
     SessionActorRef::Local(actor_ref)
@@ -792,7 +796,11 @@ mod node_manager_tests {
 #[tokio::test]
 async fn test_from_actor_ref_into_local() {
     let (config, _td) = test_agent_config().await;
-    let runtime = SessionRuntime::new(None, HashMap::new(), HashMap::new(), Vec::new());
+    let runtime = SessionRuntime::new(
+        None,
+        HashMap::new(),
+        crate::agent::core::McpToolState::empty(),
+    );
     let actor = SessionActor::new(config, "from-test".to_string(), runtime);
     let actor_ref = SessionActor::spawn(actor);
 
@@ -838,7 +846,11 @@ async fn test_registry_get_returns_working_ref() {
 #[tokio::test]
 async fn test_registry_insert_via_actor_ref() {
     let (config, _td) = test_agent_config().await;
-    let runtime = SessionRuntime::new(None, HashMap::new(), HashMap::new(), Vec::new());
+    let runtime = SessionRuntime::new(
+        None,
+        HashMap::new(),
+        crate::agent::core::McpToolState::empty(),
+    );
     let actor = SessionActor::new(config.clone(), "raw-actor".to_string(), runtime);
     let actor_ref = SessionActor::spawn(actor);
 

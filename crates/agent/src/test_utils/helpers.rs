@@ -251,8 +251,7 @@ impl UndoTestFixture {
         let runtime = crate::agent::core::SessionRuntime::new(
             Some(self.worktree.path().to_path_buf()),
             std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            vec![],
+            crate::agent::core::McpToolState::empty(),
         );
 
         let actor = SessionActor::new(self.handle.config.clone(), session_id.to_string(), runtime);

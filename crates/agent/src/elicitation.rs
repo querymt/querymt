@@ -12,7 +12,7 @@ use rmcp::model::{
     ClientCapabilities, ClientInfo, CreateElicitationRequestParam, CreateElicitationResult,
     Implementation, ProtocolVersion,
 };
-use rmcp::service::RequestContext;
+use rmcp::service::{NotificationContext, RequestContext};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -109,23 +109,32 @@ async fn take_from_pending_map(
     pending.remove(elicitation_id)
 }
 
-/// MCP client handler that routes elicitation requests through the agent's event system.
-/// This replaces `()` as the handler in `serve_client()`.
-pub struct ElicitationHandler {
+/// MCP client handler — the single `ClientHandler` impl used for all MCP server
+/// connections established by the agent.
+///
+/// Responsibilities:
+/// - **Elicitation**: routes `create_elicitation` server requests through the
+///   agent event system so the UI/ACP client can respond interactively.
+/// - **Tool-list refresh**: on `tools/list_changed` notifications, re-fetches
+///   the updated tool list from the server and atomically updates the session's
+///   [`McpToolState`][crate::agent::core::McpToolState].
+pub struct McpClientHandler {
     pending: PendingElicitationMap,
     event_sink: Arc<crate::event_sink::EventSink>,
     server_name: String,
     session_id: String,
     client_impl: Implementation,
+    tool_state: Arc<crate::agent::core::McpToolState>,
 }
 
-impl ElicitationHandler {
+impl McpClientHandler {
     pub fn new(
         pending: PendingElicitationMap,
         event_sink: Arc<crate::event_sink::EventSink>,
         server_name: String,
         session_id: String,
         client_impl: Implementation,
+        tool_state: Arc<crate::agent::core::McpToolState>,
     ) -> Self {
         Self {
             pending,
@@ -133,11 +142,12 @@ impl ElicitationHandler {
             server_name,
             session_id,
             client_impl,
+            tool_state,
         }
     }
 }
 
-impl ClientHandler for ElicitationHandler {
+impl ClientHandler for McpClientHandler {
     #[allow(clippy::manual_async_fn)]
     fn create_elicitation(
         &self,
@@ -196,6 +206,83 @@ impl ClientHandler for ElicitationHandler {
             protocol_version: ProtocolVersion::default(),
             capabilities: ClientCapabilities::default(),
             client_info: self.client_impl.clone(),
+        }
+    }
+
+    async fn on_tool_list_changed(&self, context: NotificationContext<RoleClient>) -> () {
+        use querymt::mcp::adapter::McpToolAdapter;
+        use querymt::tool_decorator::CallFunctionTool;
+
+        let peer = context.peer;
+        match peer.list_all_tools().await {
+            Ok(new_tool_list) => {
+                let mut new_tools = std::collections::HashMap::new();
+                let mut new_defs = Vec::new();
+
+                // Retain tools belonging to other servers.
+                {
+                    let current_tools = self.tool_state.tools.read().unwrap();
+                    let current_defs = self.tool_state.tool_defs.read().unwrap();
+                    for (name, adapter) in current_tools.iter() {
+                        if adapter.server_name() != self.server_name {
+                            new_tools.insert(name.clone(), adapter.clone());
+                        }
+                    }
+                    for def in current_defs.iter() {
+                        if let Some(adapter) = current_tools.get(&def.function.name)
+                            && adapter.server_name() != self.server_name
+                        {
+                            new_defs.push(def.clone());
+                        }
+                    }
+                }
+
+                // Add the refreshed tools from this server.
+                for tool in new_tool_list {
+                    match McpToolAdapter::try_new(tool, peer.clone(), self.server_name.clone()) {
+                        Ok(adapter) => {
+                            let name = adapter.descriptor().function.name.clone();
+                            if new_tools.contains_key(&name) {
+                                log::warn!(
+                                    "Duplicate MCP tool '{}' after refresh of '{}', keeping first",
+                                    name,
+                                    self.server_name,
+                                );
+                                continue;
+                            }
+                            new_defs.push(adapter.descriptor());
+                            new_tools.insert(name, Arc::new(adapter));
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to adapt refreshed tool from '{}': {}",
+                                self.server_name,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // Swap atomically (two separate locks — see module-level note on ordering).
+                *self.tool_state.tools.write().unwrap() = new_tools;
+                *self.tool_state.tool_defs.write().unwrap() = new_defs;
+                // Clear hash so the next turn unconditionally re-emits ToolsAvailable.
+                *self.tool_state.tools_hash.lock().unwrap() = None;
+
+                log::info!(
+                    "session={} server='{}': MCP tool list refreshed",
+                    self.session_id,
+                    self.server_name,
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "session={} server='{}': failed to refresh tool list: {}",
+                    self.session_id,
+                    self.server_name,
+                    e,
+                );
+            }
         }
     }
 }

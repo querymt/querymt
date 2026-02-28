@@ -97,8 +97,7 @@ async fn test_undo_handler_single_agent() -> Result<()> {
         let runtime = SessionRuntime::new(
             Some(worktree.path().to_path_buf()),
             std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            vec![],
+            crate::agent::core::McpToolState::empty(),
         );
         let actor = crate::agent::session_actor::SessionActor::new(
             config.clone(),
@@ -329,8 +328,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
         let runtime = SessionRuntime::new(
             Some(worktree.path().to_path_buf()),
             std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            vec![],
+            crate::agent::core::McpToolState::empty(),
         );
         let mut registry = handle.registry.lock().await;
 

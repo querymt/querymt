@@ -268,8 +268,7 @@ mod remote_impl {
             let runtime = SessionRuntime::new(
                 cwd_path.clone(),
                 HashMap::new(), // mcp_services
-                HashMap::new(), // mcp_tools
-                Vec::new(),     // mcp_tool_defs
+                crate::agent::core::McpToolState::empty(),
             );
 
             // Spawn the session actor, giving it access to the mesh handle so its

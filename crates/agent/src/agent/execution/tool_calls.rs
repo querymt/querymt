@@ -151,11 +151,18 @@ pub(super) async fn execute_tool_call(
     // mutations (SetAllowedTools / SetDeniedTools) are respected. Also look up
     // the MCP server name so that "servername.*" wildcard entries in the
     // allowlist correctly permit MCP tools (e.g. "context7.*" → "resolve-library-id").
-    let mcp_server_name: Option<String> = exec_ctx
-        .runtime
-        .mcp_tools
-        .get(&call.function.name)
-        .map(|a| a.server_name().to_owned());
+    //
+    // Both lookups are in a separate block so the RwLockReadGuard is dropped
+    // before any `.await` — std::sync::RwLockReadGuard is not Send.
+    let (mcp_server_name, mcp_tool) = {
+        let tools = exec_ctx.runtime.mcp_tool_state.tools.read().unwrap();
+        let server_name = tools
+            .get(&call.function.name)
+            .map(|a| a.server_name().to_owned());
+        let tool = tools.get(&call.function.name).cloned();
+        (server_name, tool)
+    };
+
     let (raw_result_json, is_error, tool_source) = if !crate::agent::tools::is_mcp_tool_allowed_with(
         &exec_ctx.tool_config,
         &call.function.name,
@@ -180,7 +187,7 @@ pub(super) async fn execute_tool_call(
             Ok(res) => (res, false, "builtin"),
             Err(e) => (format!("Error: {}", e), true, "builtin"),
         }
-    } else if let Some(tool) = exec_ctx.runtime.mcp_tools.get(&call.function.name) {
+    } else if let Some(tool) = mcp_tool {
         use querymt::tool_decorator::CallFunctionTool;
         match tool
             .call(args.clone())

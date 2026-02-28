@@ -1,4 +1,5 @@
 //! Agent Client Protocol helper functions for MCP server management
+use crate::agent::core::McpToolState;
 use crate::error::AgentError;
 use agent_client_protocol::{Error, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
 use log::warn;
@@ -16,24 +17,23 @@ use rmcp::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Builds MCP state by connecting to configured servers and returns:
-/// - RunningService instances (must be kept alive to maintain connections)
-/// - McpToolAdapter instances (for tool execution)
-/// - Tool definitions (for LLM)
+/// Builds MCP state by connecting to configured servers.
+///
+/// Populates `tool_state` with the initial tool list fetched from each server.
+/// Each [`McpClientHandler`][crate::elicitation::McpClientHandler] created here
+/// holds a clone of `tool_state` so it can refresh the maps live when the server
+/// sends a `tools/list_changed` notification.
+///
+/// Returns the `RunningService` map (must be kept alive to maintain connections).
 pub(crate) async fn build_mcp_state(
     servers: &[McpServer],
     pending_elicitations: crate::elicitation::PendingElicitationMap,
     event_sink: Arc<crate::event_sink::EventSink>,
     session_id: String,
     client_impl: &Implementation,
-) -> Result<
-    (
-        HashMap<String, RunningService<RoleClient, crate::elicitation::ElicitationHandler>>,
-        HashMap<String, Arc<querymt::mcp::adapter::McpToolAdapter>>,
-        Vec<querymt::chat::Tool>,
-    ),
-    Error,
-> {
+    tool_state: Arc<McpToolState>,
+) -> Result<HashMap<String, RunningService<RoleClient, crate::elicitation::McpClientHandler>>, Error>
+{
     let mut clients = HashMap::new();
     let mut tools = HashMap::new();
     let mut tool_defs = Vec::new();
@@ -41,13 +41,14 @@ pub(crate) async fn build_mcp_state(
     for server in servers {
         let (server_name, running): (
             String,
-            RunningService<RoleClient, crate::elicitation::ElicitationHandler>,
+            RunningService<RoleClient, crate::elicitation::McpClientHandler>,
         ) = start_mcp_server(
             server,
             pending_elicitations.clone(),
             event_sink.clone(),
             session_id.clone(),
             client_impl,
+            tool_state.clone(),
         )
         .await?;
         let peer = running.peer().clone();
@@ -74,20 +75,25 @@ pub(crate) async fn build_mcp_state(
         clients.insert(server_name, running);
     }
 
-    Ok((clients, tools, tool_defs))
+    // Populate the shared tool state with the initial tool list.
+    *tool_state.tools.write().unwrap() = tools;
+    *tool_state.tool_defs.write().unwrap() = tool_defs;
+
+    Ok(clients)
 }
 
-/// Starts an MCP server based on its configuration
+/// Starts an MCP server based on its configuration.
 async fn start_mcp_server(
     server: &McpServer,
     pending_elicitations: crate::elicitation::PendingElicitationMap,
     event_sink: Arc<crate::event_sink::EventSink>,
     session_id: String,
     client_impl: &Implementation,
+    tool_state: Arc<McpToolState>,
 ) -> Result<
     (
         String,
-        RunningService<RoleClient, crate::elicitation::ElicitationHandler>,
+        RunningService<RoleClient, crate::elicitation::McpClientHandler>,
     ),
     Error,
 > {
@@ -108,14 +114,15 @@ async fn start_mcp_server(
                 .stdin(std::process::Stdio::piped());
             let transport = TokioChildProcess::new(cmd)
                 .map_err(|e| Error::internal_error().data(e.to_string()))?;
-            let handler = crate::elicitation::ElicitationHandler::new(
+            let handler = crate::elicitation::McpClientHandler::new(
                 pending_elicitations.clone(),
                 event_sink.clone(),
                 name.clone(),
                 session_id.clone(),
                 client_impl.clone(),
+                tool_state.clone(),
             );
-            let running: RunningService<RoleClient, crate::elicitation::ElicitationHandler> =
+            let running: RunningService<RoleClient, crate::elicitation::McpClientHandler> =
                 serve_client(handler, transport).await.map_err(|e| {
                     Error::from(AgentError::McpServerFailed {
                         transport: "stdio".to_string(),
@@ -136,12 +143,13 @@ async fn start_mcp_server(
                 client,
                 StreamableHttpClientTransportConfig::with_uri(url),
             );
-            let handler = crate::elicitation::ElicitationHandler::new(
+            let handler = crate::elicitation::McpClientHandler::new(
                 pending_elicitations.clone(),
                 event_sink.clone(),
                 name.clone(),
                 session_id.clone(),
                 client_impl.clone(),
+                tool_state.clone(),
             );
             let running = serve_client(handler, transport).await.map_err(|e| {
                 Error::from(AgentError::McpServerFailed {
@@ -173,12 +181,13 @@ async fn start_mcp_server(
                     reason: e.to_string(),
                 })
             })?;
-            let handler = crate::elicitation::ElicitationHandler::new(
+            let handler = crate::elicitation::McpClientHandler::new(
                 pending_elicitations,
                 event_sink,
                 name.clone(),
                 session_id,
                 client_impl.clone(),
+                tool_state.clone(),
             );
             let running = serve_client(handler, transport).await.map_err(|e| {
                 Error::from(AgentError::McpServerFailed {

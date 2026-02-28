@@ -1513,8 +1513,7 @@ mod tests {
             let runtime = crate::agent::core::SessionRuntime::new(
                 None,
                 HashMap::new(),
-                HashMap::new(),
-                vec![],
+                crate::agent::core::McpToolState::empty(),
             );
             let actor = SessionActor::new(config.clone(), session_id.to_string(), runtime);
             let actor_ref = SessionActor::spawn(actor);

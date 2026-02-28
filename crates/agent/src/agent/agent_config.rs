@@ -303,7 +303,7 @@ impl AgentConfig {
             if let (Some(runtime), ToolPolicy::ProviderOnly | ToolPolicy::BuiltInAndProvider) =
                 (runtime, config.policy)
             {
-                runtime.mcp_tool_defs.to_vec()
+                runtime.mcp_tool_state.tool_defs.read().unwrap().clone()
             } else {
                 vec![]
             };
@@ -317,9 +317,9 @@ impl AgentConfig {
         // Filter MCP tools with the server-name-aware check so that
         // "servername.*" wildcard entries in the allowlist are honoured.
         if let Some(runtime) = runtime {
+            let mcp_tools = runtime.mcp_tool_state.tools.read().unwrap();
             for tool_def in mcp_tool_defs {
-                let server_name = runtime
-                    .mcp_tools
+                let server_name = mcp_tools
                     .get(&tool_def.function.name)
                     .map(|a| a.server_name());
                 if crate::agent::tools::is_mcp_tool_allowed_with(

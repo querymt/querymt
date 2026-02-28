@@ -129,7 +129,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn make_runtime(cwd: Option<PathBuf>) -> Arc<SessionRuntime> {
-        SessionRuntime::new(cwd, HashMap::new(), HashMap::new(), vec![])
+        SessionRuntime::new(
+            cwd,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        )
     }
 
     async fn make_context_parts() -> (Arc<SessionRuntime>, RuntimeContext, SessionHandle) {

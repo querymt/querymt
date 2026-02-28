@@ -275,7 +275,8 @@ impl SessionRegistry {
 
         // Build MCP state: merge config-level MCP servers with any client-supplied ones.
         let merged_mcp = self.merged_mcp_servers(&req.mcp_servers);
-        let (mcp_services, mcp_tools, mcp_tool_defs) = crate::agent::protocol::build_mcp_state(
+        let tool_state = crate::agent::core::McpToolState::empty();
+        let mcp_services = crate::agent::protocol::build_mcp_state(
             &merged_mcp,
             self.config.pending_elicitations(),
             self.config.event_sink.clone(),
@@ -287,6 +288,7 @@ impl SessionRegistry {
                 icons: None,
                 website_url: None,
             },
+            tool_state.clone(),
         )
         .await?;
 
@@ -300,7 +302,7 @@ impl SessionRegistry {
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
         }
 
-        let runtime = SessionRuntime::new(cwd.clone(), mcp_services, mcp_tools, mcp_tool_defs);
+        let runtime = SessionRuntime::new(cwd.clone(), mcp_services, tool_state);
 
         // Spawn the session actor
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone());
@@ -420,7 +422,8 @@ impl SessionRegistry {
         };
 
         let merged_mcp = self.merged_mcp_servers(&req.mcp_servers);
-        let (mcp_services, mcp_tools, mcp_tool_defs) = crate::agent::protocol::build_mcp_state(
+        let tool_state = crate::agent::core::McpToolState::empty();
+        let mcp_services = crate::agent::protocol::build_mcp_state(
             &merged_mcp,
             self.config.pending_elicitations(),
             self.config.event_sink.clone(),
@@ -432,10 +435,11 @@ impl SessionRegistry {
                 icons: None,
                 website_url: None,
             },
+            tool_state.clone(),
         )
         .await?;
 
-        let runtime = SessionRuntime::new(cwd, mcp_services, mcp_tools, mcp_tool_defs);
+        let runtime = SessionRuntime::new(cwd, mcp_services, tool_state);
 
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime);
         let actor_ref = SessionActor::spawn(actor);
@@ -568,7 +572,8 @@ impl SessionRegistry {
         };
 
         let merged_mcp = self.merged_mcp_servers(&req.mcp_servers);
-        let (mcp_services, mcp_tools, mcp_tool_defs) = crate::agent::protocol::build_mcp_state(
+        let tool_state = crate::agent::core::McpToolState::empty();
+        let mcp_services = crate::agent::protocol::build_mcp_state(
             &merged_mcp,
             self.config.pending_elicitations(),
             self.config.event_sink.clone(),
@@ -580,10 +585,11 @@ impl SessionRegistry {
                 icons: None,
                 website_url: None,
             },
+            tool_state.clone(),
         )
         .await?;
 
-        let runtime = SessionRuntime::new(cwd, mcp_services, mcp_tools, mcp_tool_defs);
+        let runtime = SessionRuntime::new(cwd, mcp_services, tool_state);
 
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime);
         let actor_ref = SessionActor::spawn(actor);
@@ -749,8 +755,7 @@ mod tests {
             let runtime = crate::agent::core::SessionRuntime::new(
                 None,
                 HashMap::new(),
-                HashMap::new(),
-                vec![],
+                crate::agent::core::McpToolState::empty(),
             );
             let actor = SessionActor::new(
                 self.registry.config.clone(),

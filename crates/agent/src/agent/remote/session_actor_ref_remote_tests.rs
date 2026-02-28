@@ -31,7 +31,11 @@ mod session_actor_ref_remote_tests {
         let test_id = Uuid::now_v7().to_string();
         let session_id = format!("remote-e-{}-{}", label, test_id);
 
-        let runtime = SessionRuntime::new(None, HashMap::new(), HashMap::new(), Vec::new());
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
         let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime);
         let local_ref = SessionActor::spawn(actor);
 
