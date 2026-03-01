@@ -78,13 +78,11 @@ impl SessionRegistry {
             let req_name = match req_server {
                 McpServer::Stdio(s) => s.name.as_str(),
                 McpServer::Http(s) => s.name.as_str(),
-                McpServer::Sse(s) => s.name.as_str(),
                 _ => continue,
             };
             if let Some(pos) = merged.iter().position(|s| match s {
                 McpServer::Stdio(cs) => cs.name == req_name,
                 McpServer::Http(cs) => cs.name == req_name,
-                McpServer::Sse(cs) => cs.name == req_name,
                 _ => false,
             }) {
                 merged[pos] = req_server.clone();
@@ -281,13 +279,7 @@ impl SessionRegistry {
             self.config.pending_elicitations(),
             self.config.event_sink.clone(),
             session_id.clone(),
-            &rmcp::model::Implementation {
-                name: "querymt-agent".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: None,
-                icons: None,
-                website_url: None,
-            },
+            &crate::agent::mcp::agent_implementation(),
             tool_state.clone(),
         )
         .await?;
@@ -428,13 +420,7 @@ impl SessionRegistry {
             self.config.pending_elicitations(),
             self.config.event_sink.clone(),
             session_id.clone(),
-            &rmcp::model::Implementation {
-                name: "querymt-agent".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: None,
-                icons: None,
-                website_url: None,
-            },
+            &crate::agent::mcp::agent_implementation(),
             tool_state.clone(),
         )
         .await?;
@@ -578,13 +564,7 @@ impl SessionRegistry {
             self.config.pending_elicitations(),
             self.config.event_sink.clone(),
             session_id.clone(),
-            &rmcp::model::Implementation {
-                name: "querymt-agent".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: None,
-                icons: None,
-                website_url: None,
-            },
+            &crate::agent::mcp::agent_implementation(),
             tool_state.clone(),
         )
         .await?;
@@ -1045,7 +1025,6 @@ mod tests {
             .map(|s| match s {
                 McpServer::Http(h) => h.name.as_str(),
                 McpServer::Stdio(s) => s.name.as_str(),
-                McpServer::Sse(s) => s.name.as_str(),
                 _ => "unknown",
             })
             .collect();

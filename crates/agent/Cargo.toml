@@ -39,7 +39,7 @@ tracing = { version = "0.1", features = ["attributes", "release_max_level_debug"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli", "deflate"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli", "deflate"] }
 rusqlite = { version = "0.37", features = ["bundled", "uuid", "time"] }
 time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
 uuid = { version = "1.18", features = ["v4", "v7"] }
@@ -60,7 +60,7 @@ moka = { version = "0.12", features = ["future"] }
 pathdiff = "0.2"
 patchkit = "0.2"
 gitpatch = "0.7"
-rmcp = { version = "0.9", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-sse-client-reqwest", "reqwest"] }
+rmcp = { version = "0.17", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "elicitation", "reqwest"] }
 axum = { version = "0.7", features = ["macros", "ws"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 rust-embed = { version = "8.6", features = ["axum"] }

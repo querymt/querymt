@@ -5,8 +5,7 @@ use rmcp::{
     model::{ClientCapabilities, ClientInfo, Implementation, ProtocolVersion},
     service::{DynService, RunningService},
     transport::{
-        sse_client::SseClientConfig, streamable_http_client::StreamableHttpClientTransportConfig,
-        SseClientTransport, StreamableHttpClientTransport,
+        streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
     },
     RoleClient, ServiceExt,
 };
@@ -33,10 +32,6 @@ pub enum McpServerTransportConfig {
         url: String,
         token: Option<String>,
     },
-    Sse {
-        url: String,
-        token: Option<String>,
-    },
     Stdio {
         command: String,
         #[serde(default)]
@@ -52,37 +47,12 @@ impl McpServerTransportConfig {
         client_impl: &Implementation,
     ) -> Result<RunningService<RoleClient, Box<dyn DynService<RoleClient>>>> {
         let client_info = ClientInfo {
+            meta: None,
             protocol_version: ProtocolVersion::default(),
             capabilities: ClientCapabilities::default(),
             client_info: client_impl.clone(),
         };
         let client = match self {
-            McpServerTransportConfig::Sse { url, token } => {
-                let transport = match token {
-                    Some(t) => {
-                        let mut default_headers = HeaderMap::new();
-                        default_headers.insert(
-                            AUTHORIZATION,
-                            HeaderValue::from_str(&format!("Bearer {t}"))?,
-                        );
-
-                        let client = reqwest::ClientBuilder::new()
-                            .default_headers(default_headers)
-                            .build()?;
-
-                        SseClientTransport::start_with_client(
-                            client,
-                            SseClientConfig {
-                                sse_endpoint: url.clone().into(),
-                                ..Default::default()
-                            },
-                        )
-                        .await?
-                    }
-                    None => SseClientTransport::start(url.as_str()).await?,
-                };
-                client_info.clone().into_dyn().serve(transport).await?
-            }
             McpServerTransportConfig::Http { url, token } => {
                 let transport = match token {
                     Some(t) => {

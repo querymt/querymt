@@ -31,7 +31,6 @@ pub fn get_mcp_server_name(server: &McpServer) -> &str {
     match server {
         McpServer::Stdio(stdio) => &stdio.name,
         McpServer::Http(http) => &http.name,
-        McpServer::Sse(sse) => &sse.name,
         _ => "unknown",
     }
 }
@@ -40,7 +39,6 @@ pub fn get_mcp_server_name(server: &McpServer) -> &str {
 pub fn get_mcp_server_url(server: &McpServer) -> Option<&str> {
     match server {
         McpServer::Http(http) => Some(&http.url),
-        McpServer::Sse(sse) => Some(&sse.url),
         _ => None,
     }
 }
@@ -49,12 +47,23 @@ pub fn get_mcp_server_url(server: &McpServer) -> Option<&str> {
 pub fn get_mcp_server_headers(server: &McpServer) -> &[HttpHeader] {
     match server {
         McpServer::Http(http) => &http.headers,
-        McpServer::Sse(sse) => &sse.headers,
         _ => &[],
     }
 }
 
 /// Checks if an MCP server configuration requires network access
 pub fn mcp_server_requires_network(server: &McpServer) -> bool {
-    matches!(server, McpServer::Http(_) | McpServer::Sse(_))
+    matches!(server, McpServer::Http(_))
+}
+
+/// Returns the standard `Implementation` descriptor for the querymt-agent.
+pub fn agent_implementation() -> rmcp::model::Implementation {
+    rmcp::model::Implementation {
+        name: "querymt-agent".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        description: None,
+        title: None,
+        icons: None,
+        website_url: None,
+    }
 }

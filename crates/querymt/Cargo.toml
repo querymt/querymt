@@ -34,7 +34,7 @@ either.workspace = true
 url.workspace = true
 http.workspace = true
 libloading = { version = "0.8", optional = true}
-rmcp = { version = "0.9", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-sse-client-reqwest"], optional = true }
+rmcp = { version = "0.17", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"], optional = true }
 toml = { version = "0.9", optional = true}
 thiserror = "1.0"
 extism = { version = "1.11", optional = true}
@@ -57,7 +57,7 @@ bytes = "1.10"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.0", features = ["full"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true}
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true}
 once_cell = { version = "1.21.3", optional = true}
 
 #[target.'cfg(target_arch = "wasm32")'.dependencies]
