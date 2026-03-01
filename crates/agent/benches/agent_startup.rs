@@ -77,10 +77,11 @@ fn make_bench_config(provider: &str, model: &str) -> String {
 }
 
 fn extract_handle(runner: &AgentRunner) -> Arc<dyn AgentHandle> {
-    match runner {
-        AgentRunner::Single(agent) => agent.handle(),
-        AgentRunner::Multi(_) => panic!("expected single-agent config in benchmark"),
-    }
+    assert!(
+        !runner.is_multi(),
+        "expected single-agent config in benchmark"
+    );
+    runner.handle()
 }
 
 fn create_bench_cases(rt: &Runtime) -> Vec<BenchCase> {

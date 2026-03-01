@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 ///
 /// For rare agent-wide config changes (e.g., updating tool policy across all sessions),
 /// the server layer broadcasts messages to all active session actors.
+#[derive(Clone)]
 pub struct AgentConfig {
     // ── Infrastructure (Arc, thread-safe) ────────────────────────
     pub provider: Arc<SessionProvider>,
@@ -71,6 +72,15 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
+    /// Create a copy with `middleware_drivers` replaced.
+    ///
+    /// Used by `AgentBuilder::build()` to swap in the final middleware chain
+    /// without manually cloning every field.
+    pub(crate) fn with_middleware(mut self, drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
+        self.middleware_drivers = drivers;
+        self
+    }
+
     /// Creates a `CompositeDriver` from the configured middleware drivers.
     pub fn create_driver(&self) -> CompositeDriver {
         use crate::middleware::{LimitsConfig, LimitsMiddleware};
