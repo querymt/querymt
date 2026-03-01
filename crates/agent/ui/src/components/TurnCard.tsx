@@ -310,6 +310,66 @@ export const TurnCard = memo(function TurnCard({
             borderLeftColor: agentColor || 'rgb(var(--agent-accent-1-rgb))',
           }}
         >
+          {/* Pending undo state (top stack frame awaiting confirmation) */}
+          {isUndoPending && !isUndone && (
+            <div className="mb-3 rounded-lg border border-status-warning/35 bg-status-warning/10 px-4 py-3 text-center">
+              <h3 className="text-lg font-semibold text-status-warning mb-1">Undoing Changes...</h3>
+              <p className="text-sm text-ui-secondary">Waiting for filesystem snapshot restore to finish.</p>
+            </div>
+          )}
+
+          {/* Undone state (top stack frame) */}
+          {isUndone && (
+            <div className="mb-3 rounded-lg border border-status-warning/35 bg-surface-canvas/75 p-4">
+              <div className="max-w-md w-full mx-auto space-y-4">
+                <div className="text-center">
+                  <h3 className="text-lg font-semibold text-status-warning mb-2">Changes Undone</h3>
+                  <p className="text-sm text-ui-secondary">
+                    {revertedFiles.length > 0
+                      ? `${revertedFiles.length} file${revertedFiles.length !== 1 ? 's' : ''} reverted`
+                      : 'No filesystem changes were made in this turn'}
+                  </p>
+                </div>
+
+                {/* File list - only show if there are files */}
+                {revertedFiles.length > 0 && (
+                  <div className="bg-surface-elevated/60 border border-surface-border/40 rounded-lg p-3 max-h-40 overflow-y-auto">
+                    <div className="space-y-1">
+                      {revertedFiles.slice(0, 5).map((file, idx) => (
+                        <div key={idx} className="text-xs text-ui-secondary font-mono truncate" title={file}>
+                          {file}
+                        </div>
+                      ))}
+                      {revertedFiles.length > 5 && (
+                        <div className="text-xs text-ui-muted italic">
+                          +{revertedFiles.length - 5} more file{revertedFiles.length - 5 !== 1 ? 's' : ''}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Redo button */}
+                {onRedo && (
+                  <button
+                    onClick={onRedo}
+                    className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-accent-primary/10 border border-accent-primary/40 text-accent-primary hover:bg-accent-primary/20 hover:border-accent-primary transition-colors"
+                  >
+                    <Redo2 className="w-4 h-4" />
+                    <span className="text-sm font-medium">Redo Changes</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Stacked undo placeholder (older undone frames) */}
+          {isStackedUndone && !isUndone && (
+            <div className="mb-3 px-3 py-2 rounded-md bg-status-warning/10 border border-status-warning/30 text-xs text-status-warning text-center">
+              Undone in stack. Redo newer undo first.
+            </div>
+          )}
+
           {/* Interleaved content: messages and activities in chronological order */}
           {interleaved.length > 0 ? (
             <div className="space-y-3">
@@ -388,70 +448,6 @@ export const TurnCard = memo(function TurnCard({
           ) : turn.isActive ? (
             <div className="text-sm text-ui-muted italic">Working...</div>
           ) : null}
-
-          {/* Pending undo overlay (top stack frame awaiting confirmation) */}
-          {isUndoPending && !isUndone && (
-            <div className="absolute inset-0 bg-surface-canvas/90 backdrop-blur-sm rounded-lg flex items-center justify-center p-6">
-              <div className="max-w-md w-full text-center">
-                <h3 className="text-lg font-semibold text-status-warning mb-2">Undoing Changes...</h3>
-                <p className="text-sm text-ui-secondary">Waiting for filesystem snapshot restore to finish.</p>
-              </div>
-            </div>
-          )}
-
-          {/* Undone state overlay (top stack frame) */}
-          {isUndone && (
-            <div className="absolute inset-0 bg-surface-canvas/90 backdrop-blur-sm rounded-lg flex items-center justify-center p-6">
-              <div className="max-w-md w-full space-y-4">
-                <div className="text-center">
-                  <h3 className="text-lg font-semibold text-status-warning mb-2">Changes Undone</h3>
-                  <p className="text-sm text-ui-secondary">
-                    {revertedFiles.length > 0
-                      ? `${revertedFiles.length} file${revertedFiles.length !== 1 ? 's' : ''} reverted`
-                      : 'No filesystem changes were made in this turn'}
-                  </p>
-                </div>
-
-                {/* File list - only show if there are files */}
-                {revertedFiles.length > 0 && (
-                  <div className="bg-surface-elevated/60 border border-surface-border/40 rounded-lg p-3 max-h-40 overflow-y-auto">
-                    <div className="space-y-1">
-                      {revertedFiles.slice(0, 5).map((file, idx) => (
-                        <div key={idx} className="text-xs text-ui-secondary font-mono truncate" title={file}>
-                          {file}
-                        </div>
-                      ))}
-                      {revertedFiles.length > 5 && (
-                        <div className="text-xs text-ui-muted italic">
-                          +{revertedFiles.length - 5} more file{revertedFiles.length - 5 !== 1 ? 's' : ''}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {/* Redo button */}
-                {onRedo && (
-                  <button
-                    onClick={onRedo}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-accent-primary/10 border border-accent-primary/40 text-accent-primary hover:bg-accent-primary/20 hover:border-accent-primary transition-colors"
-                  >
-                    <Redo2 className="w-4 h-4" />
-                    <span className="text-sm font-medium">Redo Changes</span>
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Stacked undo placeholder (older undone frames) */}
-          {isStackedUndone && !isUndone && (
-            <div className="absolute top-3 right-3 left-3 pointer-events-none">
-              <div className="px-3 py-2 rounded-md bg-status-warning/10 border border-status-warning/30 text-xs text-status-warning text-center">
-                Undone in stack. Redo newer undo first.
-              </div>
-            </div>
-          )}
         </div>
 
         {/* Turn actions - subtly visible, fully visible on hover */}
