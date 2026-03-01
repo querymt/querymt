@@ -56,6 +56,9 @@ pub use projection::{
 pub mod runtime;
 pub use runtime::{RuntimeContext, SessionForkHelper};
 
+// Retrieval foundation (FTS5 indexing + chunking)
+pub mod retrieval;
+
 // Tests
 #[cfg(test)]
 mod repo_tests;

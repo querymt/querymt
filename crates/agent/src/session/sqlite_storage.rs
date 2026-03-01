@@ -161,6 +161,74 @@ impl SqliteStorage {
     }
 }
 
+// ============================================================================
+// Retrieval (FTS5 index + search) — async wrappers
+// ============================================================================
+
+impl SqliteStorage {
+    /// Index content for later retrieval via FTS5 search.
+    ///
+    /// The content is automatically chunked (markdown-aware or plain-text)
+    /// and stored in the retrieval index.
+    pub async fn index_content(
+        &self,
+        session_id: &str,
+        source_label: &str,
+        content: &str,
+        chunk_config: &crate::session::retrieval::ChunkConfig,
+    ) -> SessionResult<i64> {
+        let session_id = session_id.to_string();
+        let source_label = source_label.to_string();
+        let content = content.to_string();
+        let config = chunk_config.clone();
+        self.run_blocking(move |conn| {
+            crate::session::retrieval::index_content(
+                conn,
+                &session_id,
+                &source_label,
+                &content,
+                &config,
+            )
+        })
+        .await
+    }
+
+    /// Search indexed content with optional source-label scoping.
+    ///
+    /// Returns up to `max_results` snippets ordered by relevance.
+    pub async fn search_indexed_content(
+        &self,
+        session_id: &str,
+        query: &str,
+        source_label_filter: Option<&str>,
+        max_results: usize,
+    ) -> SessionResult<Vec<crate::session::retrieval::RetrievalSnippet>> {
+        let session_id = session_id.to_string();
+        let query = query.to_string();
+        let source_label_filter = source_label_filter.map(|s| s.to_string());
+        self.run_blocking(move |conn| {
+            crate::session::retrieval::search_chunks(
+                conn,
+                &session_id,
+                &query,
+                source_label_filter.as_deref(),
+                max_results,
+            )
+        })
+        .await
+    }
+
+    /// List all indexed source labels and metadata for a session.
+    pub async fn list_indexed_sources(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Vec<crate::session::retrieval::SourceSummary>> {
+        let session_id = session_id.to_string();
+        self.run_blocking(move |conn| crate::session::retrieval::list_sources(conn, &session_id))
+            .await
+    }
+}
+
 #[async_trait]
 impl SessionStore for SqliteStorage {
     async fn create_session(
@@ -1393,6 +1461,40 @@ impl SessionStore for SqliteStorage {
         })
         .await
     }
+
+    async fn index_content(
+        &self,
+        session_id: &str,
+        source_label: &str,
+        content: &str,
+        chunk_config: &crate::session::retrieval::ChunkConfig,
+    ) -> SessionResult<i64> {
+        SqliteStorage::index_content(self, session_id, source_label, content, chunk_config).await
+    }
+
+    async fn search_indexed_content(
+        &self,
+        session_id: &str,
+        query: &str,
+        source_label_filter: Option<&str>,
+        max_results: usize,
+    ) -> SessionResult<Vec<crate::session::retrieval::RetrievalSnippet>> {
+        SqliteStorage::search_indexed_content(
+            self,
+            session_id,
+            query,
+            source_label_filter,
+            max_results,
+        )
+        .await
+    }
+
+    async fn list_indexed_sources(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Vec<crate::session::retrieval::SourceSummary>> {
+        SqliteStorage::list_indexed_sources(self, session_id).await
+    }
 }
 
 // ============================================================================
@@ -2194,6 +2296,10 @@ const MIGRATIONS: &[Migration] = &[
         version: "0002_drop_legacy_events",
         apply: migration_0002_drop_legacy_events,
     },
+    Migration {
+        version: "0003_retrieval_fts5",
+        apply: migration_0003_retrieval_fts5,
+    },
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -2273,6 +2379,14 @@ fn migration_0002_drop_legacy_events(conn: &mut Connection) -> Result<(), rusqli
     Ok(())
 }
 
+fn migration_0003_retrieval_fts5(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    // Add retrieval foundation tables: indexed_sources, indexed_chunks, and
+    // FTS5 virtual table for full-text search on chunk content.
+    // This is an additive migration — safe to run on existing DBs.
+    crate::session::retrieval::create_retrieval_tables(conn)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2290,6 +2404,42 @@ mod tests {
             )
             .expect("query migration version");
         assert_eq!(version, "0001_initial_reset");
+    }
+
+    #[test]
+    fn migration_0003_creates_retrieval_tables() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        apply_migrations(&mut conn).expect("apply migrations");
+
+        // Check indexed_sources table exists
+        let sources_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='indexed_sources'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check indexed_sources table");
+        assert_eq!(sources_count, 1, "indexed_sources table should exist");
+
+        // Check indexed_chunks table exists
+        let chunks_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='indexed_chunks'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check indexed_chunks table");
+        assert_eq!(chunks_count, 1, "indexed_chunks table should exist");
+
+        // Check FTS5 virtual table exists
+        let fts_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='indexed_chunks_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check FTS5 table");
+        assert_eq!(fts_count, 1, "indexed_chunks_fts FTS5 table should exist");
     }
 
     #[test]
@@ -2591,6 +2741,121 @@ mod tests {
             .unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].session_id, "s2");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Retrieval (FTS5 index + search) async integration tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn retrieval_index_and_search_async() {
+        use crate::session::retrieval::ChunkConfig;
+
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+
+        let source_id = storage
+            .index_content(
+                "sess-retrieval-1",
+                "tool_call_abc",
+                "The Rust programming language is fast and safe.\nIt prevents data races at compile time.",
+                &ChunkConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert!(source_id > 0);
+
+        let results = storage
+            .search_indexed_content("sess-retrieval-1", "Rust fast", None, 10)
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].source_label, "tool_call_abc");
+    }
+
+    #[tokio::test]
+    async fn retrieval_session_isolation_async() {
+        use crate::session::retrieval::ChunkConfig;
+
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+
+        storage
+            .index_content(
+                "sess-a",
+                "src",
+                "Python is interpreted",
+                &ChunkConfig::default(),
+            )
+            .await
+            .unwrap();
+
+        storage
+            .index_content(
+                "sess-b",
+                "src",
+                "Go has goroutines",
+                &ChunkConfig::default(),
+            )
+            .await
+            .unwrap();
+
+        // sess-a should not see sess-b content
+        let results = storage
+            .search_indexed_content("sess-a", "goroutines", None, 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retrieval_list_sources_async() {
+        use crate::session::retrieval::ChunkConfig;
+
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+
+        storage
+            .index_content("sess-list", "src1", "Content one", &ChunkConfig::default())
+            .await
+            .unwrap();
+        storage
+            .index_content("sess-list", "src2", "Content two", &ChunkConfig::default())
+            .await
+            .unwrap();
+
+        let sources = storage.list_indexed_sources("sess-list").await.unwrap();
+        assert_eq!(sources.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retrieval_source_scoped_search_async() {
+        use crate::session::retrieval::ChunkConfig;
+
+        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+
+        storage
+            .index_content(
+                "sess-scope",
+                "alpha",
+                "Rust error handling",
+                &ChunkConfig::default(),
+            )
+            .await
+            .unwrap();
+        storage
+            .index_content(
+                "sess-scope",
+                "beta",
+                "Rust error propagation",
+                &ChunkConfig::default(),
+            )
+            .await
+            .unwrap();
+
+        let results = storage
+            .search_indexed_content("sess-scope", "error", Some("alpha"), 10)
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| r.source_label == "alpha"));
     }
 
     #[tokio::test]

@@ -50,6 +50,36 @@ system = "You are a helpful coding assistant."
 # threshold = 0.85
 # min_lines = 5
 
+# ── Context Compression (opt-in) ─────────────────────────────────────
+#
+# Tool result compaction: deterministic compaction of large tool outputs.
+# Keeps context small by replacing large results with bounded previews.
+# Full output remains retrievable via context_search.
+#
+# Rollout: enable with `enabled = true` and add tools to `opt_in_tools`.
+# Rollback: set `enabled = false` — all behavior reverts immediately.
+#
+# [agent.execution.tool_result_compaction]
+# enabled = false                       # master switch (default: off)
+# opt_in_tools = ["shell", "web_fetch"] # tools that get compacted
+# min_bytes = 8192                      # minimum size to trigger
+# index_backend = "sqlite_fts5"         # retrieval backend
+#
+# [agent.execution.tool_result_compaction.llm_summary]
+# enabled = false                       # optional LLM summary (default: off)
+
+# Routing guardrails: nudge agents toward context-safe tools.
+# Rollout: set routing_preference to "warn" first, then "enforce".
+# Rollback: set routing_preference to "off".
+#
+# [agent.execution.routing_guardrails]
+# routing_preference = "off"  # off | warn | enforce
+#
+# [agent.execution.routing_guardrails.search_throttle]
+# window_secs = 60
+# max_calls = 20
+# degrade_after = 10
+
 # Optional: MCP servers for external tools
 # [[mcp]]
 # name = "github"

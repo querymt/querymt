@@ -69,6 +69,12 @@ impl MiddlewareRegistry {
         registry.register(Arc::new(super::context::ContextFactory));
         registry.register(Arc::new(super::modes::AgentModeFactory));
         registry.register(Arc::new(super::modes::PlanModeCompatFactory));
+        registry.register(Arc::new(
+            super::routing_guardrails::RoutingGuardrailsFactory,
+        ));
+        registry.register(Arc::new(
+            super::tool_result_compaction::ToolResultCompactionFactory,
+        ));
         registry
     }
 

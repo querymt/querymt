@@ -408,9 +408,13 @@ pub struct ExecutionPolicy {
     pub snapshot: SnapshotBackendConfig,
     /// Rate limit retry configuration
     pub rate_limit: RateLimitConfig,
+    /// Tool result compaction (context compression) — opt-in per tool
+    pub tool_result_compaction: ToolResultCompactionConfig,
+    /// Routing guardrails and search throttling
+    pub routing_guardrails: RoutingGuardrailConfig,
 }
 
-/// Runtime execution policy — the 4 configs that survive to `AgentConfig`
+/// Runtime execution policy — the configs that survive to `AgentConfig`
 /// (excludes `SnapshotBackendConfig` which is consumed at build time).
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeExecutionPolicy {
@@ -418,6 +422,10 @@ pub struct RuntimeExecutionPolicy {
     pub pruning: PruningConfig,
     pub compaction: CompactionConfig,
     pub rate_limit: RateLimitConfig,
+    /// Tool result compaction (context compression) settings.
+    pub tool_result_compaction: ToolResultCompactionConfig,
+    /// Routing guardrails and search throttling settings.
+    pub routing_guardrails: RoutingGuardrailConfig,
 }
 
 impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
@@ -427,6 +435,8 @@ impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
             pruning: ep.pruning.clone(),
             compaction: ep.compaction.clone(),
             rate_limit: ep.rate_limit.clone(),
+            tool_result_compaction: ep.tool_result_compaction.clone(),
+            routing_guardrails: ep.routing_guardrails.clone(),
         }
     }
 }
@@ -1266,6 +1276,243 @@ pub fn resolve_tools(
 }
 
 // ============================================================================
+// Tool Result Compaction Configuration (Context Compression)
+// ============================================================================
+
+/// Default minimum bytes before tool result compaction triggers.
+pub const DEFAULT_COMPACTION_MIN_BYTES: usize = 8192;
+
+fn default_compaction_min_bytes() -> usize {
+    DEFAULT_COMPACTION_MIN_BYTES
+}
+
+/// Index backend for storing full tool outputs for later retrieval.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexBackend {
+    /// SQLite FTS5 full-text search index (default).
+    #[default]
+    SqliteFts5,
+}
+
+/// Optional LLM summary sub-configuration for tool result compaction.
+///
+/// When enabled, an LLM call is used to produce a concise summary of tool
+/// output *after* the deterministic compaction pass. This is fully optional
+/// and disabled by default.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionLlmSummaryConfig {
+    /// Enable LLM summary in the compaction pipeline (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Override provider for the summary LLM call (falls back to session provider).
+    pub provider: Option<String>,
+
+    /// Override model for the summary LLM call (falls back to session model).
+    pub model: Option<String>,
+
+    /// Maximum input tokens to send to the summarizer (caps the payload).
+    #[serde(default = "default_summary_input_cap")]
+    pub input_cap_tokens: usize,
+
+    /// Timeout in seconds for the summary LLM call.
+    #[serde(default = "default_compaction_summary_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_summary_input_cap() -> usize {
+    16_000
+}
+
+fn default_compaction_summary_timeout() -> u64 {
+    15
+}
+
+impl Default for CompactionLlmSummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: None,
+            model: None,
+            input_cap_tokens: default_summary_input_cap(),
+            timeout_secs: default_compaction_summary_timeout(),
+        }
+    }
+}
+
+/// Top-level configuration for tool result compaction (context compression).
+///
+/// When enabled, tool outputs that exceed `min_bytes` and belong to
+/// `opt_in_tools` are compacted: the full output is indexed for later
+/// retrieval and a bounded preview is returned to the model context.
+///
+/// This feature is **opt-in** and disabled by default.
+///
+/// ```toml
+/// [agent.execution.tool_result_compaction]
+/// enabled = true
+/// opt_in_tools = ["shell", "web_fetch"]
+/// min_bytes = 8192
+/// index_backend = "sqlite_fts5"
+///
+/// [agent.execution.tool_result_compaction.llm_summary]
+/// enabled = false
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolResultCompactionConfig {
+    /// Master switch for the tool result compaction pipeline (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Tools that opt in to compaction. Empty = none (default: empty).
+    #[serde(default)]
+    pub opt_in_tools: Vec<String>,
+
+    /// Minimum tool output size in bytes before compaction triggers.
+    #[serde(default = "default_compaction_min_bytes")]
+    pub min_bytes: usize,
+
+    /// Backend used for indexing full tool outputs for retrieval.
+    #[serde(default)]
+    pub index_backend: IndexBackend,
+
+    /// Optional LLM summary configuration (disabled by default).
+    #[serde(default)]
+    pub llm_summary: CompactionLlmSummaryConfig,
+}
+
+impl Default for ToolResultCompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            opt_in_tools: Vec::new(),
+            min_bytes: DEFAULT_COMPACTION_MIN_BYTES,
+            index_backend: IndexBackend::default(),
+            llm_summary: CompactionLlmSummaryConfig::default(),
+        }
+    }
+}
+
+// ============================================================================
+// End Tool Result Compaction Configuration
+// ============================================================================
+
+// ============================================================================
+// Routing Guardrail Configuration
+// ============================================================================
+
+/// Routing enforcement level for context-safe tool usage.
+///
+/// Controls whether the system actively pushes agents toward context-safe
+/// workflows (batch/retrieval) or merely observes their choices.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingPreference {
+    /// Routing hints are disabled (default).
+    #[default]
+    Off,
+    /// Emit warnings when agents use high-output paths instead of
+    /// context-safe alternatives, but do not block.
+    Warn,
+    /// Actively redirect or deny calls that would flood context, preferring
+    /// batch/retrieval alternatives. Only when explicitly enabled.
+    Enforce,
+}
+
+/// Default search throttle window in seconds.
+pub const DEFAULT_THROTTLE_WINDOW_SECS: u64 = 60;
+
+/// Default maximum search calls within a throttle window.
+pub const DEFAULT_THROTTLE_MAX_CALLS: usize = 20;
+
+/// Default number of calls after which per-query result budget degrades.
+pub const DEFAULT_THROTTLE_DEGRADE_AFTER: usize = 10;
+
+fn default_throttle_window_secs() -> u64 {
+    DEFAULT_THROTTLE_WINDOW_SECS
+}
+
+fn default_throttle_max_calls() -> usize {
+    DEFAULT_THROTTLE_MAX_CALLS
+}
+
+fn default_throttle_degrade_after() -> usize {
+    DEFAULT_THROTTLE_DEGRADE_AFTER
+}
+
+/// Configuration for progressive search/retrieval throttling.
+///
+/// Prevents runaway retrieval loops by limiting the number of search
+/// calls within a sliding window.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchThrottleConfig {
+    /// Sliding window size in seconds.
+    #[serde(default = "default_throttle_window_secs")]
+    pub window_secs: u64,
+
+    /// Maximum search calls allowed within the window.
+    #[serde(default = "default_throttle_max_calls")]
+    pub max_calls: usize,
+
+    /// After this many calls in the window, per-query result budget is reduced.
+    #[serde(default = "default_throttle_degrade_after")]
+    pub degrade_after: usize,
+}
+
+impl Default for SearchThrottleConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: DEFAULT_THROTTLE_WINDOW_SECS,
+            max_calls: DEFAULT_THROTTLE_MAX_CALLS,
+            degrade_after: DEFAULT_THROTTLE_DEGRADE_AFTER,
+        }
+    }
+}
+
+/// Configuration for routing guardrails and search throttling.
+///
+/// Controls how aggressively the system steers agents toward context-safe
+/// tool usage patterns (batched operations, retrieval instead of raw output).
+///
+/// ```toml
+/// [agent.execution.routing_guardrails]
+/// routing_preference = "warn"
+///
+/// [agent.execution.routing_guardrails.search_throttle]
+/// window_secs = 60
+/// max_calls = 20
+/// degrade_after = 10
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingGuardrailConfig {
+    /// How strongly to nudge agents toward context-safe workflows.
+    #[serde(default)]
+    pub routing_preference: RoutingPreference,
+
+    /// Progressive search throttling configuration.
+    #[serde(default)]
+    pub search_throttle: SearchThrottleConfig,
+}
+
+impl Default for RoutingGuardrailConfig {
+    fn default() -> Self {
+        Self {
+            routing_preference: RoutingPreference::default(),
+            search_throttle: SearchThrottleConfig::default(),
+        }
+    }
+}
+
+// ============================================================================
+// End Routing Guardrail Configuration
+// ============================================================================
+
+// ============================================================================
 // Skills Configuration
 // ============================================================================
 
@@ -1959,6 +2206,248 @@ capabilities = ["writing"]
         assert_eq!(delegate.id, "writer");
         assert_eq!(delegate.peer, None);
         assert_eq!(delegate.description, Some("Writing specialist".to_string()));
+    }
+
+    // ── ToolResultCompactionConfig tests ─────────────────────────────────────
+
+    #[test]
+    fn test_tool_result_compaction_config_defaults() {
+        let config = ToolResultCompactionConfig::default();
+        assert!(!config.enabled);
+        assert!(config.opt_in_tools.is_empty());
+        assert_eq!(config.min_bytes, DEFAULT_COMPACTION_MIN_BYTES);
+        assert_eq!(config.index_backend, IndexBackend::SqliteFts5);
+        assert!(!config.llm_summary.enabled);
+        assert!(config.llm_summary.provider.is_none());
+        assert!(config.llm_summary.model.is_none());
+    }
+
+    #[test]
+    fn test_tool_result_compaction_config_serde_roundtrip() {
+        let config = ToolResultCompactionConfig {
+            enabled: true,
+            opt_in_tools: vec!["shell".to_string(), "web_fetch".to_string()],
+            min_bytes: 4096,
+            index_backend: IndexBackend::SqliteFts5,
+            llm_summary: CompactionLlmSummaryConfig {
+                enabled: true,
+                provider: Some("anthropic".to_string()),
+                model: Some("claude-haiku".to_string()),
+                input_cap_tokens: 8000,
+                timeout_secs: 10,
+            },
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: ToolResultCompactionConfig = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.enabled);
+        assert_eq!(deserialized.opt_in_tools, vec!["shell", "web_fetch"]);
+        assert_eq!(deserialized.min_bytes, 4096);
+        assert!(deserialized.llm_summary.enabled);
+        assert_eq!(
+            deserialized.llm_summary.provider,
+            Some("anthropic".to_string())
+        );
+    }
+
+    #[test]
+    fn test_tool_result_compaction_config_from_toml() {
+        let toml = r#"
+[agent]
+provider = "test"
+model = "test-model"
+
+[agent.execution.tool_result_compaction]
+enabled = true
+opt_in_tools = ["shell"]
+min_bytes = 16384
+"#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            agent: AgentSettings,
+        }
+        let parsed: Wrapper = toml::from_str(toml).expect("TOML should parse");
+        assert!(parsed.agent.execution.tool_result_compaction.enabled);
+        assert_eq!(
+            parsed.agent.execution.tool_result_compaction.opt_in_tools,
+            vec!["shell"]
+        );
+        assert_eq!(
+            parsed.agent.execution.tool_result_compaction.min_bytes,
+            16384
+        );
+        // LLM summary should default to disabled
+        assert!(
+            !parsed
+                .agent
+                .execution
+                .tool_result_compaction
+                .llm_summary
+                .enabled
+        );
+    }
+
+    #[test]
+    fn test_tool_result_compaction_absent_defaults_disabled() {
+        let toml = r#"
+[agent]
+provider = "test"
+model = "test-model"
+"#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            agent: AgentSettings,
+        }
+        let parsed: Wrapper = toml::from_str(toml).expect("TOML should parse");
+        assert!(!parsed.agent.execution.tool_result_compaction.enabled);
+        assert!(
+            parsed
+                .agent
+                .execution
+                .tool_result_compaction
+                .opt_in_tools
+                .is_empty()
+        );
+    }
+
+    // ── RoutingGuardrailConfig tests ──────────────────────────────────────
+
+    #[test]
+    fn test_routing_guardrail_config_defaults() {
+        let config = RoutingGuardrailConfig::default();
+        assert_eq!(config.routing_preference, RoutingPreference::Off);
+        assert_eq!(
+            config.search_throttle.window_secs,
+            DEFAULT_THROTTLE_WINDOW_SECS
+        );
+        assert_eq!(config.search_throttle.max_calls, DEFAULT_THROTTLE_MAX_CALLS);
+        assert_eq!(
+            config.search_throttle.degrade_after,
+            DEFAULT_THROTTLE_DEGRADE_AFTER
+        );
+    }
+
+    #[test]
+    fn test_routing_guardrail_config_serde_roundtrip() {
+        let config = RoutingGuardrailConfig {
+            routing_preference: RoutingPreference::Warn,
+            search_throttle: SearchThrottleConfig {
+                window_secs: 120,
+                max_calls: 50,
+                degrade_after: 25,
+            },
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: RoutingGuardrailConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.routing_preference, RoutingPreference::Warn);
+        assert_eq!(deserialized.search_throttle.window_secs, 120);
+        assert_eq!(deserialized.search_throttle.max_calls, 50);
+        assert_eq!(deserialized.search_throttle.degrade_after, 25);
+    }
+
+    #[test]
+    fn test_routing_guardrail_config_from_toml() {
+        let toml = r#"
+[agent]
+provider = "test"
+model = "test-model"
+
+[agent.execution.routing_guardrails]
+routing_preference = "warn"
+
+[agent.execution.routing_guardrails.search_throttle]
+window_secs = 30
+max_calls = 10
+degrade_after = 5
+"#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            agent: AgentSettings,
+        }
+        let parsed: Wrapper = toml::from_str(toml).expect("TOML should parse");
+        assert_eq!(
+            parsed.agent.execution.routing_guardrails.routing_preference,
+            RoutingPreference::Warn
+        );
+        assert_eq!(
+            parsed
+                .agent
+                .execution
+                .routing_guardrails
+                .search_throttle
+                .window_secs,
+            30
+        );
+        assert_eq!(
+            parsed
+                .agent
+                .execution
+                .routing_guardrails
+                .search_throttle
+                .max_calls,
+            10
+        );
+    }
+
+    #[test]
+    fn test_routing_guardrail_absent_defaults_off() {
+        let toml = r#"
+[agent]
+provider = "test"
+model = "test-model"
+"#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            agent: AgentSettings,
+        }
+        let parsed: Wrapper = toml::from_str(toml).expect("TOML should parse");
+        assert_eq!(
+            parsed.agent.execution.routing_guardrails.routing_preference,
+            RoutingPreference::Off
+        );
+    }
+
+    #[test]
+    fn test_routing_preference_enforce_variant() {
+        let toml = r#"
+[agent]
+provider = "test"
+model = "test-model"
+
+[agent.execution.routing_guardrails]
+routing_preference = "enforce"
+"#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            agent: AgentSettings,
+        }
+        let parsed: Wrapper = toml::from_str(toml).expect("TOML should parse");
+        assert_eq!(
+            parsed.agent.execution.routing_guardrails.routing_preference,
+            RoutingPreference::Enforce
+        );
+    }
+
+    #[test]
+    fn test_runtime_execution_policy_includes_new_fields() {
+        let ep = ExecutionPolicy {
+            tool_result_compaction: ToolResultCompactionConfig {
+                enabled: true,
+                opt_in_tools: vec!["shell".to_string()],
+                ..Default::default()
+            },
+            routing_guardrails: RoutingGuardrailConfig {
+                routing_preference: RoutingPreference::Warn,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime = RuntimeExecutionPolicy::from(&ep);
+        assert!(runtime.tool_result_compaction.enabled);
+        assert_eq!(runtime.tool_result_compaction.opt_in_tools, vec!["shell"]);
+        assert_eq!(
+            runtime.routing_guardrails.routing_preference,
+            RoutingPreference::Warn
+        );
     }
 
     // ── template validation in config loading ────────────────────────────────

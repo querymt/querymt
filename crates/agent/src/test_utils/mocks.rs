@@ -179,6 +179,24 @@ mock! {
             session_id: &str,
             call_ids: &[String],
         ) -> SessionResult<usize>;
+        async fn index_content(
+            &self,
+            session_id: &str,
+            source_label: &str,
+            content: &str,
+            chunk_config: &crate::session::retrieval::ChunkConfig,
+        ) -> SessionResult<i64>;
+        async fn search_indexed_content<'a, 'b, 'c, 'd>(
+            &'a self,
+            session_id: &'b str,
+            query: &'c str,
+            source_label_filter: Option<&'d str>,
+            max_results: usize,
+        ) -> SessionResult<Vec<crate::session::retrieval::RetrievalSnippet>>;
+        async fn list_indexed_sources(
+            &self,
+            session_id: &str,
+        ) -> SessionResult<Vec<crate::session::retrieval::SourceSummary>>;
     }
 }
 

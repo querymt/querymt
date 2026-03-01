@@ -1,6 +1,9 @@
 //! Defines the generic storage interface for session persistence.
 
-use crate::config::{CompactionConfig, PruningConfig, RateLimitConfig, ToolOutputConfig};
+use crate::config::{
+    CompactionConfig, PruningConfig, RateLimitConfig, RoutingGuardrailConfig, ToolOutputConfig,
+    ToolResultCompactionConfig,
+};
 use crate::model::AgentMessage;
 use crate::session::domain::{
     Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
@@ -8,6 +11,7 @@ use crate::session::domain::{
     ProgressKind, Task, TaskStatus,
 };
 use crate::session::error::{SessionError, SessionResult};
+use crate::session::retrieval::{ChunkConfig, RetrievalSnippet, SourceSummary};
 use async_trait::async_trait;
 use querymt::LLMParams;
 use serde::{Deserialize, Serialize};
@@ -96,6 +100,12 @@ pub struct SessionExecutionConfig {
     pub pruning_config: PruningConfig,
     pub compaction_config: CompactionConfig,
     pub rate_limit_config: RateLimitConfig,
+    /// Tool result compaction (context compression) settings.
+    #[serde(default)]
+    pub tool_result_compaction_config: ToolResultCompactionConfig,
+    /// Routing guardrails and search throttling settings.
+    #[serde(default)]
+    pub routing_guardrail_config: RoutingGuardrailConfig,
 }
 
 impl Default for SessionExecutionConfig {
@@ -109,6 +119,8 @@ impl Default for SessionExecutionConfig {
             pruning_config: PruningConfig::default(),
             compaction_config: CompactionConfig::default(),
             rate_limit_config: RateLimitConfig::default(),
+            tool_result_compaction_config: ToolResultCompactionConfig::default(),
+            routing_guardrail_config: RoutingGuardrailConfig::default(),
         }
     }
 }
@@ -432,6 +444,29 @@ pub trait SessionStore: Send + Sync {
         session_id: &str,
         call_ids: &[String],
     ) -> SessionResult<usize>;
+
+    // Retrieval methods (context-safe indexing/search)
+
+    /// Index content for context retrieval (FTS5).
+    async fn index_content(
+        &self,
+        session_id: &str,
+        source_label: &str,
+        content: &str,
+        chunk_config: &ChunkConfig,
+    ) -> SessionResult<i64>;
+
+    /// Search indexed content with optional source filtering.
+    async fn search_indexed_content(
+        &self,
+        session_id: &str,
+        query: &str,
+        source_label_filter: Option<&str>,
+        max_results: usize,
+    ) -> SessionResult<Vec<RetrievalSnippet>>;
+
+    /// List indexed source labels and metadata for a session.
+    async fn list_indexed_sources(&self, session_id: &str) -> SessionResult<Vec<SourceSummary>>;
 }
 
 #[cfg(test)]

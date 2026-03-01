@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use crate::session::retrieval::{RetrievalSnippet, SourceSummary};
+
 /// Capability requirements that tools may need
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -28,6 +30,15 @@ pub enum ToolError {
     SessionError(String),
     #[error("Other error: {0}")]
     Other(#[from] anyhow::Error),
+}
+
+/// Result metadata for a successful context indexing operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextIndexResult {
+    /// Internal source ID in the retrieval backend.
+    pub source_id: i64,
+    /// Source label used for retrieval scoping.
+    pub source_label: String,
 }
 
 /// Core context trait that all tools receive during execution
@@ -58,13 +69,48 @@ pub trait ToolContext: Send + Sync {
         None
     }
 
-    /// Record progress for long-running operations
+    /// Record progress for long-running operations.
     async fn record_progress(
         &self,
         kind: &str,
         content: String,
         metadata: Option<serde_json::Value>,
     ) -> Result<String, ToolError>;
+
+    /// Index content for later retrieval via `context_search`.
+    async fn index_context_content(
+        &self,
+        source_label: &str,
+        content: String,
+    ) -> Result<ContextIndexResult, ToolError> {
+        let _ = source_label;
+        let _ = content;
+        Err(ToolError::SessionError(
+            "context indexing is not available in this tool context".to_string(),
+        ))
+    }
+
+    /// Search previously indexed content.
+    async fn search_context_content(
+        &self,
+        query: &str,
+        source_label: Option<&str>,
+        max_results: usize,
+    ) -> Result<Vec<RetrievalSnippet>, ToolError> {
+        let _ = query;
+        let _ = source_label;
+        let _ = max_results;
+        Err(ToolError::SessionError(
+            "context search is not available in this tool context".to_string(),
+        ))
+    }
+
+    /// List indexed content sources for the current session.
+    async fn list_context_sources(&self) -> Result<Vec<SourceSummary>, ToolError> {
+        Err(ToolError::SessionError(
+            "context source listing is not available in this tool context".to_string(),
+        ))
+    }
 
     /// Access to tool-specific context extensions
     fn as_any(&self) -> &dyn Any;

@@ -355,6 +355,8 @@ impl AgentConfig {
             pruning_config: self.execution_policy.pruning.clone(),
             compaction_config: self.execution_policy.compaction.clone(),
             rate_limit_config: self.execution_policy.rate_limit.clone(),
+            tool_result_compaction_config: self.execution_policy.tool_result_compaction.clone(),
+            routing_guardrail_config: self.execution_policy.routing_guardrails.clone(),
         }
     }
 

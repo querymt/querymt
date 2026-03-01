@@ -12,8 +12,10 @@ pub mod delegation_guard;
 mod limits;
 mod modes;
 mod presets;
+pub mod routing_guardrails;
 mod specialized;
 mod tasks;
+pub mod tool_result_compaction;
 
 // Re-export new architecture types
 pub use driver::{CompositeDriver, MiddlewareDriver};
@@ -38,8 +40,14 @@ pub use limits::{
     LimitsConfig, LimitsMiddleware, MaxStepsMiddleware, PriceLimitMiddleware, TurnLimitMiddleware,
 };
 pub use presets::MiddlewarePresets;
+pub use routing_guardrails::{
+    RoutingGuardrailsFactory, RoutingGuardrailsMiddleware, ThrottleStatus,
+};
 pub use specialized::{
     AgentModeMiddleware, DuplicateToolCallMiddleware, TaskAutoCompletionMiddleware,
+};
+pub use tool_result_compaction::{
+    CompactionMetricsSnapshot, ToolResultCompactionFactory, ToolResultCompactionMiddleware,
 };
 
 #[cfg(test)]

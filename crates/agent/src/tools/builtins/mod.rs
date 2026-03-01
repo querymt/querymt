@@ -1,5 +1,10 @@
 pub mod apply_patch;
+pub mod batch_execute;
 pub mod browse;
+pub mod context_execute;
+pub mod context_execute_file;
+pub mod context_fetch;
+pub mod context_search;
 pub mod create_task;
 pub mod delegate;
 pub mod delete_file;
@@ -28,7 +33,12 @@ pub use route_delegation_to_peer::RouteDelegationToPeerTool;
 pub use use_remote_provider::UseRemoteProviderTool;
 
 pub use apply_patch::ApplyPatchTool;
+pub use batch_execute::BatchExecuteTool;
 pub use browse::BrowseTool;
+pub use context_execute::ContextExecuteTool;
+pub use context_execute_file::ContextExecuteFileTool;
+pub use context_fetch::ContextFetchTool;
+pub use context_search::ContextSearchTool;
 pub use create_task::CreateTaskTool;
 pub use delegate::DelegateTool;
 pub use delete_file::DeleteFileTool;
@@ -56,7 +66,12 @@ use std::sync::Arc;
 pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ApplyPatchTool::new()),
+        Arc::new(BatchExecuteTool::new()),
         Arc::new(BrowseTool::new()),
+        Arc::new(ContextExecuteTool::new()),
+        Arc::new(ContextExecuteFileTool::new()),
+        Arc::new(ContextFetchTool::new()),
+        Arc::new(ContextSearchTool::new()),
         Arc::new(SemanticEditTool::new()),
         Arc::new(CreateTaskTool::new()),
         Arc::new(DelegateTool::new()),

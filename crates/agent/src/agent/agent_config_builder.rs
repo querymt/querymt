@@ -11,7 +11,7 @@ use crate::agent::core::{
 };
 use crate::config::{
     CompactionConfig, DelegationWaitPolicy, McpServerConfig, PruningConfig, RateLimitConfig,
-    RuntimeExecutionPolicy, ToolOutputConfig,
+    RoutingGuardrailConfig, RuntimeExecutionPolicy, ToolOutputConfig, ToolResultCompactionConfig,
 };
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_fanout::EventFanout;
@@ -502,6 +502,25 @@ impl AgentConfigBuilder {
     /// Sets the rate limit retry configuration.
     pub fn with_rate_limit_config(mut self, config: RateLimitConfig) -> Self {
         self.execution_policy.rate_limit = config;
+        self
+    }
+
+    // ── Tool result compaction (context compression) ──────────────────────
+
+    /// Sets the tool result compaction configuration.
+    pub fn with_tool_result_compaction_config(
+        mut self,
+        config: ToolResultCompactionConfig,
+    ) -> Self {
+        self.execution_policy.tool_result_compaction = config;
+        self
+    }
+
+    // ── Routing guardrails ────────────────────────────────────────────────
+
+    /// Sets the routing guardrail configuration.
+    pub fn with_routing_guardrail_config(mut self, config: RoutingGuardrailConfig) -> Self {
+        self.execution_policy.routing_guardrails = config;
         self
     }
 

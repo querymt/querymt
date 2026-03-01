@@ -9,7 +9,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::elicitation::{ElicitationAction, ElicitationResponse};
-use crate::tools::context::{ToolContext, ToolError};
+use crate::session::retrieval::ChunkConfig;
+use crate::session::store::SessionStore;
+use crate::tools::context::{ContextIndexResult, ToolContext, ToolError};
 
 /// A request to elicit information from the user, sent from tool context to the agent
 pub struct ElicitationRequest {
@@ -25,6 +27,7 @@ pub struct AgentToolContext {
     session_id: String,
     cwd: Option<PathBuf>,
     agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry>>,
+    session_store: Option<Arc<dyn SessionStore>>,
     elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
     cancellation_token: CancellationToken,
 }
@@ -34,12 +37,14 @@ impl AgentToolContext {
         session_id: String,
         cwd: Option<PathBuf>,
         agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry>>,
+        session_store: Option<Arc<dyn SessionStore>>,
         elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
     ) -> Self {
         Self {
             session_id,
             cwd,
             agent_registry,
+            session_store,
             elicitation_tx,
             cancellation_token: CancellationToken::new(),
         }
@@ -53,7 +58,7 @@ impl AgentToolContext {
 
     /// Create a basic context for testing or simple operations
     pub fn basic(session_id: String, cwd: Option<PathBuf>) -> Self {
-        Self::new(session_id, cwd, None, None)
+        Self::new(session_id, cwd, None, None, None)
     }
 }
 
@@ -78,6 +83,62 @@ impl ToolContext for AgentToolContext {
         _metadata: Option<serde_json::Value>,
     ) -> Result<String, ToolError> {
         Ok(format!("progress_{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn index_context_content(
+        &self,
+        source_label: &str,
+        content: String,
+    ) -> Result<ContextIndexResult, ToolError> {
+        let store = self.session_store.as_ref().ok_or_else(|| {
+            ToolError::SessionError("session store unavailable for context indexing".to_string())
+        })?;
+
+        let source_id = store
+            .index_content(
+                &self.session_id,
+                source_label,
+                &content,
+                &ChunkConfig::default(),
+            )
+            .await
+            .map_err(|e| ToolError::SessionError(e.to_string()))?;
+
+        Ok(ContextIndexResult {
+            source_id,
+            source_label: source_label.to_string(),
+        })
+    }
+
+    async fn search_context_content(
+        &self,
+        query: &str,
+        source_label: Option<&str>,
+        max_results: usize,
+    ) -> Result<Vec<crate::session::retrieval::RetrievalSnippet>, ToolError> {
+        let store = self.session_store.as_ref().ok_or_else(|| {
+            ToolError::SessionError("session store unavailable for context search".to_string())
+        })?;
+
+        store
+            .search_indexed_content(&self.session_id, query, source_label, max_results)
+            .await
+            .map_err(|e| ToolError::SessionError(e.to_string()))
+    }
+
+    async fn list_context_sources(
+        &self,
+    ) -> Result<Vec<crate::session::retrieval::SourceSummary>, ToolError> {
+        let store = self.session_store.as_ref().ok_or_else(|| {
+            ToolError::SessionError(
+                "session store unavailable for listing context sources".to_string(),
+            )
+        })?;
+
+        store
+            .list_indexed_sources(&self.session_id)
+            .await
+            .map_err(|e| ToolError::SessionError(e.to_string()))
     }
 
     async fn ask_question(
@@ -266,5 +327,48 @@ mod tests {
         let context = AgentToolContext::basic("session".to_string(), None);
 
         assert_eq!(context.cwd(), None);
+    }
+
+    #[tokio::test]
+    async fn test_context_retrieval_roundtrip() {
+        use crate::session::backend::StorageBackend;
+        use crate::session::sqlite_storage::SqliteStorage;
+
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let store = storage.session_store();
+        let session = store.create_session(None, None, None, None).await.unwrap();
+
+        let context = AgentToolContext::new(
+            session.public_id.clone(),
+            None,
+            None,
+            Some(store.clone()),
+            None,
+        );
+
+        let indexed = context
+            .index_context_content(
+                "fetch:https://example.com",
+                "Rust makes systems programming safer.".to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(indexed.source_id > 0);
+        assert_eq!(indexed.source_label, "fetch:https://example.com");
+
+        let results = context
+            .search_context_content("systems", None, 5)
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.body.contains("systems")));
+
+        let sources = context.list_context_sources().await.unwrap();
+        assert!(
+            sources
+                .iter()
+                .any(|s| s.source_label == "fetch:https://example.com")
+        );
     }
 }

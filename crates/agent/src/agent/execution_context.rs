@@ -107,6 +107,7 @@ impl ExecutionContext {
             self.session_id.clone(),
             self.cwd().map(|p| p.to_path_buf()),
             Some(agent_registry),
+            Some(self.state.store.clone()),
             elicitation_tx,
         )
         .with_cancellation_token(self.cancellation_token.clone())
