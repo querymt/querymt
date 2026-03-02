@@ -62,7 +62,7 @@ patchkit = "0.2"
 gitpatch = "0.7"
 rmcp = { version = "0.17", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "elicitation", "reqwest"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
-tower-http = { version = "0.5", features = ["cors", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
 rust-embed = { version = "8.6", features = ["axum"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 mime_guess = "2.0"
