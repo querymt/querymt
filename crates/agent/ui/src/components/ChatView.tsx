@@ -643,7 +643,7 @@ export function ChatView() {
       <div className="flex-1 overflow-hidden flex flex-row relative">
         <div className="flex-1 overflow-hidden flex flex-col min-w-0 relative">
         {sessionId && hasDelegations && (
-          <div className="px-6 py-2 border-b border-surface-border/60 bg-surface-elevated/40 flex items-center gap-2">
+          <div className="px-3 md:px-6 py-2 border-b border-surface-border/60 bg-surface-elevated/40 flex items-center gap-2">
             <button
               type="button"
               onClick={() => {
@@ -862,7 +862,7 @@ export function ChatView() {
 
       {/* Rate Limit Indicator */}
       {rateLimitState?.isRateLimited && sessionId && (
-        <div className="px-6 py-2">
+        <div className="px-3 md:px-6 py-2">
           <RateLimitIndicator
             sessionId={sessionId}
             message={rateLimitState.message}
@@ -877,9 +877,9 @@ export function ChatView() {
       )}
 
       {/* Input Area */}
-      <div className="px-6 py-4 bg-surface-elevated border-t border-surface-border shadow-[0_-4px_20px_rgba(var(--accent-primary-rgb),0.05)]">
+      <div className="px-3 md:px-6 py-3 md:py-4 pb-safe bg-surface-elevated border-t border-surface-border shadow-[0_-4px_20px_rgba(var(--accent-primary-rgb),0.05)]">
         <div 
-          className="flex gap-3 relative items-end p-0.5 rounded-lg transition-colors duration-200"
+          className="flex gap-2 md:gap-3 relative items-end p-0.5 rounded-lg transition-colors duration-200"
           style={{ 
             background: `linear-gradient(90deg, rgba(var(--mode-rgb), 0.08) 0%, transparent 100%)` 
           }}
@@ -907,37 +907,37 @@ export function ChatView() {
             <button
               onClick={cancelSession}
               className="
-                px-6 py-3 rounded-lg font-medium transition-all duration-200
+                px-3 md:px-6 py-2.5 md:py-3 rounded-lg font-medium transition-all duration-200
                 bg-status-warning/10 border-2 border-status-warning text-status-warning
                 hover:bg-status-warning/20 hover:shadow-[0_0_15px_rgba(var(--status-warning-rgb),0.3)]
-                flex items-center gap-2 overflow-visible self-end min-h-[48px]
+                flex items-center gap-2 overflow-visible self-end min-h-[44px] md:min-h-[48px]
               "
               title="Stop generation (Esc Esc)"
             >
               <Square className="w-5 h-5" />
-              <span>Stop</span>
+              <span className="hidden md:inline">Stop</span>
             </button>
           ) : (
             <button
               onClick={handleSendPrompt}
               disabled={loading || !connected || !sessionId || !prompt.trim() || rateLimitState?.isRateLimited}
               className="
-                px-6 py-3 rounded-lg font-medium transition-all duration-200
+                px-3 md:px-6 py-2.5 md:py-3 rounded-lg font-medium transition-all duration-200
                 bg-accent-primary/10 border-2 border-accent-primary text-accent-primary
                 hover:bg-accent-primary/20 hover:shadow-glow-primary
                 disabled:opacity-30 disabled:cursor-not-allowed
-                flex items-center gap-2 overflow-visible self-end min-h-[48px]
+                flex items-center gap-2 overflow-visible self-end min-h-[44px] md:min-h-[48px]
               "
             >
               {loading ? (
                 <>
                   <Loader className="w-5 h-5 animate-spin" />
-                  <span>Sending...</span>
+                  <span className="hidden md:inline">Sending...</span>
                 </>
               ) : (
                 <>
                   <Send className="w-5 h-5" />
-                  <GlitchText text="Send" variant="0" hoverOnly />
+                  <span className="hidden md:inline"><GlitchText text="Send" variant="0" hoverOnly /></span>
                 </>
               )}
             </button>

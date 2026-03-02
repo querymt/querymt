@@ -83,11 +83,11 @@ export function StatsDrawer({
       />
       
       {/* Drawer */}
-      <div className="fixed left-0 right-0 top-[72px] z-40 animate-slide-down">
-        <div className="max-w-6xl mx-auto px-6">
+      <div className="fixed left-0 right-0 top-[52px] md:top-[72px] z-40 animate-slide-down">
+        <div className="max-w-6xl mx-auto px-2 md:px-6">
           <div className="bg-surface-elevated/95 backdrop-blur-sm border-2 border-accent-primary/30 rounded-b-xl shadow-[0_8px_40px_rgba(var(--accent-primary-rgb),0.2)]">
             {/* Header */}
-            <div className="flex items-center justify-between px-6 py-3 border-b border-surface-border/40">
+            <div className="flex items-center justify-between px-3 md:px-6 py-3 border-b border-surface-border/40">
               <div className="flex items-center gap-3">
                 <span className="text-sm font-semibold text-accent-primary uppercase tracking-wider">
                   Session Statistics
@@ -132,9 +132,9 @@ export function StatsDrawer({
             </div>
             
             {/* Content */}
-            <div className="px-6 py-4 max-h-[60vh] overflow-y-auto custom-scrollbar">
+            <div className="px-3 md:px-6 py-4 max-h-[60vh] overflow-y-auto custom-scrollbar">
               {/* Session Overview */}
-              <div className="grid grid-cols-4 gap-4 mb-4">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-4">
                 {/* Elapsed Time */}
                 <div className="p-4 rounded-lg bg-surface-canvas/50 border border-surface-border/50">
                   <div className="text-[10px] uppercase tracking-wider text-ui-muted mb-1">

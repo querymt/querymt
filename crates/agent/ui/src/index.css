@@ -42,6 +42,11 @@
 }
 
 @layer utilities {
+  /* Safe area inset for mobile devices with notch/home-indicator */
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
   .grid-background {
     background-size: 50px 50px;
     background-image: 
@@ -123,6 +128,13 @@
   border: 1px solid rgba(var(--accent-primary-rgb), 0.3);
   box-shadow: 0 0 15px rgba(var(--accent-primary-rgb), 0.15);
   background: rgba(var(--surface-elevated-rgb), 0.8);
+  --diffs-font-size: 13px;
+  --diffs-line-height: 20px;
+}
+
+.event-diff-container.diff-mobile {
+  --diffs-font-size: 11px;
+  --diffs-line-height: 16px;
 }
 
 /* Add glow to diff headers */

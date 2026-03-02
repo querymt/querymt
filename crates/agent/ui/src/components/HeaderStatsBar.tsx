@@ -17,6 +17,8 @@ interface HeaderStatsBarProps {
   agentModels: Record<string, { provider?: string; model?: string; contextLimit?: number; node?: string }>;
   sessionLimits?: SessionLimits | null;
   onClick?: () => void;
+  /** When true, renders a condensed layout suitable for narrow/mobile viewports. */
+  compact?: boolean;
 }
 
 export function HeaderStatsBar({
@@ -26,6 +28,7 @@ export function HeaderStatsBar({
   agentModels,
   sessionLimits,
   onClick,
+  compact = false,
 }: HeaderStatsBarProps) {
   const { session, perAgent } = useMemo(() => calculateStats(events, sessionLimits), [events, sessionLimits]);
   
@@ -68,7 +71,8 @@ export function HeaderStatsBar({
   return (
     <div
       onClick={onClick}
-      className={`flex items-center gap-3 px-3 py-1.5 rounded-lg border border-surface-border/40 bg-surface-elevated/50 text-xs font-mono transition-colors ${
+      data-testid="header-stats-bar"
+      className={`flex items-center ${compact ? 'gap-1.5 px-2 py-1' : 'gap-3 px-3 py-1.5'} rounded-lg border border-surface-border/40 bg-surface-elevated/50 text-xs font-mono transition-colors ${
         onClick ? 'cursor-pointer hover:border-accent-primary/60 hover:bg-surface-elevated/80' : ''
       }`}
       title="Click for detailed stats"
@@ -79,10 +83,10 @@ export function HeaderStatsBar({
         <span className="text-ui-secondary">{formatDurationCompact(globalElapsedMs)}</span>
       </div>
       
-      <span className="text-surface-border">│</span>
+      <span data-testid="stats-separator" className={`text-surface-border ${compact ? 'hidden' : ''}`}>│</span>
       
       {/* Context Usage */}
-      <div className="flex items-center gap-1.5">
+      <div className={`flex items-center gap-1.5 ${compact ? 'hidden' : ''}`}>
         <Cpu className={`w-3.5 h-3.5 ${
           contextPercent >= 80 ? 'text-status-warning' : 
           contextPercent >= 70 ? 'text-accent-primary' : 
@@ -97,20 +101,20 @@ export function HeaderStatsBar({
         </span>
       </div>
       
-      <span className="text-surface-border">│</span>
+      <span data-testid="stats-separator" className={`text-surface-border ${compact ? 'hidden' : ''}`}>│</span>
       
       {/* Tool Calls */}
-      <div className="flex items-center gap-1.5">
+      <div className={`flex items-center gap-1.5 ${compact ? 'hidden' : ''}`}>
         <Wrench className="w-3.5 h-3.5 text-ui-muted" />
         <span className="text-ui-secondary">{session.totalToolCalls}</span>
       </div>
       
       {costDisplay && (
         <>
-          <span className="text-surface-border">│</span>
+          <span data-testid="stats-separator" className={`text-surface-border ${compact ? 'hidden' : ''}`}>│</span>
           
           {/* Cost */}
-          <div className="flex items-center gap-1.5">
+          <div className={`flex items-center gap-1.5 ${compact ? 'hidden' : ''}`}>
             <DollarSign className={`w-3.5 h-3.5 ${
               costPercent > 90 ? 'text-status-warning' : 
               costPercent > 70 ? 'text-accent-primary' : 

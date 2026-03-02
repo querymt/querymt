@@ -1,9 +1,10 @@
 import { useEffect, useRef, useCallback, useMemo, useState } from 'react';
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
-import { Home, Copy, Check, Palette } from 'lucide-react';
+import { Home, Copy, Check, Palette, Menu, X } from 'lucide-react';
 import { useUiClientContext } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
 import { useSessionTimer } from '../hooks/useSessionTimer';
+import { useIsMobile } from '../hooks/useIsMobile';
 import { GlitchText } from './GlitchText';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { HeaderStatsBar } from './HeaderStatsBar';
@@ -109,10 +110,12 @@ export function AppShell() {
   
   const location = useLocation();
   const isHomePage = location.pathname === '/';
+  const isMobile = useIsMobile();
   const copyTimeoutRef = useRef<number | null>(null);
   const [shortcutGatewayOpen, setShortcutGatewayOpen] = useState(false);
   const [themeSwitcherOpen, setThemeSwitcherOpen] = useState(false);
   const [providerAuthOpen, setProviderAuthOpen] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const prevAgentModeRef = useRef(agentMode);
   const availableThemes = useMemo(() => getDashboardThemes(), []);
   const shortcutGatewayPrefix = useMemo(
@@ -444,12 +447,12 @@ export function AppShell() {
   return (
     <div className="flex flex-col h-screen bg-surface-canvas text-ui-primary">
       {/* Header */}
-      <header className="flex items-center justify-between gap-4 px-6 py-4 bg-surface-elevated border-b border-surface-border shadow-[0_0_20px_rgba(var(--accent-primary-rgb),0.05)]">
+      <header className="flex items-center justify-between gap-2 md:gap-4 px-3 md:px-6 py-2 md:py-4 bg-surface-elevated border-b border-surface-border shadow-[0_0_20px_rgba(var(--accent-primary-rgb),0.05)]">
         {/* Left section */}
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2 md:gap-3 min-w-0">
           <Link
             to="/"
-            className={`p-2 rounded-lg transition-colors ${
+            className={`p-1.5 md:p-2 rounded-lg transition-colors flex-shrink-0 ${
               isHomePage
                 ? 'text-accent-primary/50 cursor-default'
                 : 'text-accent-primary hover:bg-surface-canvas'
@@ -458,22 +461,22 @@ export function AppShell() {
           >
             <Home className="w-5 h-5" />
           </Link>
-          <h1 className="text-xl font-semibold glow-text-primary">
+          {/* Hide title on mobile to save space */}
+          <h1 className="hidden md:block text-xl font-semibold glow-text-primary">
             <GlitchText text="QueryMT" variant="3" hoverOnly />
           </h1>
           
           {/* Session chip (when active) - now includes mode */}
           {sessionId && (
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5 md:gap-2 min-w-0">
               {/* Combined session chip with mode */}
-              {/* Fixed width sized for a full UUIDv7 (36 chars) + status dot + mode */}
-              <div className="flex items-center rounded-lg border border-surface-border bg-surface-canvas overflow-hidden flex-shrink-0">
+              <div className="flex items-center rounded-lg border border-surface-border bg-surface-canvas overflow-hidden flex-shrink min-w-0">
                 {/* Session ID part - click to open session switcher */}
                 <button
                   type="button"
                   onClick={() => setSessionSwitcherOpen(true)}
                   title={`Click to switch sessions (${navigator.platform.includes('Mac') ? 'Cmd' : 'Ctrl'}+/)`}
-                  className="flex items-center gap-1.5 px-3 py-1.5 hover:bg-surface-elevated/50 transition-colors group"
+                  className="flex items-center gap-1.5 px-2 md:px-3 py-1.5 hover:bg-surface-elevated/50 transition-colors group min-w-0"
                 >
                   <span
                     className={`w-2 h-2 rounded-full flex-shrink-0 ${
@@ -491,31 +494,31 @@ export function AppShell() {
                         : 'Idle'
                     }
                   />
-                  {/* Fixed-width slot sized for a full UUIDv7 (36 chars) */}
-                  <span className="text-xs font-mono text-ui-secondary group-hover:text-accent-primary transition-colors w-[22ch] truncate">
-                    {String(sessionId).substring(0, 20)}...
+                  {/* Truncated session ID — narrower on mobile */}
+                  <span className="text-xs font-mono text-ui-secondary group-hover:text-accent-primary transition-colors w-[8ch] md:w-[22ch] truncate">
+                    {isMobile ? String(sessionId).substring(0, 8) : `${String(sessionId).substring(0, 20)}...`}
                   </span>
-                  <span className="text-ui-muted">·</span>
+                  <span className="text-ui-muted hidden md:inline">·</span>
                 </button>
                 
-                {/* Mode part - click to cycle mode, fixed width for largest mode name */}
+                {/* Mode part - click to cycle mode */}
                 <button
                   type="button"
                   onClick={cycleAgentMode}
                   title={`Mode: ${agentMode} (${navigator.platform.includes('Mac') ? '⌘E' : 'Ctrl+E'} to cycle)`}
-                  className="px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-surface-elevated/50 w-[7ch] text-center flex-shrink-0 truncate"
+                  className="px-1.5 md:px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-surface-elevated/50 w-[5ch] md:w-[7ch] text-center flex-shrink-0 truncate"
                   style={{ color: 'var(--mode-color)' }}
                 >
                   {getModeDisplayName(agentMode)}
                 </button>
               </div>
               
-              {/* Copy button */}
+              {/* Copy button — hidden on mobile */}
               <button
                 type="button"
                 onClick={handleCopySessionId}
                 title="Copy session ID to clipboard"
-                className="p-1.5 rounded-lg border border-surface-border bg-surface-canvas hover:border-accent-primary/60 hover:bg-surface-elevated/50 transition-colors"
+                className="hidden md:inline-flex p-1.5 rounded-lg border border-surface-border bg-surface-canvas hover:border-accent-primary/60 hover:bg-surface-elevated/50 transition-colors"
               >
                 {sessionCopied ? (
                   <Check className="w-3.5 h-3.5 text-status-success" />
@@ -528,8 +531,8 @@ export function AppShell() {
         </div>
         
         {/* Right section: flexible stats on the left, fixed controls pinned to the right */}
-        <div className="flex items-center gap-3 min-w-0">
-          {/* Inline stats bar (when session has events) — can grow/shrink */}
+        <div className="flex items-center gap-2 md:gap-3 min-w-0 flex-shrink-0">
+          {/* Inline stats bar — compact on mobile, full on desktop */}
           {sessionId && (
             <HeaderStatsBar
               events={events}
@@ -537,13 +540,14 @@ export function AppShell() {
               isSessionActive={isSessionActive}
               agentModels={agentModels}
               sessionLimits={sessionLimits}
+              compact={isMobile}
               onClick={() => setStatsDrawerOpen(!statsDrawerOpen)}
             />
           )}
 
-          {/* Fixed controls group — never reflows regardless of stats bar visibility */}
-          <div className="flex items-center gap-3 flex-shrink-0 ml-auto">
-            {/* Model picker — fixed width set on the trigger button itself */}
+          {/* Desktop controls — hidden on mobile, shown in mobile menu instead */}
+          <div className="hidden md:flex items-center gap-3 flex-shrink-0 ml-auto">
+            {/* Model picker */}
             <ModelPickerPopover
               open={modelPickerOpen}
               onOpenChange={setModelPickerOpen}
@@ -580,7 +584,7 @@ export function AppShell() {
               <Palette className="w-3.5 h-3.5 text-accent-primary" />
             </button>
 
-            {/* Remote node mesh indicator — fixed rightmost slot before conn dot */}
+            {/* Remote node mesh indicator */}
             <RemoteNodeIndicator remoteNodes={remoteNodes} />
 
             {/* Connection status dot */}
@@ -591,8 +595,88 @@ export function AppShell() {
               title={connected ? 'Connected' : 'Disconnected'}
             />
           </div>
+
+          {/* Mobile: connection dot + hamburger menu */}
+          <div className="flex md:hidden items-center gap-2 flex-shrink-0">
+            <div
+              className={`w-2.5 h-2.5 rounded-full flex-shrink-0 transition-colors ${
+                connected ? 'bg-status-success' : 'bg-status-warning'
+              }`}
+              title={connected ? 'Connected' : 'Disconnected'}
+            />
+            <button
+              type="button"
+              onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+              className="p-1.5 rounded-lg border border-surface-border bg-surface-canvas/60 transition-colors hover:border-accent-primary/40"
+              aria-label="Toggle mobile menu"
+            >
+              {mobileMenuOpen ? (
+                <X className="w-4 h-4 text-accent-primary" />
+              ) : (
+                <Menu className="w-4 h-4 text-accent-primary" />
+              )}
+            </button>
+          </div>
         </div>
       </header>
+
+      {/* Mobile dropdown menu */}
+      {isMobile && mobileMenuOpen && (
+        <div className="md:hidden bg-surface-elevated border-b border-surface-border px-3 py-3 flex flex-col gap-2 shadow-lg z-30">
+          {/* Model picker on mobile */}
+          <ModelPickerPopover
+            open={modelPickerOpen}
+            onOpenChange={(open) => { setModelPickerOpen(open); if (!open) setMobileMenuOpen(false); }}
+            connected={connected}
+            routingMode={routingMode}
+            activeAgentId={activeAgentId}
+            sessionId={sessionId}
+            sessionsByAgent={sessionsByAgent}
+            agents={agents}
+            allModels={allModels}
+            currentProvider={agentModels[activeAgentId]?.provider}
+            currentModel={agentModels[activeAgentId]?.model}
+            currentNode={agentModels[activeAgentId]?.node}
+            currentWorkspace={currentWorkspace}
+            recentModelsByWorkspace={recentModelsByWorkspace}
+            agentMode={agentMode}
+            onRefresh={refreshAllModels}
+            onSetSessionModel={setSessionModel}
+            providerCapabilities={providerCapabilities}
+            modelDownloads={modelDownloads}
+            onAddCustomModelFromHf={addCustomModelFromHf}
+            onAddCustomModelFromFile={addCustomModelFromFile}
+            onDeleteCustomModel={deleteCustomModel}
+          />
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => { setThemeSwitcherOpen(true); setMobileMenuOpen(false); }}
+              className="flex-1 h-8 inline-flex items-center justify-center gap-2 rounded-lg border border-surface-border bg-surface-canvas/60 transition-colors hover:border-accent-primary/40 text-xs"
+              aria-label="Open theme switcher"
+            >
+              <Palette className="w-3.5 h-3.5 text-accent-primary" />
+              <span className="text-ui-secondary">Theme</span>
+            </button>
+            {sessionId && (
+              <button
+                type="button"
+                onClick={() => { handleCopySessionId(); setMobileMenuOpen(false); }}
+                className="flex-1 h-8 inline-flex items-center justify-center gap-2 rounded-lg border border-surface-border bg-surface-canvas/60 transition-colors hover:border-accent-primary/40 text-xs"
+                title="Copy session ID"
+              >
+                {sessionCopied ? (
+                  <Check className="w-3.5 h-3.5 text-status-success" />
+                ) : (
+                  <Copy className="w-3.5 h-3.5 text-ui-muted" />
+                )}
+                <span className="text-ui-secondary">Copy ID</span>
+              </button>
+            )}
+          </div>
+          <RemoteNodeIndicator remoteNodes={remoteNodes} />
+        </div>
+      )}
       
       {/* Mode accent line */}
       <div 

@@ -376,4 +376,17 @@ describe('SessionSwitcher', () => {
     // +1 for the "New Session" action button
     expect(items.length).toBeLessThanOrEqual(11);
   });
+
+  it('uses responsive max-width on the command palette container', () => {
+    render(<SessionSwitcher {...defaultProps} />);
+    // The Command container should have responsive width for mobile
+    const commandEl = document.querySelector('[cmdk-root]');
+    expect(commandEl).not.toBeNull();
+    expect(commandEl!.className).toContain('max-w-2xl');
+    // On mobile, the outer wrapper should allow full width via responsive padding
+    const wrapper = commandEl!.closest('.fixed');
+    expect(wrapper).not.toBeNull();
+    expect(wrapper!.className).toContain('px-3');
+    expect(wrapper!.className).toContain('md:px-0');
+  });
 });

@@ -220,7 +220,7 @@ export function SessionSwitcher({
       {/* Command Palette - Wrapper for click-outside handling */}
       <div 
         data-testid="session-switcher-container"
-        className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh] px-4"
+        className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh] md:pt-[15vh] px-3 md:px-0"
         onClick={(e) => {
           // Close on click outside the command palette
           if (e.target === e.currentTarget) {

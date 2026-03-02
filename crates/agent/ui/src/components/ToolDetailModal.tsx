@@ -12,6 +12,7 @@ import { HighlightedCode } from './HighlightedCode';
 import { isMarkdownFile } from '../utils/languageDetection';
 import { MessageContent } from './MessageContent';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
+import { useIsMobile } from '../hooks/useIsMobile';
 import { useUiStore } from '../store/uiStore';
 import { getDashboardThemeVariant, getDiffThemeForDashboard } from '../utils/dashboardThemes';
 
@@ -54,9 +55,10 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
         <Dialog.Overlay className="fixed inset-0 z-50 bg-surface-canvas/80 animate-fade-in" />
         <Dialog.Content
           className="
-            fixed z-50 top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2
-            w-[96vw] max-w-none h-[85vh] max-h-[900px]
-            bg-surface-elevated border border-accent-primary/30 rounded-lg
+            fixed z-50
+            inset-0 md:inset-auto md:top-1/2 md:left-1/2 md:-translate-x-1/2 md:-translate-y-1/2
+            w-full md:w-[96vw] md:max-w-none h-full md:h-[85vh] md:max-h-[900px]
+            bg-surface-elevated border-0 md:border md:border-accent-primary/30 md:rounded-lg
             shadow-lg shadow-accent-primary/25
             flex flex-col overflow-hidden
             animate-fade-in
@@ -242,6 +244,9 @@ function DiffView({
   diffTheme: string;
   diffThemeType: 'dark' | 'light';
 }) {
+  const isMobile = useIsMobile();
+  const preferredDiffStyle = isMobile ? 'unified' : 'split' as const;
+  const diffContainerClass = `event-diff-container m-0 border-0${isMobile ? ' diff-mobile' : ''}`;
   const input = rawInput as Record<string, unknown>;
   
   // Handle write tool - show as diff with empty left side
@@ -267,13 +272,13 @@ function DiffView({
           <div className="text-[11px] text-ui-secondary mb-2 font-mono">
             Writing to: <span className="text-accent-primary">{filePath as string}</span>
           </div>
-          <div className="event-diff-container m-0 border-0">
+          <div className={diffContainerClass}>
             <PatchDiff
               patch={patch}
               options={{
                 theme: diffTheme,
                 themeType: diffThemeType,
-                diffStyle: 'split',
+                diffStyle: preferredDiffStyle,
                 diffIndicators: 'bars',
                 lineDiffType: 'word-alt',
                 overflow: 'wrap',
@@ -294,13 +299,13 @@ function DiffView({
     if (editInput?.oldString || editInput?.newString) {
       const patch = buildEditPatch(editInput);
       return (
-        <div className="event-diff-container m-0 border-0">
+        <div className={diffContainerClass}>
           <PatchDiff
             patch={patch}
             options={{
               theme: diffTheme,
               themeType: diffThemeType,
-              diffStyle: 'split',
+              diffStyle: preferredDiffStyle,
               diffIndicators: 'bars',
               lineDiffType: 'word-alt',
               overflow: 'wrap',
@@ -318,7 +323,7 @@ function DiffView({
   const patchValue = extractPatchValue(input);
   if (patchValue) {
     return (
-      <div className="event-diff-container m-0 border-0">
+      <div className={diffContainerClass}>
         <PatchDiff
           patch={patchValue}
           options={{
