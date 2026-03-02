@@ -2,11 +2,11 @@
 //!
 //! Provides a common trait for both single agents and multi-agent quorums.
 
+use crate::api::Agent;
 use crate::config::{Config, ConfigSource, load_config};
 use crate::events::EventEnvelope;
 #[cfg(feature = "dashboard")]
 use crate::server::AgentServer;
-use crate::simple::{Agent, Quorum};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 
 /// Unified interface for chat operations
 ///
-/// Implemented by both `Agent` and `Quorum` to provide a consistent API.
+/// Implemented by `Agent` to provide a consistent API.
 #[async_trait]
 pub trait ChatRunner: Send + Sync {
     /// Send a chat message and get a response
@@ -118,11 +118,8 @@ impl<T: ChatSession + ?Sized> ChatSessionExt for T {}
 
 /// Unified runner for both single agents and multi-agent quorums.
 ///
-/// This enum provides a concrete type that supports both Send and !Send
-/// async methods, unlike the ChatRunner trait which requires Send bounds.
-///
-/// Use this type when you need access to all agent functionality including
-/// ACP transport setup which uses !Send LocalSet internally.
+/// Since `Agent` now handles both single and multi-agent configurations,
+/// `AgentRunner` is a thin wrapper around `Agent` for backward compatibility.
 ///
 /// # Examples
 ///
@@ -137,77 +134,48 @@ impl<T: ChatSession + ?Sized> ChatSessionExt for T {}
 /// // Use chat functionality
 /// let response = runner.chat("Hello!").await?;
 ///
-/// // Start ACP stdio server (not possible with Box<dyn ChatRunner>)
+/// // Start ACP stdio server
 /// runner.acp("stdio").await?;
 /// # Ok(())
 /// # }
 /// ```
-pub enum AgentRunner {
-    /// Single agent runner
-    Single(Agent),
-    /// Multi-agent quorum runner
-    Multi(Quorum),
-}
+pub struct AgentRunner(Agent);
 
 impl AgentRunner {
+    /// Create a new runner from an `Agent`.
+    pub fn new(agent: Agent) -> Self {
+        Self(agent)
+    }
+
     /// Send a chat message and get a response
     pub async fn chat(&self, prompt: &str) -> Result<String> {
-        match self {
-            AgentRunner::Single(agent) => agent.chat(prompt).await,
-            AgentRunner::Multi(quorum) => quorum.chat(prompt).await,
-        }
+        self.0.chat(prompt).await
     }
 
     /// Create a new chat session for maintaining conversation history
     pub async fn chat_session(&self) -> Result<Box<dyn ChatSession>> {
-        match self {
-            AgentRunner::Single(agent) => ChatRunner::chat_session(agent).await,
-            AgentRunner::Multi(quorum) => ChatRunner::chat_session(quorum).await,
-        }
+        ChatRunner::chat_session(&self.0).await
     }
 
     /// Start an ACP server with the specified transport
-    ///
-    /// # Arguments
-    /// * `transport` - Either "stdio" for stdin/stdout, or "ip:port" for WebSocket
-    ///
-    /// # Note
-    /// This method returns a !Send future because stdio transport uses LocalSet internally.
-    /// This is the primary advantage of AgentRunner over Box<dyn ChatRunner>.
     pub async fn acp(&self, transport: &str) -> Result<()> {
-        match self {
-            AgentRunner::Single(agent) => agent.acp(transport).await,
-            AgentRunner::Multi(quorum) => quorum.acp(transport).await,
-        }
+        self.0.acp(transport).await
     }
 
     /// Get the web dashboard server
     #[cfg(feature = "dashboard")]
     pub fn dashboard(&self) -> AgentServer {
-        match self {
-            AgentRunner::Single(agent) => agent.dashboard(),
-            AgentRunner::Multi(quorum) => quorum.dashboard(),
-        }
+        self.0.dashboard()
     }
 
     /// Subscribe to agent events (tool calls, messages, etc.)
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
-        match self {
-            AgentRunner::Single(agent) => ChatRunner::subscribe(agent),
-            AgentRunner::Multi(quorum) => ChatRunner::subscribe(quorum),
-        }
+        self.0.subscribe()
     }
 
     /// Register a callback for tool call events
     pub fn on_tool_call(&self, callback: impl Fn(String, Value) + Send + Sync + 'static) -> &Self {
-        match self {
-            AgentRunner::Single(agent) => {
-                agent.on_tool_call(callback);
-            }
-            AgentRunner::Multi(quorum) => {
-                quorum.on_tool_call(callback);
-            }
-        }
+        self.0.on_tool_call(callback);
         self
     }
 
@@ -216,27 +184,13 @@ impl AgentRunner {
         &self,
         callback: impl Fn(String, String) + Send + Sync + 'static,
     ) -> &Self {
-        match self {
-            AgentRunner::Single(agent) => {
-                agent.on_tool_complete(callback);
-            }
-            AgentRunner::Multi(quorum) => {
-                quorum.on_tool_complete(callback);
-            }
-        }
+        self.0.on_tool_complete(callback);
         self
     }
 
     /// Register a callback for message events
     pub fn on_message(&self, callback: impl Fn(String, String) + Send + Sync + 'static) -> &Self {
-        match self {
-            AgentRunner::Single(agent) => {
-                agent.on_message(callback);
-            }
-            AgentRunner::Multi(quorum) => {
-                quorum.on_message(callback);
-            }
-        }
+        self.0.on_message(callback);
         self
     }
 
@@ -245,89 +199,41 @@ impl AgentRunner {
         &self,
         callback: impl Fn(String, String) + Send + Sync + 'static,
     ) -> &Self {
-        match self {
-            AgentRunner::Single(agent) => {
-                agent.on_delegation(callback);
-            }
-            AgentRunner::Multi(quorum) => {
-                quorum.on_delegation(callback);
-            }
-        }
+        self.0.on_delegation(callback);
         self
     }
 
     /// Register a callback for error events
     pub fn on_error(&self, callback: impl Fn(String) + Send + Sync + 'static) -> &Self {
-        match self {
-            AgentRunner::Single(agent) => {
-                agent.on_error(callback);
-            }
-            AgentRunner::Multi(quorum) => {
-                quorum.on_error(callback);
-            }
-        }
+        self.0.on_error(callback);
         self
     }
 
     /// Access the underlying `AgentHandle` for advanced use cases.
-    ///
-    /// For `Single` runners, this is the agent's handle.
-    /// For `Multi` (quorum) runners, this is the planner's handle.
-    ///
-    /// The handle provides direct access to the session registry, event bus,
-    /// and agent config — useful for integrating with the kameo mesh
-    /// (e.g., bootstrapping `RemoteNodeManager` with `--mesh`).
     pub fn handle(&self) -> std::sync::Arc<crate::agent::LocalAgentHandle> {
-        match self {
-            AgentRunner::Single(agent) => agent.handle(),
-            AgentRunner::Multi(quorum) => quorum.handle(),
-        }
+        self.0.handle()
     }
 
-    /// Get a reference to the inner Agent if this is a Single runner
-    pub fn as_agent(&self) -> Option<&Agent> {
-        match self {
-            AgentRunner::Single(agent) => Some(agent),
-            AgentRunner::Multi(_) => None,
-        }
+    /// Get a reference to the inner Agent.
+    pub fn as_agent(&self) -> &Agent {
+        &self.0
     }
 
-    /// Get a reference to the inner Quorum if this is a Multi runner
-    pub fn as_quorum(&self) -> Option<&Quorum> {
-        match self {
-            AgentRunner::Single(_) => None,
-            AgentRunner::Multi(quorum) => Some(quorum),
-        }
+    /// Convert into the inner Agent.
+    pub fn into_agent(self) -> Agent {
+        self.0
     }
 
-    /// Convert into the inner Agent if this is a Single runner
-    pub fn into_agent(self) -> Option<Agent> {
-        match self {
-            AgentRunner::Single(agent) => Some(agent),
-            AgentRunner::Multi(_) => None,
-        }
-    }
-
-    /// Convert into the inner Quorum if this is a Multi runner
-    pub fn into_quorum(self) -> Option<Quorum> {
-        match self {
-            AgentRunner::Single(_) => None,
-            AgentRunner::Multi(quorum) => Some(quorum),
-        }
+    /// Returns true if this is a multi-agent (quorum) runner.
+    pub fn is_multi(&self) -> bool {
+        self.0.is_multi()
     }
 }
 
-/// Convert AgentRunner to a trait object for backwards compatibility
-///
-/// This allows migration from code expecting `Box<dyn ChatRunner>` to code
-/// using `AgentRunner`. Note that the `.acp()` method will not be available
-/// through the trait object.
+/// Convert AgentRunner to a trait object for backwards compatibility.
 impl From<AgentRunner> for Box<dyn ChatRunner> {
     fn from(runner: AgentRunner) -> Self {
-        match runner {
-            AgentRunner::Single(agent) => Box::new(agent),
-            AgentRunner::Multi(quorum) => Box::new(quorum),
-        }
+        Box::new(runner.0)
     }
 }
 
@@ -428,7 +334,7 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
                         // RemoteNodeManager and ProviderHostActor so remote peers can
                         // discover this node in the DHT and create sessions here.
                         spawn_and_register_mesh_actors(&agent.handle(), &result.mesh).await;
-                        return Ok(AgentRunner::Single(agent));
+                        return Ok(AgentRunner::new(agent));
                     }
                     Err(e) => {
                         log::warn!("mesh bootstrap failed: {}; continuing without mesh", e);
@@ -437,7 +343,7 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
             }
 
             let agent = Agent::from_single_config(single_config).await?;
-            Ok(AgentRunner::Single(agent))
+            Ok(AgentRunner::new(agent))
         }
         Config::Multi(quorum_config) => {
             // bootstrap mesh from config if enabled (remote feature only).
@@ -462,7 +368,7 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
                             result.registry.list_agents().len()
                         );
                         let auto_fallback = quorum_config.mesh.auto_fallback;
-                        let quorum = Quorum::from_quorum_config_with_registry(
+                        let agent = Agent::from_quorum_config_with_registry(
                             quorum_config,
                             Some(Arc::new(result.registry)),
                             Some(result.mesh.clone()),
@@ -472,8 +378,8 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
                         // Now that we have an AgentConfig, spawn and register the
                         // RemoteNodeManager and ProviderHostActor so remote peers can
                         // discover this node in the DHT and create sessions here.
-                        spawn_and_register_mesh_actors(&quorum.handle(), &result.mesh).await;
-                        return Ok(AgentRunner::Multi(quorum));
+                        spawn_and_register_mesh_actors(&agent.handle(), &result.mesh).await;
+                        return Ok(AgentRunner::new(agent));
                     }
                     Err(e) => {
                         log::warn!("mesh bootstrap failed: {}; continuing without mesh", e);
@@ -481,8 +387,8 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
                 }
             }
 
-            let quorum = Quorum::from_quorum_config(quorum_config).await?;
-            Ok(AgentRunner::Multi(quorum))
+            let agent = Agent::from_quorum_config(quorum_config).await?;
+            Ok(AgentRunner::new(agent))
         }
     }
 }

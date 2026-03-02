@@ -1,6 +1,10 @@
+pub mod api;
 pub mod error;
 pub mod prelude;
-pub mod simple;
+
+/// Backward-compatible alias for the `api` module.
+#[doc(hidden)]
+pub use api as simple;
 
 pub mod config;
 pub mod runner;

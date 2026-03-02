@@ -28,6 +28,39 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// Non-serializable infrastructure for agent construction.
+///
+/// When not provided to a builder, `build()` uses platform defaults:
+/// - `plugin_registry`: loaded from `~/.querymt/providers.toml` with Extism + Native loaders
+/// - `storage`: SQLite at the default agent db path
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use querymt_agent::prelude::*;
+/// use std::sync::Arc;
+///
+/// # async fn example(registry: querymt::plugin::host::PluginRegistry, storage: Arc<dyn querymt_agent::session::backend::StorageBackend>) {
+/// let agent = Agent::single()
+///     .provider("anthropic", "claude-sonnet-4-20250514")
+///     .infra(AgentInfra {
+///         plugin_registry: Arc::new(registry),
+///         storage: Some(storage),
+///     })
+///     .build()
+///     .await
+///     .unwrap();
+/// # }
+/// ```
+pub struct AgentInfra {
+    /// Pre-built plugin registry.
+    /// Required for iOS/embedded where default loaders are unavailable.
+    pub plugin_registry: Arc<querymt::plugin::host::PluginRegistry>,
+    /// Pre-opened storage backend.
+    /// `None` = create SQLite from the db path specified in config/builder.
+    pub storage: Option<Arc<dyn StorageBackend>>,
+}
+
 /// Type alias for middleware factory closures
 type MiddlewareFactory = Box<dyn FnOnce(&AgentHandle) -> Arc<dyn MiddlewareDriver> + Send>;
 
@@ -47,6 +80,14 @@ pub struct AgentBuilder {
     mcp_servers: Vec<McpServerConfig>,
     /// Optional pre-built agent registry (Phase 7: injected by `from_single_config_with_registry`).
     pub(super) agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+    /// Optional pre-built infrastructure (plugin registry + storage).
+    infra: Option<AgentInfra>,
+    /// Override: maximum execution steps (forwarded to AgentConfigBuilder).
+    max_steps_override: Option<usize>,
+    /// Override: maximum prompt bytes (forwarded to AgentConfigBuilder).
+    max_prompt_bytes_override: Option<usize>,
+    /// Override: execution timeout in seconds (forwarded to AgentConfigBuilder).
+    execution_timeout_secs_override: Option<u64>,
 }
 
 impl Default for AgentBuilder {
@@ -71,6 +112,10 @@ impl AgentBuilder {
             skills_config: None,
             mcp_servers: Vec::new(),
             agent_registry: None,
+            infra: None,
+            max_steps_override: None,
+            max_prompt_bytes_override: None,
+            execution_timeout_secs_override: None,
         }
     }
 
@@ -132,6 +177,58 @@ impl AgentBuilder {
         self
     }
 
+    /// Inject custom infrastructure (plugin registry, storage).
+    ///
+    /// Required for environments without default plugin loaders (iOS, embedded).
+    /// When not called, `build()` uses platform defaults (Extism + Native loaders,
+    /// SQLite at the default db path).
+    pub fn infra(mut self, infra: AgentInfra) -> Self {
+        self.infra = Some(infra);
+        self
+    }
+
+    /// Set the maximum number of execution steps.
+    pub fn max_steps(mut self, n: usize) -> Self {
+        self.max_steps_override = Some(n);
+        self
+    }
+
+    /// Set the maximum prompt size in bytes.
+    pub fn max_prompt_bytes(mut self, n: usize) -> Self {
+        self.max_prompt_bytes_override = Some(n);
+        self
+    }
+
+    /// Set the execution timeout in seconds.
+    pub fn execution_timeout_secs(mut self, secs: u64) -> Self {
+        self.execution_timeout_secs_override = Some(secs);
+        self
+    }
+
+    /// Set the full execution policy.
+    pub fn execution_policy(mut self, policy: ExecutionPolicy) -> Self {
+        self.execution = Some(policy);
+        self
+    }
+
+    /// Configure skills.
+    pub fn skills(mut self, config: SkillsConfig) -> Self {
+        self.skills_config = Some(config);
+        self
+    }
+
+    /// Set whether to assume all tools are mutating.
+    pub fn assume_mutating(mut self, yes: bool) -> Self {
+        self.assume_mutating = Some(yes);
+        self
+    }
+
+    /// Set specific tools to be considered mutating.
+    pub fn mutating_tools(mut self, tools: Vec<String>) -> Self {
+        self.mutating_tools = Some(tools);
+        self
+    }
+
     /// Add a middleware to the agent using a factory closure.
     ///
     /// The closure receives a reference to the constructed `AgentHandle`,
@@ -140,7 +237,7 @@ impl AgentBuilder {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use querymt_agent::simple::Agent;
+    /// use querymt_agent::api::Agent;
     /// use querymt_agent::middleware::DedupCheckMiddleware;
     ///
     /// # #[tokio::main]
@@ -188,12 +285,33 @@ impl AgentBuilder {
             .llm_config
             .ok_or_else(|| anyhow!("LLM configuration is required (call .provider() first)"))?;
 
-        let plugin_registry = Arc::new(default_registry().await?);
-        let db_path = match self.db_path {
-            Some(path) => path,
-            None => default_agent_db_path()?,
+        let (plugin_registry, backend): (
+            Arc<querymt::plugin::host::PluginRegistry>,
+            Arc<dyn StorageBackend>,
+        ) = match self.infra {
+            Some(infra) => {
+                let storage = match infra.storage {
+                    Some(s) => s,
+                    None => {
+                        let db_path = match self.db_path {
+                            Some(path) => path,
+                            None => default_agent_db_path()?,
+                        };
+                        Arc::new(SqliteStorage::connect(db_path).await?)
+                    }
+                };
+                (infra.plugin_registry, storage)
+            }
+            None => {
+                let registry = Arc::new(default_registry().await?);
+                let db_path = match self.db_path {
+                    Some(path) => path,
+                    None => default_agent_db_path()?,
+                };
+                let storage = Arc::new(SqliteStorage::connect(db_path).await?);
+                (registry, storage)
+            }
         };
-        let backend = SqliteStorage::connect(db_path).await?;
 
         let mut builder = AgentConfigBuilder::new(
             plugin_registry,
@@ -214,6 +332,17 @@ impl AgentBuilder {
         }
         if let Some(mutating_tools) = self.mutating_tools {
             builder = builder.with_mutating_tools(mutating_tools);
+        }
+
+        // Apply execution overrides from builder methods
+        if let Some(max_steps) = self.max_steps_override {
+            builder = builder.with_max_steps(max_steps);
+        }
+        if let Some(max_prompt_bytes) = self.max_prompt_bytes_override {
+            builder = builder.with_max_prompt_bytes(max_prompt_bytes);
+        }
+        if let Some(execution_timeout_secs) = self.execution_timeout_secs_override {
+            builder = builder.with_execution_timeout_secs(execution_timeout_secs);
         }
 
         // Initialize skills system if enabled
@@ -296,19 +425,8 @@ impl AgentBuilder {
             builder = builder.with_mcp_servers(self.mcp_servers.clone());
         }
 
-        if let Some(exec) = self.execution {
-            use crate::config::RuntimeExecutionPolicy;
-            builder = builder.with_execution_policy(RuntimeExecutionPolicy::from(&exec));
-            match exec.snapshot.backend.as_str() {
-                "git" => {
-                    use crate::snapshot::git::GitSnapshotBackend;
-                    builder = builder.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
-                }
-                "none" | "" => {}
-                other => {
-                    log::warn!("Unknown snapshot backend '{}', ignoring", other);
-                }
-            }
+        if let Some(ref exec) = self.execution {
+            builder = builder.with_snapshot_from_execution(exec);
         }
 
         // Build initial config for middleware factories (temporary handle)
@@ -355,44 +473,23 @@ impl AgentBuilder {
             }
         }
 
-        // Build final AgentConfig with all middleware appended
-        let final_config = Arc::new(crate::agent::AgentConfig {
-            provider: initial_config.provider.clone(),
+        // Drop the temporary handle so Arc::try_unwrap can succeed
+        // (avoids a full clone of AgentConfig).
+        drop(temp_handle);
 
-            event_sink: initial_config.event_sink.clone(),
-            agent_registry: initial_config.agent_registry.clone(),
-            workspace_manager_actor: initial_config.workspace_manager_actor.clone(),
-            default_mode: initial_config.default_mode.clone(),
-            tool_config: initial_config.tool_config.clone(),
-            tool_registry: initial_config.tool_registry.clone(),
-            middleware_drivers,
-            auth_methods: initial_config.auth_methods.clone(),
-            max_steps: initial_config.max_steps,
-            snapshot_policy: initial_config.snapshot_policy,
-            assume_mutating: initial_config.assume_mutating,
-            mutating_tools: initial_config.mutating_tools.clone(),
-            max_prompt_bytes: initial_config.max_prompt_bytes,
-            execution_timeout_secs: initial_config.execution_timeout_secs,
-            delegation_wait_policy: initial_config.delegation_wait_policy.clone(),
-            delegation_wait_timeout_secs: initial_config.delegation_wait_timeout_secs,
-            delegation_cancel_grace_secs: initial_config.delegation_cancel_grace_secs,
-            execution_policy: initial_config.execution_policy.clone(),
-            compaction: initial_config.compaction.clone(),
-            snapshot_backend: initial_config.snapshot_backend.clone(),
-            snapshot_gc_config: initial_config.snapshot_gc_config.clone(),
-            delegation_context_config: initial_config.delegation_context_config.clone(),
-            pending_elicitations: initial_config.pending_elicitations.clone(),
-            mcp_servers: initial_config.mcp_servers.clone(),
-        });
+        // Build final AgentConfig with middleware swapped in
+        let initial = Arc::try_unwrap(initial_config).unwrap_or_else(|arc| (*arc).clone());
+        let final_config = Arc::new(initial.with_middleware(middleware_drivers));
 
         let handle = Arc::new(AgentHandle::from_config(final_config));
 
         Ok(Agent {
             inner: handle,
-            storage: Arc::new(backend),
+            storage: backend,
             default_session_id: Arc::new(Mutex::new(None)),
             cwd,
             callbacks: Arc::new(EventCallbacksState::new(None)),
+            quorum: None,
         })
     }
 }
@@ -401,9 +498,12 @@ pub struct Agent {
     pub(super) inner: Arc<AgentHandle>,
     #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
     pub(super) storage: Arc<dyn StorageBackend>,
-    default_session_id: Arc<Mutex<Option<String>>>,
+    pub(super) default_session_id: Arc<Mutex<Option<String>>>,
     pub(super) cwd: Option<PathBuf>,
-    callbacks: Arc<EventCallbacksState>,
+    pub(super) callbacks: Arc<EventCallbacksState>,
+    /// Present when this agent was built with `Agent::multi()`.
+    /// Holds the quorum orchestrator for delegate access.
+    pub(super) quorum: Option<crate::quorum::AgentQuorum>,
 }
 
 impl Agent {
@@ -453,7 +553,11 @@ impl Agent {
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
-        self.inner.subscribe_events()
+        if let Some(quorum) = &self.quorum {
+            quorum.subscribe_events()
+        } else {
+            self.inner.subscribe_events()
+        }
     }
 
     pub fn on_tool_call<F>(&self, callback: F) -> &Self
@@ -461,8 +565,7 @@ impl Agent {
         F: Fn(String, Value) + Send + Sync + 'static,
     {
         self.callbacks.on_tool_call(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
+        self.callbacks.ensure_listener(self.subscribe());
         self
     }
 
@@ -471,8 +574,7 @@ impl Agent {
         F: Fn(String, String) + Send + Sync + 'static,
     {
         self.callbacks.on_tool_complete(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
+        self.callbacks.ensure_listener(self.subscribe());
         self
     }
 
@@ -481,8 +583,7 @@ impl Agent {
         F: Fn(String, String) + Send + Sync + 'static,
     {
         self.callbacks.on_message(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
+        self.callbacks.ensure_listener(self.subscribe());
         self
     }
 
@@ -491,8 +592,7 @@ impl Agent {
         F: Fn(String, String) + Send + Sync + 'static,
     {
         self.callbacks.on_delegation(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
+        self.callbacks.ensure_listener(self.subscribe());
         self
     }
 
@@ -501,8 +601,7 @@ impl Agent {
         F: Fn(String) + Send + Sync + 'static,
     {
         self.callbacks.on_error(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
+        self.callbacks.ensure_listener(self.subscribe());
         self
     }
 
@@ -560,6 +659,28 @@ impl Agent {
         self.inner.clone()
     }
 
+    /// Returns `true` if this agent was built with `Agent::multi()`.
+    pub fn is_multi(&self) -> bool {
+        self.quorum.is_some()
+    }
+
+    /// Access the quorum orchestrator (returns `None` for single agents).
+    pub fn quorum(&self) -> Option<&crate::quorum::AgentQuorum> {
+        self.quorum.as_ref()
+    }
+
+    /// Access the planner handle (returns `None` for single agents).
+    ///
+    /// For single agents, use `.handle()` instead.
+    pub fn planner(&self) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
+        self.quorum.as_ref().map(|q| q.planner())
+    }
+
+    /// Access a delegate handle by ID (returns `None` for single agents or if not found).
+    pub fn delegate(&self, id: &str) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
+        self.quorum.as_ref().and_then(|q| q.delegate(id))
+    }
+
     async fn ensure_default_session(&self) -> Result<String> {
         if let Some(existing) = self.default_session_id.lock().unwrap().clone() {
             return Ok(existing);
@@ -602,7 +723,32 @@ impl Agent {
         latest_assistant_message(&history).ok_or_else(|| anyhow!("No assistant response found"))
     }
 
-    /// Build an Agent from a single agent config
+    /// Create from a serializable config + custom infrastructure.
+    ///
+    /// This is the primary construction path for FFI callers (iOS, embedded)
+    /// who have their own plugin registry and storage backend.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use querymt_agent::prelude::*;
+    /// use std::sync::Arc;
+    ///
+    /// # async fn example(config: SingleAgentConfig, registry: querymt::plugin::host::PluginRegistry, storage: Arc<dyn querymt_agent::session::backend::StorageBackend>) {
+    /// let agent = Agent::from_config(config, AgentInfra {
+    ///     plugin_registry: Arc::new(registry),
+    ///     storage: Some(storage),
+    /// }).await.unwrap();
+    /// agent.chat("hello").await.unwrap();
+    /// # }
+    /// ```
+    pub async fn from_config(config: SingleAgentConfig, infra: AgentInfra) -> Result<Self> {
+        let mut builder = Self::builder_from_config(config, None)?;
+        builder = builder.infra(infra);
+        builder.build().await
+    }
+
+    /// Build an Agent from a single agent config (default infrastructure).
     pub async fn from_single_config(config: SingleAgentConfig) -> Result<Self> {
         let builder = Self::builder_from_config(config, None)?;
         builder.build().await
@@ -634,8 +780,11 @@ impl Agent {
         Ok(agent)
     }
 
-    /// Shared helper: configure an `AgentBuilder` from a `SingleAgentConfig`.
-    fn builder_from_config(
+    /// Configure an `AgentBuilder` from a `SingleAgentConfig`.
+    ///
+    /// Returns the builder before `build()` is called, allowing further
+    /// customization (e.g., `.infra()`, `.middleware()`).
+    pub fn builder_from_config(
         config: SingleAgentConfig,
         initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
     ) -> Result<AgentBuilder> {
@@ -695,8 +844,20 @@ impl ChatRunner for Agent {
     }
 
     async fn chat_session(&self) -> Result<Box<dyn ChatSession>> {
-        let session = Agent::chat_session(self).await?;
-        Ok(Box::new(session))
+        if let Some(quorum) = &self.quorum {
+            let session_id = self.create_session().await?;
+            let session = super::quorum::QuorumSession::new(
+                quorum.planner(),
+                quorum.event_fanout(),
+                quorum.store(),
+                session_id,
+                self.cwd.clone(),
+            );
+            Ok(Box::new(session))
+        } else {
+            let session = Agent::chat_session(self).await?;
+            Ok(Box::new(session))
+        }
     }
 
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
@@ -705,32 +866,27 @@ impl ChatRunner for Agent {
 
     fn on_tool_call_boxed(&self, callback: Box<dyn Fn(String, Value) + Send + Sync>) {
         self.callbacks.on_tool_call(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
+        self.callbacks.ensure_listener(Agent::subscribe(self));
     }
 
     fn on_tool_complete_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_tool_complete(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
+        self.callbacks.ensure_listener(Agent::subscribe(self));
     }
 
     fn on_message_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_message(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
+        self.callbacks.ensure_listener(Agent::subscribe(self));
     }
 
     fn on_delegation_boxed(&self, callback: Box<dyn Fn(String, String) + Send + Sync>) {
         self.callbacks.on_delegation(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
+        self.callbacks.ensure_listener(Agent::subscribe(self));
     }
 
     fn on_error_boxed(&self, callback: Box<dyn Fn(String) + Send + Sync>) {
         self.callbacks.on_error(callback);
-        self.callbacks
-            .ensure_listener(self.inner.subscribe_events());
+        self.callbacks.ensure_listener(Agent::subscribe(self));
     }
 
     #[cfg(feature = "dashboard")]
