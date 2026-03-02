@@ -74,7 +74,7 @@ regex.workspace = true
 srgn = "0.14"
 tokio-util = { version = "0.7", features = ["compat"] }
 base64.workspace = true
-infer = "0.16"
+infer = "0.19"
 rayon = "1.11"
 indexmap = { version = "2", features = ["serde"] }
 gray_matter = "0.3"

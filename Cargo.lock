@@ -5678,18 +5678,12 @@ dependencies = [
 
 [[package]]
 name = "infer"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc150e5ce2330295b8616ce0e3f53250e53af31759a9dbedad1621ba29151847"
-dependencies = [
- "cfb",
-]
-
-[[package]]
-name = "infer"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a588916bfdfd92e71cacef98a63d9b1f0d74d6599980d11894290e7ddefffcf7"
+dependencies = [
+ "cfb",
+]
 
 [[package]]
 name = "inotify"
@@ -9593,7 +9587,7 @@ dependencies = [
  "encoding_rs",
  "env_logger",
  "futures",
- "infer 0.19.0",
+ "infer",
  "llama-cpp-2",
  "log",
  "querymt",
@@ -9799,7 +9793,7 @@ dependencies = [
  "iana-time-zone",
  "ignore",
  "indexmap 2.13.0",
- "infer 0.16.0",
+ "infer",
  "kameo",
  "libp2p",
  "log",
@@ -12372,7 +12366,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82a72c767771b47409d2345987fda8628641887d5466101319899796367354a0"
 dependencies = [
  "fastrand",
- "getrandom 0.4.1",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.59.0",
