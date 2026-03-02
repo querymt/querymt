@@ -12,7 +12,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^0.12.0",
+    "@agentclientprotocol/sdk": "^0.14.0",
     "@pierre/diffs": "^1.0.4",
     "@radix-ui/react-accordion": "^1.2.12",
     "@radix-ui/react-collapsible": "^1.1.12",
