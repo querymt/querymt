@@ -26,6 +26,7 @@ use log::{debug, info, warn};
 use querymt::chat::ChatRole;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, instrument};
 use uuid::Uuid;
@@ -961,6 +962,12 @@ impl Message<Prompt> for SessionActor {
         // older detached tasks cannot mutate current state.
         self.turn_state.generation = self.turn_state.generation.saturating_add(1);
         let prompt_generation = self.turn_state.generation;
+
+        // Mirror generation into shared runtime so middleware can make turn-scoped
+        // decisions without depending on actor-local TurnState.
+        self.runtime
+            .turn_generation
+            .store(prompt_generation, Ordering::SeqCst);
 
         // Only create a fresh token when the previous token was already cancelled.
         // Otherwise keep the token so Cancel still reaches the currently-running task
