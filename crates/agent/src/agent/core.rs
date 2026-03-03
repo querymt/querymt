@@ -6,6 +6,7 @@ use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::OnceCell;
 
 /// Runtime operating mode for the agent.
@@ -187,6 +188,10 @@ pub struct SessionRuntime {
     pub pre_turn_snapshot_task: PreTurnSnapshotTask,
     /// Accumulated changed file paths across the entire turn (for end-of-turn dedup check)
     pub turn_diffs: ParkingMutex<crate::index::DiffPaths>,
+    /// Monotonic prompt generation id for this session.
+    /// Incremented by SessionActor when accepting a new prompt and mirrored here
+    /// so middleware can make turn-scoped decisions without actor-local state.
+    pub turn_generation: AtomicU64,
     /// Execution permit ensuring only one prompt runs at a time for this session.
     /// Uses a semaphore with capacity 1 to guarantee FIFO ordering of concurrent prompts.
     /// This prevents race conditions where user messages are inserted between
@@ -219,6 +224,7 @@ impl SessionRuntime {
             turn_snapshot: ParkingMutex::new(None),
             pre_turn_snapshot_task: ParkingMutex::new(None),
             turn_diffs: ParkingMutex::new(Default::default()),
+            turn_generation: AtomicU64::new(0),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
