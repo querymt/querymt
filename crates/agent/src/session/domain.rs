@@ -3,8 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use typeshare::typeshare;
 
 /// Task kind determines lifecycle and completion semantics
+#[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -17,6 +19,7 @@ pub enum TaskKind {
 }
 
 /// Task status tracks current state
+#[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -27,6 +30,7 @@ pub enum TaskStatus {
 }
 
 /// A unit of work within a session
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     #[serde(skip)]
@@ -39,12 +43,15 @@ pub struct Task {
     pub expected_deliverable: Option<String>,
     pub acceptance_criteria: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
     pub updated_at: OffsetDateTime,
 }
 
 /// Snapshot of current user intent at a point in time (internal only)
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentSnapshot {
     #[serde(skip)]
@@ -60,10 +67,12 @@ pub struct IntentSnapshot {
     /// Hint for next action
     pub next_step_hint: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
     pub created_at: OffsetDateTime,
 }
 
 /// Decision status
+#[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionStatus {
@@ -72,6 +81,7 @@ pub enum DecisionStatus {
 }
 
 /// Records a decision made during task execution (internal only)
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {
     #[serde(skip)]
@@ -84,10 +94,12 @@ pub struct Decision {
     pub rationale: Option<String>,
     pub status: DecisionStatus,
     #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
     pub created_at: OffsetDateTime,
 }
 
 /// Alternative status
+#[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlternativeStatus {
@@ -96,6 +108,7 @@ pub enum AlternativeStatus {
 }
 
 /// Alternative approach considered (internal only)
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Alternative {
     #[serde(skip)]
@@ -107,10 +120,12 @@ pub struct Alternative {
     pub description: String,
     pub status: AlternativeStatus,
     #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
     pub created_at: OffsetDateTime,
 }
 
 /// Progress entry kind
+#[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgressKind {
@@ -121,6 +136,7 @@ pub enum ProgressKind {
 }
 
 /// Records a step of progress during task execution (internal only)
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgressEntry {
     #[serde(skip)]
@@ -134,10 +150,12 @@ pub struct ProgressEntry {
     /// JSON metadata for extensibility
     pub metadata: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
     pub created_at: OffsetDateTime,
 }
 
 /// Artifact produced during task execution (internal only)
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     #[serde(skip)]
@@ -151,10 +169,12 @@ pub struct Artifact {
     pub path: Option<String>,
     pub summary: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
     pub created_at: OffsetDateTime,
 }
 
 /// Delegation status
+#[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationStatus {
@@ -166,6 +186,7 @@ pub enum DelegationStatus {
 }
 
 /// Agent-to-agent delegation record
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Delegation {
     #[serde(skip)]
@@ -178,12 +199,14 @@ pub struct Delegation {
     pub target_agent_id: String,
     pub objective: String,
     /// Rapidhash of objective for deduplication tracking
+    #[typeshare(serialized_as = "number")]
     pub objective_hash: crate::hash::RapidHash,
     pub context: Option<String>,
     pub constraints: Option<String>,
     pub expected_output: Option<String>,
     /// Optional structured verification specification (preferred over parsing expected_output)
     #[serde(default)]
+    #[typeshare(serialized_as = "any")]
     pub verification_spec: Option<crate::verification::VerificationSpec>,
     /// AI-generated summary of parent planning conversation for coder context
     pub planning_summary: Option<String>,
@@ -191,12 +214,15 @@ pub struct Delegation {
     /// Number of retry attempts for this objective
     pub retry_count: u32,
     #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339::option")]
+    #[typeshare(serialized_as = "Option<string>")]
     pub completed_at: Option<OffsetDateTime>,
 }
 
 /// Fork point type
+#[typeshare]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForkPointType {
@@ -205,6 +231,7 @@ pub enum ForkPointType {
 }
 
 /// Fork origin (why the fork happened)
+#[typeshare]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForkOrigin {

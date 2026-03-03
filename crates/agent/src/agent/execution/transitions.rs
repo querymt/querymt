@@ -10,6 +10,7 @@ use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::session_actor::ensure_pre_turn_snapshot_ready;
+use crate::agent::utils::u32_from_usize;
 use crate::events::{AgentEventKind, ExecutionMetrics, StopType};
 use crate::middleware::{
     ExecutionState, LlmResponse, ToolCall as MiddlewareToolCall, ToolFunction, ToolResult,
@@ -143,7 +144,11 @@ pub(super) async fn transition_call_llm(
     config.emit_event(
         session_id,
         AgentEventKind::LlmRequestStart {
-            message_count: context.messages.len(),
+            message_count: u32_from_usize(
+                context.messages.len(),
+                "context.messages.len",
+                Some(session_id),
+            ),
         },
     );
 
@@ -459,14 +464,18 @@ pub(super) async fn transition_call_llm(
         session_id,
         AgentEventKind::LlmRequestEnd {
             usage: usage.clone(),
-            tool_calls: tool_calls.len(),
+            tool_calls: u32_from_usize(tool_calls.len(), "tool_calls.len", Some(session_id)),
             finish_reason,
             cost_usd: request_cost,
             cumulative_cost_usd: cumulative_cost,
             context_tokens,
             metrics: ExecutionMetrics {
-                steps: context.stats.steps + 1,
-                turns: context.stats.turns,
+                steps: u32_from_usize(
+                    context.stats.steps.saturating_add(1),
+                    "context.stats.steps + 1",
+                    Some(session_id),
+                ),
+                turns: u32_from_usize(context.stats.turns, "context.stats.turns", Some(session_id)),
             },
         },
     );

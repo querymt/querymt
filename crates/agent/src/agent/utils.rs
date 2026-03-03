@@ -1,6 +1,7 @@
 //! Utility functions for the agent
 
 use agent_client_protocol::{ContentBlock, EmbeddedResourceResource, ToolCallLocation, ToolKind};
+use log::warn;
 
 const ATTACHMENTS_DISPLAY_FALLBACK: &str = "(attachments included)";
 
@@ -147,6 +148,32 @@ pub fn extract_locations(args: &serde_json::Value) -> Vec<ToolCallLocation> {
         locations.push(ToolCallLocation::new(root));
     }
     locations
+}
+
+/// Convert usize to u32 for wire-facing payloads, logging and clamping on overflow.
+pub fn u32_from_usize(value: usize, field_name: &str, session_id: Option<&str>) -> u32 {
+    match u32::try_from(value) {
+        Ok(v) => v,
+        Err(_) => {
+            if let Some(session_id) = session_id {
+                warn!(
+                    "Session {}: {} overflowed u32 ({}), clamping to {}",
+                    session_id,
+                    field_name,
+                    value,
+                    u32::MAX
+                );
+            } else {
+                warn!(
+                    "{} overflowed u32 ({}), clamping to {}",
+                    field_name,
+                    value,
+                    u32::MAX
+                );
+            }
+            u32::MAX
+        }
+    }
 }
 
 #[cfg(test)]

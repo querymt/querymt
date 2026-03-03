@@ -9,9 +9,13 @@ use crate::session::projection::AuditView;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use typeshare::typeshare;
 
+/// A block of content in a UI prompt (text or resource reference).
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum UiPromptBlock {
     Text {
         text: String,
@@ -25,7 +29,8 @@ pub enum UiPromptBlock {
 }
 
 /// Information about an available agent for the UI.
-#[derive(Debug, Clone, Serialize)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiAgentInfo {
     pub id: String,
     pub name: String,
@@ -34,6 +39,7 @@ pub struct UiAgentInfo {
 }
 
 /// Routing mode for message distribution.
+#[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingMode {
@@ -42,7 +48,8 @@ pub enum RoutingMode {
 }
 
 /// Cached model list entry with canonical identity.
-#[derive(Debug, Clone, Serialize)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
     /// Canonical internal identifier (e.g., "hf:repo:file.gguf", "file:/path/to/model.gguf", or provider-specific ID)
     pub id: String,
@@ -68,14 +75,16 @@ pub struct ModelEntry {
     pub quant: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderCapabilityEntry {
     pub provider: String,
     pub supports_custom_models: bool,
 }
 
 /// Recent model usage entry from event history.
-#[derive(Debug, Clone, Serialize)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecentModelEntry {
     pub provider: String,
     pub model: String,
@@ -84,7 +93,8 @@ pub struct RecentModelEntry {
 }
 
 /// OAuth authentication status for a provider.
-#[derive(Debug, Clone, Serialize)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthStatus {
     NotAuthenticated,
@@ -95,7 +105,8 @@ pub enum OAuthStatus {
 pub use querymt_utils::OAuthFlowKind;
 
 /// OAuth-capable provider entry for dashboard auth UI.
-#[derive(Debug, Clone, Serialize)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthProviderEntry {
     pub provider: String,
     pub display_name: String,
@@ -103,7 +114,8 @@ pub struct AuthProviderEntry {
 }
 
 /// Summary of a session for listing.
-#[derive(Serialize)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session_id: String,
     pub name: Option<String>,
@@ -124,6 +136,7 @@ pub struct SessionSummary {
 }
 
 /// Information about a remote node discovered in the kameo mesh.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteNodeInfo {
     /// Stable mesh node id (PeerId string).
@@ -133,11 +146,12 @@ pub struct RemoteNodeInfo {
     /// Node capabilities
     pub capabilities: Vec<String>,
     /// Number of active sessions on the node
-    pub active_sessions: usize,
+    pub active_sessions: u32,
 }
 
 /// Group of sessions by working directory.
-#[derive(Serialize)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionGroup {
     pub cwd: Option<String>,
     pub sessions: Vec<SessionSummary>,
@@ -145,8 +159,10 @@ pub struct SessionGroup {
 }
 
 /// Messages from UI client to server.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum UiClientMessage {
     Init,
     SetActiveAgent {
@@ -190,6 +206,7 @@ pub enum UiClientMessage {
     GetFileIndex,
     /// Request LLM config details by config_id
     GetLlmConfig {
+        #[typeshare(serialized_as = "number")]
         config_id: i64,
     },
     /// Cancel the active session for the current agent
@@ -218,6 +235,7 @@ pub enum UiClientMessage {
     ElicitationResponse {
         elicitation_id: String,
         action: String,
+        #[typeshare(serialized_as = "any")]
         content: Option<serde_json::Value>,
     },
     /// List configured OAuth-capable providers and their auth status
@@ -292,30 +310,181 @@ pub enum UiClientMessage {
     UpdatePlugins,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UndoStackFrame {
     pub message_id: String,
 }
 
 /// Result of updating a single OCI plugin, reported in `PluginUpdateComplete`.
-#[derive(Debug, Clone, Serialize)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginUpdateResult {
     pub plugin_name: String,
     pub success: bool,
     pub message: Option<String>,
 }
 
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StreamCursor {
     #[serde(default)]
+    #[typeshare(serialized_as = "number")]
     pub local_seq: u64,
     #[serde(default)]
+    #[typeshare(serialized_as = "Record<string, number>")]
     pub remote_seq_by_source: HashMap<String, u64>,
 }
 
+// ============================================================================
+// Typeshare mirror types for upstream crate types
+// ============================================================================
+// These mirror structs exist solely to generate TypeScript/Swift types for
+// upstream types (from `querymt`, `querymt_utils`, etc.) that cannot be
+// annotated with `#[typeshare]` directly because they live in separate crates
+// without `typeshare` as a dependency.
+
+/// Mirror of `querymt::Usage` for typeshare generation.
+/// Fields match the serialized JSON shape of the upstream type.
+///
+/// Note: kept for typeshare output; may be unused in Rust code paths.
+#[allow(dead_code)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageInfo {
+    #[serde(default)]
+    pub input_tokens: u32,
+    #[serde(default)]
+    pub output_tokens: u32,
+    #[serde(default)]
+    pub reasoning_tokens: u32,
+    #[serde(default)]
+    pub cache_read: u32,
+    #[serde(default)]
+    pub cache_write: u32,
+}
+
+impl From<querymt::Usage> for UsageInfo {
+    fn from(u: querymt::Usage) -> Self {
+        Self {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            reasoning_tokens: u.reasoning_tokens,
+            cache_read: u.cache_read,
+            cache_write: u.cache_write,
+        }
+    }
+}
+
+/// Mirror of `querymt::chat::FunctionTool` for typeshare generation.
+/// Note: kept for typeshare output; may be unused in Rust code paths.
+#[allow(dead_code)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionToolInfo {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the function parameters
+    #[typeshare(serialized_as = "any")]
+    pub parameters: serde_json::Value,
+}
+
+/// Mirror of `querymt::chat::Tool` for typeshare generation.
+/// Note: kept for typeshare output; may be unused in Rust code paths.
+#[allow(dead_code)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolInfo {
+    /// The type of tool (e.g. "function")
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    /// The function definition
+    pub function: FunctionToolInfo,
+}
+
+impl From<&querymt::chat::Tool> for ToolInfo {
+    fn from(t: &querymt::chat::Tool) -> Self {
+        Self {
+            tool_type: t.tool_type.clone(),
+            function: FunctionToolInfo {
+                name: t.function.name.clone(),
+                description: t.function.description.clone(),
+                parameters: t.function.parameters.clone(),
+            },
+        }
+    }
+}
+
+/// Known values for `EventOrigin`, exposed for TypeScript/Swift type safety.
+///
+/// The real `EventOrigin` has a custom Serialize/Deserialize impl that
+/// serializes to plain strings (`"local"`, `"remote"`, or any other string
+/// for the `Unknown` variant). The `Unknown(String)` catch-all prevents
+/// standard serde enum derivation, so `#[typeshare]` can't be applied to
+/// the original type. The `origin` fields on events use
+/// `serialized_as = "string"` because any string value is valid at runtime.
+///
+/// This enum provides the known discriminants for TS/Swift code to compare against.
+/// Note: kept for typeshare output; may be unused in Rust code paths.
+#[allow(dead_code)]
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventOriginKind {
+    Local,
+    Remote,
+}
+
+/// Mirror of `querymt_utils::OAuthFlowKind` for typeshare generation.
+/// Matches the serialized JSON values of the upstream enum.
+/// Note: kept for typeshare output; may be unused in Rust code paths.
+#[allow(dead_code)]
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthFlowKindTs {
+    /// Redirect/callback flow where the user pastes the callback URL or code.
+    RedirectCode,
+    /// Device flow where the backend polls the provider's token endpoint.
+    DevicePoll,
+}
+
+/// Mirror of `querymt::mcp::config::McpServerConfig` for typeshare generation.
+/// Note: kept for typeshare output; may be unused in Rust code paths.
+#[allow(dead_code)]
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerInfo {
+    pub name: String,
+    /// Transport protocol: "http" or "stdio"
+    pub protocol: String,
+    /// URL for HTTP transport, command for stdio transport
+    pub endpoint: String,
+}
+
+impl From<&crate::config::McpServerConfig> for McpServerInfo {
+    fn from(c: &crate::config::McpServerConfig) -> Self {
+        let (protocol, endpoint) = match c {
+            crate::config::McpServerConfig::Http { name: _, url, .. } => {
+                ("http".into(), url.into())
+            }
+            crate::config::McpServerConfig::Stdio {
+                name: _, command, ..
+            } => ("stdio".into(), command.clone()),
+        };
+        Self {
+            name: c.name().into(),
+            protocol,
+            endpoint,
+        }
+    }
+}
+
 /// Messages from server to UI client.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
 #[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum UiServerMessage {
     State {
         routing_mode: RoutingMode,
@@ -342,6 +511,7 @@ pub enum UiServerMessage {
         session_id: String,
         agent_id: String,
         events: Vec<EventEnvelope>,
+        #[typeshare(serialized_as = "StreamCursor")]
         cursor: StreamCursor,
     },
     Error {
@@ -355,6 +525,7 @@ pub enum UiServerMessage {
         agent_id: String,
         audit: AuditView,
         undo_stack: Vec<UndoStackFrame>,
+        #[typeshare(serialized_as = "StreamCursor")]
         cursor: StreamCursor,
     },
     WorkspaceIndexStatus {
@@ -375,13 +546,16 @@ pub enum UiServerMessage {
     /// File index for autocomplete
     FileIndex {
         files: Vec<FileIndexEntry>,
+        #[typeshare(serialized_as = "number")]
         generated_at: u64,
     },
     /// LLM config details response
     LlmConfig {
+        #[typeshare(serialized_as = "number")]
         config_id: i64,
         provider: String,
         model: String,
+        #[typeshare(serialized_as = "any")]
         params: Option<Value>,
     },
     /// Result of an undo operation
@@ -419,6 +593,7 @@ pub enum UiServerMessage {
         flow_id: String,
         provider: String,
         authorization_url: String,
+        #[typeshare(serialized_as = "OAuthFlowKindTs")]
         flow_kind: OAuthFlowKind,
     },
     /// OAuth flow completion result
@@ -443,10 +618,14 @@ pub enum UiServerMessage {
         provider: String,
         model_id: String,
         status: String,
+        #[typeshare(serialized_as = "number")]
         bytes_downloaded: u64,
+        #[typeshare(serialized_as = "Option<number>")]
         bytes_total: Option<u64>,
         percent: Option<f32>,
+        #[typeshare(serialized_as = "Option<number>")]
         speed_bps: Option<u64>,
+        #[typeshare(serialized_as = "Option<number>")]
         eta_seconds: Option<u64>,
         message: Option<String>,
     },
@@ -455,7 +634,9 @@ pub enum UiServerMessage {
         plugin_name: String,
         image_reference: String,
         phase: String,
+        #[typeshare(serialized_as = "number")]
         bytes_downloaded: u64,
+        #[typeshare(serialized_as = "Option<number>")]
         bytes_total: Option<u64>,
         percent: Option<f32>,
         message: Option<String>,
@@ -504,13 +685,18 @@ mod tests {
     use super::{OAuthFlowKind, PluginUpdateResult, UiClientMessage, UiServerMessage};
     use serde_json::json;
 
+    // Note: All UiClientMessage and UiServerMessage tests use adjacently tagged serde format:
+    //   client sends: {"type": "variant_name", "data": { ...fields... }}
+    //   server sends: {"type": "variant_name", "data": { ...fields... }}
+    // Unit variants (no fields) serialize as: {"type": "variant_name"}
+
     #[test]
     fn deserializes_start_oauth_login_tag() {
         let current: UiClientMessage = serde_json::from_value(json!({
             "type": "start_oauth_login",
-            "provider": "openai"
+            "data": { "provider": "openai" }
         }))
-        .expect("current start_oauth_login tag should deserialize");
+        .expect("start_oauth_login should deserialize with data wrapper");
 
         match current {
             UiClientMessage::StartOAuthLogin { provider } => assert_eq!(provider, "openai"),
@@ -522,10 +708,9 @@ mod tests {
     fn deserializes_complete_oauth_login_tag() {
         let current: UiClientMessage = serde_json::from_value(json!({
             "type": "complete_oauth_login",
-            "flow_id": "flow-1",
-            "response": "code"
+            "data": { "flow_id": "flow-1", "response": "code" }
         }))
-        .expect("current complete_oauth_login tag should deserialize");
+        .expect("complete_oauth_login should deserialize with data wrapper");
 
         match current {
             UiClientMessage::CompleteOAuthLogin { flow_id, response } => {
@@ -540,9 +725,9 @@ mod tests {
     fn deserializes_disconnect_oauth_tag() {
         let current: UiClientMessage = serde_json::from_value(json!({
             "type": "disconnect_oauth",
-            "provider": "openai"
+            "data": { "provider": "openai" }
         }))
-        .expect("current disconnect_oauth tag should deserialize");
+        .expect("disconnect_oauth should deserialize with data wrapper");
 
         match current {
             UiClientMessage::DisconnectOAuth { provider } => assert_eq!(provider, "openai"),
@@ -554,9 +739,9 @@ mod tests {
     fn deserializes_delete_session_tag() {
         let msg: UiClientMessage = serde_json::from_value(json!({
             "type": "delete_session",
-            "session_id": "sess-123"
+            "data": { "session_id": "sess-123" }
         }))
-        .expect("delete_session should deserialize");
+        .expect("delete_session should deserialize with data wrapper");
 
         match msg {
             UiClientMessage::DeleteSession { session_id } => {
@@ -570,9 +755,9 @@ mod tests {
     fn deserializes_fork_session_tag() {
         let msg: UiClientMessage = serde_json::from_value(json!({
             "type": "fork_session",
-            "message_id": "msg-123"
+            "data": { "message_id": "msg-123" }
         }))
-        .expect("fork_session should deserialize");
+        .expect("fork_session should deserialize with data wrapper");
 
         match msg {
             UiClientMessage::ForkSession { message_id } => {
@@ -588,10 +773,9 @@ mod tests {
     fn create_remote_session_accepts_node_id_field() {
         let msg: UiClientMessage = serde_json::from_value(json!({
             "type": "create_remote_session",
-            "node_id": "peer-abc",
-            "cwd": "/tmp"
+            "data": { "node_id": "peer-abc", "cwd": "/tmp" }
         }))
-        .expect("node_id field should deserialize");
+        .expect("node_id field should deserialize with data wrapper");
 
         match msg {
             UiClientMessage::CreateRemoteSession { node_id, cwd, .. } => {
@@ -606,10 +790,9 @@ mod tests {
     fn create_remote_session_accepts_node_alias() {
         let msg: UiClientMessage = serde_json::from_value(json!({
             "type": "create_remote_session",
-            "node": "peer-abc",
-            "cwd": "/tmp"
+            "data": { "node": "peer-abc", "cwd": "/tmp" }
         }))
-        .expect("node alias should deserialize to node_id");
+        .expect("node alias should deserialize to node_id with data wrapper");
 
         match msg {
             UiClientMessage::CreateRemoteSession { node_id, cwd, .. } => {
@@ -624,9 +807,9 @@ mod tests {
     fn list_remote_sessions_accepts_node_alias() {
         let msg: UiClientMessage = serde_json::from_value(json!({
             "type": "list_remote_sessions",
-            "node": "peer-xyz"
+            "data": { "node": "peer-xyz" }
         }))
-        .expect("node alias should deserialize to node_id");
+        .expect("node alias should deserialize to node_id with data wrapper");
 
         match msg {
             UiClientMessage::ListRemoteSessions { node_id } => {
@@ -640,10 +823,9 @@ mod tests {
     fn attach_remote_session_accepts_node_alias() {
         let msg: UiClientMessage = serde_json::from_value(json!({
             "type": "attach_remote_session",
-            "node": "peer-xyz",
-            "session_id": "sess-1"
+            "data": { "node": "peer-xyz", "session_id": "sess-1" }
         }))
-        .expect("node alias should deserialize to node_id");
+        .expect("node alias should deserialize to node_id with data wrapper");
 
         match msg {
             UiClientMessage::AttachRemoteSession {
@@ -661,11 +843,13 @@ mod tests {
     fn set_session_model_accepts_node_alias() {
         let msg: UiClientMessage = serde_json::from_value(json!({
             "type": "set_session_model",
-            "session_id": "sess-1",
-            "model_id": "claude-3-opus",
-            "node": "peer-abc"
+            "data": {
+                "session_id": "sess-1",
+                "model_id": "claude-3-opus",
+                "node": "peer-abc"
+            }
         }))
-        .expect("node alias should deserialize to node_id");
+        .expect("node alias should deserialize to node_id with data wrapper");
 
         match msg {
             UiClientMessage::SetSessionModel {
@@ -689,7 +873,8 @@ mod tests {
         };
         let json = serde_json::to_value(&msg).expect("should serialize");
         assert_eq!(json["type"], "remote_sessions");
-        assert_eq!(json["node_id"], "peer-abc");
+        // adjacently tagged: payload is under "data"
+        assert_eq!(json["data"]["node_id"], "peer-abc");
     }
 
     // ── Plugin update message tests (RED→GREEN) ───────────────────────────────
@@ -699,7 +884,7 @@ mod tests {
         let msg: UiClientMessage = serde_json::from_value(json!({
             "type": "update_plugins"
         }))
-        .expect("update_plugins should deserialize");
+        .expect("update_plugins (unit variant) should deserialize without data wrapper");
         assert!(matches!(msg, UiClientMessage::UpdatePlugins));
     }
 
@@ -716,12 +901,13 @@ mod tests {
         };
         let json = serde_json::to_value(&msg).expect("should serialize");
         assert_eq!(json["type"], "plugin_update_status");
-        assert_eq!(json["plugin_name"], "my-plugin");
-        assert_eq!(json["phase"], "downloading");
-        assert_eq!(json["bytes_downloaded"], 1024);
-        assert_eq!(json["bytes_total"], 4096);
-        assert!((json["percent"].as_f64().unwrap() - 25.0).abs() < 0.01);
-        assert!(json["message"].is_null());
+        // adjacently tagged: payload is under "data"
+        assert_eq!(json["data"]["plugin_name"], "my-plugin");
+        assert_eq!(json["data"]["phase"], "downloading");
+        assert_eq!(json["data"]["bytes_downloaded"], 1024);
+        assert_eq!(json["data"]["bytes_total"], 4096);
+        assert!((json["data"]["percent"].as_f64().unwrap() - 25.0).abs() < 0.01);
+        assert!(json["data"]["message"].is_null());
     }
 
     #[test]
@@ -742,7 +928,8 @@ mod tests {
         };
         let json = serde_json::to_value(&msg).expect("should serialize");
         assert_eq!(json["type"], "plugin_update_complete");
-        let results = json["results"].as_array().unwrap();
+        // adjacently tagged: payload is under "data"
+        let results = json["data"]["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0]["plugin_name"], "ok-plugin");
         assert_eq!(results[0]["success"], true);
@@ -763,9 +950,10 @@ mod tests {
         };
         let json = serde_json::to_value(&msg).expect("should serialize");
         assert_eq!(json["type"], "plugin_update_status");
-        assert_eq!(json["message"], "connection refused");
-        assert!(json["bytes_total"].is_null());
-        assert!(json["percent"].is_null());
+        // adjacently tagged: payload is under "data"
+        assert_eq!(json["data"]["message"], "connection refused");
+        assert!(json["data"]["bytes_total"].is_null());
+        assert!(json["data"]["percent"].is_null());
     }
 
     #[test]
@@ -778,7 +966,8 @@ mod tests {
         })
         .expect("OAuthFlowStarted should serialize");
         assert_eq!(flow_started["type"], "oauth_flow_started");
-        assert_eq!(flow_started["flow_kind"], "redirect_code");
+        // adjacently tagged: payload is under "data"
+        assert_eq!(flow_started["data"]["flow_kind"], "redirect_code");
 
         let flow_started_device = serde_json::to_value(UiServerMessage::OAuthFlowStarted {
             flow_id: "flow-2".to_string(),
@@ -787,7 +976,7 @@ mod tests {
             flow_kind: OAuthFlowKind::DevicePoll,
         })
         .expect("OAuthFlowStarted (DevicePoll) should serialize");
-        assert_eq!(flow_started_device["flow_kind"], "device_poll");
+        assert_eq!(flow_started_device["data"]["flow_kind"], "device_poll");
 
         let result = serde_json::to_value(UiServerMessage::OAuthResult {
             provider: "openai".to_string(),

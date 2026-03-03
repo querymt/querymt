@@ -7,7 +7,7 @@ import {
   UiClientMessage,
   UiServerMessage,
   SessionGroup,
-  PromptBlock,
+  UiPromptBlock,
   AuditView,
   FileIndexEntry,
   ModelEntry,
@@ -19,6 +19,7 @@ import {
   OAuthFlowState,
   ProviderCapabilityEntry,
   OAuthResultState,
+  OAuthFlowKind,
   UndoStackFrame,
   RemoteNodeInfo,
   PluginUpdateStatus,
@@ -127,7 +128,7 @@ export function useUiClient() {
   const [eventsBySession, setEventsBySession] = useState<Map<string, EventItem[]>>(new Map());
   const [mainSessionId, setMainSessionId] = useState<string | null>(null);
   const [agents, setAgents] = useState<UiAgentInfo[]>([]);
-  const [routingMode, setRoutingMode] = useState<RoutingMode>('single');
+  const [routingMode, setRoutingMode] = useState<RoutingMode>(RoutingMode.Single);
   const [activeAgentId, setActiveAgentId] = useState<string>('primary');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
@@ -207,8 +208,8 @@ export function useUiClient() {
       if (!mounted) return;
       setConnected(true);
       sendMessage({ type: 'init' });
-      sendMessage({ type: 'list_all_models', refresh: false });
-      sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
+      sendMessage({ type: 'list_all_models', data: { refresh: false } });
+      sendMessage({ type: 'get_recent_models', data: { limit_per_workspace: 10 } });
       sendMessage({ type: 'list_remote_nodes' });
     };
 
@@ -262,21 +263,24 @@ export function useUiClient() {
   const handleServerMessage = (msg: UiServerMessage) => {
     debugLog('[useUiClient] Received message:', () => ({ type: msg.type, msg }));
     switch (msg.type) {
-      case 'state':
-        setAgents(msg.agents);
-        setRoutingMode(msg.routing_mode);
-        setActiveAgentId(msg.active_agent_id);
-        setSessionId(msg.active_session_id ?? null);
-        setDefaultCwd(msg.default_cwd ?? null);
-        setSessionsByAgent(msg.sessions_by_agent ?? {});
-        if (msg.agent_mode) {
-          setAgentModeState(msg.agent_mode);
+      case 'state': {
+        const d = msg.data;
+        setAgents(d.agents);
+        setRoutingMode(d.routing_mode);
+        setActiveAgentId(d.active_agent_id);
+        setSessionId(d.active_session_id ?? null);
+        setDefaultCwd(d.default_cwd ?? null);
+        setSessionsByAgent(d.sessions_by_agent ?? {});
+        if (d.agent_mode) {
+          setAgentModeState(d.agent_mode);
         }
         break;
-      case 'session_created':
-        if (msg.agent_id === activeAgentId) {
-          setSessionId(msg.session_id);
-          setMainSessionId(msg.session_id);
+      }
+      case 'session_created': {
+        const d = msg.data;
+        if (d.agent_id === activeAgentId) {
+          setSessionId(d.session_id);
+          setMainSessionId(d.session_id);
           setEventsBySession(new Map()); // Clear all event buckets for fresh session
           setSessionAudit(null); // Clear audit data
           setSessionLimits(null); // Clear session limits, will be set by session_configured event
@@ -290,33 +294,37 @@ export function useUiClient() {
           // This provides better UX than showing an empty badge.
         }
         // Resolve pending promise if there's a request_id match
-        if (msg.request_id && pendingRequestsRef.current.has(msg.request_id)) {
-          pendingRequestsRef.current.get(msg.request_id)!(msg.session_id);
-          pendingRequestsRef.current.delete(msg.request_id);
+        if (d.request_id && pendingRequestsRef.current.has(d.request_id)) {
+          pendingRequestsRef.current.get(d.request_id)!(d.session_id);
+          pendingRequestsRef.current.delete(d.request_id);
         }
         break;
+      }
       case 'session_events': {
+        const d = msg.data;
         // Replay batch - set all events for this session
-        const translated = msg.events.map((e: any) => {
-          const item = translateAgentEvent(msg.agent_id, e);
-          item.sessionId = msg.session_id;
-          item.seq = e.seq;
+        // Events arrive as EventEnvelope[] (adjacently tagged); unwrap before translating.
+        const translated = d.events.map((e: any) => {
+          const unwrapped = unwrapEnvelope(e);
+          const item = translateAgentEvent(d.agent_id, unwrapped);
+          item.sessionId = d.session_id;
+          item.seq = unwrapped.seq;
           return item;
         });
         setEventsBySession(prev => {
           const next = new Map(prev);
-          next.set(msg.session_id, translated);
+          next.set(d.session_id, translated);
           return next;
         });
 
         // If this is the main session, update agentModels from last provider event
-        if (msg.session_id === mainSessionId) {
+        if (d.session_id === mainSessionId) {
           const lastProvider = [...translated].reverse()
             .find(e => e.provider || e.model);
           if (lastProvider) {
             debugLog('[useUiClient] session_events: Setting agentModels from replay', () => ({
-              session_id: msg.session_id,
-              agent_id: msg.agent_id,
+              session_id: d.session_id,
+              agent_id: d.agent_id,
               provider: lastProvider.provider,
               model: lastProvider.model,
               mainSessionId,
@@ -324,7 +332,7 @@ export function useUiClient() {
             }));
             setAgentModels(prev => ({
               ...prev,
-              [msg.agent_id]: {
+              [d.agent_id]: {
                 provider: lastProvider.provider,
                 model: lastProvider.model,
                 contextLimit: lastProvider.contextLimit,
@@ -336,7 +344,12 @@ export function useUiClient() {
         break;
       }
       case 'event': {
-        const eventKind = msg.event?.kind?.type ?? msg.event?.kind?.type_name;
+        const d = msg.data;
+        // AgentEventKind uses adjacently tagged serde: kind.data holds the payload
+        // EventEnvelope is also adjacently tagged: unwrap .data to get the inner event.
+        const eventEnvelope = unwrapEnvelope(d.event);
+        const eventKind = eventEnvelope?.kind?.type;
+        const kindData = eventEnvelope?.kind?.data ?? {};
 
         if (
           eventKind === 'llm_request_start' ||
@@ -345,17 +358,17 @@ export function useUiClient() {
           eventKind === 'assistant_content_delta' ||
           eventKind === 'assistant_message_stored'
         ) {
-          const rawContent = msg.event?.kind?.content;
+          const rawContent = kindData.content;
           const contentLen = typeof rawContent === 'string' ? rawContent.length : 0;
           debugTrace('[useUiClient] stream event received', () => ({
-            session_id: msg.session_id,
-            agent_id: msg.agent_id,
-            seq: msg.event?.seq,
+            session_id: d.session_id,
+            agent_id: d.agent_id,
+            seq: eventEnvelope?.seq,
             event_kind: eventKind,
-            message_id: msg.event?.kind?.message_id,
+            message_id: kindData.message_id,
             content_len: contentLen,
-            has_thinking: typeof msg.event?.kind?.thinking === 'string' && msg.event.kind.thinking.length > 0,
-            finish_reason: msg.event?.kind?.finish_reason,
+            has_thinking: typeof kindData.thinking === 'string' && kindData.thinking.length > 0,
+            finish_reason: kindData.finish_reason,
           }));
         }
         
@@ -363,40 +376,40 @@ export function useUiClient() {
         if (eventKind === 'llm_request_start') {
           setThinkingBySession(prev => {
             const next = new Map(prev);
-            const sessionAgents = new Set(next.get(msg.session_id) ?? []);
-            sessionAgents.add(msg.agent_id);
-            next.set(msg.session_id, sessionAgents);
+            const sessionAgents = new Set(next.get(d.session_id) ?? []);
+            sessionAgents.add(d.agent_id);
+            next.set(d.session_id, sessionAgents);
             return next;
           });
           // Also update global thinking state for backward compatibility
-          setThinkingAgentIds(prev => new Set(prev).add(msg.agent_id));
+          setThinkingAgentIds(prev => new Set(prev).add(d.agent_id));
           // Clear conversation complete flag for the main session
-          if (msg.session_id === mainSessionId) {
+          if (d.session_id === mainSessionId) {
             setIsConversationComplete(false);
           }
         } else if (eventKind === 'llm_request_end') {
-          const finishReason = msg.event?.kind?.finish_reason;
+          const finishReason = kindData.finish_reason;
           if (finishReason === 'stop' || finishReason === 'Stop') {
             setThinkingBySession(prev => {
               const next = new Map(prev);
-              const sessionAgents = new Set(next.get(msg.session_id) ?? []);
-              sessionAgents.delete(msg.agent_id);
+              const sessionAgents = new Set(next.get(d.session_id) ?? []);
+              sessionAgents.delete(d.agent_id);
               if (sessionAgents.size === 0) {
-                next.delete(msg.session_id);
+                next.delete(d.session_id);
                 // Set conversation complete flag only for main session
-                if (msg.session_id === mainSessionId) {
+                if (d.session_id === mainSessionId) {
                   setIsConversationComplete(true);
                   setTimeout(() => setIsConversationComplete(false), 2000);
                 }
               } else {
-                next.set(msg.session_id, sessionAgents);
+                next.set(d.session_id, sessionAgents);
               }
               return next;
             });
             // Also update global thinking state
             setThinkingAgentIds(prev => {
               const next = new Set(prev);
-              next.delete(msg.agent_id);
+              next.delete(d.agent_id);
               return next;
             });
           } else if (finishReason === 'tool_calls' || finishReason === 'ToolCalls') {
@@ -404,24 +417,24 @@ export function useUiClient() {
           } else {
             setThinkingBySession(prev => {
               const next = new Map(prev);
-              const sessionAgents = new Set(next.get(msg.session_id) ?? []);
-              sessionAgents.delete(msg.agent_id);
+              const sessionAgents = new Set(next.get(d.session_id) ?? []);
+              sessionAgents.delete(d.agent_id);
               if (sessionAgents.size === 0) {
-                next.delete(msg.session_id);
+                next.delete(d.session_id);
               } else {
-                next.set(msg.session_id, sessionAgents);
+                next.set(d.session_id, sessionAgents);
               }
               return next;
             });
             setThinkingAgentIds(prev => {
               const next = new Set(prev);
-              next.delete(msg.agent_id);
+              next.delete(d.agent_id);
               return next;
             });
           }
         } else if (eventKind === 'prompt_received') {
           const isCurrentMainOrActiveSession =
-            msg.session_id === mainSessionId || msg.session_id === sessionId;
+            d.session_id === mainSessionId || d.session_id === sessionId;
           if (isCurrentMainOrActiveSession) {
             setIsConversationComplete(false);
             // A new prompt commits the current timeline branch; stacked redo history is no longer valid.
@@ -431,40 +444,40 @@ export function useUiClient() {
         } else if (eventKind === 'error') {
           setThinkingBySession(prev => {
             const next = new Map(prev);
-            const sessionAgents = new Set(next.get(msg.session_id) ?? []);
-            sessionAgents.delete(msg.agent_id);
+            const sessionAgents = new Set(next.get(d.session_id) ?? []);
+            sessionAgents.delete(d.agent_id);
             if (sessionAgents.size === 0) {
-              next.delete(msg.session_id);
+              next.delete(d.session_id);
             } else {
-              next.set(msg.session_id, sessionAgents);
+              next.set(d.session_id, sessionAgents);
             }
             return next;
           });
           setThinkingAgentIds(prev => {
             const next = new Set(prev);
-            next.delete(msg.agent_id);
+            next.delete(d.agent_id);
             return next;
           });
         } else if (eventKind === 'cancelled') {
           setThinkingBySession(prev => {
             const next = new Map(prev);
-            const sessionAgents = new Set(next.get(msg.session_id) ?? []);
-            sessionAgents.delete(msg.agent_id);
+            const sessionAgents = new Set(next.get(d.session_id) ?? []);
+            sessionAgents.delete(d.agent_id);
             if (sessionAgents.size === 0) {
-              next.delete(msg.session_id);
+              next.delete(d.session_id);
             } else {
-              next.set(msg.session_id, sessionAgents);
+              next.set(d.session_id, sessionAgents);
             }
             return next;
           });
           setThinkingAgentIds(prev => {
             const next = new Set(prev);
-            next.delete(msg.agent_id);
+            next.delete(d.agent_id);
             return next;
           });
         } else if (eventKind === 'delegation_cancelled') {
           // When a delegation is cancelled, the delegate agent should be removed from thinking state
-          // The msg.agent_id here is the delegator (parent), but we need to clear thinking state
+          // The d.agent_id here is the delegator (parent), but we need to clear thinking state
           // for the delegate agent. Since we track thinking per agent, and cancellation of the
           // delegation will also trigger 'cancelled' on the child session, we rely on that.
           // However, we can defensively clear all thinking state to ensure UI responsiveness.
@@ -472,25 +485,28 @@ export function useUiClient() {
         }
 
         // Auto-subscribe to delegation child sessions
-        if (eventKind === 'session_forked' && msg.event?.kind?.origin === 'delegation') {
-          const childSessionId = msg.event.kind.child_session_id;
+        // kindData.origin is the session_forked data payload (string field)
+        if (eventKind === 'session_forked' && kindData.origin === 'delegation') {
+          const childSessionId = kindData.child_session_id;
           sendMessage({
             type: 'subscribe_session',
-            session_id: childSessionId,
-            agent_id: msg.event.kind.target_agent_id,
-          });
+            data: {
+              session_id: childSessionId,
+              agent_id: kindData.target_agent_id,
+            },
+          } as any);
           // Track parent-child relationship for thinking state propagation
           setSessionParentMap(prev => {
             const next = new Map(prev);
-            next.set(childSessionId, msg.session_id);
+            next.set(childSessionId, d.session_id);
             return next;
           });
         }
 
         // Translate and route to correct session bucket with dedup
-        const translated = translateAgentEvent(msg.agent_id, msg.event);
-        translated.sessionId = msg.session_id;
-        translated.seq = msg.event.seq;
+        const translated = translateAgentEvent(d.agent_id, eventEnvelope);
+        translated.sessionId = d.session_id;
+        translated.seq = eventEnvelope?.seq;
 
         // === STREAMING DELTA MERGE LOGIC ===
         // Delta events are merged in-place into a single live accumulator rather
@@ -500,11 +516,11 @@ export function useUiClient() {
           eventKind === 'assistant_content_delta' ||
           eventKind === 'assistant_thinking_delta'
         ) {
-          const messageId = msg.event?.kind?.message_id;
+          const messageId = kindData.message_id;
           setEventsBySession(prev => {
             const next = new Map(prev);
-            const existing = next.get(msg.session_id) ?? [];
-            const realLiveIdx = findLiveAccumulatorIndex(existing, messageId, msg.agent_id);
+            const existing = next.get(d.session_id) ?? [];
+            const realLiveIdx = findLiveAccumulatorIndex(existing, messageId, d.agent_id);
 
             if (realLiveIdx >= 0) {
               const updated = [...existing];
@@ -520,9 +536,9 @@ export function useUiClient() {
                   content: live.content + translated.content,
                 };
               }
-              next.set(msg.session_id, updated);
+              next.set(d.session_id, updated);
               debugTrace('[useUiClient] stream delta merged', () => ({
-                session_id: msg.session_id,
+                session_id: d.session_id,
                 event_kind: eventKind,
                 message_id: messageId,
                 live_index: realLiveIdx,
@@ -532,9 +548,9 @@ export function useUiClient() {
               }));
             } else {
               // First delta for this message — create the live accumulator entry
-              next.set(msg.session_id, [...existing, translated]);
+              next.set(d.session_id, [...existing, translated]);
               debugTrace('[useUiClient] stream delta created live accumulator', () => ({
-                session_id: msg.session_id,
+                session_id: d.session_id,
                 event_kind: eventKind,
                 message_id: messageId,
                 existing_len: existing.length,
@@ -548,11 +564,11 @@ export function useUiClient() {
 
         // === ASSISTANT MESSAGE STORED — replace live accumulator with final message ===
         if (eventKind === 'assistant_message_stored') {
-          const messageId = msg.event?.kind?.message_id;
+          const messageId = kindData.message_id;
           setEventsBySession(prev => {
             const next = new Map(prev);
-            const existing = next.get(msg.session_id) ?? [];
-            const realLiveIdx = findLiveAccumulatorIndex(existing, messageId, msg.agent_id);
+            const existing = next.get(d.session_id) ?? [];
+            const realLiveIdx = findLiveAccumulatorIndex(existing, messageId, d.agent_id);
 
             if (realLiveIdx >= 0) {
               // Swap live accumulator → final message. Preserve streamed thinking if final event omitted it.
@@ -562,9 +578,9 @@ export function useUiClient() {
                 ...translated,
                 thinking: nonEmptyString(translated.thinking) ?? nonEmptyString(live.thinking),
               };
-              next.set(msg.session_id, updated);
+              next.set(d.session_id, updated);
               debugTrace('[useUiClient] final assistant message replaced live accumulator', () => ({
-                session_id: msg.session_id,
+                session_id: d.session_id,
                 message_id: messageId,
                 live_index: realLiveIdx,
                 final_content_len: updated[realLiveIdx].content.length,
@@ -574,10 +590,10 @@ export function useUiClient() {
               // Non-streaming provider or out-of-order final message: append if newer.
               const lastSeq = existing.length > 0 ? (existing[existing.length - 1].seq ?? -1) : -1;
               if (translated.seq == null || translated.seq > lastSeq) {
-                next.set(msg.session_id, [...existing, translated]);
+                next.set(d.session_id, [...existing, translated]);
               }
               debugTrace('[useUiClient] final assistant message appended without live accumulator', () => ({
-                session_id: msg.session_id,
+                session_id: d.session_id,
                 message_id: messageId,
                 existing_len: existing.length,
                 translated_seq: translated.seq,
@@ -590,53 +606,54 @@ export function useUiClient() {
         } else {
           setEventsBySession(prev => {
             const next = new Map(prev);
-            const existing = next.get(msg.session_id) ?? [];
+            const existing = next.get(d.session_id) ?? [];
             // Dedup: skip if we already have this seq
             if (existing.length > 0 && translated.seq != null) {
               const lastSeq = existing[existing.length - 1].seq ?? -1;
               if (translated.seq <= lastSeq) return prev;
             }
-            next.set(msg.session_id, [...existing, translated]);
+            next.set(d.session_id, [...existing, translated]);
             return next;
           });
         }
 
         // Provider/limits updates - only for main session
-        if (msg.session_id === mainSessionId) {
+        if (d.session_id === mainSessionId) {
           if (eventKind === 'provider_changed') {
             debugLog('[useUiClient] provider_changed event: Setting agentModels', () => ({
-              session_id: msg.session_id,
-              agent_id: msg.agent_id,
-              provider: msg.event?.kind?.provider,
-              model: msg.event?.kind?.model,
+              session_id: d.session_id,
+              agent_id: d.agent_id,
+              provider: kindData.provider,
+              model: kindData.model,
               mainSessionId,
-              seq: msg.event?.seq,
+              seq: eventEnvelope?.seq,
             }));
             setAgentModels((prev) => ({
               ...prev,
-              [msg.agent_id]: {
-                provider: msg.event?.kind?.provider,
-                model: msg.event?.kind?.model,
-                contextLimit: msg.event?.kind?.context_limit,
-                node: msg.event?.kind?.provider_node ?? undefined,
+              [d.agent_id]: {
+                provider: kindData.provider,
+                model: kindData.model,
+                contextLimit: kindData.context_limit,
+                node: kindData.provider_node_id ?? kindData.provider_node ?? undefined,
               },
             }));
           }
-          if (eventKind === 'session_configured' && msg.event?.kind?.limits) {
-            setSessionLimits(msg.event.kind.limits);
+          if (eventKind === 'session_configured' && kindData.limits) {
+            setSessionLimits(kindData.limits);
           }
         }
         break;
       }
       case 'error': {
-        console.error('UI server error:', msg.message);
-        const isDeleteError = msg.message.includes('Failed to delete session');
-        const isLoadError = msg.message.includes('Failed to load session');
+        const d = msg.data;
+        console.error('UI server error:', d.message);
+        const isDeleteError = d.message.includes('Failed to delete session');
+        const isLoadError = d.message.includes('Failed to load session');
 
         if (isDeleteError) {
           pendingDeleteLabelsRef.current.clear();
-          pushSessionActionNotice('error', msg.message);
-          sendMessage({ type: 'list_sessions' });
+          pushSessionActionNotice('error', d.message);
+          sendMessage({ type: 'list_sessions' } as UiClientMessage);
         }
 
         if (isLoadError) {
@@ -646,9 +663,9 @@ export function useUiClient() {
             'error',
             pendingLabel
               ? `Failed to open session: ${pendingLabel}`
-              : msg.message
+              : d.message
           );
-          sendMessage({ type: 'list_sessions' });
+          sendMessage({ type: 'list_sessions' } as UiClientMessage);
         }
 
         // Connection-level errors have no session_id. Do not inject them into the
@@ -657,16 +674,16 @@ export function useUiClient() {
         // Check if this is a file index related error and notify
         if (
           fileIndexErrorCallbackRef.current &&
-          (msg.message.includes('workspace') ||
-            msg.message.includes('File index') ||
-            msg.message.includes('working directory'))
+          (d.message.includes('workspace') ||
+            d.message.includes('File index') ||
+            d.message.includes('working directory'))
         ) {
-          fileIndexErrorCallbackRef.current(msg.message);
+          fileIndexErrorCallbackRef.current(d.message);
         }
         // Surface non-session-action errors to the generic connection error toast queue
         if (!isDeleteError && !isLoadError) {
           const errorId = Date.now();
-          setConnectionErrors((prev) => [...prev, { id: errorId, message: msg.message }]);
+          setConnectionErrors((prev) => [...prev, { id: errorId, message: d.message }]);
           // Auto-dismiss after 8 seconds
           setTimeout(() => {
             setConnectionErrors((prev) => prev.filter((e) => e.id !== errorId));
@@ -675,11 +692,12 @@ export function useUiClient() {
         break;
       }
       case 'session_list': {
-        setSessionGroups(msg.groups);
+        const d = msg.data;
+        setSessionGroups(d.groups);
 
         if (pendingDeleteLabelsRef.current.size > 0) {
           const remainingSessionIds = new Set(
-            msg.groups.flatMap((group) => group.sessions.map((session) => session.session_id))
+            d.groups.flatMap((group: any) => group.sessions.map((session: any) => session.session_id))
           );
 
           for (const [pendingId, label] of pendingDeleteLabelsRef.current.entries()) {
@@ -692,28 +710,29 @@ export function useUiClient() {
         break;
       }
       case 'session_loaded': {
-        pendingLoadLabelsRef.current.delete(msg.session_id);
-        setSessionId(msg.session_id);
-        setMainSessionId(msg.session_id);
-        setSessionAudit(msg.audit);
+        const d = msg.data;
+        pendingLoadLabelsRef.current.delete(d.session_id);
+        setSessionId(d.session_id);
+        setMainSessionId(d.session_id);
+        setSessionAudit(d.audit);
         // Hydrate undo stack from backend so refresh/load reflects persisted state.
         setUndoState((prev) => {
-          const next = buildUndoStateFromServerStack(msg.undo_stack, prev);
+          const next = buildUndoStateFromServerStack(d.undo_stack, prev);
           undoStateRef.current = next;
           return next;
         });
         
         // Populate eventsBySession from the audit events (for old session history)
-        const translated = msg.audit.events.map((e: any) => {
-          const item = translateAgentEvent(msg.agent_id, e);
-          item.sessionId = msg.session_id;
+        const translated = d.audit.events.map((e: any) => {
+          const item = translateAgentEvent(d.agent_id, e);
+          item.sessionId = d.session_id;
           item.seq = e.seq;
           return item;
         });
         
         // Initialize eventsBySession with the main session's events
         const eventsMap = new Map();
-        eventsMap.set(msg.session_id, translated);
+        eventsMap.set(d.session_id, translated);
         setEventsBySession(eventsMap);
         
         // Update agentModels from the last provider event in the loaded session.
@@ -722,14 +741,14 @@ export function useUiClient() {
           .find(e => e.provider || e.model);
         if (lastProvider) {
           debugLog('[useUiClient] session_loaded: Setting agentModels from loaded session', () => ({
-            session_id: msg.session_id,
-            agent_id: msg.agent_id,
+            session_id: d.session_id,
+            agent_id: d.agent_id,
             provider: lastProvider.provider,
             model: lastProvider.model,
             eventCount: translated.length,
           }));
           setAgentModels({
-            [msg.agent_id]: {
+            [d.agent_id]: {
               provider: lastProvider.provider,
               model: lastProvider.model,
               contextLimit: lastProvider.contextLimit,
@@ -743,109 +762,127 @@ export function useUiClient() {
         }
         
         // Subscribe to child delegation sessions
-        for (const event of msg.audit.events) {
+        for (const event of d.audit.events) {
           if (
             (event.kind as any)?.type === 'session_forked' &&
-            (event.kind as any)?.origin === 'delegation'
+            (event.kind as any)?.data?.origin === 'delegation'
           ) {
-            const childSessionId = (event.kind as any)?.child_session_id;
+            const childSessionId = (event.kind as any)?.data?.child_session_id;
             sendMessage({
               type: 'subscribe_session',
-              session_id: childSessionId,
-              agent_id: (event.kind as any)?.target_agent_id,
-            });
+              data: {
+                session_id: childSessionId,
+                agent_id: (event.kind as any)?.data?.target_agent_id,
+              },
+            } as any);
             // Track parent-child relationship
             setSessionParentMap(prev => {
               const next = new Map(prev);
-              next.set(childSessionId, msg.session_id);
+              next.set(childSessionId, d.session_id);
               return next;
             });
           }
         }
         break;
       }
-      case 'workspace_index_status':
+      case 'workspace_index_status': {
+        const d = msg.data;
         setWorkspaceIndexStatus(prev => ({
           ...prev,
-          [msg.session_id]: { status: msg.status, message: msg.message ?? null },
+          [d.session_id]: { status: d.status as 'building' | 'ready' | 'error', message: d.message ?? null },
         }));
         break;
-      case 'file_index':
+      }
+      case 'file_index': {
+        const d = msg.data;
         if (fileIndexCallbackRef.current) {
-          fileIndexCallbackRef.current(msg.files, msg.generated_at);
+          fileIndexCallbackRef.current(d.files, d.generated_at);
         }
         break;
-      case 'all_models_list':
-        setAllModels(msg.models);
+      }
+      case 'all_models_list': {
+        const d = msg.data;
+        setAllModels(d.models);
         break;
+      }
       case 'provider_capabilities': {
+        const d = msg.data;
         const next: Record<string, ProviderCapabilityEntry> = {};
-        for (const entry of msg.providers) {
+        for (const entry of d.providers) {
           next[entry.provider] = entry;
         }
         setProviderCapabilities(next);
         break;
       }
       case 'recent_models': {
+        const d = msg.data;
         // Convert null keys to empty string for consistent lookup
         const normalized: Record<string, RecentModelEntry[]> = {};
-        for (const [key, value] of Object.entries(msg.by_workspace)) {
-          normalized[key === 'null' ? '' : key] = value;
+        for (const [key, value] of Object.entries(d.by_workspace)) {
+          normalized[key === 'null' ? '' : key] = value as RecentModelEntry[];
         }
         setRecentModelsByWorkspace(normalized);
         break;
       }
-      case 'auth_providers':
-        setAuthProviders(msg.providers);
+      case 'auth_providers': {
+        const d = msg.data;
+        setAuthProviders(d.providers);
         break;
-      case 'oauth_flow_started':
+      }
+      case 'oauth_flow_started': {
+        const d = msg.data;
         setOauthFlow({
-          flow_id: msg.flow_id,
-          provider: msg.provider,
-          authorization_url: msg.authorization_url,
-          flow_kind: msg.flow_kind,
+          flow_id: d.flow_id,
+          provider: d.provider,
+          authorization_url: d.authorization_url,
+          flow_kind: d.flow_kind as OAuthFlowKind,
         });
         setOauthResult(null);
         break;
-      case 'oauth_result':
+      }
+      case 'oauth_result': {
+        const d = msg.data;
         setOauthResult({
-          provider: msg.provider,
-          success: msg.success,
-          message: msg.message,
+          provider: d.provider,
+          success: d.success,
+          message: d.message,
         });
-        if (msg.success) {
+        if (d.success) {
           setOauthFlow(null);
         }
         break;
+      }
       case 'llm_config': {
+        const d = msg.data;
         const config: LlmConfigDetails = {
-          configId: msg.config_id,
-          provider: msg.provider,
-          model: msg.model,
-          params: msg.params,
+          configId: d.config_id,
+          provider: d.provider,
+          model: d.model,
+          params: d.params,
         };
         // Cache the config
-        setLlmConfigCache((prev) => ({ ...prev, [msg.config_id]: config }));
+        setLlmConfigCache((prev) => ({ ...prev, [d.config_id]: config }));
         // Notify any pending callbacks
-        const callback = llmConfigCallbacksRef.current.get(msg.config_id);
+        const callback = llmConfigCallbacksRef.current.get(d.config_id);
         if (callback) {
           callback(config);
-          llmConfigCallbacksRef.current.delete(msg.config_id);
+          llmConfigCallbacksRef.current.delete(d.config_id);
         }
         break;
       }
       case 'undo_result': {
+        const d = msg.data;
         const filesByMessageId = new Map<string, string[]>();
-        const messageIdForFiles = msg.message_id
-          ?? msg.undo_stack[msg.undo_stack.length - 1]?.message_id;
-        if (msg.success && messageIdForFiles) {
-          filesByMessageId.set(messageIdForFiles, msg.reverted_files);
+        const messageIdForFiles = d.message_id
+          ?? d.undo_stack[d.undo_stack.length - 1]?.message_id;
+        if (d.success && messageIdForFiles) {
+          filesByMessageId.set(messageIdForFiles, d.reverted_files);
         }
 
         setUndoState((prev) => {
-          const preferredFrontier = msg.success ? messageIdForFiles : undefined;
+          const preferredFrontier = d.success ? messageIdForFiles : undefined;
           const next = buildUndoStateFromServerStack(
-            msg.undo_stack,
+            d.undo_stack,
             prev,
             filesByMessageId,
             preferredFrontier
@@ -854,37 +891,39 @@ export function useUiClient() {
           return next;
         });
 
-        if (msg.success) {
-          debugLog('[useUiClient] Undo succeeded', () => ({ reverted_files: msg.reverted_files }));
+        if (d.success) {
+          debugLog('[useUiClient] Undo succeeded', () => ({ reverted_files: d.reverted_files }));
         } else {
-          console.error('[useUiClient] Undo failed:', msg.message);
+          console.error('[useUiClient] Undo failed:', d.message);
         }
         break;
       }
       case 'redo_result': {
+        const d = msg.data;
         setUndoState((prev) => {
-          const next = buildUndoStateFromServerStack(msg.undo_stack, prev);
+          const next = buildUndoStateFromServerStack(d.undo_stack, prev);
           undoStateRef.current = next;
           return next;
         });
 
-        if (msg.success) {
+        if (d.success) {
           debugLog('[useUiClient] Redo succeeded');
         } else {
-          console.error('[useUiClient] Redo failed:', msg.message);
+          console.error('[useUiClient] Redo failed:', d.message);
         }
         break;
       }
       case 'fork_result': {
+        const d = msg.data;
         const pendingFork = pendingForkResolverRef.current;
         pendingForkResolverRef.current = null;
 
-        if (msg.success && msg.forked_session_id) {
+        if (d.success && d.forked_session_id) {
           if (pendingFork) {
-            pendingFork.resolve(msg.forked_session_id);
+            pendingFork.resolve(d.forked_session_id);
           }
         } else {
-          const errorMessage = msg.message ?? 'Failed to fork session';
+          const errorMessage = d.message ?? 'Failed to fork session';
           sessionCreatingRef.current = false;
           if (pendingFork) {
             pendingFork.reject(new Error(errorMessage));
@@ -893,60 +932,69 @@ export function useUiClient() {
         }
         break;
       }
-      case 'agent_mode':
-        setAgentModeState(msg.mode);
+      case 'agent_mode': {
+        const d = msg.data;
+        setAgentModeState(d.mode);
         break;
-      case 'remote_nodes':
-        setRemoteNodes(msg.nodes);
+      }
+      case 'remote_nodes': {
+        const d = msg.data;
+        setRemoteNodes(d.nodes);
         break;
-      case 'remote_sessions':
+      }
+      case 'remote_sessions': {
+        const d = msg.data;
         // Currently used for on-demand node session listing;
         // data is handled by the caller via callback if needed.
-        debugLog('[useUiClient] remote_sessions for node:', () => ({ node_id: msg.node_id, sessions: msg.sessions }));
+        debugLog('[useUiClient] remote_sessions for node:', () => ({ node_id: d.node_id, sessions: d.sessions }));
         break;
+      }
       case 'model_download_status': {
-        const key = `${msg.provider}:${msg.model_id}`;
+        const d = msg.data;
+        const key = `${d.provider}:${d.model_id}`;
         setModelDownloads((prev) => ({
           ...prev,
           [key]: {
-            provider: msg.provider,
-            model_id: msg.model_id,
-            status: msg.status,
-            bytes_downloaded: msg.bytes_downloaded,
-            bytes_total: msg.bytes_total,
-            percent: msg.percent,
-            speed_bps: msg.speed_bps,
-            eta_seconds: msg.eta_seconds,
-            message: msg.message,
+            provider: d.provider,
+            model_id: d.model_id,
+            status: d.status,
+            bytes_downloaded: d.bytes_downloaded,
+            bytes_total: d.bytes_total,
+            percent: d.percent,
+            speed_bps: d.speed_bps,
+            eta_seconds: d.eta_seconds,
+            message: d.message,
           },
         }));
 
-        if (msg.status === 'completed') {
+        if (d.status === 'completed') {
           setTimeout(() => {
-            sendMessage({ type: 'list_all_models', refresh: true });
+            sendMessage({ type: 'list_all_models', data: { refresh: true } });
           }, 250);
         }
         break;
       }
       case 'plugin_update_status': {
+        const d = msg.data;
         setIsUpdatingPlugins(true);
         setPluginUpdateStatus(prev => ({
           ...prev,
-          [msg.plugin_name]: {
-            plugin_name: msg.plugin_name,
-            image_reference: msg.image_reference,
-            phase: msg.phase,
-            bytes_downloaded: msg.bytes_downloaded,
-            bytes_total: msg.bytes_total,
-            percent: msg.percent,
-            message: msg.message,
+          [d.plugin_name]: {
+            plugin_name: d.plugin_name,
+            image_reference: d.image_reference,
+            phase: d.phase,
+            bytes_downloaded: d.bytes_downloaded,
+            bytes_total: d.bytes_total,
+            percent: d.percent,
+            message: d.message,
           },
         }));
         break;
       }
       case 'plugin_update_complete': {
+        const d = msg.data;
         setIsUpdatingPlugins(false);
-        setPluginUpdateResults(msg.results);
+        setPluginUpdateResults(d.results);
         setTimeout(() => setPluginUpdateResults(null), 8000);
         break;
       }
@@ -1019,53 +1067,57 @@ export function useUiClient() {
         pendingRequestsRef.current.set(requestId, resolve);
         sendMessage({
           type: 'create_remote_session',
-          node_id: node,
-          cwd: cwd.length > 0 ? cwd : null,
-          request_id: requestId,
+          data: {
+            node_id: node,
+            cwd: cwd.length > 0 ? cwd : undefined,
+            request_id: requestId,
+          },
         });
       });
     }
 
     return new Promise((resolve) => {
       pendingRequestsRef.current.set(requestId, resolve);
-      sendMessage({ 
-        type: 'new_session', 
-        cwd: cwd.length > 0 ? cwd : null,
-        request_id: requestId 
+      sendMessage({
+        type: 'new_session',
+        data: {
+          cwd: cwd.length > 0 ? cwd : undefined,
+          request_id: requestId,
+        },
       });
     });
   }, [requestWorkspacePath, sessionGroups, sessionId, defaultCwd]);
 
-  const sendPrompt = useCallback(async (prompt: PromptBlock[]) => {
-    sendMessage({ type: 'prompt', prompt });
+  const sendPrompt = useCallback(async (prompt: UiPromptBlock[]) => {
+    sendMessage({ type: 'prompt', data: { prompt } });
   }, []);
 
   const selectAgent = useCallback((agentId: string) => {
     setActiveAgentId(agentId);
-    sendMessage({ type: 'set_active_agent', agent_id: agentId });
+    sendMessage({ type: 'set_active_agent', data: { agent_id: agentId } });
   }, []);
 
   const selectRoutingMode = useCallback((mode: RoutingMode) => {
     setRoutingMode(mode);
-    sendMessage({ type: 'set_routing_mode', mode });
+    sendMessage({ type: 'set_routing_mode', data: { mode } });
   }, []);
 
   const loadSession = useCallback((sessionId: string, sessionLabel?: string) => {
     const label = sessionLabel && sessionLabel.trim().length > 0 ? sessionLabel : sessionId;
     pendingLoadLabelsRef.current.set(sessionId, label);
-    sendMessage({ type: 'load_session', session_id: sessionId });
+    sendMessage({ type: 'load_session', data: { session_id: sessionId } });
   }, []);
 
   const refreshAllModels = useCallback(() => {
-    sendMessage({ type: 'list_all_models', refresh: true });
+    sendMessage({ type: 'list_all_models', data: { refresh: true } });
   }, []);
 
   const setSessionModel = useCallback((sessionId: string, modelId: string, node?: string) => {
-    sendMessage({ type: 'set_session_model', session_id: sessionId, model_id: modelId, node_id: node });
+    sendMessage({ type: 'set_session_model', data: { session_id: sessionId, model_id: modelId, node_id: node } });
     // Refresh recent models after a short delay (only for local providers)
     if (!node) {
       setTimeout(() => {
-        sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
+        sendMessage({ type: 'get_recent_models', data: { limit_per_workspace: 10 } });
       }, 500);
     }
   }, []);
@@ -1074,10 +1126,7 @@ export function useUiClient() {
     (provider: string, repo: string, filename: string, displayName?: string) => {
       sendMessage({
         type: 'add_custom_model_from_hf',
-        provider,
-        repo,
-        filename,
-        display_name: displayName,
+        data: { provider, repo, filename, display_name: displayName },
       });
     },
     []
@@ -1087,20 +1136,18 @@ export function useUiClient() {
     (provider: string, filePath: string, displayName?: string) => {
       sendMessage({
         type: 'add_custom_model_from_file',
-        provider,
-        file_path: filePath,
-        display_name: displayName,
+        data: { provider, file_path: filePath, display_name: displayName },
       });
     },
     []
   );
 
   const deleteCustomModel = useCallback((provider: string, modelId: string) => {
-    sendMessage({ type: 'delete_custom_model', provider, model_id: modelId });
+    sendMessage({ type: 'delete_custom_model', data: { provider, model_id: modelId } });
   }, []);
 
   const fetchRecentModels = useCallback(() => {
-    sendMessage({ type: 'get_recent_models', limit_per_workspace: 10 });
+    sendMessage({ type: 'get_recent_models', data: { limit_per_workspace: 10 } });
   }, []);
 
   const requestAuthProviders = useCallback(() => {
@@ -1109,17 +1156,17 @@ export function useUiClient() {
 
   const startOAuthLogin = useCallback((provider: string) => {
     setOauthResult(null);
-    sendMessage({ type: 'start_oauth_login', provider });
+    sendMessage({ type: 'start_oauth_login', data: { provider } });
   }, []);
 
   const completeOAuthLogin = useCallback((flowId: string, response: string) => {
-    sendMessage({ type: 'complete_oauth_login', flow_id: flowId, response });
+    sendMessage({ type: 'complete_oauth_login', data: { flow_id: flowId, response } });
   }, []);
 
   const disconnectOAuth = useCallback((provider: string) => {
     setOauthFlow(null);
     setOauthResult(null);
-    sendMessage({ type: 'disconnect_oauth', provider });
+    sendMessage({ type: 'disconnect_oauth', data: { provider } });
   }, []);
 
   const clearOAuthState = useCallback(() => {
@@ -1151,7 +1198,7 @@ export function useUiClient() {
   const deleteSession = useCallback((targetSessionId: string, sessionLabel?: string) => {
     const label = sessionLabel && sessionLabel.trim().length > 0 ? sessionLabel : targetSessionId;
     pendingDeleteLabelsRef.current.set(targetSessionId, label);
-    sendMessage({ type: 'delete_session', session_id: targetSessionId });
+    sendMessage({ type: 'delete_session', data: { session_id: targetSessionId } });
   }, []);
 
   // Refresh the list of remote nodes from the mesh
@@ -1178,18 +1225,18 @@ export function useUiClient() {
     }
     // Register callback and request
     llmConfigCallbacksRef.current.set(configId, callback);
-    sendMessage({ type: 'get_llm_config', config_id: configId });
+    sendMessage({ type: 'get_llm_config', data: { config_id: configId } });
   }, [llmConfigCache]);
 
   // Derive thinkingAgentId for backward compatibility
   const thinkingAgentId = thinkingAgentIds.size > 0 ? Array.from(thinkingAgentIds).pop()! : null;
 
   const subscribeSession = useCallback((sessionId: string, agentId?: string) => {
-    sendMessage({ type: 'subscribe_session', session_id: sessionId, agent_id: agentId });
+    sendMessage({ type: 'subscribe_session', data: { session_id: sessionId, agent_id: agentId } });
   }, []);
 
   const unsubscribeSession = useCallback((sessionId: string) => {
-    sendMessage({ type: 'unsubscribe_session', session_id: sessionId });
+    sendMessage({ type: 'unsubscribe_session', data: { session_id: sessionId } });
   }, []);
 
   const sendUndo = useCallback((messageId: string, turnId: string) => {
@@ -1208,7 +1255,7 @@ export function useUiClient() {
     };
 
     undoStateRef.current = nextUndoState;
-    sendMessage({ type: 'undo', message_id: messageId });
+    sendMessage({ type: 'undo', data: { message_id: messageId } });
     // Optimistically push pending frame; confirmation arrives via undo_result.
     setUndoState(nextUndoState);
   }, []);
@@ -1233,7 +1280,7 @@ export function useUiClient() {
 
     return new Promise((resolve, reject) => {
       pendingForkResolverRef.current = { resolve, reject };
-      sendMessage({ type: 'fork_session', message_id: messageId });
+      sendMessage({ type: 'fork_session', data: { message_id: messageId } });
     });
   }, []);
 
@@ -1242,12 +1289,12 @@ export function useUiClient() {
     action: 'accept' | 'decline' | 'cancel',
     content?: Record<string, unknown>
   ) => {
-    sendMessage({ type: 'elicitation_response', elicitation_id: elicitationId, action, content });
+    sendMessage({ type: 'elicitation_response', data: { elicitation_id: elicitationId, action, content } });
   }, []);
 
   const setAgentMode = useCallback((mode: string) => {
     setAgentModeState(mode);  // Optimistic update
-    sendMessage({ type: 'set_agent_mode', mode });
+    sendMessage({ type: 'set_agent_mode', data: { mode } });
   }, []);
 
   const cycleAgentMode = useCallback(() => {
@@ -1354,8 +1401,19 @@ function findCurrentWorkspace(groups: SessionGroup[], activeSessionId: string | 
   return null;
 }
 
+/** Unwrap an EventEnvelope (adjacently tagged) into a flat AgentEvent-like object. */
+function unwrapEnvelope(envelope: any): any {
+  const inner = envelope?.data ?? envelope;
+  return {
+    ...inner,
+    seq: inner.stream_seq ?? inner.seq,
+  };
+}
+
 function translateAgentEvent(agentId: string, event: any): EventItem {
   const kind = event?.kind?.type ?? event?.kind?.type_name ?? event?.kind?.type;
+  // AgentEventKind uses adjacently tagged serde: kind.data holds the variant payload
+  const kindData = event?.kind?.data ?? {};
   const timestamp = typeof event.timestamp === 'number' ? event.timestamp * 1000 : Date.now();
   const id = event.seq ? String(event.seq) : `${Date.now()}-${Math.random()}`;
   const seq = event.seq;
@@ -1366,31 +1424,31 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       agentId,
       seq: seq,
       type: 'tool_call',
-      content: event.kind?.tool_name ?? 'tool_call',
+      content: kindData.tool_name ?? 'tool_call',
       timestamp,
       toolCall: {
-        tool_call_id: event.kind?.tool_call_id,
-        kind: event.kind?.tool_name,
+        tool_call_id: kindData.tool_call_id,
+        kind: kindData.tool_name,
         status: 'in_progress',
-        raw_input: parseJsonMaybe(event.kind?.arguments),
+        raw_input: parseJsonMaybe(kindData.arguments),
       },
     };
   }
 
   if (kind === 'tool_call_end') {
-    const status = event.kind?.is_error ? 'failed' : 'completed';
+    const status = kindData.is_error ? 'failed' : 'completed';
     return {
       id,
       agentId,
       seq: seq,
       type: 'tool_result',
-      content: event.kind?.result ?? '',
+      content: kindData.result ?? '',
       timestamp,
       toolCall: {
-        tool_call_id: event.kind?.tool_call_id,
-        kind: event.kind?.tool_name,
+        tool_call_id: kindData.tool_call_id,
+        kind: kindData.tool_name,
         status,
-        raw_output: parseJsonMaybe(event.kind?.result),
+        raw_output: parseJsonMaybe(kindData.result),
       },
     };
   }
@@ -1401,10 +1459,10 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       agentId,
       seq: seq,
       type: 'user',
-      content: event.kind?.content ?? '',
+      content: kindData.content ?? '',
       timestamp,
       isMessage: true,
-      messageId: event.kind?.message_id,
+      messageId: kindData.message_id,
     };
   }
 
@@ -1414,13 +1472,13 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       agentId,
       seq: seq,
       type: 'agent',
-      content: event.kind?.content ?? '',
-      thinking: event.kind?.thinking,
+      content: kindData.content ?? '',
+      thinking: kindData.thinking,
       timestamp,
       isMessage: true,
-      messageId: event.kind?.message_id,
+      messageId: kindData.message_id,
       // streamMessageId matches message_id so UI can find and replace the live accumulator
-      streamMessageId: event.kind?.message_id,
+      streamMessageId: kindData.message_id,
     };
   }
 
@@ -1430,11 +1488,11 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       agentId,
       seq,
       type: 'agent',
-      content: event.kind?.content ?? '',
+      content: kindData.content ?? '',
       timestamp,
       isStreamDelta: true,
       isThinkingDelta: false,
-      streamMessageId: event.kind?.message_id,
+      streamMessageId: kindData.message_id,
     };
   }
 
@@ -1445,11 +1503,11 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       seq,
       type: 'agent',
       content: '',
-      thinking: event.kind?.content ?? '',
+      thinking: kindData.content ?? '',
       timestamp,
       isStreamDelta: true,
       isThinkingDelta: true,
-      streamMessageId: event.kind?.message_id,
+      streamMessageId: kindData.message_id,
     };
   }
 
@@ -1460,12 +1518,12 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       type: 'agent',
       content: `Event: llm_request_end`,
       timestamp,
-      usage: event.kind?.usage,
-      costUsd: event.kind?.cost_usd,
-      cumulativeCostUsd: event.kind?.cumulative_cost_usd,
-      contextTokens: event.kind?.context_tokens,
-      finishReason: event.kind?.finish_reason,
-      metrics: event.kind?.metrics,
+      usage: kindData.usage,
+      costUsd: kindData.cost_usd,
+      cumulativeCostUsd: kindData.cumulative_cost_usd,
+      contextTokens: kindData.context_tokens,
+      finishReason: kindData.finish_reason,
+      metrics: kindData.metrics,
     };
   }
 
@@ -1476,9 +1534,9 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       type: 'agent',
       content: `Event: delegation_requested`,
       timestamp,
-      delegationId: event.kind?.delegation?.public_id,
-      delegationTargetAgentId: event.kind?.delegation?.target_agent_id,
-      delegationObjective: event.kind?.delegation?.objective,
+      delegationId: kindData.delegation?.public_id,
+      delegationTargetAgentId: kindData.delegation?.target_agent_id,
+      delegationObjective: kindData.delegation?.objective,
       delegationEventType: 'requested',
     };
   }
@@ -1490,7 +1548,7 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       type: 'agent',
       content: `Event: delegation_completed`,
       timestamp,
-      delegationId: event.kind?.delegation_id,
+      delegationId: kindData.delegation_id,
       delegationEventType: 'completed',
     };
   }
@@ -1502,7 +1560,7 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       type: 'agent',
       content: `Event: delegation_failed`,
       timestamp,
-      delegationId: event.kind?.delegation_id,
+      delegationId: kindData.delegation_id,
       delegationEventType: 'failed',
     };
   }
@@ -1514,8 +1572,8 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       type: 'agent',
       content: `Event: session_forked`,
       timestamp,
-      forkChildSessionId: event.kind?.child_session_id,
-      forkDelegationId: event.kind?.fork_point_ref,
+      forkChildSessionId: kindData.child_session_id,
+      forkDelegationId: kindData.fork_point_ref,
     };
   }
 
@@ -1526,11 +1584,11 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       type: 'agent',
       content: `Event: provider_changed`,
       timestamp,
-      provider: event.kind?.provider,
-      model: event.kind?.model,
-      contextLimit: event.kind?.context_limit,
-      configId: event.kind?.config_id,
-      providerNode: event.kind?.provider_node ?? undefined,
+      provider: kindData.provider,
+      model: kindData.model,
+      contextLimit: kindData.context_limit,
+      configId: kindData.config_id,
+      providerNode: kindData.provider_node_id ?? kindData.provider_node ?? undefined,
     };
   }
 
@@ -1540,14 +1598,14 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       agentId,
       seq,
       type: 'tool_call',  // Render it as a tool interaction
-      content: event.kind?.message ?? 'Elicitation',
+      content: kindData.message ?? 'Elicitation',
       timestamp,
       elicitationData: {
-        elicitationId: event.kind?.elicitation_id,
-        sessionId: event.kind?.session_id,
-        message: event.kind?.message,
-        requestedSchema: event.kind?.requested_schema,
-        source: event.kind?.source ?? 'unknown',
+        elicitationId: kindData.elicitation_id,
+        sessionId: kindData.session_id,
+        message: kindData.message,
+        requestedSchema: kindData.requested_schema,
+        source: kindData.source ?? 'unknown',
       },
     };
   }
@@ -1560,7 +1618,7 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       type: 'system',
       content: 'Context compaction started',
       timestamp,
-      compactionTokenEstimate: event.kind?.token_estimate,
+      compactionTokenEstimate: kindData.token_estimate,
     };
   }
 
@@ -1572,8 +1630,8 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       type: 'system',
       content: 'Context compacted',
       timestamp,
-      compactionSummary: event.kind?.summary,
-      compactionSummaryLen: event.kind?.summary_len,
+      compactionSummary: kindData.summary,
+      compactionSummaryLen: kindData.summary_len,
     };
   }
 
@@ -1584,7 +1642,7 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       id,
       agentId: 'system',
       type: 'system',
-      content: event.kind?.message ?? 'Error',
+      content: kindData.message ?? 'Error',
       timestamp,
       isMessage: true,
     };

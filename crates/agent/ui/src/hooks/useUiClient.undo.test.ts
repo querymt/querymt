@@ -84,7 +84,7 @@ describe('useUiClient - undo/redo', () => {
     expect(MockWebSocket.instance!.sentMessages).toHaveLength(1);
     expect(MockWebSocket.instance!.sentMessages[0]).toEqual({
       type: 'undo',
-      message_id: 'msg-123',
+      data: { message_id: 'msg-123' },
     });
   });
 
@@ -127,10 +127,12 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        message_id: 'msg-123',
-        reverted_files: ['a.txt', 'b.txt'],
-        undo_stack: [{ message_id: 'msg-123' }],
+        data: {
+          success: true,
+          message_id: 'msg-123',
+          reverted_files: ['a.txt', 'b.txt'],
+          undo_stack: [{ message_id: 'msg-123' }],
+        },
       });
     });
 
@@ -159,10 +161,12 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: false,
-        error: 'Snapshot not found',
-        undo_stack: [],
-        cursor_seq: 0,
+        data: {
+          success: false,
+          message: 'Snapshot not found',
+          reverted_files: [],
+          undo_stack: [],
+        },
       });
     });
 
@@ -184,10 +188,11 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        reverted_files: ['a.txt'],
-        undo_stack: [],
-        cursor_seq: 0,
+        data: {
+          success: true,
+          reverted_files: ['a.txt'],
+          undo_stack: [],
+        },
       });
     });
 
@@ -212,10 +217,12 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        message_id: 'msg-123',
-        reverted_files: ['a.txt'],
-        undo_stack: [{ message_id: 'msg-123' }],
+        data: {
+          success: true,
+          message_id: 'msg-123',
+          reverted_files: ['a.txt'],
+          undo_stack: [{ message_id: 'msg-123' }],
+        },
       });
     });
 
@@ -247,9 +254,11 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        reverted_files: ['a.txt'],
-        undo_stack: [{ message_id: 'msg-123' }],
+        data: {
+          success: true,
+          reverted_files: ['a.txt'],
+          undo_stack: [{ message_id: 'msg-123' }],
+        },
       });
     });
 
@@ -263,9 +272,10 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'redo_result',
-        success: true,
-        undo_stack: [],
-        cursor_seq: 0,
+        data: {
+          success: true,
+          undo_stack: [],
+        },
       });
     });
 
@@ -288,9 +298,11 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        reverted_files: ['a.txt'],
-        undo_stack: [{ message_id: 'msg-123' }],
+        data: {
+          success: true,
+          reverted_files: ['a.txt'],
+          undo_stack: [{ message_id: 'msg-123' }],
+        },
       });
     });
 
@@ -304,9 +316,11 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'redo_result',
-        success: false,
-        error: 'No redo available',
-        undo_stack: [{ message_id: 'msg-123' }],
+        data: {
+          success: false,
+          message: 'No redo available',
+          undo_stack: [{ message_id: 'msg-123' }],
+        },
       });
     });
 
@@ -332,7 +346,7 @@ describe('useUiClient - undo/redo', () => {
     expect(MockWebSocket.instance!.sentMessages).toEqual([
       {
         type: 'undo',
-        message_id: 'msg-123',
+        data: { message_id: 'msg-123' },
       },
     ]);
   });
@@ -355,7 +369,7 @@ describe('useUiClient - undo/redo', () => {
     expect(MockWebSocket.instance!.sentMessages).toEqual([
       {
         type: 'undo',
-        message_id: 'msg-123',
+        data: { message_id: 'msg-123' },
       },
     ]);
 
@@ -380,10 +394,12 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        message_id: 'msg-1',
-        reverted_files: ['old.txt'],
-        undo_stack: [{ message_id: 'msg-1' }],
+        data: {
+          success: true,
+          message_id: 'msg-1',
+          reverted_files: ['old.txt'],
+          undo_stack: [{ message_id: 'msg-1' }],
+        },
       });
     });
 
@@ -394,10 +410,12 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        message_id: 'msg-2',
-        reverted_files: ['new.txt'],
-        undo_stack: [{ message_id: 'msg-1' }, { message_id: 'msg-2' }],
+        data: {
+          success: true,
+          message_id: 'msg-2',
+          reverted_files: ['new.txt'],
+          undo_stack: [{ message_id: 'msg-1' }, { message_id: 'msg-2' }],
+        },
       });
     });
 
@@ -423,10 +441,12 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        message_id: 'msg-1',
-        reverted_files: ['old.txt'],
-        undo_stack: [{ message_id: 'msg-1' }],
+        data: {
+          success: true,
+          message_id: 'msg-1',
+          reverted_files: ['old.txt'],
+          undo_stack: [{ message_id: 'msg-1' }],
+        },
       });
     });
 
@@ -437,10 +457,12 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        message_id: 'msg-2',
-        reverted_files: ['new.txt'],
-        undo_stack: [{ message_id: 'msg-1' }, { message_id: 'msg-2' }],
+        data: {
+          success: true,
+          message_id: 'msg-2',
+          reverted_files: ['new.txt'],
+          undo_stack: [{ message_id: 'msg-1' }, { message_id: 'msg-2' }],
+        },
       });
     });
 
@@ -448,8 +470,10 @@ describe('useUiClient - undo/redo', () => {
       result.current.sendRedo();
       MockWebSocket.instance?.simulateMessage({
         type: 'redo_result',
-        success: true,
-        undo_stack: [{ message_id: 'msg-1' }],
+        data: {
+          success: true,
+          undo_stack: [{ message_id: 'msg-1' }],
+        },
       });
     });
 
@@ -480,7 +504,7 @@ describe('useUiClient - undo/redo', () => {
     expect(MockWebSocket.instance!.sentMessages).toEqual([
       {
         type: 'fork_session',
-        message_id: 'msg-fork-123',
+        data: { message_id: 'msg-fork-123' },
       },
     ]);
     expect(result.current.sessionCreatingRef.current).toBe(false);
@@ -488,8 +512,10 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'fork_result',
-        success: true,
-        forked_session_id: 'child-session-1',
+        data: {
+          success: true,
+          forked_session_id: 'child-session-1',
+        },
       });
     });
 
@@ -510,12 +536,14 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'state',
-        routing_mode: 'single',
-        active_agent_id: 'primary',
-        active_session_id: 'main-session',
-        agents: [],
-        sessions_by_agent: {},
-        agent_mode: 'build',
+        data: {
+          routing_mode: 'single',
+          active_agent_id: 'primary',
+          active_session_id: 'main-session',
+          agents: [],
+          sessions_by_agent: {},
+          agent_mode: 'build',
+        },
       });
     });
 
@@ -527,10 +555,12 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        message_id: 'msg-1',
-        reverted_files: ['old.txt'],
-        undo_stack: [{ message_id: 'msg-1' }],
+        data: {
+          success: true,
+          message_id: 'msg-1',
+          reverted_files: ['old.txt'],
+          undo_stack: [{ message_id: 'msg-1' }],
+        },
       });
     });
 
@@ -541,10 +571,12 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        message_id: 'msg-2',
-        reverted_files: ['new.txt'],
-        undo_stack: [{ message_id: 'msg-1' }, { message_id: 'msg-2' }],
+        data: {
+          success: true,
+          message_id: 'msg-2',
+          reverted_files: ['new.txt'],
+          undo_stack: [{ message_id: 'msg-1' }, { message_id: 'msg-2' }],
+        },
       });
     });
 
@@ -554,15 +586,21 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'event',
-        session_id: 'main-session',
-        agent_id: 'primary',
-        event: {
-          seq: 1,
-          timestamp: 1,
-          kind: {
-            type: 'prompt_received',
-            content: 'new prompt',
-            message_id: 'msg-new',
+        data: {
+          session_id: 'main-session',
+          agent_id: 'primary',
+          event: {
+            type: 'durable',
+            data: {
+              seq: 1,
+              timestamp: 1,
+              session_id: 'main-session',
+              origin: 'local',
+              kind: {
+                type: 'prompt_received',
+                data: { content: 'new prompt', message_id: 'msg-new' },
+              },
+            },
           },
         },
       });
@@ -589,9 +627,11 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        reverted_files: ['a.txt'],
-        undo_stack: [{ message_id: 'msg-123' }],
+        data: {
+          success: true,
+          reverted_files: ['a.txt'],
+          undo_stack: [{ message_id: 'msg-123' }],
+        },
       });
     });
 
@@ -601,8 +641,10 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'session_created',
-        session_id: 'new-session',
-        agent_id: 'primary',
+        data: {
+          session_id: 'new-session',
+          agent_id: 'primary',
+        },
       });
     });
 
@@ -626,9 +668,11 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'undo_result',
-        success: true,
-        reverted_files: ['a.txt'],
-        undo_stack: [{ message_id: 'msg-123' }],
+        data: {
+          success: true,
+          reverted_files: ['a.txt'],
+          undo_stack: [{ message_id: 'msg-123' }],
+        },
       });
     });
 
@@ -638,17 +682,23 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'session_loaded',
-        session_id: 'another-session',
-        agent_id: 'primary',
-        audit: {
+        data: {
           session_id: 'another-session',
-          cwd: '/test',
-          events: [],
-          delegations: [],
-          file_mentions: [],
+          agent_id: 'primary',
+          audit: {
+            session_id: 'another-session',
+            events: [],
+            tasks: [],
+            intent_snapshots: [],
+            decisions: [],
+            progress_entries: [],
+            artifacts: [],
+            delegations: [],
+            generated_at: new Date().toISOString(),
+          },
+          undo_stack: [],
+          cursor: {},
         },
-        undo_stack: [],
-        cursor_seq: 0,
       });
     });
 
@@ -667,19 +717,26 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'session_loaded',
-        session_id: 'session-hydrated',
-        agent_id: 'primary',
-        audit: {
+        data: {
           session_id: 'session-hydrated',
-          cwd: '/test',
-          events: [],
-          delegations: [],
-          file_mentions: [],
+          agent_id: 'primary',
+          audit: {
+            session_id: 'session-hydrated',
+            events: [],
+            tasks: [],
+            intent_snapshots: [],
+            decisions: [],
+            progress_entries: [],
+            artifacts: [],
+            delegations: [],
+            generated_at: new Date().toISOString(),
+          },
+          undo_stack: [
+            { message_id: 'msg-1' },
+            { message_id: 'msg-2' },
+          ],
+          cursor: {},
         },
-        undo_stack: [
-          { message_id: 'msg-1' },
-          { message_id: 'msg-2' },
-        ],
       });
     });
 
@@ -703,51 +760,68 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'session_created',
-        session_id: 'session-thinking',
-        agent_id: 'primary',
+        data: { session_id: 'session-thinking', agent_id: 'primary' },
       });
     });
 
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'event',
-        session_id: 'session-thinking',
-        agent_id: 'primary',
-        event: {
-          seq: 1,
-          timestamp: 1,
-          kind: {
-            type: 'assistant_thinking_delta',
-            content: 'Plan: ',
-            message_id: 'm-1',
+        data: {
+          session_id: 'session-thinking',
+          agent_id: 'primary',
+          event: {
+            type: 'ephemeral',
+            data: {
+              seq: 1,
+              timestamp: 1,
+              session_id: 'session-thinking',
+              origin: 'local',
+              kind: {
+                type: 'assistant_thinking_delta',
+                data: { content: 'Plan: ', message_id: 'm-1' },
+              },
+            },
           },
         },
       });
       MockWebSocket.instance?.simulateMessage({
         type: 'event',
-        session_id: 'session-thinking',
-        agent_id: 'primary',
-        event: {
-          seq: 2,
-          timestamp: 2,
-          kind: {
-            type: 'assistant_thinking_delta',
-            content: 'step by step',
-            message_id: 'm-1',
+        data: {
+          session_id: 'session-thinking',
+          agent_id: 'primary',
+          event: {
+            type: 'ephemeral',
+            data: {
+              seq: 2,
+              timestamp: 2,
+              session_id: 'session-thinking',
+              origin: 'local',
+              kind: {
+                type: 'assistant_thinking_delta',
+                data: { content: 'step by step', message_id: 'm-1' },
+              },
+            },
           },
         },
       });
       MockWebSocket.instance?.simulateMessage({
         type: 'event',
-        session_id: 'session-thinking',
-        agent_id: 'primary',
-        event: {
-          seq: 3,
-          timestamp: 3,
-          kind: {
-            type: 'assistant_message_stored',
-            content: 'Final answer',
-            message_id: 'm-1',
+        data: {
+          session_id: 'session-thinking',
+          agent_id: 'primary',
+          event: {
+            type: 'durable',
+            data: {
+              seq: 3,
+              timestamp: 3,
+              session_id: 'session-thinking',
+              origin: 'local',
+              kind: {
+                type: 'assistant_message_stored',
+                data: { content: 'Final answer', message_id: 'm-1' },
+              },
+            },
           },
         },
       });
@@ -771,42 +845,55 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'session_loaded',
-        session_id: 'rehydrated-session',
-        agent_id: 'primary',
-        audit: {
+        data: {
           session_id: 'rehydrated-session',
-          cwd: '/test',
-          events: [
-            {
-              seq: 10,
-              timestamp: 10,
-              kind: {
-                type: 'assistant_message_stored',
-                content: 'Older assistant message',
-                message_id: 'assistant-10',
+          agent_id: 'primary',
+          audit: {
+            session_id: 'rehydrated-session',
+            events: [
+              {
+                seq: 10,
+                timestamp: 10,
+                session_id: 'rehydrated-session',
+                origin: 'local',
+                kind: {
+                  type: 'assistant_message_stored',
+                  data: { content: 'Older assistant message', message_id: 'assistant-10' },
+                },
               },
-            },
-          ],
-          delegations: [],
-          file_mentions: [],
+            ],
+            tasks: [],
+            intent_snapshots: [],
+            decisions: [],
+            progress_entries: [],
+            artifacts: [],
+            delegations: [],
+            generated_at: new Date().toISOString(),
+          },
+          undo_stack: [],
+          cursor: { local_seq: 10 },
         },
-        undo_stack: [],
-        cursor_seq: 10,
       });
     });
 
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'event',
-        session_id: 'rehydrated-session',
-        agent_id: 'primary',
-        event: {
-          seq: 11,
-          timestamp: 11,
-          kind: {
-            type: 'prompt_received',
-            content: 'resumed prompt',
-            message_id: 'prompt-11',
+        data: {
+          session_id: 'rehydrated-session',
+          agent_id: 'primary',
+          event: {
+            type: 'durable',
+            data: {
+              seq: 11,
+              timestamp: 11,
+              session_id: 'rehydrated-session',
+              origin: 'local',
+              kind: {
+                type: 'prompt_received',
+                data: { content: 'resumed prompt', message_id: 'prompt-11' },
+              },
+            },
           },
         },
       });
@@ -827,36 +914,48 @@ describe('useUiClient - undo/redo', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'session_created',
-        session_id: 'session-thinking-2',
-        agent_id: 'primary',
+        data: { session_id: 'session-thinking-2', agent_id: 'primary' },
       });
     });
 
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'event',
-        session_id: 'session-thinking-2',
-        agent_id: 'primary',
-        event: {
-          seq: 1,
-          timestamp: 1,
-          kind: {
-            type: 'assistant_thinking_delta',
-            content: 'hidden rationale',
-            message_id: 'stream-only-id',
+        data: {
+          session_id: 'session-thinking-2',
+          agent_id: 'primary',
+          event: {
+            type: 'ephemeral',
+            data: {
+              seq: 1,
+              timestamp: 1,
+              session_id: 'session-thinking-2',
+              origin: 'local',
+              kind: {
+                type: 'assistant_thinking_delta',
+                data: { content: 'hidden rationale', message_id: 'stream-only-id' },
+              },
+            },
           },
         },
       });
       MockWebSocket.instance?.simulateMessage({
         type: 'event',
-        session_id: 'session-thinking-2',
-        agent_id: 'primary',
-        event: {
-          seq: 2,
-          timestamp: 2,
-          kind: {
-            type: 'assistant_message_stored',
-            content: 'Final without message id',
+        data: {
+          session_id: 'session-thinking-2',
+          agent_id: 'primary',
+          event: {
+            type: 'durable',
+            data: {
+              seq: 2,
+              timestamp: 2,
+              session_id: 'session-thinking-2',
+              origin: 'local',
+              kind: {
+                type: 'assistant_message_stored',
+                data: { content: 'Final without message id' },
+              },
+            },
           },
         },
       });

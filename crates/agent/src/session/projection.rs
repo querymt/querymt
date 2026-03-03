@@ -10,10 +10,12 @@ use crate::session::error::SessionResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use typeshare::typeshare;
 
 use super::domain::{Artifact, Decision, Delegation, IntentSnapshot, ProgressEntry, Task};
 
 /// Full audit view with all details for internal/compliance use
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditView {
     pub session_id: String,
@@ -25,6 +27,7 @@ pub struct AuditView {
     pub artifacts: Vec<Artifact>,
     pub delegations: Vec<Delegation>,
     #[serde(with = "time::serde::rfc3339")]
+    #[typeshare(serialized_as = "string")]
     pub generated_at: OffsetDateTime,
 }
 

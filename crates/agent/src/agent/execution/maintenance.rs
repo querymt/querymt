@@ -5,6 +5,7 @@
 
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
+use crate::agent::utils::u32_from_usize;
 use crate::events::AgentEventKind;
 use crate::middleware::ExecutionState;
 use crate::model::MessagePart;
@@ -83,7 +84,7 @@ pub(super) async fn run_ai_compaction(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get agent history: {}", e))?;
 
-    let token_estimate = messages
+    let token_estimate: usize = messages
         .iter()
         .map(|m| {
             m.parts
@@ -99,7 +100,9 @@ pub(super) async fn run_ai_compaction(
 
     config.emit_event(
         session_id,
-        AgentEventKind::CompactionStart { token_estimate },
+        AgentEventKind::CompactionStart {
+            token_estimate: u32_from_usize(token_estimate, "token_estimate", Some(session_id)),
+        },
     );
 
     let llm_provider = exec_ctx
@@ -163,7 +166,11 @@ pub(super) async fn run_ai_compaction(
         session_id,
         AgentEventKind::CompactionEnd {
             summary: result.summary.clone(),
-            summary_len: result.summary.len(),
+            summary_len: u32_from_usize(
+                result.summary.len(),
+                "result.summary.len",
+                Some(session_id),
+            ),
         },
     );
 

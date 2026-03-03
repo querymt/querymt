@@ -69,21 +69,27 @@ describe('useUiClient - agentModels tracking', () => {
       // We need to trigger a provider_changed via session_loaded which sets mainSessionId
       MockWebSocket.instance?.simulateMessage({
         type: 'session_loaded',
-        session_id: 'session-1',
-        agent_id: 'primary',
-        audit: {
+        data: {
           session_id: 'session-1',
-          cwd: '/test',
-          events: [{
-            seq: 1,
-            timestamp: Date.now() / 1000,
-            kind: { type: 'provider_changed', provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' },
-          }],
-          delegations: [],
-          file_mentions: [],
+          agent_id: 'primary',
+          audit: {
+            session_id: 'session-1',
+            events: [{
+              seq: 1,
+              timestamp: Date.now() / 1000,
+              kind: { type: 'provider_changed', data: { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' } },
+            }],
+            tasks: [],
+            intent_snapshots: [],
+            decisions: [],
+            progress_entries: [],
+            artifacts: [],
+            delegations: [],
+            generated_at: new Date().toISOString(),
+          },
+          undo_stack: [],
+          cursor: {},
         },
-        undo_stack: [],
-        cursor_seq: 1,
       });
     });
 
@@ -97,8 +103,10 @@ describe('useUiClient - agentModels tracking', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'session_created',
-        agent_id: 'primary', 
-        session_id: 'session-2',
+        data: {
+          agent_id: 'primary',
+          session_id: 'session-2',
+        },
       });
     });
 
@@ -119,21 +127,27 @@ describe('useUiClient - agentModels tracking', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'session_loaded',
-        session_id: 'session-1',
-        agent_id: 'primary',
-        audit: {
+        data: {
           session_id: 'session-1',
-          cwd: '/test',
-          events: [{
-            seq: 1,
-            timestamp: Date.now() / 1000,
-            kind: { type: 'provider_changed', provider: 'openai', model: 'gpt-4-turbo', context_limit: 128000 },
-          }],
-          delegations: [],
-          file_mentions: [],
+          agent_id: 'primary',
+          audit: {
+            session_id: 'session-1',
+            events: [{
+              seq: 1,
+              timestamp: Date.now() / 1000,
+              kind: { type: 'provider_changed', data: { provider: 'openai', model: 'gpt-4-turbo', context_limit: 128000 } },
+            }],
+            tasks: [],
+            intent_snapshots: [],
+            decisions: [],
+            progress_entries: [],
+            artifacts: [],
+            delegations: [],
+            generated_at: new Date().toISOString(),
+          },
+          undo_stack: [],
+          cursor: {},
         },
-        undo_stack: [],
-        cursor_seq: 1,
       });
     });
 
@@ -152,21 +166,27 @@ describe('useUiClient - agentModels tracking', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'session_loaded',
-        session_id: 'session-codex',
-        agent_id: 'primary',
-        audit: {
+        data: {
           session_id: 'session-codex',
-          cwd: '/test',
-          events: [{
-            seq: 1,
-            timestamp: Date.now() / 1000,
-            kind: { type: 'provider_changed', provider: 'codex', model: 'gpt-5.3-codex' },
-          }],
-          delegations: [],
-          file_mentions: [],
+          agent_id: 'primary',
+          audit: {
+            session_id: 'session-codex',
+            events: [{
+              seq: 1,
+              timestamp: Date.now() / 1000,
+              kind: { type: 'provider_changed', data: { provider: 'codex', model: 'gpt-5.3-codex' } },
+            }],
+            tasks: [],
+            intent_snapshots: [],
+            decisions: [],
+            progress_entries: [],
+            artifacts: [],
+            delegations: [],
+            generated_at: new Date().toISOString(),
+          },
+          undo_stack: [],
+          cursor: {},
         },
-        undo_stack: [],
-        cursor_seq: 1,
       });
     });
 
@@ -175,7 +195,7 @@ describe('useUiClient - agentModels tracking', () => {
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'error',
-        message: 'anthropic auth failed',
+        data: { message: 'anthropic auth failed' },
       });
     });
 

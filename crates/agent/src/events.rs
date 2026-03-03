@@ -3,6 +3,7 @@ use querymt::Usage;
 use querymt::chat::FinishReason;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use typeshare::typeshare;
 
 use crate::config::McpServerConfig;
 use crate::hash::RapidHash;
@@ -11,7 +12,9 @@ use crate::session::domain::{
     ProgressEntry, Task,
 };
 
-/// Why execution was stopped
+/// Why execution was stopped.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StopType {
@@ -47,22 +50,26 @@ impl From<StopType> for StopReason {
     }
 }
 
-/// Execution progress metrics
+/// Execution progress metrics.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExecutionMetrics {
     /// Number of LLM calls made
-    pub steps: usize,
+    pub steps: u32,
     /// Number of user/assistant turns
-    pub turns: usize,
+    pub turns: u32,
 }
 
 /// Session limits configuration (exposed to UI)
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionLimits {
     /// Maximum number of LLM calls
-    pub max_steps: Option<usize>,
+    pub max_steps: Option<u32>,
     /// Maximum number of user/assistant turns
-    pub max_turns: Option<usize>,
+    pub max_turns: Option<u32>,
     /// Maximum cost in USD
     pub max_cost_usd: Option<f64>,
 }
@@ -103,20 +110,30 @@ impl<'de> Deserialize<'de> for EventOrigin {
     }
 }
 
+/// A single agent event with metadata.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
+    #[typeshare(serialized_as = "number")]
     pub seq: u64,
+    #[typeshare(serialized_as = "number")]
     pub timestamp: i64,
     pub session_id: String,
     #[serde(default)]
+    #[typeshare(serialized_as = "string")]
     pub origin: EventOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_node: Option<String>,
     pub kind: AgentEventKind,
 }
 
+/// All agent event kinds.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+/// Uses adjacently tagged serde (`tag = "type", content = "data"`) for typeshare compatibility.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEventKind {
     SessionCreated,
     PromptReceived {
@@ -147,17 +164,20 @@ pub enum AgentEventKind {
         message_id: String,
     },
     LlmRequestStart {
-        message_count: usize,
+        message_count: u32,
     },
     LlmRequestEnd {
+        #[typeshare(serialized_as = "Option<UsageInfo>")]
         usage: Option<Usage>,
-        tool_calls: usize,
+        tool_calls: u32,
+        #[typeshare(serialized_as = "Option<string>")]
         finish_reason: Option<FinishReason>,
         /// Cost information for this request in USD
         cost_usd: Option<f64>,
         /// Cumulative cost for the session in USD
         cumulative_cost_usd: Option<f64>,
         /// Current context size (input + output tokens)
+        #[typeshare(serialized_as = "number")]
         context_tokens: u64,
         /// Execution progress metrics (steps/turns)
         metrics: ExecutionMetrics,
@@ -165,11 +185,14 @@ pub enum AgentEventKind {
     ProviderChanged {
         provider: String,
         model: String,
+        #[typeshare(serialized_as = "number")]
         config_id: i64,
+        #[typeshare(serialized_as = "Option<number>")]
         context_limit: Option<u64>,
         /// Mesh node that owns this provider. `None` = local node.
         /// Included so the UI can display a node badge next to the model label.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(alias = "provider_node")]
         provider_node_id: Option<String>,
     },
     ToolCallStart {
@@ -190,11 +213,11 @@ pub enum AgentEventKind {
         summary: Option<String>,
     },
     CompactionStart {
-        token_estimate: usize,
+        token_estimate: u32,
     },
     CompactionEnd {
         summary: String,
-        summary_len: usize,
+        summary_len: u32,
     },
     MiddlewareInjected {
         message: String,
@@ -237,7 +260,9 @@ pub enum AgentEventKind {
         alternative: Alternative,
     },
     AlternativeDiscarded {
+        #[typeshare(serialized_as = "number")]
         alternative_id: i64,
+        #[typeshare(serialized_as = "Option<number>")]
         task_id: Option<i64>,
     },
     ProgressRecorded {
@@ -282,6 +307,7 @@ pub enum AgentEventKind {
         elicitation_id: String,
         session_id: String,
         message: String,
+        #[typeshare(serialized_as = "any")]
         requested_schema: serde_json::Value,
         source: String,
     },
@@ -289,21 +315,27 @@ pub enum AgentEventKind {
         parent_session_id: String,
         child_session_id: String,
         target_agent_id: String,
+        #[typeshare(serialized_as = "string")]
         origin: ForkOrigin,
+        #[typeshare(serialized_as = "string")]
         fork_point_type: ForkPointType,
         fork_point_ref: String,
         instructions: Option<String>,
     },
     /// Emitted once at session creation with environment configuration
     SessionConfigured {
+        #[typeshare(serialized_as = "Option<string>")]
         cwd: Option<PathBuf>,
+        #[typeshare(serialized_as = "Vec<McpServerInfo>")]
         mcp_servers: Vec<McpServerConfig>,
         /// Session limits configuration (if any)
         limits: Option<SessionLimits>,
     },
     /// Emitted at session start and whenever available tools change
     ToolsAvailable {
+        #[typeshare(serialized_as = "Vec<ToolInfo>")]
         tools: Vec<querymt::chat::Tool>,
+        #[typeshare(serialized_as = "number")]
         tools_hash: RapidHash,
     },
     /// Emitted when duplicate/similar code is detected in newly written code
@@ -320,6 +352,7 @@ pub enum AgentEventKind {
     },
     /// Emitted when a session's mode changes (per-session mode in actor model)
     SessionModeChanged {
+        #[typeshare(serialized_as = "string")]
         mode: crate::agent::core::AgentMode,
     },
     /// LLM request was rate limited, execution is paused and waiting
@@ -327,18 +360,20 @@ pub enum AgentEventKind {
         /// Human-readable message from the provider
         message: String,
         /// Seconds until retry will be attempted
+        #[typeshare(serialized_as = "number")]
         wait_secs: u64,
         /// When the wait started (Unix timestamp in seconds)
+        #[typeshare(serialized_as = "number")]
         started_at: i64,
         /// Current retry attempt (1-indexed)
-        attempt: usize,
+        attempt: u32,
         /// Maximum retry attempts configured
-        max_attempts: usize,
+        max_attempts: u32,
     },
     /// Rate limit wait completed, resuming execution
     RateLimitResume {
         /// Which attempt is now being made
-        attempt: usize,
+        attempt: u32,
     },
     /// Emitted on the remote node once its workspace index has finished
     /// building and is available via `GetFileIndex`.  Flows through the
@@ -355,6 +390,8 @@ pub enum AgentEventKind {
 
 /// Whether an event must be persisted to the journal (durable) or is
 /// live-only (ephemeral).
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Durability {
@@ -367,12 +404,17 @@ pub enum Durability {
 /// A durable event that has been persisted to the journal.
 ///
 /// Contains a DB-assigned `event_id` and monotonic `stream_seq`.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DurableEvent {
     pub event_id: String,
+    #[typeshare(serialized_as = "number")]
     pub stream_seq: u64,
     pub session_id: String,
+    #[typeshare(serialized_as = "number")]
     pub timestamp: i64,
+    #[typeshare(serialized_as = "string")]
     pub origin: EventOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_node: Option<String>,
@@ -393,10 +435,14 @@ impl From<DurableEvent> for AgentEvent {
 }
 
 /// An ephemeral event — live delivery only, no persistence, no sequence.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EphemeralEvent {
     pub session_id: String,
+    #[typeshare(serialized_as = "number")]
     pub timestamp: i64,
+    #[typeshare(serialized_as = "string")]
     pub origin: EventOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_node: Option<String>,
@@ -431,8 +477,10 @@ impl From<AgentEvent> for EventEnvelope {
 }
 
 /// A tagged union of durable and ephemeral events for the fanout layer.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "durability", rename_all = "snake_case")]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum EventEnvelope {
     Durable(DurableEvent),
     Ephemeral(EphemeralEvent),
@@ -615,8 +663,9 @@ mod tests {
         };
         let json = serde_json::to_value(&kind).unwrap();
         assert_eq!(json["type"], "prompt_received");
-        assert_eq!(json["content"], "test prompt");
-        assert_eq!(json["message_id"], "msg-1");
+        // adjacently tagged: payload is under "data"
+        assert_eq!(json["data"]["content"], "test prompt");
+        assert_eq!(json["data"]["message_id"], "msg-1");
     }
 
     #[test]
@@ -631,10 +680,11 @@ mod tests {
         };
         let json = serde_json::to_value(&kind).unwrap();
         assert_eq!(json["type"], "middleware_stopped");
-        assert_eq!(json["stop_type"], "step_limit");
-        assert_eq!(json["reason"], "max steps reached");
-        assert_eq!(json["metrics"]["steps"], 10);
-        assert_eq!(json["metrics"]["turns"], 5);
+        // adjacently tagged: payload is under "data"
+        assert_eq!(json["data"]["stop_type"], "step_limit");
+        assert_eq!(json["data"]["reason"], "max steps reached");
+        assert_eq!(json["data"]["metrics"]["steps"], 10);
+        assert_eq!(json["data"]["metrics"]["turns"], 5);
     }
 
     #[test]
@@ -644,7 +694,8 @@ mod tests {
         };
         let json = serde_json::to_value(&kind).unwrap();
         assert_eq!(json["type"], "error");
-        assert_eq!(json["message"], "test error");
+        // adjacently tagged: payload is under "data"
+        assert_eq!(json["data"]["message"], "test error");
     }
 
     // ── EventOrigin serialization/compatibility ────────────────────────────

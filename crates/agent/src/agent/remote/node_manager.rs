@@ -10,17 +10,21 @@
 
 use crate::agent::remote::NodeId;
 use serde::{Deserialize, Serialize};
+use typeshare::typeshare;
 
 /// Metadata about a session available on a remote node.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteSessionInfo {
     /// Session public ID (same format as local sessions)
     pub session_id: String,
     /// kameo ActorId of the SessionActor on the remote node (raw u64)
+    #[typeshare(serialized_as = "number")]
     pub actor_id: u64,
     /// Working directory on the remote machine (if set)
     pub cwd: Option<String>,
     /// Unix timestamp when the session was created
+    #[typeshare(serialized_as = "number")]
     pub created_at: i64,
     /// Session title/name, if set
     pub title: Option<String>,

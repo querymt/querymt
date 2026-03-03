@@ -145,10 +145,11 @@ async fn fork_session_from_selected_message_succeeds() -> Result<()> {
     .await;
 
     let fork_result = wait_for_fork_result(&mut rx).await;
-    assert_eq!(fork_result["success"], true);
-    assert_eq!(fork_result["source_session_id"], source_session_id);
+    let fork_data = &fork_result["data"];
+    assert_eq!(fork_data["success"], true);
+    assert_eq!(fork_data["source_session_id"], source_session_id);
 
-    let forked_session_id = fork_result["forked_session_id"]
+    let forked_session_id = fork_data["forked_session_id"]
         .as_str()
         .expect("forked session id should exist")
         .to_string();
@@ -197,9 +198,9 @@ async fn fork_session_from_selected_message_succeeds() -> Result<()> {
     for _ in 0..10 {
         if let Some(msg) = next_json(&mut rx).await
             && msg["type"] == "session_loaded"
-            && msg["session_id"] == forked_session_id
+            && msg["data"]["session_id"] == forked_session_id
         {
-            loaded_events = msg["audit"]["events"].as_array().cloned();
+            loaded_events = msg["data"]["audit"]["events"].as_array().cloned();
             break;
         }
     }
@@ -252,9 +253,10 @@ async fn fork_session_without_active_session_returns_error() -> Result<()> {
     .await;
 
     let fork_result = wait_for_fork_result(&mut rx).await;
-    assert_eq!(fork_result["success"], false);
-    assert!(fork_result["forked_session_id"].is_null());
-    assert_eq!(fork_result["message"], "No active session");
+    let fork_data = &fork_result["data"];
+    assert_eq!(fork_data["success"], false);
+    assert!(fork_data["forked_session_id"].is_null());
+    assert_eq!(fork_data["message"], "No active session");
 
     Ok(())
 }
@@ -285,10 +287,11 @@ async fn fork_session_invalid_message_id_returns_error() -> Result<()> {
     .await;
 
     let fork_result = wait_for_fork_result(&mut rx).await;
-    assert_eq!(fork_result["success"], false);
-    assert_eq!(fork_result["source_session_id"], source_session_id);
-    assert!(fork_result["forked_session_id"].is_null());
-    let message = fork_result["message"]
+    let fork_data = &fork_result["data"];
+    assert_eq!(fork_data["success"], false);
+    assert_eq!(fork_data["source_session_id"], source_session_id);
+    assert!(fork_data["forked_session_id"].is_null());
+    let message = fork_data["message"]
         .as_str()
         .expect("error message should be present");
     assert!(message.contains("Failed to fork session"));

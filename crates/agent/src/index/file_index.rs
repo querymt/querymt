@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
+use typeshare::typeshare;
 
 /// Error types for file index operations
 #[derive(Debug, Error)]
@@ -33,6 +34,7 @@ pub enum FileIndexError {
 }
 
 /// A single entry in the file index.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileIndexEntry {
     /// Relative path from the index root
