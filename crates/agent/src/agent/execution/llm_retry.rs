@@ -3,6 +3,7 @@
 //! This module handles retrying LLM calls with exponential backoff when rate limits are hit.
 
 use crate::agent::agent_config::AgentConfig;
+use crate::agent::utils::u32_from_usize;
 use crate::events::AgentEventKind;
 use futures_util::Stream;
 use log::{debug, info};
@@ -73,8 +74,12 @@ where
                             message: message.clone(),
                             wait_secs,
                             started_at,
-                            attempt,
-                            max_attempts: max_retries,
+                            attempt: u32_from_usize(attempt, "attempt", Some(session_id)),
+                            max_attempts: u32_from_usize(
+                                max_retries,
+                                "max_retries",
+                                Some(session_id),
+                            ),
                         },
                     );
 
@@ -96,7 +101,11 @@ where
                     config.emit_event(
                         session_id,
                         AgentEventKind::RateLimitResume {
-                            attempt: attempt + 1,
+                            attempt: u32_from_usize(
+                                attempt.saturating_add(1),
+                                "attempt + 1",
+                                Some(session_id),
+                            ),
                         },
                     );
 
@@ -212,8 +221,12 @@ where
                             message: message.clone(),
                             wait_secs,
                             started_at,
-                            attempt,
-                            max_attempts: max_retries,
+                            attempt: u32_from_usize(attempt, "attempt", Some(session_id)),
+                            max_attempts: u32_from_usize(
+                                max_retries,
+                                "max_retries",
+                                Some(session_id),
+                            ),
                         },
                     );
 
@@ -225,7 +238,11 @@ where
                     config.emit_event(
                         session_id,
                         AgentEventKind::RateLimitResume {
-                            attempt: attempt + 1,
+                            attempt: u32_from_usize(
+                                attempt.saturating_add(1),
+                                "attempt + 1",
+                                Some(session_id),
+                            ),
                         },
                     );
 

@@ -14,6 +14,8 @@ use super::super::connection::{send_error, send_message};
 use super::super::messages::UiServerMessage;
 #[cfg(feature = "remote")]
 use super::session_ops::handle_list_sessions;
+#[cfg(feature = "remote")]
+use crate::agent::utils::u32_from_usize;
 use tokio::sync::mpsc;
 
 /// List remote nodes discovered in the kameo mesh.
@@ -30,7 +32,7 @@ pub async fn handle_list_remote_nodes(state: &ServerState, tx: &mpsc::Sender<Str
                         id: n.node_id.to_string(),
                         label: n.hostname,
                         capabilities: n.capabilities,
-                        active_sessions: n.active_sessions,
+                        active_sessions: u32_from_usize(n.active_sessions, "active_sessions", None),
                     })
                     .collect(),
             },

@@ -4,6 +4,8 @@
 //! agent events to connected clients.
 
 use crate::agent::core::AgentMode;
+#[cfg(feature = "remote")]
+use crate::agent::utils::u32_from_usize;
 
 use super::messages::{RoutingMode, UiClientMessage, UiServerMessage};
 use super::session::{PRIMARY_AGENT_ID, build_agent_list};
@@ -500,7 +502,11 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                                         id: n.node_id.to_string(),
                                         label: n.hostname.clone(),
                                         capabilities: n.capabilities.clone(),
-                                        active_sessions: n.active_sessions,
+                                        active_sessions: u32_from_usize(
+                                            n.active_sessions,
+                                            "active_sessions",
+                                            None,
+                                        ),
                                     })
                                     .collect(),
                             };
@@ -592,7 +598,11 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                                     id: n.node_id.to_string(),
                                     label: n.hostname,
                                     capabilities: n.capabilities,
-                                    active_sessions: n.active_sessions,
+                                    active_sessions: u32_from_usize(
+                                        n.active_sessions,
+                                        "active_sessions",
+                                        None,
+                                    ),
                                 })
                                 .collect(),
                         };
@@ -619,7 +629,11 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                                         id: n.node_id.to_string(),
                                         label: n.hostname,
                                         capabilities: n.capabilities,
-                                        active_sessions: n.active_sessions,
+                                        active_sessions: u32_from_usize(
+                                            n.active_sessions,
+                                            "active_sessions",
+                                            None,
+                                        ),
                                     })
                                     .collect(),
                             };
@@ -638,7 +652,11 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                                 id: n.node_id.to_string(),
                                 label: n.hostname,
                                 capabilities: n.capabilities,
-                                active_sessions: n.active_sessions,
+                                active_sessions: u32_from_usize(
+                                    n.active_sessions,
+                                    "active_sessions",
+                                    None,
+                                ),
                             })
                             .collect(),
                     };

@@ -443,7 +443,11 @@ impl SessionStore for SqliteStorage {
                                 Ok(value) => value,
                                 Err(_) => return false,
                             };
-                            let message_id = parsed.get("message_id").and_then(|id| id.as_str());
+                            // payload_json uses adjacently tagged format: fields are under "data"
+                            let message_id = parsed
+                                .get("data")
+                                .and_then(|d| d.get("message_id"))
+                                .and_then(|id| id.as_str());
                             return message_id
                                 .map(|id| copied_message_ids.contains(id))
                                 .unwrap_or(false);
@@ -454,7 +458,11 @@ impl SessionStore for SqliteStorage {
                                 Ok(value) => value,
                                 Err(_) => return false,
                             };
-                            let message_id = parsed.get("message_id").and_then(|id| id.as_str());
+                            // payload_json uses adjacently tagged format: fields are under "data"
+                            let message_id = parsed
+                                .get("data")
+                                .and_then(|d| d.get("message_id"))
+                                .and_then(|id| id.as_str());
                             return message_id
                                 .map(|id| copied_message_ids.contains(id))
                                 .unwrap_or(false);
@@ -1829,12 +1837,14 @@ impl ViewStore for SqliteStorage {
                 // Query all ProviderChanged events with workspace info.
                 // Uses event_journal (the legacy `events` table was dropped
                 // by migration 0002).
+                // Note: payload_json uses adjacently tagged serde format
+                // (tag="type", content="data"), so variant payload is under $.data.*
                 let mut stmt = conn.prepare(
                     r#"
                 SELECT 
                     s.cwd,
-                    json_extract(e.payload_json, '$.provider') as provider,
-                    json_extract(e.payload_json, '$.model') as model,
+                    json_extract(e.payload_json, '$.data.provider') as provider,
+                    json_extract(e.payload_json, '$.data.model') as model,
                     MAX(e.timestamp) as last_used_ts,
                     COUNT(*) as use_count
                 FROM event_journal e

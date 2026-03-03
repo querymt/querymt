@@ -24,6 +24,7 @@ dbus-secret-service = ["oauth", "querymt-utils/dbus-secret-service"]
 remote = ["kameo/remote", "dep:libp2p"]
 
 [dependencies]
+typeshare = "1.0"
 querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
 querymt-provider-common = { path = "../provider-common" }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde"] }

@@ -57,7 +57,8 @@ async fn load_session_includes_cursor_seq_from_audit_tail() -> Result<()> {
     }
 
     let loaded = loaded_msg.expect("session_loaded should be sent");
-    let events = loaded["audit"]["events"]
+    let data = &loaded["data"];
+    let events = data["audit"]["events"]
         .as_array()
         .expect("audit.events should be an array");
     let replay_tail = events
@@ -67,7 +68,7 @@ async fn load_session_includes_cursor_seq_from_audit_tail() -> Result<()> {
         .expect("expected replayed events with seq");
 
     // session_loaded exposes cursor.local_seq at replay tail.
-    assert_eq!(loaded["cursor"]["local_seq"].as_u64(), Some(replay_tail));
+    assert_eq!(data["cursor"]["local_seq"].as_u64(), Some(replay_tail));
 
     Ok(())
 }
@@ -94,17 +95,19 @@ async fn subscribe_session_includes_cursor_seq_from_replay_tail() -> Result<()> 
     let parsed = parse_message(&msg);
     assert_eq!(parsed["type"], "session_events");
 
-    let events = parsed["events"]
+    let data = &parsed["data"];
+    let events = data["events"]
         .as_array()
         .expect("events should be an array");
+    // EventEnvelope is adjacently tagged: durable events have stream_seq under ["data"]["stream_seq"]
     let replay_tail = events
         .iter()
-        .filter_map(|e| e["stream_seq"].as_u64())
+        .filter_map(|e| e["data"]["stream_seq"].as_u64())
         .max()
         .unwrap_or(0);
 
     // session_events exposes cursor.local_seq at replay tail.
-    assert_eq!(parsed["cursor"]["local_seq"].as_u64(), Some(replay_tail));
+    assert_eq!(data["cursor"]["local_seq"].as_u64(), Some(replay_tail));
 
     Ok(())
 }
@@ -217,8 +220,12 @@ async fn forwarder_drops_event_when_seq_is_at_or_below_cursor() -> Result<()> {
         .expect("channel should remain open");
     let forwarded_msg = parse_message(&forwarded);
     assert_eq!(forwarded_msg["type"], "event");
-    assert_eq!(forwarded_msg["session_id"], session_id);
-    assert_eq!(forwarded_msg["event"]["stream_seq"].as_u64(), Some(11));
+    assert_eq!(forwarded_msg["data"]["session_id"], session_id);
+    // EventEnvelope is adjacently tagged: durable event fields are under ["data"]["event"]["data"]
+    assert_eq!(
+        forwarded_msg["data"]["event"]["data"]["stream_seq"].as_u64(),
+        Some(11)
+    );
 
     {
         let connections = state.connections.lock().await;
@@ -318,9 +325,11 @@ async fn forwarder_does_not_drop_ephemeral_events_despite_cursor() -> Result<()>
 
     let msg = parse_message(&forwarded);
     assert_eq!(msg["type"], "event");
-    assert_eq!(msg["session_id"], session_id);
+    assert_eq!(msg["data"]["session_id"], session_id);
+    // EventEnvelope is adjacently tagged: ephemeral event fields are under ["data"]["event"]["data"]
+    // AgentEventKind is also adjacently tagged: kind fields are under ["data"]["event"]["data"]["kind"]
     assert_eq!(
-        msg["event"]["kind"]["type"], "assistant_content_delta",
+        msg["data"]["event"]["data"]["kind"]["type"], "assistant_content_delta",
         "forwarded event should be the ephemeral content delta"
     );
 

@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tracing::instrument;
+use typeshare::typeshare;
 
 /// Maximum number of warnings shown inline in the injected summary message.
 /// Remaining warnings are still in the overflow file but not listed in context.
@@ -68,8 +69,10 @@ struct WarningOffset {
 }
 
 /// Location of a function in source code
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionLocation {
+    #[typeshare(serialized_as = "string")]
     pub file_path: PathBuf,
     pub function_name: String,
     pub start_line: u32,
@@ -88,6 +91,7 @@ impl FunctionLocation {
 }
 
 /// A warning about duplicate code
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateWarning {
     /// The newly written function that is similar to existing code
@@ -97,8 +101,10 @@ pub struct DuplicateWarning {
 }
 
 /// A match found in the existing codebase
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimilarMatch {
+    #[typeshare(serialized_as = "string")]
     pub file_path: PathBuf,
     pub function_name: String,
     pub start_line: u32,

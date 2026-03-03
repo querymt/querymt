@@ -119,4 +119,38 @@ jobs:
       - name: Run UI Tests
         working-directory: crates/agent/ui
         run: npm test
-     
+
+  # Job 5: Check that generated TypeScript types are up to date
+  check-generated-types:
+    name: Check generated types drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+
+      - name: Install typeshare-cli
+        run: cargo install typeshare-cli --locked
+
+      - name: Regenerate types
+        run: bash scripts/generate-types.sh
+
+      - name: Check TypeScript drift
+        run: |
+          git diff --exit-code crates/agent/ui/src/generated/types.ts || \
+          (echo "ERROR: generated/types.ts is out of date. Run scripts/generate-types.sh and commit." && exit 1)
+
+      - name: Check Swift drift (if iOS sibling exists)
+        run: |
+          if [ -f ../querymt-ios/Sources/QueryMTIOSApp/Generated/Types.swift ]; then
+            git diff --exit-code ../querymt-ios/Sources/QueryMTIOSApp/Generated/Types.swift || \
+            (echo "ERROR: Generated Swift types are out of date. Run scripts/generate-types.sh and commit." && exit 1)
+          else
+            echo "querymt-ios sibling repo not present; skipping Swift drift check."
+          fi
+

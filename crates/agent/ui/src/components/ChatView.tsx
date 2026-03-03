@@ -18,7 +18,7 @@ import { useUiStore } from '../store/uiStore';
 import { useSessionManager } from '../hooks/useSessionManager';
 import { useFileMention } from '../hooks/useFileMention';
 import { useTodoState } from '../hooks/useTodoState';
-import { EventItem, EventRow, PromptBlock } from '../types';
+import { EventItem, EventRow, UiPromptBlock } from '../types';
 import { MentionInput } from './MentionInput';
 import { ToolDetailModal } from './ToolDetailModal';
 import { TurnCard } from './TurnCard';
@@ -34,8 +34,8 @@ import { RateLimitIndicator } from './RateLimitIndicator';
 
 const FILE_MENTION_MARKUP_RE = /@\{(file|dir):([^}]+)\}/g;
 
-function buildPromptBlocksFromInput(input: string): PromptBlock[] {
-  const links = new Map<string, PromptBlock>();
+function buildPromptBlocksFromInput(input: string): UiPromptBlock[] {
+  const links = new Map<string, UiPromptBlock>();
   const normalizedText = input.replace(FILE_MENTION_MARKUP_RE, (_match, _kind: string, rawPath: string) => {
     const path = String(rawPath).trim();
     if (!path) {
@@ -44,15 +44,14 @@ function buildPromptBlocksFromInput(input: string): PromptBlock[] {
     if (!links.has(path)) {
       links.set(path, {
         type: 'resource_link',
-        name: path,
-        uri: path,
+        data: { name: path, uri: path },
       });
     }
     return `@${path}`;
   });
 
   return [
-    { type: 'text', text: normalizedText },
+    { type: 'text', data: { text: normalizedText } },
     ...Array.from(links.values()),
   ];
 }

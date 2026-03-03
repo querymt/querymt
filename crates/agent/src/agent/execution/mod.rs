@@ -20,6 +20,7 @@ mod transitions;
 mod wait;
 
 use crate::agent::execution_context::ExecutionContext;
+use crate::agent::utils::u32_from_usize;
 use crate::events::{AgentEventKind, ExecutionMetrics, StopType};
 use crate::middleware::ExecutionState;
 use agent_client_protocol::StopReason;
@@ -303,8 +304,16 @@ pub(crate) async fn execute_cycle_state_machine(
                 let metrics = state
                     .context()
                     .map(|ctx| ExecutionMetrics {
-                        steps: ctx.stats.steps,
-                        turns: ctx.stats.turns,
+                        steps: u32_from_usize(
+                            ctx.stats.steps,
+                            "ctx.stats.steps",
+                            Some(&exec_ctx.session_id),
+                        ),
+                        turns: u32_from_usize(
+                            ctx.stats.turns,
+                            "ctx.stats.turns",
+                            Some(&exec_ctx.session_id),
+                        ),
                     })
                     .unwrap_or_default();
 

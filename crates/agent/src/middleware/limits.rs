@@ -1,3 +1,4 @@
+use crate::agent::utils::u32_from_usize;
 use crate::events::StopType;
 use crate::middleware::factory::MiddlewareFactory;
 use crate::middleware::{
@@ -235,8 +236,14 @@ impl MiddlewareDriver for LimitsMiddleware {
 
     fn get_limits(&self) -> Option<crate::events::SessionLimits> {
         Some(crate::events::SessionLimits {
-            max_steps: self.config.max_steps,
-            max_turns: self.config.max_turns,
+            max_steps: self
+                .config
+                .max_steps
+                .map(|v| u32_from_usize(v, "LimitsConfig.max_steps", None)),
+            max_turns: self
+                .config
+                .max_turns
+                .map(|v| u32_from_usize(v, "LimitsConfig.max_turns", None)),
             max_cost_usd: self.config.max_price_usd,
         })
     }
@@ -309,7 +316,11 @@ impl MiddlewareDriver for MaxStepsMiddleware {
 
     fn get_limits(&self) -> Option<crate::events::SessionLimits> {
         Some(crate::events::SessionLimits {
-            max_steps: Some(self.max_steps),
+            max_steps: Some(u32_from_usize(
+                self.max_steps,
+                "MaxStepsMiddleware.max_steps",
+                None,
+            )),
             max_turns: None,
             max_cost_usd: None,
         })
@@ -387,7 +398,11 @@ impl MiddlewareDriver for TurnLimitMiddleware {
     fn get_limits(&self) -> Option<crate::events::SessionLimits> {
         Some(crate::events::SessionLimits {
             max_steps: None,
-            max_turns: Some(self.max_turns),
+            max_turns: Some(u32_from_usize(
+                self.max_turns,
+                "TurnLimitMiddleware.max_turns",
+                None,
+            )),
             max_cost_usd: None,
         })
     }

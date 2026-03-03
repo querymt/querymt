@@ -220,15 +220,16 @@ async fn test_undo_handler_single_agent() -> Result<()> {
         response["type"], "undo_result",
         "Should be undo_result message"
     );
-    assert_eq!(response["success"], true, "Undo should succeed");
+    let data = &response["data"];
+    assert_eq!(data["success"], true, "Undo should succeed");
 
-    let reverted_files = response["reverted_files"]
+    let reverted_files = data["reverted_files"]
         .as_array()
         .expect("Should have reverted_files");
     assert_eq!(reverted_files.len(), 1);
     assert_eq!(reverted_files[0], "test.txt");
-    assert_eq!(response["message_id"], user_msg_id);
-    let undo_stack = response["undo_stack"]
+    assert_eq!(data["message_id"], user_msg_id);
+    let undo_stack = data["undo_stack"]
         .as_array()
         .expect("Should have undo_stack");
     assert_eq!(undo_stack.len(), 1);
@@ -460,15 +461,16 @@ async fn test_undo_handler_cross_session() -> Result<()> {
         response["type"], "undo_result",
         "Should be undo_result message"
     );
-    assert_eq!(response["success"], true, "Undo should succeed");
+    let data = &response["data"];
+    assert_eq!(data["success"], true, "Undo should succeed");
 
-    let reverted_files = response["reverted_files"]
+    let reverted_files = data["reverted_files"]
         .as_array()
         .expect("Should have reverted_files");
     assert_eq!(reverted_files.len(), 1, "Should revert 1 file");
     assert_eq!(reverted_files[0], "test.txt");
-    assert_eq!(response["message_id"], user_msg_id);
-    let undo_stack = response["undo_stack"]
+    assert_eq!(data["message_id"], user_msg_id);
+    let undo_stack = data["undo_stack"]
         .as_array()
         .expect("Should have undo_stack");
     assert_eq!(undo_stack.len(), 1);
@@ -570,7 +572,12 @@ async fn test_set_session_model_hydrates_persisted_session() -> Result<()> {
     while let Ok(Some(msg_str)) = tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
         let parsed: Value = serde_json::from_str(&msg_str)?;
         if parsed["type"] == "error" {
-            errors.push(parsed["message"].as_str().unwrap_or_default().to_string());
+            errors.push(
+                parsed["data"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
         }
     }
     assert!(
@@ -630,7 +637,7 @@ async fn test_set_session_model_unknown_session_returns_not_found() -> Result<()
     {
         let parsed: Value = serde_json::from_str(&msg_str)?;
         if parsed["type"] == "error"
-            && parsed["message"]
+            && parsed["data"]["message"]
                 .as_str()
                 .unwrap_or_default()
                 .contains(&format!("Session not found: {}", missing_id))

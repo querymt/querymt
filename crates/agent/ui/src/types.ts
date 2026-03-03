@@ -7,37 +7,75 @@ import type {
 // Re-export SDK types for use in other components
 export type { SessionNotification, SessionUpdate };
 
-// Stop type enum matching Rust StopType
-export type StopType =
-  | 'step_limit'
-  | 'turn_limit'
-  | 'price_limit'
-  | 'context_threshold'
-  | 'model_token_limit'
-  | 'content_filter'
-  | 'delegation_blocked'
-  | 'other';
+// ── Generated types (authoritative from Rust via typeshare) ──────────────────
+// These types are generated from Rust source and must not be hand-edited here.
+// Re-export everything from the generated file.
+// Enums must use plain `export` (not `export type`) so their values are accessible at runtime.
+export {
+  StopType,
+  RoutingMode,
+  OAuthStatus,
+  Durability,
+  AlternativeStatus,
+  DecisionStatus,
+  DelegationStatus,
+  ForkOrigin,
+  ForkPointType,
+  ProgressKind,
+  TaskKind,
+  TaskStatus,
+  EventOriginKind,
+  OAuthFlowKindTs,
+} from './generated/types';
 
-// Execution metrics matching Rust ExecutionMetrics
-export interface ExecutionMetrics {
-  steps: number;
-  turns: number;
-}
+export type {
+  // Structs
+  ExecutionMetrics,
+  SessionLimits,
+  AgentEvent,
+  DurableEvent,
+  EphemeralEvent,
+  EventEnvelope,
+  UndoStackFrame,
+  StreamCursor,
+  PluginUpdateResult,
+  // Structs previously hand-defined, now generated from Rust
+  UiAgentInfo,
+  SessionSummary,
+  SessionGroup,
+  AuditView,
+  AuthProviderEntry,
+  ModelEntry,
+  ProviderCapabilityEntry,
+  RecentModelEntry,
+  RemoteNodeInfo,
+  // AuditView sub-types (generated with richer fields than prior manual definitions)
+  Task,
+  IntentSnapshot,
+  Decision,
+  ProgressEntry,
+  Artifact,
+  Delegation,
+  // Discriminated unions
+  AgentEventKind,
+  UiPromptBlock,
+  UiClientMessage,
+  UiServerMessage,
+  // P3: Previously `any` types, now generated with proper structure
+  UsageInfo,
+  ToolInfo,
+  FunctionToolInfo,
+  McpServerInfo,
+  FileIndexEntry,
+  RemoteSessionInfo,
+  DuplicateWarning,
+  FunctionLocation,
+  SimilarMatch,
+} from './generated/types';
 
-// Session limits matching Rust SessionLimits
-export interface SessionLimits {
-  max_steps?: number;
-  max_turns?: number;
-  max_cost_usd?: number;
-}
+// FileIndexEntry is now generated from Rust via typeshare — re-exported above.
 
-// File index types for @ mentions
-export interface FileIndexEntry {
-  path: string;
-  is_dir: boolean;
-}
-
-// Elicitation tool types (unified MCP protocol)
+// ── Elicitation tool types (unified MCP protocol) ────────────────────────────
 export interface ElicitationData {
   elicitationId: string;
   sessionId: string;
@@ -46,7 +84,9 @@ export interface ElicitationData {
   source: string;  // "builtin:question" or "mcp:server_name"
 }
 
-// Custom UI-specific types
+// ── UI-only view-model types ──────────────────────────────────────────────────
+// These are not generated from Rust and represent UI-specific data models.
+
 export interface EventItem {
   id: string;
   agentId?: string;
@@ -92,11 +132,11 @@ export interface EventItem {
   /** Mesh node that owns the provider (from provider_changed events). Absent for local providers. */
   providerNode?: string;
   // Execution metrics from llm_request_end events
-  metrics?: ExecutionMetrics;
+  metrics?: import('./generated/types').ExecutionMetrics;
   // Middleware stopped event data
-  stopType?: StopType;
+  stopType?: import('./generated/types').StopType;
   stopReason?: string;
-  stopMetrics?: ExecutionMetrics;
+  stopMetrics?: import('./generated/types').ExecutionMetrics;
   // Elicitation tool fields
   elicitationData?: ElicitationData;
   // Rate limit fields
@@ -126,36 +166,6 @@ export interface RateLimitState {
   attempt: number;
   maxAttempts: number;
   remainingSecs: number;  // Updated by timer in UI
-}
-
-export type RoutingMode = 'single' | 'broadcast';
-
-export interface UiAgentInfo {
-  id: string;
-  name: string;
-  description: string;
-  capabilities: string[];
-}
-
-// Session history
-export interface SessionSummary {
-  session_id: string;
-  name?: string;
-  cwd?: string;
-  title?: string;
-  created_at?: string;
-  updated_at?: string;
-  parent_session_id?: string;
-  fork_origin?: string;
-  has_children?: boolean;
-  /** Node label where this session lives. Absent or undefined for local sessions. */
-  node?: string;
-}
-
-export interface SessionGroup {
-  cwd?: string;
-  sessions: SessionSummary[];
-  latest_activity?: string;
 }
 
 // Event filters
@@ -196,7 +206,7 @@ export interface SessionStats {
   totalSteps: number;  // LLM calls
   totalTurns: number;  // User/assistant exchanges
   // Session limits (if configured)
-  limits?: SessionLimits;
+  limits?: import('./generated/types').SessionLimits;
 }
 
 // Combined statistics result
@@ -205,94 +215,12 @@ export interface CalculatedStats {
   perAgent: AgentStats[];
 }
 
-// AgentEvent type (matches Rust AgentEvent)
-export interface AgentEvent {
-  seq: number;
-  timestamp: number;
-  session_id: string;
-  kind: AgentEventKind;
-}
-
-// AgentEventKind union type
-export type AgentEventKind =
-  | { type: 'prompt_received'; content: string }
-  | { type: 'assistant_message_stored'; content: string; thinking?: string; message_id?: string }
-  | { type: 'assistant_content_delta'; content: string; message_id: string }   // streaming text delta
-  | { type: 'assistant_thinking_delta'; content: string; message_id: string }  // streaming thinking delta
-  | { type: 'tool_call_start'; tool_call_id: string; tool_name: string; arguments?: string }
-  | { type: 'tool_call_end'; tool_call_id: string; tool_name: string; result?: string; is_error?: boolean }
-  | { type: 'error'; message: string }
-  | { type: 'delegation_cancelled'; delegation_id: string }
-  | { type: string; [key: string]: unknown };
-
-// Full AuditView matching Rust struct (for session loading)
-export interface AuditView {
-  session_id: string;
-  events: AgentEvent[];
-  tasks: Task[];
-  intent_snapshots: IntentSnapshot[];
-  decisions: Decision[];
-  progress_entries: ProgressEntry[];
-  artifacts: Artifact[];
-  delegations: Delegation[];
-  generated_at: string;  // RFC3339
-}
-
-// Supporting domain types for AuditView
-export interface Task {
-  public_id: string;
-  session_id: string;
-  status: string;
-  expected_deliverable?: string;
-  created_at: string;
-}
-
 // TodoItem - agent's working task list (from todowrite tool)
 export interface TodoItem {
   id: string;
   content: string;
   status: 'pending' | 'in_progress' | 'completed' | 'cancelled';
   priority: 'high' | 'medium' | 'low';
-}
-
-export interface IntentSnapshot {
-  public_id: string;
-  session_id: string;
-  summary: string;
-  created_at: string;
-}
-
-export interface Decision {
-  public_id: string;
-  session_id: string;
-  description: string;
-  status: string;
-  created_at: string;
-}
-
-export interface ProgressEntry {
-  public_id: string;
-  session_id: string;
-  kind: string;
-  content: string;
-  created_at: string;
-}
-
-export interface Artifact {
-  public_id: string;
-  session_id: string;
-  kind: string;
-  summary?: string;
-  created_at: string;
-}
-
-export interface Delegation {
-  public_id: string;
-  session_id: string;
-  target_agent_id: string;
-  objective: string;
-  status: string;
-  created_at: string;
 }
 
 // Extended event row with display metadata (used in App.tsx)
@@ -347,10 +275,6 @@ export interface Turn {
   compaction?: TurnCompaction;
 }
 
-export interface UndoStackFrame {
-  message_id: string;
-}
-
 export interface PluginUpdateStatus {
   plugin_name: string;
   image_reference: string;
@@ -359,138 +283,6 @@ export interface PluginUpdateStatus {
   bytes_total?: number | null;
   percent?: number | null;
   message?: string | null;
-}
-
-export interface PluginUpdateResult {
-  plugin_name: string;
-  success: boolean;
-  message?: string | null;
-}
-
-export type UiServerMessage =
-  | {
-      type: 'state';
-      routing_mode: RoutingMode;
-      active_agent_id: string;
-      active_session_id?: string | null;
-      default_cwd?: string | null;
-      agents: UiAgentInfo[];
-      sessions_by_agent: Record<string, string>;
-      agent_mode: string;
-    }
-  | {
-      type: 'session_created';
-      agent_id: string;
-      session_id: string;
-      request_id?: string;
-    }
-  | {
-      type: 'event';
-      agent_id: string;
-      session_id: string;
-      event: any;
-    }
-  | {
-      type: 'session_events';
-      session_id: string;
-      agent_id: string;
-      events: any[];
-      cursor_seq: number;
-    }
-  | {
-      type: 'error';
-      message: string;
-    }
-  | { type: 'session_list'; groups: SessionGroup[] }
-  | {
-      type: 'session_loaded';
-      session_id: string;
-      agent_id: string;
-      audit: AuditView;
-      undo_stack: UndoStackFrame[];
-      cursor_seq: number;
-    }
-  | {
-      type: 'workspace_index_status';
-      session_id: string;
-      status: 'building' | 'ready' | 'error';
-      message?: string | null;
-    }
-  | { type: 'all_models_list'; models: ModelEntry[] }
-  | { type: 'recent_models'; by_workspace: Record<string, RecentModelEntry[]> }
-  | { type: 'provider_capabilities'; providers: ProviderCapabilityEntry[] }
-  | { type: 'auth_providers'; providers: AuthProviderEntry[] }
-  | {
-      type: 'oauth_flow_started';
-      flow_id: string;
-      provider: string;
-      authorization_url: string;
-      flow_kind: OAuthFlowKind;
-    }
-  | { type: 'oauth_result'; provider: string; success: boolean; message: string }
-  | { type: 'file_index'; files: FileIndexEntry[]; generated_at: number }
-  | { type: 'llm_config'; config_id: number; provider: string; model: string; params?: Record<string, unknown> | null }
-  | {
-      type: 'undo_result';
-      success: boolean;
-      message?: string | null;
-      reverted_files: string[];
-      message_id?: string | null;
-      undo_stack: UndoStackFrame[];
-    }
-  | { type: 'redo_result'; success: boolean; message?: string | null; undo_stack: UndoStackFrame[] }
-  | {
-      type: 'fork_result';
-      success: boolean;
-      source_session_id?: string | null;
-      forked_session_id?: string | null;
-      message?: string | null;
-    }
-  | { type: 'agent_mode'; mode: string }
-  | { type: 'remote_nodes'; nodes: RemoteNodeInfo[] }
-  | { type: 'remote_sessions'; node_id: string; sessions: RemoteSessionInfo[] }
-  | ({ type: 'model_download_status' } & ModelDownloadStatus)
-  | {
-      type: 'plugin_update_status';
-      plugin_name: string;
-      image_reference: string;
-      phase: string;
-      bytes_downloaded: number;
-      bytes_total?: number | null;
-      percent?: number | null;
-      message?: string | null;
-    }
-  | {
-      type: 'plugin_update_complete';
-      results: PluginUpdateResult[];
-    };
-
-export interface ModelEntry {
-  id?: string;
-  label?: string;
-  source?: 'preset' | 'cached' | 'custom' | 'catalog' | string;
-  family?: string;
-  quant?: string;
-  provider: string;
-  model: string;
-  /** Stable mesh node id (PeerId) where this provider lives. Absent for local models. */
-  node_id?: string;
-  /** Human-readable node label for display. Absent for local models. */
-  node_label?: string;
-  /** @deprecated Use node_label for display or node_id for identity. Alias for node_label. */
-  node?: string;
-}
-
-export interface ProviderCapabilityEntry {
-  provider: string;
-  supports_custom_models: boolean;
-}
-
-export interface RecentModelEntry {
-  provider: string;
-  model: string;
-  last_used: string;  // ISO 8601 timestamp
-  use_count: number;
 }
 
 export interface ModelDownloadStatus {
@@ -505,14 +297,9 @@ export interface ModelDownloadStatus {
   message?: string | null;
 }
 
-export type OAuthStatus = 'not_authenticated' | 'expired' | 'connected';
+// OAuthFlowKind is now generated as OAuthFlowKindTs in generated/types.ts (re-exported above).
+// Alias for backward compatibility with existing code that uses the old name.
 export type OAuthFlowKind = 'redirect_code' | 'device_poll';
-
-export interface AuthProviderEntry {
-  provider: string;
-  display_name: string;
-  status: OAuthStatus;
-}
 
 export interface OAuthFlowState {
   flow_id: string;
@@ -535,60 +322,4 @@ export interface LlmConfigDetails {
   params?: Record<string, unknown> | null;
 }
 
-// Remote node/session types for mesh-based multi-node support
-export interface RemoteNodeInfo {
-  /** Stable mesh node id (PeerId string) — used as the identity for backend messages. */
-  id: string;
-  /** Human-readable label / hostname — used for display only. */
-  label: string;
-  capabilities: string[];
-  active_sessions: number;
-}
-
-export interface RemoteSessionInfo {
-  session_id: string;
-  actor_id: number;
-  cwd?: string;
-  created_at: number;
-  title?: string;
-}
-
-export type PromptBlock =
-  | { type: 'text'; text: string }
-  | { type: 'resource_link'; name: string; uri: string; description?: string };
-
-export type UiClientMessage =
-  | { type: 'init' }
-  | { type: 'set_active_agent'; agent_id: string }
-  | { type: 'set_routing_mode'; mode: RoutingMode }
-  | { type: 'new_session'; cwd?: string | null; request_id?: string }
-  | { type: 'prompt'; prompt: PromptBlock[] }
-  | { type: 'list_sessions' }
-  | { type: 'load_session'; session_id: string }
-  | { type: 'delete_session'; session_id: string }
-  | { type: 'list_all_models'; refresh?: boolean }
-  | { type: 'set_session_model'; session_id: string; model_id: string; node_id?: string }
-  | { type: 'get_recent_models'; limit_per_workspace?: number }
-  | { type: 'list_auth_providers' }
-  | { type: 'start_oauth_login'; provider: string }
-  | { type: 'complete_oauth_login'; flow_id: string; response: string }
-  | { type: 'disconnect_oauth'; provider: string }
-  | { type: 'get_file_index' }
-  | { type: 'get_llm_config'; config_id: number }
-  | { type: 'cancel_session' }
-  | { type: 'undo'; message_id: string }
-  | { type: 'redo' }
-  | { type: 'fork_session'; message_id: string }
-  | { type: 'subscribe_session'; session_id: string; agent_id?: string }
-  | { type: 'unsubscribe_session'; session_id: string }
-  | { type: 'elicitation_response'; elicitation_id: string; action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> }
-  | { type: 'set_agent_mode'; mode: string }
-  | { type: 'get_agent_mode' }
-  | { type: 'list_remote_nodes' }
-  | { type: 'list_remote_sessions'; node_id: string }
-  | { type: 'create_remote_session'; node_id: string; cwd?: string | null; request_id?: string }
-  | { type: 'attach_remote_session'; node_id: string; session_id: string }
-  | { type: 'add_custom_model_from_hf'; provider: string; repo: string; filename: string; display_name?: string }
-  | { type: 'add_custom_model_from_file'; provider: string; file_path: string; display_name?: string }
-  | { type: 'delete_custom_model'; provider: string; model_id: string }
-  | { type: 'update_plugins' };
+// RemoteSessionInfo is now generated from Rust via typeshare — re-exported above.
