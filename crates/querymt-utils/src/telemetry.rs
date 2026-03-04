@@ -1,7 +1,9 @@
-use opentelemetry::{KeyValue, trace::TracerProvider};
+use opentelemetry::{KeyValue, trace::TracerProvider as _};
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     Resource,
+    logs::SdkLoggerProvider,
     trace::{RandomIdGenerator, SdkTracerProvider},
 };
 use opentelemetry_semantic_conventions::{SCHEMA_URL, resource::SERVICE_VERSION};
@@ -34,10 +36,28 @@ fn init_tracer_provider(
         .with_tonic()
         .with_endpoint(endpoint)
         .build()
-        .expect("OTLP exporter init failed");
+        .expect("OTLP span exporter init failed");
 
     SdkTracerProvider::builder()
         .with_id_generator(RandomIdGenerator::default())
+        .with_resource(resource(service_name, service_version))
+        .with_batch_exporter(exporter)
+        .build()
+}
+
+/// Initialize an OTLP logger provider
+fn init_logger_provider(
+    service_name: &str,
+    service_version: &str,
+    endpoint: &str,
+) -> SdkLoggerProvider {
+    let exporter = opentelemetry_otlp::LogExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()
+        .expect("OTLP log exporter init failed");
+
+    SdkLoggerProvider::builder()
         .with_resource(resource(service_name, service_version))
         .with_batch_exporter(exporter)
         .build()
@@ -67,26 +87,26 @@ pub fn setup_telemetry(service_name: &str, service_version: &str) {
 
     // Check if telemetry is disabled
     if std::env::var("QMT_NO_TELEMETRY").is_ok() {
-        // Telemetry disabled - only use fmt + filter layers
         let subscriber = Registry::default().with(filter).with(fmt_layer);
         tracing::subscriber::set_global_default(subscriber)
             .expect("Failed to set tracing subscriber");
         return;
     }
 
-    // Telemetry enabled - use custom endpoint or default
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string());
 
-    // Initialize tracer provider with custom service name, version, and endpoint
-    let tp = init_tracer_provider(service_name, service_version, &endpoint);
-    let tracer = tp.tracer("qmt-tracer");
+    let tracer_provider = init_tracer_provider(service_name, service_version, &endpoint);
+    let tracer = tracer_provider.tracer("qmt-tracer");
 
-    // Build subscriber with fmt + filter + OpenTelemetry layers
+    let logger_provider = init_logger_provider(service_name, service_version, &endpoint);
+    let log_layer = OpenTelemetryTracingBridge::new(&logger_provider);
+
     let subscriber = Registry::default()
         .with(filter)
         .with(fmt_layer)
-        .with(OpenTelemetryLayer::new(tracer));
+        .with(OpenTelemetryLayer::new(tracer))
+        .with(log_layer);
 
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 }
