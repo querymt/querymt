@@ -29,8 +29,8 @@ interface SessionTimerState {
 
 export interface UiState {
   // Focus management
-  mainInputRef: RefObject<HTMLTextAreaElement> | null;
-  setMainInputRef: (ref: RefObject<HTMLTextAreaElement> | null) => void;
+  mainInputRef: RefObject<HTMLTextAreaElement | null> | null;
+  setMainInputRef: (ref: RefObject<HTMLTextAreaElement | null> | null) => void;
   focusMainInput: () => void;
   
   // UI visibility toggles
