@@ -260,9 +260,23 @@ impl LLMProviderFactory for ExtismFactory {
             }
         };
         let plugin = self.plugin.clone();
+        let user_data = self.user_data.clone();
         async move {
             tokio::task::spawn_blocking(move || {
                 let mut plug = plugin.lock().unwrap();
+
+                // Reset any stale cancellation state left over from a previously dropped future
+                // (e.g. a cancelled chat/stream call). Without this reset, the cancel_watch_rx is
+                // still `true`, causing qmt_http_request to return HTTP 499 immediately and the
+                // plugin to surface {"kind":"Cancelled"} on every subsequent list_models call.
+                if let Some(ud) = &user_data {
+                    if let Ok(state) = ud.get() {
+                        let mut state_guard = state.lock().unwrap();
+                        state_guard.cancel_state = functions::CancelState::NotCancelled;
+                        let _ = state_guard.cancel_watch_tx.send(false);
+                    }
+                }
+
                 let out: Json<Vec<String>> = plug
                     .call_get_error_code("list_models", Json(cfg_value))
                     .map_err(|(e, code)| decode_plugin_error(e, code))?;
