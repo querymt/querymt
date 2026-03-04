@@ -117,15 +117,11 @@ impl CallFunctionTool for McpToolAdapter {
             _ => None,
         };
 
-        let call_result = self
-            .server
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: self.mcp_tool.name.clone(),
-                arguments,
-                task: None,
-            })
-            .await?;
+        let mut params = CallToolRequestParams::new(self.mcp_tool.name.clone());
+        if let Some(arguments) = arguments {
+            params = params.with_arguments(arguments);
+        }
+        let call_result = self.server.call_tool(params).await?;
         Ok(serde_json::to_string(&call_result)?)
     }
 }

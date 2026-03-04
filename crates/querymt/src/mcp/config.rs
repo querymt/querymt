@@ -2,7 +2,7 @@ use anyhow::Result;
 use http::{header::AUTHORIZATION, HeaderValue};
 use reqwest::header::HeaderMap;
 use rmcp::{
-    model::{ClientCapabilities, ClientInfo, Implementation, ProtocolVersion},
+    model::{ClientCapabilities, ClientInfo, Implementation},
     service::{DynService, RunningService},
     transport::{
         streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
@@ -46,12 +46,7 @@ impl McpServerTransportConfig {
         &self,
         client_impl: &Implementation,
     ) -> Result<RunningService<RoleClient, Box<dyn DynService<RoleClient>>>> {
-        let client_info = ClientInfo {
-            meta: None,
-            protocol_version: ProtocolVersion::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: client_impl.clone(),
-        };
+        let client_info = ClientInfo::new(ClientCapabilities::default(), client_impl.clone());
         let client = match self {
             McpServerTransportConfig::Http { url, token } => {
                 let transport = match token {
