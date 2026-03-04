@@ -1,10 +1,82 @@
-/* Glitch effects - must come before @tailwind */
+/* Glitch effects - must come before tailwind import */
 @import './styles/glitch-effects.css';
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
+@plugin "@tailwindcss/typography";
+
+/* ===== Tailwind v4 Theme Configuration ===== */
+/* Migrated from tailwind.config.js — all custom design tokens */
+@theme {
+  /* Colors: surface */
+  --color-surface-canvas: rgb(var(--surface-canvas-rgb));
+  --color-surface-elevated: rgb(var(--surface-elevated-rgb));
+  --color-surface-border: rgb(var(--surface-border-rgb));
+
+  /* Colors: accent */
+  --color-accent-primary: rgb(var(--accent-primary-rgb));
+  --color-accent-secondary: rgb(var(--accent-secondary-rgb));
+  --color-accent-tertiary: rgb(var(--accent-tertiary-rgb));
+
+  /* Colors: status */
+  --color-status-success: rgb(var(--status-success-rgb));
+  --color-status-warning: rgb(var(--status-warning-rgb));
+
+  /* Colors: ui text */
+  --color-ui-primary: rgb(var(--ui-text-primary-rgb));
+  --color-ui-secondary: rgb(var(--ui-text-secondary-rgb));
+  --color-ui-muted: rgb(var(--ui-text-muted-rgb));
+
+  /* Box shadows */
+  --shadow-glow-primary: 0 0 10px rgba(var(--accent-primary-rgb), 0.5);
+  --shadow-glow-secondary: 0 0 10px rgba(var(--accent-secondary-rgb), 0.5);
+  --shadow-glow-tertiary: 0 0 10px rgba(var(--accent-tertiary-rgb), 0.5);
+  --shadow-glow-success: 0 0 10px rgba(var(--status-success-rgb), 0.5);
+
+  /* Background images */
+  --background-image-grid-pattern: linear-gradient(rgba(var(--accent-primary-rgb), 0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(var(--accent-primary-rgb), 0.1) 1px, transparent 1px);
+
+  /* Animations */
+  --animate-accent-pulse: accent-pulse 2s ease-in-out infinite;
+  --animate-slide-in-right: slide-in-right 0.3s ease-out;
+  --animate-slide-in-left: slide-in-left 0.3s ease-out;
+  --animate-slide-down: slide-down 0.25s ease-out;
+  --animate-slide-up: slide-up 0.2s ease-in;
+  --animate-fade-in: fade-in 0.5s ease-out;
+  --animate-fade-in-up: fade-in-up 0.5s ease-out;
+
+  /* Keyframes */
+  @keyframes accent-pulse {
+    0%, 100% { box-shadow: 0 0 5px rgba(var(--accent-primary-rgb), 0.5); }
+    50% { box-shadow: 0 0 20px rgba(var(--accent-primary-rgb), 0.8); }
+  }
+  @keyframes slide-in-right {
+    0% { transform: translateX(100%); }
+    100% { transform: translateX(0); }
+  }
+  @keyframes slide-in-left {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(0); }
+  }
+  @keyframes slide-down {
+    0% { transform: translateY(-100%); opacity: 0; }
+    100% { transform: translateY(0); opacity: 1; }
+  }
+  @keyframes slide-up {
+    0% { transform: translateY(0); opacity: 1; }
+    100% { transform: translateY(-100%); opacity: 0; }
+  }
+  @keyframes fade-in {
+    0% { opacity: 0; }
+    100% { opacity: 1; }
+  }
+  @keyframes fade-in-up {
+    0% { opacity: 0; transform: translateY(20px); }
+    100% { opacity: 1; transform: translateY(0); }
+  }
+}
+
+/* ===== Root CSS Variables (dynamically updated by theme switcher) ===== */
 @layer base {
   :root {
     /* Dashboard theme variables (updated dynamically from Base16 theme selection) */
