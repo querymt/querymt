@@ -449,14 +449,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(cfg) = &args.mcp_config {
         let cfg = MCPConfig::load(cfg.clone()).await?;
         mcp_clients = cfg
-            .create_mcp_clients(&querymt::mcp::Implementation {
-                name: "querymt-cli".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                description: None,
-                title: None,
-                icons: None,
-                website_url: None,
-            })
+            .create_mcp_clients(&querymt::mcp::Implementation::new(
+                "querymt-cli",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .await?;
         for (server_name, client) in mcp_clients.iter() {
             tool_stats.increment_server();

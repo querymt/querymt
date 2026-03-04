@@ -10,7 +10,7 @@ use rmcp::RoleClient;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     ClientCapabilities, ClientInfo, CreateElicitationRequestParams, CreateElicitationResult,
-    Implementation, ProtocolVersion,
+    Implementation,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use serde::{Deserialize, Serialize};
@@ -213,12 +213,7 @@ impl ClientHandler for McpClientHandler {
     }
 
     fn get_info(&self) -> ClientInfo {
-        ClientInfo {
-            meta: None,
-            protocol_version: ProtocolVersion::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: self.client_impl.clone(),
-        }
+        ClientInfo::new(ClientCapabilities::default(), self.client_impl.clone())
     }
 
     async fn on_tool_list_changed(&self, context: NotificationContext<RoleClient>) -> () {
