@@ -30,7 +30,7 @@
     "react-timer-hook": "^4.0.5",
     "react-virtuoso": "^4.6.2",
     "remark-gfm": "^4.0.1",
-    "shiki": "^1.29.2",
+    "shiki": "^4.0.0",
     "splitting": "^1.1.0",
     "uuid": "^13.0.0",
     "zod": "^4.3.5",
