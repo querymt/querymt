@@ -1,7 +1,7 @@
 import { useMemo, useRef, useEffect, useState } from 'react';
 import { Command } from 'cmdk';
 import Fuse from 'fuse.js';
-import { Plus, GitBranch, Clock, Globe, Trash2 } from 'lucide-react';
+import { Plus, GitBranch, Clock, Globe, Trash2, X } from 'lucide-react';
 import { SessionGroup, SessionSummary } from '../types';
 import { useUiStore } from '../store/uiStore';
 
@@ -245,6 +245,14 @@ export function SessionSwitcher({
               placeholder="Search sessions by ID, title, or workspace..."
               className="flex-1 bg-transparent text-ui-primary placeholder:text-ui-muted text-sm focus:outline-none"
             />
+            <button
+              type="button"
+              onClick={() => onOpenChange(false)}
+              className="sm:hidden p-1.5 rounded hover:bg-surface-canvas transition-colors text-ui-secondary hover:text-ui-primary"
+              aria-label="Close"
+            >
+              <X className="w-5 h-5" />
+            </button>
             <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-muted">
               ESC
             </kbd>

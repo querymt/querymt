@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Command } from 'cmdk';
-import { Bug, Keyboard, KeyRound, MessageSquare, Palette, Plus, RefreshCw } from 'lucide-react';
+import { Bug, Keyboard, KeyRound, MessageSquare, Palette, Plus, RefreshCw, X } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
 import { isDebugLogEnabled, toggleDebugLog } from '../utils/debugLog';
 
@@ -71,9 +71,19 @@ export function ShortcutGateway({
               <Keyboard className="w-4 h-4" />
               <span className="text-sm font-medium">Shortcut Gateway</span>
             </div>
-            <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-muted">
-              ESC
-            </kbd>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={close}
+                className="sm:hidden p-1.5 rounded hover:bg-surface-canvas transition-colors text-ui-secondary hover:text-ui-primary"
+                aria-label="Close"
+              >
+                <X className="w-5 h-5" />
+              </button>
+              <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-muted">
+                ESC
+              </kbd>
+            </div>
           </div>
 
           <div className="flex items-center gap-2 px-4 py-2.5 border-b border-surface-border/40">

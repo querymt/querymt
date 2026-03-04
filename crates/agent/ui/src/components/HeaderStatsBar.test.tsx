@@ -50,12 +50,12 @@ describe('HeaderStatsBar', () => {
     });
   });
 
-  it('shows all separators in non-compact mode', () => {
+  it('shows separators progressively in non-compact mode', () => {
     const { container } = render(<HeaderStatsBar {...defaultProps} compact={false} />);
     const separators = container.querySelectorAll('[data-testid="stats-separator"]');
-    // Separators should be visible (no "hidden" class)
+    // Separators use responsive classes (hidden md:inline / hidden lg:inline) to appear at wider breakpoints
     separators.forEach((sep) => {
-      expect(sep.className).not.toContain('hidden');
+      expect(sep.className).toMatch(/md:inline|lg:inline|xl:inline/);
     });
   });
 

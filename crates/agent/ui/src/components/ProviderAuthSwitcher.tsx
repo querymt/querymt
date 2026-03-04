@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { Command } from 'cmdk';
-import { Copy, ExternalLink, KeyRound, ShieldCheck } from 'lucide-react';
+import { Copy, ExternalLink, KeyRound, ShieldCheck, X } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
 import type { AuthProviderEntry, OAuthFlowState, OAuthResultState } from '../types';
 
@@ -226,6 +226,14 @@ export function ProviderAuthSwitcher({
               placeholder={`Authenticate provider (${providers.length})...`}
               className="flex-1 bg-transparent text-ui-primary placeholder:text-ui-muted text-sm focus:outline-none"
             />
+            <button
+              type="button"
+              onClick={close}
+              className="sm:hidden p-1.5 rounded hover:bg-surface-canvas transition-colors text-ui-secondary hover:text-ui-primary"
+              aria-label="Close"
+            >
+              <X className="w-5 h-5" />
+            </button>
             <kbd className="hidden sm:inline-block px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-muted">
               ESC
             </kbd>

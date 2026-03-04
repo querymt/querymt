@@ -35,11 +35,17 @@
   body {
     @apply bg-surface-canvas text-ui-primary;
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
-    background-image: 
+    background-image:
       radial-gradient(circle at 20% 50%, rgba(var(--accent-primary-rgb), 0.03) 0%, transparent 50%),
       radial-gradient(circle at 80% 80%, rgba(var(--accent-secondary-rgb), 0.03) 0%, transparent 50%);
   }
+
+  body.modal-open {
+    overscroll-behavior: contain;
+    overflow: hidden;
+  }
 }
+
 
 @layer utilities {
   /* Safe area inset for mobile devices with notch/home-indicator */
@@ -49,46 +55,46 @@
 
   .grid-background {
     background-size: 50px 50px;
-    background-image: 
+    background-image:
       linear-gradient(rgba(var(--accent-primary-rgb), 0.05) 1px, transparent 1px),
       linear-gradient(90deg, rgba(var(--accent-primary-rgb), 0.05) 1px, transparent 1px);
   }
-  
+
   .glow-border-primary {
     border: 1px solid rgba(var(--accent-primary-rgb), 0.3);
     box-shadow: 0 0 10px rgba(var(--accent-primary-rgb), 0.2);
   }
-  
+
   .glow-border-secondary {
     border: 1px solid rgba(var(--accent-secondary-rgb), 0.3);
     box-shadow: 0 0 10px rgba(var(--accent-secondary-rgb), 0.2);
   }
-  
+
   .glow-border-tertiary {
     border: 1px solid rgba(var(--accent-tertiary-rgb), 0.3);
     box-shadow: 0 0 10px rgba(var(--accent-tertiary-rgb), 0.2);
   }
-  
+
   .glow-text-primary {
     color: rgb(var(--accent-primary-rgb));
     text-shadow: 0 0 10px rgba(var(--accent-primary-rgb), 0.5);
   }
-  
+
   .glow-text-secondary {
     color: rgb(var(--accent-secondary-rgb));
     text-shadow: 0 0 10px rgba(var(--accent-secondary-rgb), 0.5);
   }
-  
+
   .glow-text-success {
     color: rgb(var(--status-success-rgb));
     text-shadow: 0 0 10px rgba(var(--status-success-rgb), 0.5);
   }
-  
+
   .scanline {
     position: relative;
     overflow: hidden;
   }
-  
+
   .scanline::before {
     content: '';
     position: absolute;
@@ -103,20 +109,20 @@
     background-size: 100% 4px;
     pointer-events: none;
   }
-  
+
   /* Mode-aware utilities */
   .border-mode {
     border-color: rgba(var(--mode-rgb), 0.3);
   }
-  
+
   .border-mode-strong {
     border-color: rgba(var(--mode-rgb), 0.6);
   }
-  
+
   .shadow-mode {
     box-shadow: 0 0 10px rgba(var(--mode-rgb), 0.3);
   }
-  
+
   .bg-mode-subtle {
     background-color: rgba(var(--mode-rgb), 0.05);
   }
@@ -124,9 +130,7 @@
 
 /* Custom diff container styling for @pierre/diffs */
 .event-diff-container {
-  @apply my-2 rounded-md overflow-hidden;
-  border: 1px solid rgba(var(--accent-primary-rgb), 0.3);
-  box-shadow: 0 0 15px rgba(var(--accent-primary-rgb), 0.15);
+  @apply rounded-md overflow-hidden;
   background: rgba(var(--surface-elevated-rgb), 0.8);
   --diffs-font-size: 13px;
   --diffs-line-height: 20px;
@@ -563,7 +567,7 @@
   padding: 0 8px;
   display: flex;
   justify-content: center;
-  
+
   /* Slide-in animation */
   animation: slide-in-top 0.3s ease-out;
 }
@@ -573,12 +577,12 @@
   width: 100%;
   max-width: 72rem; /* Same as max-w-6xl */
   min-height: 44px;
-  
+
   /* Ghost-like styling */
   background: rgba(var(--surface-elevated-rgb), 0.85);
   backdrop-filter: blur(8px);
   border-bottom: 1px solid rgba(var(--accent-secondary-rgb), 0.2);
-  
+
   /* Layout */
   display: flex;
   align-items: center;
@@ -592,7 +596,7 @@
   font-weight: 600; /* Bold text */
   color: rgb(var(--ui-text-secondary-rgb));
   line-height: 1.4;
-  
+
   /* 2-line clamp */
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -674,7 +678,7 @@
 }
 
 .session-group-header:hover {
-  box-shadow: 0 0 15px rgba(var(--accent-primary-rgb), 0.15);
+  box-shadow: 0 0 5px rgba(var(--accent-primary-rgb), 0.1);
 }
 
 /* Session card entrance animation */
@@ -696,7 +700,7 @@
 
 /* Hover glow effect */
 .session-card:hover {
-  box-shadow: 0 0 20px rgba(var(--accent-primary-rgb), 0.2);
+  box-shadow: 0 0 5px rgba(var(--accent-primary-rgb), 0.12);
 }
 
 /* Border trace animation on hover */

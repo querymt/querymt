@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 
 // Capture PatchDiff props to inspect diffStyle
 const patchDiffSpy = vi.fn();
@@ -25,9 +25,9 @@ vi.mock('@radix-ui/react-dialog', () => ({
   Root: ({ children }: any) => <div>{children}</div>,
   Portal: ({ children }: any) => <div>{children}</div>,
   Overlay: () => <div />,
-  Content: ({ children }: any) => <div>{children}</div>,
-  Title: ({ children }: any) => <div>{children}</div>,
-  Close: ({ children }: any) => <div>{children}</div>,
+  Content: ({ children, ...rest }: any) => <div {...rest}>{children}</div>,
+  Title: ({ children, ...rest }: any) => <div {...rest}>{children}</div>,
+  Close: ({ children, ...rest }: any) => <button data-testid="close-button" {...rest}>{children}</button>,
 }));
 
 vi.mock('./HighlightedCode', () => ({
@@ -94,5 +94,76 @@ describe('ToolDetailModal diff style', () => {
     expect(patchDiffSpy).toHaveBeenCalled();
     const lastCall = patchDiffSpy.mock.calls[patchDiffSpy.mock.calls.length - 1][0];
     expect(lastCall.options.diffStyle).toBe('unified');
+  });
+});
+
+describe('ToolDetailModal mobile header layout', () => {
+  const originalWidth = window.innerWidth;
+
+  afterEach(() => {
+    setViewportWidth(originalWidth);
+  });
+
+  const completedEvent = {
+    id: 'e1',
+    type: 'tool_call' as const,
+    content: '',
+    timestamp: 1000,
+    agentId: 'agent-0',
+    toolCall: {
+      name: 'Shell',
+      kind: 'shell',
+      raw_input: { command: 'ls' },
+      status: 'completed',
+    },
+    mergedResult: {
+      id: 'e2',
+      type: 'tool_result' as const,
+      content: 'file.txt',
+      timestamp: 1001,
+      agentId: 'agent-0',
+      toolCall: { status: 'completed' },
+    },
+  } as any;
+
+  it('on mobile, close button is in a separate row from status and timestamp', () => {
+    setViewportWidth(375);
+    window.dispatchEvent(new Event('resize'));
+
+    render(<ToolDetailModal event={completedEvent} onClose={vi.fn()} />);
+
+    const closeButton = screen.getByTestId('close-button');
+    // On mobile, the close button's parent row should NOT contain status/timestamp text
+    const closeRow = closeButton.closest('[data-testid="header-top-row"]');
+    expect(closeRow).not.toBeNull();
+
+    // Status and timestamp should be in a separate row
+    const metaRow = screen.getByTestId('header-meta-row');
+    expect(metaRow).toBeInTheDocument();
+    expect(metaRow.textContent).toContain('Completed');
+  });
+
+  it('on desktop, close button is in the same row as status and timestamp', () => {
+    setViewportWidth(1024);
+    window.dispatchEvent(new Event('resize'));
+
+    render(<ToolDetailModal event={completedEvent} onClose={vi.fn()} />);
+
+    const closeButton = screen.getByTestId('close-button');
+    // On desktop, the close button should be inside the right-side group
+    const rightGroup = closeButton.closest('[data-testid="header-right-group"]');
+    expect(rightGroup).not.toBeNull();
+    // The right group should contain status text too
+    expect(rightGroup!.textContent).toContain('Completed');
+  });
+
+  it('on mobile, close button has flex-shrink-0 to prevent clipping', () => {
+    setViewportWidth(375);
+    window.dispatchEvent(new Event('resize'));
+
+    render(<ToolDetailModal event={completedEvent} onClose={vi.fn()} />);
+
+    const closeButton = screen.getByTestId('close-button');
+    expect(closeButton.className).toContain('shrink-0');
   });
 });

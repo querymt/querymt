@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, useMemo, useState } from 'react';
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
-import { Home, Copy, Check, Palette, Menu, X } from 'lucide-react';
+import { Home, Copy, Check, Palette, Keyboard, Menu, X } from 'lucide-react';
 import { useUiClientContext } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
 import { useSessionTimer } from '../hooks/useSessionTimer';
@@ -104,6 +104,8 @@ export function AppShell() {
     setModelPickerOpen,
     statsDrawerOpen,
     setStatsDrawerOpen,
+    delegationDrawerOpen,
+    selectedToolEvent,
     selectedTheme,
     setSelectedTheme,
   } = useUiStore();
@@ -126,6 +128,37 @@ export function AppShell() {
     () => availableThemes.find((theme) => theme.id === selectedTheme)?.label ?? selectedTheme,
     [availableThemes, selectedTheme],
   );
+
+  // Prevent page scroll when any modal/drawer overlay is open.
+  useEffect(() => {
+    const hasOpenOverlay =
+      sessionSwitcherOpen ||
+      (isMobile && modelPickerOpen) ||
+      statsDrawerOpen ||
+      delegationDrawerOpen ||
+      selectedToolEvent !== null ||
+      shortcutGatewayOpen ||
+      themeSwitcherOpen ||
+      providerAuthOpen ||
+      workspacePathDialogOpen;
+
+    document.body.classList.toggle('modal-open', hasOpenOverlay);
+
+    return () => {
+      document.body.classList.remove('modal-open');
+    };
+  }, [
+    sessionSwitcherOpen,
+    modelPickerOpen,
+    statsDrawerOpen,
+    delegationDrawerOpen,
+    selectedToolEvent,
+    shortcutGatewayOpen,
+    themeSwitcherOpen,
+    providerAuthOpen,
+    workspacePathDialogOpen,
+    isMobile,
+  ]);
 
   // Live timer hook (per-session)
   const { globalElapsedMs, agentElapsedMs, isSessionActive } = useSessionTimer(
@@ -462,7 +495,7 @@ export function AppShell() {
             <Home className="w-5 h-5" />
           </Link>
           {/* Hide title on mobile to save space */}
-          <h1 className="hidden md:block text-xl font-semibold glow-text-primary">
+          <h1 className="hidden md:block text-xl font-semibold glow-text-primary whitespace-nowrap">
             <GlitchText text="QueryMT" variant="3" hoverOnly />
           </h1>
           
@@ -506,7 +539,7 @@ export function AppShell() {
                   type="button"
                   onClick={cycleAgentMode}
                   title={`Mode: ${agentMode} (${navigator.platform.includes('Mac') ? '⌘E' : 'Ctrl+E'} to cycle)`}
-                  className="px-1.5 md:px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-surface-elevated/50 w-[5ch] md:w-[7ch] text-center flex-shrink-0 truncate"
+                  className="px-1.5 md:px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-surface-elevated/50 text-center flex-shrink-0 whitespace-nowrap"
                   style={{ color: 'var(--mode-color)' }}
                 >
                   {getModeDisplayName(agentMode)}
@@ -518,7 +551,7 @@ export function AppShell() {
                 type="button"
                 onClick={handleCopySessionId}
                 title="Copy session ID to clipboard"
-                className="hidden md:inline-flex p-1.5 rounded-lg border border-surface-border bg-surface-canvas hover:border-accent-primary/60 hover:bg-surface-elevated/50 transition-colors"
+                className="inline-flex p-1.5 rounded-lg border border-surface-border bg-surface-canvas hover:border-accent-primary/60 hover:bg-surface-elevated/50 transition-colors"
               >
                 {sessionCopied ? (
                   <Check className="w-3.5 h-3.5 text-status-success" />
@@ -545,56 +578,58 @@ export function AppShell() {
             />
           )}
 
-          {/* Desktop controls — hidden on mobile, shown in mobile menu instead */}
-          <div className="hidden md:flex items-center gap-3 flex-shrink-0 ml-auto">
-            {/* Model picker */}
-            <ModelPickerPopover
-              open={modelPickerOpen}
-              onOpenChange={setModelPickerOpen}
-              connected={connected}
-              routingMode={routingMode}
-              activeAgentId={activeAgentId}
-              sessionId={sessionId}
-              sessionsByAgent={sessionsByAgent}
-              agents={agents}
-              allModels={allModels}
-              currentProvider={agentModels[activeAgentId]?.provider}
-              currentModel={agentModels[activeAgentId]?.model}
-              currentNode={agentModels[activeAgentId]?.node}
-              currentWorkspace={currentWorkspace}
-              recentModelsByWorkspace={recentModelsByWorkspace}
-              agentMode={agentMode}
-              onRefresh={refreshAllModels}
-              onSetSessionModel={setSessionModel}
-              providerCapabilities={providerCapabilities}
-              modelDownloads={modelDownloads}
-              onAddCustomModelFromHf={addCustomModelFromHf}
-              onAddCustomModelFromFile={addCustomModelFromFile}
-              onDeleteCustomModel={deleteCustomModel}
-            />
+          {/* Desktop controls — rendered only on desktop to avoid duplicate popover portals on mobile */}
+          {!isMobile && (
+            <div className="hidden md:flex items-center gap-3 min-w-0 ml-auto">
+              {/* Model picker */}
+              <ModelPickerPopover
+                open={modelPickerOpen}
+                onOpenChange={setModelPickerOpen}
+                connected={connected}
+                routingMode={routingMode}
+                activeAgentId={activeAgentId}
+                sessionId={sessionId}
+                sessionsByAgent={sessionsByAgent}
+                agents={agents}
+                allModels={allModels}
+                currentProvider={agentModels[activeAgentId]?.provider}
+                currentModel={agentModels[activeAgentId]?.model}
+                currentNode={agentModels[activeAgentId]?.node}
+                currentWorkspace={currentWorkspace}
+                recentModelsByWorkspace={recentModelsByWorkspace}
+                agentMode={agentMode}
+                onRefresh={refreshAllModels}
+                onSetSessionModel={setSessionModel}
+                providerCapabilities={providerCapabilities}
+                modelDownloads={modelDownloads}
+                onAddCustomModelFromHf={addCustomModelFromHf}
+                onAddCustomModelFromFile={addCustomModelFromFile}
+                onDeleteCustomModel={deleteCustomModel}
+              />
 
-            {/* Dashboard theme picker */}
-            <button
-              type="button"
-              onClick={() => setThemeSwitcherOpen(true)}
-              className="h-8 w-8 inline-flex items-center justify-center rounded-lg border border-surface-border bg-surface-canvas/60 transition-colors hover:border-accent-primary/40"
-              title={`Dashboard theme: ${selectedThemeLabel} (${shortcutGatewayPrefix} then T)`}
-              aria-label="Open theme switcher"
-            >
-              <Palette className="w-3.5 h-3.5 text-accent-primary" />
-            </button>
+              {/* Dashboard theme picker */}
+              <button
+                type="button"
+                onClick={() => setThemeSwitcherOpen(true)}
+                className="h-8 w-8 inline-flex items-center justify-center rounded-lg border border-surface-border bg-surface-canvas/60 transition-colors hover:border-accent-primary/40"
+                title={`Dashboard theme: ${selectedThemeLabel} (${shortcutGatewayPrefix} then T)`}
+                aria-label="Open theme switcher"
+              >
+                <Palette className="w-3.5 h-3.5 text-accent-primary" />
+              </button>
 
-            {/* Remote node mesh indicator */}
-            <RemoteNodeIndicator remoteNodes={remoteNodes} />
+              {/* Remote node mesh indicator */}
+              <RemoteNodeIndicator remoteNodes={remoteNodes} />
 
-            {/* Connection status dot */}
-            <div
-              className={`w-3 h-3 rounded-full flex-shrink-0 transition-colors ${
-                connected ? 'bg-status-success' : 'bg-status-warning'
-              }`}
-              title={connected ? 'Connected' : 'Disconnected'}
-            />
-          </div>
+              {/* Connection status dot */}
+              <div
+                className={`w-3 h-3 rounded-full flex-shrink-0 transition-colors ${
+                  connected ? 'bg-status-success' : 'bg-status-warning'
+                }`}
+                title={connected ? 'Connected' : 'Disconnected'}
+              />
+            </div>
+          )}
 
           {/* Mobile: connection dot + hamburger menu */}
           <div className="flex md:hidden items-center gap-2 flex-shrink-0">
@@ -627,6 +662,7 @@ export function AppShell() {
           <ModelPickerPopover
             open={modelPickerOpen}
             onOpenChange={(open) => { setModelPickerOpen(open); if (!open) setMobileMenuOpen(false); }}
+            isInMobileMenu
             connected={connected}
             routingMode={routingMode}
             activeAgentId={activeAgentId}
@@ -658,21 +694,16 @@ export function AppShell() {
               <Palette className="w-3.5 h-3.5 text-accent-primary" />
               <span className="text-ui-secondary">Theme</span>
             </button>
-            {sessionId && (
-              <button
-                type="button"
-                onClick={() => { handleCopySessionId(); setMobileMenuOpen(false); }}
-                className="flex-1 h-8 inline-flex items-center justify-center gap-2 rounded-lg border border-surface-border bg-surface-canvas/60 transition-colors hover:border-accent-primary/40 text-xs"
-                title="Copy session ID"
-              >
-                {sessionCopied ? (
-                  <Check className="w-3.5 h-3.5 text-status-success" />
-                ) : (
-                  <Copy className="w-3.5 h-3.5 text-ui-muted" />
-                )}
-                <span className="text-ui-secondary">Copy ID</span>
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => { setShortcutGatewayOpen(true); setMobileMenuOpen(false); }}
+              className="flex-1 h-8 inline-flex items-center justify-center gap-2 rounded-lg border border-surface-border bg-surface-canvas/60 transition-colors hover:border-accent-primary/40 text-xs"
+              aria-label="Open shortcut gateway"
+            >
+              <Keyboard className="w-3.5 h-3.5 text-accent-primary" />
+              <span className="text-ui-secondary">Shortcuts</span>
+            </button>
+
           </div>
           <RemoteNodeIndicator remoteNodes={remoteNodes} />
         </div>

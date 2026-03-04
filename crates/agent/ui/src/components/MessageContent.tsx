@@ -212,7 +212,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
             }
             // Render text segments as markdown
             return (
-              <ReactMarkdown 
+              <ReactMarkdown
                 key={index}
                 remarkPlugins={[remarkGfm]}
                 components={markdownComponents}
@@ -228,7 +228,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
     // No mentions, render normally
     return (
       <div className="message-content">
-        <ReactMarkdown 
+        <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           components={markdownComponents}
         >
@@ -237,7 +237,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       </div>
     );
   }
-  
+
   if (type === 'code' || type === 'tool_output' || type === 'diff') {
     return (
       <div className="event-diff-container">
@@ -247,6 +247,6 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       </div>
     );
   }
-  
+
   return <pre className={`${bodyText} whitespace-pre-wrap break-words`}>{content}</pre>;
 });

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { Command } from 'cmdk';
 import * as Popover from '@radix-ui/react-popover';
+import * as Dialog from '@radix-ui/react-dialog';
 import { RefreshCw, Search, X, ChevronRight, ChevronDown, Plus, Trash2 } from 'lucide-react';
 import type {
   ModelDownloadStatus,
@@ -19,6 +20,7 @@ import { useUiStore } from '../store/uiStore';
 interface ModelPickerPopoverProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  isInMobileMenu?: boolean;
   connected: boolean;
   routingMode: RoutingMode;
   activeAgentId: string;
@@ -119,6 +121,7 @@ function sessionModelId(provider: string, model: string, id?: string): string {
 export function ModelPickerPopover({
   open,
   onOpenChange,
+  isInMobileMenu = false,
   connected,
   routingMode,
   activeAgentId: _activeAgentId,
@@ -334,12 +337,306 @@ export function ModelPickerPopover({
 
   /* ---- render ---- */
 
+  const CloseComponent = isInMobileMenu ? Dialog.Close : Popover.Close;
+
+  const panel = (
+    <>
+      {/* Header */}
+      <div className="flex items-center justify-between px-3 py-2 border-b border-surface-border/60">
+        <span className="text-xs font-semibold text-ui-secondary uppercase tracking-wider">
+          Switch Model
+        </span>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={!connected || isRefreshing}
+            className="p-1 rounded text-ui-secondary hover:text-accent-primary hover:bg-accent-primary/10 transition-colors disabled:opacity-50"
+            title="Refresh model list"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
+          </button>
+          <CloseComponent className="p-1 rounded text-ui-secondary hover:text-ui-primary hover:bg-surface-elevated/60 transition-colors">
+            <X className="h-3.5 w-3.5" />
+          </CloseComponent>
+        </div>
+      </div>
+
+      {/* Target selector */}
+      <div className="px-3 py-2 border-b border-surface-border/40">
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-[10px] uppercase tracking-widest text-ui-muted">Target</span>
+          <select
+            value={target}
+            onChange={(e) => setTarget(e.target.value)}
+            className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-2 py-1 text-xs text-ui-primary focus:border-accent-primary focus:outline-none"
+            disabled={!connected}
+          >
+            <option value={TARGET_ACTIVE}>Active agent</option>
+            <option value={TARGET_ALL}>All agents</option>
+            {targetAgents.map((agent) => (
+              <option key={agent.id} value={agent.id}>
+                {agent.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        {canManageCustomModels && (
+          <div className="mt-2 pt-2 border-t border-surface-border/40 space-y-2">
+            <div className="text-[10px] uppercase tracking-widest text-ui-muted">Add custom model ({selectedProvider})</div>
+            <div className="flex items-center gap-2">
+              <input
+                value={hfRepo}
+                onChange={(e) => setHfRepo(e.target.value)}
+                placeholder="HF repo (owner/name-GGUF)"
+                className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-2 py-1 text-xs text-ui-primary"
+              />
+              <input
+                value={hfFilename}
+                onChange={(e) => setHfFilename(e.target.value)}
+                placeholder="filename.gguf"
+                className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-2 py-1 text-xs text-ui-primary"
+              />
+              <button
+                type="button"
+                onClick={handleAddHfModel}
+                className="px-2 py-1 rounded border border-surface-border text-ui-secondary hover:text-accent-primary"
+                title="Add from Hugging Face"
+              >
+                <Plus className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                value={filePath}
+                onChange={(e) => setFilePath(e.target.value)}
+                placeholder="/absolute/path/to/model.gguf"
+                className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-2 py-1 text-xs text-ui-primary"
+              />
+              <button
+                type="button"
+                onClick={handleAddFileModel}
+                className="px-2 py-1 rounded border border-surface-border text-ui-secondary hover:text-accent-primary"
+                title="Add local GGUF file"
+              >
+                <Plus className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={handleDeleteCurrentCustom}
+                disabled={selectedProviderEntry?.source !== 'custom'}
+                className="px-2 py-1 rounded border border-surface-border text-ui-secondary hover:text-red-400 disabled:opacity-40"
+                title="Delete selected custom model"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            {activeDownload && (
+              <div className="text-[10px] text-ui-muted">
+                {activeDownload.status}: {activeDownload.model_id}
+                {activeDownload.percent != null ? ` (${Math.round(activeDownload.percent)}%)` : ''}
+                {activeDownload.message ? ` - ${activeDownload.message}` : ''}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Command palette (filter + list) */}
+      <Command
+        label="Model picker"
+        value={selectedValue}
+        onValueChange={setSelectedValue}
+        className="flex flex-col flex-1 min-h-0"
+        filter={(value, search, keywords) => {
+          if (!search) return 1;
+          const normalized = normalizeValue(value);
+          const withoutNode = normalized.replace(/@[^/]+\//, '/');
+          const searchLower = search.toLowerCase();
+          if (withoutNode.toLowerCase().includes(searchLower)) return 1;
+          if (keywords?.some((k) => k.toLowerCase().includes(searchLower))) return 1;
+          return 0;
+        }}
+      >
+        <div className="px-3 py-2 border-b border-surface-border/40">
+          <div className="relative">
+            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-ui-muted pointer-events-none" />
+            <Command.Input
+              ref={inputRef}
+              placeholder="Filter models..."
+              className="w-full rounded-lg border border-surface-border bg-surface-elevated/70 pl-8 pr-3 py-1.5 text-xs text-ui-primary placeholder:text-ui-muted focus:border-accent-primary focus:outline-none"
+            />
+          </div>
+        </div>
+
+        <Command.List ref={commandListRef} className="flex-1 overflow-y-auto px-1 py-1 max-h-[240px]">
+          {allModels.length === 0 ? (
+            <Command.Loading className="px-3 py-6 text-center text-xs text-ui-muted">
+              Loading models...
+            </Command.Loading>
+          ) : (
+            <>
+              <Command.Empty className="px-3 py-6 text-center text-xs text-ui-muted">
+                No models match your search
+              </Command.Empty>
+
+              {recentModels.length > 0 && (
+                <Command.Group
+                  heading="Recent"
+                  className="mb-2 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-accent-primary [&_[cmdk-group-heading]]:bg-surface-canvas/95"
+                >
+                  {recentModels.map((entry) => {
+                    const val = itemValue(entry.provider, entry.model);
+                    const isCurrent = currentProvider === entry.provider && currentModel === entry.model;
+
+                    return (
+                      <Command.Item
+                        key={`recent-${val}`}
+                        value={`${RECENT_PREFIX}${val}`}
+                        keywords={[entry.provider, entry.model]}
+                        onSelect={(v) => switchModel(v)}
+                        className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-ui-secondary data-[selected=true]:bg-accent-primary/20 data-[selected=true]:text-accent-primary data-[selected=true]:border data-[selected=true]:border-accent-primary/40 hover:bg-surface-elevated/60 cursor-pointer"
+                      >
+                        <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-accent-primary transition-opacity" />
+                        <span className="flex-1 truncate">
+                          {entry.provider} / {entry.model}
+                        </span>
+                        {isCurrent && (
+                          <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-accent-tertiary/20 text-accent-tertiary border border-accent-tertiary/30">
+                            current
+                          </span>
+                        )}
+                      </Command.Item>
+                    );
+                  })}
+                </Command.Group>
+              )}
+
+              {recentModels.length > 0 && (
+                <div className="h-px bg-surface-border/40 my-2" />
+              )}
+
+              {grouped.map((group) => (
+                <Command.Group
+                  key={group.heading}
+                  heading={group.heading}
+                  className="mb-1 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-ui-muted [&_[cmdk-group-heading]]:bg-surface-canvas/95"
+                >
+                  {group.models.map((model) => {
+                    const val = itemValue(group.provider, model.value, group.node);
+                    const isCurrent =
+                      currentProvider === group.provider &&
+                      currentModel === model.value &&
+                      (group.node ?? undefined) === (currentNode ?? undefined);
+
+                    return (
+                      <Command.Item
+                        key={val}
+                        value={val}
+                        keywords={[group.provider, model.display, model.value, ...(group.nodeLabel ? [group.nodeLabel] : [])]}
+                        onSelect={(v) => switchModel(v)}
+                        className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-ui-secondary data-[selected=true]:bg-accent-primary/20 data-[selected=true]:text-accent-primary data-[selected=true]:border data-[selected=true]:border-accent-primary/40 hover:bg-surface-elevated/60 cursor-pointer"
+                      >
+                        <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-accent-primary transition-opacity" />
+                        <span className="flex-1 truncate">{model.display}</span>
+                        {group.nodeLabel && (
+                          <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                            {group.nodeLabel}
+                          </span>
+                        )}
+                        {isCurrent && (
+                          <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-accent-tertiary/20 text-accent-tertiary border border-accent-tertiary/30">
+                            current
+                          </span>
+                        )}
+                      </Command.Item>
+                    );
+                  })}
+                </Command.Group>
+              ))}
+            </>
+          )}
+        </Command.List>
+      </Command>
+
+      <div className="px-3 py-2 border-t border-surface-border/60 bg-surface-elevated/30">
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-[10px] text-ui-muted truncate flex-1 flex items-center gap-1.5">
+            {selectedEntry ? (
+              <>
+                <span className="text-ui-secondary">
+                  {selectedEntry.provider} / {selectedEntry.model}
+                </span>
+                {selectedEntry.nodeLabel && (
+                  <span className="px-1 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                    {selectedEntry.nodeLabel}
+                  </span>
+                )}
+              </>
+            ) : (
+              'Select a model above'
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={handleSwitchClick}
+            disabled={!canSwitch}
+            className={`px-4 py-1.5 rounded-lg text-xs font-medium transition-all ${
+              canSwitch
+                ? 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30 hover:shadow-glow-primary'
+                : 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
+            }`}
+          >
+            {routingMode === 'broadcast' && target === TARGET_ALL ? 'Switch all' : 'Switch'}
+          </button>
+        </div>
+      </div>
+    </>
+  );
+
+  if (isInMobileMenu) {
+    return (
+      <Dialog.Root open={open} onOpenChange={onOpenChange}>
+        <Dialog.Trigger asChild>
+          <button
+            type="button"
+            className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-surface-border bg-surface-canvas/60 text-xs text-ui-secondary hover:border-accent-primary/60 hover:text-accent-primary transition-colors w-full"
+            title={triggerTitle}
+          >
+            <span className="truncate">{triggerLabel}</span>
+            {currentNode && (
+              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                {currentNode}
+              </span>
+            )}
+            <ChevronDown className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
+          </button>
+        </Dialog.Trigger>
+
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-40 bg-black/40" />
+          <Dialog.Content
+            className="fixed left-1/2 top-4 z-50 w-[calc(100vw-1rem)] max-w-[480px] max-h-[calc(100vh-2rem)] -translate-x-1/2 flex flex-col rounded-xl border border-accent-primary/30 bg-surface-canvas shadow-lg shadow-accent-primary/25 animate-fade-in"
+            onOpenAutoFocus={(e) => {
+              e.preventDefault();
+            }}
+            onCloseAutoFocus={(e) => {
+              e.preventDefault();
+            }}
+          >
+            {panel}
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+    );
+  }
+
   return (
     <Popover.Root open={open} onOpenChange={onOpenChange}>
       <Popover.Trigger asChild>
         <button
           type="button"
-          className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-surface-border bg-surface-canvas/60 text-xs text-ui-secondary hover:border-accent-primary/60 hover:text-accent-primary transition-colors w-[20rem] flex-shrink-0"
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-surface-border bg-surface-canvas/60 text-xs text-ui-secondary hover:border-accent-primary/60 hover:text-accent-primary transition-colors max-w-[20rem] flex-shrink min-w-0"
           title={triggerTitle}
         >
           <span className="truncate">{triggerLabel}</span>
@@ -348,9 +645,7 @@ export function ModelPickerPopover({
               {currentNode}
             </span>
           )}
-          <ChevronDown
-            className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`}
-          />
+          <ChevronDown className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
         </button>
       </Popover.Trigger>
 
@@ -368,266 +663,7 @@ export function ModelPickerPopover({
             focusMainInput();
           }}
         >
-          {/* Header */}
-          <div className="flex items-center justify-between px-3 py-2 border-b border-surface-border/60">
-            <span className="text-xs font-semibold text-ui-secondary uppercase tracking-wider">
-              Switch Model
-            </span>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={handleRefresh}
-                disabled={!connected || isRefreshing}
-                className="p-1 rounded text-ui-secondary hover:text-accent-primary hover:bg-accent-primary/10 transition-colors disabled:opacity-50"
-                title="Refresh model list"
-              >
-                <RefreshCw className={`h-3.5 w-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
-              </button>
-              <Popover.Close className="p-1 rounded text-ui-secondary hover:text-ui-primary hover:bg-surface-elevated/60 transition-colors">
-                <X className="h-3.5 w-3.5" />
-              </Popover.Close>
-            </div>
-          </div>
-
-          {/* Target selector */}
-          <div className="px-3 py-2 border-b border-surface-border/40">
-            <div className="flex items-center gap-2 text-xs">
-              <span className="text-[10px] uppercase tracking-widest text-ui-muted">Target</span>
-              <select
-                value={target}
-                onChange={(e) => setTarget(e.target.value)}
-                className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-2 py-1 text-xs text-ui-primary focus:border-accent-primary focus:outline-none"
-                disabled={!connected}
-              >
-                <option value={TARGET_ACTIVE}>Active agent</option>
-                <option value={TARGET_ALL}>All agents</option>
-                {targetAgents.map((agent) => (
-                  <option key={agent.id} value={agent.id}>
-                    {agent.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-            {canManageCustomModels && (
-              <div className="mt-2 pt-2 border-t border-surface-border/40 space-y-2">
-                <div className="text-[10px] uppercase tracking-widest text-ui-muted">Add custom model ({selectedProvider})</div>
-                <div className="flex items-center gap-2">
-                  <input
-                    value={hfRepo}
-                    onChange={(e) => setHfRepo(e.target.value)}
-                    placeholder="HF repo (owner/name-GGUF)"
-                    className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-2 py-1 text-xs text-ui-primary"
-                  />
-                  <input
-                    value={hfFilename}
-                    onChange={(e) => setHfFilename(e.target.value)}
-                    placeholder="filename.gguf"
-                    className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-2 py-1 text-xs text-ui-primary"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleAddHfModel}
-                    className="px-2 py-1 rounded border border-surface-border text-ui-secondary hover:text-accent-primary"
-                    title="Add from Hugging Face"
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-                <div className="flex items-center gap-2">
-                  <input
-                    value={filePath}
-                    onChange={(e) => setFilePath(e.target.value)}
-                    placeholder="/absolute/path/to/model.gguf"
-                    className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-2 py-1 text-xs text-ui-primary"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleAddFileModel}
-                    className="px-2 py-1 rounded border border-surface-border text-ui-secondary hover:text-accent-primary"
-                    title="Add local GGUF file"
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleDeleteCurrentCustom}
-                    disabled={selectedProviderEntry?.source !== 'custom'}
-                    className="px-2 py-1 rounded border border-surface-border text-ui-secondary hover:text-red-400 disabled:opacity-40"
-                    title="Delete selected custom model"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-                {activeDownload && (
-                  <div className="text-[10px] text-ui-muted">
-                    {activeDownload.status}: {activeDownload.model_id}
-                    {activeDownload.percent != null ? ` (${Math.round(activeDownload.percent)}%)` : ''}
-                    {activeDownload.message ? ` - ${activeDownload.message}` : ''}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Command palette (filter + list) */}
-          <Command
-            label="Model picker"
-            value={selectedValue}
-            onValueChange={setSelectedValue}
-            className="flex flex-col flex-1 min-h-0"
-            filter={(value, search, keywords) => {
-              // value is "provider/model", "provider@node_id/model", or "recent:provider/model"
-              if (!search) return 1;
-              const normalized = normalizeValue(value);
-              // Strip "@node_id" so "ollama/llama3.2" matches "ollama@peer123/llama3.2"
-              const withoutNode = normalized.replace(/@[^/]+\//, '/');
-              const searchLower = search.toLowerCase();
-              if (withoutNode.toLowerCase().includes(searchLower)) return 1;
-              // Also check keywords (provider, model display name, node label)
-              if (keywords?.some((k) => k.toLowerCase().includes(searchLower))) return 1;
-              return 0;
-            }}
-          >
-            {/* Filter input */}
-            <div className="px-3 py-2 border-b border-surface-border/40">
-              <div className="relative">
-                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-ui-muted pointer-events-none" />
-                <Command.Input
-                  ref={inputRef}
-                  placeholder="Filter models..."
-                  className="w-full rounded-lg border border-surface-border bg-surface-elevated/70 pl-8 pr-3 py-1.5 text-xs text-ui-primary placeholder:text-ui-muted focus:border-accent-primary focus:outline-none"
-                />
-              </div>
-            </div>
-
-            {/* Model list */}
-            <Command.List ref={commandListRef} className="flex-1 overflow-y-auto px-1 py-1 max-h-[240px]">
-              {allModels.length === 0 ? (
-                <Command.Loading className="px-3 py-6 text-center text-xs text-ui-muted">
-                  Loading models...
-                </Command.Loading>
-              ) : (
-                <>
-                  <Command.Empty className="px-3 py-6 text-center text-xs text-ui-muted">
-                    No models match your search
-                  </Command.Empty>
-
-                  {/* Recent Models Section */}
-                  {recentModels.length > 0 && (
-                    <Command.Group
-                      heading="Recent"
-                      className="mb-2 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-accent-primary [&_[cmdk-group-heading]]:bg-surface-canvas/95"
-                    >
-                      {recentModels.map((entry) => {
-                        const val = itemValue(entry.provider, entry.model);
-                        const isCurrent =
-                          currentProvider === entry.provider && currentModel === entry.model;
-
-                        return (
-                          <Command.Item
-                            key={`recent-${val}`}
-                            value={`${RECENT_PREFIX}${val}`}
-                            keywords={[entry.provider, entry.model]}
-                            onSelect={(v) => switchModel(v)}
-                            className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-ui-secondary data-[selected=true]:bg-accent-primary/20 data-[selected=true]:text-accent-primary data-[selected=true]:border data-[selected=true]:border-accent-primary/40 hover:bg-surface-elevated/60 cursor-pointer"
-                          >
-                            <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-accent-primary transition-opacity" />
-                            <span className="flex-1 truncate">
-                              {entry.provider} / {entry.model}
-                            </span>
-                            {isCurrent && (
-                              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-accent-tertiary/20 text-accent-tertiary border border-accent-tertiary/30">
-                                current
-                              </span>
-                            )}
-                          </Command.Item>
-                        );
-                      })}
-                    </Command.Group>
-                  )}
-
-                  {/* Separator if we have recent models */}
-                  {recentModels.length > 0 && (
-                    <div className="h-px bg-surface-border/40 my-2" />
-                  )}
-
-                  {/* Provider-grouped models (local + remote) */}
-                  {grouped.map((group) => (
-                    <Command.Group
-                      key={group.heading}
-                      heading={group.heading}
-                      className="mb-1 [&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-widest [&_[cmdk-group-heading]]:text-ui-muted [&_[cmdk-group-heading]]:bg-surface-canvas/95"
-                    >
-                      {group.models.map((model) => {
-                        const val = itemValue(group.provider, model.value, group.node);
-                        const isCurrent =
-                          currentProvider === group.provider &&
-                          currentModel === model.value &&
-                          (group.node ?? undefined) === (currentNode ?? undefined);
-
-                        return (
-                          <Command.Item
-                            key={val}
-                            value={val}
-                            keywords={[group.provider, model.display, model.value, ...(group.nodeLabel ? [group.nodeLabel] : [])]}
-                            onSelect={(v) => switchModel(v)}
-                            className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition-colors text-ui-secondary data-[selected=true]:bg-accent-primary/20 data-[selected=true]:text-accent-primary data-[selected=true]:border data-[selected=true]:border-accent-primary/40 hover:bg-surface-elevated/60 cursor-pointer"
-                          >
-                            <ChevronRight className="cmdk-chevron h-3 w-3 flex-shrink-0 opacity-0 text-accent-primary transition-opacity" />
-                            <span className="flex-1 truncate">{model.display}</span>
-                            {group.nodeLabel && (
-                              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                                {group.nodeLabel}
-                              </span>
-                            )}
-                            {isCurrent && (
-                              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-accent-tertiary/20 text-accent-tertiary border border-accent-tertiary/30">
-                                current
-                              </span>
-                            )}
-                          </Command.Item>
-                        );
-                      })}
-                    </Command.Group>
-                  ))}
-                </>
-              )}
-            </Command.List>
-          </Command>
-
-          {/* Footer with switch button */}
-          <div className="px-3 py-2 border-t border-surface-border/60 bg-surface-elevated/30">
-            <div className="flex items-center justify-between gap-3">
-              <div className="text-[10px] text-ui-muted truncate flex-1 flex items-center gap-1.5">
-                {selectedEntry ? (
-                  <>
-                    <span className="text-ui-secondary">
-                      {selectedEntry.provider} / {selectedEntry.model}
-                    </span>
-                    {selectedEntry.nodeLabel && (
-                      <span className="px-1 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                        {selectedEntry.nodeLabel}
-                      </span>
-                    )}
-                  </>
-                ) : (
-                  'Select a model above'
-                )}
-              </div>
-              <button
-                type="button"
-                onClick={handleSwitchClick}
-                disabled={!canSwitch}
-                className={`px-4 py-1.5 rounded-lg text-xs font-medium transition-all ${
-                  canSwitch
-                    ? 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30 hover:shadow-glow-primary'
-                    : 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
-                }`}
-              >
-                {routingMode === 'broadcast' && target === TARGET_ALL ? 'Switch all' : 'Switch'}
-              </button>
-            </div>
-          </div>
+          {panel}
         </Popover.Content>
       </Popover.Portal>
     </Popover.Root>

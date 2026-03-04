@@ -31,6 +31,7 @@ import { SystemLog } from './SystemLog';
 import { GlitchText } from './GlitchText';
 import { buildTurns, buildDelegationTurn, buildEventRowsWithDelegations, isRateLimitEvent, processRateLimitEvent } from '../logic/chatViewLogic';
 import { RateLimitIndicator } from './RateLimitIndicator';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 const FILE_MENTION_MARKUP_RE = /@\{(file|dir):([^}]+)\}/g;
 
@@ -110,6 +111,8 @@ export function ChatView() {
     setMainInputRef,
   } = useUiStore();
   
+  const isMobile = useIsMobile();
+
   // Get rate limit state for current session
   const rateLimitState = sessionId ? rateLimitBySession.get(sessionId) : undefined;
 
@@ -817,7 +820,7 @@ export function ChatView() {
           )}
         </div>
         {activeTimelineView === 'chat' && hasTurns && !isAtBottom && (
-          <div className="absolute bottom-6 left-1/2 -translate-x-1/2">
+          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-10">
             <button
               type="button"
               onClick={() => {
@@ -884,7 +887,7 @@ export function ChatView() {
             background: `linear-gradient(90deg, rgba(var(--mode-rgb), 0.08) 0%, transparent 100%)` 
           }}
         >
-          <div className="flex gap-3 relative items-end flex-1">
+          <div className="flex gap-3 relative items-stretch flex-1">
           <MentionInput
             ref={mentionInputRef}
             value={prompt}
@@ -895,7 +898,7 @@ export function ChatView() {
                 ? "Create a session to start chatting..." 
                 : rateLimitState?.isRateLimited
                   ? "Waiting for rate limit..."
-                  : "Enter your prompt... (use @ to mention files)"
+                  : isMobile ? "Enter your prompt..." : "Enter your prompt... (use @ to mention files)"
             }
             disabled={loading || !connected || !sessionId || rateLimitState?.isRateLimited}
             files={fileMention.allFiles}
@@ -910,7 +913,7 @@ export function ChatView() {
                 px-3 md:px-6 py-2.5 md:py-3 rounded-lg font-medium transition-all duration-200
                 bg-status-warning/10 border-2 border-status-warning text-status-warning
                 hover:bg-status-warning/20 hover:shadow-[0_0_15px_rgba(var(--status-warning-rgb),0.3)]
-                flex items-center gap-2 overflow-visible self-end min-h-[44px] md:min-h-[48px]
+                flex items-center justify-center gap-2 overflow-visible
               "
               title="Stop generation (Esc Esc)"
             >
@@ -926,7 +929,7 @@ export function ChatView() {
                 bg-accent-primary/10 border-2 border-accent-primary text-accent-primary
                 hover:bg-accent-primary/20 hover:shadow-glow-primary
                 disabled:opacity-30 disabled:cursor-not-allowed
-                flex items-center gap-2 overflow-visible self-end min-h-[44px] md:min-h-[48px]
+                flex items-center justify-center gap-2 overflow-visible
               "
             >
               {loading ? (

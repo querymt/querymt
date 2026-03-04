@@ -53,7 +53,7 @@ export const ToolSummary = memo(function ToolSummary({
   const isShell = normalized === 'shell' || normalized === 'bash';
   const hasInlinePreview = isEdit || isPatch || isWrite || isShell;
   const [showPreview, setShowPreview] = useState(!isMobile && (isEdit || isPatch || isWrite)); // Auto-expand diffs (collapsed on mobile)
-  const diffContainerClass = `event-diff-container m-0 border-0${isMobile ? ' diff-mobile' : ''}`;
+  const diffContainerClass = `event-diff-container${isMobile ? ' diff-mobile' : ''}`;
 
   // Build preview data
   const previewData = useMemo(() => {

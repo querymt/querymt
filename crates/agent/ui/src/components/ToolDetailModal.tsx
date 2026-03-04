@@ -22,6 +22,7 @@ export interface ToolDetailModalProps {
 }
 
 export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
+  const isMobile = useIsMobile();
   const selectedTheme = useUiStore((state) => state.selectedTheme);
   const diffTheme = getDiffThemeForDashboard(selectedTheme);
   const diffThemeType = getDashboardThemeVariant(selectedTheme);
@@ -66,53 +67,104 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
           aria-describedby={undefined}
         >
           {/* Header */}
-          <div className="flex items-center justify-between px-5 py-3 border-b border-surface-border bg-surface-canvas/50">
-            <div className="flex items-center gap-3">
-              <span className="text-xl">{summary.icon}</span>
-              <div>
-                <Dialog.Title className="text-lg font-semibold text-accent-primary">
-                  {summary.name}
-                </Dialog.Title>
-                {summary.keyParam && (
-                  <p className="text-xs text-ui-secondary font-mono truncate max-w-md">
-                    {summary.keyParam}
-                  </p>
-                )}
+          {isMobile ? (
+            <div className="border-b border-surface-border bg-surface-canvas/50 px-3 py-2">
+              {/* Row 1: icon + name + close button */}
+              <div className="flex items-center justify-between" data-testid="header-top-row">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-lg shrink-0">{summary.icon}</span>
+                  <div className="min-w-0">
+                    <Dialog.Title className="text-base font-semibold text-accent-primary truncate">
+                      {summary.name}
+                    </Dialog.Title>
+                    {summary.keyParam && (
+                      <p className="text-xs text-ui-secondary font-mono truncate">
+                        {summary.keyParam}
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <Dialog.Close className="shrink-0 p-1.5 rounded hover:bg-surface-canvas transition-colors text-ui-secondary hover:text-ui-primary">
+                  <X className="w-5 h-5" />
+                </Dialog.Close>
+              </div>
+              {/* Row 2: status + timestamp */}
+              <div className="flex items-center gap-3 mt-1.5 pl-8" data-testid="header-meta-row">
+                <div className="flex items-center gap-2">
+                  {isInProgress && (
+                    <span className="flex items-center gap-1.5 text-xs text-accent-tertiary">
+                      <Loader className="w-3.5 h-3.5 animate-spin" />
+                      Running...
+                    </span>
+                  )}
+                  {isCompleted && (
+                    <span className="flex items-center gap-1.5 text-xs text-status-success">
+                      <CheckCircle className="w-3.5 h-3.5" />
+                      Completed
+                    </span>
+                  )}
+                  {isFailed && (
+                    <span className="flex items-center gap-1.5 text-xs text-status-warning">
+                      <XCircle className="w-3.5 h-3.5" />
+                      Failed
+                    </span>
+                  )}
+                </div>
+                <span className="flex items-center gap-1 text-xs text-ui-muted">
+                  <Clock className="w-3 h-3" />
+                  {new Date(event.timestamp).toLocaleTimeString()}
+                </span>
               </div>
             </div>
-            <div className="flex items-center gap-4">
-              {/* Status */}
-              <div className="flex items-center gap-2">
-                {isInProgress && (
-                  <span className="flex items-center gap-1.5 text-xs text-accent-tertiary">
-                    <Loader className="w-4 h-4 animate-spin" />
-                    Running...
-                  </span>
-                )}
-                {isCompleted && (
-                  <span className="flex items-center gap-1.5 text-xs text-status-success">
-                    <CheckCircle className="w-4 h-4" />
-                    Completed
-                  </span>
-                )}
-                {isFailed && (
-                  <span className="flex items-center gap-1.5 text-xs text-status-warning">
-                    <XCircle className="w-4 h-4" />
-                    Failed
-                  </span>
-                )}
+          ) : (
+            <div className="flex items-center justify-between px-5 py-3 border-b border-surface-border bg-surface-canvas/50">
+              <div className="flex items-center gap-3">
+                <span className="text-xl">{summary.icon}</span>
+                <div>
+                  <Dialog.Title className="text-lg font-semibold text-accent-primary">
+                    {summary.name}
+                  </Dialog.Title>
+                  {summary.keyParam && (
+                    <p className="text-xs text-ui-secondary font-mono truncate max-w-md">
+                      {summary.keyParam}
+                    </p>
+                  )}
+                </div>
               </div>
-              {/* Timestamp */}
-              <span className="flex items-center gap-1 text-xs text-ui-muted">
-                <Clock className="w-3.5 h-3.5" />
-                {new Date(event.timestamp).toLocaleTimeString()}
-              </span>
-              {/* Close button */}
-              <Dialog.Close className="p-1.5 rounded hover:bg-surface-canvas transition-colors text-ui-secondary hover:text-ui-primary">
-                <X className="w-5 h-5" />
-              </Dialog.Close>
+              <div className="flex items-center gap-4" data-testid="header-right-group">
+                {/* Status */}
+                <div className="flex items-center gap-2">
+                  {isInProgress && (
+                    <span className="flex items-center gap-1.5 text-xs text-accent-tertiary">
+                      <Loader className="w-4 h-4 animate-spin" />
+                      Running...
+                    </span>
+                  )}
+                  {isCompleted && (
+                    <span className="flex items-center gap-1.5 text-xs text-status-success">
+                      <CheckCircle className="w-4 h-4" />
+                      Completed
+                    </span>
+                  )}
+                  {isFailed && (
+                    <span className="flex items-center gap-1.5 text-xs text-status-warning">
+                      <XCircle className="w-4 h-4" />
+                      Failed
+                    </span>
+                  )}
+                </div>
+                {/* Timestamp */}
+                <span className="flex items-center gap-1 text-xs text-ui-muted">
+                  <Clock className="w-3.5 h-3.5" />
+                  {new Date(event.timestamp).toLocaleTimeString()}
+                </span>
+                {/* Close button */}
+                <Dialog.Close className="shrink-0 p-1.5 rounded hover:bg-surface-canvas transition-colors text-ui-secondary hover:text-ui-primary">
+                  <X className="w-5 h-5" />
+                </Dialog.Close>
+              </div>
             </div>
-          </div>
+          )}
 
           {/* Content */}
           <div className="flex-1 overflow-auto p-5 space-y-5">
@@ -246,7 +298,7 @@ function DiffView({
 }) {
   const isMobile = useIsMobile();
   const preferredDiffStyle = isMobile ? 'unified' : 'split' as const;
-  const diffContainerClass = `event-diff-container m-0 border-0${isMobile ? ' diff-mobile' : ''}`;
+  const diffContainerClass = `event-diff-container${isMobile ? ' diff-mobile' : ''}`;
   const input = rawInput as Record<string, unknown>;
   
   // Handle write tool - show as diff with empty left side

@@ -252,7 +252,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
         </div>
         
         {/* Sessions list */}
-        <div className="space-y-4 mb-6 max-h-[50vh] overflow-y-auto custom-scrollbar">
+        <div className="space-y-4 mb-6 max-h-[50vh] overflow-y-auto custom-scrollbar p-1 -m-1">
           {filteredGroups.length === 0 ? (
             <div className="text-center py-8 text-ui-muted">
               <p>No sessions found matching "{filterText}"</p>
@@ -307,7 +307,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
             <Plus className="w-6 h-6" />
             <GlitchText text="Start New Session" variant="0" hoverOnly />
           </button>
-          <p className="text-xs text-ui-muted mt-2">
+          <p className="text-xs text-ui-muted mt-6">
             or press{' '}
             <kbd className="px-2 py-1 bg-surface-canvas border border-surface-border rounded text-accent-primary font-mono text-[10px]">
               {navigator.platform.includes('Mac') ? '⌘+X N' : 'Ctrl+X N'}
