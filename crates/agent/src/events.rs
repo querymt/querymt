@@ -335,7 +335,7 @@ pub enum AgentEventKind {
     ToolsAvailable {
         #[typeshare(serialized_as = "Vec<ToolInfo>")]
         tools: Vec<querymt::chat::Tool>,
-        #[typeshare(serialized_as = "number")]
+        #[typeshare(serialized_as = "string")]
         tools_hash: RapidHash,
     },
     /// Emitted when duplicate/similar code is detected in newly written code

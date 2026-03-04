@@ -194,7 +194,7 @@ export type AgentEventKind =
 	/** Emitted at session start and whenever available tools change */
 	| { type: "tools_available", data: {
 	tools: ToolInfo[];
-	tools_hash: number;
+	tools_hash: string;
 }}
 	/** Emitted when duplicate/similar code is detected in newly written code */
 	| { type: "duplicate_code_detected", data: {
