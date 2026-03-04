@@ -502,4 +502,38 @@ describe('TurnCard', () => {
 
     expect(screen.queryByText('Undo')).not.toBeInTheDocument();
   });
+
+  describe('mobile overflow prevention', () => {
+    it('turn-card wrapper has overflow-hidden to prevent horizontal bleed', () => {
+      const turn = makeTurn({
+        userMessage: { content: 'Hello', timestamp: 1000 } as any,
+        agentMessages: [{ id: 'a1', type: 'agent' as const, content: 'Hi', timestamp: 2000, agentId: 'primary', isMessage: true }] as any,
+      });
+
+      const { container } = render(
+        <TurnCard {...defaultProps} turn={turn} />
+      );
+
+      const turnCard = container.querySelector('.turn-card') as HTMLElement;
+      expect(turnCard).not.toBeNull();
+      expect(turnCard.className).toContain('overflow-hidden');
+    });
+
+    it('turn-card uses responsive horizontal padding', () => {
+      const turn = makeTurn({
+        userMessage: { content: 'Hello', timestamp: 1000 } as any,
+        agentMessages: [{ id: 'a1', type: 'agent' as const, content: 'Hi', timestamp: 2000, agentId: 'primary', isMessage: true }] as any,
+      });
+
+      const { container } = render(
+        <TurnCard {...defaultProps} turn={turn} />
+      );
+
+      const turnCard = container.querySelector('.turn-card') as HTMLElement;
+      expect(turnCard).not.toBeNull();
+      // Should have responsive padding: smaller on mobile, normal on desktop
+      expect(turnCard.className).toContain('px-2');
+      expect(turnCard.className).toContain('md:px-4');
+    });
+  });
 });

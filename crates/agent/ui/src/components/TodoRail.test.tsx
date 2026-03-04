@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TodoRail } from './TodoRail';
@@ -158,5 +158,22 @@ describe('TodoRail', () => {
 
     const completedText = screen.getByText('Completed task');
     expect(completedText.className).toContain('line-through');
+  });
+
+  describe('mobile responsiveness', () => {
+    it('applies hidden md:flex class on expanded rail wrapper', () => {
+      const { container } = render(<TodoRail {...defaultProps} collapsed={false} />);
+      const rail = container.firstElementChild as HTMLElement;
+      // The expanded rail should have the responsive hidden class for mobile
+      expect(rail.className).toContain('hidden');
+      expect(rail.className).toContain('md:flex');
+    });
+
+    it('applies hidden md:flex class on collapsed rail wrapper', () => {
+      const { container } = render(<TodoRail {...defaultProps} collapsed={true} />);
+      const rail = container.firstElementChild as HTMLElement;
+      expect(rail.className).toContain('hidden');
+      expect(rail.className).toContain('md:flex');
+    });
   });
 });

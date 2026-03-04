@@ -4,6 +4,7 @@ import { ComponentPropsWithoutRef, ReactNode, isValidElement, memo, useMemo } fr
 import { parseFileMentions } from '../utils/fileMentionParser';
 import { FileMention } from './FileMention';
 import { HighlightedCode } from './HighlightedCode';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 interface MessageContentProps {
   content: string;
@@ -51,9 +52,13 @@ export function isLastFenceUnclosed(markdown: string): boolean {
 }
 
 export const MessageContent = memo(function MessageContent({ content, type = 'text', isStreaming }: MessageContentProps) {
-  // For now, we'll use markdown for text and pre-formatted code for others
-  // In the future, we can integrate @pierre/diffs for better code/diff rendering
-  
+  const isMobile = useIsMobile();
+  // Text size classes: smaller on mobile for better density
+  const bodyText = isMobile ? 'text-xs' : 'text-sm';
+  const h1Text = isMobile ? 'text-base' : 'text-lg';
+  const h2Text = isMobile ? 'text-sm' : 'text-base';
+  const h3Text = isMobile ? 'text-xs' : 'text-sm';
+
   if (type === 'text' || !type) {
     const mainContent = useMemo(() => content, [content]);
 
@@ -97,7 +102,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
         }
 
         return (
-          <pre className="my-3 bg-surface-canvas/70 border border-surface-border rounded-md p-3 overflow-x-auto max-w-full font-mono text-sm">
+          <pre className={`my-3 bg-surface-canvas/70 border border-surface-border rounded-md p-3 overflow-x-auto max-w-full font-mono ${bodyText}`}>
             {children}
           </pre>
         );
@@ -113,7 +118,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
         }
 
         return (
-          <code className="bg-surface-canvas/50 px-1.5 py-0.5 rounded text-accent-primary font-mono text-sm">
+          <code className={`bg-surface-canvas/50 px-1.5 py-0.5 rounded text-accent-primary font-mono ${bodyText}`}>
             {children}
           </code>
         );
@@ -131,7 +136,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       p(props: ComponentPropsWithoutRef<'p'>) {
         const { children, ...rest } = props;
         return (
-          <p className="mb-2 text-sm leading-relaxed text-ui-primary" {...rest}>
+          <p className={`mb-2 ${bodyText} leading-relaxed text-ui-primary`} {...rest}>
             {children}
           </p>
         );
@@ -140,7 +145,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       ul(props: ComponentPropsWithoutRef<'ul'>) {
         const { children, ...rest } = props;
         return (
-          <ul className="my-2 ml-4 space-y-1 list-disc text-sm text-ui-primary" {...rest}>
+          <ul className={`my-2 ml-4 space-y-1 list-disc ${bodyText} text-ui-primary`} {...rest}>
             {children}
           </ul>
         );
@@ -148,7 +153,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       ol(props: ComponentPropsWithoutRef<'ol'>) {
         const { children, ...rest } = props;
         return (
-          <ol className="my-2 ml-4 space-y-1 list-decimal text-sm text-ui-primary" {...rest}>
+          <ol className={`my-2 ml-4 space-y-1 list-decimal ${bodyText} text-ui-primary`} {...rest}>
             {children}
           </ol>
         );
@@ -165,7 +170,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       h1(props: ComponentPropsWithoutRef<'h1'>) {
         const { children, ...rest } = props;
         return (
-          <h1 className="text-lg font-semibold mt-4 mb-2 text-accent-primary" {...rest}>
+          <h1 className={`${h1Text} font-semibold mt-4 mb-2 text-accent-primary`} {...rest}>
             {children}
           </h1>
         );
@@ -173,7 +178,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       h2(props: ComponentPropsWithoutRef<'h2'>) {
         const { children, ...rest } = props;
         return (
-          <h2 className="text-base font-semibold mt-3 mb-2 text-accent-primary" {...rest}>
+          <h2 className={`${h2Text} font-semibold mt-3 mb-2 text-accent-primary`} {...rest}>
             {children}
           </h2>
         );
@@ -181,7 +186,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       h3(props: ComponentPropsWithoutRef<'h3'>) {
         const { children, ...rest } = props;
         return (
-          <h3 className="text-sm font-semibold mt-2 mb-1 text-ui-secondary" {...rest}>
+          <h3 className={`${h3Text} font-semibold mt-2 mb-1 text-ui-secondary`} {...rest}>
             {children}
           </h3>
         );
@@ -190,7 +195,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       blockquote(props: ComponentPropsWithoutRef<'blockquote'>) {
         const { children, ...rest } = props;
         return (
-          <blockquote className="my-2 pl-4 border-l-2 border-accent-primary/50 text-ui-secondary italic text-sm" {...rest}>
+          <blockquote className={`my-2 pl-4 border-l-2 border-accent-primary/50 text-ui-secondary italic ${bodyText}`} {...rest}>
             {children}
           </blockquote>
         );
@@ -207,7 +212,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
             }
             // Render text segments as markdown
             return (
-              <ReactMarkdown 
+              <ReactMarkdown
                 key={index}
                 remarkPlugins={[remarkGfm]}
                 components={markdownComponents}
@@ -223,7 +228,7 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
     // No mentions, render normally
     return (
       <div className="message-content">
-        <ReactMarkdown 
+        <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           components={markdownComponents}
         >
@@ -232,16 +237,16 @@ export const MessageContent = memo(function MessageContent({ content, type = 'te
       </div>
     );
   }
-  
+
   if (type === 'code' || type === 'tool_output' || type === 'diff') {
     return (
       <div className="event-diff-container">
-        <pre className="text-sm overflow-x-auto p-4">
+        <pre className={`${bodyText} overflow-x-auto p-4`}>
           <code>{content}</code>
         </pre>
       </div>
     );
   }
-  
-  return <pre className="text-sm whitespace-pre-wrap break-words">{content}</pre>;
+
+  return <pre className={`${bodyText} whitespace-pre-wrap break-words`}>{content}</pre>;
 });

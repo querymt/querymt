@@ -10,6 +10,7 @@ import { ModelConfigPopover } from './ModelConfigPopover';
 import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { getAgentShortName } from '../utils/agentNames';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
+import { useIsMobile } from '../hooks/useIsMobile';
 import { calculateDelegationStats } from '../utils/statsCalculator';
 import { formatTokensAbbrev, formatCost, formatTimestamp } from '../utils/formatters';
 
@@ -31,20 +32,8 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
     const parsed = stored ? Number.parseInt(stored, 10) : 420;
     return Number.isNaN(parsed) ? 420 : parsed;
   });
-  const [isMobile, setIsMobile] = useState(() => {
-    if (typeof window === 'undefined') return false;
-    return window.innerWidth < 768;
-  });
+  const isMobile = useIsMobile();
   const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
-
-  useEffect(() => {
-    const handleResize = () => {
-      setIsMobile(window.innerWidth < 768);
-    };
-    handleResize();
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;

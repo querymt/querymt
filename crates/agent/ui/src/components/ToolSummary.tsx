@@ -7,6 +7,7 @@ import { Loader, CheckCircle, XCircle, ChevronRight, ChevronDown, Eye, Pause } f
 import { PatchDiff } from '@pierre/diffs/react';
 import { generateToolSummary } from '../utils/toolSummary';
 import { EventItem } from '../types';
+import { useIsMobile } from '../hooks/useIsMobile';
 import { useUiStore } from '../store/uiStore';
 import { getDashboardThemeVariant, getDiffThemeForDashboard } from '../utils/dashboardThemes';
 
@@ -25,6 +26,7 @@ export const ToolSummary = memo(function ToolSummary({
   isAwaitingInput,
   onDelegateClick,
 }: ToolSummaryProps) {
+  const isMobile = useIsMobile();
   const selectedTheme = useUiStore((state) => state.selectedTheme);
   const diffTheme = getDiffThemeForDashboard(selectedTheme);
   const diffThemeType = getDashboardThemeVariant(selectedTheme);
@@ -50,7 +52,8 @@ export const ToolSummary = memo(function ToolSummary({
   const isWrite = normalized === 'write' || normalized === 'write_file';
   const isShell = normalized === 'shell' || normalized === 'bash';
   const hasInlinePreview = isEdit || isPatch || isWrite || isShell;
-  const [showPreview, setShowPreview] = useState(isEdit || isPatch || isWrite); // Auto-expand diffs
+  const [showPreview, setShowPreview] = useState(!isMobile && (isEdit || isPatch || isWrite)); // Auto-expand diffs (collapsed on mobile)
+  const diffContainerClass = `event-diff-container${isMobile ? ' diff-mobile' : ''}`;
 
   // Build preview data
   const previewData = useMemo(() => {
@@ -191,13 +194,13 @@ export const ToolSummary = memo(function ToolSummary({
           title="Click for full details"
         >
           {previewData.type === 'diff' && previewData.patch && (
-            <div className="event-diff-container m-0 border-0 text-[11px]">
+            <div className={diffContainerClass}>
               <PatchDiff
                 patch={previewData.patch}
                 options={{
                   theme: diffTheme,
                   themeType: diffThemeType,
-                  diffStyle: 'split',
+                  diffStyle: isMobile ? 'unified' : 'split',
                   diffIndicators: 'bars',
                   lineDiffType: 'word-alt',
                   overflow: 'wrap',

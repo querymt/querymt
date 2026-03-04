@@ -196,7 +196,7 @@ export const TurnCard = memo(function TurnCard({
 
   return (
     <div
-      className={`turn-card max-w-6xl mx-auto px-2 py-3 group transition-opacity ${
+      className={`turn-card max-w-6xl mx-auto px-2 md:px-4 py-3 group transition-opacity overflow-hidden ${
         isStackedUndone ? 'opacity-45' : 'opacity-100'
       }`}
       data-stacked-undone={isStackedUndone ? 'true' : 'false'}
