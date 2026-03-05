@@ -42,43 +42,64 @@ export function hasMultipleAuthMethods(provider: AuthProviderEntry): boolean {
 
 /** Determine the badge label and styling for a provider's current auth state. */
 export function activeAuthLabel(provider: AuthProviderEntry): { label: string; classes: string } {
-  const pref = provider.preferred_method;
   const successClasses = 'border-status-success/40 bg-status-success/10 text-status-success';
   const warningClasses = 'border-status-warning/45 bg-status-warning/10 text-status-warning';
 
-  // Determine effective auth status based on preference
-  if (pref === AuthMethod.OAuth || (!pref && provider.supports_oauth)) {
-    if (provider.oauth_status === 'connected') {
-      return { label: 'OAuth', classes: successClasses };
-    }
-    if (provider.oauth_status === 'expired') {
-      return { label: 'Expired', classes: warningClasses };
-    }
+  // Resolve the effective auth source: try the preferred method first, then
+  // fall back through all available sources in default order.
+  const effective = resolveEffectiveAuth(provider);
+
+  if (!effective) {
+    return { label: 'Not configured', classes: 'border-surface-border/60 bg-surface-canvas/60 text-ui-muted' };
   }
-  if (pref === AuthMethod.ApiKey || (!pref && !provider.supports_oauth)) {
-    if (provider.has_stored_api_key) {
-      return { label: 'API Key', classes: successClasses };
-    }
-  }
-  // EnvVar is no longer user-selectable, but honour legacy preference from backend
-  if (pref === AuthMethod.EnvVar) {
-    if (provider.has_env_api_key) {
-      return { label: 'Env', classes: successClasses };
-    }
+  if (effective === 'expired') {
+    return { label: 'Expired', classes: warningClasses };
   }
 
-  // Fallback: check if anything is configured (any source)
-  if (provider.oauth_status === 'connected') {
-    return { label: 'OAuth', classes: successClasses };
+  const labelMap: Record<AuthMethod, string> = {
+    [AuthMethod.OAuth]: 'OAuth',
+    [AuthMethod.ApiKey]: 'API Key',
+    [AuthMethod.EnvVar]: 'Env',
+  };
+  return { label: labelMap[effective], classes: successClasses };
+}
+
+/** Check whether a specific auth method is active for a provider. */
+function isMethodAvailable(provider: AuthProviderEntry, method: AuthMethod): boolean | 'expired' {
+  switch (method) {
+    case AuthMethod.OAuth:
+      if (provider.oauth_status === 'connected') return true;
+      if (provider.oauth_status === 'expired') return 'expired';
+      return false;
+    case AuthMethod.ApiKey:
+      return provider.has_stored_api_key;
+    case AuthMethod.EnvVar:
+      return provider.has_env_api_key;
   }
-  if (provider.has_stored_api_key) {
-    return { label: 'API Key', classes: successClasses };
-  }
-  if (provider.has_env_api_key) {
-    return { label: 'Env', classes: successClasses };
+}
+
+const DEFAULT_ORDER: AuthMethod[] = [AuthMethod.OAuth, AuthMethod.ApiKey, AuthMethod.EnvVar];
+
+/** Resolve which auth method is effectively active, respecting preference. */
+function resolveEffectiveAuth(provider: AuthProviderEntry): AuthMethod | 'expired' | null {
+  // Build resolution order: preferred method first (if set), then the rest.
+  const pref = provider.preferred_method;
+  let order: AuthMethod[];
+  if (pref) {
+    order = [pref, ...DEFAULT_ORDER.filter(m => m !== pref)];
+  } else if (provider.supports_oauth) {
+    order = DEFAULT_ORDER;
+  } else {
+    // No OAuth support — skip it in the default order
+    order = DEFAULT_ORDER.filter(m => m !== AuthMethod.OAuth);
   }
 
-  return { label: 'Not configured', classes: 'border-surface-border/60 bg-surface-canvas/60 text-ui-muted' };
+  for (const method of order) {
+    const available = isMethodAvailable(provider, method);
+    if (available === true) return method;
+    if (available === 'expired') return 'expired';
+  }
+  return null;
 }
 
 // ── Component ──
