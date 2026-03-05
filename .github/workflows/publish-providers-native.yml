@@ -556,7 +556,7 @@ jobs:
 
       - name: Upload manifest data artifact
         if: matrix.crate != 'noop'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: manifest-${{ matrix.crate }}-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.feature_tag }}
           path: manifest-data/data.txt
@@ -571,7 +571,7 @@ jobs:
 
     steps:
       - name: Download all manifest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: manifest-*
           path: manifests/
