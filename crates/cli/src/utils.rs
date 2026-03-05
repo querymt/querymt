@@ -1,7 +1,7 @@
 use colored::*;
 use log::{Level, log_enabled};
 use querymt::ToolCall;
-use querymt::chat::{ChatMessage, ImageMime};
+use querymt::chat::ChatMessage;
 use querymt::plugin::HTTPLLMProviderFactory;
 use rustyline::{Config, Editor, error::ReadlineError};
 use serde_json::Value;
@@ -73,13 +73,13 @@ pub fn parse_kv(s: &str) -> Result<(String, Value), String> {
 }
 
 /// Detects the MIME type of an image from its binary data
-pub fn detect_image_mime(data: &[u8]) -> Option<ImageMime> {
+pub fn detect_image_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        Some(ImageMime::JPEG)
+        Some("image/jpeg")
     } else if data.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
-        Some(ImageMime::PNG)
+        Some("image/png")
     } else if data.starts_with(&[0x47, 0x49, 0x46]) {
-        Some(ImageMime::GIF)
+        Some("image/gif")
     } else {
         None
     }
@@ -89,17 +89,17 @@ pub fn detect_image_mime(data: &[u8]) -> Option<ImageMime> {
 pub fn process_input(input: &[u8], prompt: String) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     if let Some(mime) = detect_image_mime(input) {
-        messages.push(ChatMessage::user().content(prompt.clone()).build());
+        messages.push(ChatMessage::user().text(prompt.clone()).build());
         messages.push(ChatMessage::user().image(mime, input.to_vec()).build());
     } else if !input.is_empty() {
         let input_str = String::from_utf8_lossy(input);
         messages.push(
             ChatMessage::user()
-                .content(format!("{}\n\n{}", prompt, input_str))
+                .text(format!("{}\n\n{}", prompt, input_str))
                 .build(),
         );
     } else {
-        messages.push(ChatMessage::user().content(prompt).build());
+        messages.push(ChatMessage::user().text(prompt).build());
     }
     messages
 }

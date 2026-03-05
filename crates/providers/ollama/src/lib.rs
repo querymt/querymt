@@ -7,8 +7,8 @@ use http::{Method, Request, Response, header::CONTENT_TYPE};
 use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, StructuredOutputFormat,
-        Tool, http::HTTPChatProvider,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StructuredOutputFormat, Tool,
+        http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -133,9 +133,9 @@ pub struct Ollama {
 
 /// Request payload for Ollama's chat API endpoint.
 #[derive(Serialize)]
-struct OllamaChatRequest<'a> {
+struct OllamaChatRequest {
     model: String,
-    messages: Vec<OllamaChatMessage<'a>>,
+    messages: Vec<OllamaChatMessage>,
     stream: bool,
     think: bool,
     options: Option<OllamaOptions>,
@@ -235,9 +235,9 @@ struct OllamaOptions {
 
 /// Individual message in an Ollama chat conversation.
 #[derive(Serialize)]
-struct OllamaChatMessage<'a> {
-    role: &'a str,
-    content: &'a str,
+struct OllamaChatMessage {
+    role: String,
+    content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -445,38 +445,87 @@ impl HTTPChatProvider for Ollama {
         let mut chat_messages: Vec<OllamaChatMessage> = vec![];
 
         for msg in messages {
-            match &msg.message_type {
-                MessageType::Text => chat_messages.push(OllamaChatMessage {
-                    role: match msg.role {
-                        ChatRole::User => "user",
-                        ChatRole::Assistant => "assistant",
-                    },
-                    content: &msg.content,
-                    images: None,
-                    name: None,
-                }),
-                MessageType::ToolResult(results) => {
-                    for tool_result in results {
+            let role = match msg.role {
+                ChatRole::User => "user",
+                ChatRole::Assistant => "assistant",
+            }
+            .to_string();
+
+            let text = msg
+                .content
+                .iter()
+                .filter_map(|c| c.as_text())
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let mut inline_images: Vec<String> = Vec::new();
+
+            for block in &msg.content {
+                match block {
+                    Content::Image { data, .. } => inline_images.push(BASE64.encode(data)),
+                    Content::ToolResult {
+                        id, name, content, ..
+                    } => {
+                        let output = content
+                            .iter()
+                            .filter_map(|c| c.as_text())
+                            .collect::<Vec<_>>()
+                            .join("\n");
                         chat_messages.push(OllamaChatMessage {
-                            role: "tool",
-                            name: Some(tool_result.function.name.clone()),
-                            content: &tool_result.function.arguments,
+                            role: "tool".to_string(),
+                            name: name.clone(),
+                            content: output,
                             images: None,
-                        })
+                        });
+
+                        // If tool result contains images, emit a separate user image message
+                        // because Ollama tool role only supports text content.
+                        let tool_images: Vec<String> = content
+                            .iter()
+                            .filter_map(|c| match c {
+                                Content::Image { data, .. } => Some(BASE64.encode(data)),
+                                _ => None,
+                            })
+                            .collect();
+                        if !tool_images.is_empty() {
+                            chat_messages.push(OllamaChatMessage {
+                                role: "user".to_string(),
+                                name: None,
+                                content: format!("[Tool result image for {id}]"),
+                                images: Some(tool_images),
+                            });
+                        }
                     }
+                    _ => {}
                 }
-                MessageType::Image((_mime_type, content)) => {
+            }
+
+            let has_tool_result = msg.content.iter().any(|b| b.is_tool_result());
+            if has_tool_result {
+                // Tool results are already emitted above.
+                // Keep non-empty text as normal role content to preserve context.
+                if !text.is_empty() {
                     chat_messages.push(OllamaChatMessage {
-                        role: match msg.role {
-                            ChatRole::User => "user",
-                            ChatRole::Assistant => "assistant",
-                        },
-                        content: &msg.content,
-                        images: Some(vec![BASE64.encode(content)]), // FIXME: this actually should be collected into MessageType::Text
+                        role,
+                        content: text,
+                        images: None,
                         name: None,
-                    })
+                    });
                 }
-                _ => (),
+                continue;
+            }
+
+            if !text.is_empty() || !inline_images.is_empty() {
+                chat_messages.push(OllamaChatMessage {
+                    role,
+                    content: text,
+                    images: if inline_images.is_empty() {
+                        None
+                    } else {
+                        Some(inline_images)
+                    },
+                    name: None,
+                });
             }
         }
 
@@ -484,8 +533,8 @@ impl HTTPChatProvider for Ollama {
             chat_messages.insert(
                 0,
                 OllamaChatMessage {
-                    role: "system",
-                    content: system,
+                    role: "system".to_string(),
+                    content: system.clone(),
                     images: None,
                     name: None,
                 },

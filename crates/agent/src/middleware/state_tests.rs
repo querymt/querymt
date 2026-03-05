@@ -4,7 +4,7 @@ use crate::middleware::{
     WaitReason,
 };
 use crate::test_utils::{mock_tool_call, test_context};
-use querymt::chat::{ChatMessage, ChatRole, FinishReason, MessageType};
+use querymt::chat::{ChatMessage, ChatRole, Content, FinishReason};
 use std::sync::Arc;
 
 #[test]
@@ -126,23 +126,17 @@ fn test_conversation_context_counts_user_messages() {
     let messages = vec![
         ChatMessage {
             role: ChatRole::User,
-            content: "one".to_string(),
-            message_type: MessageType::Text,
-            thinking: None,
+            content: vec![Content::text("one")],
             cache: None,
         },
         ChatMessage {
             role: ChatRole::Assistant,
-            content: "two".to_string(),
-            message_type: MessageType::Text,
-            thinking: None,
+            content: vec![Content::text("two")],
             cache: None,
         },
         ChatMessage {
             role: ChatRole::User,
-            content: "three".to_string(),
-            message_type: MessageType::Text,
-            thinking: None,
+            content: vec![Content::text("three")],
             cache: None,
         },
     ];
@@ -177,7 +171,7 @@ fn test_conversation_context_inject_message() {
     assert_eq!(context.messages.len(), 0);
     assert_eq!(injected.messages.len(), 1);
     assert!(matches!(injected.messages[0].role, ChatRole::User));
-    assert_eq!(injected.messages[0].content, "hello");
+    assert_eq!(injected.messages[0].text(), "hello");
     assert!(injected.is_first_turn());
 }
 
@@ -199,7 +193,7 @@ fn test_llm_response_has_tool_calls() {
 fn test_tool_result_with_snapshot() {
     let result = ToolResult::new(
         "call-1".to_string(),
-        "ok".to_string(),
+        vec![Content::text("ok")],
         false,
         Some("tool".to_string()),
         Some("{}".to_string()),

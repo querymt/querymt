@@ -2,8 +2,8 @@ use crate::agent::utils::render_prompt_for_llm;
 use crate::index::merkle::DiffPaths;
 use agent_client_protocol::ContentBlock;
 use querymt::{
-    FunctionCall, ToolCall,
-    chat::{ChatMessage, ChatRole, MessageType},
+    ToolCall,
+    chat::{ChatMessage, ChatRole, Content},
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +32,7 @@ pub enum MessagePart {
     ToolUse(ToolCall),
     ToolResult {
         call_id: String,
-        content: String,
+        content: Vec<Content>,
         is_error: bool,
         tool_name: Option<String>,
         tool_arguments: Option<String>,
@@ -138,73 +138,73 @@ impl AgentMessage {
         &self,
         max_prompt_bytes: Option<usize>,
     ) -> ChatMessage {
-        let mut content = String::new();
-        let mut tool_calls = Vec::new();
-        let mut tool_results = Vec::new();
+        let mut blocks = Vec::new();
 
         for part in &self.parts {
             match part {
-                MessagePart::Text { content: t } => content.push_str(t),
-                MessagePart::Prompt { blocks } => {
-                    content.push_str(&render_prompt_for_llm(blocks, max_prompt_bytes));
+                MessagePart::Text { content } => {
+                    blocks.push(Content::text(content));
                 }
-                MessagePart::Reasoning { .. } => {
-                    // Option: Exclude reasoning from context sent to LLM to save tokens
+                MessagePart::Prompt {
+                    blocks: prompt_blocks,
+                } => {
+                    blocks.push(Content::text(render_prompt_for_llm(
+                        prompt_blocks,
+                        max_prompt_bytes,
+                    )));
                 }
-                MessagePart::ToolUse(tc) => tool_calls.push(tc.clone()),
+                MessagePart::Reasoning { content, .. } => {
+                    blocks.push(Content::thinking(content));
+                }
+                MessagePart::ToolUse(tc) => {
+                    blocks.push(Content::tool_use(
+                        &tc.id,
+                        &tc.function.name,
+                        serde_json::from_str(&tc.function.arguments)
+                            .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
+                    ));
+                }
                 MessagePart::ToolResult {
                     call_id,
-                    content: res,
+                    content,
+                    is_error,
                     tool_name,
-                    tool_arguments: _tool_arguments,
                     compacted_at,
                     ..
                 } => {
-                    // If compacted, return placeholder text instead of original content
-                    let effective_content = if compacted_at.is_some() {
-                        "[Old tool result content cleared]".to_string()
+                    let inner = if compacted_at.is_some() {
+                        vec![Content::text("[Old tool result content cleared]")]
                     } else {
-                        res.clone()
+                        content.clone()
                     };
-                    tool_results.push(ToolCall {
+                    blocks.push(Content::ToolResult {
                         id: call_id.clone(),
-                        call_type: "function".to_string(),
-                        function: FunctionCall {
-                            name: tool_name.clone().unwrap_or_else(|| "unknown".to_string()),
-                            arguments: effective_content.clone(),
-                        },
+                        name: tool_name.clone(),
+                        is_error: *is_error,
+                        content: inner,
                     });
-                    content.push_str(&effective_content);
                 }
                 MessagePart::Snapshot { changed_paths, .. } => {
-                    let summary = changed_paths.summary();
                     if !changed_paths.is_empty() {
-                        content.push_str(&format!("\n[System: File changes: {}]", summary));
+                        blocks.push(Content::text(format!(
+                            "\n[System: File changes: {}]",
+                            changed_paths.summary()
+                        )));
                     }
                 }
                 MessagePart::Compaction { summary, .. } => {
-                    content.push_str(summary);
+                    blocks.push(Content::text(summary));
                 }
                 MessagePart::CompactionRequest { .. } => {
-                    content.push_str("Summarize our conversation so far.");
+                    blocks.push(Content::text("Summarize our conversation so far."));
                 }
                 _ => {}
             }
         }
 
-        let message_type = if !tool_calls.is_empty() {
-            MessageType::ToolUse(tool_calls)
-        } else if !tool_results.is_empty() {
-            MessageType::ToolResult(tool_results)
-        } else {
-            MessageType::Text
-        };
-
         ChatMessage {
             role: self.role.clone(),
-            message_type,
-            content,
-            thinking: None,
+            content: blocks,
             cache: None,
         }
     }
@@ -214,7 +214,7 @@ impl AgentMessage {
 mod tests {
     use super::{AgentMessage, MessagePart};
     use agent_client_protocol::{ContentBlock, TextContent};
-    use querymt::chat::ChatRole;
+    use querymt::chat::{ChatRole, Content};
 
     #[test]
     fn to_chat_message_renders_prompt_blocks() {
@@ -230,7 +230,7 @@ mod tests {
         };
 
         let chat = msg.to_chat_message();
-        assert_eq!(chat.content, "display");
+        assert_eq!(chat.text(), "display");
     }
 
     #[test]
@@ -248,7 +248,7 @@ mod tests {
         };
 
         let chat = msg.to_chat_message();
-        assert_eq!(chat.content, "Summary of previous conversation");
+        assert_eq!(chat.text(), "Summary of previous conversation");
         assert_eq!(chat.role, ChatRole::Assistant);
     }
 
@@ -266,7 +266,7 @@ mod tests {
         };
 
         let chat = msg.to_chat_message();
-        assert_eq!(chat.content, "Summarize our conversation so far.");
+        assert_eq!(chat.text(), "Summarize our conversation so far.");
         assert_eq!(chat.role, ChatRole::User);
     }
 
@@ -301,8 +301,77 @@ mod tests {
         assert_eq!(req_chat.role, ChatRole::User);
         assert_eq!(sum_chat.role, ChatRole::Assistant);
 
-        // Neither ends with trailing whitespace
-        assert!(!req_chat.content.ends_with(char::is_whitespace));
-        assert!(!sum_chat.content.ends_with(char::is_whitespace));
+        // Neither has trailing whitespace in text content
+        assert!(!req_chat.text().ends_with(char::is_whitespace));
+        assert!(!sum_chat.text().ends_with(char::is_whitespace));
+    }
+
+    #[test]
+    fn to_chat_message_tool_result_uses_content_blocks() {
+        let msg = AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::ToolResult {
+                call_id: "call-1".to_string(),
+                content: vec![Content::text("tool output")],
+                is_error: false,
+                tool_name: Some("shell".to_string()),
+                tool_arguments: Some("{}".to_string()),
+                compacted_at: None,
+            }],
+            created_at: 0,
+            parent_message_id: None,
+        };
+
+        let chat = msg.to_chat_message();
+        assert!(chat.has_tool_result());
+        // The tool result block should contain the text
+        let tr = chat.content.iter().find(|b| b.is_tool_result()).unwrap();
+        match tr {
+            Content::ToolResult {
+                id,
+                content,
+                is_error,
+                ..
+            } => {
+                assert_eq!(id, "call-1");
+                assert!(!is_error);
+                assert_eq!(content.len(), 1);
+                assert_eq!(content[0].as_text(), Some("tool output"));
+            }
+            _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn to_chat_message_compacted_tool_result_uses_placeholder() {
+        let msg = AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::ToolResult {
+                call_id: "call-1".to_string(),
+                content: vec![Content::text("original content")],
+                is_error: false,
+                tool_name: Some("shell".to_string()),
+                tool_arguments: Some("{}".to_string()),
+                compacted_at: Some(1234567890),
+            }],
+            created_at: 0,
+            parent_message_id: None,
+        };
+
+        let chat = msg.to_chat_message();
+        let tr = chat.content.iter().find(|b| b.is_tool_result()).unwrap();
+        match tr {
+            Content::ToolResult { content, .. } => {
+                assert_eq!(
+                    content[0].as_text(),
+                    Some("[Old tool result content cleared]")
+                );
+            }
+            _ => panic!("Expected ToolResult"),
+        }
     }
 }

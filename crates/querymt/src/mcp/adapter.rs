@@ -1,11 +1,12 @@
 use crate::{
-    chat::{FunctionTool, Tool},
+    chat::{Content, FunctionTool, Tool},
     tool_decorator::CallFunctionTool,
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use base64::Engine;
 use jsonschema::ValidationError;
-use rmcp::model::Tool as RmcpTool;
+use rmcp::model::{RawContent, ResourceContents, Tool as RmcpTool};
 use rmcp::{model::CallToolRequestParams, service::ServerSink};
 use serde_json::Value;
 use std::convert::TryFrom;
@@ -100,6 +101,39 @@ impl McpToolAdapter {
     }
 }
 
+/// Convert an MCP `RawContent` value into a `Content` block.
+impl From<RawContent> for Content {
+    fn from(raw: RawContent) -> Self {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        match raw {
+            RawContent::Text(t) => Content::text(t.text),
+            RawContent::Image(img) => Content::Image {
+                mime_type: img.mime_type,
+                data: b64.decode(&img.data).unwrap_or_default(),
+            },
+            RawContent::Audio(a) => Content::Audio {
+                mime_type: a.mime_type,
+                data: b64.decode(&a.data).unwrap_or_default(),
+            },
+            RawContent::Resource(r) => match r.resource {
+                ResourceContents::TextResourceContents { text, .. } => Content::text(text),
+                ResourceContents::BlobResourceContents {
+                    blob, mime_type, ..
+                } => Content::Image {
+                    mime_type: mime_type.unwrap_or_default(),
+                    data: b64.decode(&blob).unwrap_or_default(),
+                },
+            },
+            RawContent::ResourceLink(r) => Content::ResourceLink {
+                uri: r.uri,
+                name: Some(r.name),
+                description: r.description,
+                mime_type: r.mime_type,
+            },
+        }
+    }
+}
+
 #[async_trait]
 impl CallFunctionTool for McpToolAdapter {
     fn descriptor(&self) -> Tool {
@@ -111,7 +145,7 @@ impl CallFunctionTool for McpToolAdapter {
     }
 
     #[instrument(name = "mcp_tool.call", skip_all, fields(name = %self.mcp_tool.name))]
-    async fn call(&self, args: Value) -> Result<String> {
+    async fn call(&self, args: Value) -> Result<Vec<Content>> {
         let arguments = match args {
             Value::Object(map) => Some(map),
             _ => None,
@@ -122,6 +156,10 @@ impl CallFunctionTool for McpToolAdapter {
             params = params.with_arguments(arguments);
         }
         let call_result = self.server.call_tool(params).await?;
-        Ok(serde_json::to_string(&call_result)?)
+        Ok(call_result
+            .content
+            .into_iter()
+            .map(|c| Content::from(c.raw))
+            .collect())
     }
 }

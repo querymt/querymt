@@ -1088,7 +1088,7 @@ mod tests {
     fn test_extract_changed_paths() {
         let results = vec![ToolResult {
             call_id: "1".to_string(),
-            content: "ok".to_string(),
+            content: vec![querymt::chat::Content::text("ok")],
             is_error: false,
             tool_name: Some("write_file".to_string()),
             tool_arguments: None,

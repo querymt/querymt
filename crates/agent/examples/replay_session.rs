@@ -245,16 +245,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("💬 Message History: {} messages", chat_messages.len());
     for (i, msg) in chat_messages.iter().enumerate() {
+        let text = msg.text();
         println!(
             "   [{}] {:?}: {} chars{}",
             i + 1,
             msg.role,
-            msg.content.len(),
-            if !msg.content.is_empty() {
+            text.len(),
+            if !text.is_empty() {
                 format!(
                     " - Preview: {}",
-                    msg.content
-                        .lines()
+                    text.lines()
                         .next()
                         .unwrap_or("")
                         .chars()

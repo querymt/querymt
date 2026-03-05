@@ -7,11 +7,8 @@ use uuid::Uuid;
 
 use super::types::{ChatRequest, ChatResponse, Choice, Message};
 use super::ServerState;
-use crate::chat::{ChatMessage, ChatRole};
-use crate::{
-    chain::{MultiChainStepBuilder, MultiChainStepMode, MultiPromptChain},
-    chat::MessageType,
-};
+use crate::chat::{ChatMessage, ChatRole, Content};
+use crate::chain::{MultiChainStepBuilder, MultiChainStepMode, MultiPromptChain};
 
 /// Handles chat completion requests to the API server.
 ///
@@ -83,9 +80,7 @@ pub async fn handle_chat(
                 "assistant" => ChatRole::Assistant,
                 _ => ChatRole::User,
             },
-            message_type: MessageType::Text,
-            content: msg.content,
-            thinking: None,
+            content: vec![Content::text(msg.content)],
             cache: None,
         })
         .collect();

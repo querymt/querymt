@@ -8,8 +8,7 @@ use log::debug;
 use querymt::{
     FunctionCall, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, StreamChunk, Tool,
-        ToolChoice,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StreamChunk, Tool, ToolChoice,
     },
     error::LLMError,
     handle_http_error,
@@ -20,6 +19,7 @@ use schemars::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
@@ -130,24 +130,27 @@ const DEFAULT_INSTRUCTIONS_DIRECTORY: &str = "querymt";
 enum CodexInputItem<'a> {
     #[serde(rename = "message")]
     Message {
-        role: &'a str,
+        role: Cow<'a, str>,
         content: Vec<CodexInputContent<'a>>,
     },
     #[serde(rename = "function_call")]
     FunctionCall {
-        call_id: &'a str,
-        name: &'a str,
-        arguments: &'a str,
+        call_id: Cow<'a, str>,
+        name: Cow<'a, str>,
+        arguments: Cow<'a, str>,
     },
     #[serde(rename = "function_call_output")]
-    FunctionCallOutput { call_id: &'a str, output: &'a str },
+    FunctionCallOutput {
+        call_id: Cow<'a, str>,
+        output: Cow<'a, str>,
+    },
 }
 
 #[derive(Serialize, Debug)]
 struct CodexInputContent<'a> {
     #[serde(rename = "type")]
-    content_type: &'a str,
-    text: &'a str,
+    content_type: Cow<'a, str>,
+    text: Cow<'a, str>,
 }
 
 #[derive(Serialize, Debug)]
@@ -357,12 +360,11 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
             "# AGENTS.md instructions for {directory}\n\n<INSTRUCTIONS>\n{system}\n</INSTRUCTIONS>",
             directory = DEFAULT_INSTRUCTIONS_DIRECTORY
         );
-        let leaked = Box::leak(text.into_boxed_str());
         inputs.push(CodexInputItem::Message {
-            role: "user",
+            role: Cow::Borrowed("user"),
             content: vec![CodexInputContent {
-                content_type: "input_text",
-                text: leaked,
+                content_type: Cow::Borrowed("input_text"),
+                text: Cow::Owned(text),
             }],
         });
     }
@@ -371,46 +373,58 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
             ChatRole::User => ("user", "input_text"),
             ChatRole::Assistant => ("assistant", "output_text"),
         };
-        match &msg.message_type {
-            MessageType::Text => {
-                inputs.push(CodexInputItem::Message {
-                    role,
-                    content: vec![CodexInputContent {
-                        content_type,
-                        text: &msg.content,
-                    }],
-                });
-            }
-            MessageType::ToolUse(calls) => {
-                if !msg.content.trim().is_empty() {
-                    inputs.push(CodexInputItem::Message {
-                        role,
-                        content: vec![CodexInputContent {
-                            content_type,
-                            text: &msg.content,
-                        }],
-                    });
-                }
-                for call in calls {
+
+        let text = msg
+            .content
+            .iter()
+            .filter_map(|c| c.as_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if !text.trim().is_empty() {
+            inputs.push(CodexInputItem::Message {
+                role: Cow::Borrowed(role),
+                content: vec![CodexInputContent {
+                    content_type: Cow::Borrowed(content_type),
+                    text: Cow::Owned(text),
+                }],
+            });
+        }
+
+        for block in &msg.content {
+            match block {
+                Content::ToolUse {
+                    id,
+                    name,
+                    arguments,
+                } => {
                     inputs.push(CodexInputItem::FunctionCall {
-                        call_id: &call.id,
-                        name: &call.function.name,
-                        arguments: &call.function.arguments,
+                        call_id: Cow::Borrowed(id.as_str()),
+                        name: Cow::Borrowed(name.as_str()),
+                        arguments: Cow::Owned(serde_json::to_string(arguments).unwrap_or_default()),
                     });
                 }
-            }
-            MessageType::ToolResult(results) => {
-                for result in results {
+                Content::ToolResult { id, content, .. } => {
+                    let output = content
+                        .iter()
+                        .filter_map(|c| c.as_text())
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     inputs.push(CodexInputItem::FunctionCallOutput {
-                        call_id: &result.id,
-                        output: &result.function.arguments,
+                        call_id: Cow::Borrowed(id.as_str()),
+                        output: Cow::Owned(output),
                     });
                 }
-            }
-            _ => {
-                return Err(LLMError::ProviderError(
-                    "Codex backend only supports text messages".to_string(),
-                ));
+                Content::Image { .. }
+                | Content::ImageUrl { .. }
+                | Content::Pdf { .. }
+                | Content::Audio { .. }
+                | Content::ResourceLink { .. } => {
+                    return Err(LLMError::ProviderError(
+                        "Codex backend only supports text/tool messages".to_string(),
+                    ));
+                }
+                _ => {}
             }
         }
     }

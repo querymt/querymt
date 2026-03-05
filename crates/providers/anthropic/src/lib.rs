@@ -19,7 +19,7 @@ use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, Tool, ToolChoice,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, Tool, ToolChoice,
         http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -166,7 +166,7 @@ struct ThinkingConfig {
 /// Request payload for Anthropic's messages API endpoint.
 #[derive(Serialize, Debug)]
 struct AnthropicCompleteRequest<'a> {
-    messages: Vec<AnthropicMessage<'a>>,
+    messages: Vec<AnthropicMessage>,
     model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
@@ -190,48 +190,116 @@ struct AnthropicCompleteRequest<'a> {
 
 /// Individual message in an Anthropic chat conversation.
 #[derive(Serialize, Debug)]
-struct AnthropicMessage<'a> {
-    role: &'a str,
-    content: Vec<MessageContent<'a>>,
+struct AnthropicMessage {
+    role: &'static str,
+    content: Vec<MessageContent>,
+}
+
+/// A content block sent to the Anthropic API.
+///
+/// Uses `#[serde(untagged)]` so each variant controls its own `type` field.
+/// This avoids needing a single flat struct with many `Option` fields.
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+enum MessageContent {
+    Text {
+        #[serde(rename = "type")]
+        content_type: &'static str, // "text"
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlEphemeral>,
+    },
+    Image {
+        #[serde(rename = "type")]
+        content_type: &'static str, // "image"
+        source: ImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlEphemeral>,
+    },
+    ImageUrl {
+        #[serde(rename = "type")]
+        content_type: &'static str, // "image_url"
+        image_url: ImageUrlContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlEphemeral>,
+    },
+    Document {
+        #[serde(rename = "type")]
+        content_type: &'static str, // "document"
+        source: ImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlEphemeral>,
+    },
+    Thinking {
+        #[serde(rename = "type")]
+        content_type: &'static str, // "thinking"
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlEphemeral>,
+    },
+    ToolUse {
+        #[serde(rename = "type")]
+        content_type: &'static str, // "tool_use"
+        id: String,
+        name: String,
+        input: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlEphemeral>,
+    },
+    ToolResult {
+        #[serde(rename = "type")]
+        content_type: &'static str, // "tool_result"
+        tool_use_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+        content: Vec<ToolResultContent>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlEphemeral>,
+    },
+}
+
+/// Content block inside a tool_result (Anthropic supports text + image).
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+enum ToolResultContent {
+    Text {
+        #[serde(rename = "type")]
+        content_type: &'static str,
+        text: String,
+    },
+    Image {
+        #[serde(rename = "type")]
+        content_type: &'static str,
+        source: ImageSource,
+    },
+}
+
+impl MessageContent {
+    fn set_cache_control(&mut self, cc: CacheControlEphemeral) {
+        match self {
+            MessageContent::Text { cache_control, .. }
+            | MessageContent::Image { cache_control, .. }
+            | MessageContent::ImageUrl { cache_control, .. }
+            | MessageContent::Document { cache_control, .. }
+            | MessageContent::Thinking { cache_control, .. }
+            | MessageContent::ToolUse { cache_control, .. }
+            | MessageContent::ToolResult { cache_control, .. } => {
+                *cache_control = Some(cc);
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Debug)]
-struct MessageContent<'a> {
+struct ImageUrlContent {
+    url: String,
+}
+
+#[derive(Serialize, Debug)]
+struct ImageSource {
     #[serde(rename = "type")]
-    message_type: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    image_url: Option<ImageUrlContent<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<ImageSource<'a>>,
-    // tool use
-    #[serde(skip_serializing_if = "Option::is_none", rename = "id")]
-    tool_use_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "name")]
-    tool_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "input")]
-    tool_input: Option<Value>,
-    // tool result
-    #[serde(skip_serializing_if = "Option::is_none", rename = "tool_use_id")]
-    tool_result_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "content")]
-    tool_output: Option<String>,
-    // cache control
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cache_control: Option<CacheControlEphemeral>,
-}
-
-#[derive(Serialize, Debug)]
-struct ImageUrlContent<'a> {
-    url: &'a str,
-}
-
-#[derive(Serialize, Debug)]
-struct ImageSource<'a> {
-    #[serde(rename = "type")]
-    source_type: &'a str,
-    media_type: &'a str,
+    source_type: &'static str,
+    media_type: String,
     data: String,
 }
 
@@ -673,132 +741,120 @@ impl HTTPChatProvider for Anthropic {
         let anthropic_messages: Vec<AnthropicMessage> = messages
             .iter()
             .map(|m| {
-                // Build content blocks first
-                let mut content = match &m.message_type {
-                    MessageType::Text => {
-                        // Only add text content block if content is non-empty
-                        // to avoid Anthropic API error: "text content blocks must be non-empty"
-                        if !m.content.is_empty() {
-                            vec![MessageContent {
-                                message_type: Some("text"),
-                                text: Some(&m.content),
-                                image_url: None,
-                                source: None,
-                                tool_use_id: None,
-                                tool_input: None,
-                                tool_name: None,
-                                tool_result_id: None,
-                                tool_output: None,
-                                cache_control: None,
-                            }]
-                        } else {
-                            vec![]
+                let mut content: Vec<MessageContent> = Vec::new();
+
+                for block in &m.content {
+                    match block {
+                        Content::Text { text } => {
+                            // Avoid Anthropic API error: "text content blocks must be non-empty"
+                            if !text.is_empty() {
+                                content.push(MessageContent::Text {
+                                    content_type: "text",
+                                    text: text.clone(),
+                                    cache_control: None,
+                                });
+                            }
                         }
-                    }
-                    MessageType::Pdf(raw_bytes) => {
-                        vec![MessageContent {
-                            message_type: Some("document"),
-                            text: None,
-                            image_url: None,
-                            source: Some(ImageSource {
-                                source_type: "base64",
-                                media_type: "application/pdf",
-                                data: BASE64.encode(raw_bytes),
-                            }),
-                            tool_use_id: None,
-                            tool_input: None,
-                            tool_name: None,
-                            tool_result_id: None,
-                            tool_output: None,
-                            cache_control: None,
-                        }]
-                    }
-                    MessageType::Image((image_mime, raw_bytes)) => {
-                        vec![MessageContent {
-                            message_type: Some("image"),
-                            text: None,
-                            image_url: None,
-                            source: Some(ImageSource {
-                                source_type: "base64",
-                                media_type: image_mime.mime_type(),
-                                data: BASE64.encode(raw_bytes),
-                            }),
-                            tool_use_id: None,
-                            tool_input: None,
-                            tool_name: None,
-                            tool_result_id: None,
-                            tool_output: None,
-                            cache_control: None,
-                        }]
-                    }
-                    MessageType::ImageURL(url) => vec![MessageContent {
-                        message_type: Some("image_url"),
-                        text: None,
-                        image_url: Some(ImageUrlContent { url }),
-                        source: None,
-                        tool_use_id: None,
-                        tool_input: None,
-                        tool_name: None,
-                        tool_result_id: None,
-                        tool_output: None,
-                        cache_control: None,
-                    }],
-                    MessageType::ToolUse(calls) => {
-                        let mut content = Vec::new();
-                        if !m.content.is_empty() {
-                            content.push(MessageContent {
-                                message_type: Some("text"),
-                                text: Some(&m.content),
-                                image_url: None,
-                                source: None,
-                                tool_use_id: None,
-                                tool_input: None,
-                                tool_name: None,
-                                tool_result_id: None,
-                                tool_output: None,
+                        Content::Thinking { text } => {
+                            content.push(MessageContent::Thinking {
+                                content_type: "thinking",
+                                thinking: text.clone(),
                                 cache_control: None,
                             });
                         }
-                        content.extend(calls.iter().map(|c| {
-                            MessageContent {
-                                message_type: Some("tool_use"),
-                                text: None,
-                                image_url: None,
-                                source: None,
-                                tool_use_id: Some(c.id.clone()),
-                                tool_input: Some(
-                                    serde_json::from_str(&c.function.arguments)
-                                        .unwrap_or_else(|_| serde_json::json!({})),
-                                ),
-                                tool_name: Some(self.prefix_tool_name(&c.function.name)),
-                                tool_result_id: None,
-                                tool_output: None,
+                        Content::Image { mime_type, data } => {
+                            content.push(MessageContent::Image {
+                                content_type: "image",
+                                source: ImageSource {
+                                    source_type: "base64",
+                                    media_type: mime_type.clone(),
+                                    data: BASE64.encode(data),
+                                },
                                 cache_control: None,
-                            }
-                        }));
-                        content
+                            });
+                        }
+                        Content::ImageUrl { url } => {
+                            content.push(MessageContent::ImageUrl {
+                                content_type: "image_url",
+                                image_url: ImageUrlContent { url: url.clone() },
+                                cache_control: None,
+                            });
+                        }
+                        Content::Pdf { data } => {
+                            content.push(MessageContent::Document {
+                                content_type: "document",
+                                source: ImageSource {
+                                    source_type: "base64",
+                                    media_type: "application/pdf".to_string(),
+                                    data: BASE64.encode(data),
+                                },
+                                cache_control: None,
+                            });
+                        }
+                        Content::ToolUse {
+                            id,
+                            name,
+                            arguments,
+                        } => {
+                            // Anthropic API requires `input` to be a JSON object, never null.
+                            let input = if arguments.is_object() {
+                                arguments.clone()
+                            } else {
+                                Value::Object(Default::default())
+                            };
+                            content.push(MessageContent::ToolUse {
+                                content_type: "tool_use",
+                                id: id.clone(),
+                                name: self.prefix_tool_name(name),
+                                input,
+                                cache_control: None,
+                            });
+                        }
+                        Content::ToolResult {
+                            id,
+                            is_error,
+                            content: inner,
+                            ..
+                        } => {
+                            // Anthropic supports multi-content tool results natively:
+                            // { type: "tool_result", tool_use_id, content: [text, image, ...] }
+                            let tool_content: Vec<ToolResultContent> = inner
+                                .iter()
+                                .filter_map(|c| match c {
+                                    Content::Text { text } => Some(ToolResultContent::Text {
+                                        content_type: "text",
+                                        text: text.clone(),
+                                    }),
+                                    Content::Image { mime_type, data } => {
+                                        Some(ToolResultContent::Image {
+                                            content_type: "image",
+                                            source: ImageSource {
+                                                source_type: "base64",
+                                                media_type: mime_type.clone(),
+                                                data: BASE64.encode(data),
+                                            },
+                                        })
+                                    }
+                                    _ => None, // Skip unsupported nested types
+                                })
+                                .collect();
+                            content.push(MessageContent::ToolResult {
+                                content_type: "tool_result",
+                                tool_use_id: id.clone(),
+                                is_error: if *is_error { Some(true) } else { None },
+                                content: tool_content,
+                                cache_control: None,
+                            });
+                        }
+                        // Audio, ResourceLink — skip (not supported by Anthropic)
+                        _ => {}
                     }
-                    MessageType::ToolResult(responses) => responses
-                        .iter()
-                        .map(|r| MessageContent {
-                            message_type: Some("tool_result"),
-                            text: None,
-                            image_url: None,
-                            source: None,
-                            tool_use_id: None,
-                            tool_input: None,
-                            tool_name: None,
-                            tool_result_id: Some(r.id.clone()),
-                            tool_output: Some(r.function.arguments.clone()),
-                            cache_control: None,
-                        })
-                        .collect(),
-                };
+                }
 
                 // Apply cache_control to the last content block if present
                 if let Some(cache_hint) = &m.cache {
                     if let Some(last) = content.last_mut() {
-                        last.cache_control = Some(match cache_hint {
+                        let cc = match cache_hint {
                             querymt::chat::CacheHint::Ephemeral { ttl_seconds } => {
                                 CacheControlEphemeral {
                                     control_type: "ephemeral".to_string(),
@@ -809,7 +865,8 @@ impl HTTPChatProvider for Anthropic {
                                     },
                                 }
                             }
-                        });
+                        };
+                        last.set_cache_control(cc);
                     }
                 }
 
@@ -1022,7 +1079,11 @@ impl HTTPChatProvider for Anthropic {
                                     call_type: "function".to_string(),
                                     function: querymt::FunctionCall {
                                         name: state.name,
-                                        arguments: state.arguments_buffer,
+                                        arguments: if state.arguments_buffer.is_empty() {
+                                            "{}".to_string()
+                                        } else {
+                                            state.arguments_buffer
+                                        },
                                     },
                                 },
                             });

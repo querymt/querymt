@@ -1,5 +1,5 @@
 use crate::{
-    chat::{ChatMessage, ChatProvider, ChatResponse, StreamChunk},
+    chat::{ChatMessage, ChatProvider, ChatResponse, Content, StreamChunk},
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
@@ -12,11 +12,14 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
 
-/// Adapter interface for your host‐side implementations
+/// Adapter interface for your host‐side implementations.
+///
+/// Tool implementations return `Vec<Content>` to support mixed content results
+/// (e.g., text + images from MCP tools).
 #[async_trait]
 pub trait CallFunctionTool: Send + Sync {
     fn descriptor(&self) -> Tool;
-    async fn call(&self, args: Value) -> anyhow::Result<String>;
+    async fn call(&self, args: Value) -> anyhow::Result<Vec<Content>>;
 
     /// Returns the server name for server-aware tools (e.g., MCP tools).
     /// Returns None for tools that don't have server information.
@@ -144,7 +147,11 @@ impl LLMProvider for ToolEnabledProvider {
         Some(&self.tool_list)
     }
 
-    async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<String, LLMError> {
+    async fn call_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<Vec<Content>, LLMError> {
         let tool = self
             .registry
             .get(name)

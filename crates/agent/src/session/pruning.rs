@@ -155,7 +155,12 @@ pub fn compute_prune_candidates(
                     continue;
                 }
 
-                let tokens = estimator.estimate(content);
+                let text: String = content
+                    .iter()
+                    .filter_map(|b| b.as_text())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let tokens = estimator.estimate(&text);
 
                 // Step 5: Protect the most recent PRUNE_PROTECT tokens
                 if protected_tokens < config.protect_tokens {
@@ -229,7 +234,7 @@ mod tests {
             role: ChatRole::Assistant,
             parts: vec![MessagePart::ToolResult {
                 call_id: call_id.to_string(),
-                content: content.to_string(),
+                content: vec![querymt::chat::Content::text(content)],
                 is_error: false,
                 tool_name: tool_name.map(|s| s.to_string()),
                 tool_arguments: None,

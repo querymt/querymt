@@ -14,7 +14,7 @@ use crate::middleware::{ExecutionState, ToolResult, WaitCondition};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::TaskStatus;
 use log::debug;
-use querymt::chat::ChatRole;
+use querymt::chat::{ChatRole, Content};
 use std::sync::Arc;
 use tracing::{Instrument, Span, info_span, instrument};
 use uuid::Uuid;
@@ -163,100 +163,124 @@ pub(super) async fn execute_tool_call(
         (server_name, tool)
     };
 
-    let (raw_result_json, is_error, tool_source) = if !crate::agent::tools::is_mcp_tool_allowed_with(
-        &exec_ctx.tool_config,
-        &call.function.name,
-        mcp_server_name.as_deref(),
-    ) {
-        (
-            format!("Error: tool '{}' is not allowed", call.function.name),
-            true,
-            "blocked",
+    let (raw_result_blocks, is_error, tool_source) =
+        if !crate::agent::tools::is_mcp_tool_allowed_with(
+            &exec_ctx.tool_config,
+            &call.function.name,
+            mcp_server_name.as_deref(),
+        ) {
+            (
+                vec![Content::text(format!(
+                    "Error: tool '{}' is not allowed",
+                    call.function.name
+                ))],
+                true,
+                "blocked",
+            )
+        } else if let Some(tool) = config.tool_registry.find(&call.function.name) {
+            match tool
+                .call(args.clone(), &tool_context)
+                .instrument(info_span!(
+                    "agent.tool.invoke",
+                    source = "builtin",
+                    tool_name = %call.function.name,
+                    tool_call_id = %call.id,
+                ))
+                .await
+            {
+                Ok(res) => (vec![Content::text(res)], false, "builtin"),
+                Err(e) => (
+                    vec![Content::text(format!("Error: {}", e))],
+                    true,
+                    "builtin",
+                ),
+            }
+        } else if let Some(tool) = mcp_tool {
+            use querymt::tool_decorator::CallFunctionTool;
+            match tool
+                .call(args.clone())
+                .instrument(info_span!(
+                    "agent.tool.invoke",
+                    source = "mcp",
+                    tool_name = %call.function.name,
+                    tool_call_id = %call.id,
+                ))
+                .await
+            {
+                Ok(res) => (res, false, "mcp"),
+                Err(e) => (vec![Content::text(format!("Error: {}", e))], true, "mcp"),
+            }
+        } else if !ensure_tool_permission(
+            config,
+            exec_ctx,
+            &call.id,
+            &call.function.name,
+            &args,
+            bridge,
         )
-    } else if let Some(tool) = config.tool_registry.find(&call.function.name) {
-        match tool
-            .call(args.clone(), &tool_context)
-            .instrument(info_span!(
-                "agent.tool.invoke",
-                source = "builtin",
-                tool_name = %call.function.name,
-                tool_call_id = %call.id,
-            ))
-            .await
+        .instrument(info_span!(
+            "agent.tool.permission_wait",
+            tool_name = %call.function.name,
+            tool_call_id = %call.id,
+            session_id = %exec_ctx.session_id,
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?
         {
-            Ok(res) => (res, false, "builtin"),
-            Err(e) => (format!("Error: {}", e), true, "builtin"),
-        }
-    } else if let Some(tool) = mcp_tool {
-        use querymt::tool_decorator::CallFunctionTool;
-        match tool
-            .call(args.clone())
-            .instrument(info_span!(
-                "agent.tool.invoke",
-                source = "mcp",
-                tool_name = %call.function.name,
-                tool_call_id = %call.id,
-            ))
-            .await
-        {
-            Ok(res) => (res, false, "mcp"),
-            Err(e) => (format!("Error: {}", e), true, "mcp"),
-        }
-    } else if !ensure_tool_permission(
-        config,
-        exec_ctx,
-        &call.id,
-        &call.function.name,
-        &args,
-        bridge,
-    )
-    .instrument(info_span!(
-        "agent.tool.permission_wait",
-        tool_name = %call.function.name,
-        tool_call_id = %call.id,
-        session_id = %exec_ctx.session_id,
-    ))
-    .await
-    .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?
-    {
-        ("Error: permission denied".to_string(), true, "provider")
-    } else {
-        match exec_ctx
-            .session_handle
-            .call_tool(&call.function.name, args.clone())
-            .instrument(info_span!(
-                "agent.tool.invoke",
-                source = "provider",
-                tool_name = %call.function.name,
-                tool_call_id = %call.id,
-            ))
-            .await
-        {
-            Ok(res) => (res, false, "provider"),
-            Err(e) => (format!("Error: {}", e), true, "provider"),
-        }
-    };
+            (
+                vec![Content::text("Error: permission denied")],
+                true,
+                "provider",
+            )
+        } else {
+            match exec_ctx
+                .session_handle
+                .call_tool(&call.function.name, args.clone())
+                .instrument(info_span!(
+                    "agent.tool.invoke",
+                    source = "provider",
+                    tool_name = %call.function.name,
+                    tool_call_id = %call.id,
+                ))
+                .await
+            {
+                Ok(res) => (res, false, "provider"),
+                Err(e) => (
+                    vec![Content::text(format!("Error: {}", e))],
+                    true,
+                    "provider",
+                ),
+            }
+        };
 
     let span = Span::current();
     span.record("tool_source", tool_source);
     span.record("is_error", is_error);
 
-    // Apply Layer 1 truncation
-    let result_json = if !is_error {
+    // Apply Layer 1 truncation to text content blocks
+    let result_blocks = if !is_error {
         use crate::tools::builtins::helpers::{
             TruncationDirection, format_truncation_message_with_overflow, save_overflow_output,
             truncate_output,
         };
         let tc = &config.execution_policy.tool_output;
+
+        // Extract text from content blocks for truncation
+        let raw_text: String = raw_result_blocks
+            .iter()
+            .filter_map(|b| b.as_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+
         let truncation = truncate_output(
-            &raw_result_json,
+            &raw_text,
             tc.max_lines,
             tc.max_bytes,
             TruncationDirection::Head,
         );
         if truncation.was_truncated {
             let overflow = save_overflow_output(
-                &raw_result_json,
+                &raw_text,
                 &tc.overflow_storage,
                 &exec_ctx.session_id,
                 &call.id,
@@ -274,13 +298,29 @@ pub(super) async fn execute_tool_call(
                 Some(&overflow),
                 tool_hint,
             );
-            format!("{}{}", truncation.content, suffix)
+            // Replace text blocks with truncated text; keep non-text blocks as-is
+            let mut blocks: Vec<Content> = raw_result_blocks
+                .into_iter()
+                .filter(|b| b.as_text().is_none())
+                .collect();
+            blocks.insert(
+                0,
+                Content::text(format!("{}{}", truncation.content, suffix)),
+            );
+            blocks
         } else {
-            raw_result_json
+            raw_result_blocks
         }
     } else {
-        raw_result_json
+        raw_result_blocks
     };
+
+    // Extract text summary for event (display purposes)
+    let result_text: String = result_blocks
+        .iter()
+        .filter_map(|b| b.as_text())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     config.emit_event(
         &exec_ctx.session_id,
@@ -288,7 +328,7 @@ pub(super) async fn execute_tool_call(
             tool_call_id: call.id.clone(),
             tool_name: call.function.name.clone(),
             is_error,
-            result: result_json.clone(),
+            result: result_text,
         },
     );
 
@@ -338,7 +378,7 @@ pub(super) async fn execute_tool_call(
 
     let mut tool_result = ToolResult::new(
         call.id.clone(),
-        result_json,
+        result_blocks,
         is_error,
         Some(call.function.name.clone()),
         Some(call.function.arguments.clone()),

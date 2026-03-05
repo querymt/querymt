@@ -46,9 +46,7 @@ pub fn test_context_with_user_messages(
     let messages: Vec<ChatMessage> = (0..user_message_count)
         .map(|i| ChatMessage {
             role: ChatRole::User,
-            message_type: querymt::chat::MessageType::Text,
-            content: format!("User message {}", i),
-            thinking: None,
+            content: vec![querymt::chat::Content::text(format!("User message {}", i))],
             cache: None,
         })
         .collect();

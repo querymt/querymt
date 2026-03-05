@@ -45,8 +45,8 @@ use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, StructuredOutputFormat,
-        Tool, ToolChoice, http::HTTPChatProvider,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StructuredOutputFormat, Tool,
+        ToolChoice, http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -716,84 +716,88 @@ impl HTTPChatProvider for Google {
             ));
         }
 
-        // Add conversation messages in pairs to maintain context
         for msg in messages {
-            // For tool results, we need to use "function" role
-            let role = match &msg.message_type {
-                MessageType::ToolResult(_) => "function",
-                _ => match msg.role {
+            let has_tool_result = msg.content.iter().any(|b| b.is_tool_result());
+            let role = if has_tool_result {
+                "function"
+            } else {
+                match msg.role {
                     ChatRole::User => "user",
                     ChatRole::Assistant => "model",
-                },
+                }
             };
 
             let mut parts = Vec::new();
 
-            // Restore thinking if present
-            if let Some(thinking) = &msg.thinking {
-                parts.push(GoogleContentPart::thought(thinking));
-            }
-
-            // Always add text content if it's not empty, except for ToolResult which handles it differently
-            if !msg.content.is_empty() && !matches!(msg.message_type, MessageType::ToolResult(_)) {
-                parts.push(GoogleContentPart::text(&msg.content));
-            }
-
-            let msg_parts = match &msg.message_type {
-                MessageType::Text => vec![], // Already added above
-                MessageType::Image((image_mime, raw_bytes)) => {
-                    vec![GoogleContentPart::inline_data(
-                        image_mime.mime_type().to_string(),
-                        BASE64.encode(raw_bytes),
-                    )]
-                }
-                MessageType::ImageURL(_) => unimplemented!(),
-                MessageType::Pdf(raw_bytes) => {
-                    vec![GoogleContentPart::inline_data(
-                        "application/pdf".to_string(),
-                        BASE64.encode(raw_bytes),
-                    )]
-                }
-                MessageType::ToolUse(calls) => {
-                    let mut tool_parts = Vec::with_capacity(calls.len());
-                    for call in calls {
-                        let (name, signature) = {
-                            let expected_prefix = format!("call_{}:", call.function.name);
-                            if call.id.starts_with(&expected_prefix) {
-                                (
-                                    call.function.name.clone(),
-                                    Some(call.id[expected_prefix.len()..].to_string()),
-                                )
-                            } else {
-                                (call.function.name.clone(), None)
-                            }
+            for block in &msg.content {
+                match block {
+                    Content::Text { text } => {
+                        if !text.is_empty() {
+                            parts.push(GoogleContentPart::text(text));
+                        }
+                    }
+                    Content::Thinking { text } => {
+                        if !text.is_empty() {
+                            parts.push(GoogleContentPart::thought(text));
+                        }
+                    }
+                    Content::Image { mime_type, data } => {
+                        parts.push(GoogleContentPart::inline_data(
+                            mime_type.clone(),
+                            BASE64.encode(data),
+                        ));
+                    }
+                    Content::Pdf { data } => {
+                        parts.push(GoogleContentPart::inline_data(
+                            "application/pdf".to_string(),
+                            BASE64.encode(data),
+                        ));
+                    }
+                    Content::ImageUrl { url } => {
+                        // Google input parts do not expose a direct image URL field,
+                        // so preserve the reference as text.
+                        parts.push(GoogleContentPart::text(url));
+                    }
+                    Content::ToolUse {
+                        id,
+                        name,
+                        arguments,
+                    } => {
+                        let expected_prefix = format!("call_{}:", name);
+                        let signature = if id.starts_with(&expected_prefix) {
+                            Some(id[expected_prefix.len()..].to_string())
+                        } else {
+                            None
                         };
-
-                        tool_parts.push(GoogleContentPart::function_call(
-                            name,
-                            serde_json::from_str(&call.function.arguments)
-                                .unwrap_or(serde_json::Value::Null),
+                        parts.push(GoogleContentPart::function_call(
+                            name.clone(),
+                            arguments.clone(),
                             signature,
                         ));
                     }
-                    tool_parts
-                }
-                MessageType::ToolResult(result) => {
-                    let mut tool_parts = Vec::with_capacity(result.len());
-                    for res in result {
-                        let parsed_args = serde_json::from_str::<Value>(&res.function.arguments)
-                            .unwrap_or(serde_json::Value::Null);
-
-                        tool_parts.push(GoogleContentPart::function_response(
-                            res.function.name.clone(),
-                            parsed_args,
+                    Content::ToolResult {
+                        id, name, content, ..
+                    } => {
+                        let text = content
+                            .iter()
+                            .filter_map(|c| c.as_text())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let payload = if text.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::String(text)
+                        };
+                        parts.push(GoogleContentPart::function_response(
+                            name.clone().unwrap_or_else(|| id.clone()),
+                            payload,
                         ));
                     }
-                    tool_parts
+                    Content::Audio { .. } | Content::ResourceLink { .. } => {
+                        // Unsupported in Google request format today.
+                    }
                 }
-            };
-
-            parts.extend(msg_parts);
+            }
 
             chat_contents.push(GoogleChatContent { role, parts });
         }
@@ -943,7 +947,7 @@ impl HTTPChatProvider for Google {
 
 impl HTTPCompletionProvider for Google {
     fn complete_request(&self, req: &CompletionRequest) -> Result<Request<Vec<u8>>, LLMError> {
-        let chat_message = ChatMessage::user().content(req.prompt.clone()).build();
+        let chat_message = ChatMessage::user().text(req.prompt.clone()).build();
         self.chat_request(&[chat_message], None)
     }
 

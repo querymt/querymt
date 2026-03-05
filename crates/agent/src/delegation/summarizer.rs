@@ -110,9 +110,7 @@ impl DelegationSummarizer {
         // 2. Call LLM with timeout
         let messages = vec![ChatMessage {
             role: ChatRole::User,
-            message_type: querymt::chat::MessageType::Text,
-            content: input,
-            thinking: None,
+            content: vec![querymt::chat::Content::text(input)],
             cache: None,
         }];
 
@@ -151,7 +149,14 @@ impl DelegationSummarizer {
                         MessagePart::Prompt { blocks } => self
                             .estimator
                             .estimate(&render_prompt_for_llm(blocks, None)),
-                        MessagePart::ToolResult { content, .. } => self.estimator.estimate(content),
+                        MessagePart::ToolResult { content, .. } => {
+                            let text: String = content
+                                .iter()
+                                .filter_map(|b| b.as_text())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            self.estimator.estimate(&text)
+                        }
                         MessagePart::Reasoning { content, .. } => self.estimator.estimate(content),
                         MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
                         _ => 0,

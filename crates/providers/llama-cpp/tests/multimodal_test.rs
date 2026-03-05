@@ -23,7 +23,8 @@
 //! ```
 
 use qmt_llama_cpp::{LlamaCppConfig, create_provider};
-use querymt::chat::{ChatMessage, ChatRole, ImageMime, MessageType};
+use querymt::chat::{ChatMessage, Content, FunctionTool, Tool};
+use serde_json::json;
 use std::env;
 
 /// Returns (model, mmproj_path_opt, image_path) or None to skip.
@@ -70,6 +71,25 @@ fn make_provider(model: String, mmproj_path: Option<String>) -> Box<dyn querymt:
     create_provider(cfg).expect("Failed to create provider")
 }
 
+fn weather_tool() -> Tool {
+    Tool {
+        tool_type: "function".to_string(),
+        function: FunctionTool {
+            name: "get_weather".to_string(),
+            description: "Get weather information for a location".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string"
+                    }
+                },
+                "required": ["location"]
+            }),
+        },
+    }
+}
+
 #[tokio::test]
 async fn test_vision_chat_basic() {
     let Some((model, mmproj_path, image_path)) = test_env() else {
@@ -80,13 +100,10 @@ async fn test_vision_chat_basic() {
     let provider = make_provider(model, mmproj_path);
     let image_data = std::fs::read(&image_path).expect("Failed to read test image");
 
-    let messages = vec![ChatMessage {
-        role: ChatRole::User,
-        message_type: MessageType::Image((ImageMime::JPEG, image_data)),
-        content: "What's in this image?".to_string(),
-        thinking: None,
-        cache: None,
-    }];
+    let messages = vec![ChatMessage::from_user(vec![
+        Content::image("image/jpeg", image_data),
+        Content::text("What's in this image?"),
+    ])];
 
     let response = provider.chat(&messages).await.expect("Chat failed");
     let text = response.text().unwrap_or_default();
@@ -114,13 +131,10 @@ async fn test_vision_streaming() {
     let provider = make_provider(model, mmproj_path);
     let image_data = std::fs::read(&image_path).expect("Failed to read test image");
 
-    let messages = vec![ChatMessage {
-        role: ChatRole::User,
-        message_type: MessageType::Image((ImageMime::JPEG, image_data)),
-        content: "Describe this image briefly.".to_string(),
-        thinking: None,
-        cache: None,
-    }];
+    let messages = vec![ChatMessage::from_user(vec![
+        Content::image("image/jpeg", image_data),
+        Content::text("Describe this image briefly."),
+    ])];
 
     let mut stream = provider
         .chat_stream(&messages)
@@ -158,6 +172,87 @@ async fn test_vision_streaming() {
 }
 
 #[tokio::test]
+async fn test_vision_chat_with_tools() {
+    let Some((model, mmproj_path, image_path)) = test_env() else {
+        println!("{}", SKIP_MSG);
+        return;
+    };
+
+    let provider = make_provider(model, mmproj_path);
+    let image_data = std::fs::read(&image_path).expect("Failed to read test image");
+    let tools = vec![weather_tool()];
+
+    let messages = vec![ChatMessage::from_user(vec![
+        Content::image("image/jpeg", image_data),
+        Content::text("Describe the scene and call get_weather for the location you infer."),
+    ])];
+
+    let response = provider
+        .chat_with_tools(&messages, Some(&tools))
+        .await
+        .expect("Chat with tools failed");
+
+    let usage = response.usage().unwrap_or_default();
+    assert!(usage.input_tokens > 0, "Should have input tokens");
+    assert!(
+        usage.output_tokens > 0 || response.tool_calls().is_some(),
+        "Should generate text or tool calls"
+    );
+}
+
+#[tokio::test]
+async fn test_vision_streaming_with_tools() {
+    let Some((model, mmproj_path, image_path)) = test_env() else {
+        println!("{}", SKIP_MSG);
+        return;
+    };
+
+    use futures::StreamExt;
+
+    let provider = make_provider(model, mmproj_path);
+    let image_data = std::fs::read(&image_path).expect("Failed to read test image");
+    let tools = vec![weather_tool()];
+
+    let messages = vec![ChatMessage::from_user(vec![
+        Content::image("image/jpeg", image_data),
+        Content::text("Analyze this image and use get_weather if a location is obvious."),
+    ])];
+
+    let mut stream = provider
+        .chat_stream_with_tools(&messages, Some(&tools))
+        .await
+        .expect("stream with tools failed");
+
+    let mut text_chunks = 0usize;
+    let mut got_usage = false;
+    let mut got_done = false;
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(querymt::chat::StreamChunk::Text(t)) => {
+                if !t.is_empty() {
+                    text_chunks += 1;
+                }
+            }
+            Ok(querymt::chat::StreamChunk::ToolUseStart { .. }) => {}
+            Ok(querymt::chat::StreamChunk::ToolUseInputDelta { .. }) => {}
+            Ok(querymt::chat::StreamChunk::ToolUseComplete { .. }) => {}
+            Ok(querymt::chat::StreamChunk::Usage(u)) => {
+                assert!(u.input_tokens > 0);
+                got_usage = true;
+            }
+            Ok(querymt::chat::StreamChunk::Done { .. }) => got_done = true,
+            Err(e) => panic!("Stream error: {}", e),
+            _ => {}
+        }
+    }
+
+    assert!(got_usage, "Should receive usage");
+    assert!(got_done, "Should receive done signal");
+    assert!(text_chunks > 0, "Should emit at least one text chunk");
+}
+
+#[tokio::test]
 async fn test_text_only_with_vision_model() {
     let Some((model, mmproj_path, _)) = test_env() else {
         println!("{}", SKIP_MSG);
@@ -166,13 +261,7 @@ async fn test_text_only_with_vision_model() {
 
     let provider = make_provider(model, mmproj_path);
 
-    let messages = vec![ChatMessage {
-        role: ChatRole::User,
-        message_type: MessageType::Text,
-        content: "What is 2+2?".to_string(),
-        thinking: None,
-        cache: None,
-    }];
+    let messages = vec![ChatMessage::from_user(vec![Content::text("What is 2+2?")])];
 
     let response = provider.chat(&messages).await.expect("Chat failed");
     let text = response.text().unwrap_or_default();

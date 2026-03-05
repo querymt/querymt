@@ -1,4 +1,4 @@
-use querymt::chat::{ChatMessage, ChatRole, FinishReason};
+use querymt::chat::{ChatMessage, ChatRole, Content, FinishReason};
 use std::sync::Arc;
 
 use crate::events::StopType;
@@ -142,9 +142,7 @@ impl ConversationContext {
 
         let injected_msg = ChatMessage {
             role: ChatRole::User,
-            message_type: querymt::chat::MessageType::Text,
-            content,
-            thinking: None,
+            content: vec![Content::text(content)],
             cache: None,
         };
 
@@ -229,7 +227,7 @@ impl LlmResponse {
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub call_id: String,
-    pub content: String,
+    pub content: Vec<Content>,
     pub is_error: bool,
     pub tool_name: Option<String>,
     pub tool_arguments: Option<String>,
@@ -239,7 +237,7 @@ pub struct ToolResult {
 impl ToolResult {
     pub fn new(
         call_id: String,
-        content: String,
+        content: Vec<Content>,
         is_error: bool,
         tool_name: Option<String>,
         tool_arguments: Option<String>,
@@ -257,6 +255,15 @@ impl ToolResult {
     pub fn with_snapshot(mut self, part: MessagePart) -> Self {
         self.snapshot_part = Some(part);
         self
+    }
+
+    /// Extract concatenated text from content blocks for display purposes.
+    pub fn text_content(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|b| b.as_text())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -386,7 +393,7 @@ mod tests {
     fn test_tool_result_with_snapshot() {
         let result = ToolResult::new(
             "call-123".to_string(),
-            "tool output".to_string(),
+            vec![Content::text("tool output")],
             false,
             Some("shell".to_string()),
             Some("{}".to_string()),

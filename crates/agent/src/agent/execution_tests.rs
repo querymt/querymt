@@ -295,7 +295,7 @@ async fn test_single_tool_call_cycle() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok("tool output".to_string()))
+        .returning(|_, _| Ok(vec![querymt::chat::Content::text("tool output")]))
         .times(1);
     harness
         .provider_mut()
@@ -341,7 +341,7 @@ async fn test_multiple_tool_calls_batch() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok("tool output".to_string()))
+        .returning(|_, _| Ok(vec![querymt::chat::Content::text("tool output")]))
         .times(2);
     harness
         .provider_mut()
@@ -500,7 +500,7 @@ async fn test_waiting_for_event_delegation() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok("ok".to_string()))
+        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
         .times(1);
     harness
         .provider_mut()

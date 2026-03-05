@@ -85,7 +85,11 @@ pub trait LLMProvider:
         None
     }
 
-    async fn call_tool(&self, _name: &str, _args: Value) -> Result<String, error::LLMError> {
+    async fn call_tool(
+        &self,
+        _name: &str,
+        _args: Value,
+    ) -> Result<Vec<chat::Content>, error::LLMError> {
         Err(error::LLMError::ProviderError(
             "tool calling not supported".into(),
         ))
