@@ -1008,6 +1008,9 @@ mod mesh_setup_config_tests {
             MeshDiscoveryConfig::Kademlia => MeshDiscovery::Kademlia {
                 bootstrap: bootstrap.clone(),
             },
+            MeshDiscoveryConfig::Internet => MeshDiscovery::Internet {
+                relays: bootstrap.clone(),
+            },
         }
     }
 
@@ -1051,6 +1054,26 @@ mod mesh_setup_config_tests {
     }
 
     // ── I.4 ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mesh_config_translates_internet_discovery() {
+        let peers = vec![MeshPeerConfig {
+            name: "relay1".to_string(),
+            addr: "/ip4/203.0.113.10/udp/4001/quic-v1/p2p/12D3KooWRelay".to_string(),
+        }];
+        let result = translate_discovery(&MeshDiscoveryConfig::Internet, &peers);
+        match result {
+            MeshDiscovery::Internet { relays } => {
+                assert_eq!(
+                    relays,
+                    vec!["/ip4/203.0.113.10/udp/4001/quic-v1/p2p/12D3KooWRelay"]
+                );
+            }
+            other => panic!("expected Internet, got {:?}", other),
+        }
+    }
+
+    // ── I.5 ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_setup_mesh_with_no_remotes_returns_empty_registry() {

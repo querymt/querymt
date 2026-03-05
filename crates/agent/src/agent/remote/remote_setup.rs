@@ -78,19 +78,23 @@ pub async fn setup_mesh_from_config(
         MeshDiscoveryConfig::Kademlia => MeshDiscovery::Kademlia {
             bootstrap: peers.clone(),
         },
+        MeshDiscoveryConfig::Internet => MeshDiscovery::Internet {
+            relays: mesh_cfg.relay_addrs.clone(),
+        },
     };
 
     let config = MeshConfig {
         listen: mesh_cfg.listen.clone(),
         discovery,
         bootstrap_peers: if matches!(mesh_cfg.discovery, MeshDiscoveryConfig::Kademlia) {
-            // Already used as Kademlia bootstrap peers above.
+            // Kademlia mode consumes peers as bootstrap input in discovery config.
             vec![]
         } else {
             peers
         },
         directory: crate::agent::remote::mesh::DirectoryMode::default(),
         request_timeout: std::time::Duration::from_secs(mesh_cfg.request_timeout_secs),
+        quic_first: mesh_cfg.quic_first,
     };
     let listen_addr_str = config.listen.as_deref().unwrap_or("<auto>").to_string();
 

@@ -87,6 +87,7 @@ pub(crate) mod fixtures {
                             bootstrap_peers: vec![],
                             directory: crate::agent::remote::mesh::DirectoryMode::default(),
                             request_timeout: std::time::Duration::from_secs(300),
+                            quic_first: true,
                         };
                         bootstrap_mesh(&cfg)
                             .await

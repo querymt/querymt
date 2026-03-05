@@ -538,7 +538,7 @@ pub struct MeshPeerConfig {
 
 /// Discovery strategy for the libp2p swarm.
 ///
-/// In TOML: `discovery = "mdns"` | `"kademlia"` | `"none"`.
+/// In TOML: `discovery = "mdns"` | `"kademlia"` | `"none"` | `"internet"`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MeshDiscoveryConfig {
@@ -549,6 +549,8 @@ pub enum MeshDiscoveryConfig {
     Kademlia,
     /// No automatic discovery — peers are added only via `[[mesh.peers]]`.
     None,
+    /// Internet mode using relay bootstrap addresses for cross-NAT meshes.
+    Internet,
 }
 
 fn default_mesh_listen() -> Option<String> {
@@ -557,6 +559,10 @@ fn default_mesh_listen() -> Option<String> {
 
 fn default_mesh_request_timeout_secs() -> u64 {
     300
+}
+
+fn default_mesh_quic_first() -> bool {
+    true
 }
 
 /// Configuration for the kameo libp2p mesh.
@@ -571,6 +577,11 @@ fn default_mesh_request_timeout_secs() -> u64 {
 /// [[mesh.peers]]
 /// name = "dev-gpu"
 /// addr = "/ip4/192.168.1.100/tcp/9000"
+///
+/// # Internet mode (relay bootstrap, no manual per-peer circuit addresses)
+/// # discovery = "internet"
+/// # relay_addrs = ["/ip4/203.0.113.10/udp/4001/quic-v1/p2p/12D3KooW..."]
+/// # quic_first = true
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -597,6 +608,17 @@ pub struct MeshTomlConfig {
     #[serde(default)]
     pub peers: Vec<MeshPeerConfig>,
 
+    /// Relay bootstrap addresses used by `discovery = "internet"`.
+    ///
+    /// Format: multiaddr strings with a peer id, e.g.
+    /// `/ip4/203.0.113.10/udp/4001/quic-v1/p2p/12D3KooW...`.
+    #[serde(default)]
+    pub relay_addrs: Vec<String>,
+
+    /// Prefer dialing QUIC relay addresses before TCP when both are configured.
+    #[serde(default = "default_mesh_quic_first")]
+    pub quic_first: bool,
+
     /// Timeout in seconds for non-streaming mesh request-response calls
     /// (e.g. compaction, no-tools LLM calls).  Default: 300 (5 minutes).
     /// Increase for very slow models or large context windows.
@@ -612,6 +634,8 @@ impl Default for MeshTomlConfig {
             discovery: MeshDiscoveryConfig::default(),
             auto_fallback: false,
             peers: Vec::new(),
+            relay_addrs: Vec::new(),
+            quic_first: default_mesh_quic_first(),
             request_timeout_secs: default_mesh_request_timeout_secs(),
         }
     }

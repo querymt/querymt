@@ -17,6 +17,7 @@
 //!     bootstrap_peers: vec![],
 //!     directory: DirectoryMode::default(),
 //!     request_timeout: std::time::Duration::from_secs(300),
+//!     quic_first: true,
 //! };
 //! let mesh = bootstrap_mesh(&config).await?;
 //! println!("Mesh peer ID: {}", mesh.peer_id());
@@ -26,15 +27,20 @@
 //!
 //! ## Production (cross-subnet)
 //!
-//! Use `MeshDiscovery::None` with explicit `bootstrap_peers` addresses for
-//! deployments where mDNS multicast is not available.
+//! Use `MeshDiscovery::Internet` with relay addresses (recommended) or
+//! `MeshDiscovery::None` with explicit `bootstrap_peers` for static topologies.
 
-use libp2p::{Multiaddr, PeerId};
+use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
+
+fn is_quic_addr(addr: &Multiaddr) -> bool {
+    addr.iter()
+        .any(|p| matches!(p, Protocol::Quic | Protocol::QuicV1))
+}
 
 /// A peer lifecycle event emitted by the swarm event loop.
 ///
@@ -67,6 +73,12 @@ pub enum MeshDiscovery {
     /// No automatic discovery — peers must be added manually via
     /// `bootstrap_peers` in `MeshConfig`.
     None,
+
+    /// Internet discovery mode backed by one or more relay bootstrap addresses.
+    ///
+    /// Nodes dial the relay(s), then discover peers through the mesh registry.
+    /// This avoids requiring users to manually configure per-peer circuit paths.
+    Internet { relays: Vec<String> },
 }
 
 /// How actor lookups are performed in the mesh.
@@ -122,6 +134,9 @@ pub struct MeshConfig {
     ///
     /// Defaults to 300 seconds (5 minutes).
     pub request_timeout: std::time::Duration,
+
+    /// Prefer QUIC relay addresses when both QUIC and TCP relay addrs are configured.
+    pub quic_first: bool,
 }
 
 impl Default for MeshConfig {
@@ -133,6 +148,7 @@ impl Default for MeshConfig {
             bootstrap_peers: vec![],
             directory: DirectoryMode::default(),
             request_timeout: std::time::Duration::from_secs(300),
+            quic_first: true,
         }
     }
 }
@@ -501,15 +517,19 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
     use futures_util::StreamExt as _;
     use kameo::remote;
     use libp2p::{
-        SwarmBuilder, mdns, noise,
+        SwarmBuilder, mdns, noise, relay,
         swarm::{NetworkBehaviour, SwarmEvent},
         tcp, yamux,
     };
 
     let listen_addr = config.listen.as_deref().unwrap_or("/ip4/0.0.0.0/tcp/0");
 
-    // Validate bootstrap_peers addresses up-front so we fail fast.
-    for peer_addr in &config.bootstrap_peers {
+    // Validate bootstrap addresses up-front so we fail fast.
+    let mut bootstrap_addrs = config.bootstrap_peers.clone();
+    if let MeshDiscovery::Internet { relays } = &config.discovery {
+        bootstrap_addrs.extend(relays.clone());
+    }
+    for peer_addr in &bootstrap_addrs {
         peer_addr
             .parse::<libp2p::Multiaddr>()
             .map_err(|e| MeshError::InvalidBootstrapAddr {
@@ -545,6 +565,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
     struct MeshBehaviour {
         kameo: remote::Behaviour,
         mdns: mdns::tokio::Behaviour,
+        relay_client: relay::client::Behaviour,
     }
 
     let mut swarm = SwarmBuilder::with_new_identity()
@@ -556,7 +577,9 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         )
         .map_err(|e| MeshError::SwarmError(e.to_string()))?
         .with_quic()
-        .with_behaviour(|key| {
+        .with_relay_client(noise::Config::new, yamux::Config::default)
+        .map_err(|e| MeshError::SwarmError(e.to_string()))?
+        .with_behaviour(|key, relay_client| {
             let local_peer_id = key.public().to_peer_id();
             let kameo_behaviour = remote::Behaviour::new(
                 local_peer_id,
@@ -579,6 +602,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
             Ok(MeshBehaviour {
                 kameo: kameo_behaviour,
                 mdns: mdns_behaviour,
+                relay_client,
             })
         })
         .map_err(|e: libp2p::BehaviourBuilderError| MeshError::SwarmError(e.to_string()))?
@@ -606,6 +630,62 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
             }
         })?)
         .map_err(|e| MeshError::SwarmError(e.to_string()))?;
+
+    let mut dial_addrs: Vec<Multiaddr> = bootstrap_addrs
+        .iter()
+        .filter_map(|s| s.parse::<Multiaddr>().ok())
+        .collect();
+
+    if config.quic_first {
+        dial_addrs.sort_by_key(|addr| if is_quic_addr(addr) { 0 } else { 1 });
+    }
+
+    let mut relay_attempts = 0usize;
+    let mut relay_dial_success = 0usize;
+
+    for multiaddr in dial_addrs {
+        let is_relay_addr = matches!(&config.discovery, MeshDiscovery::Internet { relays } if relays.iter().any(|r| r == &multiaddr.to_string()));
+        if is_relay_addr {
+            relay_attempts += 1;
+        }
+
+        let peer_id_from_addr = multiaddr.iter().find_map(|protocol| match protocol {
+            Protocol::P2p(peer_id) => Some(peer_id),
+            _ => None,
+        });
+
+        match swarm.dial(multiaddr.clone()) {
+            Ok(()) => {
+                if is_relay_addr {
+                    relay_dial_success += 1;
+                }
+                log::info!("Dialing bootstrap peer: {}", multiaddr);
+            }
+            Err(e) => {
+                log::warn!("Failed to dial bootstrap peer {}: {}", multiaddr, e);
+                continue;
+            }
+        }
+
+        if let Some(peer_id) = peer_id_from_addr {
+            if let Ok(mut peers) = known_peers_loop.write() {
+                peers.entry(peer_id).or_default().insert(multiaddr.clone());
+            }
+            let _ = peer_events_tx_loop.send(PeerEvent::Discovered(peer_id));
+        }
+    }
+
+    if let MeshDiscovery::Internet { relays } = &config.discovery {
+        if relays.is_empty() {
+            log::warn!(
+                "mesh discovery=internet but no relay_addrs configured; degrading to local-only connectivity"
+            );
+        } else if relay_attempts == 0 || relay_dial_success == 0 {
+            log::warn!(
+                "mesh discovery=internet could not dial any relay bootstrap address; degrading to local-only connectivity"
+            );
+        }
+    }
 
     let local_peer_id = *swarm.local_peer_id();
 
