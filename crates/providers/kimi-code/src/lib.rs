@@ -11,8 +11,8 @@ use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, MessageType, StreamChunk, StructuredOutputFormat,
-        Tool, ToolChoice, http::HTTPChatProvider,
+        ChatMessage, ChatResponse, ChatRole, Content, StreamChunk, StructuredOutputFormat, Tool,
+        ToolChoice, http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -247,12 +247,12 @@ impl KimiCode {
 
         let mut reasoning_by_tool_id: HashMap<&str, &str> = HashMap::new();
         for msg in source_messages {
-            if let (ChatRole::Assistant, MessageType::ToolUse(calls)) =
-                (&msg.role, &msg.message_type)
-            {
-                let thinking = msg.thinking.as_deref().unwrap_or_default();
-                for call in calls {
-                    reasoning_by_tool_id.insert(&call.id, thinking);
+            if msg.role == ChatRole::Assistant {
+                let thinking = msg.thinking().unwrap_or_default();
+                for block in &msg.content {
+                    if let Content::ToolUse { id, .. } = block {
+                        reasoning_by_tool_id.insert(id.as_str(), thinking);
+                    }
                 }
             }
         }
@@ -427,7 +427,6 @@ impl HTTPLLMProviderFactory for KimiCodeFactory {
 mod tests {
     use super::KimiCode;
     use querymt::chat::{ChatMessage, http::HTTPChatProvider};
-    use querymt::{FunctionCall, ToolCall};
     use serde_json::Value;
 
     fn test_provider() -> KimiCode {
@@ -442,7 +441,7 @@ mod tests {
     fn chat_request_includes_kimi_agent_headers() {
         let provider = test_provider();
 
-        let messages = vec![ChatMessage::user().content("hello").build()];
+        let messages = vec![ChatMessage::user().text("hello").build()];
         let request = provider.chat_request(&messages, None).unwrap();
 
         for header_name in [
@@ -466,16 +465,9 @@ mod tests {
     fn chat_request_injects_reasoning_content_for_assistant_tool_calls() {
         let provider = test_provider();
         let messages = vec![
-            ChatMessage::user().content("run tool").build(),
+            ChatMessage::user().text("run tool").build(),
             ChatMessage::assistant()
-                .tool_use(vec![ToolCall {
-                    id: "call_1".to_string(),
-                    call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "run".to_string(),
-                        arguments: "{}".to_string(),
-                    },
-                }])
+                .tool_use("call_1", "run", serde_json::json!({}))
                 .thinking("need to run tool")
                 .build(),
         ];
@@ -507,16 +499,9 @@ mod tests {
     fn chat_request_injects_non_empty_reasoning_content_when_missing() {
         let provider = test_provider();
         let messages = vec![
-            ChatMessage::user().content("run tool").build(),
+            ChatMessage::user().text("run tool").build(),
             ChatMessage::assistant()
-                .tool_use(vec![ToolCall {
-                    id: "call_1".to_string(),
-                    call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "run".to_string(),
-                        arguments: "{}".to_string(),
-                    },
-                }])
+                .tool_use("call_1", "run", serde_json::json!({}))
                 .build(),
         ];
 
@@ -547,28 +532,14 @@ mod tests {
     fn reasoning_content_matches_by_tool_call_id_not_position() {
         let provider = test_provider();
         let messages = vec![
-            ChatMessage::user().content("first").build(),
+            ChatMessage::user().text("first").build(),
             ChatMessage::assistant()
-                .tool_use(vec![ToolCall {
-                    id: "call_a".into(),
-                    call_type: "function".into(),
-                    function: FunctionCall {
-                        name: "alpha".into(),
-                        arguments: "{}".into(),
-                    },
-                }])
+                .tool_use("call_a", "alpha", serde_json::json!({}))
                 .thinking("reasoning for alpha")
                 .build(),
-            ChatMessage::user().content("second").build(),
+            ChatMessage::user().text("second").build(),
             ChatMessage::assistant()
-                .tool_use(vec![ToolCall {
-                    id: "call_b".into(),
-                    call_type: "function".into(),
-                    function: FunctionCall {
-                        name: "beta".into(),
-                        arguments: "{}".into(),
-                    },
-                }])
+                .tool_use("call_b", "beta", serde_json::json!({}))
                 .thinking("reasoning for beta")
                 .build(),
         ];
@@ -625,7 +596,7 @@ mod tests {
     fn stream_config_defaults_to_false_in_request() {
         // When stream is omitted, the request body should have stream: false
         let provider = test_provider();
-        let messages = vec![ChatMessage::user().content("hi").build()];
+        let messages = vec![ChatMessage::user().text("hi").build()];
         let request = provider.chat_request(&messages, None).unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         assert_eq!(body.get("stream").and_then(Value::as_bool), Some(false));

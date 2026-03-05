@@ -133,9 +133,7 @@ impl SessionCompaction {
         // Add the compaction prompt as a user message
         chat_messages.push(querymt::chat::ChatMessage {
             role: ChatRole::User,
-            message_type: querymt::chat::MessageType::Text,
-            content: COMPACTION_PROMPT.to_string(),
-            thinking: None,
+            content: vec![querymt::chat::Content::text(COMPACTION_PROMPT)],
             cache: None,
         });
 
@@ -253,7 +251,14 @@ impl SessionCompaction {
                         MessagePart::Prompt { blocks } => self
                             .estimator
                             .estimate(&render_prompt_for_llm(blocks, max_prompt_bytes)),
-                        MessagePart::ToolResult { content, .. } => self.estimator.estimate(content),
+                        MessagePart::ToolResult { content, .. } => {
+                            let text: String = content
+                                .iter()
+                                .filter_map(|b| b.as_text())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            self.estimator.estimate(&text)
+                        }
                         MessagePart::Reasoning { content, .. } => self.estimator.estimate(content),
                         MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
                         _ => 0,
@@ -436,7 +441,7 @@ mod tests {
                 role: ChatRole::Assistant,
                 parts: vec![MessagePart::ToolResult {
                     call_id: call_id.to_string(),
-                    content: content.to_string(),
+                    content: vec![querymt::chat::Content::text(content)],
                     is_error: false,
                     tool_name: Some("test_tool".to_string()),
                     tool_arguments: None,
@@ -786,7 +791,7 @@ mod tests {
             chat_messages
                 .last()
                 .unwrap()
-                .content
+                .text()
                 .contains("conversation")
         );
     }
@@ -1000,7 +1005,7 @@ mod tests {
 
         // Verify first message is the user message from conversation
         if let MessagePart::Text { content } = &messages[0].parts[0] {
-            assert!(chat_messages[0].content.contains(content));
+            assert!(chat_messages[0].text().contains(content));
         }
     }
 
@@ -1009,10 +1014,11 @@ mod tests {
         let (_, sum) = SessionCompaction::create_compaction_messages("s1", "Test summary", 5000);
         let chat = sum.to_chat_message();
 
+        let text = chat.text();
         assert!(
-            !chat.content.ends_with(char::is_whitespace),
+            !text.ends_with(char::is_whitespace),
             "Compaction chat message must not end with whitespace, got: {:?}",
-            &chat.content[chat.content.len().saturating_sub(30)..]
+            &text[text.len().saturating_sub(30)..]
         );
     }
 

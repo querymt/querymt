@@ -1,6 +1,6 @@
 use image::load_from_memory;
 use mistralrs::{Model, ModelCategory, RequestBuilder, TextMessageRole};
-use querymt::chat::{ChatMessage, ChatRole, MessageType};
+use querymt::chat::{ChatMessage, ChatRole, Content};
 use querymt::error::LLMError;
 
 use crate::tools::convert_tool_call;
@@ -17,37 +17,79 @@ pub(crate) fn apply_message_to_request(
     msg: &ChatMessage,
     model: &Model,
 ) -> Result<RequestBuilder, LLMError> {
-    match &msg.message_type {
-        MessageType::Text => {
-            let role = map_chat_role(&msg.role);
-            Ok(req.add_message(role, msg.content.clone()))
-        }
-        MessageType::ToolResult(calls) => {
-            for call in calls {
-                req = req.add_tool_message(call.function.arguments.clone(), call.id.clone());
+    let role = map_chat_role(&msg.role);
+    let text = msg
+        .content
+        .iter()
+        .filter_map(|c| c.as_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut tool_uses = Vec::new();
+    let mut images = Vec::new();
+
+    for block in &msg.content {
+        match block {
+            Content::ToolUse {
+                id,
+                name,
+                arguments,
+            } => {
+                let call = querymt::ToolCall {
+                    id: id.clone(),
+                    call_type: "function".to_string(),
+                    function: querymt::FunctionCall {
+                        name: name.clone(),
+                        arguments: serde_json::to_string(arguments).unwrap_or_default(),
+                    },
+                };
+                let idx = tool_uses.len();
+                tool_uses.push(convert_tool_call(idx, &call));
             }
-            Ok(req)
+            Content::ToolResult { id, content, .. } => {
+                let output = content
+                    .iter()
+                    .filter_map(|c| c.as_text())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                req = req.add_tool_message(output, id.clone());
+
+                // ToolResult images are emitted as adjacent image messages.
+                for inner in content {
+                    if let Content::Image { data, .. } = inner {
+                        let image = load_from_memory(data).map_err(|e| {
+                            LLMError::InvalidRequest(format!("invalid image payload: {e}"))
+                        })?;
+                        images.push(image);
+                    }
+                }
+            }
+            Content::Image { data, .. } => {
+                let image = load_from_memory(data)
+                    .map_err(|e| LLMError::InvalidRequest(format!("invalid image payload: {e}")))?;
+                images.push(image);
+            }
+            Content::Pdf { .. } | Content::ImageUrl { .. } | Content::Audio { .. } => {
+                return Err(LLMError::InvalidRequest(
+                    "mistralrs provider only supports inline image bytes for vision messages"
+                        .into(),
+                ));
+            }
+            _ => {}
         }
-        MessageType::ToolUse(calls) => {
-            let role = map_chat_role(&msg.role);
-            let tool_calls = calls
-                .iter()
-                .enumerate()
-                .map(|(index, call)| convert_tool_call(index, call))
-                .collect();
-            Ok(req.add_message_with_tool_call(role, msg.content.clone(), tool_calls))
-        }
-        MessageType::Image((_, raw_bytes)) => {
-            let role = map_chat_role(&msg.role);
-            let image = load_from_memory(raw_bytes)
-                .map_err(|e| LLMError::InvalidRequest(format!("invalid image payload: {e}")))?;
-            req.add_image_message(role, msg.content.clone(), vec![image], model)
-                .map_err(|e| LLMError::InvalidRequest(format!("{:#}", e)))
-        }
-        MessageType::Pdf(_) | MessageType::ImageURL(_) => Err(LLMError::InvalidRequest(
-            "mistralrs provider only supports inline image bytes for vision messages".into(),
-        )),
     }
+
+    if !images.is_empty() {
+        req = req
+            .add_image_message(role, text.clone(), images, model)
+            .map_err(|e| LLMError::InvalidRequest(format!("{:#}", e)))?;
+    } else if !tool_uses.is_empty() {
+        req = req.add_message_with_tool_call(role, text, tool_uses);
+    } else if !text.is_empty() {
+        req = req.add_message(role, text);
+    }
+
+    Ok(req)
 }
 
 pub(crate) fn ensure_chat_model(model: &Model) -> Result<(), LLMError> {

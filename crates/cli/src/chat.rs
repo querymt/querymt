@@ -6,7 +6,7 @@ use futures::StreamExt;
 use futures::future::join_all;
 use querymt::{
     FunctionCall, LLMProvider, ToolCall,
-    chat::{ChatMessage, ChatResponse, StreamChunk},
+    chat::{ChatMessage, ChatResponse, Content, StreamChunk},
     error::LLMError,
 };
 use rustyline::{
@@ -235,9 +235,12 @@ pub async fn handle_any_response(
         };
 
         if let Some(ref tcalls) = tool_calls {
-            let mut msg_builder = ChatMessage::assistant()
-                .tool_use(tcalls.clone())
-                .content(text.clone().unwrap_or_default());
+            let mut msg_builder = ChatMessage::assistant().text(text.clone().unwrap_or_default());
+            for tc in tcalls {
+                let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                msg_builder = msg_builder.tool_use(tc.id.clone(), tc.function.name.clone(), args);
+            }
             if let Some(ref t) = thinking {
                 msg_builder = msg_builder.thinking(t.clone());
             }
@@ -290,12 +293,11 @@ pub async fn handle_any_response(
                             };
                             return (
                                 call,
-                                Ok(format!(
+                                Ok(vec![Content::text(format!(
                                     "Tool execution denied by user. The user chose not to execute the '{}' tool. {}",
                                     tool_name, denial_message
                                 )
-                                .trim()
-                                .to_string()),
+                                .trim())]),
                             );
                         }
                         Err(e) => {
@@ -312,10 +314,10 @@ pub async fn handle_any_response(
                     ToolPolicyState::Deny => {
                         return (
                             call,
-                            Ok(format!(
+                            Ok(vec![Content::text(format!(
                                 "Tool execution denied by configuration. The '{}' tool is not allowed.",
                                 tool_name
-                            )),
+                            ))]),
                         );
                     }
                 }
@@ -337,13 +339,7 @@ pub async fn handle_any_response(
                 };
 
                 match provider.call_tool(&call.function.name, args).await {
-                    Ok(result) => {
-                        let result_str = match serde_json::to_string(&result) {
-                            Ok(s) => s,
-                            Err(e) => return (call, Err(LLMError::from(e))),
-                        };
-                        (call, Ok(result_str))
-                    }
+                    Ok(content_blocks) => (call, Ok(content_blocks)),
                     Err(e) => (call, Err(e)),
                 }
             });
@@ -364,26 +360,34 @@ pub async fn handle_any_response(
                 }
                 res
             };
-            let tool_results = tool_results_from_futures
-                .into_iter()
-                .map(|(call, result)| {
-                    let tool_res_str = match result {
-                        Ok(res_str) => res_str,
-                        Err(e) => e.to_string(),
-                    };
-                    log::debug!("Tool {} result: {}", call.function.name, tool_res_str);
-                    ToolCall {
-                        id: call.id.clone(),
-                        call_type: "function".to_string(),
-                        function: FunctionCall {
-                            name: call.function.name.clone(),
-                            arguments: tool_res_str,
-                        },
+            let mut tool_result_builder = ChatMessage::user();
+            for (call, result) in tool_results_from_futures {
+                let (content_blocks, is_error) = match result {
+                    Ok(blocks) => {
+                        let text_preview: String = blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                Content::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        log::debug!("Tool {} result: {}", call.function.name, text_preview);
+                        (blocks, false)
                     }
-                })
-                .collect::<Vec<_>>();
-
-            messages.push(ChatMessage::user().tool_result(tool_results).build());
+                    Err(e) => {
+                        log::debug!("Tool {} error: {}", call.function.name, e);
+                        (vec![Content::text(e.to_string())], true)
+                    }
+                };
+                tool_result_builder = tool_result_builder.tool_result(
+                    call.id.clone(),
+                    Some(call.function.name.clone()),
+                    is_error,
+                    content_blocks,
+                );
+            }
+            messages.push(tool_result_builder.build());
 
             // For the next turn, show thinking spinner if not streaming
             spinner = Some(Spinner::new(
@@ -407,7 +411,7 @@ pub async fn handle_any_response(
                     println!("{}", text.as_deref().unwrap_or_default());
                 }
             }
-            let mut msg_builder = ChatMessage::assistant().content(text.unwrap_or_default());
+            let mut msg_builder = ChatMessage::assistant().text(text.unwrap_or_default());
             if let Some(t) = thinking {
                 msg_builder = msg_builder.thinking(t);
             }
@@ -484,7 +488,7 @@ pub async fn interactive_loop(
                 }
                 let _ = rl.add_history_entry(trimmed);
 
-                messages.push(ChatMessage::user().content(trimmed.to_string()).build());
+                messages.push(ChatMessage::user().text(trimmed.to_string()).build());
                 let mut sp =
                     Spinner::new(Spinners::Dots12, "Thinking...".bright_magenta().to_string());
                 let chat_fut = unified_chat(&messages, provider);

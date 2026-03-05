@@ -331,21 +331,21 @@ impl ChatProvider for LlamaCppProvider {
         // If tools are provided and not empty, use tool-aware generation
         if let Some(tools) = tools {
             if !tools.is_empty() {
-                // TODO: Tool-aware generation with images not yet implemented
-                if !bitmaps.is_empty() {
-                    return Err(LLMError::NotImplemented(
-                        "Tool calls with images not yet implemented".into(),
-                    ));
-                }
-
-                let template_result =
-                    apply_template_with_tools(&self.model, &self.cfg, messages, tools)?;
+                let template_result = apply_template_with_tools(
+                    &self.model,
+                    &self.cfg,
+                    messages,
+                    tools,
+                    media_marker,
+                )?;
                 let generated = generate_with_tools(
                     &self.model,
                     &self.cfg,
                     &template_result,
                     max_tokens,
                     None,
+                    self.multimodal.as_deref(),
+                    &bitmaps,
                 )?;
                 let (content, thinking, tool_calls, finish_reason) =
                     parse_tool_response(&template_result, &generated.text)?;
@@ -448,17 +448,16 @@ impl ChatProvider for LlamaCppProvider {
         // If tools are provided and not empty, use tool-aware streaming
         if let Some(tools) = tools {
             if !tools.is_empty() {
-                // TODO: Streaming tool calls with images not yet implemented
-                if !bitmaps.is_empty() {
-                    return Err(LLMError::NotImplemented(
-                        "Streaming tool calls with images not yet implemented".into(),
-                    ));
-                }
-
-                let template_result =
-                    apply_template_with_tools(&self.model, &self.cfg, messages, tools)?;
+                let template_result = apply_template_with_tools(
+                    &self.model,
+                    &self.cfg,
+                    messages,
+                    tools,
+                    media_marker,
+                )?;
                 let cfg = self.cfg.clone();
                 let model = Arc::clone(&self.model);
+                let multimodal = self.multimodal.clone();
 
                 thread::spawn(move || {
                     match generate_streaming_with_tools(
@@ -468,6 +467,8 @@ impl ChatProvider for LlamaCppProvider {
                         max_tokens,
                         None,
                         &tx,
+                        multimodal.as_deref(),
+                        &bitmaps,
                     ) {
                         Ok((usage, has_tool_calls)) => {
                             let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));

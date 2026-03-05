@@ -91,7 +91,7 @@ pub(crate) async fn execute_cycle_state_machine(
     let turns = messages
         .iter()
         .filter(|msg| matches!(msg.role, ChatRole::User))
-        .filter(|msg| matches!(msg.message_type, querymt::chat::MessageType::Text))
+        .filter(|msg| !msg.has_tool_result())
         .count();
     let stats = crate::middleware::AgentStats {
         turns,

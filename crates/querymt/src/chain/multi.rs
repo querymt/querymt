@@ -2,10 +2,10 @@
 //! Each step can reference a distinct provider_id ("openai", "anthro", etc.).
 
 use crate::{
-    chat::{ChatMessage, ChatRole, MessageType},
+    chat::{ChatMessage, ChatRole, Content},
     completion::CompletionRequest,
     error::LLMError,
-    LLMProvider, ToolCall,
+    LLMProvider,
 };
 use std::collections::HashMap;
 use tracing::instrument;
@@ -217,9 +217,7 @@ impl<'a> MultiPromptChain<'a> {
                 MultiChainStepMode::Chat => {
                     let mut step_messages = vec![ChatMessage {
                         role: ChatRole::User,
-                        message_type: MessageType::Text,
-                        content: prompt_text,
-                        thinking: None,
+                        content: vec![Content::text(prompt_text)],
                         cache: None,
                     }];
 
@@ -233,22 +231,9 @@ impl<'a> MultiPromptChain<'a> {
                         let response_text = response.text();
                         let tool_calls = response.tool_calls();
 
-                        // Add the assistant's response to the conversation history for the next turn.
-                        step_messages.push(ChatMessage {
-                            role: ChatRole::Assistant,
-                            content: response_text.clone().unwrap_or_default(),
-                            thinking: response.thinking(),
-                            cache: None,
-                            message_type: if let Some(ref tcs) = tool_calls {
-                                if tcs.is_empty() {
-                                    MessageType::Text
-                                } else {
-                                    MessageType::ToolUse(tcs.clone())
-                                }
-                            } else {
-                                MessageType::Text
-                            },
-                        });
+                        // Build assistant response as Content blocks
+                        let assistant_msg: ChatMessage = response.as_ref().into();
+                        step_messages.push(assistant_msg);
 
                         // If there are tool calls, execute them. Otherwise, we're done.
                         if let Some(calls) = tool_calls {
@@ -264,31 +249,23 @@ impl<'a> MultiPromptChain<'a> {
                                 let result_content =
                                     llm.call_tool(&call.function.name, args).await?;
 
-                                // Repurpose `ToolCall` to carry the result. This is a workaround due to
-                                // the existing `MessageType::ToolResult` definition. The result from the
-                                // tool is placed into the `arguments` field.
-                                Ok(ToolCall {
+                                Ok::<Content, LLMError>(Content::ToolResult {
                                     id: call.id.clone(),
-                                    call_type: "function".to_string(),
-                                    function: crate::FunctionCall {
-                                        name: call.function.name.clone(),
-                                        arguments: result_content,
-                                    },
+                                    name: Some(call.function.name.clone()),
+                                    is_error: false,
+                                    content: result_content,
                                 })
                             });
 
-                            let tool_results = futures::future::join_all(tool_futures)
+                            let tool_result_blocks = futures::future::join_all(tool_futures)
                                 .await
                                 .into_iter()
-                                .collect::<Result<Vec<ToolCall>, LLMError>>()?;
+                                .collect::<Result<Vec<Content>, LLMError>>()?;
 
-                            // Add tool results back into the conversation history. The 'User' role is
-                            // used as a substitute for the standard 'tool' role, which is not defined.
+                            // Add tool results back into the conversation history.
                             step_messages.push(ChatMessage {
                                 role: ChatRole::User,
-                                content: String::new(),
-                                message_type: MessageType::ToolResult(tool_results),
-                                thinking: None,
+                                content: tool_result_blocks,
                                 cache: None,
                             });
 

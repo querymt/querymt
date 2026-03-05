@@ -217,7 +217,7 @@ mock! {
             &'a self,
             name: &'b str,
             args: serde_json::Value,
-        ) -> Result<String, LLMError>;
+        ) -> Result<Vec<querymt::chat::Content>, LLMError>;
     }
 }
 
@@ -287,7 +287,11 @@ impl LLMProvider for SharedLlmProvider {
         }
     }
 
-    async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<String, LLMError> {
+    async fn call_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<Vec<querymt::chat::Content>, LLMError> {
         let provider = self.inner.lock().await;
         provider.call_tool(name, args).await
     }
@@ -522,7 +526,11 @@ impl LLMProvider for MockCompactionProvider {
         None
     }
 
-    async fn call_tool(&self, _name: &str, _args: serde_json::Value) -> Result<String, LLMError> {
+    async fn call_tool(
+        &self,
+        _name: &str,
+        _args: serde_json::Value,
+    ) -> Result<Vec<querymt::chat::Content>, LLMError> {
         Err(LLMError::NotImplemented(
             "MockCompactionProvider does not support tools".to_string(),
         ))

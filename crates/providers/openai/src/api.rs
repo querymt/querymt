@@ -6,7 +6,7 @@ use http::{
 use querymt::{
     FunctionCall, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, FinishReason, MessageType, StreamChunk,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StreamChunk,
         StructuredOutputFormat, Tool, ToolChoice,
     },
     error::LLMError,
@@ -20,6 +20,7 @@ use schemars::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use url::Url;
 
@@ -88,50 +89,50 @@ pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
 #[derive(Serialize, Debug)]
 struct OpenAIChatMessage<'a> {
     #[allow(dead_code)]
-    role: &'a str,
+    role: Cow<'a, str>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         with = "either::serde_untagged_optional"
     )]
-    content: Option<Either<Vec<MessageContent<'a>>, String>>,
+    content: Option<Either<Vec<MessageContent<'a>>, Cow<'a, str>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenAIFunctionCall<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
+    tool_call_id: Option<Cow<'a, str>>,
 }
 
 #[derive(Serialize, Debug)]
 struct OpenAIFunctionPayload<'a> {
-    name: &'a str,
-    arguments: &'a str,
+    name: Cow<'a, str>,
+    arguments: Cow<'a, str>,
 }
 
 #[derive(Serialize, Debug)]
 struct OpenAIFunctionCall<'a> {
-    id: &'a str,
+    id: Cow<'a, str>,
     #[serde(rename = "type")]
-    content_type: &'a str,
+    content_type: Cow<'a, str>,
     function: OpenAIFunctionPayload<'a>,
 }
 
 #[derive(Serialize, Debug)]
 struct MessageContent<'a> {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    message_type: Option<&'a str>,
+    message_type: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<&'a str>,
+    text: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_url: Option<ImageUrlContent<'a>>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "tool_call_id")]
-    tool_call_id: Option<&'a str>,
+    tool_call_id: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "content")]
-    tool_output: Option<&'a str>,
+    tool_output: Option<Cow<'a, str>>,
 }
 
 /// Individual image message in an OpenAI chat conversation.
 #[derive(Serialize, Debug)]
 struct ImageUrlContent<'a> {
-    url: &'a str,
+    url: Cow<'a, str>,
 }
 
 #[derive(Serialize)]
@@ -766,27 +767,10 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
     let token = cfg.api_key();
     let auth = determine_effective_auth(token, cfg.auth_type(), cfg.base_url())?;
 
-    // Clone the messages to have an owned mutable vector.
-    let messages = messages.to_vec();
-
-    let mut openai_msgs: Vec<OpenAIChatMessage> = vec![];
+    let mut openai_msgs: Vec<OpenAIChatMessage<'_>> = vec![];
 
     for msg in messages {
-        if let MessageType::ToolResult(ref results) = msg.message_type {
-            for result in results {
-                openai_msgs.push(
-                    // Clone strings to own them
-                    OpenAIChatMessage {
-                        role: "tool",
-                        tool_call_id: Some(result.id.clone()),
-                        tool_calls: None,
-                        content: Some(Right(result.function.arguments.clone())),
-                    },
-                );
-            }
-        } else {
-            openai_msgs.push(chat_message_to_api_message(msg))
-        }
+        convert_chat_message_to_openai(msg, &mut openai_msgs);
     }
 
     let system_parts = cfg.system();
@@ -797,10 +781,10 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
             openai_msgs.insert(
                 0,
                 OpenAIChatMessage {
-                    role: "system",
+                    role: Cow::Borrowed("system"),
                     content: Some(Left(vec![MessageContent {
-                        message_type: Some("text"),
-                        text: Some(part),
+                        message_type: Some(Cow::Borrowed("text")),
+                        text: Some(Cow::Borrowed(part)),
                         image_url: None,
                         tool_call_id: None,
                         tool_output: None,
@@ -883,66 +867,161 @@ pub fn openai_parse_chat<C: OpenAIProviderConfig>(
     }
 }
 
-// Create an owned OpenAIChatMessage that doesn't borrow from any temporary variables
-fn chat_message_to_api_message(chat_msg: ChatMessage) -> OpenAIChatMessage<'static> {
-    // For other message types, create an owned OpenAIChatMessage
-    OpenAIChatMessage {
-        role: match chat_msg.role {
-            ChatRole::User => "user",
-            ChatRole::Assistant => "assistant",
-        },
-        tool_call_id: None,
-        content: match &chat_msg.message_type {
-            MessageType::Text => Some(Right(chat_msg.content.clone())),
-            // Image case is handled separately above
-            MessageType::Image(_) => unreachable!(),
-            MessageType::Pdf(_) => unimplemented!(),
-            MessageType::ImageURL(url) => {
-                // Clone the URL to create an owned version
-                let owned_url = url.clone();
-                // Leak the string to get a 'static reference
-                let url_str = Box::leak(owned_url.into_boxed_str());
-                Some(Left(vec![MessageContent {
-                    message_type: Some("image_url"),
-                    text: None,
-                    image_url: Some(ImageUrlContent { url: url_str }),
-                    tool_output: None,
-                    tool_call_id: None,
-                }]))
-            }
-            MessageType::ToolUse(_) => None,
-            MessageType::ToolResult(_) => None,
-        },
-        tool_calls: match &chat_msg.message_type {
-            MessageType::ToolUse(calls) => {
-                let owned_calls: Vec<OpenAIFunctionCall<'static>> = calls
+/// Convert a ChatMessage with Vec<Content> blocks into one or more OpenAI API messages.
+///
+/// Most messages map 1:1, but ToolResult blocks each become a separate `role: "tool"` message.
+fn convert_chat_message_to_openai<'a>(
+    chat_msg: &'a ChatMessage,
+    out: &mut Vec<OpenAIChatMessage<'a>>,
+) {
+    let role: Cow<'a, str> = match chat_msg.role {
+        ChatRole::User => Cow::Borrowed("user"),
+        ChatRole::Assistant => Cow::Borrowed("assistant"),
+    };
+
+    // Check if this message contains any ToolResult blocks — those must be
+    // emitted as separate `role: "tool"` messages in the OpenAI API.
+    let has_tool_results = chat_msg.content.iter().any(|b| b.is_tool_result());
+    // Check if this message contains any ToolUse blocks — those map to tool_calls.
+    let has_tool_use = chat_msg.content.iter().any(|b| b.is_tool_use());
+
+    // Emit tool result blocks as separate messages
+    if has_tool_results {
+        for block in &chat_msg.content {
+            if let Content::ToolResult { id, content, .. } = block {
+                // Extract text from the tool result content blocks
+                let text: String = content
                     .iter()
-                    .map(|c| {
-                        let owned_id = c.id.clone();
-                        let owned_name = c.function.name.clone();
-                        let owned_args = c.function.arguments.clone();
-
-                        // Need to leak these strings to create 'static references
-                        // This is a deliberate choice to solve the lifetime issue
-                        // The small memory leak is acceptable in this context
-                        let id_str = Box::leak(owned_id.into_boxed_str());
-                        let name_str = Box::leak(owned_name.into_boxed_str());
-                        let args_str = Box::leak(owned_args.into_boxed_str());
-
-                        OpenAIFunctionCall {
-                            id: id_str,
-                            content_type: "function",
-                            function: OpenAIFunctionPayload {
-                                name: name_str,
-                                arguments: args_str,
-                            },
-                        }
-                    })
-                    .collect();
-                Some(owned_calls)
+                    .filter_map(|c| c.as_text().map(str::to_string))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                out.push(OpenAIChatMessage {
+                    role: Cow::Borrowed("tool"),
+                    tool_call_id: Some(Cow::Borrowed(id.as_str())),
+                    tool_calls: None,
+                    content: Some(Right(Cow::Owned(text))),
+                });
             }
-            _ => None,
-        },
+        }
+        // If there are also non-tool-result blocks (e.g. text), emit those too
+        let non_tool_content: Vec<&Content> = chat_msg
+            .content
+            .iter()
+            .filter(|b| !b.is_tool_result())
+            .collect();
+        if !non_tool_content.is_empty() {
+            let text: String = non_tool_content
+                .iter()
+                .filter_map(|b| b.as_text().map(str::to_string))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.is_empty() {
+                out.push(OpenAIChatMessage {
+                    role,
+                    tool_call_id: None,
+                    tool_calls: None,
+                    content: Some(Right(Cow::Owned(text))),
+                });
+            }
+        }
+        return;
+    }
+
+    // Emit tool use blocks as tool_calls on an assistant message
+    if has_tool_use {
+        // Collect any text blocks as the message content
+        let text: String = chat_msg.text();
+        let content_val = if text.is_empty() {
+            None
+        } else {
+            Some(Right(Cow::Owned(text)))
+        };
+
+        let tool_calls: Vec<OpenAIFunctionCall<'a>> = chat_msg
+            .content
+            .iter()
+            .filter_map(|block| {
+                if let Content::ToolUse {
+                    id,
+                    name,
+                    arguments,
+                } = block
+                {
+                    let args_string = serde_json::to_string(arguments).unwrap_or_default();
+                    Some(OpenAIFunctionCall {
+                        id: Cow::Borrowed(id.as_str()),
+                        content_type: Cow::Borrowed("function"),
+                        function: OpenAIFunctionPayload {
+                            name: Cow::Borrowed(name.as_str()),
+                            arguments: Cow::Owned(args_string),
+                        },
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        out.push(OpenAIChatMessage {
+            role,
+            tool_call_id: None,
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
+            content: content_val,
+        });
+        return;
+    }
+
+    // Normal message: text, images, etc.
+    // Check for image URLs — use content array format
+    let has_images = chat_msg
+        .content
+        .iter()
+        .any(|b| matches!(b, Content::ImageUrl { .. } | Content::Image { .. }));
+
+    if has_images {
+        let content_blocks: Vec<MessageContent<'a>> = chat_msg
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                Content::Text { text } => Some(MessageContent {
+                    message_type: Some(Cow::Borrowed("text")),
+                    text: Some(Cow::Borrowed(text.as_str())),
+                    image_url: None,
+                    tool_call_id: None,
+                    tool_output: None,
+                }),
+                Content::ImageUrl { url } => Some(MessageContent {
+                    message_type: Some(Cow::Borrowed("image_url")),
+                    text: None,
+                    image_url: Some(ImageUrlContent {
+                        url: Cow::Borrowed(url.as_str()),
+                    }),
+                    tool_call_id: None,
+                    tool_output: None,
+                }),
+                _ => None,
+            })
+            .collect();
+
+        out.push(OpenAIChatMessage {
+            role,
+            tool_call_id: None,
+            tool_calls: None,
+            content: Some(Left(content_blocks)),
+        });
+    } else {
+        // Simple text-only message
+        let text = chat_msg.text();
+        out.push(OpenAIChatMessage {
+            role,
+            tool_call_id: None,
+            tool_calls: None,
+            content: Some(Right(Cow::Owned(text))),
+        });
     }
 }
 

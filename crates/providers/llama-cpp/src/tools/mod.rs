@@ -1,4 +1,5 @@
 pub(crate) mod generation;
+pub(crate) mod prefill;
 pub(crate) mod sampler;
 pub(crate) mod streaming;
 pub(crate) mod template;

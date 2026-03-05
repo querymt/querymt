@@ -10,7 +10,7 @@ use querymt::plugin::host::PluginRegistry;
 use querymt::providers::ModelPricing;
 use querymt::{
     LLMProvider,
-    chat::{ChatMessage, ChatResponse, MessageType},
+    chat::{ChatMessage, ChatResponse, Content},
     error::LLMError,
 };
 use serde_json::{Map, Value};
@@ -582,7 +582,11 @@ impl SessionHandle {
     }
 
     /// Execute a raw tool call without side effects
-    pub async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<String, LLMError> {
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<Vec<Content>, LLMError> {
         let provider = self.provider().await?;
         provider.call_tool(name, args).await
     }
@@ -642,42 +646,55 @@ impl SessionHandle {
     pub fn convert_chat_to_agent(&self, msg: &ChatMessage) -> AgentMessage {
         let mut parts = Vec::new();
 
-        match &msg.message_type {
-            MessageType::Text => {
-                parts.push(MessagePart::Text {
-                    content: msg.content.clone(),
-                });
-            }
-            MessageType::ToolUse(calls) => {
-                if !msg.content.is_empty() {
+        for block in &msg.content {
+            match block {
+                Content::Text { text } => {
                     parts.push(MessagePart::Text {
-                        content: msg.content.clone(),
+                        content: text.clone(),
                     });
                 }
-                for call in calls {
-                    parts.push(MessagePart::ToolUse(call.clone()));
+                Content::Thinking { text } => {
+                    parts.push(MessagePart::Reasoning {
+                        content: text.clone(),
+                        time_ms: None,
+                    });
                 }
-            }
-            MessageType::ToolResult(calls) => {
-                for (i, call) in calls.iter().enumerate() {
-                    parts.push(MessagePart::ToolResult {
-                        call_id: call.id.clone(),
-                        content: if i == 0 {
-                            msg.content.clone()
-                        } else {
-                            "(See previous result)".to_string()
+                Content::ToolUse {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    parts.push(MessagePart::ToolUse(querymt::ToolCall {
+                        id: id.clone(),
+                        call_type: "function".to_string(),
+                        function: querymt::FunctionCall {
+                            name: name.clone(),
+                            arguments: arguments.to_string(),
                         },
-                        is_error: false,
-                        tool_name: Some(call.function.name.clone()),
-                        tool_arguments: Some(call.function.arguments.clone()),
+                    }));
+                }
+                Content::ToolResult {
+                    id,
+                    name,
+                    is_error,
+                    content,
+                } => {
+                    parts.push(MessagePart::ToolResult {
+                        call_id: id.clone(),
+                        content: content.clone(),
+                        is_error: *is_error,
+                        tool_name: name.clone(),
+                        tool_arguments: None,
                         compacted_at: None,
                     });
                 }
-            }
-            _ => {
-                parts.push(MessagePart::Text {
-                    content: msg.content.clone(),
-                });
+                _ => {
+                    // Image, ImageUrl, Pdf, Audio, ResourceLink — store as text description
+                    let desc = block.to_string();
+                    if !desc.is_empty() {
+                        parts.push(MessagePart::Text { content: desc });
+                    }
+                }
             }
         }
 

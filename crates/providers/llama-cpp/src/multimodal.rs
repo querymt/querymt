@@ -11,7 +11,7 @@
 use crate::config::LlamaCppConfig;
 use llama_cpp_2::model::{LlamaModel, RopeType};
 use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, mtmd_default_marker};
-use querymt::chat::{ChatMessage, ImageMime, MessageType};
+use querymt::chat::{ChatMessage, Content};
 use querymt::error::LLMError;
 use querymt_provider_common::{
     ModelRef, ModelRefError, parse_model_ref, resolve_hf_model_fast, resolve_hf_model_sync,
@@ -229,32 +229,31 @@ impl MultimodalContext {
 /// Represents an image or audio attachment extracted from messages.
 pub(crate) struct MediaAttachment {
     pub data: Vec<u8>,
-    pub mime: ImageMime,
+    pub mime: String,
     pub is_audio: bool,
 }
 
 impl MediaAttachment {
     /// Validate that the image data matches the claimed MIME type.
     fn validate_mime(&self) -> Result<(), LLMError> {
-        let is_valid = match self.mime {
-            ImageMime::JPEG => infer::image::is_jpeg(&self.data),
-            ImageMime::PNG => infer::image::is_png(&self.data),
-            ImageMime::GIF => infer::image::is_gif(&self.data),
-            ImageMime::WEBP => infer::image::is_webp(&self.data),
-            // For any other MIME types (enum is non-exhaustive), skip validation
+        let is_valid = match self.mime.as_str() {
+            "image/jpeg" => infer::image::is_jpeg(&self.data),
+            "image/png" => infer::image::is_png(&self.data),
+            "image/gif" => infer::image::is_gif(&self.data),
+            "image/webp" => infer::image::is_webp(&self.data),
+            // For unknown/other MIME types, skip strict validation.
             _ => return Ok(()),
         };
 
         if is_valid {
             Ok(())
         } else {
-            // Try to detect actual type for better error message
             let actual = infer::get(&self.data)
                 .map(|t| t.mime_type().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
 
             Err(LLMError::ProviderError(format!(
-                "Image data does not match MIME type {:?}. Detected: {}",
+                "Image data does not match MIME type {}. Detected: {}",
                 self.mime, actual
             )))
         }
@@ -284,20 +283,33 @@ pub(crate) fn extract_media(messages: &[ChatMessage]) -> Vec<MediaAttachment> {
     let mut attachments = Vec::new();
 
     for msg in messages {
-        match &msg.message_type {
-            MessageType::Image((mime, data)) => {
-                attachments.push(MediaAttachment {
-                    data: data.clone(),
-                    mime: mime.clone(),
-                    is_audio: false,
-                });
+        for block in &msg.content {
+            match block {
+                Content::Image { mime_type, data } => {
+                    attachments.push(MediaAttachment {
+                        data: data.clone(),
+                        mime: mime_type.clone(),
+                        is_audio: false,
+                    });
+                }
+                Content::ImageUrl { .. } => {
+                    // Future: fetch from URL
+                    log::warn!("ImageURL not yet supported, skipping");
+                }
+                Content::ToolResult { content, .. } => {
+                    // Also extract images nested in tool results.
+                    for inner in content {
+                        if let Content::Image { mime_type, data } = inner {
+                            attachments.push(MediaAttachment {
+                                data: data.clone(),
+                                mime: mime_type.clone(),
+                                is_audio: false,
+                            });
+                        }
+                    }
+                }
+                _ => {}
             }
-            MessageType::ImageURL(_url) => {
-                // Future: fetch from URL
-                // For now, skip or error in conversion
-                log::warn!("ImageURL not yet supported, skipping");
-            }
-            _ => {}
         }
     }
 

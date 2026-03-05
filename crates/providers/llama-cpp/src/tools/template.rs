@@ -46,8 +46,7 @@ pub(crate) fn convert_tools_to_json(tools: &[Tool]) -> Result<String, LLMError> 
 /// This now delegates to the unified messages module.
 ///
 /// `media_marker` should be `Some(marker)` when the caller has a multimodal context
-/// and needs image placeholder tokens injected into the prompt text.  Pass `None` for
-/// tool-call paths where image support is not yet implemented.
+/// and needs image placeholder tokens injected into the prompt text.
 pub(crate) fn build_messages_json_for_tools(
     cfg: &LlamaCppConfig,
     messages: &[ChatMessage],
@@ -124,10 +123,10 @@ pub(crate) fn apply_template_with_tools(
     cfg: &LlamaCppConfig,
     messages: &[ChatMessage],
     tools: &[Tool],
+    media_marker: Option<&str>,
 ) -> Result<ChatTemplateResult, LLMError> {
     let tools_json = convert_tools_to_json(tools)?;
-    // Tools + images are not yet implemented, so pass None for the media marker.
-    let messages_json = build_messages_json_for_tools(cfg, messages, None)?;
+    let messages_json = build_messages_json_for_tools(cfg, messages, media_marker)?;
 
     log::debug!(
         "Applying chat template with {} messages and {} tools",

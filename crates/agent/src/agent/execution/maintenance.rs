@@ -91,7 +91,14 @@ pub(super) async fn run_ai_compaction(
                 .iter()
                 .map(|p| match p {
                     MessagePart::Text { content } => content.len() / 4,
-                    MessagePart::ToolResult { content, .. } => content.len() / 4,
+                    MessagePart::ToolResult { content, .. } => {
+                        content
+                            .iter()
+                            .filter_map(|b| b.as_text())
+                            .map(|t| t.len())
+                            .sum::<usize>()
+                            / 4
+                    }
                     _ => 0,
                 })
                 .sum::<usize>()

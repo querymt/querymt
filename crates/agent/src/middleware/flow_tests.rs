@@ -72,7 +72,7 @@ async fn test_message_injection_flow() {
         assert_eq!(context.messages.len(), 1);
         assert!(
             context.messages[0]
-                .content
+                .text()
                 .contains("Remember to be helpful")
         );
     } else {

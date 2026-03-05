@@ -5,7 +5,7 @@
 //! or simple text format (for raw prompt building).
 
 use crate::config::LlamaCppConfig;
-use querymt::chat::{ChatMessage, ChatRole, MessageType};
+use querymt::chat::{ChatMessage, ChatRole, Content};
 use querymt::error::LLMError;
 use serde_json::Value;
 
@@ -41,141 +41,130 @@ pub(crate) fn messages_to_json(
     }
 
     for msg in messages {
-        match &msg.message_type {
-            MessageType::Text => {
-                let role = match msg.role {
-                    ChatRole::User => "user",
-                    ChatRole::Assistant => "assistant",
-                };
+        let role = match msg.role {
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+        };
 
-                // For assistant messages, separate <think> blocks from content
-                // into reasoning_content for the template engine.
-                // If thinking was already extracted (msg.thinking is Some), use it.
-                // Otherwise, extract from content as a fallback for messages
-                // stored before thinking extraction was available.
-                let (thinking, content) = if msg.thinking.is_some() {
-                    (msg.thinking.clone(), msg.content.clone())
-                } else if matches!(msg.role, ChatRole::Assistant) {
-                    let (t, c) = querymt::chat::extract_thinking(&msg.content);
-                    (t, c)
-                } else {
-                    (None, msg.content.clone())
-                };
+        let text = msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-                let mut json_msg = serde_json::json!({
-                    "role": role,
-                    "content": content
-                });
-                if let Some(ref t) = thinking {
-                    if !t.is_empty() {
-                        json_msg["reasoning_content"] = serde_json::json!(t);
-                    }
-                }
-                json_messages.push(json_msg);
-            }
-            MessageType::ToolUse(tool_calls) => {
-                // Assistant message with tool calls in OpenAI format
-                let tool_calls_array: Vec<Value> = tool_calls
-                    .iter()
-                    .map(|tc| {
-                        serde_json::json!({
-                            "id": tc.id,
-                            "type": tc.call_type,
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            }
-                        })
-                    })
-                    .collect();
+        let thinking = msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                Content::Thinking { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-                // Separate <think> blocks from content (fallback extraction)
-                let (thinking, clean_content) = if msg.thinking.is_some() {
-                    (msg.thinking.clone(), msg.content.clone())
-                } else {
-                    let (t, c) = querymt::chat::extract_thinking(&msg.content);
-                    (t, c)
-                };
+        let mut tool_calls_array: Vec<Value> = Vec::new();
+        let mut has_image = false;
 
-                let content = if clean_content.is_empty() {
-                    Value::Null
-                } else {
-                    Value::String(clean_content)
-                };
-
-                let mut json_msg = serde_json::json!({
-                    "role": "assistant",
-                    "content": content,
-                    "tool_calls": tool_calls_array
-                });
-                if let Some(ref t) = thinking {
-                    if !t.is_empty() {
-                        json_msg["reasoning_content"] = serde_json::json!(t);
-                    }
-                }
-                json_messages.push(json_msg);
-            }
-            MessageType::ToolResult(results) => {
-                // Tool results - each result is a separate message with tool role
-                // Note: function.arguments contains the result content,
-                // function.name contains the tool name, and id is the tool_call_id
-                for result in results {
-                    json_messages.push(serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": result.id,
-                        "name": result.function.name,
-                        "content": result.function.arguments
+        for block in &msg.content {
+            match block {
+                Content::ToolUse {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    tool_calls_array.push(serde_json::json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": serde_json::to_string(arguments).unwrap_or_default()
+                        }
                     }));
                 }
+                Content::ToolResult {
+                    id, name, content, ..
+                } => {
+                    let output_text = content
+                        .iter()
+                        .filter_map(|c| c.as_text())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    json_messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "name": name.clone().unwrap_or_default(),
+                        "content": output_text
+                    }));
+
+                    let nested_images = content
+                        .iter()
+                        .filter(|c| matches!(c, Content::Image { .. } | Content::ImageUrl { .. }))
+                        .count();
+                    for _ in 0..nested_images {
+                        json_messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": marker,
+                        }));
+                        media_count += 1;
+                    }
+                }
+                Content::Image { .. } | Content::ImageUrl { .. } => {
+                    has_image = true;
+                    media_count += 1;
+                }
+                _ => {}
             }
-            MessageType::Image(_) => {
-                // Inject marker into content
-                let role = match msg.role {
-                    ChatRole::User => "user",
-                    ChatRole::Assistant => "assistant",
-                };
+        }
 
-                let content = if msg.content.is_empty() {
-                    // If no text, just the marker
-                    marker.to_string()
-                } else {
-                    // Prepend marker before text
-                    format!("{}\n{}", marker, msg.content)
-                };
+        if !tool_calls_array.is_empty() {
+            let content = if text.is_empty() {
+                Value::Null
+            } else {
+                Value::String(text)
+            };
 
-                json_messages.push(serde_json::json!({
-                    "role": role,
-                    "content": content
-                }));
-
-                media_count += 1;
+            let mut json_msg = serde_json::json!({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": tool_calls_array
+            });
+            if !thinking.is_empty() {
+                json_msg["reasoning_content"] = serde_json::json!(thinking);
             }
-            MessageType::ImageURL(_) => {
-                // Same as Image for now (media extraction handles the difference)
-                let role = match msg.role {
-                    ChatRole::User => "user",
-                    ChatRole::Assistant => "assistant",
-                };
+            json_messages.push(json_msg);
+            continue;
+        }
 
-                let content = if msg.content.is_empty() {
-                    marker.to_string()
-                } else {
-                    format!("{}\n{}", marker, msg.content)
-                };
-
-                json_messages.push(serde_json::json!({
-                    "role": role,
-                    "content": content
-                }));
-
-                media_count += 1;
+        if has_image {
+            let content = if text.is_empty() {
+                marker.to_string()
+            } else {
+                format!("{}\n{}", marker, text)
+            };
+            let mut json_msg = serde_json::json!({
+                "role": role,
+                "content": content
+            });
+            if !thinking.is_empty() {
+                json_msg["reasoning_content"] = serde_json::json!(thinking);
             }
-            _ => {
-                return Err(LLMError::InvalidRequest(format!(
-                    "MessageType {:?} not yet supported",
-                    msg.message_type
-                )));
+            json_messages.push(json_msg);
+            continue;
+        }
+
+        if !text.is_empty() || !thinking.is_empty() {
+            let mut json_msg = serde_json::json!({
+                "role": role,
+                "content": text
+            });
+            if !thinking.is_empty() {
+                json_msg["reasoning_content"] = serde_json::json!(thinking);
             }
+            json_messages.push(json_msg);
         }
     }
 
@@ -199,30 +188,23 @@ pub(crate) fn messages_to_text(
     cfg: &LlamaCppConfig,
     messages: &[ChatMessage],
 ) -> Result<String, LLMError> {
-    // Check for images - not supported in text-only mode
-    if messages.iter().any(|m| {
+    // Check for binary/image content - not supported in text-only mode.
+    if messages.iter().flat_map(|m| m.content.iter()).any(|b| {
         matches!(
-            m.message_type,
-            MessageType::Image(_) | MessageType::ImageURL(_)
+            b,
+            Content::Image { .. }
+                | Content::ImageUrl { .. }
+                | Content::Pdf { .. }
+                | Content::Audio { .. }
         )
     }) {
         return Err(LLMError::InvalidRequest(
-            "Images not supported in text-only mode (model lacks chat template or multimodal support)".into(),
+            "Binary content not supported in text-only mode (model lacks chat template or multimodal support)".into(),
         ));
     }
 
-    // Normalize tool messages to text for basic prompt building
+    // Normalize tool messages to text for basic prompt building.
     let normalized = normalize_messages_to_text(messages);
-
-    // Validate that only text messages remain after normalization
-    for msg in &normalized {
-        if !matches!(msg.message_type, MessageType::Text) {
-            return Err(LLMError::InvalidRequest(format!(
-                "MessageType {:?} not supported in text-only mode",
-                msg.message_type
-            )));
-        }
-    }
 
     let mut prompt = String::new();
     if !cfg.system.is_empty() {
@@ -230,7 +212,7 @@ pub(crate) fn messages_to_text(
         prompt.push_str("\n\n");
     }
     for (idx, msg) in normalized.iter().enumerate() {
-        prompt.push_str(&msg.content);
+        prompt.push_str(&msg.text());
         if idx + 1 < normalized.len() {
             prompt.push_str("\n\n");
         }
@@ -238,28 +220,44 @@ pub(crate) fn messages_to_text(
     Ok(prompt)
 }
 
-/// Normalize messages to Text type for providers that don't support structured tool messages.
-/// ToolUse and ToolResult messages are converted to Text, preserving their content.
-/// Image/PDF/ImageURL messages are NOT normalized and will still error (appropriate behavior).
+/// Normalize messages for providers that don't support structured tool messages.
+/// ToolUse/ToolResult blocks are rendered into text blocks.
 fn normalize_messages_to_text(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     messages
         .iter()
         .map(|msg| {
-            match &msg.message_type {
-                MessageType::Text => msg.clone(),
-                MessageType::ToolUse(_) | MessageType::ToolResult(_) => {
-                    // Tool messages already have text content populated by to_chat_message()
-                    // We convert them to Text type to allow basic prompt building
-                    ChatMessage {
-                        role: msg.role.clone(),
-                        message_type: MessageType::Text,
-                        content: msg.content.clone(),
-                        thinking: msg.thinking.clone(),
-                        cache: msg.cache.clone(),
+            let mut out_blocks = Vec::new();
+            for block in &msg.content {
+                match block {
+                    Content::Text { .. } | Content::Thinking { .. } => {
+                        out_blocks.push(block.clone())
                     }
+                    Content::ToolUse {
+                        id,
+                        name,
+                        arguments,
+                    } => out_blocks.push(Content::text(format!(
+                        "[ToolUse: {name} ({id}) args={}]",
+                        serde_json::to_string(arguments).unwrap_or_default()
+                    ))),
+                    Content::ToolResult { id, content, .. } => {
+                        out_blocks.push(Content::text(format!(
+                            "[ToolResult: {id}] {}",
+                            content
+                                .iter()
+                                .filter_map(|c| c.as_text())
+                                .collect::<Vec<_>>()
+                                .join("\\n")
+                        )))
+                    }
+                    _ => out_blocks.push(block.clone()),
                 }
-                // Image/PDF/ImageURL will NOT be normalized - they should still error
-                _ => msg.clone(),
+            }
+
+            ChatMessage {
+                role: msg.role.clone(),
+                content: out_blocks,
+                cache: msg.cache.clone(),
             }
         })
         .collect()

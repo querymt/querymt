@@ -805,7 +805,7 @@ pub(super) async fn transition_processing_tool_calls(
                     // Produce a synthetic cancelled result so history stays valid.
                     Ok(ToolResult::new(
                         call.id.clone(),
-                        "Error: Cancelled by user".to_string(),
+                        vec![querymt::chat::Content::text("Error: Cancelled by user")],
                         true,
                         Some(call.function.name.clone()),
                         Some(call.function.arguments.clone()),
@@ -861,14 +861,12 @@ pub(super) async fn transition_processing_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use querymt::chat::{ChatMessage, ChatRole, MessageType};
+    use querymt::chat::{ChatMessage, ChatRole, Content};
 
     fn make_message(role: ChatRole, content: &str) -> ChatMessage {
         ChatMessage {
             role,
-            message_type: MessageType::Text,
-            content: content.to_string(),
-            thinking: None,
+            content: vec![Content::text(content)],
             cache: None,
         }
     }
@@ -945,9 +943,9 @@ mod tests {
             make_message(ChatRole::User, "follow-up"),
         ];
         let result = apply_cache_breakpoints(&msgs);
-        assert_eq!(result[0].content, "important content");
-        assert_eq!(result[1].content, "response text");
-        assert_eq!(result[2].content, "follow-up");
+        assert_eq!(result[0].text(), "important content");
+        assert_eq!(result[1].text(), "response text");
+        assert_eq!(result[2].text(), "follow-up");
     }
 
     #[test]

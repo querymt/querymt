@@ -555,7 +555,7 @@ async fn test_multiple_sequential_delegations() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok("ok".to_string()))
+        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
         .times(2);
 
     harness
@@ -601,8 +601,8 @@ async fn test_delegation_failure_recovery() {
         .in_sequence(&mut seq)
         .returning(|messages| {
             let last_msg = messages.last().unwrap();
-            assert!(last_msg.content.contains("Delegation failed"));
-            assert!(last_msg.content.contains("Patch Application Failure"));
+            assert!(last_msg.text().contains("Delegation failed"));
+            assert!(last_msg.text().contains("Patch Application Failure"));
             Ok(Box::new(MockChatResponse::text_only(
                 "I'll handle it differently",
             )))
@@ -612,7 +612,7 @@ async fn test_delegation_failure_recovery() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok("ok".to_string()))
+        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
         .times(1);
 
     harness
@@ -658,10 +658,10 @@ async fn test_delegation_completion_message_format() {
         .in_sequence(&mut seq)
         .returning(|messages| {
             let last_msg = messages.last().unwrap();
-            assert!(last_msg.content.contains("Delegation completed"));
-            assert!(last_msg.content.contains("Delegation ID:"));
-            assert!(last_msg.content.contains("Please review the changes"));
-            assert!(last_msg.content.contains("=== Delegate Agent Results ==="));
+            assert!(last_msg.text().contains("Delegation completed"));
+            assert!(last_msg.text().contains("Delegation ID:"));
+            assert!(last_msg.text().contains("Please review the changes"));
+            assert!(last_msg.text().contains("=== Delegate Agent Results ==="));
             Ok(Box::new(MockChatResponse::text_only(
                 "Perfect, task complete",
             )))
@@ -671,7 +671,7 @@ async fn test_delegation_completion_message_format() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok("ok".to_string()))
+        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
         .times(1);
 
     harness
@@ -717,10 +717,10 @@ async fn test_delegation_failure_message_format() {
         .in_sequence(&mut seq)
         .returning(|messages| {
             let last_msg = messages.last().unwrap();
-            assert!(last_msg.content.contains("Delegation failed"));
-            assert!(last_msg.content.contains("Error Type:"));
-            assert!(last_msg.content.contains("Patch Application Failure"));
-            assert!(last_msg.content.contains("Do NOT immediately retry"));
+            assert!(last_msg.text().contains("Delegation failed"));
+            assert!(last_msg.text().contains("Error Type:"));
+            assert!(last_msg.text().contains("Patch Application Failure"));
+            assert!(last_msg.text().contains("Do NOT immediately retry"));
             Ok(Box::new(MockChatResponse::text_only(
                 "I'll try a different approach",
             )))
@@ -730,7 +730,7 @@ async fn test_delegation_failure_message_format() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok("ok".to_string()))
+        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
         .times(1);
 
     harness
@@ -934,14 +934,14 @@ async fn test_delegation_premature_stop_is_failure() {
             let last_msg = messages.last().unwrap();
             // Must be a failure, not a "Delegation completed" success
             assert!(
-                last_msg.content.contains("Delegation failed"),
+                last_msg.text().contains("Delegation failed"),
                 "Expected 'Delegation failed' in message, got: {}",
-                last_msg.content
+                last_msg.text()
             );
             assert!(
-                last_msg.content.contains("stopped prematurely"),
+                last_msg.text().contains("stopped prematurely"),
                 "Expected 'stopped prematurely' in message, got: {}",
-                last_msg.content
+                last_msg.text()
             );
             Ok(Box::new(MockChatResponse::text_only(
                 "I see the delegate was stopped. Let me try differently.",
@@ -952,7 +952,7 @@ async fn test_delegation_premature_stop_is_failure() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok("ok".to_string()))
+        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
         .times(1);
 
     harness
@@ -1009,14 +1009,14 @@ async fn test_delegation_compaction_success_continues() {
         .returning(|messages| {
             let last_msg = messages.last().unwrap();
             assert!(
-                last_msg.content.contains("Delegation completed"),
+                last_msg.text().contains("Delegation completed"),
                 "Expected 'Delegation completed' after successful compaction, got: {}",
-                last_msg.content
+                last_msg.text()
             );
             assert!(
-                !last_msg.content.contains("Delegation failed"),
+                !last_msg.text().contains("Delegation failed"),
                 "Should NOT contain 'Delegation failed' after successful compaction, got: {}",
-                last_msg.content
+                last_msg.text()
             );
             Ok(Box::new(MockChatResponse::text_only(
                 "Great, the delegate completed successfully after compaction.",
@@ -1027,7 +1027,7 @@ async fn test_delegation_compaction_success_continues() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok("ok".to_string()))
+        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
         .times(1);
 
     harness
@@ -1088,14 +1088,14 @@ async fn test_delegation_compaction_failure_is_delegation_failure() {
         .returning(|messages| {
             let last_msg = messages.last().unwrap();
             assert!(
-                last_msg.content.contains("Delegation failed"),
+                last_msg.text().contains("Delegation failed"),
                 "Expected 'Delegation failed' after compaction failure, got: {}",
-                last_msg.content
+                last_msg.text()
             );
             assert!(
-                last_msg.content.contains("stopped prematurely"),
+                last_msg.text().contains("stopped prematurely"),
                 "Expected 'stopped prematurely' after compaction failure, got: {}",
-                last_msg.content
+                last_msg.text()
             );
             Ok(Box::new(MockChatResponse::text_only(
                 "The delegate failed due to compaction failure. I'll try a different approach.",
@@ -1106,7 +1106,7 @@ async fn test_delegation_compaction_failure_is_delegation_failure() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok("ok".to_string()))
+        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
         .times(1);
 
     harness

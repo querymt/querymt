@@ -15,6 +15,265 @@ use std::pin::Pin;
 
 pub mod http;
 
+// ---------------------------------------------------------------------------
+// Content — a single content block within a message
+// ---------------------------------------------------------------------------
+
+/// A content block within a message.
+///
+/// Messages are composed of one or more `Content` blocks, allowing mixed content
+/// such as text, images, tool calls, and tool results within a single message.
+/// This aligns with how major LLM APIs (Anthropic, OpenAI, Google, MCP) model
+/// message content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Content {
+    /// Plain text
+    Text { text: String },
+    /// Base64-encoded image
+    Image { mime_type: String, data: Vec<u8> },
+    /// Image referenced by URL
+    ImageUrl { url: String },
+    /// PDF document
+    Pdf { data: Vec<u8> },
+    /// Audio data
+    Audio { mime_type: String, data: Vec<u8> },
+    /// Model reasoning / chain-of-thought
+    Thinking { text: String },
+    /// Tool invocation requested by the model
+    ToolUse {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+    /// Result of a tool invocation (can itself contain mixed content)
+    ToolResult {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        is_error: bool,
+        content: Vec<Content>,
+    },
+    /// A link to a resource, identified by URI.
+    /// Carries optional metadata (name, description, MIME type).
+    ResourceLink {
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
+}
+
+impl Content {
+    /// Create a text content block.
+    pub fn text(s: impl Into<String>) -> Self {
+        Content::Text { text: s.into() }
+    }
+
+    /// Create an image content block.
+    pub fn image(mime: impl Into<String>, data: Vec<u8>) -> Self {
+        Content::Image {
+            mime_type: mime.into(),
+            data,
+        }
+    }
+
+    /// Create an image URL content block.
+    pub fn image_url(url: impl Into<String>) -> Self {
+        Content::ImageUrl { url: url.into() }
+    }
+
+    /// Create a PDF content block.
+    pub fn pdf(data: Vec<u8>) -> Self {
+        Content::Pdf { data }
+    }
+
+    /// Create an audio content block.
+    pub fn audio(mime: impl Into<String>, data: Vec<u8>) -> Self {
+        Content::Audio {
+            mime_type: mime.into(),
+            data,
+        }
+    }
+
+    /// Create a thinking content block.
+    pub fn thinking(s: impl Into<String>) -> Self {
+        Content::Thinking { text: s.into() }
+    }
+
+    /// Create a tool use content block.
+    pub fn tool_use(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> Self {
+        Content::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+        }
+    }
+
+    /// Create a tool result content block.
+    pub fn tool_result(id: impl Into<String>, content: Vec<Content>) -> Self {
+        Content::ToolResult {
+            id: id.into(),
+            name: None,
+            is_error: false,
+            content,
+        }
+    }
+
+    /// Create a resource link content block.
+    pub fn resource_link(uri: impl Into<String>) -> Self {
+        Content::ResourceLink {
+            uri: uri.into(),
+            name: None,
+            description: None,
+            mime_type: None,
+        }
+    }
+
+    /// Create an error tool result content block.
+    pub fn tool_result_error(id: impl Into<String>, content: Vec<Content>) -> Self {
+        Content::ToolResult {
+            id: id.into(),
+            name: None,
+            is_error: true,
+            content,
+        }
+    }
+
+    /// Returns the text if this is a `Text` block.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Content::Text { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this is a `ToolUse` block.
+    pub fn is_tool_use(&self) -> bool {
+        matches!(self, Content::ToolUse { .. })
+    }
+
+    /// Returns true if this is a `ToolResult` block.
+    pub fn is_tool_result(&self) -> bool {
+        matches!(self, Content::ToolResult { .. })
+    }
+}
+
+impl PartialEq for Content {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Content::Text { text: a }, Content::Text { text: b }) => a == b,
+            (
+                Content::Image {
+                    mime_type: ma,
+                    data: da,
+                },
+                Content::Image {
+                    mime_type: mb,
+                    data: db,
+                },
+            ) => ma == mb && da == db,
+            (Content::ImageUrl { url: a }, Content::ImageUrl { url: b }) => a == b,
+            (Content::Pdf { data: a }, Content::Pdf { data: b }) => a == b,
+            (
+                Content::Audio {
+                    mime_type: ma,
+                    data: da,
+                },
+                Content::Audio {
+                    mime_type: mb,
+                    data: db,
+                },
+            ) => ma == mb && da == db,
+            (Content::Thinking { text: a }, Content::Thinking { text: b }) => a == b,
+            (
+                Content::ToolUse {
+                    id: ia,
+                    name: na,
+                    arguments: aa,
+                },
+                Content::ToolUse {
+                    id: ib,
+                    name: nb,
+                    arguments: ab,
+                },
+            ) => ia == ib && na == nb && aa == ab,
+            (
+                Content::ToolResult {
+                    id: ia,
+                    name: na,
+                    is_error: ea,
+                    content: ca,
+                },
+                Content::ToolResult {
+                    id: ib,
+                    name: nb,
+                    is_error: eb,
+                    content: cb,
+                },
+            ) => ia == ib && na == nb && ea == eb && ca == cb,
+            (
+                Content::ResourceLink {
+                    uri: ua,
+                    name: na,
+                    description: da,
+                    mime_type: ma,
+                },
+                Content::ResourceLink {
+                    uri: ub,
+                    name: nb,
+                    description: db,
+                    mime_type: mb,
+                },
+            ) => ua == ub && na == nb && da == db && ma == mb,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Content {}
+
+impl fmt::Display for Content {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Content::Text { text } => write!(f, "{}", text),
+            Content::Image { mime_type, data } => {
+                write!(f, "[Image: {}, {} bytes]", mime_type, data.len())
+            }
+            Content::ImageUrl { url } => write!(f, "[Image URL: {}]", url),
+            Content::Pdf { data } => write!(f, "[PDF: {} bytes]", data.len()),
+            Content::Audio { mime_type, data } => {
+                write!(f, "[Audio: {}, {} bytes]", mime_type, data.len())
+            }
+            Content::Thinking { text } => write!(f, "[Thinking: {}]", text),
+            Content::ToolUse { id, name, .. } => write!(f, "[ToolUse: {} ({})]", name, id),
+            Content::ToolResult {
+                id,
+                is_error,
+                content,
+                ..
+            } => {
+                let label = if *is_error { "ToolError" } else { "ToolResult" };
+                write!(f, "[{}: {}, {} blocks]", label, id, content.len())
+            }
+            Content::ResourceLink { uri, name, .. } => {
+                if let Some(name) = name {
+                    write!(f, "[Resource: {} ({})]", name, uri)
+                } else {
+                    write!(f, "[Resource: {}]", uri)
+                }
+            }
+        }
+    }
+}
+
 /// Extract `<think>...</think>` blocks from text, returning (thinking, clean_content).
 ///
 /// This handles the common pattern where local models (Qwen3, DeepSeek, QwQ)
@@ -119,49 +378,6 @@ pub enum CacheHint {
     },
 }
 
-/// The supported MIME type of an image.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum ImageMime {
-    /// JPEG image
-    JPEG,
-    /// PNG image
-    PNG,
-    /// GIF image
-    GIF,
-    /// WebP image
-    WEBP,
-}
-
-impl ImageMime {
-    pub fn mime_type(&self) -> &'static str {
-        match self {
-            ImageMime::JPEG => "image/jpeg",
-            ImageMime::PNG => "image/png",
-            ImageMime::GIF => "image/gif",
-            ImageMime::WEBP => "image/webp",
-        }
-    }
-}
-
-/// The type of a message in a chat conversation.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum MessageType {
-    /// A text message
-    #[default]
-    Text,
-    /// An image message
-    Image((ImageMime, Vec<u8>)),
-    /// PDF message
-    Pdf(Vec<u8>),
-    /// An image URL message
-    ImageURL(String),
-    /// A tool use
-    ToolUse(Vec<ToolCall>),
-    /// Tool result
-    ToolResult(Vec<ToolCall>),
-}
-
 /// The type of reasoning effort for a message in a chat conversation.
 pub enum ReasoningEffort {
     /// Low reasoning effort
@@ -173,20 +389,16 @@ pub enum ReasoningEffort {
 }
 
 /// A single message in a chat conversation.
+///
+/// Messages contain a role (user or assistant) and a vector of `Content` blocks,
+/// allowing mixed content such as text, images, tool calls, and tool results
+/// within a single message. This aligns with how major LLM APIs model messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// The role of who sent this message (user or assistant)
     pub role: ChatRole,
-    /// The type of the message (text, image, audio, video, etc)
-    pub message_type: MessageType,
-    /// The text content of the message
-    pub content: String,
-    /// Optional thinking/reasoning content from the model.
-    /// Kept separate from `content` so providers can serialize it in their
-    /// expected format (e.g., `reasoning_content` for llama.cpp templates,
-    /// `thinking` content blocks for Anthropic).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<String>,
+    /// Content blocks for this message.
+    pub content: Vec<Content>,
     /// Optional cache hint. Providers that support caching (e.g., Anthropic)
     /// will translate this into provider-specific cache breakpoint markers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -549,19 +761,32 @@ pub trait ChatResponse: std::fmt::Debug + std::fmt::Display + Send {
 
 impl From<&dyn ChatResponse> for ChatMessage {
     fn from(response: &dyn ChatResponse) -> Self {
-        let content = response.text().unwrap_or_default();
-        let thinking = response.thinking();
-        let tool_calls = response.tool_calls();
-        let message_type = if let Some(calls) = tool_calls.clone() {
-            MessageType::ToolUse(calls)
-        } else {
-            MessageType::Text
-        };
+        let mut content = Vec::new();
+
+        if let Some(t) = response.thinking() {
+            if !t.is_empty() {
+                content.push(Content::thinking(t));
+            }
+        }
+        if let Some(text) = response.text() {
+            if !text.is_empty() {
+                content.push(Content::text(text));
+            }
+        }
+        if let Some(calls) = response.tool_calls() {
+            for call in calls {
+                content.push(Content::ToolUse {
+                    id: call.id.clone(),
+                    name: call.function.name.clone(),
+                    arguments: serde_json::from_str(&call.function.arguments)
+                        .unwrap_or_else(|_| Value::Object(Default::default())),
+                });
+            }
+        }
+
         ChatMessage {
             role: ChatRole::Assistant,
-            message_type,
             content,
-            thinking,
             cache: None,
         }
     }
@@ -730,96 +955,161 @@ impl fmt::Display for ReasoningEffort {
 }
 
 impl ChatMessage {
-    /// Create a new builder for a user message
+    /// Create a new builder for a user message.
     pub fn user() -> ChatMessageBuilder {
         ChatMessageBuilder::new(ChatRole::User)
     }
 
-    /// Create a new builder for an assistant message
+    /// Create a new builder for an assistant message.
     pub fn assistant() -> ChatMessageBuilder {
         ChatMessageBuilder::new(ChatRole::Assistant)
     }
-}
 
-/// Builder for ChatMessage
-#[derive(Debug)]
-pub struct ChatMessageBuilder {
-    role: ChatRole,
-    message_type: MessageType,
-    content: String,
-    thinking: Option<String>,
-    cache: Option<CacheHint>,
-}
-
-impl ChatMessageBuilder {
-    /// Create a new ChatMessageBuilder with specified role
-    pub fn new(role: ChatRole) -> Self {
-        Self {
-            role,
-            message_type: MessageType::default(),
-            content: String::new(),
-            thinking: None,
+    /// Convenience: create a user message from content blocks.
+    pub fn from_user(content: Vec<Content>) -> Self {
+        ChatMessage {
+            role: ChatRole::User,
+            content,
             cache: None,
         }
     }
 
-    /// Set the message content
-    pub fn content<S: Into<String>>(mut self, content: S) -> Self {
-        self.content = content.into();
+    /// Convenience: create an assistant message from content blocks.
+    pub fn from_assistant(content: Vec<Content>) -> Self {
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content,
+            cache: None,
+        }
+    }
+
+    /// Extract concatenated text from all `Content::Text` blocks.
+    pub fn text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|b| b.as_text())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// Check if the message contains any `Content::ToolUse` blocks.
+    pub fn has_tool_use(&self) -> bool {
+        self.content.iter().any(|b| b.is_tool_use())
+    }
+
+    /// Extract all `Content::ToolUse` blocks.
+    pub fn tool_uses(&self) -> Vec<&Content> {
+        self.content.iter().filter(|b| b.is_tool_use()).collect()
+    }
+
+    /// Check if the message contains any `Content::ToolResult` blocks.
+    pub fn has_tool_result(&self) -> bool {
+        self.content.iter().any(|b| b.is_tool_result())
+    }
+
+    /// Extract the first thinking block text, if any.
+    pub fn thinking(&self) -> Option<&str> {
+        self.content.iter().find_map(|b| match b {
+            Content::Thinking { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+}
+
+/// Builder for ChatMessage.
+///
+/// Accumulates `Content` blocks and produces a `ChatMessage`.
+#[derive(Debug)]
+pub struct ChatMessageBuilder {
+    role: ChatRole,
+    content: Vec<Content>,
+    cache: Option<CacheHint>,
+}
+
+impl ChatMessageBuilder {
+    /// Create a new ChatMessageBuilder with specified role.
+    pub fn new(role: ChatRole) -> Self {
+        Self {
+            role,
+            content: Vec::new(),
+            cache: None,
+        }
+    }
+
+    /// Append a text content block. If called multiple times, multiple text blocks are added.
+    pub fn text(mut self, s: impl Into<String>) -> Self {
+        self.content.push(Content::text(s));
         self
     }
 
-    /// Set the thinking/reasoning content.
-    /// Empty strings are treated as None.
-    pub fn thinking<S: Into<String>>(mut self, thinking: S) -> Self {
-        let t = thinking.into();
-        self.thinking = if t.is_empty() { None } else { Some(t) };
+    /// Append a thinking/reasoning content block.
+    /// Empty strings are ignored.
+    pub fn thinking(mut self, s: impl Into<String>) -> Self {
+        let t = s.into();
+        if !t.is_empty() {
+            self.content.push(Content::thinking(t));
+        }
         self
     }
 
-    /// Set the message type as Image
-    pub fn image(mut self, image_mime: ImageMime, raw_bytes: Vec<u8>) -> Self {
-        self.message_type = MessageType::Image((image_mime, raw_bytes));
+    /// Append an image content block.
+    pub fn image(mut self, mime: impl Into<String>, data: Vec<u8>) -> Self {
+        self.content.push(Content::image(mime, data));
         self
     }
 
-    /// Set the message type as Image
-    pub fn pdf(mut self, raw_bytes: Vec<u8>) -> Self {
-        self.message_type = MessageType::Pdf(raw_bytes);
-        self
-    }
-
-    /// Set the message type as ImageURL
+    /// Append an image URL content block.
     pub fn image_url(mut self, url: impl Into<String>) -> Self {
-        self.message_type = MessageType::ImageURL(url.into());
+        self.content.push(Content::image_url(url));
         self
     }
 
-    /// Set the message type as ToolUse
-    pub fn tool_use(mut self, tools: Vec<ToolCall>) -> Self {
-        self.message_type = MessageType::ToolUse(tools);
+    /// Append a PDF content block.
+    pub fn pdf(mut self, data: Vec<u8>) -> Self {
+        self.content.push(Content::pdf(data));
         self
     }
 
-    /// Set the message type as ToolResult
-    pub fn tool_result(mut self, tools: Vec<ToolCall>) -> Self {
-        self.message_type = MessageType::ToolResult(tools);
+    /// Append a tool use content block.
+    pub fn tool_use(mut self, id: String, name: String, args: Value) -> Self {
+        self.content.push(Content::tool_use(id, name, args));
         self
     }
 
-    /// Set cache hint for this message
+    /// Append a tool result content block.
+    pub fn tool_result(
+        mut self,
+        id: String,
+        name: Option<String>,
+        is_error: bool,
+        inner: Vec<Content>,
+    ) -> Self {
+        self.content.push(Content::ToolResult {
+            id,
+            name,
+            is_error,
+            content: inner,
+        });
+        self
+    }
+
+    /// Append an arbitrary content block.
+    pub fn block(mut self, block: Content) -> Self {
+        self.content.push(block);
+        self
+    }
+
+    /// Set cache hint for this message.
     pub fn cache(mut self, cache: CacheHint) -> Self {
         self.cache = Some(cache);
         self
     }
 
-    /// Build the ChatMessage
+    /// Build the ChatMessage.
     pub fn build(self) -> ChatMessage {
         ChatMessage {
             role: self.role,
-            message_type: self.message_type,
             content: self.content,
-            thinking: self.thinking,
             cache: self.cache,
         }
     }
@@ -827,7 +1117,7 @@ impl ChatMessageBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_thinking;
+    use super::*;
 
     #[test]
     fn extract_thinking_handles_multiple_blocks() {
@@ -854,5 +1144,98 @@ mod tests {
 
         assert_eq!(thinking, None);
         assert_eq!(content, "plain response");
+    }
+
+    #[test]
+    fn content_text_constructor() {
+        let c = Content::text("hello");
+        assert_eq!(
+            c,
+            Content::Text {
+                text: "hello".into()
+            }
+        );
+        assert_eq!(c.as_text(), Some("hello"));
+    }
+
+    #[test]
+    fn content_tool_result_constructor() {
+        let c = Content::tool_result("id1", vec![Content::text("ok")]);
+        match c {
+            Content::ToolResult {
+                id,
+                name,
+                is_error,
+                content,
+            } => {
+                assert_eq!(id, "id1");
+                assert_eq!(name, None);
+                assert!(!is_error);
+                assert_eq!(content.len(), 1);
+            }
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn builder_produces_correct_blocks() {
+        let msg = ChatMessage::user()
+            .text("Hello")
+            .image("image/png", vec![1, 2, 3])
+            .build();
+
+        assert_eq!(msg.role, ChatRole::User);
+        assert_eq!(msg.content.len(), 2);
+        assert_eq!(msg.text(), "Hello");
+    }
+
+    #[test]
+    fn builder_thinking_skips_empty() {
+        let msg = ChatMessage::assistant()
+            .thinking("")
+            .text("response")
+            .build();
+
+        assert_eq!(msg.content.len(), 1);
+        assert!(msg.thinking().is_none());
+    }
+
+    #[test]
+    fn chat_message_has_tool_use() {
+        let msg = ChatMessage::assistant()
+            .text("Let me search")
+            .tool_use(
+                "t1".into(),
+                "search".into(),
+                serde_json::json!({"q": "rust"}),
+            )
+            .build();
+
+        assert!(msg.has_tool_use());
+        assert_eq!(msg.tool_uses().len(), 1);
+        assert!(!msg.has_tool_result());
+    }
+
+    #[test]
+    fn content_serde_roundtrip() {
+        let blocks = vec![
+            Content::text("hello"),
+            Content::image("image/png", vec![1, 2]),
+            Content::ToolUse {
+                id: "t1".into(),
+                name: "search".into(),
+                arguments: serde_json::json!({"q": "test"}),
+            },
+            Content::ToolResult {
+                id: "t1".into(),
+                name: Some("search".into()),
+                is_error: false,
+                content: vec![Content::text("found it")],
+            },
+        ];
+
+        let json = serde_json::to_string(&blocks).unwrap();
+        let roundtripped: Vec<Content> = serde_json::from_str(&json).unwrap();
+        assert_eq!(blocks, roundtripped);
     }
 }
