@@ -597,7 +597,8 @@ pub async fn handle_set_session_model(
     state: &ServerState,
     session_id: &str,
     model_id: &str,
-    node_id: Option<&str>,
+    #[cfg(feature = "remote")] node_id: Option<&str>,
+    #[cfg(not(feature = "remote"))] _node_id: Option<&str>,
 ) -> Result<(), String> {
     use crate::agent::messages::SetSessionModel;
 

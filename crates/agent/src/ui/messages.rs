@@ -719,7 +719,7 @@ impl UiServerMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthMethod, OAuthFlowKind, PluginUpdateResult, UiClientMessage, UiServerMessage};
+    use super::{OAuthFlowKind, PluginUpdateResult, UiClientMessage, UiServerMessage};
     use serde_json::json;
 
     // Note: All UiClientMessage and UiServerMessage tests use adjacently tagged serde format:
