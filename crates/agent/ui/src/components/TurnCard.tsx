@@ -25,8 +25,10 @@ export interface TurnCardProps {
   llmConfigCache?: Record<number, LlmConfigDetails>; // Cached LLM configs
   requestLlmConfig?: (configId: number, callback: (config: LlmConfigDetails) => void) => void;
   activeView?: 'chat' | 'delegations'; // Current view - only show pinned message in chat view
-  onUndo?: () => void; // Callback to undo this turn
-  onFork?: () => void; // Callback to fork this turn into a new session
+  /** Index of this turn in the filtered list — used for stable undo/fork callbacks */
+  turnIndex: number;
+  onUndoTurn?: (index: number) => void; // Stable callback: undo turn at index
+  onForkTurn?: (index: number) => void; // Stable callback: fork turn at index
   onRedo?: () => void; // Callback to redo this turn
   isUndone?: boolean; // This turn is the top confirmed undone frame (redo available)
   isUndoPending?: boolean; // This turn is the top undo frame waiting for backend confirmation
@@ -137,8 +139,9 @@ export const TurnCard = memo(function TurnCard({
   llmConfigCache = {},
   requestLlmConfig,
   activeView = 'chat',
-  onUndo,
-  onFork,
+  turnIndex,
+  onUndoTurn,
+  onForkTurn,
   onRedo,
   isUndone = false,
   isUndoPending = false,
@@ -151,9 +154,9 @@ export const TurnCard = memo(function TurnCard({
   const agentName = turn.agentId ? getAgentShortName(turn.agentId, agents) : 'Agent';
   const agentColor = turn.agentId ? getAgentColor(turn.agentId) : undefined;
   const hasUndoOverlay = isUndone || isUndoPending || isStackedUndone;
-  const canShowUndoButton = !!onUndo && canUndo && !turn.isActive && !hasUndoOverlay;
+  const canShowUndoButton = !!onUndoTurn && canUndo && !turn.isActive && !hasUndoOverlay;
   const canShowForkButton =
-    !!onFork &&
+    !!onForkTurn &&
     (!!turn.userMessage?.messageId || turn.agentMessages.some((message) => !!message.messageId)) &&
     !turn.isActive &&
     !hasUndoOverlay;
@@ -455,7 +458,7 @@ export const TurnCard = memo(function TurnCard({
           <div className="mt-2 flex justify-end gap-2 opacity-60 group-hover:opacity-100 transition-opacity">
             {canShowForkButton && (
               <button
-                onClick={onFork}
+                onClick={() => onForkTurn!(turnIndex)}
                 className="flex items-center gap-1.5 px-2 py-1 rounded text-xs text-ui-secondary hover:text-accent-primary hover:bg-accent-primary/10 border border-transparent hover:border-accent-primary/40 transition-colors"
                 title="Fork a new session from this turn"
               >
@@ -465,7 +468,7 @@ export const TurnCard = memo(function TurnCard({
             )}
             {canShowUndoButton && (
               <button
-                onClick={onUndo}
+                onClick={() => onUndoTurn!(turnIndex)}
                 className="flex items-center gap-1.5 px-2 py-1 rounded text-xs text-ui-secondary hover:text-status-warning hover:bg-status-warning/10 border border-transparent hover:border-status-warning/40 transition-colors"
                 title="Undo changes from this turn"
               >

@@ -6,6 +6,8 @@ import { useState } from 'react';
 import { ChevronDown, ChevronRight, Loader } from 'lucide-react';
 import { EventRow, DelegationGroupInfo, UiAgentInfo } from '../types';
 import { isDelegationAwaitingInput } from '../logic/chatViewLogic';
+import { useIsMobile } from '../hooks/useIsMobile';
+import { useUiStore } from '../store/uiStore';
 import { ToolSummary } from './ToolSummary';
 import { DelegationSummaryCard } from './DelegationSummaryCard';
 
@@ -27,6 +29,9 @@ export function ActivitySection({
   onDelegateClick,
 }: ActivitySectionProps) {
   const [isExpanded, setIsExpanded] = useState(true); // Always expanded by default
+  // Read once, pass down to each ToolSummary to avoid N per-instance subscriptions.
+  const isMobile = useIsMobile();
+  const selectedTheme = useUiStore((state) => state.selectedTheme);
 
   // Calculate summary
   const totalTools = toolCalls.length;
@@ -105,6 +110,8 @@ export function ActivitySection({
                   isDelegate={isDelegate}
                   isAwaitingInput={isAwaitingInput}
                   onDelegateClick={delegationGroup ? () => onDelegateClick(delegationGroup.id) : undefined}
+                  isMobile={isMobile}
+                  selectedTheme={selectedTheme}
                 />
 
                 {/* Delegation summary below delegate tool */}

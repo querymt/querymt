@@ -1,6 +1,19 @@
+import { memo } from 'react';
 import { CheckCircle, Circle, XCircle, ChevronRight, ChevronLeft } from 'lucide-react';
 import { TodoItem } from '../types';
 import { TodoStats } from '../hooks/useTodoState';
+
+// Pre-rendered status icons — avoids recreating JSX elements on every render.
+const STATUS_ICONS = {
+  in_progress: (
+    <div className="w-4 h-4 rounded-full bg-accent-primary/20 flex items-center justify-center">
+      <div className="w-2 h-2 rounded-full bg-accent-primary animate-pulse" />
+    </div>
+  ),
+  pending: <Circle className="w-4 h-4 text-ui-muted" />,
+  completed: <CheckCircle className="w-4 h-4 text-status-success" />,
+  cancelled: <XCircle className="w-4 h-4 text-red-400" />,
+} as const;
 
 interface TodoRailProps {
   todos: TodoItem[];
@@ -129,30 +142,23 @@ interface TodoItemRowProps {
   isRecentlyChanged: boolean;
 }
 
-function TodoItemRow({ todo, isRecentlyChanged }: TodoItemRowProps) {
-  const priorityColor = {
-    high: 'bg-status-warning',
-    medium: 'bg-accent-primary',
-    low: 'bg-accent-tertiary',
-  }[todo.priority];
-  
-  const statusIcon = {
-    in_progress: (
-      <div className="w-4 h-4 rounded-full bg-accent-primary/20 flex items-center justify-center">
-        <div className="w-2 h-2 rounded-full bg-accent-primary animate-pulse" />
-      </div>
-    ),
-    pending: <Circle className="w-4 h-4 text-ui-muted" />,
-    completed: <CheckCircle className="w-4 h-4 text-status-success" />,
-    cancelled: <XCircle className="w-4 h-4 text-red-400" />,
-  }[todo.status];
-  
-  const textStyle = {
-    in_progress: 'text-ui-primary font-medium',
-    pending: 'text-ui-secondary',
-    completed: 'text-ui-muted line-through',
-    cancelled: 'text-ui-muted line-through',
-  }[todo.status];
+const PRIORITY_COLORS: Record<string, string> = {
+  high: 'bg-status-warning',
+  medium: 'bg-accent-primary',
+  low: 'bg-accent-tertiary',
+};
+
+const TEXT_STYLES: Record<string, string> = {
+  in_progress: 'text-ui-primary font-medium',
+  pending: 'text-ui-secondary',
+  completed: 'text-ui-muted line-through',
+  cancelled: 'text-ui-muted line-through',
+};
+
+const TodoItemRow = memo(function TodoItemRow({ todo, isRecentlyChanged }: TodoItemRowProps) {
+  const priorityColor = PRIORITY_COLORS[todo.priority] ?? PRIORITY_COLORS.medium;
+  const statusIcon = STATUS_ICONS[todo.status as keyof typeof STATUS_ICONS] ?? STATUS_ICONS.pending;
+  const textStyle = TEXT_STYLES[todo.status] ?? TEXT_STYLES.pending;
   
   return (
     <div
@@ -178,4 +184,4 @@ function TodoItemRow({ todo, isRecentlyChanged }: TodoItemRowProps) {
       </div>
     </div>
   );
-}
+});

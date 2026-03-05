@@ -13,7 +13,7 @@ import { Clock, Cpu, Wrench, DollarSign } from 'lucide-react';
 import { EventItem, SessionLimits } from '../types';
 import { calculateStats } from '../utils/statsCalculator';
 import { formatDurationCompact, formatTokensAbbrev, formatCost, formatPercentage } from '../utils/formatters';
-import { useSessionTimerContext } from '../context/SessionTimerContext';
+import { useSessionTimerElapsed, useSessionTimerActive } from '../context/SessionTimerContext';
 
 interface HeaderStatsBarProps {
   events: EventItem[];
@@ -31,7 +31,8 @@ export function HeaderStatsBar({
   onClick,
   compact = false,
 }: HeaderStatsBarProps) {
-  const { globalElapsedMs, isSessionActive } = useSessionTimerContext();
+  const globalElapsedMs = useSessionTimerElapsed();
+  const isSessionActive = useSessionTimerActive();
   const { session, perAgent } = useMemo(() => calculateStats(events, sessionLimits), [events, sessionLimits]);
   
   // Enhance perAgent stats with context limits from agentModels if missing

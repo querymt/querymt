@@ -2,14 +2,50 @@
  * Compact tool card component - shows summary with inline preview for key tools
  */
 
-import { memo, useState, useMemo } from 'react';
+import { memo, useState, useMemo, useRef, useEffect } from 'react';
 import { Loader, CheckCircle, XCircle, ChevronRight, ChevronDown, Eye, Pause } from 'lucide-react';
 import { PatchDiff } from '@pierre/diffs/react';
 import { generateToolSummary } from '../utils/toolSummary';
 import { EventItem } from '../types';
-import { useIsMobile } from '../hooks/useIsMobile';
-import { useUiStore } from '../store/uiStore';
 import { getDashboardThemeVariant, getDiffThemeForDashboard } from '../utils/dashboardThemes';
+
+/**
+ * Defers rendering of the expensive PatchDiff component until the container
+ * scrolls into (or near) the viewport.  Uses IntersectionObserver with a
+ * generous rootMargin so the diff is ready slightly before the user sees it.
+ */
+function LazyPatchDiff(props: React.ComponentProps<typeof PatchDiff> & { className?: string }) {
+  const { className, ...diffProps } = props;
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '200px' }, // start rendering 200px before entering viewport
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  return (
+    <div ref={containerRef} className={className}>
+      {visible ? <PatchDiff {...diffProps} /> : (
+        <div className="h-16 flex items-center justify-center text-[10px] text-ui-muted">
+          Loading diff...
+        </div>
+      )}
+    </div>
+  );
+}
 
 export interface ToolSummaryProps {
   event: EventItem & { mergedResult?: EventItem };
@@ -17,6 +53,10 @@ export interface ToolSummaryProps {
   isDelegate?: boolean;
   isAwaitingInput?: boolean;
   onDelegateClick?: () => void;
+  /** Passed down from parent to avoid per-instance store subscription. */
+  isMobile?: boolean;
+  /** Passed down from parent to avoid per-instance store subscription. */
+  selectedTheme?: string;
 }
 
 export const ToolSummary = memo(function ToolSummary({
@@ -25,9 +65,9 @@ export const ToolSummary = memo(function ToolSummary({
   isDelegate,
   isAwaitingInput,
   onDelegateClick,
+  isMobile = false,
+  selectedTheme = 'cyber-noir',
 }: ToolSummaryProps) {
-  const isMobile = useIsMobile();
-  const selectedTheme = useUiStore((state) => state.selectedTheme);
   const diffTheme = getDiffThemeForDashboard(selectedTheme);
   const diffThemeType = getDashboardThemeVariant(selectedTheme);
   const toolKind = event.toolCall?.kind;
@@ -194,22 +234,21 @@ export const ToolSummary = memo(function ToolSummary({
           title="Click for full details"
         >
           {previewData.type === 'diff' && previewData.patch && (
-            <div className={diffContainerClass}>
-              <PatchDiff
-                patch={previewData.patch}
-                options={{
-                  theme: diffTheme,
-                  themeType: diffThemeType,
-                  diffStyle: isMobile ? 'unified' : 'split',
-                  diffIndicators: 'bars',
-                  lineDiffType: 'word-alt',
-                  overflow: 'wrap',
-                  disableLineNumbers: false,
-                  useCSSClasses: true,
-                  disableBackground: true,
-                }}
-              />
-            </div>
+            <LazyPatchDiff
+              className={diffContainerClass}
+              patch={previewData.patch}
+              options={{
+                theme: diffTheme,
+                themeType: diffThemeType,
+                diffStyle: isMobile ? 'unified' : 'split',
+                diffIndicators: 'bars',
+                lineDiffType: 'word-alt',
+                overflow: 'wrap',
+                disableLineNumbers: false,
+                useCSSClasses: true,
+                disableBackground: true,
+              }}
+            />
           )}
           {previewData.type === 'shell' && (
             <div className="px-3 py-2 font-mono text-[11px] max-h-64 overflow-auto">

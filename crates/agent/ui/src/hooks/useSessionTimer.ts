@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef } from 'react';
-import { useStopwatch } from 'react-timer-hook';
 import { EventItem } from '../types';
 import { useUiStore } from '../store/uiStore';
 
@@ -10,7 +9,7 @@ interface SessionTimerResult {
 }
 
 /**
- * Simple stopwatch class for tracking per-agent elapsed time.
+ * Simple stopwatch class for tracking elapsed time.
  * Uses timestamps to calculate elapsed time with millisecond precision.
  */
 class AgentStopwatch {
@@ -44,9 +43,7 @@ class AgentStopwatch {
     return this.running;
   }
 
-  // For save/restore functionality
   getAccumulated(): number {
-    // Capture current state including running time
     if (this.running && this.startedAt !== undefined) {
       return this.accumulated + (Date.now() - this.startedAt);
     }
@@ -68,12 +65,12 @@ class AgentStopwatch {
 
 /**
  * Live timer hook that tracks per-session elapsed time.
- * 
+ *
  * This hook provides:
  * - Global session elapsed time (total wall-clock time while agents are thinking)
  * - Per-agent active time (time each agent spends actively thinking)
  * - Session active state (whether any agent is currently thinking)
- * 
+ *
  * Key behaviors:
  * - Timer state is stored per-session in Zustand store
  * - When switching sessions, timer state is saved and restored
@@ -82,15 +79,18 @@ class AgentStopwatch {
  * - Per-agent timers start when agent enters thinkingAgentIds
  * - Per-agent timers pause when agent leaves thinkingAgentIds
  * - Null sessionId (home page) shows 0:00
- * 
+ *
  * Implementation notes:
- * - Uses useStopwatch from react-timer-hook for smooth global timer
- * - Uses custom AgentStopwatch class in refs for per-agent tracking
- * - Re-renders every second while active to update displayed times
- * - Saves/restores timer state via Zustand when session changes
- * 
- * @param events - Event history (currently unused, for future historical replay)
- * @param thinkingAgentIds - Set of agent IDs currently thinking/processing
+ * - Uses a single AgentStopwatch for the global timer (same class as per-agent tracking)
+ *   instead of react-timer-hook, eliminating a second independent re-render source.
+ * - A single 1-second setInterval drives all display updates while the session is active.
+ *   The interval produces a snapshot of the current elapsed values and stores them as
+ *   React state, so the Map reference only changes once per second (not on every render).
+ * - Saves/restores timer state via Zustand when the session changes.
+ *
+ * @param _events - Event history (currently unused, reserved for future historical replay)
+ * @param thinkingAgentIds - Set of agent IDs currently thinking/processing,
+ *   scoped to the currently viewed session (not the global cross-session set).
  * @param sessionId - Current session ID (null when on home page)
  * @returns Session timer state with elapsed times and active status
  */
@@ -100,172 +100,170 @@ export function useSessionTimer(
   sessionId: string | null
 ): SessionTimerResult {
   const { saveSessionTimer, getSessionTimer } = useUiStore();
-  
+
   // Track previous session ID for save/restore
   const prevSessionIdRef = useRef<string | null>(null);
-  
-  // Global stopwatch using react-timer-hook
-  // We'll use reset() with offset to restore saved time
-  const { totalSeconds, start, pause, reset, isRunning } = useStopwatch({ autoStart: false });
-  
-  // Store latest totalSeconds in ref for save operations
-  const totalSecondsRef = useRef(totalSeconds);
-  totalSecondsRef.current = totalSeconds;
-  
+
+  // Global stopwatch — same lightweight class as per-agent tracking.
+  // Stored in a ref so start/pause never cause a re-render themselves.
+  const globalStopwatch = useRef(new AgentStopwatch());
+
   // Per-agent stopwatches stored in ref (persists across renders)
   const agentStopwatches = useRef(new Map<string, AgentStopwatch>());
-  
-  // Tick state to force re-render every second while active
-  // This ensures agentElapsedMs Map reflects current elapsed time
-  const [, setTick] = useState(0);
-  
-  // Track restored time to handle reset() async behavior
-  // useStopwatch doesn't update totalSeconds immediately after reset()
-  const [restoredTimeMs, setRestoredTimeMs] = useState<number | null>(null);
-  
+
+  // Displayed state — only updated once per second by the interval below.
+  // Keeping globalElapsedMs and agentElapsedMs as a single state object means
+  // a single setState call per tick instead of two, halving the number of
+  // re-renders triggered by the interval.
+  const [timerState, setTimerState] = useState<{
+    globalElapsedMs: number;
+    agentElapsedMs: Map<string, number>;
+  }>({ globalElapsedMs: 0, agentElapsedMs: new Map() });
+
   // Determine if session is active (any agents thinking)
   const isSessionActive = thinkingAgentIds.size > 0;
-  
+
+  // Keep a ref to the latest thinkingAgentIds so the session-switch effect can
+  // inspect it without adding it as a dependency (which would re-run the effect
+  // on every thinking-state change, defeating the session-switch guard).
+  const thinkingAgentIdsRef = useRef(thinkingAgentIds);
+  thinkingAgentIdsRef.current = thinkingAgentIds;
+
   // Session switching: save previous session state and restore new session state
   useEffect(() => {
     const prevSessionId = prevSessionIdRef.current;
-    
+
     // Only process when sessionId actually changes
     if (prevSessionId === sessionId) return;
-    
-    // Save timer state when leaving a session
+
+    // Save timer state when leaving a session — pause running timers first so
+    // the accumulated value includes the current running segment.
     if (prevSessionId) {
-      const globalAccumulatedMs = totalSecondsRef.current * 1000;
+      globalStopwatch.current.pause();
       const agentAccumulatedMs: Record<string, number> = {};
-      
-      for (const [agentId, stopwatch] of agentStopwatches.current) {
-        agentAccumulatedMs[agentId] = stopwatch.getAccumulated();
+      for (const [agentId, sw] of agentStopwatches.current) {
+        sw.pause();
+        agentAccumulatedMs[agentId] = sw.getAccumulated();
       }
-      
       saveSessionTimer(prevSessionId, {
-        globalAccumulatedMs,
+        globalAccumulatedMs: globalStopwatch.current.getAccumulated(),
         agentAccumulatedMs,
       });
-      
-      console.log(`[useSessionTimer] Saved timer state for session ${prevSessionId}:`, {
-        globalAccumulatedMs,
-        agentCount: Object.keys(agentAccumulatedMs).length,
-      });
     }
-    
+
     // Restore or reset timer state when entering a session
-    if (sessionId) {
-      const savedState = getSessionTimer(sessionId);
-      
-      if (savedState) {
-        // Restore from saved state
-        const offsetTimestamp = new Date();
-        offsetTimestamp.setSeconds(offsetTimestamp.getSeconds() + savedState.globalAccumulatedMs / 1000);
-        reset(offsetTimestamp, false); // Set offset, don't auto-start
-        setRestoredTimeMs(savedState.globalAccumulatedMs);
-        
-        // Restore agent stopwatches
-        const newAgentStopwatches = new Map<string, AgentStopwatch>();
-        for (const [agentId, accumulated] of Object.entries(savedState.agentAccumulatedMs)) {
-          const stopwatch = new AgentStopwatch();
-          stopwatch.setAccumulated(accumulated as number);
-          newAgentStopwatches.set(agentId, stopwatch);
-        }
-        agentStopwatches.current = newAgentStopwatches;
-        
-        console.log(`[useSessionTimer] Restored timer state for session ${sessionId}:`, {
-          globalAccumulatedMs: savedState.globalAccumulatedMs,
-          agentCount: Object.keys(savedState.agentAccumulatedMs).length,
-        });
-      } else {
-        // Fresh session - reset to 0
-        reset(undefined, false);
-        setRestoredTimeMs(0);
-        agentStopwatches.current.clear();
-        
-        console.log(`[useSessionTimer] Fresh timer for session ${sessionId}`);
+    const savedState = sessionId ? getSessionTimer(sessionId) : null;
+
+    globalStopwatch.current.reset();
+    agentStopwatches.current.clear();
+
+    if (savedState) {
+      globalStopwatch.current.setAccumulated(savedState.globalAccumulatedMs);
+      for (const [agentId, accumulated] of Object.entries(savedState.agentAccumulatedMs)) {
+        const sw = new AgentStopwatch();
+        sw.setAccumulated(accumulated as number);
+        agentStopwatches.current.set(agentId, sw);
       }
-    } else {
-      // Navigated to home page - reset timer
-      reset(undefined, false);
-      setRestoredTimeMs(0);
-      agentStopwatches.current.clear();
-      
-      console.log(`[useSessionTimer] Reset timer (navigated to home)`);
     }
-    
+
+    // If the new session is already active (thinkingAgentIds non-empty at the
+    // time of the switch), start the stopwatches immediately. The isSessionActive
+    // effect won't fire when isSessionActive stays true across the session change,
+    // so we handle it here to avoid the global timer remaining paused.
+    const currentThinking = thinkingAgentIdsRef.current;
+    if (currentThinking.size > 0) {
+      globalStopwatch.current.start();
+      for (const agentId of currentThinking) {
+        if (!agentStopwatches.current.has(agentId)) {
+          agentStopwatches.current.set(agentId, new AgentStopwatch());
+        }
+        agentStopwatches.current.get(agentId)!.start();
+      }
+    }
+
+    // Immediately reflect restored/reset state in displayed values
+    setTimerState({
+      globalElapsedMs: globalStopwatch.current.getElapsedMs(),
+      agentElapsedMs: new Map(
+        Array.from(agentStopwatches.current.entries()).map(([id, sw]) => [id, sw.getElapsedMs()])
+      ),
+    });
+
     prevSessionIdRef.current = sessionId;
-  }, [sessionId, reset, saveSessionTimer, getSessionTimer]);
-  
+  }, [sessionId, saveSessionTimer, getSessionTimer]);
+
   // Control global stopwatch based on session active state
   useEffect(() => {
-    if (isSessionActive && !isRunning) {
-      // Session became active - start or resume global timer
-      start();
-    } else if (!isSessionActive && isRunning) {
-      // Session became inactive - pause global timer
-      pause();
+    if (isSessionActive) {
+      globalStopwatch.current.start();
+    } else {
+      globalStopwatch.current.pause();
     }
-  }, [isSessionActive, isRunning, start, pause]);
-  
+  }, [isSessionActive]);
+
   // Control per-agent stopwatches based on thinkingAgentIds membership
   useEffect(() => {
-    // Start stopwatches for agents that are thinking
+    // Start stopwatches for agents that are now thinking
     for (const agentId of thinkingAgentIds) {
       if (!agentStopwatches.current.has(agentId)) {
-        // First time seeing this agent - create stopwatch
         agentStopwatches.current.set(agentId, new AgentStopwatch());
       }
-      const stopwatch = agentStopwatches.current.get(agentId)!;
-      if (!stopwatch.isRunning()) {
-        stopwatch.start();
-      }
+      const sw = agentStopwatches.current.get(agentId)!;
+      if (!sw.isRunning()) sw.start();
     }
-    
+
     // Pause stopwatches for agents that stopped thinking
-    for (const [agentId, stopwatch] of agentStopwatches.current) {
-      if (!thinkingAgentIds.has(agentId) && stopwatch.isRunning()) {
-        stopwatch.pause();
+    for (const [agentId, sw] of agentStopwatches.current) {
+      if (!thinkingAgentIds.has(agentId) && sw.isRunning()) {
+        sw.pause();
       }
     }
   }, [thinkingAgentIds]);
-  
-  // Update tick every second while session is active
-  // This triggers re-render to update displayed elapsed times
+
+  // Single interval: snapshot displayed values once per second while active.
+  // We only create a new Map when at least one value has actually changed
+  // (rounded to seconds) so that consumers memoised on agentElapsedMs can
+  // bail out of re-renders when the displayed second hasn't ticked.
   useEffect(() => {
     if (!isSessionActive) return;
-    
+
     const interval = setInterval(() => {
-      setTick(t => t + 1);
+      setTimerState((prev) => {
+        const nextGlobal = globalStopwatch.current.getElapsedMs();
+
+        // Check whether any agent-level value changed (second granularity).
+        let agentChanged = false;
+        const nextAgentEntries: [string, number][] = [];
+        for (const [agentId, sw] of agentStopwatches.current) {
+          const ms = sw.getElapsedMs();
+          nextAgentEntries.push([agentId, ms]);
+          const prevMs = prev.agentElapsedMs.get(agentId);
+          if (prevMs === undefined || Math.floor(ms / 1000) !== Math.floor(prevMs / 1000)) {
+            agentChanged = true;
+          }
+        }
+        // Also detect removed agents.
+        if (nextAgentEntries.length !== prev.agentElapsedMs.size) {
+          agentChanged = true;
+        }
+
+        const globalChanged = Math.floor(nextGlobal / 1000) !== Math.floor(prev.globalElapsedMs / 1000);
+
+        if (!globalChanged && !agentChanged) return prev; // no state update
+
+        return {
+          globalElapsedMs: nextGlobal,
+          agentElapsedMs: agentChanged ? new Map(nextAgentEntries) : prev.agentElapsedMs,
+        };
+      });
     }, 1000);
-    
+
     return () => clearInterval(interval);
   }, [isSessionActive]);
-  
-  // Build agentElapsedMs map from current stopwatch states
-  const agentElapsedMs = new Map<string, number>();
-  for (const [agentId, stopwatch] of agentStopwatches.current) {
-    agentElapsedMs.set(agentId, stopwatch.getElapsedMs());
-  }
-  
-  // Convert totalSeconds to milliseconds for global elapsed time
-  // Use restoredTimeMs if available (handles reset() async behavior)
-  // Clear restoredTimeMs once totalSeconds catches up
-  const currentTimeMs = totalSeconds * 1000;
-  const globalElapsedMs = restoredTimeMs !== null && Math.abs(currentTimeMs - restoredTimeMs) > 100
-    ? restoredTimeMs
-    : currentTimeMs;
-  
-  // Clear restoredTimeMs once useStopwatch has caught up
-  useEffect(() => {
-    if (restoredTimeMs !== null && Math.abs(currentTimeMs - restoredTimeMs) <= 100) {
-      setRestoredTimeMs(null);
-    }
-  }, [currentTimeMs, restoredTimeMs]);
-  
+
   return {
-    globalElapsedMs,
-    agentElapsedMs,
+    globalElapsedMs: timerState.globalElapsedMs,
+    agentElapsedMs: timerState.agentElapsedMs,
     isSessionActive,
   };
 }
