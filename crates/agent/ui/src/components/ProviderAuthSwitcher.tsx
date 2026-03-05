@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { Command } from 'cmdk';
-import { Copy, ExternalLink, KeyRound, ShieldCheck, X } from 'lucide-react';
+import { Copy, ExternalLink, Eye, EyeOff, KeyRound, ShieldCheck, X } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
+import { AuthMethod } from '../types';
 import type { AuthProviderEntry, OAuthFlowState, OAuthResultState } from '../types';
 
 interface ProviderAuthSwitcherProps {
@@ -10,32 +11,77 @@ interface ProviderAuthSwitcherProps {
   providers: AuthProviderEntry[];
   oauthFlow: OAuthFlowState | null;
   oauthResult: OAuthResultState | null;
+  apiTokenResult: { provider: string; success: boolean; message: string } | null;
   onRequestProviders: () => void;
   onStartOAuthLogin: (provider: string) => void;
   onCompleteOAuthLogin: (flowId: string, response: string) => void;
   onClearOAuthState: () => void;
   onDisconnectOAuth: (provider: string) => void;
+  onSetApiToken: (provider: string, apiKey: string) => void;
+  onClearApiToken: (provider: string) => void;
+  onSetAuthMethod: (provider: string, method: AuthMethod) => void;
+  onClearApiTokenResult: () => void;
 }
 
-function statusClasses(status: AuthProviderEntry['status']): string {
-  if (status === 'connected') {
-    return 'border-status-success/40 bg-status-success/10 text-status-success';
-  }
-  if (status === 'expired') {
-    return 'border-status-warning/45 bg-status-warning/10 text-status-warning';
-  }
-  return 'border-surface-border/60 bg-surface-canvas/60 text-ui-muted';
+// ── Exported helpers (tested independently) ──
+
+/** Provider supports only OAuth (no API key env var). */
+export function isOAuthOnly(provider: AuthProviderEntry): boolean {
+  return provider.supports_oauth && provider.env_var_name == null;
 }
 
-function statusLabel(status: AuthProviderEntry['status']): string {
-  if (status === 'connected') {
-    return 'Connected';
-  }
-  if (status === 'expired') {
-    return 'Expired';
-  }
-  return 'Not connected';
+/** Provider supports only API key (no OAuth). */
+export function isApiKeyOnly(provider: AuthProviderEntry): boolean {
+  return !provider.supports_oauth && provider.env_var_name != null;
 }
+
+/** Provider supports multiple auth methods (both OAuth and API key). */
+export function hasMultipleAuthMethods(provider: AuthProviderEntry): boolean {
+  return provider.supports_oauth && provider.env_var_name != null;
+}
+
+/** Determine the badge label and styling for a provider's current auth state. */
+export function activeAuthLabel(provider: AuthProviderEntry): { label: string; classes: string } {
+  const pref = provider.preferred_method;
+  const successClasses = 'border-status-success/40 bg-status-success/10 text-status-success';
+  const warningClasses = 'border-status-warning/45 bg-status-warning/10 text-status-warning';
+
+  // Determine effective auth status based on preference
+  if (pref === AuthMethod.OAuth || (!pref && provider.supports_oauth)) {
+    if (provider.oauth_status === 'connected') {
+      return { label: 'OAuth', classes: successClasses };
+    }
+    if (provider.oauth_status === 'expired') {
+      return { label: 'Expired', classes: warningClasses };
+    }
+  }
+  if (pref === AuthMethod.ApiKey || (!pref && !provider.supports_oauth)) {
+    if (provider.has_stored_api_key) {
+      return { label: 'API Key', classes: successClasses };
+    }
+  }
+  // EnvVar is no longer user-selectable, but honour legacy preference from backend
+  if (pref === AuthMethod.EnvVar) {
+    if (provider.has_env_api_key) {
+      return { label: 'Env', classes: successClasses };
+    }
+  }
+
+  // Fallback: check if anything is configured (any source)
+  if (provider.oauth_status === 'connected') {
+    return { label: 'OAuth', classes: successClasses };
+  }
+  if (provider.has_stored_api_key) {
+    return { label: 'API Key', classes: successClasses };
+  }
+  if (provider.has_env_api_key) {
+    return { label: 'Env', classes: successClasses };
+  }
+
+  return { label: 'Not configured', classes: 'border-surface-border/60 bg-surface-canvas/60 text-ui-muted' };
+}
+
+// ── Component ──
 
 export function ProviderAuthSwitcher({
   open,
@@ -43,22 +89,32 @@ export function ProviderAuthSwitcher({
   providers,
   oauthFlow,
   oauthResult,
+  apiTokenResult,
   onRequestProviders,
   onStartOAuthLogin,
   onCompleteOAuthLogin,
   onClearOAuthState,
   onDisconnectOAuth,
+  onSetApiToken,
+  onClearApiToken,
+  onSetAuthMethod,
+  onClearApiTokenResult,
 }: ProviderAuthSwitcherProps) {
   const [search, setSearch] = useState('');
   const [responseInput, setResponseInput] = useState('');
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [showApiKey, setShowApiKey] = useState(false);
   const [isCompleting, setIsCompleting] = useState(false);
   const [isDisconnecting, setIsDisconnecting] = useState(false);
+  const [isSavingApiKey, setIsSavingApiKey] = useState(false);
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
-  const [selectedConnectedProvider, setSelectedConnectedProvider] = useState<AuthProviderEntry | null>(null);
+  const [oauthPending, setOauthPending] = useState(false);
+  const [apiKeyPanelProvider, setApiKeyPanelProvider] = useState<AuthProviderEntry | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<AuthProviderEntry | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const callbackRef = useRef<HTMLInputElement>(null);
+  const apiKeyInputRef = useRef<HTMLInputElement>(null);
   const openAuthButtonRef = useRef<HTMLButtonElement>(null);
-  const disconnectButtonRef = useRef<HTMLButtonElement>(null);
   const disconnectInFlightProviderRef = useRef<string | null>(null);
   const { focusMainInput } = useUiStore();
   const isDevicePoll = oauthFlow?.flow_kind === 'device_poll';
@@ -68,37 +124,38 @@ export function ProviderAuthSwitcher({
     focusMainInput();
   };
 
+  // Reset state when opening
   useEffect(() => {
     if (!open) {
       return;
     }
     setSearch('');
     setResponseInput('');
+    setApiKeyInput('');
+    setShowApiKey(false);
     setIsCompleting(false);
     setIsDisconnecting(false);
+    setIsSavingApiKey(false);
     setCopyStatus('idle');
-    setSelectedConnectedProvider(null);
+    setOauthPending(false);
+    setApiKeyPanelProvider(null);
+    setSelectedProvider(null);
     disconnectInFlightProviderRef.current = null;
     onRequestProviders();
     window.setTimeout(() => inputRef.current?.focus(), 0);
   }, [open, onRequestProviders]);
 
+  // Focus auth button when OAuth flow starts
   useEffect(() => {
     if (!open || !oauthFlow) {
       return;
     }
-    setSelectedConnectedProvider(null);
+    setOauthPending(false);
     setCopyStatus('idle');
     window.setTimeout(() => openAuthButtonRef.current?.focus(), 0);
   }, [open, oauthFlow]);
 
-  useEffect(() => {
-    if (!open || oauthFlow || !selectedConnectedProvider) {
-      return;
-    }
-    window.setTimeout(() => disconnectButtonRef.current?.focus(), 0);
-  }, [open, oauthFlow, selectedConnectedProvider]);
-
+  // Handle OAuth result
   useEffect(() => {
     if (!oauthResult) {
       return;
@@ -111,26 +168,32 @@ export function ProviderAuthSwitcher({
       oauthResult.provider === disconnectInFlightProviderRef.current
     ) {
       setIsDisconnecting(false);
-      if (oauthResult.success) {
-        setSelectedConnectedProvider(null);
-        window.setTimeout(() => inputRef.current?.focus(), 0);
-      }
       disconnectInFlightProviderRef.current = null;
     }
   }, [oauthResult]);
 
+  // Handle API token result
   useEffect(() => {
-    if (!selectedConnectedProvider) {
+    if (!apiTokenResult) {
       return;
     }
-
-    const nextProvider = providers.find(
-      (provider) => provider.provider === selectedConnectedProvider.provider,
-    );
-    if (!nextProvider || nextProvider.status !== 'connected') {
-      setSelectedConnectedProvider(null);
+    setIsSavingApiKey(false);
+    if (apiTokenResult.success) {
+      setApiKeyInput('');
     }
-  }, [providers, selectedConnectedProvider]);
+  }, [apiTokenResult]);
+
+  // Update selected provider when providers list changes
+  useEffect(() => {
+    if (selectedProvider) {
+      const next = providers.find((p) => p.provider === selectedProvider.provider);
+      if (next) setSelectedProvider(next);
+    }
+    if (apiKeyPanelProvider) {
+      const next = providers.find((p) => p.provider === apiKeyPanelProvider.provider);
+      if (next) setApiKeyPanelProvider(next);
+    }
+  }, [providers, selectedProvider, apiKeyPanelProvider]);
 
   useEffect(() => {
     if (copyStatus === 'idle') {
@@ -157,27 +220,70 @@ export function ProviderAuthSwitcher({
   }
 
   const handleProviderSelect = (provider: AuthProviderEntry) => {
-    if (provider.status === 'connected') {
-      onClearOAuthState();
-      setSelectedConnectedProvider(provider);
-      setResponseInput('');
-      setIsCompleting(false);
-      setIsDisconnecting(false);
-      return;
-    }
+    onClearOAuthState();
+    onClearApiTokenResult();
+    setResponseInput('');
+    setApiKeyInput('');
+    setShowApiKey(false);
+    setIsCompleting(false);
+    setIsDisconnecting(false);
+    setIsSavingApiKey(false);
+    setApiKeyPanelProvider(null);
 
-    setSelectedConnectedProvider(null);
-    onStartOAuthLogin(provider.provider);
+    if (isOAuthOnly(provider) && provider.oauth_status !== 'connected') {
+      // OAuth-only, not connected → skip detail panel, start flow immediately
+      setSelectedProvider(provider);
+      setOauthPending(true);
+      onStartOAuthLogin(provider.provider);
+    } else if (isApiKeyOnly(provider)) {
+      // API-key-only → show dedicated API key panel directly
+      setSelectedProvider(provider);
+      setApiKeyPanelProvider(provider);
+    } else {
+      // Multi-method or connected OAuth-only → show detail panel
+      setSelectedProvider(provider);
+    }
   };
 
   const handleDisconnect = () => {
-    if (!selectedConnectedProvider || isDisconnecting) {
+    if (!selectedProvider || isDisconnecting) {
       return;
     }
-
     setIsDisconnecting(true);
-    disconnectInFlightProviderRef.current = selectedConnectedProvider.provider;
-    onDisconnectOAuth(selectedConnectedProvider.provider);
+    disconnectInFlightProviderRef.current = selectedProvider.provider;
+    onDisconnectOAuth(selectedProvider.provider);
+  };
+
+  const handleSaveApiKey = () => {
+    const target = apiKeyPanelProvider ?? selectedProvider;
+    if (!target || !apiKeyInput.trim() || isSavingApiKey) {
+      return;
+    }
+    setIsSavingApiKey(true);
+    onSetApiToken(target.provider, apiKeyInput.trim());
+  };
+
+  const handleClearApiKey = () => {
+    const target = apiKeyPanelProvider ?? selectedProvider;
+    if (!target) {
+      return;
+    }
+    onClearApiToken(target.provider);
+  };
+
+  const handleAuthMethodChange = (method: AuthMethod) => {
+    if (!selectedProvider) {
+      return;
+    }
+    onSetAuthMethod(selectedProvider.provider, method);
+
+    // When switching to API Key method on a multi-method provider,
+    // show the dedicated API key panel
+    if (method === AuthMethod.ApiKey) {
+      setApiKeyPanelProvider(selectedProvider);
+    } else {
+      setApiKeyPanelProvider(null);
+    }
   };
 
   const stopCommandActivationPropagation = (e: KeyboardEvent<HTMLElement>) => {
@@ -195,6 +301,35 @@ export function ProviderAuthSwitcher({
     'focus-visible:outline-none focus-visible:border-accent-primary/70 focus-visible:ring-2 focus-visible:ring-accent-primary/50 focus-visible:shadow-[0_0_14px_rgba(var(--accent-primary-rgb),0.35)]';
   const disconnectFocusClasses =
     'focus-visible:outline-none focus-visible:border-status-warning/70 focus-visible:ring-2 focus-visible:ring-status-warning/50 focus-visible:shadow-[0_0_14px_rgba(var(--status-warning-rgb),0.35)]';
+
+  // The provider for which the detail panel is shown (multi-method or connected OAuth-only)
+  const showDetailPanel =
+    selectedProvider &&
+    !oauthFlow &&
+    !oauthPending &&
+    !apiKeyPanelProvider &&
+    (hasMultipleAuthMethods(selectedProvider) ||
+      (isOAuthOnly(selectedProvider) && selectedProvider.oauth_status === 'connected'));
+
+  // Effective method for the detail panel (multi-method providers only)
+  const effectiveMethod = selectedProvider?.preferred_method ?? (
+    selectedProvider?.supports_oauth ? AuthMethod.OAuth : AuthMethod.ApiKey
+  );
+
+  // The active provider for API key panel (either dedicated or from detail panel switch)
+  const apiKeyTarget = apiKeyPanelProvider;
+
+  // Result message to display (from either OAuth or API token operations)
+  const resultMessage = (() => {
+    const activeProvider = apiKeyTarget ?? selectedProvider;
+    if (oauthResult && activeProvider && oauthResult.provider === activeProvider.provider) {
+      return oauthResult;
+    }
+    if (apiTokenResult && activeProvider && apiTokenResult.provider === activeProvider.provider) {
+      return apiTokenResult;
+    }
+    return null;
+  })();
 
   return (
     <>
@@ -223,7 +358,7 @@ export function ProviderAuthSwitcher({
               ref={inputRef}
               value={search}
               onValueChange={setSearch}
-              placeholder={`Authenticate provider (${providers.length})...`}
+              placeholder={`Manage provider authentication (${providers.length})...`}
               className="flex-1 bg-transparent text-ui-primary placeholder:text-ui-muted text-sm focus:outline-none"
             />
             <button
@@ -241,35 +376,204 @@ export function ProviderAuthSwitcher({
 
           <Command.List className="max-h-[260px] overflow-y-auto p-2 custom-scrollbar">
             <Command.Empty className="px-4 py-8 text-center text-sm text-ui-muted">
-              No OAuth providers found
+              No providers found
             </Command.Empty>
 
             <Command.Group className="mb-1">
-              {providers.map((provider) => (
-                <Command.Item
-                  key={provider.provider}
-                  value={`${provider.provider} ${provider.display_name}`}
-                  keywords={[provider.provider, provider.display_name, provider.status]}
-                  onSelect={() => handleProviderSelect(provider)}
-                  className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
-                >
-                  <div className="w-7 h-7 rounded-md border border-accent-primary/35 bg-accent-primary/10 flex items-center justify-center">
-                    <KeyRound className="w-3.5 h-3.5 text-accent-primary" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm text-ui-primary">{provider.display_name}</div>
-                    <div className="text-xs text-ui-muted">{provider.provider}</div>
-                  </div>
-                  <span
-                    className={`inline-flex items-center rounded border px-2 py-0.5 text-[10px] uppercase tracking-wider ${statusClasses(provider.status)}`}
+              {providers.map((provider) => {
+                const badge = activeAuthLabel(provider);
+                return (
+                  <Command.Item
+                    key={provider.provider}
+                    value={`${provider.provider} ${provider.display_name}`}
+                    keywords={[provider.provider, provider.display_name]}
+                    onSelect={() => handleProviderSelect(provider)}
+                    className={`flex items-center gap-3 px-3 py-2.5 rounded-lg border cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40 ${
+                      selectedProvider?.provider === provider.provider
+                        ? 'border-accent-primary/35 bg-accent-primary/10'
+                        : 'border-surface-border/20'
+                    }`}
                   >
-                    {statusLabel(provider.status)}
-                  </span>
-                </Command.Item>
-              ))}
+                    <div className="w-7 h-7 rounded-md border border-accent-primary/35 bg-accent-primary/10 flex items-center justify-center">
+                      <KeyRound className="w-3.5 h-3.5 text-accent-primary" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm text-ui-primary">{provider.display_name}</div>
+                      <div className="text-xs text-ui-muted">{provider.provider}</div>
+                    </div>
+                    <span
+                      className={`inline-flex items-center rounded border px-2 py-0.5 text-[10px] uppercase tracking-wider ${badge.classes}`}
+                    >
+                      {badge.label}
+                    </span>
+                  </Command.Item>
+                );
+              })}
             </Command.Group>
           </Command.List>
 
+          {/* ── Provider Detail Panel (multi-method selector OR connected OAuth-only status) ── */}
+          {showDetailPanel && selectedProvider && (
+            <div className="border-t border-surface-border/60 bg-surface-canvas/40 px-4 py-3 space-y-3">
+              <div className="text-sm text-ui-primary">
+                Configure: <span className="text-accent-primary">{selectedProvider.display_name}</span>
+              </div>
+
+              {/* Auth method selector — only for multi-method providers */}
+              {hasMultipleAuthMethods(selectedProvider) && (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs text-ui-muted mr-1">Method:</span>
+                  <button
+                    type="button"
+                    onKeyDown={stopCommandActivationPropagation}
+                    onClick={() => handleAuthMethodChange(AuthMethod.OAuth)}
+                    className={`px-2.5 py-1 rounded-md text-xs border transition-all ${oauthActionFocusClasses} ${
+                      effectiveMethod === AuthMethod.OAuth
+                        ? 'border-accent-primary/60 bg-accent-primary/20 text-accent-primary'
+                        : 'border-surface-border/40 bg-surface-elevated/40 text-ui-muted hover:text-ui-secondary hover:border-surface-border/60'
+                    }`}
+                  >
+                    OAuth
+                  </button>
+                  <button
+                    type="button"
+                    onKeyDown={stopCommandActivationPropagation}
+                    onClick={() => handleAuthMethodChange(AuthMethod.ApiKey)}
+                    className={`px-2.5 py-1 rounded-md text-xs border transition-all ${oauthActionFocusClasses} ${
+                      effectiveMethod === AuthMethod.ApiKey
+                        ? 'border-accent-primary/60 bg-accent-primary/20 text-accent-primary'
+                        : 'border-surface-border/40 bg-surface-elevated/40 text-ui-muted hover:text-ui-secondary hover:border-surface-border/60'
+                    }`}
+                  >
+                    API Key
+                  </button>
+                </div>
+              )}
+
+              {/* OAuth section (inline in detail panel for multi-method, or for connected OAuth-only) */}
+              {(effectiveMethod === AuthMethod.OAuth || isOAuthOnly(selectedProvider)) &&
+                selectedProvider.supports_oauth && (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="text-ui-muted">Status:</span>
+                      {selectedProvider.oauth_status === 'connected' && (
+                        <span className="text-status-success">Connected</span>
+                      )}
+                      {selectedProvider.oauth_status === 'expired' && (
+                        <span className="text-status-warning">Expired</span>
+                      )}
+                      {selectedProvider.oauth_status === 'not_authenticated' && (
+                        <span className="text-ui-muted">Not connected</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {selectedProvider.oauth_status === 'connected' ? (
+                        <button
+                          type="button"
+                          onKeyDown={stopCommandActivationPropagation}
+                          disabled={isDisconnecting}
+                          onClick={handleDisconnect}
+                          className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-all ${disconnectFocusClasses} ${
+                            isDisconnecting
+                              ? 'border-surface-border text-ui-muted cursor-not-allowed bg-surface-elevated/40'
+                              : 'border-status-warning/45 bg-status-warning/10 text-status-warning hover:bg-status-warning/20'
+                          }`}
+                        >
+                          {isDisconnecting ? 'Disconnecting...' : 'Disconnect'}
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onKeyDown={stopCommandActivationPropagation}
+                          onClick={() => {
+                            onClearApiTokenResult();
+                            onStartOAuthLogin(selectedProvider.provider);
+                          }}
+                          className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-accent-primary/40 text-accent-primary text-xs hover:bg-accent-primary/10 transition-all ${oauthActionFocusClasses}`}
+                        >
+                          {selectedProvider.oauth_status === 'expired' ? 'Reconnect' : 'Connect'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+            </div>
+          )}
+
+          {/* ── Dedicated API Key Panel ── */}
+          {apiKeyTarget && !oauthFlow && (
+            <div className="border-t border-surface-border/60 bg-surface-canvas/40 px-4 py-3 space-y-3">
+              <div className="text-sm text-ui-primary">
+                API Key for <span className="text-accent-primary">{apiKeyTarget.display_name}</span>
+                {apiKeyTarget.env_var_name && (
+                  <code className="ml-2 px-1.5 py-0.5 rounded bg-surface-canvas border border-surface-border text-ui-muted text-[10px] font-mono">
+                    {apiKeyTarget.env_var_name}
+                  </code>
+                )}
+              </div>
+
+              {apiKeyTarget.has_stored_api_key && (
+                <div className="flex items-center gap-2 text-xs">
+                  <span className="text-status-success">API key stored in keychain</span>
+                </div>
+              )}
+
+              <div className="flex items-center gap-2">
+                <div className="relative flex-1">
+                  <input
+                    ref={apiKeyInputRef}
+                    value={apiKeyInput}
+                    onChange={(e) => setApiKeyInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      e.stopPropagation();
+                      if (e.key === 'Enter' && apiKeyInput.trim() && !isSavingApiKey) {
+                        handleSaveApiKey();
+                      }
+                    }}
+                    type={showApiKey ? 'text' : 'password'}
+                    placeholder={apiKeyTarget.has_stored_api_key ? 'Enter new key to update...' : 'Enter API key...'}
+                    className="w-full rounded-lg border border-surface-border bg-surface-elevated/70 px-3 py-2 pr-8 text-xs text-ui-primary placeholder:text-ui-muted focus:border-accent-primary focus:outline-none font-mono"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowApiKey(!showApiKey)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-ui-muted hover:text-ui-secondary transition-colors"
+                    tabIndex={-1}
+                  >
+                    {showApiKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onKeyDown={stopCommandActivationPropagation}
+                  disabled={!apiKeyInput.trim() || isSavingApiKey}
+                  onClick={handleSaveApiKey}
+                  className={`px-3 py-2 rounded-lg text-xs font-medium transition-all ${oauthActionFocusClasses} ${
+                    !apiKeyInput.trim() || isSavingApiKey
+                      ? 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
+                      : 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30'
+                  }`}
+                >
+                  {isSavingApiKey ? 'Saving...' : 'Save'}
+                </button>
+              </div>
+
+              {apiKeyTarget.has_stored_api_key && (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onKeyDown={stopCommandActivationPropagation}
+                    onClick={handleClearApiKey}
+                    className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-all ${disconnectFocusClasses} border-status-warning/45 bg-status-warning/10 text-status-warning hover:bg-status-warning/20`}
+                  >
+                    Clear Stored Key
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── OAuth Flow Panel (active flow in progress) ── */}
           {oauthFlow && (
             <div className="border-t border-surface-border/60 bg-surface-canvas/40 px-4 py-3 space-y-3">
               <div className="text-sm text-ui-primary">
@@ -372,43 +676,16 @@ export function ProviderAuthSwitcher({
             </div>
           )}
 
-          {!oauthFlow && selectedConnectedProvider && (
-            <div className="border-t border-surface-border/60 bg-surface-canvas/40 px-4 py-3 space-y-3">
-              <div className="text-sm text-ui-primary">
-                Manage Connection for{' '}
-                <span className="text-accent-primary">{selectedConnectedProvider.display_name}</span>
-              </div>
-              <div className="text-xs text-ui-muted">
-                Disconnect removes stored OAuth credentials for this provider from your local keychain.
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  ref={disconnectButtonRef}
-                  type="button"
-                  onKeyDown={stopCommandActivationPropagation}
-                  disabled={isDisconnecting}
-                  onClick={handleDisconnect}
-                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-all ${disconnectFocusClasses} ${
-                    isDisconnecting
-                      ? 'border-surface-border text-ui-muted cursor-not-allowed bg-surface-elevated/40'
-                      : 'border-status-warning/45 bg-status-warning/10 text-status-warning hover:bg-status-warning/20'
-                  }`}
-                >
-                  {isDisconnecting ? 'Disconnecting...' : 'Disconnect'}
-                </button>
-              </div>
-            </div>
-          )}
-
-          {oauthResult && (
+          {/* ── Result message ── */}
+          {resultMessage && (
             <div
               className={`border-t px-4 py-3 text-xs ${
-                oauthResult.success
+                resultMessage.success
                   ? 'border-status-success/40 bg-status-success/10 text-status-success'
                   : 'border-status-warning/40 bg-status-warning/10 text-status-warning'
               }`}
             >
-              {oauthResult.message}
+              {resultMessage.message}
             </div>
           )}
         </Command>

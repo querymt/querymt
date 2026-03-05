@@ -39,6 +39,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
  * - workspaceIndexStatus
  * - allModels, sessionsByAgent, agentModels, refreshAllModels, setSessionModel
  * - authProviders, oauthFlow, oauthResult, requestAuthProviders, startOAuthLogin, completeOAuthLogin, disconnectOAuth
+ * - apiTokenResult, setApiToken, clearApiToken, setAuthMethodPref, clearApiTokenResult
  * - llmConfigCache, requestLlmConfig
  * - sessionLimits
  * - session subscription: subscribeSession, unsubscribeSession

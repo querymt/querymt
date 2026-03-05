@@ -396,11 +396,29 @@ export enum OAuthStatus {
 	Connected = "connected",
 }
 
-/** OAuth-capable provider entry for dashboard auth UI. */
+/** Preferred authentication method for a provider. */
+export enum AuthMethod {
+	OAuth = "oauth",
+	ApiKey = "api_key",
+	EnvVar = "env_var",
+}
+
+/** Provider entry for dashboard auth UI (supports both OAuth and API token auth). */
 export interface AuthProviderEntry {
 	provider: string;
 	display_name: string;
-	status: OAuthStatus;
+	/** OAuth status (`null` if provider has no OAuth support) */
+	oauth_status?: OAuthStatus;
+	/** Whether a manually-entered API key is stored in the keyring */
+	has_stored_api_key: boolean;
+	/** Whether the environment variable for this provider is set */
+	has_env_api_key: boolean;
+	/** The environment variable name for this provider (e.g. "OPENAI_API_KEY") */
+	env_var_name?: string;
+	/** Whether this provider supports OAuth flows */
+	supports_oauth: boolean;
+	/** User's preferred auth method (`null` = auto/default) */
+	preferred_method?: AuthMethod;
 }
 
 /** Location of a function in source code */
@@ -874,6 +892,20 @@ export type UiClientMessage =
 	provider: string;
 	model_id: string;
 }}
+	/** Set an API token for a provider (stored in SecretStore) */
+	| { type: "set_api_token", data: {
+	provider: string;
+	api_key: string;
+}}
+	/** Clear a stored API token for a provider */
+	| { type: "clear_api_token", data: {
+	provider: string;
+}}
+	/** Set the preferred auth method for a provider */
+	| { type: "set_auth_method", data: {
+	provider: string;
+	method: AuthMethod;
+}}
 	/** Trigger an update of all OCI provider plugins. */
 	| { type: "update_plugins", data?: undefined };
 
@@ -1038,5 +1070,11 @@ export type UiServerMessage =
 	/** All OCI plugin updates have completed. */
 	| { type: "plugin_update_complete", data: {
 	results: PluginUpdateResult[];
+}}
+	/** Result of setting/clearing an API token */
+	| { type: "api_token_result", data: {
+	provider: string;
+	success: boolean;
+	message: string;
 }};
 

@@ -3,15 +3,17 @@
 //! - `handle_list_all_models` — fetch all models from all providers (with moka cache)
 //! - `handle_get_recent_models` — recent models from ViewStore
 //! - `handle_set_session_model` — update the model for a specific session
+//! - `handle_list_auth_providers` — list all providers with auth status (OAuth + API key)
+//! - `handle_set_api_token` / `handle_clear_api_token` / `handle_set_auth_method` — API token management
 //! - `fetch_all_models` / `resolve_provider_api_key` / `resolve_base_url_for_provider` — helpers
 
 use super::super::ServerState;
 use super::super::connection::{send_error, send_message};
 #[cfg(feature = "oauth")]
-use super::super::messages::AuthProviderEntry;
-#[cfg(feature = "oauth")]
 use super::super::messages::OAuthStatus;
-use super::super::messages::{ModelEntry, ProviderCapabilityEntry, UiServerMessage};
+use super::super::messages::{
+    AuthMethod, AuthProviderEntry, ModelEntry, ProviderCapabilityEntry, UiServerMessage,
+};
 use super::session_ops::ensure_session_loaded;
 use crate::session::store::CustomModel;
 #[cfg(feature = "remote")]
@@ -24,7 +26,6 @@ use querymt_provider_common::{
     download_hf_gguf_with_progress, list_cached_hf_gguf_models, parse_gguf_metadata,
 };
 use serde_json::Value;
-#[cfg(feature = "oauth")]
 use std::collections::HashSet;
 use std::collections::HashSet as StdHashSet;
 use time::format_description::well_known::Rfc3339;
@@ -62,76 +63,308 @@ pub(super) fn resolve_model_for_provider(state: &ServerState, provider: &str) ->
     })
 }
 
-/// Resolve API key for a provider from OAuth token store or environment variable.
+/// Resolve API key for a provider from OAuth token store, stored API key, or environment variable.
+///
+/// OAuth resolution does not require `api_key_name()` — it uses the provider name
+/// to look up tokens. This allows OAuth-only providers (like Codex) that return
+/// `api_key_name() = None` to still resolve credentials.
 async fn resolve_provider_api_key(
     provider: &str,
     factory: &dyn HTTPLLMProviderFactory,
 ) -> Option<String> {
-    let api_key_name = factory.api_key_name()?;
+    let api_key_name = factory.api_key_name();
+
+    // OAuth doesn't depend on api_key_name
     #[cfg(feature = "oauth")]
     {
         if let Ok(token) = crate::auth::get_or_refresh_token(provider).await {
             return Some(token);
         }
     }
-    std::env::var(api_key_name).ok()
+
+    // Stored key and env var require api_key_name
+    let name = api_key_name?;
+
+    // Check for stored API key in keyring (set via dashboard UI)
+    if let Some(key) = crate::auth::SecretStore::new()
+        .ok()
+        .and_then(|s| s.get(&name))
+    {
+        return Some(key);
+    }
+    std::env::var(name).ok()
 }
 
 // ── Public handlers ───────────────────────────────────────────────────────────
 
-/// Handle OAuth provider listing for dashboard auth UI.
+/// Handle provider listing for dashboard auth UI.
+///
+/// Lists ALL registered providers with their full auth status:
+/// - OAuth connection status (if the provider supports OAuth)
+/// - Whether a manually-stored API key exists in the keyring
+/// - Whether the environment variable is set
+/// - The user's preferred auth method
 pub async fn handle_list_auth_providers(state: &ServerState, tx: &mpsc::Sender<String>) {
-    #[cfg(feature = "oauth")]
-    {
-        let registry = state.agent.config.provider.plugin_registry();
+    let registry = state.agent.config.provider.plugin_registry();
 
-        let mut seen = HashSet::new();
-        let mut providers = Vec::new();
+    let mut seen = HashSet::new();
+    let mut providers = Vec::new();
 
-        let store = crate::auth::SecretStore::new().ok();
+    let store = crate::auth::SecretStore::new().ok();
 
-        for cfg in &registry.config.providers {
-            if !seen.insert(cfg.name.clone()) {
-                continue;
-            }
-
-            let provider_name = cfg.name.clone();
-            let oauth_provider = match crate::auth::get_oauth_provider(&provider_name, None) {
-                Ok(provider) => provider,
-                Err(_) => continue,
-            };
-
-            let status = match store
-                .as_ref()
-                .and_then(|s| s.get_oauth_tokens(&provider_name))
-            {
-                Some(tokens) if tokens.is_expired() => OAuthStatus::Expired,
-                Some(_) => OAuthStatus::Connected,
-                None => OAuthStatus::NotAuthenticated,
-            };
-
-            providers.push(AuthProviderEntry {
-                provider: provider_name,
-                display_name: oauth_provider.display_name().to_string(),
-                status,
-            });
+    for cfg in &registry.config.providers {
+        if !seen.insert(cfg.name.clone()) {
+            continue;
         }
 
-        providers.sort_by(|a, b| a.provider.cmp(&b.provider));
+        let provider_name = cfg.name.clone();
 
-        let _ = send_message(tx, UiServerMessage::AuthProviders { providers }).await;
+        // Resolve factory to get api_key_name and display name
+        let factory = registry.get(&provider_name).await;
+        let env_var_name = factory
+            .as_ref()
+            .and_then(|f| f.as_http())
+            .and_then(|h| h.api_key_name());
+
+        // Check OAuth support
+        #[cfg(feature = "oauth")]
+        let (supports_oauth, oauth_status, display_name_from_oauth) = {
+            match crate::auth::get_oauth_provider(&provider_name, None) {
+                Ok(oauth_provider) => {
+                    let status = match store
+                        .as_ref()
+                        .and_then(|s| s.get_oauth_tokens(&provider_name))
+                    {
+                        Some(tokens) if tokens.is_expired() => Some(OAuthStatus::Expired),
+                        Some(_) => Some(OAuthStatus::Connected),
+                        None => Some(OAuthStatus::NotAuthenticated),
+                    };
+                    (
+                        true,
+                        status,
+                        Some(oauth_provider.display_name().to_string()),
+                    )
+                }
+                Err(_) => (false, None, None),
+            }
+        };
+        #[cfg(not(feature = "oauth"))]
+        let (supports_oauth, oauth_status, display_name_from_oauth): (
+            bool,
+            Option<OAuthStatus>,
+            Option<String>,
+        ) = (false, None, None);
+
+        // Check for stored API key in keyring
+        let has_stored_api_key = env_var_name
+            .as_ref()
+            .and_then(|name| store.as_ref().and_then(|s| s.get(name)))
+            .is_some();
+
+        // Check for env var
+        let has_env_api_key = env_var_name
+            .as_ref()
+            .is_some_and(|name| std::env::var(name).is_ok());
+
+        // Get preferred auth method from store
+        let preferred_method = store
+            .as_ref()
+            .and_then(|s| s.get(&format!("auth_method_{}", provider_name)))
+            .and_then(|v| v.parse::<AuthMethod>().ok());
+
+        // Use OAuth display name if available, otherwise capitalize the provider name
+        let display_name = display_name_from_oauth.unwrap_or_else(|| {
+            let mut chars = provider_name.chars();
+            match chars.next() {
+                None => provider_name.clone(),
+                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+            }
+        });
+
+        providers.push(AuthProviderEntry {
+            provider: provider_name,
+            display_name,
+            oauth_status,
+            has_stored_api_key,
+            has_env_api_key,
+            env_var_name: env_var_name.map(|s| s.to_string()),
+            supports_oauth,
+            preferred_method,
+        });
     }
 
-    #[cfg(not(feature = "oauth"))]
-    {
-        let _ = send_message(
-            tx,
-            UiServerMessage::AuthProviders {
-                providers: Vec::new(),
-            },
-        )
-        .await;
-    }
+    providers.sort_by(|a, b| a.provider.cmp(&b.provider));
+
+    let _ = send_message(tx, UiServerMessage::AuthProviders { providers }).await;
+}
+
+/// Handle setting an API token for a provider.
+///
+/// Stores the token in the system keyring under the provider's env var name
+/// and invalidates the model cache so credentials are re-resolved.
+pub async fn handle_set_api_token(
+    state: &ServerState,
+    provider: &str,
+    api_key: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    let registry = state.agent.config.provider.plugin_registry();
+    let factory = registry.get(provider).await;
+
+    let env_var_name = factory
+        .as_ref()
+        .and_then(|f| f.as_http())
+        .and_then(|h| h.api_key_name());
+
+    let result = match env_var_name {
+        Some(name) => {
+            let mut store = match crate::auth::SecretStore::new() {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = send_message(
+                        tx,
+                        UiServerMessage::ApiTokenResult {
+                            provider: provider.to_string(),
+                            success: false,
+                            message: format!("Failed to open secret store: {}", e),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            match store.set(&name, api_key) {
+                Ok(()) => {
+                    // Invalidate model cache so new credentials take effect
+                    state.model_cache.invalidate(&()).await;
+                    Ok(format!("API key stored for {} ({})", provider, name))
+                }
+                Err(e) => Err(format!("Failed to store API key: {}", e)),
+            }
+        }
+        None => Err(format!(
+            "Provider '{}' does not have a known API key name",
+            provider
+        )),
+    };
+
+    let (success, message) = match result {
+        Ok(msg) => (true, msg),
+        Err(msg) => (false, msg),
+    };
+
+    let _ = send_message(
+        tx,
+        UiServerMessage::ApiTokenResult {
+            provider: provider.to_string(),
+            success,
+            message,
+        },
+    )
+    .await;
+
+    // Refresh auth providers list so UI updates
+    handle_list_auth_providers(state, tx).await;
+}
+
+/// Handle clearing an API token for a provider.
+pub async fn handle_clear_api_token(
+    state: &ServerState,
+    provider: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    let registry = state.agent.config.provider.plugin_registry();
+    let factory = registry.get(provider).await;
+
+    let env_var_name = factory
+        .as_ref()
+        .and_then(|f| f.as_http())
+        .and_then(|h| h.api_key_name());
+
+    let result = match env_var_name {
+        Some(name) => {
+            let mut store = match crate::auth::SecretStore::new() {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = send_message(
+                        tx,
+                        UiServerMessage::ApiTokenResult {
+                            provider: provider.to_string(),
+                            success: false,
+                            message: format!("Failed to open secret store: {}", e),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            match store.delete(&name) {
+                Ok(()) => {
+                    state.model_cache.invalidate(&()).await;
+                    Ok(format!("API key cleared for {} ({})", provider, name))
+                }
+                Err(e) => Err(format!("Failed to clear API key: {}", e)),
+            }
+        }
+        None => Err(format!(
+            "Provider '{}' does not have a known API key name",
+            provider
+        )),
+    };
+
+    let (success, message) = match result {
+        Ok(msg) => (true, msg),
+        Err(msg) => (false, msg),
+    };
+
+    let _ = send_message(
+        tx,
+        UiServerMessage::ApiTokenResult {
+            provider: provider.to_string(),
+            success,
+            message,
+        },
+    )
+    .await;
+
+    handle_list_auth_providers(state, tx).await;
+}
+
+/// Handle setting the preferred auth method for a provider.
+pub async fn handle_set_auth_method(
+    state: &ServerState,
+    provider: &str,
+    method: &AuthMethod,
+    tx: &mpsc::Sender<String>,
+) {
+    let key = format!("auth_method_{}", provider);
+
+    let result = match crate::auth::SecretStore::new() {
+        Ok(mut store) => match store.set(&key, method.to_string()) {
+            Ok(()) => Ok(format!("Auth method set to '{}' for {}", method, provider)),
+            Err(e) => Err(format!("Failed to set auth method: {}", e)),
+        },
+        Err(e) => Err(format!("Failed to open secret store: {}", e)),
+    };
+
+    let (success, message) = match result {
+        Ok(msg) => (true, msg),
+        Err(msg) => (false, msg),
+    };
+
+    let _ = send_message(
+        tx,
+        UiServerMessage::ApiTokenResult {
+            provider: provider.to_string(),
+            success,
+            message,
+        },
+    )
+    .await;
+
+    handle_list_auth_providers(state, tx).await;
 }
 
 /// Handle model listing request using moka cache.

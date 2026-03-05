@@ -60,6 +60,7 @@
           llvmPackages.libclang
           rust-bindgen
           pkg-config
+          typeshare
           libgcc
           gdb
         ];
