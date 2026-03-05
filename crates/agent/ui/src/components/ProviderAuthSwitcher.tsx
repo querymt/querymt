@@ -102,7 +102,341 @@ function resolveEffectiveAuth(provider: AuthProviderEntry): AuthMethod | 'expire
   return null;
 }
 
-// ── Component ──
+// ── Shared focus class constants ──
+
+const FOCUS_PRIMARY =
+  'focus-visible:outline-none focus-visible:border-accent-primary/70 focus-visible:ring-2 focus-visible:ring-accent-primary/50 focus-visible:shadow-[0_0_14px_rgba(var(--accent-primary-rgb),0.35)]';
+const FOCUS_WARNING =
+  'focus-visible:outline-none focus-visible:border-status-warning/70 focus-visible:ring-2 focus-visible:ring-status-warning/50 focus-visible:shadow-[0_0_14px_rgba(var(--status-warning-rgb),0.35)]';
+
+// ── Sub-components ──
+
+/** Auth method selector + inline OAuth status for multi-method / connected OAuth-only providers. */
+function ProviderDetailPanel({
+  provider,
+  effectiveMethod,
+  isDisconnecting,
+  onAuthMethodChange,
+  onStartOAuth,
+  onDisconnect,
+  onClearApiTokenResult,
+  onStopPropagation,
+}: {
+  provider: AuthProviderEntry;
+  effectiveMethod: AuthMethod;
+  isDisconnecting: boolean;
+  onAuthMethodChange: (method: AuthMethod) => void;
+  onStartOAuth: () => void;
+  onDisconnect: () => void;
+  onClearApiTokenResult: () => void;
+  onStopPropagation: (e: KeyboardEvent<HTMLElement>) => void;
+}) {
+  return (
+    <div className="border-t border-surface-border/60 bg-surface-canvas/40 px-4 py-3 space-y-3">
+      <div className="text-sm text-ui-primary">
+        Configure: <span className="text-accent-primary">{provider.display_name}</span>
+      </div>
+
+      {/* Auth method selector — only for multi-method providers */}
+      {hasMultipleAuthMethods(provider) && (
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs text-ui-muted mr-1">Method:</span>
+          <button
+            type="button"
+            onKeyDown={onStopPropagation}
+            onClick={() => onAuthMethodChange(AuthMethod.OAuth)}
+            className={`px-2.5 py-1 rounded-md text-xs border transition-all ${FOCUS_PRIMARY} ${
+              effectiveMethod === AuthMethod.OAuth
+                ? 'border-accent-primary/60 bg-accent-primary/20 text-accent-primary'
+                : 'border-surface-border/40 bg-surface-elevated/40 text-ui-muted hover:text-ui-secondary hover:border-surface-border/60'
+            }`}
+          >
+            OAuth
+          </button>
+          <button
+            type="button"
+            onKeyDown={onStopPropagation}
+            onClick={() => onAuthMethodChange(AuthMethod.ApiKey)}
+            className={`px-2.5 py-1 rounded-md text-xs border transition-all ${FOCUS_PRIMARY} ${
+              effectiveMethod === AuthMethod.ApiKey
+                ? 'border-accent-primary/60 bg-accent-primary/20 text-accent-primary'
+                : 'border-surface-border/40 bg-surface-elevated/40 text-ui-muted hover:text-ui-secondary hover:border-surface-border/60'
+            }`}
+          >
+            API Key
+          </button>
+        </div>
+      )}
+
+      {/* OAuth section (inline in detail panel for multi-method, or for connected OAuth-only) */}
+      {(effectiveMethod === AuthMethod.OAuth || isOAuthOnly(provider)) &&
+        provider.supports_oauth && (
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-ui-muted">Status:</span>
+              {provider.oauth_status === 'connected' && (
+                <span className="text-status-success">Connected</span>
+              )}
+              {provider.oauth_status === 'expired' && (
+                <span className="text-status-warning">Expired</span>
+              )}
+              {provider.oauth_status === 'not_authenticated' && (
+                <span className="text-ui-muted">Not connected</span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              {provider.oauth_status === 'connected' ? (
+                <button
+                  type="button"
+                  onKeyDown={onStopPropagation}
+                  disabled={isDisconnecting}
+                  onClick={onDisconnect}
+                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-all ${FOCUS_WARNING} ${
+                    isDisconnecting
+                      ? 'border-surface-border text-ui-muted cursor-not-allowed bg-surface-elevated/40'
+                      : 'border-status-warning/45 bg-status-warning/10 text-status-warning hover:bg-status-warning/20'
+                  }`}
+                >
+                  {isDisconnecting ? 'Disconnecting...' : 'Disconnect'}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onKeyDown={onStopPropagation}
+                  onClick={() => {
+                    onClearApiTokenResult();
+                    onStartOAuth();
+                  }}
+                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-accent-primary/40 text-accent-primary text-xs hover:bg-accent-primary/10 transition-all ${FOCUS_PRIMARY}`}
+                >
+                  {provider.oauth_status === 'expired' ? 'Reconnect' : 'Connect'}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+    </div>
+  );
+}
+
+/** Dedicated API key input / save / clear panel. */
+function ApiKeyPanel({
+  provider,
+  apiKeyInput,
+  onApiKeyInputChange,
+  showApiKey,
+  onToggleShowApiKey,
+  isSaving,
+  onSave,
+  onClear,
+  onStopPropagation,
+  inputRef,
+}: {
+  provider: AuthProviderEntry;
+  apiKeyInput: string;
+  onApiKeyInputChange: (value: string) => void;
+  showApiKey: boolean;
+  onToggleShowApiKey: () => void;
+  isSaving: boolean;
+  onSave: () => void;
+  onClear: () => void;
+  onStopPropagation: (e: KeyboardEvent<HTMLElement>) => void;
+  inputRef: React.RefObject<HTMLInputElement>;
+}) {
+  return (
+    <div className="border-t border-surface-border/60 bg-surface-canvas/40 px-4 py-3 space-y-3">
+      <div className="text-sm text-ui-primary">
+        API Key for <span className="text-accent-primary">{provider.display_name}</span>
+        {provider.env_var_name && (
+          <code className="ml-2 px-1.5 py-0.5 rounded bg-surface-canvas border border-surface-border text-ui-muted text-[10px] font-mono">
+            {provider.env_var_name}
+          </code>
+        )}
+      </div>
+
+      {provider.has_stored_api_key && (
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-status-success">API key stored in keychain</span>
+        </div>
+      )}
+
+      <div className="flex items-center gap-2">
+        <div className="relative flex-1">
+          <input
+            ref={inputRef}
+            value={apiKeyInput}
+            onChange={(e) => onApiKeyInputChange(e.target.value)}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === 'Enter' && apiKeyInput.trim() && !isSaving) {
+                onSave();
+              }
+            }}
+            type={showApiKey ? 'text' : 'password'}
+            placeholder={provider.has_stored_api_key ? 'Enter new key to update...' : 'Enter API key...'}
+            className="w-full rounded-lg border border-surface-border bg-surface-elevated/70 px-3 py-2 pr-8 text-xs text-ui-primary placeholder:text-ui-muted focus:border-accent-primary focus:outline-none font-mono"
+          />
+          <button
+            type="button"
+            onClick={onToggleShowApiKey}
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-ui-muted hover:text-ui-secondary transition-colors"
+            tabIndex={-1}
+          >
+            {showApiKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+          </button>
+        </div>
+        <button
+          type="button"
+          onKeyDown={onStopPropagation}
+          disabled={!apiKeyInput.trim() || isSaving}
+          onClick={onSave}
+          className={`px-3 py-2 rounded-lg text-xs font-medium transition-all ${FOCUS_PRIMARY} ${
+            !apiKeyInput.trim() || isSaving
+              ? 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
+              : 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30'
+          }`}
+        >
+          {isSaving ? 'Saving...' : 'Save'}
+        </button>
+      </div>
+
+      {provider.has_stored_api_key && (
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onKeyDown={onStopPropagation}
+            onClick={onClear}
+            className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-all ${FOCUS_WARNING} border-status-warning/45 bg-status-warning/10 text-status-warning hover:bg-status-warning/20`}
+          >
+            Clear Stored Key
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Active OAuth flow panel (authorization URL, callback input, device poll). */
+function OAuthFlowPanel({
+  oauthFlow,
+  isCompleting,
+  responseInput,
+  copyStatus,
+  onResponseInputChange,
+  onComplete,
+  onCopyUrl,
+  onStopPropagation,
+  openAuthButtonRef,
+  callbackRef,
+}: {
+  oauthFlow: OAuthFlowState;
+  isCompleting: boolean;
+  responseInput: string;
+  copyStatus: 'idle' | 'copied' | 'error';
+  onResponseInputChange: (value: string) => void;
+  onComplete: (response: string) => void;
+  onCopyUrl: () => void;
+  onStopPropagation: (e: KeyboardEvent<HTMLElement>) => void;
+  openAuthButtonRef: React.RefObject<HTMLButtonElement>;
+  callbackRef: React.RefObject<HTMLInputElement>;
+}) {
+  const isDevicePoll = oauthFlow.flow_kind === 'device_poll';
+
+  return (
+    <div className="border-t border-surface-border/60 bg-surface-canvas/40 px-4 py-3 space-y-3">
+      <div className="text-sm text-ui-primary">
+        Continue OAuth for <span className="text-accent-primary">{oauthFlow.provider}</span>
+      </div>
+      <div className="text-xs text-ui-muted">
+        {isDevicePoll
+          ? 'Open the device authorization page (URL includes your device code), approve access, then click Check Authentication.'
+          : 'Open the authorization page, approve access, then paste the callback URL or authorization code below.'}
+      </div>
+
+      <div className="flex items-center gap-2">
+        <button
+          ref={openAuthButtonRef}
+          type="button"
+          onKeyDown={onStopPropagation}
+          onClick={() => window.open(oauthFlow.authorization_url, '_blank', 'noopener,noreferrer')}
+          className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-accent-primary/40 text-accent-primary text-xs hover:bg-accent-primary/10 transition-all ${FOCUS_PRIMARY}`}
+        >
+          <ExternalLink className="w-3.5 h-3.5" />
+          Open Authorization Page
+        </button>
+
+        <button
+          type="button"
+          onKeyDown={onStopPropagation}
+          onClick={onCopyUrl}
+          className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-accent-primary/40 text-accent-primary text-xs hover:bg-accent-primary/10 transition-all ${FOCUS_PRIMARY}`}
+        >
+          <Copy className="w-3.5 h-3.5" />
+          {copyStatus === 'copied'
+            ? 'Copied!'
+            : copyStatus === 'error'
+              ? 'Copy failed'
+              : isDevicePoll
+                ? 'Copy Device Login URL'
+                : 'Copy Authorization URL'}
+        </button>
+
+        {isDevicePoll && (
+          <button
+            type="button"
+            onKeyDown={onStopPropagation}
+            disabled={isCompleting}
+            onClick={() => onComplete('')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${FOCUS_PRIMARY} ${
+              isCompleting
+                ? 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
+                : 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30'
+            }`}
+          >
+            {isCompleting ? 'Checking...' : 'Check Authentication'}
+          </button>
+        )}
+      </div>
+
+      {!isDevicePoll && (
+        <div className="flex items-center gap-2">
+          <input
+            ref={callbackRef}
+            value={responseInput}
+            onChange={(e) => onResponseInputChange(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                e.stopPropagation();
+              }
+
+              if (e.key === 'Enter' && responseInput.trim() && !isCompleting) {
+                onComplete(responseInput.trim());
+              }
+            }}
+            placeholder="Paste callback URL or code"
+            className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-3 py-2 text-xs text-ui-primary placeholder:text-ui-muted focus:border-accent-primary focus:outline-none"
+          />
+          <button
+            type="button"
+            onKeyDown={onStopPropagation}
+            disabled={!responseInput.trim() || isCompleting}
+            onClick={() => onComplete(responseInput.trim())}
+            className={`px-3 py-2 rounded-lg text-xs font-medium transition-all ${FOCUS_PRIMARY} ${
+              !responseInput.trim() || isCompleting
+                ? 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
+                : 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30'
+            }`}
+          >
+            {isCompleting ? 'Completing...' : 'Complete'}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Main component ──
 
 export function ProviderAuthSwitcher({
   open,
@@ -138,7 +472,6 @@ export function ProviderAuthSwitcher({
   const openAuthButtonRef = useRef<HTMLButtonElement>(null);
   const disconnectInFlightProviderRef = useRef<string | null>(null);
   const { focusMainInput } = useUiStore();
-  const isDevicePoll = oauthFlow?.flow_kind === 'device_poll';
 
   const close = () => {
     onOpenChange(false);
@@ -318,11 +651,6 @@ export function ProviderAuthSwitcher({
     }
   };
 
-  const oauthActionFocusClasses =
-    'focus-visible:outline-none focus-visible:border-accent-primary/70 focus-visible:ring-2 focus-visible:ring-accent-primary/50 focus-visible:shadow-[0_0_14px_rgba(var(--accent-primary-rgb),0.35)]';
-  const disconnectFocusClasses =
-    'focus-visible:outline-none focus-visible:border-status-warning/70 focus-visible:ring-2 focus-visible:ring-status-warning/50 focus-visible:shadow-[0_0_14px_rgba(var(--status-warning-rgb),0.35)]';
-
   // The provider for which the detail panel is shown (multi-method or connected OAuth-only)
   const showDetailPanel =
     selectedProvider &&
@@ -433,268 +761,50 @@ export function ProviderAuthSwitcher({
             </Command.Group>
           </Command.List>
 
-          {/* ── Provider Detail Panel (multi-method selector OR connected OAuth-only status) ── */}
           {showDetailPanel && selectedProvider && (
-            <div className="border-t border-surface-border/60 bg-surface-canvas/40 px-4 py-3 space-y-3">
-              <div className="text-sm text-ui-primary">
-                Configure: <span className="text-accent-primary">{selectedProvider.display_name}</span>
-              </div>
-
-              {/* Auth method selector — only for multi-method providers */}
-              {hasMultipleAuthMethods(selectedProvider) && (
-                <div className="flex items-center gap-1.5">
-                  <span className="text-xs text-ui-muted mr-1">Method:</span>
-                  <button
-                    type="button"
-                    onKeyDown={stopCommandActivationPropagation}
-                    onClick={() => handleAuthMethodChange(AuthMethod.OAuth)}
-                    className={`px-2.5 py-1 rounded-md text-xs border transition-all ${oauthActionFocusClasses} ${
-                      effectiveMethod === AuthMethod.OAuth
-                        ? 'border-accent-primary/60 bg-accent-primary/20 text-accent-primary'
-                        : 'border-surface-border/40 bg-surface-elevated/40 text-ui-muted hover:text-ui-secondary hover:border-surface-border/60'
-                    }`}
-                  >
-                    OAuth
-                  </button>
-                  <button
-                    type="button"
-                    onKeyDown={stopCommandActivationPropagation}
-                    onClick={() => handleAuthMethodChange(AuthMethod.ApiKey)}
-                    className={`px-2.5 py-1 rounded-md text-xs border transition-all ${oauthActionFocusClasses} ${
-                      effectiveMethod === AuthMethod.ApiKey
-                        ? 'border-accent-primary/60 bg-accent-primary/20 text-accent-primary'
-                        : 'border-surface-border/40 bg-surface-elevated/40 text-ui-muted hover:text-ui-secondary hover:border-surface-border/60'
-                    }`}
-                  >
-                    API Key
-                  </button>
-                </div>
-              )}
-
-              {/* OAuth section (inline in detail panel for multi-method, or for connected OAuth-only) */}
-              {(effectiveMethod === AuthMethod.OAuth || isOAuthOnly(selectedProvider)) &&
-                selectedProvider.supports_oauth && (
-                  <div className="space-y-2">
-                    <div className="flex items-center gap-2 text-xs">
-                      <span className="text-ui-muted">Status:</span>
-                      {selectedProvider.oauth_status === 'connected' && (
-                        <span className="text-status-success">Connected</span>
-                      )}
-                      {selectedProvider.oauth_status === 'expired' && (
-                        <span className="text-status-warning">Expired</span>
-                      )}
-                      {selectedProvider.oauth_status === 'not_authenticated' && (
-                        <span className="text-ui-muted">Not connected</span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {selectedProvider.oauth_status === 'connected' ? (
-                        <button
-                          type="button"
-                          onKeyDown={stopCommandActivationPropagation}
-                          disabled={isDisconnecting}
-                          onClick={handleDisconnect}
-                          className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-all ${disconnectFocusClasses} ${
-                            isDisconnecting
-                              ? 'border-surface-border text-ui-muted cursor-not-allowed bg-surface-elevated/40'
-                              : 'border-status-warning/45 bg-status-warning/10 text-status-warning hover:bg-status-warning/20'
-                          }`}
-                        >
-                          {isDisconnecting ? 'Disconnecting...' : 'Disconnect'}
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          onKeyDown={stopCommandActivationPropagation}
-                          onClick={() => {
-                            onClearApiTokenResult();
-                            onStartOAuthLogin(selectedProvider.provider);
-                          }}
-                          className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-accent-primary/40 text-accent-primary text-xs hover:bg-accent-primary/10 transition-all ${oauthActionFocusClasses}`}
-                        >
-                          {selectedProvider.oauth_status === 'expired' ? 'Reconnect' : 'Connect'}
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                )}
-            </div>
+            <ProviderDetailPanel
+              provider={selectedProvider}
+              effectiveMethod={effectiveMethod}
+              isDisconnecting={isDisconnecting}
+              onAuthMethodChange={handleAuthMethodChange}
+              onStartOAuth={() => onStartOAuthLogin(selectedProvider.provider)}
+              onDisconnect={handleDisconnect}
+              onClearApiTokenResult={onClearApiTokenResult}
+              onStopPropagation={stopCommandActivationPropagation}
+            />
           )}
 
-          {/* ── Dedicated API Key Panel ── */}
           {apiKeyTarget && !oauthFlow && (
-            <div className="border-t border-surface-border/60 bg-surface-canvas/40 px-4 py-3 space-y-3">
-              <div className="text-sm text-ui-primary">
-                API Key for <span className="text-accent-primary">{apiKeyTarget.display_name}</span>
-                {apiKeyTarget.env_var_name && (
-                  <code className="ml-2 px-1.5 py-0.5 rounded bg-surface-canvas border border-surface-border text-ui-muted text-[10px] font-mono">
-                    {apiKeyTarget.env_var_name}
-                  </code>
-                )}
-              </div>
-
-              {apiKeyTarget.has_stored_api_key && (
-                <div className="flex items-center gap-2 text-xs">
-                  <span className="text-status-success">API key stored in keychain</span>
-                </div>
-              )}
-
-              <div className="flex items-center gap-2">
-                <div className="relative flex-1">
-                  <input
-                    ref={apiKeyInputRef}
-                    value={apiKeyInput}
-                    onChange={(e) => setApiKeyInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      e.stopPropagation();
-                      if (e.key === 'Enter' && apiKeyInput.trim() && !isSavingApiKey) {
-                        handleSaveApiKey();
-                      }
-                    }}
-                    type={showApiKey ? 'text' : 'password'}
-                    placeholder={apiKeyTarget.has_stored_api_key ? 'Enter new key to update...' : 'Enter API key...'}
-                    className="w-full rounded-lg border border-surface-border bg-surface-elevated/70 px-3 py-2 pr-8 text-xs text-ui-primary placeholder:text-ui-muted focus:border-accent-primary focus:outline-none font-mono"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowApiKey(!showApiKey)}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 text-ui-muted hover:text-ui-secondary transition-colors"
-                    tabIndex={-1}
-                  >
-                    {showApiKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                  </button>
-                </div>
-                <button
-                  type="button"
-                  onKeyDown={stopCommandActivationPropagation}
-                  disabled={!apiKeyInput.trim() || isSavingApiKey}
-                  onClick={handleSaveApiKey}
-                  className={`px-3 py-2 rounded-lg text-xs font-medium transition-all ${oauthActionFocusClasses} ${
-                    !apiKeyInput.trim() || isSavingApiKey
-                      ? 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
-                      : 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30'
-                  }`}
-                >
-                  {isSavingApiKey ? 'Saving...' : 'Save'}
-                </button>
-              </div>
-
-              {apiKeyTarget.has_stored_api_key && (
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onKeyDown={stopCommandActivationPropagation}
-                    onClick={handleClearApiKey}
-                    className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-all ${disconnectFocusClasses} border-status-warning/45 bg-status-warning/10 text-status-warning hover:bg-status-warning/20`}
-                  >
-                    Clear Stored Key
-                  </button>
-                </div>
-              )}
-            </div>
+            <ApiKeyPanel
+              provider={apiKeyTarget}
+              apiKeyInput={apiKeyInput}
+              onApiKeyInputChange={setApiKeyInput}
+              showApiKey={showApiKey}
+              onToggleShowApiKey={() => setShowApiKey(!showApiKey)}
+              isSaving={isSavingApiKey}
+              onSave={handleSaveApiKey}
+              onClear={handleClearApiKey}
+              onStopPropagation={stopCommandActivationPropagation}
+              inputRef={apiKeyInputRef}
+            />
           )}
 
-          {/* ── OAuth Flow Panel (active flow in progress) ── */}
           {oauthFlow && (
-            <div className="border-t border-surface-border/60 bg-surface-canvas/40 px-4 py-3 space-y-3">
-              <div className="text-sm text-ui-primary">
-                Continue OAuth for <span className="text-accent-primary">{oauthFlow.provider}</span>
-              </div>
-              <div className="text-xs text-ui-muted">
-                {isDevicePoll
-                  ? 'Open the device authorization page (URL includes your device code), approve access, then click Check Authentication.'
-                  : 'Open the authorization page, approve access, then paste the callback URL or authorization code below.'}
-              </div>
-
-              <div className="flex items-center gap-2">
-                <button
-                  ref={openAuthButtonRef}
-                  type="button"
-                  onKeyDown={stopCommandActivationPropagation}
-                  onClick={() => window.open(oauthFlow.authorization_url, '_blank', 'noopener,noreferrer')}
-                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-accent-primary/40 text-accent-primary text-xs hover:bg-accent-primary/10 transition-all ${oauthActionFocusClasses}`}
-                >
-                  <ExternalLink className="w-3.5 h-3.5" />
-                  Open Authorization Page
-                </button>
-
-                <button
-                  type="button"
-                  onKeyDown={stopCommandActivationPropagation}
-                  onClick={() => {
-                    void copyAuthorizationUrl();
-                  }}
-                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-accent-primary/40 text-accent-primary text-xs hover:bg-accent-primary/10 transition-all ${oauthActionFocusClasses}`}
-                >
-                  <Copy className="w-3.5 h-3.5" />
-                  {copyStatus === 'copied'
-                    ? 'Copied!'
-                    : copyStatus === 'error'
-                      ? 'Copy failed'
-                      : isDevicePoll
-                        ? 'Copy Device Login URL'
-                        : 'Copy Authorization URL'}
-                </button>
-
-                {isDevicePoll && (
-                  <button
-                    type="button"
-                    onKeyDown={stopCommandActivationPropagation}
-                    disabled={isCompleting}
-                    onClick={() => {
-                      setIsCompleting(true);
-                      onCompleteOAuthLogin(oauthFlow.flow_id, '');
-                    }}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${oauthActionFocusClasses} ${
-                      isCompleting
-                        ? 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
-                        : 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30'
-                    }`}
-                  >
-                    {isCompleting ? 'Checking...' : 'Check Authentication'}
-                  </button>
-                )}
-              </div>
-
-              {!isDevicePoll && (
-                <div className="flex items-center gap-2">
-                  <input
-                    ref={callbackRef}
-                    value={responseInput}
-                    onChange={(e) => setResponseInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        e.stopPropagation();
-                      }
-
-                      if (e.key === 'Enter' && responseInput.trim() && !isCompleting) {
-                        setIsCompleting(true);
-                        onCompleteOAuthLogin(oauthFlow.flow_id, responseInput.trim());
-                      }
-                    }}
-                    placeholder="Paste callback URL or code"
-                    className="flex-1 rounded-lg border border-surface-border bg-surface-elevated/70 px-3 py-2 text-xs text-ui-primary placeholder:text-ui-muted focus:border-accent-primary focus:outline-none"
-                  />
-                  <button
-                    type="button"
-                    onKeyDown={stopCommandActivationPropagation}
-                    disabled={!responseInput.trim() || isCompleting}
-                    onClick={() => {
-                      setIsCompleting(true);
-                      onCompleteOAuthLogin(oauthFlow.flow_id, responseInput.trim());
-                    }}
-                    className={`px-3 py-2 rounded-lg text-xs font-medium transition-all ${oauthActionFocusClasses} ${
-                      !responseInput.trim() || isCompleting
-                        ? 'bg-surface-elevated/50 border border-surface-border text-ui-muted cursor-not-allowed'
-                        : 'bg-accent-primary/20 border border-accent-primary text-accent-primary hover:bg-accent-primary/30'
-                    }`}
-                  >
-                    {isCompleting ? 'Completing...' : 'Complete'}
-                  </button>
-                </div>
-              )}
-            </div>
+            <OAuthFlowPanel
+              oauthFlow={oauthFlow}
+              isCompleting={isCompleting}
+              responseInput={responseInput}
+              copyStatus={copyStatus}
+              onResponseInputChange={setResponseInput}
+              onComplete={(response) => {
+                setIsCompleting(true);
+                onCompleteOAuthLogin(oauthFlow.flow_id, response);
+              }}
+              onCopyUrl={() => void copyAuthorizationUrl()}
+              onStopPropagation={stopCommandActivationPropagation}
+              openAuthButtonRef={openAuthButtonRef}
+              callbackRef={callbackRef}
+            />
           )}
 
           {/* ── Result message ── */}
