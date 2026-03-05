@@ -1801,7 +1801,7 @@
         SA1[Session Actor] &amp; SA2[Session Actor] &amp; SA3[Session Actor]
         SA1 &amp; SA2 &amp; SA3 --&gt; AC
 
-        AC["AgentConfig\n(Shared State)"]
+        AC["AgentConfig&lt;br/&gt;(Shared State)"]
 
         AC --&gt; MW &amp; TR &amp; PS
 
@@ -1884,10 +1884,10 @@
 <h2 id="multi-agent-quorum-architecture">Multi-Agent (Quorum) Architecture</h2>
 <p>For complex tasks, QueryMT supports a planner-delegate pattern:</p>
 <pre class="mermaid"><code>flowchart TD
-    P["Planner Agent\n(Analyzes task, decides which delegate to use)"]
+    P["Planner Agent&lt;br/&gt;(Analyzes task, decides which delegate to use)"]
     P --&gt;|"Delegation Request"| D1 &amp; D2
-    D1["Delegate 1\n(Code Reviewer)"]
-    D2["Delegate 2\n(Tester)"]</code></pre>
+    D1["Delegate 1&lt;br/&gt;(Code Reviewer)"]
+    D2["Delegate 2&lt;br/&gt;(Tester)"]</code></pre>
 <h2 id="key-features">Key Features</h2>
 <h3 id="context-management">Context Management</h3>
 <p>QueryMT implements a 3-layer context management system:</p>

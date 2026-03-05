@@ -1907,7 +1907,7 @@
 <pre class="mermaid"><code>flowchart LR
     A([User Request])
     subgraph CD["CompositeDriver (Middleware Chain)"]
-        M1[Limits\nMiddleware] --&gt; M2[Context\nMiddleware] --&gt; M3[AgentMode\nMiddleware]
+        M1["Limits&lt;br/&gt;Middleware"] --&gt; M2["Context&lt;br/&gt;Middleware"] --&gt; M3["AgentMode&lt;br/&gt;Middleware"]
     end
     B([Agent Processing])
 

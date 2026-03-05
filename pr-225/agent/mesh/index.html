@@ -2178,7 +2178,7 @@
         BL[LLM Provider]
     end
 
-    AS &lt;--&gt;|"Internet\n(libp2p Mesh)"| BS</code></pre>
+    AS &lt;--&gt;|"Internet&lt;br/&gt;(libp2p Mesh)"| BS</code></pre>
 <h2 id="quick-start">Quick Start</h2>
 <h3 id="starting-a-mesh-node">Starting a Mesh Node</h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># Start mesh node (default: /ip4/0.0.0.0/tcp/9000)</span>
@@ -2364,16 +2364,16 @@
 <h3 id="1-gpu-accelerated-coding">1. GPU-Accelerated Coding</h3>
 <pre class="mermaid"><code>flowchart LR
     subgraph Local["Local Machine (CPU)"]
-        PA["Planner Agent\n(Lightweight)"]
+        PA["Planner Agent&lt;br/&gt;(Lightweight)"]
         LM[Local Model]
     end
     subgraph Remote["Remote Machine (GPU)"]
-        CA["Coder Agent\n(GPU-accelerated)"]
+        CA["Coder Agent&lt;br/&gt;(GPU-accelerated)"]
         GM[GPU Model]
     end
 
     PA --&gt;|"Delegates task"| CA
-    PA --&gt;|"LLM calls\n(routed to GPU)"| GM
+    PA --&gt;|"LLM calls&lt;br/&gt;(routed to GPU)"| GM
     CA --&gt;|"Fast model inference"| GM</code></pre>
 <p><strong>Configuration:</strong>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="k">[mesh]</span>
@@ -2392,9 +2392,9 @@
 </code></pre></div></p>
 <h3 id="2-distributed-team-collaboration">2. Distributed Team Collaboration</h3>
 <pre class="mermaid"><code>flowchart TD
-    S1["Session 1\n(Feature A)"]
-    S2["Session 2\n(Feature B)"]
-    S3["Session 3\n(Feature C)"]
+    S1["Session 1&lt;br/&gt;(Feature A)"]
+    S2["Session 2&lt;br/&gt;(Feature B)"]
+    S3["Session 3&lt;br/&gt;(Feature C)"]
     SS[("Shared State")]
 
     S1 &amp; S2 &amp; S3 &lt;--&gt; SS</code></pre>
@@ -2405,11 +2405,11 @@
 <h3 id="3-load-distribution">3. Load Distribution</h3>
 <pre class="mermaid"><code>flowchart LR
     subgraph LB["Load Balancer Node"]
-        SR["Session Router\n- Distribute\n- Monitor"]
+        SR["Session Router&lt;br/&gt;- Distribute&lt;br/&gt;- Monitor"]
     end
     subgraph WN["Worker Nodes"]
-        W1["Worker 1\n(Handle Tasks)"]
-        W2["Worker 2\n(Handle Tasks)"]
+        W1["Worker 1&lt;br/&gt;(Handle Tasks)"]
+        W2["Worker 2&lt;br/&gt;(Handle Tasks)"]
     end
 
     SR --&gt; W1 &amp; W2</code></pre>

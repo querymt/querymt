@@ -2089,10 +2089,10 @@
 - <strong>Route to remote agents</strong> via mesh networking</p>
 <h2 id="architecture">Architecture</h2>
 <pre class="mermaid"><code>flowchart TD
-    P["Planner Agent\n(Analyzes task, decides which delegate to use)"]
-    O["Delegation Orchestrator\n(Manages delegation lifecycle)"]
-    D1["Delegate 1\n(Coder)"]
-    D2["Delegate 2\n(Tester)"]
+    P["Planner Agent&lt;br/&gt;(Analyzes task, decides which delegate to use)"]
+    O["Delegation Orchestrator&lt;br/&gt;(Manages delegation lifecycle)"]
+    D1["Delegate 1&lt;br/&gt;(Coder)"]
+    D2["Delegate 2&lt;br/&gt;(Tester)"]
 
     P --&gt;|"Delegation Request"| O
     O --&gt; D1 &amp; D2</code></pre>
