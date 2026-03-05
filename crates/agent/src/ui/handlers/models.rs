@@ -27,7 +27,6 @@ use querymt_provider_common::{
 };
 use serde_json::Value;
 use std::collections::HashSet;
-use std::collections::HashSet as StdHashSet;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 
@@ -193,53 +192,17 @@ pub async fn handle_list_auth_providers(state: &ServerState, tx: &mpsc::Sender<S
 ///
 /// Stores the token in the system keyring under the provider's env var name
 /// and invalidates the model cache so credentials are re-resolved.
-pub async fn handle_set_api_token(
+/// Send an `ApiTokenResult` message and refresh the auth providers list.
+///
+/// Shared tail for `handle_set_api_token`, `handle_clear_api_token`, and
+/// `handle_set_auth_method` — all three follow the same pattern of performing
+/// a keyring operation, reporting the result, then refreshing the UI.
+async fn finish_auth_op(
     state: &ServerState,
     provider: &str,
-    api_key: &str,
+    result: Result<String, String>,
     tx: &mpsc::Sender<String>,
 ) {
-    let registry = state.agent.config.provider.plugin_registry();
-    let factory = registry.get(provider).await;
-
-    let env_var_name = factory
-        .as_ref()
-        .and_then(|f| f.as_http())
-        .and_then(|h| h.api_key_name());
-
-    let result = match env_var_name {
-        Some(name) => {
-            let mut store = match crate::auth::SecretStore::new() {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = send_message(
-                        tx,
-                        UiServerMessage::ApiTokenResult {
-                            provider: provider.to_string(),
-                            success: false,
-                            message: format!("Failed to open secret store: {}", e),
-                        },
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-            match store.set(&name, api_key) {
-                Ok(()) => {
-                    // Invalidate model cache so new credentials take effect
-                    state.model_cache.invalidate(&()).await;
-                    Ok(format!("API key stored for {} ({})", provider, name))
-                }
-                Err(e) => Err(format!("Failed to store API key: {}", e)),
-            }
-        }
-        None => Err(format!(
-            "Provider '{}' does not have a known API key name",
-            provider
-        )),
-    };
-
     let (success, message) = match result {
         Ok(msg) => (true, msg),
         Err(msg) => (false, msg),
@@ -255,8 +218,49 @@ pub async fn handle_set_api_token(
     )
     .await;
 
-    // Refresh auth providers list so UI updates
     handle_list_auth_providers(state, tx).await;
+}
+
+/// Resolve the `api_key_name` for a provider from the plugin registry.
+async fn resolve_env_var_name(state: &ServerState, provider: &str) -> Option<String> {
+    let registry = state.agent.config.provider.plugin_registry();
+    let factory = registry.get(provider).await;
+    factory
+        .as_ref()
+        .and_then(|f| f.as_http())
+        .and_then(|h| h.api_key_name())
+}
+
+pub async fn handle_set_api_token(
+    state: &ServerState,
+    provider: &str,
+    api_key: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        finish_auth_op(state, provider, Err("API key cannot be empty".into()), tx).await;
+        return;
+    }
+
+    let result = match resolve_env_var_name(state, provider).await {
+        Some(name) => match crate::auth::SecretStore::new() {
+            Ok(mut store) => match store.set(&name, api_key) {
+                Ok(()) => {
+                    state.model_cache.invalidate(&()).await;
+                    Ok(format!("API key stored for {} ({})", provider, name))
+                }
+                Err(e) => Err(format!("Failed to store API key: {}", e)),
+            },
+            Err(e) => Err(format!("Failed to open secret store: {}", e)),
+        },
+        None => Err(format!(
+            "Provider '{}' does not have a known API key name",
+            provider
+        )),
+    };
+
+    finish_auth_op(state, provider, result, tx).await;
 }
 
 /// Handle clearing an API token for a provider.
@@ -265,62 +269,24 @@ pub async fn handle_clear_api_token(
     provider: &str,
     tx: &mpsc::Sender<String>,
 ) {
-    let registry = state.agent.config.provider.plugin_registry();
-    let factory = registry.get(provider).await;
-
-    let env_var_name = factory
-        .as_ref()
-        .and_then(|f| f.as_http())
-        .and_then(|h| h.api_key_name());
-
-    let result = match env_var_name {
-        Some(name) => {
-            let mut store = match crate::auth::SecretStore::new() {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = send_message(
-                        tx,
-                        UiServerMessage::ApiTokenResult {
-                            provider: provider.to_string(),
-                            success: false,
-                            message: format!("Failed to open secret store: {}", e),
-                        },
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-            match store.delete(&name) {
+    let result = match resolve_env_var_name(state, provider).await {
+        Some(name) => match crate::auth::SecretStore::new() {
+            Ok(mut store) => match store.delete(&name) {
                 Ok(()) => {
                     state.model_cache.invalidate(&()).await;
                     Ok(format!("API key cleared for {} ({})", provider, name))
                 }
                 Err(e) => Err(format!("Failed to clear API key: {}", e)),
-            }
-        }
+            },
+            Err(e) => Err(format!("Failed to open secret store: {}", e)),
+        },
         None => Err(format!(
             "Provider '{}' does not have a known API key name",
             provider
         )),
     };
 
-    let (success, message) = match result {
-        Ok(msg) => (true, msg),
-        Err(msg) => (false, msg),
-    };
-
-    let _ = send_message(
-        tx,
-        UiServerMessage::ApiTokenResult {
-            provider: provider.to_string(),
-            success,
-            message,
-        },
-    )
-    .await;
-
-    handle_list_auth_providers(state, tx).await;
+    finish_auth_op(state, provider, result, tx).await;
 }
 
 /// Handle setting the preferred auth method for a provider.
@@ -340,22 +306,7 @@ pub async fn handle_set_auth_method(
         Err(e) => Err(format!("Failed to open secret store: {}", e)),
     };
 
-    let (success, message) = match result {
-        Ok(msg) => (true, msg),
-        Err(msg) => (false, msg),
-    };
-
-    let _ = send_message(
-        tx,
-        UiServerMessage::ApiTokenResult {
-            provider: provider.to_string(),
-            success,
-            message,
-        },
-    )
-    .await;
-
-    handle_list_auth_providers(state, tx).await;
+    finish_auth_op(state, provider, result, tx).await;
 }
 
 /// Handle model listing request using moka cache.
@@ -919,7 +870,7 @@ async fn fetch_custom_models(state: &ServerState, provider: &str) -> Vec<ModelEn
 }
 
 fn dedupe_models(models: Vec<ModelEntry>) -> Vec<ModelEntry> {
-    let mut seen = StdHashSet::new();
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
 
     for source in ["custom", "cached", "catalog", "preset"] {
