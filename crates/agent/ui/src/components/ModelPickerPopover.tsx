@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useState, useRef, memo } from 'react';
 import { Command } from 'cmdk';
 import * as Popover from '@radix-ui/react-popover';
 import * as Dialog from '@radix-ui/react-dialog';
@@ -52,7 +52,7 @@ const TARGET_ALL = 'all';
 /* ------------------------------------------------------------------ */
 
 const RECENT_PREFIX = 'recent:';
-const normalizeValue = (value: string) => 
+const normalizeValue = (value: string) =>
   value.startsWith(RECENT_PREFIX) ? value.slice(RECENT_PREFIX.length) : value;
 
 interface GroupedModels {
@@ -80,8 +80,6 @@ function groupByProvider(models: ModelEntry[]): GroupedModels[] {
     const key = groupKey(entry);
     if (!map.has(key)) {
       const nodeDisplay = entry.node_label ?? entry.node_id;
-      // When remote models exist, annotate local groups with "(local)" and
-      // remote groups with "(node)" so the user can distinguish them.
       const heading = nodeDisplay
         ? `${entry.provider} (${nodeDisplay})`
         : hasRemote
@@ -115,16 +113,58 @@ function sessionModelId(provider: string, model: string, id?: string): string {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Component                                                          */
+/*  Trigger label helpers — no allModels scan needed                   */
 /* ------------------------------------------------------------------ */
 
-export function ModelPickerPopover({
-  open,
-  onOpenChange,
-  isInMobileMenu = false,
+/** Stable platform detection — computed once, not per-render. */
+const isMacPlatform = navigator.platform.includes('Mac');
+const shortcutHint = isMacPlatform ? '⌘⇧M' : 'Ctrl+Shift+M';
+
+function makeTriggerLabel(currentProvider?: string, currentModel?: string): string {
+  return currentProvider && currentModel
+    ? `${currentProvider} / ${currentModel}`
+    : 'Select model';
+}
+
+function makeTriggerTitle(currentProvider?: string, currentModel?: string, currentNode?: string): string {
+  return currentProvider && currentModel
+    ? `${currentProvider} / ${currentModel}${currentNode ? ` on ${currentNode}` : ''} (${shortcutHint} to open)`
+    : `Select model (${shortcutHint})`;
+}
+
+/* ------------------------------------------------------------------ */
+/*  ModelPickerPanel — heavy panel, only mounted when open            */
+/* ------------------------------------------------------------------ */
+
+interface ModelPickerPanelProps {
+  connected: boolean;
+  routingMode: RoutingMode;
+  sessionId: string | null;
+  sessionsByAgent: Record<string, string>;
+  agents: UiAgentInfo[];
+  allModels: ModelEntry[];
+  currentProvider?: string;
+  currentModel?: string;
+  currentNode?: string;
+  currentWorkspace: string | null;
+  recentModelsByWorkspace: Record<string, RecentModelEntry[]>;
+  agentMode: string;
+  onRefresh: () => void;
+  onSetSessionModel: (sessionId: string, modelId: string, node?: string) => void;
+  providerCapabilities: Record<string, ProviderCapabilityEntry>;
+  modelDownloads: Record<string, ModelDownloadStatus>;
+  onAddCustomModelFromHf: (provider: string, repo: string, filename: string, displayName?: string) => void;
+  onAddCustomModelFromFile: (provider: string, filePath: string, displayName?: string) => void;
+  onDeleteCustomModel: (provider: string, modelId: string) => void;
+  onOpenChange: (open: boolean) => void;
+  isInMobileMenu: boolean;
+  inputRef: React.RefObject<HTMLInputElement | null>;
+  commandListRef: React.RefObject<HTMLDivElement | null>;
+}
+
+const ModelPickerPanel = memo(function ModelPickerPanel({
   connected,
   routingMode,
-  activeAgentId: _activeAgentId,
   sessionId,
   sessionsByAgent,
   agents,
@@ -142,24 +182,25 @@ export function ModelPickerPopover({
   onAddCustomModelFromHf,
   onAddCustomModelFromFile,
   onDeleteCustomModel,
-}: ModelPickerPopoverProps) {
+  onOpenChange,
+  isInMobileMenu,
+  inputRef,
+  commandListRef,
+}: ModelPickerPanelProps) {
+  // Profiler: mark panel render start
+  performance.mark('ModelPickerPanel-render-start');
+
   const [target, setTarget] = useState(TARGET_ACTIVE);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedValue, setSelectedValue] = useState('');
   const [hfRepo, setHfRepo] = useState('');
   const [hfFilename, setHfFilename] = useState('');
   const [filePath, setFilePath] = useState('');
-  const inputRef = useRef<HTMLInputElement>(null);
-  const commandListRef = useRef<HTMLDivElement>(null);
-  const { setModeModelPreference, focusMainInput } = useUiStore();
+  const { setModeModelPreference } = useUiStore();
 
-  // When the popover opens, auto-select the current model in the recent section
-  // and scroll the list to the top so the Recent section is visible.
-  // When it closes, reset selection for a clean slate next time.
+  // When the popover opens, auto-select the current model and scroll to top.
   useEffect(() => {
-    if (open && currentProvider && currentModel) {
-      // For remote models, select directly in the grouped section (recent section only has
-      // local models). For local models, prefer the recent section entry.
+    if (currentProvider && currentModel) {
       const val = itemValue(currentProvider, currentModel, currentNode);
       setSelectedValue(currentNode ? val : `${RECENT_PREFIX}${val}`);
       setTimeout(() => {
@@ -167,10 +208,12 @@ export function ModelPickerPopover({
           commandListRef.current.scrollTop = 0;
         }
       }, 0);
-    } else if (!open) {
-      setSelectedValue('');
     }
-  }, [open, currentProvider, currentModel, currentNode]);
+    // Reset on unmount (panel is unmounted when closed)
+    return () => setSelectedValue('');
+  }, [currentProvider, currentModel, currentNode, commandListRef]);
+
+  // ---- Heavy memos — only run while panel is mounted (i.e. open) ----
 
   const targetAgents = useMemo(
     () => agents.filter((agent) => sessionsByAgent[agent.id]),
@@ -196,7 +239,7 @@ export function ModelPickerPopover({
     return values.sort((a, b) => (b.percent ?? 0) - (a.percent ?? 0))[0];
   }, [modelDownloads, selectedProvider]);
 
-   // Build a lookup map so we can resolve provider/model/node from the cmdk value
+  // Build a lookup map so we can resolve provider/model/node from the cmdk value
   const modelMap = useMemo(() => {
     const m = new Map<string, { provider: string; model: string; node?: string; nodeLabel?: string }>();
     for (const entry of allModels) {
@@ -220,20 +263,24 @@ export function ModelPickerPopover({
     }
     return m;
   }, [allModels]);
-  
+
+  // O(1) lookup set for available local models — avoids O(n*m) nested scan in recent filter
+  const localModelKeySet = useMemo(() => {
+    const s = new Set<string>();
+    for (const m of allModels) {
+      if (!m.node_id) s.add(`${m.provider}/${m.model}`);
+    }
+    return s;
+  }, [allModels]);
+
   // Get recent models for current workspace from backend data
   const recentModels = useMemo(() => {
-    const key = currentWorkspace ?? '';  // Empty string for null workspace
+    const key = currentWorkspace ?? '';
     const recent = recentModelsByWorkspace[key] || [];
-    
-    // Filter to only show models that are currently available and limit to 5
-    // Recent models are always local (no node field) — they come from local event history
     return recent
-      .filter(entry => 
-        allModels.some(m => m.provider === entry.provider && m.model === entry.model && !m.node_id)
-      )
+      .filter(entry => localModelKeySet.has(`${entry.provider}/${entry.model}`))
       .slice(0, 5);
-  }, [currentWorkspace, recentModelsByWorkspace, allModels]);
+  }, [currentWorkspace, recentModelsByWorkspace, localModelKeySet]);
 
   const hasTargetSession =
     target === TARGET_ALL
@@ -271,19 +318,13 @@ export function ModelPickerPopover({
       }
 
       if (sessionIds.size === 0) return;
-      // Pass node_id along so the backend can route to the correct provider host
       sessionIds.forEach((id) => onSetSessionModel(id, modelId, entry.node));
-      
-      // Save the model preference for the current agent mode (local models only)
+
       if (!entry.node) {
         setModeModelPreference(agentMode, entry.provider, entry.model);
       }
-      
-      // Backend will automatically record model usage and refresh recent models
-      
+
       onOpenChange(false);
-      
-      // Focus is handled by onCloseAutoFocus in Popover.Content
     },
     [
       modelMap,
@@ -325,21 +366,12 @@ export function ModelPickerPopover({
     onDeleteCustomModel(selectedProvider, modelId);
   }, [onDeleteCustomModel, selectedProviderEntry, selectedProvider]);
 
-  /* ---- trigger label ---- */
-  const triggerLabel =
-    currentProvider && currentModel
-      ? `${currentProvider} / ${currentModel}`
-      : 'Select model';
-
-  const triggerTitle = currentProvider && currentModel
-    ? `${currentProvider} / ${currentModel}${currentNode ? ` on ${currentNode}` : ''} (${navigator.platform.includes('Mac') ? '⌘⇧M' : 'Ctrl+Shift+M'} to open)`
-    : `Select model (${navigator.platform.includes('Mac') ? '⌘⇧M' : 'Ctrl+Shift+M'})`;
-
-  /* ---- render ---- */
-
   const CloseComponent = isInMobileMenu ? Dialog.Close : Popover.Close;
 
-  const panel = (
+  // Profiler: measure panel render
+  performance.measure('ModelPickerPanel-render', 'ModelPickerPanel-render-start');
+
+  return (
     <>
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-surface-border/60">
@@ -593,6 +625,77 @@ export function ModelPickerPopover({
       </div>
     </>
   );
+});
+
+/* ------------------------------------------------------------------ */
+/*  ModelPickerPopover — cheap trigger always rendered                 */
+/*  Panel is only mounted when open                                    */
+/* ------------------------------------------------------------------ */
+
+export const ModelPickerPopover = memo(function ModelPickerPopover({
+  open,
+  onOpenChange,
+  isInMobileMenu = false,
+  connected,
+  routingMode,
+  activeAgentId: _activeAgentId,
+  sessionId,
+  sessionsByAgent,
+  agents,
+  allModels,
+  currentProvider,
+  currentModel,
+  currentNode,
+  currentWorkspace,
+  recentModelsByWorkspace,
+  agentMode,
+  onRefresh,
+  onSetSessionModel,
+  providerCapabilities,
+  modelDownloads,
+  onAddCustomModelFromHf,
+  onAddCustomModelFromFile,
+  onDeleteCustomModel,
+}: ModelPickerPopoverProps) {
+  // Profiler: mark outer trigger render (cheap — only trigger shown when closed)
+  performance.mark('ModelPickerPopover-render-start');
+
+  const inputRef = useRef<HTMLInputElement>(null);
+  const commandListRef = useRef<HTMLDivElement>(null);
+  const { focusMainInput } = useUiStore();
+
+  // Cheap trigger-only derivations — no allModels scan
+  const triggerLabel = makeTriggerLabel(currentProvider, currentModel);
+  const triggerTitle = makeTriggerTitle(currentProvider, currentModel, currentNode);
+
+  performance.measure('ModelPickerPopover-render', 'ModelPickerPopover-render-start');
+
+  // Shared panel props — passed through only when panel is mounted
+  const panelProps: ModelPickerPanelProps = {
+    connected,
+    routingMode,
+    sessionId,
+    sessionsByAgent,
+    agents,
+    allModels,
+    currentProvider,
+    currentModel,
+    currentNode,
+    currentWorkspace,
+    recentModelsByWorkspace,
+    agentMode,
+    onRefresh,
+    onSetSessionModel,
+    providerCapabilities,
+    modelDownloads,
+    onAddCustomModelFromHf,
+    onAddCustomModelFromFile,
+    onDeleteCustomModel,
+    onOpenChange,
+    isInMobileMenu,
+    inputRef,
+    commandListRef,
+  };
 
   if (isInMobileMenu) {
     return (
@@ -624,7 +727,8 @@ export function ModelPickerPopover({
               e.preventDefault();
             }}
           >
-            {panel}
+            {/* Panel only mounted when dialog is open */}
+            {open && <ModelPickerPanel {...panelProps} />}
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
@@ -663,9 +767,10 @@ export function ModelPickerPopover({
             focusMainInput();
           }}
         >
-          {panel}
+          {/* Panel only mounted when popover is open */}
+          {open && <ModelPickerPanel {...panelProps} />}
         </Popover.Content>
       </Popover.Portal>
     </Popover.Root>
   );
-}
+});

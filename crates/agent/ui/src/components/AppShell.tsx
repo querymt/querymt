@@ -476,6 +476,22 @@ export function AppShell() {
       }
     };
   }, []);
+
+  // Stable derived model props for ModelPickerPopover — avoids inline property access
+  // creating new primitive reads on every AppShell render.
+  const activeAgentModel = useMemo(
+    () => agentModels[activeAgentId],
+    [agentModels, activeAgentId],
+  );
+
+  // Stable callback for mobile picker so the inline arrow is not recreated every render.
+  const handleMobilePickerOpenChange = useCallback(
+    (open: boolean) => {
+      setModelPickerOpen(open);
+      if (!open) setMobileMenuOpen(false);
+    },
+    [setModelPickerOpen],
+  );
   
   return (
     <div className="flex flex-col h-screen bg-surface-canvas text-ui-primary">
@@ -592,9 +608,9 @@ export function AppShell() {
                 sessionsByAgent={sessionsByAgent}
                 agents={agents}
                 allModels={allModels}
-                currentProvider={agentModels[activeAgentId]?.provider}
-                currentModel={agentModels[activeAgentId]?.model}
-                currentNode={agentModels[activeAgentId]?.node}
+                currentProvider={activeAgentModel?.provider}
+                currentModel={activeAgentModel?.model}
+                currentNode={activeAgentModel?.node}
                 currentWorkspace={currentWorkspace}
                 recentModelsByWorkspace={recentModelsByWorkspace}
                 agentMode={agentMode}
@@ -661,7 +677,7 @@ export function AppShell() {
           {/* Model picker on mobile */}
           <ModelPickerPopover
             open={modelPickerOpen}
-            onOpenChange={(open) => { setModelPickerOpen(open); if (!open) setMobileMenuOpen(false); }}
+            onOpenChange={handleMobilePickerOpenChange}
             isInMobileMenu
             connected={connected}
             routingMode={routingMode}
@@ -670,9 +686,9 @@ export function AppShell() {
             sessionsByAgent={sessionsByAgent}
             agents={agents}
             allModels={allModels}
-            currentProvider={agentModels[activeAgentId]?.provider}
-            currentModel={agentModels[activeAgentId]?.model}
-            currentNode={agentModels[activeAgentId]?.node}
+            currentProvider={activeAgentModel?.provider}
+            currentModel={activeAgentModel?.model}
+            currentNode={activeAgentModel?.node}
             currentWorkspace={currentWorkspace}
             recentModelsByWorkspace={recentModelsByWorkspace}
             agentMode={agentMode}
