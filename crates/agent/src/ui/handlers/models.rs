@@ -68,31 +68,22 @@ pub(super) fn resolve_model_for_provider(state: &ServerState, provider: &str) ->
 /// OAuth resolution does not require `api_key_name()` — it uses the provider name
 /// to look up tokens. This allows OAuth-only providers (like Codex) that return
 /// `api_key_name() = None` to still resolve credentials.
+///
+/// Resolution order respects the provider's preferred auth method (if configured).
 async fn resolve_provider_api_key(
     provider: &str,
     factory: &dyn HTTPLLMProviderFactory,
 ) -> Option<String> {
-    let api_key_name = factory.api_key_name();
+    let preferred_method = crate::session::provider::preferred_auth_method(provider);
+    let mut use_oauth_resolver = false;
 
-    // OAuth doesn't depend on api_key_name
-    #[cfg(feature = "oauth")]
-    {
-        if let Ok(token) = crate::auth::get_or_refresh_token(provider).await {
-            return Some(token);
-        }
-    }
-
-    // Stored key and env var require api_key_name
-    let name = api_key_name?;
-
-    // Check for stored API key in keyring (set via dashboard UI)
-    if let Some(key) = crate::auth::SecretStore::new()
-        .ok()
-        .and_then(|s| s.get(&name))
-    {
-        return Some(key);
-    }
-    std::env::var(name).ok()
+    crate::session::provider::resolve_api_key_with_preference(
+        provider,
+        factory.api_key_name().as_deref(),
+        preferred_method.as_ref(),
+        &mut use_oauth_resolver,
+    )
+    .await
 }
 
 // ── Public handlers ───────────────────────────────────────────────────────────

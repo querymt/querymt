@@ -747,6 +747,14 @@ impl std::str::FromStr for AuthMethod {
     }
 }
 
+/// Read the preferred auth method for a provider from SecretStore.
+pub(crate) fn preferred_auth_method(provider_name: &str) -> Option<AuthMethod> {
+    querymt_utils::secret_store::SecretStore::new()
+        .ok()
+        .and_then(|s| s.get(&format!("auth_method_{}", provider_name)))
+        .and_then(|v| v.parse::<AuthMethod>().ok())
+}
+
 /// Resolve an API key for a provider, respecting the user's preferred auth method.
 ///
 /// The three credential sources are:
@@ -759,7 +767,7 @@ impl std::str::FromStr for AuthMethod {
 ///
 /// When `preferred` is `None`, the default order is: OAuth → stored key → env var.
 /// When set, the preferred source is tried first, then the remaining sources in order.
-async fn resolve_api_key_with_preference(
+pub(crate) async fn resolve_api_key_with_preference(
     provider_name: &str,
     env_var_name: Option<&str>,
     preferred: Option<&AuthMethod>,
@@ -799,7 +807,6 @@ async fn resolve_api_key_with_preference(
             AuthMethod::ApiKey => {
                 // Stored key requires an env_var_name (used as keyring key)
                 if let Some(name) = env_var_name {
-                    #[cfg(feature = "oauth")]
                     if let Some(key) = querymt_utils::secret_store::SecretStore::new()
                         .ok()
                         .and_then(|s| s.get(name))
@@ -1009,14 +1016,7 @@ pub async fn build_provider_from_config(
         let api_key = if let Some(key) = api_key_override {
             Some(key.to_string())
         } else {
-            // Read user's preferred auth method from the secret store
-            #[cfg(feature = "oauth")]
-            let preferred_method = querymt_utils::secret_store::SecretStore::new()
-                .ok()
-                .and_then(|s| s.get(&format!("auth_method_{}", provider_name)))
-                .and_then(|v| v.parse::<AuthMethod>().ok());
-            #[cfg(not(feature = "oauth"))]
-            let preferred_method: Option<AuthMethod> = None;
+            let preferred_method = preferred_auth_method(provider_name);
 
             log::debug!(
                 "Resolving API key for provider '{}' (preferred: {:?}, env_var: {:?})",
@@ -1037,21 +1037,21 @@ pub async fn build_provider_from_config(
         if let Some(key) = api_key {
             builder_config["api_key"] = key.into();
         } else {
-            // All credential sources failed
-            if let Some(ref env_name) = env_var_name {
-                log::warn!(
+            // All credential sources failed — return a descriptive error
+            // instead of letting `from_config` fail with a cryptic serde
+            // "missing field `api_key`" message.
+            let msg = if let Some(ref env_name) = env_var_name {
+                format!(
                     "No API key found for provider '{}'. Set {} or run 'qmt auth login {}'",
-                    provider_name,
-                    env_name,
-                    provider_name
-                );
+                    provider_name, env_name, provider_name
+                )
             } else {
-                log::warn!(
-                    "No credential found for provider '{}'. Run 'qmt auth login {}'",
-                    provider_name,
-                    provider_name
-                );
-            }
+                format!(
+                    "No credentials found for provider '{}'. Run 'qmt auth login {}'",
+                    provider_name, provider_name
+                )
+            };
+            return Err(SessionError::ProviderError(LLMError::AuthError(msg)));
         }
     }
 
@@ -1103,7 +1103,9 @@ pub async fn build_provider_from_config(
         ));
 
         // Generic path — works for Extism providers that implement set_key_resolver.
-        let mut provider = factory.from_config(&pruned_config_str)?;
+        let mut provider = factory
+            .from_config(&pruned_config_str)
+            .map_err(|e| LLMError::PluginError(format!("provider '{}': {}", provider_name, e)))?;
         provider.set_key_resolver(resolver.clone());
 
         if provider.key_resolver().is_some() {
@@ -1118,7 +1120,9 @@ pub async fn build_provider_from_config(
         // Fallback for native HTTP providers: set the resolver on the inner
         // HTTPLLMProvider before it gets wrapped in Arc by the adapter.
         if let Some(http_factory) = factory.as_http() {
-            let mut http_provider = http_factory.from_config(&pruned_config_str)?;
+            let mut http_provider = http_factory.from_config(&pruned_config_str).map_err(|e| {
+                LLMError::PluginError(format!("provider '{}': {}", provider_name, e))
+            })?;
             http_provider.set_key_resolver(resolver);
 
             log::debug!(
@@ -1142,7 +1146,9 @@ pub async fn build_provider_from_config(
         return Ok(Arc::from(provider));
     }
 
-    let provider = factory.from_config(&pruned_config_str)?;
+    let provider = factory
+        .from_config(&pruned_config_str)
+        .map_err(|e| LLMError::PluginError(format!("provider '{}': {}", provider_name, e)))?;
     Ok(Arc::from(provider))
 }
 
