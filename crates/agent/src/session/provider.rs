@@ -714,12 +714,11 @@ impl SessionHandle {
 /// Stored in the system keyring under `auth_method_{provider}` and used by
 /// the credential resolution logic to determine the order in which OAuth,
 /// stored API key, and environment variable sources are tried.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "dashboard", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "dashboard", typeshare::typeshare)]
-#[cfg_attr(feature = "dashboard", serde(rename_all = "snake_case"))]
+#[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
-    #[cfg_attr(feature = "dashboard", serde(rename = "oauth"))]
+    #[serde(rename = "oauth")]
     OAuth,
     ApiKey,
     EnvVar,

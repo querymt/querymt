@@ -396,7 +396,13 @@ export enum OAuthStatus {
 	Connected = "connected",
 }
 
-/** Preferred authentication method for a provider. */
+/**
+ * Preferred authentication method for a provider.
+ * 
+ * Stored in the system keyring under `auth_method_{provider}` and used by
+ * the credential resolution logic to determine the order in which OAuth,
+ * stored API key, and environment variable sources are tried.
+ */
 export enum AuthMethod {
 	OAuth = "oauth",
 	ApiKey = "api_key",
@@ -407,7 +413,7 @@ export enum AuthMethod {
 export interface AuthProviderEntry {
 	provider: string;
 	display_name: string;
-	/** OAuth status (`null` if provider has no OAuth support) */
+	/** OAuth status (`None` if provider has no OAuth support) */
 	oauth_status?: OAuthStatus;
 	/** Whether a manually-entered API key is stored in the keyring */
 	has_stored_api_key: boolean;
@@ -417,7 +423,7 @@ export interface AuthProviderEntry {
 	env_var_name?: string;
 	/** Whether this provider supports OAuth flows */
 	supports_oauth: boolean;
-	/** User's preferred auth method (`null` = auto/default) */
+	/** User's preferred auth method (`None` = auto/default) */
 	preferred_method?: AuthMethod;
 }
 
