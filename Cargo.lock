@@ -70,11 +70,11 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.9.5"
+version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "499b7ff5c6c842e43fb188f6da7c99a258ae89a9df8c896d6e9784da9b4b23e7"
+checksum = "1ea4b85f3bcd56ebe65f830321d34bc939af1b5a33b9dcb683195a3b72de0cdb"
 dependencies = [
- "agent-client-protocol-schema",
+ "agent-client-protocol-schema 0.10.6",
  "anyhow",
  "async-broadcast",
  "async-trait",
@@ -87,9 +87,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "0.10.8"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44bc1fef9c32f03bce2ab44af35b6f483bfd169bf55cc59beeb2e3b1a00ae4d1"
+checksum = "70829a300bd178abe42836ac779cd3eb3b0dd3881250c752b2621b5324735df1"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -97,6 +97,20 @@ dependencies = [
  "serde",
  "serde_json",
  "strum 0.27.2",
+]
+
+[[package]]
+name = "agent-client-protocol-schema"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f833f2ec0d0ac6d68cbd0c1e2e02642876291048f45fb9772ff617ac5c34ef3"
+dependencies = [
+ "anyhow",
+ "derive_more",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "strum 0.28.0",
 ]
 
 [[package]]
@@ -9733,7 +9747,7 @@ name = "querymt-agent"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
- "agent-client-protocol-schema",
+ "agent-client-protocol-schema 0.11.0",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -12004,6 +12018,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "strum"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+dependencies = [
+ "strum_macros 0.28.0",
+]
+
+[[package]]
 name = "strum_macros"
 version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12034,6 +12057,18 @@ name = "strum_macros"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
