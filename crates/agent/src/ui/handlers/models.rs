@@ -1016,3 +1016,105 @@ async fn fetch_remote_models(state: &ServerState) -> Vec<ModelEntry> {
 
     all_remote
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::TestServerState;
+    use tokio::time::Duration;
+
+    /// Parse the next JSON message from the channel.
+    async fn next_msg(rx: &mut mpsc::Receiver<String>) -> serde_json::Value {
+        let raw = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout waiting for message")
+            .expect("channel closed");
+        serde_json::from_str(&raw).expect("invalid JSON from handler")
+    }
+
+    // ── handle_set_api_token ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_api_token_rejects_empty_key() {
+        let ts = TestServerState::new().await;
+        let (tx, mut rx) = ts.add_connection("c1").await;
+
+        handle_set_api_token(&ts.state, "openai", "", &tx).await;
+
+        // First message: ApiTokenResult with success=false
+        let msg = next_msg(&mut rx).await;
+        assert_eq!(msg["type"], "api_token_result");
+        assert_eq!(msg["data"]["success"], false);
+        assert!(
+            msg["data"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be empty")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_api_token_rejects_whitespace_only_key() {
+        let ts = TestServerState::new().await;
+        let (tx, mut rx) = ts.add_connection("c1").await;
+
+        handle_set_api_token(&ts.state, "openai", "   \t\n  ", &tx).await;
+
+        let msg = next_msg(&mut rx).await;
+        assert_eq!(msg["type"], "api_token_result");
+        assert_eq!(msg["data"]["success"], false);
+    }
+
+    #[tokio::test]
+    async fn set_api_token_unknown_provider_returns_error() {
+        let ts = TestServerState::new().await;
+        let (tx, mut rx) = ts.add_connection("c1").await;
+
+        handle_set_api_token(&ts.state, "nonexistent", "sk-test", &tx).await;
+
+        let msg = next_msg(&mut rx).await;
+        assert_eq!(msg["type"], "api_token_result");
+        assert_eq!(msg["data"]["success"], false);
+        assert!(
+            msg["data"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not have a known API key name")
+        );
+    }
+
+    // ── handle_clear_api_token ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn clear_api_token_unknown_provider_returns_error() {
+        let ts = TestServerState::new().await;
+        let (tx, mut rx) = ts.add_connection("c1").await;
+
+        handle_clear_api_token(&ts.state, "nonexistent", &tx).await;
+
+        let msg = next_msg(&mut rx).await;
+        assert_eq!(msg["type"], "api_token_result");
+        assert_eq!(msg["data"]["success"], false);
+        assert!(
+            msg["data"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not have a known API key name")
+        );
+    }
+
+    // ── handle_list_auth_providers ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_auth_providers_empty_registry() {
+        let ts = TestServerState::new().await;
+        let (tx, mut rx) = ts.add_connection("c1").await;
+
+        handle_list_auth_providers(&ts.state, &tx).await;
+
+        let msg = next_msg(&mut rx).await;
+        assert_eq!(msg["type"], "auth_providers");
+        let providers = msg["data"]["providers"].as_array().unwrap();
+        assert!(providers.is_empty());
+    }
+}

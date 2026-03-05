@@ -1262,4 +1262,86 @@ pub mod tests {
     }
 
     impl LLMProvider for MockProvider {}
+
+    // ── resolve_api_key_with_preference tests ─────────────────────────────────
+
+    /// Use a unique env var name per test to avoid cross-test interference.
+    fn unique_env_var(suffix: &str) -> String {
+        format!("QMT_TEST_API_KEY_{}", suffix)
+    }
+
+    #[tokio::test]
+    async fn resolve_env_var_preferred() {
+        let var = unique_env_var("ENV_PREF");
+        // SAFETY: test-only; each test uses a unique env var name.
+        unsafe { std::env::set_var(&var, "key-from-env") };
+
+        let mut use_oauth = false;
+        let result = super::resolve_api_key_with_preference(
+            "test-provider",
+            Some(&var),
+            Some(&AuthMethod::EnvVar),
+            &mut use_oauth,
+        )
+        .await;
+
+        assert_eq!(result.as_deref(), Some("key-from-env"));
+        assert!(!use_oauth);
+        unsafe { std::env::remove_var(&var) };
+    }
+
+    #[tokio::test]
+    async fn resolve_env_var_as_fallback_no_preference() {
+        let var = unique_env_var("ENV_FALLBACK");
+        // SAFETY: test-only; each test uses a unique env var name.
+        unsafe { std::env::set_var(&var, "fallback-key") };
+
+        let mut use_oauth = false;
+        let result = super::resolve_api_key_with_preference(
+            "test-provider",
+            Some(&var),
+            None, // default order: OAuth → stored key → env var
+            &mut use_oauth,
+        )
+        .await;
+
+        // OAuth and stored key will fail, should fall back to env var
+        assert_eq!(result.as_deref(), Some("fallback-key"));
+        unsafe { std::env::remove_var(&var) };
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_none_when_no_sources() {
+        let var = unique_env_var("NONE_EXIST");
+        // SAFETY: test-only; each test uses a unique env var name.
+        unsafe { std::env::remove_var(&var) };
+
+        let mut use_oauth = false;
+        let result = super::resolve_api_key_with_preference(
+            "no-such-provider",
+            Some(&var),
+            None,
+            &mut use_oauth,
+        )
+        .await;
+
+        assert!(result.is_none());
+        assert!(!use_oauth);
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth_only_provider_no_env_var_name() {
+        // OAuth-only providers pass env_var_name=None.
+        // Without a valid OAuth token, should return None.
+        let mut use_oauth = false;
+        let result = super::resolve_api_key_with_preference(
+            "codex-like",
+            None, // no env var name
+            None,
+            &mut use_oauth,
+        )
+        .await;
+
+        assert!(result.is_none());
+    }
 }
