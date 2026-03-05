@@ -25,7 +25,7 @@
 use clap::Parser;
 use futures::StreamExt;
 use qmt_llama_cpp::{LlamaCppConfig, create_provider};
-use querymt::chat::{ChatMessage, ChatRole, ImageMime, MessageType};
+use querymt::chat::{ChatMessage, ChatRole, Content};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -125,9 +125,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let messages = vec![ChatMessage {
         role: ChatRole::User,
-        message_type: MessageType::Image((mime, image_data)),
-        content: args.prompt.clone(),
-        thinking: None,
+        content: vec![
+            Content::image(mime, image_data),
+            Content::text(&args.prompt),
+        ],
         cache: None,
     }];
 
@@ -164,17 +165,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn detect_mime(path: &PathBuf) -> Result<ImageMime, Box<dyn std::error::Error>> {
+fn detect_mime(path: &PathBuf) -> Result<String, Box<dyn std::error::Error>> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .ok_or("no file extension")?
         .to_lowercase();
     match ext.as_str() {
-        "jpg" | "jpeg" => Ok(ImageMime::JPEG),
-        "png" => Ok(ImageMime::PNG),
-        "gif" => Ok(ImageMime::GIF),
-        "webp" => Ok(ImageMime::WEBP),
+        "jpg" | "jpeg" => Ok("image/jpeg".to_string()),
+        "png" => Ok("image/png".to_string()),
+        "gif" => Ok("image/gif".to_string()),
+        "webp" => Ok("image/webp".to_string()),
         other => Err(format!("unsupported image format: {}", other).into()),
     }
 }

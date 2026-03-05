@@ -46,16 +46,6 @@ pub(crate) fn messages_to_json(
             ChatRole::Assistant => "assistant",
         };
 
-        let text = msg
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
         let thinking = msg
             .content
             .iter()
@@ -67,10 +57,34 @@ pub(crate) fn messages_to_json(
             .join("\n");
 
         let mut tool_calls_array: Vec<Value> = Vec::new();
-        let mut has_image = false;
+        // Count only Content::Image (not ImageUrl — unsupported for now).
+        // This must exactly match what extract_media() collects.
+        let mut image_count: usize = 0;
+
+        // Build text by interleaving markers at exact image positions.
+        // This ensures N images produce exactly N markers in the text.
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut pending_markers: usize = 0;
 
         for block in &msg.content {
             match block {
+                Content::Text { text } => {
+                    // Flush any pending image markers before the next text segment.
+                    for _ in 0..pending_markers {
+                        text_parts.push(marker.to_string());
+                    }
+                    pending_markers = 0;
+                    text_parts.push(text.clone());
+                }
+                Content::Image { .. } => {
+                    image_count += 1;
+                    pending_markers += 1;
+                }
+                Content::ImageUrl { .. } => {
+                    // ImageUrl is not supported by extract_media — skip marker
+                    // to avoid count mismatch. Log a warning.
+                    log::warn!("ImageUrl in message skipped (not supported for multimodal)");
+                }
                 Content::ToolUse {
                     id,
                     name,
@@ -100,9 +114,10 @@ pub(crate) fn messages_to_json(
                         "content": output_text
                     }));
 
+                    // Count only Content::Image inside tool results (matching extract_media).
                     let nested_images = content
                         .iter()
-                        .filter(|c| matches!(c, Content::Image { .. } | Content::ImageUrl { .. }))
+                        .filter(|c| matches!(c, Content::Image { .. }))
                         .count();
                     for _ in 0..nested_images {
                         json_messages.push(serde_json::json!({
@@ -111,16 +126,32 @@ pub(crate) fn messages_to_json(
                         }));
                         media_count += 1;
                     }
-                }
-                Content::Image { .. } | Content::ImageUrl { .. } => {
-                    has_image = true;
-                    media_count += 1;
+
+                    // Warn about skipped ImageUrl in tool results.
+                    let skipped_urls = content
+                        .iter()
+                        .filter(|c| matches!(c, Content::ImageUrl { .. }))
+                        .count();
+                    if skipped_urls > 0 {
+                        log::warn!(
+                            "Skipped {} ImageUrl block(s) inside ToolResult (not supported for multimodal)",
+                            skipped_urls
+                        );
+                    }
                 }
                 _ => {}
             }
         }
 
+        // Flush any trailing image markers (images at the end of a message).
+        for _ in 0..pending_markers {
+            text_parts.push(marker.to_string());
+        }
+
+        media_count += image_count;
+
         if !tool_calls_array.is_empty() {
+            let text = text_parts.join("\n");
             let content = if text.is_empty() {
                 Value::Null
             } else {
@@ -139,22 +170,7 @@ pub(crate) fn messages_to_json(
             continue;
         }
 
-        if has_image {
-            let content = if text.is_empty() {
-                marker.to_string()
-            } else {
-                format!("{}\n{}", marker, text)
-            };
-            let mut json_msg = serde_json::json!({
-                "role": role,
-                "content": content
-            });
-            if !thinking.is_empty() {
-                json_msg["reasoning_content"] = serde_json::json!(thinking);
-            }
-            json_messages.push(json_msg);
-            continue;
-        }
+        let text = text_parts.join("\n");
 
         if !text.is_empty() || !thinking.is_empty() {
             let mut json_msg = serde_json::json!({
@@ -266,8 +282,6 @@ fn normalize_messages_to_text(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use querymt::chat::ImageMime;
-    use querymt::{FunctionCall, ToolCall};
 
     fn test_config() -> LlamaCppConfig {
         LlamaCppConfig {
@@ -302,24 +316,28 @@ mod tests {
         }
     }
 
+    fn user_msg(blocks: Vec<Content>) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::User,
+            content: blocks,
+            cache: None,
+        }
+    }
+
+    fn assistant_msg(blocks: Vec<Content>) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: blocks,
+            cache: None,
+        }
+    }
+
     #[test]
-    fn test_messages_to_json_basic() {
+    fn basic_text_messages() {
         let cfg = test_config();
         let messages = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                message_type: MessageType::Text,
-                content: "Hello".to_string(),
-                thinking: None,
-                cache: None,
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                message_type: MessageType::Text,
-                content: "Hi there!".to_string(),
-                thinking: None,
-                cache: None,
-            },
+            user_msg(vec![Content::text("Hello")]),
+            assistant_msg(vec![Content::text("Hi there!")]),
         ];
 
         let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
@@ -334,17 +352,11 @@ mod tests {
     }
 
     #[test]
-    fn test_messages_to_json_with_system() {
+    fn system_message_prepended() {
         let mut cfg = test_config();
         cfg.system = vec!["You are a helpful assistant".to_string()];
 
-        let messages = vec![ChatMessage {
-            role: ChatRole::User,
-            message_type: MessageType::Text,
-            content: "Hello".to_string(),
-            thinking: None,
-            cache: None,
-        }];
+        let messages = vec![user_msg(vec![Content::text("Hello")])];
 
         let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
@@ -357,15 +369,12 @@ mod tests {
     }
 
     #[test]
-    fn test_messages_to_json_with_thinking() {
+    fn thinking_block_emitted() {
         let cfg = test_config();
-        let messages = vec![ChatMessage {
-            role: ChatRole::Assistant,
-            message_type: MessageType::Text,
-            content: "The answer is 42".to_string(),
-            thinking: Some("Let me calculate this...".to_string()),
-            cache: None,
-        }];
+        let messages = vec![assistant_msg(vec![
+            Content::thinking("Let me calculate..."),
+            Content::text("The answer is 42"),
+        ])];
 
         let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
@@ -374,28 +383,20 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["role"], "assistant");
         assert_eq!(parsed[0]["content"], "The answer is 42");
-        assert_eq!(parsed[0]["reasoning_content"], "Let me calculate this...");
+        assert_eq!(parsed[0]["reasoning_content"], "Let me calculate...");
     }
 
     #[test]
-    fn test_messages_to_json_with_tool_use() {
+    fn tool_use_message() {
         let cfg = test_config();
-        let tool_calls = vec![ToolCall {
-            id: "call_123".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "get_weather".to_string(),
-                arguments: r#"{"city": "Paris"}"#.to_string(),
-            },
-        }];
-
-        let messages = vec![ChatMessage {
-            role: ChatRole::Assistant,
-            message_type: MessageType::ToolUse(tool_calls),
-            content: "Let me check the weather".to_string(),
-            thinking: None,
-            cache: None,
-        }];
+        let messages = vec![assistant_msg(vec![
+            Content::text("Let me check"),
+            Content::tool_use(
+                "call_123",
+                "get_weather",
+                serde_json::json!({"city": "Paris"}),
+            ),
+        ])];
 
         let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
@@ -403,7 +404,7 @@ mod tests {
         assert_eq!(media_count, 0);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["role"], "assistant");
-        assert_eq!(parsed[0]["content"], "Let me check the weather");
+        assert_eq!(parsed[0]["content"], "Let me check");
         assert!(parsed[0]["tool_calls"].is_array());
         assert_eq!(parsed[0]["tool_calls"][0]["id"], "call_123");
         assert_eq!(
@@ -413,24 +414,14 @@ mod tests {
     }
 
     #[test]
-    fn test_messages_to_json_with_tool_result() {
+    fn tool_result_message() {
         let cfg = test_config();
-        let tool_results = vec![ToolCall {
+        let messages = vec![user_msg(vec![Content::ToolResult {
             id: "call_123".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "get_weather".to_string(),
-                arguments: r#"{"temperature": 22, "condition": "sunny"}"#.to_string(),
-            },
-        }];
-
-        let messages = vec![ChatMessage {
-            role: ChatRole::User,
-            message_type: MessageType::ToolResult(tool_results),
-            content: "Weather data".to_string(),
-            thinking: None,
-            cache: None,
-        }];
+            name: Some("get_weather".to_string()),
+            is_error: false,
+            content: vec![Content::text(r#"{"temperature": 22}"#)],
+        }])];
 
         let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
@@ -440,22 +431,16 @@ mod tests {
         assert_eq!(parsed[0]["role"], "tool");
         assert_eq!(parsed[0]["tool_call_id"], "call_123");
         assert_eq!(parsed[0]["name"], "get_weather");
-        assert_eq!(
-            parsed[0]["content"],
-            r#"{"temperature": 22, "condition": "sunny"}"#
-        );
+        assert_eq!(parsed[0]["content"], r#"{"temperature": 22}"#);
     }
 
     #[test]
-    fn test_messages_to_json_with_image() {
+    fn single_image_with_text() {
         let cfg = test_config();
-        let messages = vec![ChatMessage {
-            role: ChatRole::User,
-            message_type: MessageType::Image((ImageMime::JPEG, vec![0xFF, 0xD8, 0xFF])),
-            content: "What's in this image?".to_string(),
-            thinking: None,
-            cache: None,
-        }];
+        let messages = vec![user_msg(vec![
+            Content::image("image/jpeg", vec![0xFF, 0xD8, 0xFF]),
+            Content::text("What's in this image?"),
+        ])];
 
         let (result, media_count) = messages_to_json(&cfg, &messages, Some("<image>")).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
@@ -467,15 +452,12 @@ mod tests {
     }
 
     #[test]
-    fn test_messages_to_json_with_image_no_text() {
+    fn single_image_no_text() {
         let cfg = test_config();
-        let messages = vec![ChatMessage {
-            role: ChatRole::User,
-            message_type: MessageType::Image((ImageMime::PNG, vec![0x89, 0x50, 0x4E, 0x47])),
-            content: "".to_string(),
-            thinking: None,
-            cache: None,
-        }];
+        let messages = vec![user_msg(vec![Content::image(
+            "image/png",
+            vec![0x89, 0x50, 0x4E, 0x47],
+        )])];
 
         let (result, media_count) = messages_to_json(&cfg, &messages, Some("<__media__>")).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
@@ -487,23 +469,148 @@ mod tests {
     }
 
     #[test]
-    fn test_messages_to_text_basic() {
+    fn multiple_images_produce_multiple_markers() {
+        let cfg = test_config();
+        let messages = vec![user_msg(vec![
+            Content::image("image/png", vec![1]),
+            Content::image("image/png", vec![2]),
+            Content::image("image/png", vec![3]),
+            Content::text("Describe all three images"),
+        ])];
+
+        let (result, media_count) = messages_to_json(&cfg, &messages, Some("<M>")).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(media_count, 3);
+        assert_eq!(parsed.len(), 1);
+        let content = parsed[0]["content"].as_str().unwrap();
+        assert_eq!(
+            content.matches("<M>").count(),
+            3,
+            "Expected 3 markers, got: {}",
+            content
+        );
+    }
+
+    #[test]
+    fn images_interleaved_with_text() {
+        let cfg = test_config();
+        let messages = vec![user_msg(vec![
+            Content::image("image/png", vec![1]),
+            Content::text("First image above."),
+            Content::image("image/png", vec![2]),
+            Content::text("Second image above."),
+        ])];
+
+        let (result, media_count) = messages_to_json(&cfg, &messages, Some("<M>")).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(media_count, 2);
+        let content = parsed[0]["content"].as_str().unwrap();
+        assert_eq!(content.matches("<M>").count(), 2);
+        // Markers should appear before their respective text segments.
+        assert!(content.contains("<M>\nFirst image above."));
+        assert!(content.contains("<M>\nSecond image above."));
+    }
+
+    #[test]
+    fn tool_result_with_nested_image() {
+        let cfg = test_config();
+        let messages = vec![user_msg(vec![Content::ToolResult {
+            id: "call_1".to_string(),
+            name: Some("photos_recent".to_string()),
+            is_error: false,
+            content: vec![
+                Content::text("Photo metadata here"),
+                Content::image("image/png", vec![0x89, 0x50]),
+            ],
+        }])];
+
+        let (result, media_count) = messages_to_json(&cfg, &messages, Some("<__media__>")).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(media_count, 1);
+        // Should produce: tool message + separate user message with marker
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["role"], "tool");
+        assert_eq!(parsed[0]["content"], "Photo metadata here");
+        assert_eq!(parsed[1]["role"], "user");
+        assert_eq!(parsed[1]["content"], "<__media__>");
+    }
+
+    #[test]
+    fn tool_result_with_multiple_nested_images() {
+        let cfg = test_config();
+        let messages = vec![user_msg(vec![Content::ToolResult {
+            id: "call_1".to_string(),
+            name: Some("photos_search".to_string()),
+            is_error: false,
+            content: vec![
+                Content::text("metadata"),
+                Content::image("image/png", vec![1]),
+                Content::image("image/png", vec![2]),
+                Content::image("image/jpeg", vec![3]),
+            ],
+        }])];
+
+        let (result, media_count) = messages_to_json(&cfg, &messages, Some("<M>")).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(media_count, 3);
+        // 1 tool message + 3 user marker messages
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0]["role"], "tool");
+        for i in 1..=3 {
+            assert_eq!(parsed[i]["role"], "user");
+            assert_eq!(parsed[i]["content"], "<M>");
+        }
+    }
+
+    #[test]
+    fn image_url_skipped_no_marker() {
+        let cfg = test_config();
+        let messages = vec![user_msg(vec![
+            Content::image_url("https://example.com/photo.jpg"),
+            Content::text("What is this?"),
+        ])];
+
+        let (result, media_count) = messages_to_json(&cfg, &messages, Some("<M>")).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
+
+        // ImageUrl is unsupported — no marker, no media count
+        assert_eq!(media_count, 0);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["content"], "What is this?");
+    }
+
+    #[test]
+    fn image_url_in_tool_result_skipped() {
+        let cfg = test_config();
+        let messages = vec![user_msg(vec![Content::ToolResult {
+            id: "call_1".to_string(),
+            name: Some("tool".to_string()),
+            is_error: false,
+            content: vec![
+                Content::text("result"),
+                Content::image_url("https://example.com/img.png"),
+            ],
+        }])];
+
+        let (result, media_count) = messages_to_json(&cfg, &messages, Some("<M>")).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
+
+        // ImageUrl inside ToolResult is unsupported — no marker
+        assert_eq!(media_count, 0);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["role"], "tool");
+    }
+
+    #[test]
+    fn text_only_messages_to_text() {
         let cfg = test_config();
         let messages = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                message_type: MessageType::Text,
-                content: "Hello".to_string(),
-                thinking: None,
-                cache: None,
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                message_type: MessageType::Text,
-                content: "Hi there!".to_string(),
-                thinking: None,
-                cache: None,
-            },
+            user_msg(vec![Content::text("Hello")]),
+            assistant_msg(vec![Content::text("Hi there!")]),
         ];
 
         let result = messages_to_text(&cfg, &messages).unwrap();
@@ -511,89 +618,43 @@ mod tests {
     }
 
     #[test]
-    fn test_messages_to_text_with_system() {
+    fn text_with_system_prompt() {
         let mut cfg = test_config();
         cfg.system = vec!["You are helpful".to_string()];
 
-        let messages = vec![ChatMessage {
-            role: ChatRole::User,
-            message_type: MessageType::Text,
-            content: "Hello".to_string(),
-            thinking: None,
-            cache: None,
-        }];
+        let messages = vec![user_msg(vec![Content::text("Hello")])];
 
         let result = messages_to_text(&cfg, &messages).unwrap();
         assert_eq!(result, "You are helpful\n\nHello");
     }
 
     #[test]
-    fn test_messages_to_text_normalizes_tool_messages() {
+    fn text_normalizes_tool_messages() {
         let cfg = test_config();
-        let tool_calls = vec![ToolCall {
-            id: "call_123".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "search".to_string(),
-                arguments: r#"{"query": "rust"}"#.to_string(),
-            },
-        }];
-
         let messages = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                message_type: MessageType::Text,
-                content: "Search for rust".to_string(),
-                thinking: None,
-                cache: None,
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                message_type: MessageType::ToolUse(tool_calls),
-                content: "Searching...".to_string(),
-                thinking: None,
-                cache: None,
-            },
+            user_msg(vec![Content::text("Search for rust")]),
+            assistant_msg(vec![
+                Content::text("Searching..."),
+                Content::tool_use("call_123", "search", serde_json::json!({"query": "rust"})),
+            ]),
         ];
 
         let result = messages_to_text(&cfg, &messages).unwrap();
-        assert_eq!(result, "Search for rust\n\nSearching...");
+        // Tool use is normalized — text content is preserved, tool block becomes text
+        assert!(result.contains("Search for rust"));
+        assert!(result.contains("Searching..."));
+        assert!(result.contains("[ToolUse: search"));
     }
 
     #[test]
-    fn test_normalize_messages_to_text() {
-        let tool_calls = vec![ToolCall {
-            id: "call_123".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "test".to_string(),
-                arguments: "{}".to_string(),
-            },
-        }];
+    fn text_mode_rejects_binary_content() {
+        let cfg = test_config();
+        let messages = vec![user_msg(vec![
+            Content::text("Look at this"),
+            Content::image("image/png", vec![1, 2, 3]),
+        ])];
 
-        let messages = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                message_type: MessageType::Text,
-                content: "Hello".to_string(),
-                thinking: None,
-                cache: None,
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                message_type: MessageType::ToolUse(tool_calls),
-                content: "Using tool".to_string(),
-                thinking: Some("Thinking...".to_string()),
-                cache: None,
-            },
-        ];
-
-        let normalized = normalize_messages_to_text(&messages);
-
-        assert_eq!(normalized.len(), 2);
-        assert!(matches!(normalized[0].message_type, MessageType::Text));
-        assert!(matches!(normalized[1].message_type, MessageType::Text));
-        assert_eq!(normalized[1].content, "Using tool");
-        assert_eq!(normalized[1].thinking.as_ref().unwrap(), "Thinking...");
+        let result = messages_to_text(&cfg, &messages);
+        assert!(result.is_err());
     }
 }

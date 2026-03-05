@@ -321,65 +321,208 @@ mod tests {
     use super::*;
     use querymt::chat::ChatRole;
 
-    #[test]
-    fn test_extract_media_no_images() {
-        let messages = vec![ChatMessage {
+    fn user_msg(blocks: Vec<Content>) -> ChatMessage {
+        ChatMessage {
             role: ChatRole::User,
-            message_type: MessageType::Text,
-            content: "Hello".to_string(),
-            thinking: None,
+            content: blocks,
             cache: None,
-        }];
+        }
+    }
+
+    #[test]
+    fn extract_media_no_images() {
+        let messages = vec![user_msg(vec![Content::text("Hello")])];
+        let media = extract_media(&messages);
+        assert_eq!(media.len(), 0);
+    }
+
+    #[test]
+    fn extract_media_single_image() {
+        let messages = vec![user_msg(vec![
+            Content::image("image/jpeg", vec![0xFF, 0xD8, 0xFF]),
+            Content::text("Describe this"),
+        ])];
+
+        let media = extract_media(&messages);
+        assert_eq!(media.len(), 1);
+        assert!(!media[0].is_audio);
+        assert_eq!(media[0].mime, "image/jpeg");
+        assert_eq!(media[0].data, vec![0xFF, 0xD8, 0xFF]);
+    }
+
+    #[test]
+    fn extract_media_multiple_images_across_messages() {
+        let messages = vec![
+            user_msg(vec![
+                Content::image("image/jpeg", vec![0xFF, 0xD8, 0xFF]),
+                Content::text("First image"),
+            ]),
+            user_msg(vec![Content::text("Some text")]),
+            user_msg(vec![
+                Content::image("image/png", vec![0x89, 0x50, 0x4E, 0x47]),
+                Content::text("Second image"),
+            ]),
+        ];
+
+        let media = extract_media(&messages);
+        assert_eq!(media.len(), 2);
+        assert_eq!(media[0].mime, "image/jpeg");
+        assert_eq!(media[1].mime, "image/png");
+    }
+
+    #[test]
+    fn extract_media_multiple_images_in_single_message() {
+        let messages = vec![user_msg(vec![
+            Content::image("image/png", vec![1]),
+            Content::image("image/jpeg", vec![2]),
+            Content::image("image/png", vec![3]),
+            Content::text("Three images"),
+        ])];
+
+        let media = extract_media(&messages);
+        assert_eq!(media.len(), 3);
+        assert_eq!(media[0].data, vec![1]);
+        assert_eq!(media[1].data, vec![2]);
+        assert_eq!(media[2].data, vec![3]);
+    }
+
+    #[test]
+    fn extract_media_skips_image_url() {
+        let messages = vec![user_msg(vec![
+            Content::image_url("https://example.com/photo.jpg"),
+            Content::text("Describe this"),
+        ])];
 
         let media = extract_media(&messages);
         assert_eq!(media.len(), 0);
     }
 
     #[test]
-    fn test_extract_media_with_images() {
-        let messages = vec![ChatMessage {
-            role: ChatRole::User,
-            message_type: MessageType::Image((ImageMime::JPEG, vec![0xFF, 0xD8, 0xFF])),
-            content: "Describe this".to_string(),
-            thinking: None,
-            cache: None,
-        }];
+    fn extract_media_from_tool_result() {
+        let messages = vec![user_msg(vec![Content::ToolResult {
+            id: "call_1".to_string(),
+            name: Some("photos".to_string()),
+            is_error: false,
+            content: vec![
+                Content::text("metadata"),
+                Content::image("image/png", vec![0x89, 0x50]),
+            ],
+        }])];
 
         let media = extract_media(&messages);
         assert_eq!(media.len(), 1);
-        assert!(!media[0].is_audio);
-        assert!(matches!(media[0].mime, ImageMime::JPEG));
+        assert_eq!(media[0].mime, "image/png");
+        assert_eq!(media[0].data, vec![0x89, 0x50]);
     }
 
     #[test]
-    fn test_extract_media_multiple_images() {
-        let messages = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                message_type: MessageType::Image((ImageMime::JPEG, vec![0xFF, 0xD8, 0xFF])),
-                content: "First image".to_string(),
-                thinking: None,
-                cache: None,
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                message_type: MessageType::Text,
-                content: "Some text".to_string(),
-                thinking: None,
-                cache: None,
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                message_type: MessageType::Image((ImageMime::PNG, vec![0x89, 0x50, 0x4E, 0x47])),
-                content: "Second image".to_string(),
-                thinking: None,
-                cache: None,
-            },
-        ];
+    fn extract_media_tool_result_multiple_images() {
+        let messages = vec![user_msg(vec![Content::ToolResult {
+            id: "call_1".to_string(),
+            name: Some("photos_search".to_string()),
+            is_error: false,
+            content: vec![
+                Content::text("metadata"),
+                Content::image("image/png", vec![1]),
+                Content::image("image/jpeg", vec![2]),
+            ],
+        }])];
 
         let media = extract_media(&messages);
         assert_eq!(media.len(), 2);
-        assert!(matches!(media[0].mime, ImageMime::JPEG));
-        assert!(matches!(media[1].mime, ImageMime::PNG));
+        assert_eq!(media[0].data, vec![1]);
+        assert_eq!(media[1].data, vec![2]);
+    }
+
+    #[test]
+    fn extract_media_tool_result_skips_image_url() {
+        let messages = vec![user_msg(vec![Content::ToolResult {
+            id: "call_1".to_string(),
+            name: Some("tool".to_string()),
+            is_error: false,
+            content: vec![
+                Content::text("result"),
+                Content::image_url("https://example.com/img.png"),
+            ],
+        }])];
+
+        let media = extract_media(&messages);
+        assert_eq!(media.len(), 0);
+    }
+
+    /// Verify that extract_media and messages_to_json agree on media count.
+    /// This is the critical invariant for MTMD tokenization.
+    #[test]
+    fn extract_media_count_matches_messages_to_json_count() {
+        use crate::config::LlamaCppConfig;
+        use crate::messages::messages_to_json;
+
+        let cfg = LlamaCppConfig {
+            model: "test.gguf".to_string(),
+            system: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            min_p: None,
+            top_k: None,
+            n_ctx: None,
+            n_batch: None,
+            n_threads: None,
+            n_threads_batch: None,
+            n_gpu_layers: None,
+            seed: None,
+            chat_template: None,
+            use_chat_template: None,
+            add_bos: None,
+            log: None,
+            fast_download: None,
+            enable_thinking: None,
+            flash_attention: None,
+            kv_cache_type_k: None,
+            kv_cache_type_v: None,
+            mmproj_path: None,
+            media_marker: None,
+            mmproj_threads: None,
+            mmproj_use_gpu: None,
+            n_ubatch: None,
+            text_only: None,
+        };
+
+        // Case: multiple top-level images + tool result with nested images
+        let messages = vec![
+            user_msg(vec![
+                Content::image("image/png", vec![1]),
+                Content::image("image/jpeg", vec![2]),
+                Content::text("Two images above"),
+            ]),
+            user_msg(vec![Content::ToolResult {
+                id: "call_1".to_string(),
+                name: Some("photos".to_string()),
+                is_error: false,
+                content: vec![
+                    Content::text("metadata"),
+                    Content::image("image/png", vec![3]),
+                    Content::image("image/png", vec![4]),
+                ],
+            }]),
+            user_msg(vec![
+                Content::image("image/png", vec![5]),
+                Content::text("One more"),
+                // ImageUrl should be skipped in both paths
+                Content::image_url("https://example.com/skip.jpg"),
+            ]),
+        ];
+
+        let extracted = extract_media(&messages);
+        let (_, marker_count) = messages_to_json(&cfg, &messages, Some("<__media__>")).unwrap();
+
+        assert_eq!(
+            extracted.len(),
+            marker_count,
+            "extract_media count ({}) must equal messages_to_json marker count ({})",
+            extracted.len(),
+            marker_count
+        );
+        assert_eq!(extracted.len(), 5); // 2 top-level + 2 nested + 1 top-level
     }
 }
