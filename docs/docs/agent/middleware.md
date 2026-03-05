@@ -6,20 +6,15 @@ Middleware in QueryMT Agent provides a pluggable way to extend and modify agent 
 
 The middleware system uses a **driver-based architecture** where each middleware implements the `MiddlewareDriver` trait. Multiple drivers are chained together in a `CompositeDriver` that processes each agent interaction.
 
-```
-User Request
-    │
-    ▼
-─────────────────────────────────────────────────────────
-│              CompositeDriver (Middleware Chain)          │
-│  ─────────────  ─────────────  ─────────────      │
-│  │   Limits    │  │   Context   │  │   AgentMode │      │
-│  │  Middleware │→ │  Middleware │→ │  Middleware │      │
-│  ─────────────  ─────────────  ─────────────      │
-─────────────────────────────────────────────────────────
-    │
-    ▼
-Agent Processing
+```mermaid
+flowchart LR
+    A([User Request])
+    subgraph CD["CompositeDriver (Middleware Chain)"]
+        M1["Limits<br/>Middleware"] --> M2["Context<br/>Middleware"] --> M3["AgentMode<br/>Middleware"]
+    end
+    B([Agent Processing])
+
+    A --> CD --> B
 ```
 
 ## Middleware Driver Trait
@@ -368,20 +363,16 @@ MIDDLEWARE_REGISTRY.register(Arc::new(MyMiddlewareFactory));
 
 Middleware is executed in the order it was added to the chain:
 
-```
-Middleware 1 (first added)
-    ↓
-Middleware 2
-    ↓
-Middleware 3 (last added)
-    ↓
-Agent processing
-    ↓
-Middleware 3 (reverse order for responses)
-    ↓
-Middleware 2
-    ↓
-Middleware 1
+```mermaid
+flowchart TD
+    A([Request]) --> M1
+    M1["Middleware 1 (first added)"] --> M2
+    M2[Middleware 2] --> M3
+    M3["Middleware 3 (last added)"] --> AP
+    AP([Agent Processing]) --> M3R
+    M3R["Middleware 3 (response)"] --> M2R
+    M2R["Middleware 2 (response)"] --> M1R
+    M1R["Middleware 1 (response)"] --> Z([Done])
 ```
 
 ## Common Patterns
