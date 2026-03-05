@@ -395,7 +395,7 @@ export function ProviderAuthSwitcher({
             </kbd>
           </div>
 
-          <Command.List className="max-h-[260px] overflow-y-auto p-2 custom-scrollbar">
+          <Command.List className="max-h-[360px] overflow-y-auto p-2 custom-scrollbar">
             <Command.Empty className="px-4 py-8 text-center text-sm text-ui-muted">
               No providers found
             </Command.Empty>
