@@ -215,20 +215,15 @@ default = "plan"  # "build", "plan", or "review"
 
 ## Mode Transition Flow
 
-```
-Build Mode (default)
-    │
-    │ Ctrl+M
-    ▼
-Plan Mode
-    │
-    │ Ctrl+M
-    ▼
-Review Mode
-    │
-    │ Ctrl+M
-    ▼
-Build Mode (cycle repeats)
+```mermaid
+flowchart LR
+    B["Build Mode<br/>(default)"]
+    P[Plan Mode]
+    R[Review Mode]
+
+    B -->|"Ctrl+M"| P
+    P -->|"Ctrl+M"| R
+    R -->|"Ctrl+M"| B
 ```
 
 ## Mode-Aware Behavior

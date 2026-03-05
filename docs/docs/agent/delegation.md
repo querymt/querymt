@@ -13,26 +13,15 @@ Delegation allows agents to:
 
 ## Architecture
 
-```
-─────────────────────────────────────────────────────────────
-│                      Planner Agent                          │
-│  (Analyzes task, decides which delegate to use)             │
-────────────────────────────────────────────────────────────
-                            │
-                            │ Delegation Request
-                            ▼
-        ──────────────────────────────────────────
-        │          Delegation Orchestrator          │
-        │  (Manages delegation lifecycle)          │
-        ────────────────────────────────────────
-                      │
-        ──────────────────────────
-        │                           │
-        ▼                           ▼
-───────────────          ───────────────
-│  Delegate 1   │          │  Delegate 2   │
-│  (Coder)      │          │  (Tester)     │
-───────────────          ───────────────
+```mermaid
+flowchart TD
+    P["Planner Agent<br/>(Analyzes task, decides which delegate to use)"]
+    O["Delegation Orchestrator<br/>(Manages delegation lifecycle)"]
+    D1["Delegate 1<br/>(Coder)"]
+    D2["Delegate 2<br/>(Tester)"]
+
+    P -->|"Delegation Request"| O
+    O --> D1 & D2
 ```
 
 ## Configuration

@@ -14,29 +14,20 @@ QueryMT Agent is a Rust library that enables you to:
 
 ## Architecture Overview
 
-```
-─────────────────────────────────────────────────────────────────
-│                        Agent Runtime                            │
-─────────────────────────────────────────────────────────────────
-│  ──────────────  ──────────────  ──────────────          │
-│  │   Session    │  │   Session    │  │   Session    │          │
-│  │    Actor     │  │    Actor     │  │    Actor     │          │
-│  ─────────────  ─────────────  ─────────────          │
-│         │                 │                 │                   │
-│         ──────────────────────────────────                   │
-│                           │                                     │
-│                  ────────▼────────                            │
-│                  │  AgentConfig    │                            │
-│                  │  (Shared State) │                            │
-│                  ────────────────                            │
-│                           │                                     │
-│         ──────────────────────────────────                   │
-│         │                 │                 │                   │
-│  ──────▼──────  ──────▼──────  ──────▼──────            │
-│  │  Middleware │  │   Tools     │  │  Provider   │            │
-│  │    Stack    │  │  Registry   │  │   System    │            │
-│  ─────────────  ─────────────  ─────────────            │
-─────────────────────────────────────────────────────────────────
+```mermaid
+graph TD
+    subgraph Runtime["Agent Runtime"]
+        SA1[Session Actor] & SA2[Session Actor] & SA3[Session Actor]
+        SA1 & SA2 & SA3 --> AC
+
+        AC["AgentConfig<br/>(Shared State)"]
+
+        AC --> MW & TR & PS
+
+        MW[Middleware Stack]
+        TR[Tools Registry]
+        PS[Provider System]
+    end
 ```
 
 ### Core Components
@@ -84,61 +75,35 @@ Switch modes with `Ctrl+M` (or `Cmd+M` on macOS) in dashboard mode.
 
 ## Execution Flow
 
-```
-User Request
-    │
-    ▼
-─────────────────
-│  SessionActor   │  ← Create session via ACP or dashboard
-────────────────
-         │
-         ▼
-─────────────────
-│  Middleware     │  ← Limits check, mode validation
-│     Stack       │
-────────────────
-         │
-         ▼
-─────────────────
-│  Tool Selection │  ← Agent chooses tools to use
-────────────────
-         │
-         ▼
-─────────────────
-│  Tool Execution │  ← Execute tools (shell, file ops, etc.)
-────────────────
-         │
-         ▼
-─────────────────
-│  Context        │  ← Prune/compact if needed
-│   Management    │
-────────────────
-         │
-         ▼
-─────────────────
-│  LLM Response   │  ← Send to LLM, get next action
-─────────────────
+```mermaid
+flowchart TD
+    A([User Request])
+    B[SessionActor]
+    C[Middleware Stack]
+    D[Tool Selection]
+    E[Tool Execution]
+    F[Context Management]
+    G[LLM Response]
+
+    A --> B
+    B -->|"Limits check, mode validation"| C
+    C --> D
+    D -->|"Agent chooses tools"| E
+    E -->|"shell, file ops, etc."| F
+    F -->|"Prune/compact if needed"| G
+    G -->|"Next action"| B
 ```
 
 ## Multi-Agent (Quorum) Architecture
 
 For complex tasks, QueryMT supports a planner-delegate pattern:
 
-```
-──────────────────────────────────────────────────────────────
-│                        Planner Agent                          │
-│  (Analyzes task, decides which delegate to use)               │
-─────────────────────────────────────────────────────────────
-                           │
-                           │ Delegation Request
-                           ▼
-        ────────────────────────────────────
-        │                                     │
-        ▼                                     ▼
-─────────────────                   ─────────────────
-│   Delegate 1    │                   │   Delegate 2    │
-│  (Code Reviewer)│                   │   (Tester)      │
-─────────────────                   ─────────────────
+```mermaid
+flowchart TD
+    P["Planner Agent<br/>(Analyzes task, decides which delegate to use)"]
+    P -->|"Delegation Request"| D1 & D2
+    D1["Delegate 1<br/>(Code Reviewer)"]
+    D2["Delegate 2<br/>(Tester)"]
 ```
 
 ## Key Features

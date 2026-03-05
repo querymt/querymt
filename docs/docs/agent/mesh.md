@@ -13,20 +13,18 @@ Mesh networking uses the **kameo** actor framework with **libp2p** for peer-to-p
 
 ## Architecture
 
-```
-─────────────────                    ─────────────────
-│   Machine A     │                    │   Machine B     │
-│                 │  ──────────────  │                 │
-│  ───────────  │  │   Internet   │  │  ───────────  │
-│  │  Agent    │────  (libp2p)    ├────│  Agent    │  │
-│  │  Session  │  │  │   Mesh       │  │  │  Session  │  │
-│  ───────────  │  ──────────────  │  ───────────  │
-│                 │                    │                 │
-│  ───────────  │                    │  ───────────  │
-│  │  GPU      │  │                    │  │  LLM      │  │
-│  │  Worker   │  │                    │  │  Provider │  │
-│  ───────────  │                    │  ───────────  │
-─────────────────                    ─────────────────
+```mermaid
+flowchart LR
+    subgraph A["Machine A"]
+        AS[Agent Session]
+        AG[GPU Worker]
+    end
+    subgraph B["Machine B"]
+        BS[Agent Session]
+        BL[LLM Provider]
+    end
+
+    AS <-->|"Internet<br/>(libp2p Mesh)"| BS
 ```
 
 ## Quick Start
@@ -269,21 +267,20 @@ if let Some(policy) = snapshot.get(&agent_id) {
 
 ### 1. GPU-Accelerated Coding
 
-```
-Local Machine (CPU)          Remote Machine (GPU)
-─────────────────          ────────────────
-─────────────────        ─────────────────
-│  Planner Agent  │        │  Coder Agent    │
-│  (Lightweight)  │──────►│  (GPU-accelerated)│
-─────────────────        ─────────────────
-        │                          │
-        │ LLM calls                │ Fast model inference
-        │ (routed to GPU)          │
-        ▼                          ▼
-   ─────────              ─────────
-   │  Local  │              │  GPU    │
-   │  Model  │              │  Model  │
-   ─────────              ─────────
+```mermaid
+flowchart LR
+    subgraph Local["Local Machine (CPU)"]
+        PA["Planner Agent<br/>(Lightweight)"]
+        LM[Local Model]
+    end
+    subgraph Remote["Remote Machine (GPU)"]
+        CA["Coder Agent<br/>(GPU-accelerated)"]
+        GM[GPU Model]
+    end
+
+    PA -->|"Delegates task"| CA
+    PA -->|"LLM calls<br/>(routed to GPU)"| GM
+    CA -->|"Fast model inference"| GM
 ```
 
 **Configuration:**
@@ -305,20 +302,14 @@ tools = ["edit", "write_file", "shell"]
 
 ### 2. Distributed Team Collaboration
 
-```
-Developer A              Developer B              Developer C
-─────────────            ────────────            ────────────
-─────────────────     ─────────────────     ─────────────────
-│  Session 1      │     │  Session 2      │     │  Session 3      │
-│  (Feature A)    │────  (Feature B)    │────  (Feature C)    │
-─────────────────     ─────────────────     ─────────────────
-        │                       │                       │
-        ──────────────────────────────────────────────
-                                │
-                        ───────────────
-                        │   Shared      │
-                        │   State       │
-                        ───────────────
+```mermaid
+flowchart TD
+    S1["Session 1<br/>(Feature A)"]
+    S2["Session 2<br/>(Feature B)"]
+    S3["Session 3<br/>(Feature C)"]
+    SS[("Shared State")]
+
+    S1 & S2 & S3 <--> SS
 ```
 
 **Benefits:**
@@ -328,15 +319,17 @@ Developer A              Developer B              Developer C
 
 ### 3. Load Distribution
 
-```
-Load Balancer Node           Worker Nodes
-─────────────────            ───────────
-─────────────────          ───────── ─────────
-│  Session Router │─────────►│ Worker 1│ │ Worker 2│
-│                 │          │         │ │         │
-│  - Distribute   │          │ Handle  │ │ Handle  │
-│  - Monitor      │          │ Tasks   │ │ Tasks   │
-─────────────────          ───────── ─────────
+```mermaid
+flowchart LR
+    subgraph LB["Load Balancer Node"]
+        SR["Session Router<br/>- Distribute<br/>- Monitor"]
+    end
+    subgraph WN["Worker Nodes"]
+        W1["Worker 1<br/>(Handle Tasks)"]
+        W2["Worker 2<br/>(Handle Tasks)"]
+    end
+
+    SR --> W1 & W2
 ```
 
 **Configuration:**
@@ -356,13 +349,18 @@ addr = "/ip4/10.0.0.2/tcp/9000"
 
 ### 4. Specialized Hardware
 
-```
-Development Machine      Specialized Nodes
-─────────────────        ───────────────
-─────────────────      ───────── ───────── ─────────
-│  Development    │      │ GPU     │ │ TPU     │ │ FPGA    │
-│  Agent          │─────►│ Worker  │ │ Worker  │ │ Worker  │
-─────────────────      ───────── ───────── ─────────
+```mermaid
+flowchart LR
+    subgraph DM["Development Machine"]
+        DA[Development Agent]
+    end
+    subgraph SN["Specialized Nodes"]
+        GPU[GPU Worker]
+        TPU[TPU Worker]
+        FPGA[FPGA Worker]
+    end
+
+    DA --> GPU & TPU & FPGA
 ```
 
 ## Security
