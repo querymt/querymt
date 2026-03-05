@@ -466,10 +466,10 @@ export function ProviderAuthSwitcher({
   const [oauthPending, setOauthPending] = useState(false);
   const [apiKeyPanelProvider, setApiKeyPanelProvider] = useState<AuthProviderEntry | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<AuthProviderEntry | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const callbackRef = useRef<HTMLInputElement>(null);
-  const apiKeyInputRef = useRef<HTMLInputElement>(null);
-  const openAuthButtonRef = useRef<HTMLButtonElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null) as React.RefObject<HTMLInputElement>;
+  const callbackRef = useRef<HTMLInputElement>(null) as React.RefObject<HTMLInputElement>;
+  const apiKeyInputRef = useRef<HTMLInputElement>(null) as React.RefObject<HTMLInputElement>;
+  const openAuthButtonRef = useRef<HTMLButtonElement>(null) as React.RefObject<HTMLButtonElement>;
   const disconnectInFlightProviderRef = useRef<string | null>(null);
   const { focusMainInput } = useUiStore();
 
