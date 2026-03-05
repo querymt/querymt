@@ -2,6 +2,21 @@ import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { HeaderStatsBar } from './HeaderStatsBar';
 import type { EventItem, SessionLimits } from '../types';
+import { vi } from 'vitest';
+
+// Provide a stable timer context so HeaderStatsBar can be tested in isolation
+// without needing a full UiClientProvider stack.
+vi.mock('../context/SessionTimerContext', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../context/SessionTimerContext')>();
+  return {
+    ...actual,
+    useSessionTimerContext: () => ({
+      globalElapsedMs: 5000,
+      agentElapsedMs: new Map<string, number>(),
+      isSessionActive: false,
+    }),
+  };
+});
 
 // Minimal events to make the stats bar render (needs at least 1 message or tool call)
 const mockEvents: EventItem[] = [
@@ -25,8 +40,6 @@ const mockEvents: EventItem[] = [
 
 const defaultProps = {
   events: mockEvents,
-  globalElapsedMs: 5000,
-  isSessionActive: false,
   agentModels: {} as Record<string, { provider?: string; model?: string; contextLimit?: number; node?: string }>,
   sessionLimits: null as SessionLimits | null,
 };

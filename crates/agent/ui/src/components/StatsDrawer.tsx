@@ -6,6 +6,7 @@ import { getAgentColor } from '../utils/agentColors';
 import { getAgentDisplayName } from '../utils/agentNames';
 import { TodoStats } from '../hooks/useTodoState';
 import { formatDuration, formatCost, formatTokensAbbrev, formatPercentage } from '../utils/formatters';
+import { useSessionTimerContext } from '../context/SessionTimerContext';
 
 /**
  * StatsDrawer - Top-sliding drawer for detailed session statistics
@@ -21,9 +22,6 @@ interface StatsDrawerProps {
   onOpenChange: (open: boolean) => void;
   events: EventItem[];
   agents: UiAgentInfo[];
-  globalElapsedMs: number;
-  agentElapsedMs: Map<string, number>;
-  isSessionActive: boolean;
   agentModels: Record<string, { provider?: string; model?: string; contextLimit?: number; node?: string }>;
   sessionLimits?: SessionLimits | null;
   todoStats?: TodoStats | null;
@@ -35,14 +33,12 @@ export function StatsDrawer({
   onOpenChange,
   events,
   agents,
-  globalElapsedMs,
-  agentElapsedMs,
-  isSessionActive,
   agentModels,
   sessionLimits,
   todoStats = null,
   hasTodos = false,
 }: StatsDrawerProps) {
+  const { globalElapsedMs, agentElapsedMs, isSessionActive } = useSessionTimerContext();
   const [expertMode, setExpertMode] = useState(false);
   const [expandedAgents, setExpandedAgents] = useState<Set<string>>(new Set());
   

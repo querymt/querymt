@@ -3,7 +3,7 @@ import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
 import { Home, Copy, Check, Palette, Keyboard, Menu, X } from 'lucide-react';
 import { useUiClientContext } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
-import { useSessionTimer } from '../hooks/useSessionTimer';
+
 import { useIsMobile } from '../hooks/useIsMobile';
 import { GlitchText } from './GlitchText';
 import { ModelPickerPopover } from './ModelPickerPopover';
@@ -17,6 +17,7 @@ import { ProviderAuthSwitcher } from './ProviderAuthSwitcher';
 import { WorkspacePathDialog } from './WorkspacePathDialog';
 import { RemoteNodeIndicator } from './RemoteNodeIndicator';
 import { copyToClipboard } from '../utils/clipboard';
+import { SessionTimerProvider } from '../context/SessionTimerContext';
 import { getModeColors, getModeDisplayName } from '../utils/modeColors';
 import {
   applyDashboardTheme,
@@ -124,6 +125,7 @@ export function AppShell() {
   const [providerAuthOpen, setProviderAuthOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const prevAgentModeRef = useRef(agentMode);
+  const isSessionActive = thinkingAgentIds.size > 0;
   const availableThemes = useMemo(() => getDashboardThemes(), []);
   const shortcutGatewayPrefix = useMemo(
     () => (navigator.platform.includes('Mac') ? '⌘+X' : 'Ctrl+X'),
@@ -165,13 +167,6 @@ export function AppShell() {
     isMobile,
   ]);
 
-  // Live timer hook (per-session)
-  const { globalElapsedMs, agentElapsedMs, isSessionActive } = useSessionTimer(
-    events,
-    thinkingAgentIds,
-    sessionId
-  );
-  
   // Load persisted UI state on mount
   useEffect(() => {
     useUiStore.getState().loadPersistedState();
@@ -499,6 +494,7 @@ export function AppShell() {
   );
   
   return (
+    <SessionTimerProvider>
     <div className="flex flex-col h-screen bg-surface-canvas text-ui-primary">
       {/* Header */}
       <header className="flex items-center justify-between gap-2 md:gap-4 px-3 md:px-6 py-2 md:py-4 bg-surface-elevated border-b border-surface-border shadow-[0_0_20px_rgba(var(--accent-primary-rgb),0.05)]">
@@ -590,8 +586,6 @@ export function AppShell() {
           {sessionId && (
             <HeaderStatsBar
               events={events}
-              globalElapsedMs={globalElapsedMs}
-              isSessionActive={isSessionActive}
               agentModels={agentModels}
               sessionLimits={sessionLimits}
               compact={isMobile}
@@ -825,17 +819,14 @@ export function AppShell() {
       
       {/* Stats Drawer - Phase 4 */}
       {sessionId && (
-        <StatsDrawer
-          open={statsDrawerOpen}
-          onOpenChange={setStatsDrawerOpen}
-          events={events}
-          agents={agents}
-          globalElapsedMs={globalElapsedMs}
-          agentElapsedMs={agentElapsedMs}
-          isSessionActive={isSessionActive}
-          agentModels={agentModels}
-          sessionLimits={sessionLimits}
-        />
+          <StatsDrawer
+            open={statsDrawerOpen}
+            onOpenChange={setStatsDrawerOpen}
+            events={events}
+            agents={agents}
+            agentModels={agentModels}
+            sessionLimits={sessionLimits}
+          />
       )}
 
       {/* Plugin update progress / result indicator */}
@@ -893,5 +884,6 @@ export function AppShell() {
         </div>
       )}
     </div>
+    </SessionTimerProvider>
   );
 }

@@ -7,6 +7,14 @@
  * These are structural tests — they assert CSS class presence, not pixel-level layout.
  */
 import { describe, it, expect, vi, beforeAll } from 'vitest';
+
+vi.mock('../context/SessionTimerContext', () => ({
+  useSessionTimerContext: () => ({
+    globalElapsedMs: 5000,
+    agentElapsedMs: new Map<string, number>(),
+    isSessionActive: false,
+  }),
+}));
 import { render, screen } from '@testing-library/react';
 import { TodoRail } from './TodoRail';
 import { HeaderStatsBar } from './HeaderStatsBar';
@@ -101,8 +109,6 @@ describe('Mobile Responsive Audit', () => {
       const { container } = render(
         <HeaderStatsBar
           events={mockEvents}
-          globalElapsedMs={5000}
-          isSessionActive={false}
           agentModels={{}}
           sessionLimits={null}
           compact
@@ -117,8 +123,6 @@ describe('Mobile Responsive Audit', () => {
       const { container } = render(
         <HeaderStatsBar
           events={mockEvents}
-          globalElapsedMs={5000}
-          isSessionActive={false}
           agentModels={{}}
           sessionLimits={null}
           compact={false}
