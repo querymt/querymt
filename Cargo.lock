@@ -6053,13 +6053,13 @@ dependencies = [
 
 [[package]]
 name = "izwi-asr-toolkit"
-version = "0.1.0-beta-2"
-source = "git+https://github.com/agentem-ai/izwi?tag=v0.1.0-beta-2#c2125e4330e8b94fbbe3f49323688b9759238829"
+version = "0.1.0-beta-5"
+source = "git+https://github.com/agentem-ai/izwi?tag=v0.1.0-beta-5#83413eefa89db13900c91dccaf760720e70db6ec"
 
 [[package]]
 name = "izwi-core"
-version = "0.1.0-beta-2"
-source = "git+https://github.com/agentem-ai/izwi?tag=v0.1.0-beta-2#c2125e4330e8b94fbbe3f49323688b9759238829"
+version = "0.1.0-beta-5"
+source = "git+https://github.com/agentem-ai/izwi?tag=v0.1.0-beta-5#83413eefa89db13900c91dccaf760720e70db6ec"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -6070,11 +6070,14 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "dirs 5.0.1",
+ "flate2",
  "futures",
  "hf-hub 0.3.2",
  "hound",
+ "image",
  "indicatif 0.17.11",
  "izwi-asr-toolkit",
+ "memmap2",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rand_distr 0.4.3",
@@ -6084,7 +6087,9 @@ dependencies = [
  "safetensors 0.4.5",
  "serde",
  "serde_json",
+ "serde_yaml",
  "symphonia",
+ "tar",
  "thiserror 1.0.69",
  "tokenizers 0.22.2",
  "tokio",
