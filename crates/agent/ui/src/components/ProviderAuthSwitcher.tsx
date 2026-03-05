@@ -356,13 +356,13 @@ export function ProviderAuthSwitcher({
     <>
       <div
         data-testid="provider-auth-switcher-backdrop"
-        className="fixed inset-0 bg-surface-canvas/70 backdrop-blur-sm z-40 animate-fade-in"
+        className="fixed inset-0 bg-surface-canvas/65 backdrop-blur-sm z-40 animate-fade-in"
         onClick={close}
       />
 
       <div
         data-testid="provider-auth-switcher-container"
-        className="fixed inset-0 z-50 flex items-start justify-center pt-[12vh] px-4"
+        className="fixed inset-0 z-50 flex items-start justify-center pt-[18vh] px-4"
         onClick={(e) => {
           if (e.target === e.currentTarget) {
             close();
@@ -371,7 +371,7 @@ export function ProviderAuthSwitcher({
       >
         <Command
           label="Provider auth switcher"
-          className="w-full max-w-2xl bg-surface-elevated border-2 border-accent-primary/30 rounded-xl shadow-[0_0_40px_rgba(var(--accent-primary-rgb),0.25)] overflow-hidden animate-scale-in"
+          className="w-full max-w-lg bg-surface-elevated border-2 border-accent-primary/30 rounded-xl shadow-[0_0_40px_rgba(var(--accent-primary-rgb),0.22)] overflow-hidden animate-scale-in"
         >
           <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-border/60">
             <ShieldCheck className="w-4 h-4 text-accent-primary" />
