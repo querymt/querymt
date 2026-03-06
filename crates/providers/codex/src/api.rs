@@ -13,10 +13,7 @@ use querymt::{
     error::LLMError,
     handle_http_error,
 };
-use schemars::{
-    r#gen::SchemaGenerator,
-    schema::{InstanceType, Schema, SchemaObject, SingleOrVec},
-};
+use schemars::{Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::borrow::Cow;

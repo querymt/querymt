@@ -16,12 +16,7 @@ use querymt::{
     get_env_var, handle_http_error,
     plugin::HTTPLLMProviderFactory,
 };
-use schemars::{
-    JsonSchema,
-    r#gen::SchemaGenerator,
-    schema::{InstanceType, Schema, SchemaObject, SingleOrVec},
-    schema_for,
-};
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
