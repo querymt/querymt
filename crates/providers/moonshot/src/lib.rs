@@ -198,8 +198,7 @@ impl HTTPLLMProviderFactory for MoonshotAIFactory {
 
     fn config_schema(&self) -> String {
         let schema = schema_for!(MoonshotAI);
-        serde_json::to_string(&schema.schema)
-            .expect("MoonshotAI JSON Schema should always serialize")
+        serde_json::to_string(&schema).expect("MoonshotAI JSON Schema should always serialize")
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {

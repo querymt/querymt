@@ -413,7 +413,7 @@ impl HTTPLLMProviderFactory for KimiCodeFactory {
 
     fn config_schema(&self) -> String {
         let schema = schema_for!(KimiCode);
-        serde_json::to_string(&schema.schema).expect("KimiCode JSON Schema should always serialize")
+        serde_json::to_string(&schema).expect("KimiCode JSON Schema should always serialize")
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {

@@ -25,11 +25,9 @@ use std::sync::{Arc, Mutex};
 use url::Url;
 
 pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
-    Schema::Object(SchemaObject {
-        metadata: None,
-        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-        format: Some("uri".to_string()),
-        ..Default::default()
+    json_schema!({
+        "type": "string",
+        "format": "uri"
     })
 }
 

@@ -1,8 +1,5 @@
 use async_trait::async_trait;
-use schemars::schema::{
-    InstanceType, Metadata, ObjectValidation, Schema, SchemaObject, SingleOrVec,
-};
-use schemars::{gen::SchemaGenerator, JsonSchema};
+use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -675,77 +672,37 @@ impl<'de> Deserialize<'de> for ToolChoice {
 }
 
 impl JsonSchema for ToolChoice {
-    fn schema_name() -> String {
-        "ToolChoice".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ToolChoice".into()
     }
 
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
-        // string variant schema
-        let str_schema = SchemaObject {
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            metadata: Some(Box::new(Metadata {
-                description: Some(
-                    "One of the string options: \"required\", \"auto\", \"none\"".to_string(),
-                ),
-                ..Default::default()
-            })),
-            enum_values: Some(vec![
-                serde_json::Value::String("required".to_string()),
-                serde_json::Value::String("auto".to_string()),
-                serde_json::Value::String("none".to_string()),
-            ]),
-            ..Default::default()
-        };
-
-        // function object schema
-        let mut func_obj = ObjectValidation::default();
-        func_obj.required.insert("type".to_string());
-        func_obj.required.insert("function".to_string());
-
-        // "type": "function"
-        func_obj.properties.insert(
-            "type".to_string(),
-            Schema::Object(SchemaObject {
-                instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-                enum_values: Some(vec![serde_json::Value::String("function".to_string())]),
-                ..Default::default()
-            }),
-        );
-
-        // "function": { name: string }
-        let mut inner = ObjectValidation::default();
-        inner.required.insert("name".to_string());
-        inner.properties.insert(
-            "name".to_string(),
-            Schema::Object(SchemaObject {
-                instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-                ..Default::default()
-            }),
-        );
-        func_obj.properties.insert(
-            "function".to_string(),
-            Schema::Object(SchemaObject {
-                instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Object))),
-                object: Some(Box::new(inner)),
-                ..Default::default()
-            }),
-        );
-
-        // combine via anyOf
-        let mut schema = SchemaObject::default();
-        schema.subschemas = Some(Box::new(schemars::schema::SubschemaValidation {
-            any_of: Some(vec![
-                Schema::Object(str_schema),
-                Schema::Object(SchemaObject {
-                    instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Object))),
-                    object: Some(Box::new(func_obj)),
-                    ..Default::default()
-                }),
-            ]),
-            ..Default::default()
-        }));
-
-        Schema::Object(schema)
+        json_schema!({
+            "anyOf": [
+                {
+                    "type": "string",
+                    "description": "One of the string options: \"required\", \"auto\", \"none\"",
+                    "enum": ["required", "auto", "none"]
+                },
+                {
+                    "type": "object",
+                    "required": ["type", "function"],
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["function"]
+                        },
+                        "function": {
+                            "type": "object",
+                            "required": ["name"],
+                            "properties": {
+                                "name": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            ]
+        })
     }
 }
 
@@ -1237,5 +1194,27 @@ mod tests {
         let json = serde_json::to_string(&blocks).unwrap();
         let roundtripped: Vec<Content> = serde_json::from_str(&json).unwrap();
         assert_eq!(blocks, roundtripped);
+    }
+
+    #[test]
+    fn tool_choice_schema_has_any_of() {
+        let schema = schemars::schema_for!(ToolChoice);
+        let schema_json = serde_json::to_string_pretty(&schema).unwrap();
+        assert!(
+            schema_json.contains("anyOf"),
+            "schema should contain anyOf: {schema_json}"
+        );
+        assert!(
+            schema_json.contains("auto"),
+            "schema should contain 'auto' enum value: {schema_json}"
+        );
+        assert!(
+            schema_json.contains("required"),
+            "schema should contain 'required': {schema_json}"
+        );
+        assert!(
+            schema_json.contains("function"),
+            "schema should contain 'function': {schema_json}"
+        );
     }
 }

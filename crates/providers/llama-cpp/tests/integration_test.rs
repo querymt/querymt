@@ -9,7 +9,7 @@ use schemars::schema_for;
 fn test_config_schema_generation() {
     // Verify that the config schema can be generated (tests serde/schemars integration)
     let schema = schema_for!(LlamaCppConfig);
-    assert!(schema.schema.object.is_some());
+    assert!(schema.as_object().is_some());
 }
 
 #[test]

@@ -14,10 +14,7 @@ use querymt::{
     stt::{SttRequest, SttResponse},
     tts::{TtsRequest, TtsResponse},
 };
-use schemars::{
-    r#gen::SchemaGenerator,
-    schema::{InstanceType, Schema, SchemaObject, SingleOrVec},
-};
+use schemars::{Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
@@ -75,13 +72,9 @@ fn normalize_extra_body_map(map: Map<String, Value>) -> Map<String, Value> {
 }
 
 pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
-    Schema::Object(SchemaObject {
-        metadata: None,
-        // say "this is a string"
-        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-        // with the "uri" format
-        format: Some("uri".to_string()),
-        ..Default::default()
+    json_schema!({
+        "type": "string",
+        "format": "uri"
     })
 }
 

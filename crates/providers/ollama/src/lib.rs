@@ -27,13 +27,9 @@ use serde_json::Value;
 use url::Url;
 
 pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
-    Schema::Object(SchemaObject {
-        metadata: None,
-        // say "this is a string"
-        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-        // with the "uri" format
-        format: Some("uri".to_string()),
-        ..Default::default()
+    json_schema!({
+        "type": "string",
+        "format": "uri"
     })
 }
 
@@ -710,7 +706,7 @@ impl HTTPLLMProviderFactory for OllamaFactory {
 
     fn config_schema(&self) -> String {
         let schema = schema_for!(Ollama);
-        serde_json::to_string(&schema.schema).expect("Ollama JSON Schema should always serialize")
+        serde_json::to_string(&schema).expect("Ollama JSON Schema should always serialize")
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
