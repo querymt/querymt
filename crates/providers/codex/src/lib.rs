@@ -244,7 +244,7 @@ impl HTTPLLMProviderFactory for CodexFactory {
 
     fn config_schema(&self) -> String {
         let schema = schema_for!(Codex);
-        serde_json::to_string(&schema.schema).expect("Codex JSON Schema should always serialize")
+        serde_json::to_string(&schema).expect("Codex JSON Schema should always serialize")
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {

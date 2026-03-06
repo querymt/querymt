@@ -202,7 +202,7 @@ macro_rules! impl_extism_http_plugin {
         // Export the JSON schema for the config type
         #[plugin_fn]
         pub fn config_schema() -> FnResult<String> {
-            let schema = schemars::schema_for!($Config).schema;
+            let schema = schemars::schema_for!($Config);
             let s = serde_json::to_string(&schema).map_err(PdkError::new)?;
             Ok(s)
         }

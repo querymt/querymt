@@ -233,8 +233,7 @@ impl HTTPLLMProviderFactory for AlibabaFactory {
     fn config_schema(&self) -> String {
         let schema = schema_for!(Alibaba);
         // Extract the schema object and turn it into a JSON string
-        serde_json::to_string(&schema.schema)
-            .expect("OpenRouter JSON Schema should always serialize")
+        serde_json::to_string(&schema).expect("OpenRouter JSON Schema should always serialize")
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {

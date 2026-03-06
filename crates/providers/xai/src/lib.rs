@@ -252,7 +252,7 @@ impl HTTPLLMProviderFactory for XaiFactory {
 
     fn config_schema(&self) -> String {
         let schema = schema_for!(Xai);
-        serde_json::to_string(&schema.schema).expect("Xai JSON Schema should always serialize")
+        serde_json::to_string(&schema).expect("Xai JSON Schema should always serialize")
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
