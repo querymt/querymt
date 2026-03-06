@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { Command } from 'cmdk';
-import { Copy, ExternalLink, Eye, EyeOff, KeyRound, ShieldCheck, X } from 'lucide-react';
+import { Copy, ExternalLink, Eye, EyeOff, Info, KeyRound, ShieldCheck, X } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
 import { AuthMethod } from '../types';
 import type { AuthProviderEntry, OAuthFlowState, OAuthResultState } from '../types';
@@ -40,6 +40,11 @@ export function hasMultipleAuthMethods(provider: AuthProviderEntry): boolean {
   return provider.supports_oauth && provider.env_var_name != null;
 }
 
+/** Provider requires OAuth but the build doesn't include it — no auth method is available. */
+export function isUnconfigurable(provider: AuthProviderEntry): boolean {
+  return !provider.supports_oauth && provider.env_var_name == null;
+}
+
 /** Determine the badge label and styling for a provider's current auth state. */
 export function activeAuthLabel(provider: AuthProviderEntry): { label: string; classes: string } {
   const successClasses = 'border-status-success/40 bg-status-success/10 text-status-success';
@@ -50,6 +55,9 @@ export function activeAuthLabel(provider: AuthProviderEntry): { label: string; c
   const effective = resolveEffectiveAuth(provider);
 
   if (!effective) {
+    if (isUnconfigurable(provider)) {
+      return { label: 'OAuth required', classes: 'border-surface-border/60 bg-surface-canvas/60 text-ui-muted' };
+    }
     return { label: 'Not configured', classes: 'border-surface-border/60 bg-surface-canvas/60 text-ui-muted' };
   }
   if (effective === 'expired') {
@@ -584,7 +592,10 @@ export function ProviderAuthSwitcher({
     setIsSavingApiKey(false);
     setApiKeyPanelProvider(null);
 
-    if (isOAuthOnly(provider) && provider.oauth_status !== 'connected') {
+    if (isUnconfigurable(provider)) {
+      // No auth methods available in this build → show explanation
+      setSelectedProvider(provider);
+    } else if (isOAuthOnly(provider) && provider.oauth_status !== 'connected') {
       // OAuth-only, not connected → skip detail panel, start flow immediately
       setSelectedProvider(provider);
       setOauthPending(true);
@@ -699,7 +710,7 @@ export function ProviderAuthSwitcher({
       >
         <Command
           label="Provider auth switcher"
-          className="w-full max-w-lg bg-surface-elevated border-2 border-accent-primary/30 rounded-xl shadow-[0_0_40px_rgba(var(--accent-primary-rgb),0.22)] overflow-hidden animate-scale-in"
+          className="w-full max-w-2xl bg-surface-elevated border-2 border-accent-primary/30 rounded-xl shadow-[0_0_40px_rgba(var(--accent-primary-rgb),0.22)] overflow-hidden animate-scale-in"
         >
           <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-border/60">
             <ShieldCheck className="w-4 h-4 text-accent-primary" />
@@ -772,6 +783,20 @@ export function ProviderAuthSwitcher({
               onClearApiTokenResult={onClearApiTokenResult}
               onStopPropagation={stopCommandActivationPropagation}
             />
+          )}
+
+          {selectedProvider && isUnconfigurable(selectedProvider) && !oauthFlow && (
+            <div className="border-t border-surface-border/60 bg-surface-canvas/40 px-4 py-3">
+              <div className="flex items-start gap-2.5 text-xs text-ui-muted">
+                <Info className="w-3.5 h-3.5 mt-0.5 shrink-0 text-ui-secondary" />
+                <p>
+                  <span className="font-medium text-ui-secondary">{selectedProvider.display_name}</span>
+                  {' '}uses OAuth for authentication. Enable the{' '}
+                  <code className="px-1 py-0.5 rounded bg-surface-canvas border border-surface-border text-[10px] font-mono">oauth</code>
+                  {' '}feature to connect this provider.
+                </p>
+              </div>
+            </div>
           )}
 
           {apiKeyTarget && !oauthFlow && (

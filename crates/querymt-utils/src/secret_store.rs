@@ -25,6 +25,7 @@
 //! # }
 //! ```
 
+#[cfg(feature = "oauth")]
 use anthropic_auth::TokenSet;
 use keyring::Entry;
 use std::io;
@@ -87,7 +88,11 @@ impl SecretStore {
         entry.get_password().ok()
     }
 
-    /// Deletes a secret with the given key
+    /// Deletes a secret with the given key.
+    ///
+    /// This operation is idempotent: deleting a key that does not exist is
+    /// treated as success (the desired postcondition — "no credential stored
+    /// for this key" — is already satisfied).
     ///
     /// # Arguments
     ///
@@ -99,9 +104,10 @@ impl SecretStore {
     pub fn delete(&mut self, key: &str) -> io::Result<()> {
         let entry = Entry::new(SERVICE_NAME, key).map_err(|e| io::Error::other(e.to_string()))?;
 
-        entry
-            .delete_credential()
-            .map_err(|e| io::Error::other(e.to_string()))
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(io::Error::other(e.to_string())),
+        }
     }
 
     /// Sets the default provider for LLM interactions
@@ -134,7 +140,17 @@ impl SecretStore {
     pub fn delete_default_provider(&mut self) -> io::Result<()> {
         self.delete(DEFAULT_PROVIDER_KEY)
     }
+}
 
+/// OAuth token methods — only available when the `oauth` feature is enabled,
+/// which brings in the `anthropic-auth` crate for the [`TokenSet`] type.
+///
+// TODO: Extract `TokenSet` from `anthropic-auth` into `querymt-utils` (or other place?) so that
+// these methods can live behind `secret-store` without pulling in the full
+// `anthropic-auth` dependency.  `anthropic-auth` is our crate, so this is a
+// straightforward refactor.
+#[cfg(feature = "oauth")]
+impl SecretStore {
     /// Sets OAuth tokens for a provider
     ///
     /// # Arguments

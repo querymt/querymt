@@ -16,7 +16,7 @@ oauth = ["querymt-utils/oauth"]
 
 # Enable DBus Secret Service backend for keyring on Linux.
 # This mirrors the CLI's `dbus-secret-service` feature, but is wired through the agent crate.
-dbus-secret-service = ["oauth", "querymt-utils/dbus-secret-service"]
+dbus-secret-service = ["querymt-utils/dbus-secret-service"]
 
 # Enables kameo remote actor support for cross-machine session management.
 # Adds libp2p-based P2P networking, mDNS peer discovery, and Kademlia DHT
@@ -27,7 +27,7 @@ remote = ["kameo/remote", "dep:libp2p"]
 typeshare = "1.0"
 querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
 querymt-provider-common = { path = "../provider-common" }
-querymt-utils = { path = "../querymt-utils", features = ["providers", "serde"] }
+querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
 agent-client-protocol = { version = "0.9", features = ["unstable"] }
 agent-client-protocol-schema = { version = "0.11", features = ["unstable"]}
 kameo = "0.19"

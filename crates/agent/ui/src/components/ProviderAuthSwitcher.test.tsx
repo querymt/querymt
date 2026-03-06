@@ -13,6 +13,7 @@ import {
   isOAuthOnly,
   isApiKeyOnly,
   hasMultipleAuthMethods,
+  isUnconfigurable,
 } from './ProviderAuthSwitcher';
 import { AuthMethod } from '../types';
 import type { AuthProviderEntry } from '../types';
@@ -78,6 +79,18 @@ const multiMethodWithApiKey: AuthProviderEntry = {
   has_stored_api_key: true,
 };
 
+/** OAuth-only provider in a build without OAuth — no auth method available. */
+const unconfigurable: AuthProviderEntry = {
+  provider: 'codex',
+  display_name: 'Codex',
+  oauth_status: null,
+  has_stored_api_key: false,
+  has_env_api_key: false,
+  env_var_name: null,
+  supports_oauth: false,
+  preferred_method: null,
+};
+
 // ── Provider type classification ──
 
 describe('isOAuthOnly', () => {
@@ -119,6 +132,24 @@ describe('hasMultipleAuthMethods', () => {
 
   it('returns false for API-key-only providers', () => {
     expect(hasMultipleAuthMethods(apiKeyOnly)).toBe(false);
+  });
+});
+
+describe('isUnconfigurable', () => {
+  it('returns true when no OAuth support and no env_var_name', () => {
+    expect(isUnconfigurable(unconfigurable)).toBe(true);
+  });
+
+  it('returns false for OAuth-only provider (has OAuth support)', () => {
+    expect(isUnconfigurable(oauthOnly)).toBe(false);
+  });
+
+  it('returns false for API-key-only provider (has env_var_name)', () => {
+    expect(isUnconfigurable(apiKeyOnly)).toBe(false);
+  });
+
+  it('returns false for multi-method provider', () => {
+    expect(isUnconfigurable(multiMethod)).toBe(false);
   });
 });
 
@@ -184,5 +215,12 @@ describe('activeAuthLabel', () => {
   it('shows Not configured for provider with no auth at all', () => {
     const result = activeAuthLabel(apiKeyOnly);
     expect(result.label).toBe('Not configured');
+  });
+
+  // Unconfigurable providers (OAuth-only in a non-OAuth build)
+  it('shows OAuth required for unconfigurable provider', () => {
+    const result = activeAuthLabel(unconfigurable);
+    expect(result.label).toBe('OAuth required');
+    expect(result.classes).toContain('text-ui-muted');
   });
 });

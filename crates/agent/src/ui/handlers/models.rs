@@ -9,10 +9,9 @@
 
 use super::super::ServerState;
 use super::super::connection::{send_error, send_message};
-#[cfg(feature = "oauth")]
-use super::super::messages::OAuthStatus;
 use super::super::messages::{
-    AuthMethod, AuthProviderEntry, ModelEntry, ProviderCapabilityEntry, UiServerMessage,
+    AuthMethod, AuthProviderEntry, ModelEntry, OAuthStatus, ProviderCapabilityEntry,
+    UiServerMessage,
 };
 use super::session_ops::ensure_session_loaded;
 use crate::session::store::CustomModel;
@@ -100,7 +99,7 @@ pub async fn handle_list_auth_providers(state: &ServerState, tx: &mpsc::Sender<S
     let mut seen = HashSet::new();
     let mut providers = Vec::new();
 
-    let store = crate::auth::SecretStore::new().ok();
+    let store = crate::SecretStore::new().ok();
 
     for cfg in &registry.config.providers {
         if !seen.insert(cfg.name.clone()) {
@@ -244,7 +243,7 @@ pub async fn handle_set_api_token(
     }
 
     let result = match resolve_env_var_name(state, provider).await {
-        Some(name) => match crate::auth::SecretStore::new() {
+        Some(name) => match crate::SecretStore::new() {
             Ok(mut store) => match store.set(&name, api_key) {
                 Ok(()) => {
                     state.model_cache.invalidate(&()).await;
@@ -270,7 +269,7 @@ pub async fn handle_clear_api_token(
     tx: &mpsc::Sender<String>,
 ) {
     let result = match resolve_env_var_name(state, provider).await {
-        Some(name) => match crate::auth::SecretStore::new() {
+        Some(name) => match crate::SecretStore::new() {
             Ok(mut store) => match store.delete(&name) {
                 Ok(()) => {
                     state.model_cache.invalidate(&()).await;
@@ -298,7 +297,7 @@ pub async fn handle_set_auth_method(
 ) {
     let key = format!("auth_method_{}", provider);
 
-    let result = match crate::auth::SecretStore::new() {
+    let result = match crate::SecretStore::new() {
         Ok(mut store) => match store.set(&key, method.to_string()) {
             Ok(()) => Ok(format!("Auth method set to '{}' for {}", method, provider)),
             Err(e) => Err(format!("Failed to set auth method: {}", e)),
