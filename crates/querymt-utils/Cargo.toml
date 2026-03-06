@@ -8,8 +8,8 @@ description = "Shared utilities for querymt workspace"
 [features]
 default = []
 serde = ["dep:serde"]
-secret-store = ["dep:keyring", "dep:anthropic-auth", "dep:serde_json"]
-oauth = ["secret-store", "serde", "dep:openai-auth", "dep:kimi-auth", "dep:async-trait", "dep:anyhow", "dep:url", "dep:tokio"]
+secret-store = ["dep:keyring", "dep:serde_json"]
+oauth = ["secret-store", "serde", "dep:anthropic-auth", "dep:openai-auth", "dep:kimi-auth", "dep:async-trait", "dep:anyhow", "dep:url", "dep:tokio"]
 providers = ["dep:reqwest", "dep:dirs", "dep:anyhow"]
 dbus-secret-service = ["keyring/sync-secret-service"]
 
@@ -27,10 +27,10 @@ opentelemetry-semantic-conventions = "0.31"
 
 # Secret store dependencies (optional, behind secret-store feature)
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native", "crypto-rust"], optional = true }
-anthropic-auth = { version = "0.1", default-features = false, features = ["async", "callback-server", "rustls-tls"], optional = true }
 serde_json = { workspace = true, optional = true }
 
 # OAuth dependencies (optional, behind oauth feature)
+anthropic-auth = { version = "0.1", default-features = false, features = ["async", "callback-server", "rustls-tls"], optional = true }
 openai-auth = { version = "1.0", features = ["async", "callback-server"], optional = true }
 kimi-auth = { git = "https://github.com/querymt/kimi-auth", tag = "v0.1.0", default-features = false, features = ["async", "rustls-tls"], optional = true }
 async-trait = { workspace = true, optional = true }

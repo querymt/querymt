@@ -368,7 +368,7 @@ impl HTTPLLMProviderFactory for KimiCodeFactory {
     }
 
     fn api_key_name(&self) -> Option<String> {
-        Some("KIMI_API_KEY".into())
+        None
     }
 
     fn list_models_request(&self, cfg: &str) -> Result<Request<Vec<u8>>, LLMError> {

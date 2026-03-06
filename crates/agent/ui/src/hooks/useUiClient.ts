@@ -15,6 +15,7 @@ import {
   LlmConfigDetails,
   SessionLimits,
   AuthProviderEntry,
+  AuthMethod,
   ModelDownloadStatus,
   OAuthFlowState,
   ProviderCapabilityEntry,
@@ -143,6 +144,7 @@ export function useUiClient() {
   const [modelDownloads, setModelDownloads] = useState<Record<string, ModelDownloadStatus>>({});
   const [oauthFlow, setOauthFlow] = useState<OAuthFlowState | null>(null);
   const [oauthResult, setOauthResult] = useState<OAuthResultState | null>(null);
+  const [apiTokenResult, setApiTokenResult] = useState<{ provider: string; success: boolean; message: string } | null>(null);
   const [sessionsByAgent, setSessionsByAgent] = useState<Record<string, string>>({});
   const [agentModels, setAgentModels] = useState<
     Record<string, { provider?: string; model?: string; contextLimit?: number; node?: string }>
@@ -852,6 +854,15 @@ export function useUiClient() {
         }
         break;
       }
+      case 'api_token_result': {
+        const d = msg.data;
+        setApiTokenResult({
+          provider: d.provider,
+          success: d.success,
+          message: d.message,
+        });
+        break;
+      }
       case 'llm_config': {
         const d = msg.data;
         const config: LlmConfigDetails = {
@@ -1174,6 +1185,24 @@ export function useUiClient() {
     setOauthResult(null);
   }, []);
 
+  const setApiToken = useCallback((provider: string, apiKey: string) => {
+    setApiTokenResult(null);
+    sendMessage({ type: 'set_api_token', data: { provider, api_key: apiKey } });
+  }, []);
+
+  const clearApiToken = useCallback((provider: string) => {
+    setApiTokenResult(null);
+    sendMessage({ type: 'clear_api_token', data: { provider } });
+  }, []);
+
+  const setAuthMethodPref = useCallback((provider: string, method: AuthMethod) => {
+    sendMessage({ type: 'set_auth_method', data: { provider, method } });
+  }, []);
+
+  const clearApiTokenResult = useCallback(() => {
+    setApiTokenResult(null);
+  }, []);
+
   // Register a callback for file index updates
   const setFileIndexCallback = useCallback((callback: FileIndexCallback | null) => {
     debugLog('[useUiClient] Registering file index callback:', () => ({ hasCallback: !!callback }));
@@ -1343,6 +1372,11 @@ export function useUiClient() {
     completeOAuthLogin,
     disconnectOAuth,
     clearOAuthState,
+    apiTokenResult,
+    setApiToken,
+    clearApiToken,
+    setAuthMethodPref,
+    clearApiTokenResult,
     setSessionModel,
     addCustomModelFromHf,
     addCustomModelFromFile,

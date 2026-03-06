@@ -32,6 +32,10 @@
 //! # }
 //! ```
 
+// Re-export AuthMethod from session::provider (the canonical definition)
+// so that UI and handler code can access it via `crate::auth::AuthMethod`.
+pub use crate::session::provider::AuthMethod;
+
 // Re-export from querymt-utils
 pub use querymt_utils::OAuthFlowKind;
 pub use querymt_utils::oauth::{

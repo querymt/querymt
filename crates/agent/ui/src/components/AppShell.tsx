@@ -69,6 +69,11 @@ export function AppShell() {
     completeOAuthLogin,
     disconnectOAuth,
     clearOAuthState,
+    apiTokenResult,
+    setApiToken,
+    clearApiToken,
+    setAuthMethodPref,
+    clearApiTokenResult,
     setSessionModel,
     addCustomModelFromHf,
     addCustomModelFromFile,
@@ -792,16 +797,22 @@ export function AppShell() {
           setProviderAuthOpen(open);
           if (!open) {
             clearOAuthState();
+            clearApiTokenResult();
           }
         }}
         providers={authProviders}
         oauthFlow={oauthFlow}
         oauthResult={oauthResult}
+        apiTokenResult={apiTokenResult}
         onRequestProviders={requestAuthProviders}
         onStartOAuthLogin={startOAuthLogin}
         onCompleteOAuthLogin={completeOAuthLogin}
         onClearOAuthState={clearOAuthState}
         onDisconnectOAuth={disconnectOAuth}
+        onSetApiToken={setApiToken}
+        onClearApiToken={clearApiToken}
+        onSetAuthMethod={setAuthMethodPref}
+        onClearApiTokenResult={clearApiTokenResult}
       />
 
       <WorkspacePathDialog

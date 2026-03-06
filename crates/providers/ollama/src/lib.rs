@@ -3,7 +3,7 @@
 //! This module provides integration with Ollama's local LLM server through its API.
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use http::{Method, Request, Response, header::CONTENT_TYPE};
+use http::{Method, Request, Response, header::AUTHORIZATION, header::CONTENT_TYPE};
 use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     chat::{
@@ -408,6 +408,16 @@ impl Ollama {
         Url::parse(&base_url).unwrap()
     }
 
+    /// Add `Authorization: Bearer` header if `api_key` is set.
+    fn maybe_add_auth(&self, builder: http::request::Builder) -> http::request::Builder {
+        match &self.api_key {
+            Some(key) if !key.is_empty() => {
+                builder.header(AUTHORIZATION, format!("Bearer {}", key))
+            }
+            _ => builder,
+        }
+    }
+
     /// Builds OllamaOptions from Ollama configuration, handling all parameters
     fn build_options(&self) -> OllamaOptions {
         OllamaOptions {
@@ -563,11 +573,11 @@ impl HTTPChatProvider for Ollama {
         let req_json: Vec<u8> = serde_json::to_vec(&req_body)?;
 
         let url = self.base_url.join("api/chat")?;
-        Ok(Request::builder()
+        let builder = Request::builder()
             .method(Method::POST)
             .uri(url.as_str())
-            .header(CONTENT_TYPE, "application/json")
-            .body(req_json)?)
+            .header(CONTENT_TYPE, "application/json");
+        Ok(self.maybe_add_auth(builder).body(req_json)?)
     }
 
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
@@ -591,10 +601,12 @@ impl HTTPCompletionProvider for Ollama {
             options: Some(self.build_options()),
         };
 
-        Ok(Request::builder()
+        let builder = Request::builder()
             .method(Method::POST)
             .uri(url.as_str())
-            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_TYPE, "application/json");
+        Ok(self
+            .maybe_add_auth(builder)
             .body(serde_json::to_vec(&req_body)?)?)
     }
 
@@ -622,10 +634,12 @@ impl HTTPEmbeddingProvider for Ollama {
             input: inputs.to_vec(),
         };
 
-        Ok(Request::builder()
+        let builder = Request::builder()
             .method(Method::POST)
             .uri(url.as_str())
-            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_TYPE, "application/json");
+        Ok(self
+            .maybe_add_auth(builder)
             .body(serde_json::to_vec(&body)?)?)
     }
 
@@ -647,6 +661,10 @@ impl HTTPLLMProviderFactory for OllamaFactory {
         "ollama"
     }
 
+    fn api_key_name(&self) -> Option<String> {
+        Some("OLLAMA_API_KEY".into())
+    }
+
     fn supports_custom_models(&self) -> bool {
         true
     }
@@ -658,13 +676,19 @@ impl HTTPLLMProviderFactory for OllamaFactory {
             .and_then(Value::as_str)
             .map(String::from)
             .unwrap_or_else(|| Ollama::default_base_url().as_str().to_string());
+        let api_key = cfg.get("api_key").and_then(Value::as_str);
 
         let url: String = format!("{}/api/tags", base);
-        Ok(Request::builder()
+        let mut builder = Request::builder()
             .method(Method::GET)
             .header(CONTENT_TYPE, "application/json")
-            .uri(url)
-            .body(Vec::new())?)
+            .uri(url);
+        if let Some(key) = api_key {
+            if !key.is_empty() {
+                builder = builder.header(AUTHORIZATION, format!("Bearer {}", key));
+            }
+        }
+        Ok(builder.body(Vec::new())?)
     }
 
     fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
@@ -696,7 +720,7 @@ impl HTTPLLMProviderFactory for OllamaFactory {
 }
 
 #[cfg(feature = "native")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
     Box::into_raw(Box::new(OllamaFactory)) as *mut _
 }
@@ -710,5 +734,154 @@ mod extism_exports {
         config = Ollama,
         factory = OllamaFactory,
         name   = "ollama",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use querymt::chat::http::HTTPChatProvider;
+    use querymt::completion::http::HTTPCompletionProvider;
+    use querymt::embedding::http::HTTPEmbeddingProvider;
+
+    #[test]
+    fn factory_api_key_name_returns_ollama_api_key() {
+        let factory = OllamaFactory;
+        assert_eq!(factory.api_key_name(), Some("OLLAMA_API_KEY".to_string()),);
+    }
+
+    fn test_ollama(api_key: Option<&str>) -> Ollama {
+        Ollama {
+            base_url: Url::parse("http://localhost:11434").unwrap(),
+            api_key: api_key.map(String::from),
+            model: "llama3".to_string(),
+            timeout_seconds: None,
+            stream: Some(false),
+            reasoning: None,
+            system: None,
+            json_schema: None,
+            tools: None,
+            max_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            typical_p: None,
+            repeat_last_n: None,
+            repeat_penalty: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            penalize_newline: None,
+            seed: None,
+            stop: None,
+            num_keep: None,
+            num_batch: None,
+            num_thread: None,
+            num_gpu: None,
+            main_gpu: None,
+            use_mmap: None,
+            numa: None,
+            num_ctx: None,
+        }
+    }
+
+    #[test]
+    fn chat_request_includes_bearer_when_api_key_set() {
+        let ollama = test_ollama(Some("test-key-123"));
+        let req = ollama
+            .chat_request(&[], None)
+            .expect("chat_request should succeed");
+        let auth = req
+            .headers()
+            .get("authorization")
+            .expect("should have auth header");
+        assert_eq!(auth.to_str().unwrap(), "Bearer test-key-123");
+    }
+
+    #[test]
+    fn chat_request_omits_auth_when_no_api_key() {
+        let ollama = test_ollama(None);
+        let req = ollama
+            .chat_request(&[], None)
+            .expect("chat_request should succeed");
+        assert!(req.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn complete_request_includes_bearer_when_api_key_set() {
+        let ollama = test_ollama(Some("key-abc"));
+        let req = ollama
+            .complete_request(&CompletionRequest {
+                prompt: "hello".to_string(),
+                suffix: None,
+                max_tokens: None,
+                temperature: None,
+            })
+            .expect("complete_request should succeed");
+        let auth = req
+            .headers()
+            .get("authorization")
+            .expect("should have auth header");
+        assert_eq!(auth.to_str().unwrap(), "Bearer key-abc");
+    }
+
+    #[test]
+    fn complete_request_omits_auth_when_no_api_key() {
+        let ollama = test_ollama(None);
+        let req = ollama
+            .complete_request(&CompletionRequest {
+                prompt: "hello".to_string(),
+                suffix: None,
+                max_tokens: None,
+                temperature: None,
+            })
+            .expect("complete_request should succeed");
+        assert!(req.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn embed_request_includes_bearer_when_api_key_set() {
+        let ollama = test_ollama(Some("embed-key"));
+        let req = ollama
+            .embed_request(&["test".to_string()])
+            .expect("embed_request should succeed");
+        let auth = req
+            .headers()
+            .get("authorization")
+            .expect("should have auth header");
+        assert_eq!(auth.to_str().unwrap(), "Bearer embed-key");
+    }
+
+    #[test]
+    fn embed_request_omits_auth_when_no_api_key() {
+        let ollama = test_ollama(None);
+        let req = ollama
+            .embed_request(&["test".to_string()])
+            .expect("embed_request should succeed");
+        assert!(req.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn list_models_request_includes_bearer_when_api_key_in_config() {
+        let factory = OllamaFactory;
+        let cfg = r#"{"base_url":"http://localhost:11434","api_key":"list-key","model":"x"}"#;
+        let req = factory
+            .list_models_request(cfg)
+            .expect("list_models_request should succeed");
+        let auth = req
+            .headers()
+            .get("authorization")
+            .expect("should have auth header");
+        assert_eq!(auth.to_str().unwrap(), "Bearer list-key");
+    }
+
+    #[test]
+    fn list_models_request_omits_auth_when_no_api_key_in_config() {
+        let factory = OllamaFactory;
+        let cfg = r#"{"base_url":"http://localhost:11434","model":"x"}"#;
+        let req = factory
+            .list_models_request(cfg)
+            .expect("list_models_request should succeed");
+        assert!(req.headers().get("authorization").is_none());
     }
 }

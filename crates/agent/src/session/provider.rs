@@ -709,13 +709,140 @@ impl SessionHandle {
     }
 }
 
+/// Preferred authentication method for a provider.
+///
+/// Stored in the system keyring under `auth_method_{provider}` and used by
+/// the credential resolution logic to determine the order in which OAuth,
+/// stored API key, and environment variable sources are tried.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "dashboard", typeshare::typeshare)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMethod {
+    #[serde(rename = "oauth")]
+    OAuth,
+    ApiKey,
+    EnvVar,
+}
+
+impl std::fmt::Display for AuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthMethod::OAuth => write!(f, "oauth"),
+            AuthMethod::ApiKey => write!(f, "api_key"),
+            AuthMethod::EnvVar => write!(f, "env_var"),
+        }
+    }
+}
+
+impl std::str::FromStr for AuthMethod {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "oauth" => Ok(AuthMethod::OAuth),
+            "api_key" => Ok(AuthMethod::ApiKey),
+            "env_var" => Ok(AuthMethod::EnvVar),
+            other => Err(format!("unknown auth method: {}", other)),
+        }
+    }
+}
+
+/// Read the preferred auth method for a provider from SecretStore.
+pub(crate) fn preferred_auth_method(provider_name: &str) -> Option<AuthMethod> {
+    querymt_utils::secret_store::SecretStore::new()
+        .ok()
+        .and_then(|s| s.get(&format!("auth_method_{}", provider_name)))
+        .and_then(|v| v.parse::<AuthMethod>().ok())
+}
+
+/// Resolve an API key for a provider, respecting the user's preferred auth method.
+///
+/// The three credential sources are:
+/// - **OAuth**: token from the system keyring (requires `oauth` feature)
+/// - **Stored key**: API key set via the dashboard UI (stored in SecretStore under `env_var_name`)
+/// - **Env var**: environment variable (e.g. `OPENAI_API_KEY`)
+///
+/// `env_var_name` may be `None` for OAuth-only providers (e.g. Codex). In that case
+/// only the OAuth path is attempted; stored-key and env-var are skipped.
+///
+/// When `preferred` is `None`, the default order is: OAuth → stored key → env var.
+/// When set, the preferred source is tried first, then the remaining sources in order.
+pub(crate) async fn resolve_api_key_with_preference(
+    provider_name: &str,
+    env_var_name: Option<&str>,
+    preferred: Option<&AuthMethod>,
+    use_oauth_resolver: &mut bool,
+) -> Option<String> {
+    // Build the resolution order based on preference
+    let order: Vec<AuthMethod> = match preferred {
+        Some(AuthMethod::OAuth) | None => {
+            vec![AuthMethod::OAuth, AuthMethod::ApiKey, AuthMethod::EnvVar]
+        }
+        Some(AuthMethod::ApiKey) => {
+            vec![AuthMethod::ApiKey, AuthMethod::EnvVar, AuthMethod::OAuth]
+        }
+        Some(AuthMethod::EnvVar) => {
+            vec![AuthMethod::EnvVar, AuthMethod::ApiKey, AuthMethod::OAuth]
+        }
+    };
+
+    for method in &order {
+        match method {
+            AuthMethod::OAuth => {
+                #[cfg(feature = "oauth")]
+                {
+                    use crate::auth::get_or_refresh_token;
+                    match get_or_refresh_token(provider_name).await {
+                        Ok(token) => {
+                            log::debug!("Using OAuth token for provider: {}", provider_name);
+                            *use_oauth_resolver = true;
+                            return Some(token);
+                        }
+                        Err(e) => {
+                            log::debug!("OAuth unavailable for {}: {}", provider_name, e);
+                        }
+                    }
+                }
+            }
+            AuthMethod::ApiKey => {
+                // Stored key requires an env_var_name (used as keyring key)
+                if let Some(name) = env_var_name {
+                    if let Some(key) = querymt_utils::secret_store::SecretStore::new()
+                        .ok()
+                        .and_then(|s| s.get(name))
+                    {
+                        log::debug!(
+                            "Using stored API key for provider: {} ({})",
+                            provider_name,
+                            name
+                        );
+                        return Some(key);
+                    }
+                    log::debug!("No stored API key for {} ({})", provider_name, name);
+                }
+            }
+            AuthMethod::EnvVar => {
+                if let Some(name) = env_var_name {
+                    if let Ok(key) = std::env::var(name) {
+                        log::debug!("Using env var for provider: {} ({})", provider_name, name);
+                        return Some(key);
+                    }
+                    log::debug!("Env var {} not set", name);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Build an LLM provider from configuration parameters (reusable helper)
 ///
 /// This function encapsulates the provider construction logic, including:
 /// - Routing to a remote `MeshChatProvider` when `provider_node_id` names a mesh peer
 /// - Looking up the factory from the plugin registry
 /// - Merging model and params into a builder config
-/// - Resolving API keys (OAuth first, then env var fallback)
+/// - Resolving API keys (respecting user's preferred auth method from dashboard)
 /// - Applying model-specific heuristic defaults
 /// - Falling back to the mesh when the provider is unavailable locally (requires `remote` feature)
 ///
@@ -867,50 +994,64 @@ pub async fn build_provider_from_config(
     // The resolver enables transparent token refresh without rebuilding the provider.
     let mut _use_oauth_resolver = false;
 
-    // Get API key - try override, then OAuth (if feature enabled), then env var
-    if let Some(http_factory) = factory.as_http()
-        && let Some(env_var_name) = http_factory.api_key_name()
-    {
+    // Get API key — respects user's preferred auth method if set.
+    //
+    // Resolution order (when no preference):
+    //   1. api_key_override (explicit caller param — always wins)
+    //   2. OAuth token (if oauth feature enabled)
+    //   3. Stored API key from keyring (set via dashboard UI)
+    //   4. Environment variable
+    //
+    // When the user has set a preferred_method via the dashboard:
+    //   - "oauth":   OAuth → stored key → env
+    //   - "api_key": stored key → env → OAuth
+    //   - "env_var": env → stored key → OAuth
+    //
+    // Note: `api_key_name()` may return `None` for OAuth-only providers
+    // (e.g. Codex). The OAuth path does not depend on an env var name,
+    // so it runs regardless.
+    if let Some(http_factory) = factory.as_http() {
+        let env_var_name = http_factory.api_key_name();
+
         let api_key = if let Some(key) = api_key_override {
             Some(key.to_string())
         } else {
-            #[cfg(feature = "oauth")]
-            {
-                use crate::auth::get_or_refresh_token;
+            let preferred_method = preferred_auth_method(provider_name);
 
-                log::debug!("Resolving API key for provider: {}", provider_name);
+            log::debug!(
+                "Resolving API key for provider '{}' (preferred: {:?}, env_var: {:?})",
+                provider_name,
+                preferred_method,
+                env_var_name
+            );
 
-                // Try OAuth tokens first
-                match get_or_refresh_token(provider_name).await {
-                    Ok(token) => {
-                        log::debug!("Using OAuth token for provider: {}", provider_name);
-                        _use_oauth_resolver = true;
-                        Some(token)
-                    }
-                    Err(e) => {
-                        // OAuth failed - fall back to environment variable
-                        log::debug!("OAuth unavailable for {}: {}", provider_name, e);
-                        log::debug!("Falling back to env var: {}", env_var_name);
-                        std::env::var(&env_var_name).ok()
-                    }
-                }
-            }
-            #[cfg(not(feature = "oauth"))]
-            {
-                std::env::var(&env_var_name).ok()
-            }
+            resolve_api_key_with_preference(
+                provider_name,
+                env_var_name.as_deref(),
+                preferred_method.as_ref(),
+                &mut _use_oauth_resolver,
+            )
+            .await
         };
 
         if let Some(key) = api_key {
             builder_config["api_key"] = key.into();
         } else {
-            // Both OAuth and env var failed
-            log::warn!(
-                "No API key found for provider '{}'. Set {} or run 'qmt auth login {}'",
-                provider_name,
-                env_var_name,
-                provider_name
-            );
+            // All credential sources failed — return a descriptive error
+            // instead of letting `from_config` fail with a cryptic serde
+            // "missing field `api_key`" message.
+            let msg = if let Some(ref env_name) = env_var_name {
+                format!(
+                    "No API key found for provider '{}'. Set {} or run 'qmt auth login {}'",
+                    provider_name, env_name, provider_name
+                )
+            } else {
+                format!(
+                    "No credentials found for provider '{}'. Run 'qmt auth login {}'",
+                    provider_name, provider_name
+                )
+            };
+            return Err(SessionError::ProviderError(LLMError::AuthError(msg)));
         }
     }
 
@@ -962,7 +1103,9 @@ pub async fn build_provider_from_config(
         ));
 
         // Generic path — works for Extism providers that implement set_key_resolver.
-        let mut provider = factory.from_config(&pruned_config_str)?;
+        let mut provider = factory
+            .from_config(&pruned_config_str)
+            .map_err(|e| LLMError::PluginError(format!("provider '{}': {}", provider_name, e)))?;
         provider.set_key_resolver(resolver.clone());
 
         if provider.key_resolver().is_some() {
@@ -977,7 +1120,9 @@ pub async fn build_provider_from_config(
         // Fallback for native HTTP providers: set the resolver on the inner
         // HTTPLLMProvider before it gets wrapped in Arc by the adapter.
         if let Some(http_factory) = factory.as_http() {
-            let mut http_provider = http_factory.from_config(&pruned_config_str)?;
+            let mut http_provider = http_factory.from_config(&pruned_config_str).map_err(|e| {
+                LLMError::PluginError(format!("provider '{}': {}", provider_name, e))
+            })?;
             http_provider.set_key_resolver(resolver);
 
             log::debug!(
@@ -1001,7 +1146,9 @@ pub async fn build_provider_from_config(
         return Ok(Arc::from(provider));
     }
 
-    let provider = factory.from_config(&pruned_config_str)?;
+    let provider = factory
+        .from_config(&pruned_config_str)
+        .map_err(|e| LLMError::PluginError(format!("provider '{}': {}", provider_name, e)))?;
     Ok(Arc::from(provider))
 }
 
@@ -1115,4 +1262,86 @@ pub mod tests {
     }
 
     impl LLMProvider for MockProvider {}
+
+    // ── resolve_api_key_with_preference tests ─────────────────────────────────
+
+    /// Use a unique env var name per test to avoid cross-test interference.
+    fn unique_env_var(suffix: &str) -> String {
+        format!("QMT_TEST_API_KEY_{}", suffix)
+    }
+
+    #[tokio::test]
+    async fn resolve_env_var_preferred() {
+        let var = unique_env_var("ENV_PREF");
+        // SAFETY: test-only; each test uses a unique env var name.
+        unsafe { std::env::set_var(&var, "key-from-env") };
+
+        let mut use_oauth = false;
+        let result = super::resolve_api_key_with_preference(
+            "test-provider",
+            Some(&var),
+            Some(&AuthMethod::EnvVar),
+            &mut use_oauth,
+        )
+        .await;
+
+        assert_eq!(result.as_deref(), Some("key-from-env"));
+        assert!(!use_oauth);
+        unsafe { std::env::remove_var(&var) };
+    }
+
+    #[tokio::test]
+    async fn resolve_env_var_as_fallback_no_preference() {
+        let var = unique_env_var("ENV_FALLBACK");
+        // SAFETY: test-only; each test uses a unique env var name.
+        unsafe { std::env::set_var(&var, "fallback-key") };
+
+        let mut use_oauth = false;
+        let result = super::resolve_api_key_with_preference(
+            "test-provider",
+            Some(&var),
+            None, // default order: OAuth → stored key → env var
+            &mut use_oauth,
+        )
+        .await;
+
+        // OAuth and stored key will fail, should fall back to env var
+        assert_eq!(result.as_deref(), Some("fallback-key"));
+        unsafe { std::env::remove_var(&var) };
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_none_when_no_sources() {
+        let var = unique_env_var("NONE_EXIST");
+        // SAFETY: test-only; each test uses a unique env var name.
+        unsafe { std::env::remove_var(&var) };
+
+        let mut use_oauth = false;
+        let result = super::resolve_api_key_with_preference(
+            "no-such-provider",
+            Some(&var),
+            None,
+            &mut use_oauth,
+        )
+        .await;
+
+        assert!(result.is_none());
+        assert!(!use_oauth);
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth_only_provider_no_env_var_name() {
+        // OAuth-only providers pass env_var_name=None.
+        // Without a valid OAuth token, should return None.
+        let mut use_oauth = false;
+        let result = super::resolve_api_key_with_preference(
+            "codex-like",
+            None, // no env var name
+            None,
+            &mut use_oauth,
+        )
+        .await;
+
+        assert!(result.is_none());
+    }
 }

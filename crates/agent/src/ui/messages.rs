@@ -102,15 +102,27 @@ pub enum OAuthStatus {
     Connected,
 }
 
+pub use crate::session::provider::AuthMethod;
 pub use querymt_utils::OAuthFlowKind;
 
-/// OAuth-capable provider entry for dashboard auth UI.
+/// Provider entry for dashboard auth UI (supports both OAuth and API token auth).
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthProviderEntry {
     pub provider: String,
     pub display_name: String,
-    pub status: OAuthStatus,
+    /// OAuth status (`None` if provider has no OAuth support)
+    pub oauth_status: Option<OAuthStatus>,
+    /// Whether a manually-entered API key is stored in the keyring
+    pub has_stored_api_key: bool,
+    /// Whether the environment variable for this provider is set
+    pub has_env_api_key: bool,
+    /// The environment variable name for this provider (e.g. "OPENAI_API_KEY")
+    pub env_var_name: Option<String>,
+    /// Whether this provider supports OAuth flows
+    pub supports_oauth: bool,
+    /// User's preferred auth method (`None` = auto/default)
+    pub preferred_method: Option<AuthMethod>,
 }
 
 /// Summary of a session for listing.
@@ -305,6 +317,23 @@ pub enum UiClientMessage {
     DeleteCustomModel {
         provider: String,
         model_id: String,
+    },
+    /// Set an API token for a provider (stored in SecretStore)
+    #[serde(rename = "set_api_token")]
+    SetApiToken {
+        provider: String,
+        api_key: String,
+    },
+    /// Clear a stored API token for a provider
+    #[serde(rename = "clear_api_token")]
+    ClearApiToken {
+        provider: String,
+    },
+    /// Set the preferred auth method for a provider
+    #[serde(rename = "set_auth_method")]
+    SetAuthMethod {
+        provider: String,
+        method: AuthMethod,
     },
     /// Trigger an update of all OCI provider plugins.
     UpdatePlugins,
@@ -645,6 +674,13 @@ pub enum UiServerMessage {
     PluginUpdateComplete {
         results: Vec<PluginUpdateResult>,
     },
+    /// Result of setting/clearing an API token
+    #[serde(rename = "api_token_result")]
+    ApiTokenResult {
+        provider: String,
+        success: bool,
+        message: String,
+    },
 }
 
 impl UiServerMessage {
@@ -676,6 +712,7 @@ impl UiServerMessage {
             Self::ModelDownloadStatus { .. } => "model_download_status",
             Self::PluginUpdateStatus { .. } => "plugin_update_status",
             Self::PluginUpdateComplete { .. } => "plugin_update_complete",
+            Self::ApiTokenResult { .. } => "api_token_result",
         }
     }
 }
@@ -956,6 +993,151 @@ mod tests {
         assert!(json["data"]["percent"].is_null());
     }
 
+    // ── API token & auth method message tests (RED→GREEN) ───────────────────
+
+    #[test]
+    fn deserializes_set_api_token_tag() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "set_api_token",
+            "data": { "provider": "openai", "api_key": "sk-test123" }
+        }))
+        .expect("set_api_token should deserialize with data wrapper");
+
+        match msg {
+            UiClientMessage::SetApiToken { provider, api_key } => {
+                assert_eq!(provider, "openai");
+                assert_eq!(api_key, "sk-test123");
+            }
+            _ => panic!("expected SetApiToken variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_clear_api_token_tag() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "clear_api_token",
+            "data": { "provider": "openai" }
+        }))
+        .expect("clear_api_token should deserialize with data wrapper");
+
+        match msg {
+            UiClientMessage::ClearApiToken { provider } => {
+                assert_eq!(provider, "openai");
+            }
+            _ => panic!("expected ClearApiToken variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_set_auth_method_tag() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "set_auth_method",
+            "data": { "provider": "anthropic", "method": "oauth" }
+        }))
+        .expect("set_auth_method should deserialize with data wrapper");
+
+        match msg {
+            UiClientMessage::SetAuthMethod { provider, method } => {
+                assert_eq!(provider, "anthropic");
+                assert!(matches!(method, super::AuthMethod::OAuth));
+            }
+            _ => panic!("expected SetAuthMethod variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_set_auth_method_api_key_variant() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "set_auth_method",
+            "data": { "provider": "openai", "method": "api_key" }
+        }))
+        .expect("set_auth_method api_key should deserialize");
+
+        match msg {
+            UiClientMessage::SetAuthMethod { method, .. } => {
+                assert!(matches!(method, super::AuthMethod::ApiKey));
+            }
+            _ => panic!("expected SetAuthMethod variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_set_auth_method_env_var_variant() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "set_auth_method",
+            "data": { "provider": "google", "method": "env_var" }
+        }))
+        .expect("set_auth_method env_var should deserialize");
+
+        match msg {
+            UiClientMessage::SetAuthMethod { method, .. } => {
+                assert!(matches!(method, super::AuthMethod::EnvVar));
+            }
+            _ => panic!("expected SetAuthMethod variant"),
+        }
+    }
+
+    #[test]
+    fn auth_providers_server_msg_serializes_extended_fields() {
+        let msg = UiServerMessage::AuthProviders {
+            providers: vec![super::AuthProviderEntry {
+                provider: "anthropic".to_string(),
+                display_name: "Anthropic".to_string(),
+                oauth_status: Some(super::OAuthStatus::Connected),
+                has_stored_api_key: true,
+                has_env_api_key: false,
+                env_var_name: Some("ANTHROPIC_API_KEY".to_string()),
+                supports_oauth: true,
+                preferred_method: Some(super::AuthMethod::OAuth),
+            }],
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        assert_eq!(json["type"], "auth_providers");
+        let p = &json["data"]["providers"][0];
+        assert_eq!(p["provider"], "anthropic");
+        assert_eq!(p["oauth_status"], "connected");
+        assert_eq!(p["has_stored_api_key"], true);
+        assert_eq!(p["has_env_api_key"], false);
+        assert_eq!(p["env_var_name"], "ANTHROPIC_API_KEY");
+        assert_eq!(p["supports_oauth"], true);
+        assert_eq!(p["preferred_method"], "oauth");
+    }
+
+    #[test]
+    fn auth_providers_server_msg_serializes_no_oauth_provider() {
+        let msg = UiServerMessage::AuthProviders {
+            providers: vec![super::AuthProviderEntry {
+                provider: "groq".to_string(),
+                display_name: "Groq".to_string(),
+                oauth_status: None,
+                has_stored_api_key: false,
+                has_env_api_key: true,
+                env_var_name: Some("GROQ_API_KEY".to_string()),
+                supports_oauth: false,
+                preferred_method: None,
+            }],
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        let p = &json["data"]["providers"][0];
+        assert_eq!(p["supports_oauth"], false);
+        assert!(p["oauth_status"].is_null());
+        assert!(p["preferred_method"].is_null());
+    }
+
+    #[test]
+    fn api_token_result_server_msg_serializes() {
+        let msg = UiServerMessage::ApiTokenResult {
+            provider: "openai".to_string(),
+            success: true,
+            message: "API key stored successfully".to_string(),
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        assert_eq!(json["type"], "api_token_result");
+        assert_eq!(json["data"]["provider"], "openai");
+        assert_eq!(json["data"]["success"], true);
+        assert_eq!(json["data"]["message"], "API key stored successfully");
+    }
+
     #[test]
     fn serializes_oauth_server_tags_without_extra_underscore() {
         let flow_started = serde_json::to_value(UiServerMessage::OAuthFlowStarted {
@@ -985,5 +1167,51 @@ mod tests {
         })
         .expect("OAuthResult should serialize");
         assert_eq!(result["type"], "oauth_result");
+    }
+
+    #[test]
+    fn auth_method_display_and_from_str_round_trip() {
+        use super::AuthMethod;
+        for (method, expected_str) in [
+            (AuthMethod::OAuth, "oauth"),
+            (AuthMethod::ApiKey, "api_key"),
+            (AuthMethod::EnvVar, "env_var"),
+        ] {
+            let s = method.to_string();
+            assert_eq!(s, expected_str);
+            let parsed: AuthMethod = s.parse().unwrap();
+            assert_eq!(parsed, method);
+        }
+    }
+
+    #[test]
+    fn auth_method_from_str_rejects_unknown() {
+        use super::AuthMethod;
+        let result = "unknown".parse::<AuthMethod>();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn auth_providers_oauth_only_provider_has_no_env_var() {
+        // OAuth-only providers (like Codex) should have env_var_name = None
+        // and has_stored_api_key / has_env_api_key = false.
+        let msg = UiServerMessage::AuthProviders {
+            providers: vec![super::AuthProviderEntry {
+                provider: "codex".to_string(),
+                display_name: "Codex".to_string(),
+                oauth_status: Some(super::OAuthStatus::Connected),
+                has_stored_api_key: false,
+                has_env_api_key: false,
+                env_var_name: None,
+                supports_oauth: true,
+                preferred_method: None,
+            }],
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        let p = &json["data"]["providers"][0];
+        assert_eq!(p["supports_oauth"], true);
+        assert!(p["env_var_name"].is_null());
+        assert_eq!(p["has_stored_api_key"], false);
+        assert_eq!(p["has_env_api_key"], false);
     }
 }

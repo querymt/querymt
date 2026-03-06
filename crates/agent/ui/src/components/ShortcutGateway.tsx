@@ -64,7 +64,7 @@ export function ShortcutGateway({
       >
         <Command
           label="Shortcut gateway"
-          className="w-full max-w-lg bg-surface-elevated border-2 border-accent-primary/30 rounded-xl shadow-[0_0_40px_rgba(var(--accent-primary-rgb),0.22)] overflow-hidden animate-scale-in"
+          className="w-full max-w-2xl bg-surface-elevated border-2 border-accent-primary/30 rounded-xl shadow-[0_0_40px_rgba(var(--accent-primary-rgb),0.22)] overflow-hidden animate-scale-in"
         >
           <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-surface-border/60">
             <div className="flex items-center gap-2 text-accent-primary">

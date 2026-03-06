@@ -290,6 +290,15 @@ pub async fn handle_ui_message(
                 let _ = send_error(tx, err).await;
             }
         }
+        UiClientMessage::SetApiToken { provider, api_key } => {
+            models::handle_set_api_token(state, &provider, &api_key, tx).await;
+        }
+        UiClientMessage::ClearApiToken { provider } => {
+            models::handle_clear_api_token(state, &provider, tx).await;
+        }
+        UiClientMessage::SetAuthMethod { provider, method } => {
+            models::handle_set_auth_method(state, &provider, &method, tx).await;
+        }
         UiClientMessage::UpdatePlugins => {
             handle_update_plugins(state, tx).await;
         }

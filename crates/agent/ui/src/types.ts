@@ -15,6 +15,7 @@ export {
   StopType,
   RoutingMode,
   OAuthStatus,
+  AuthMethod,
   Durability,
   AlternativeStatus,
   DecisionStatus,

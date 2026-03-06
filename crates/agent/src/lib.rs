@@ -13,6 +13,10 @@ pub mod template;
 #[cfg(feature = "oauth")]
 pub mod auth;
 
+// Re-export SecretStore at crate root so it is available without the `oauth`
+// feature.  Dashboard and ACP builds use this for plain API-key storage.
+pub use querymt_utils::secret_store::SecretStore;
+
 pub mod acp;
 pub mod agent;
 pub mod delegation;
