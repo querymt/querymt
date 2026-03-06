@@ -1633,6 +1633,12 @@
 </ul>
 </li>
 <li>
+<p><strong><code>LLMBuilder::disable_tools()</code></strong>: A convenience method to explicitly disable tool usage, even if tools are registered. This sets <code>tool_choice</code> to <code>ToolChoice::None</code>.</p>
+<ul>
+<li>Source: <code>crates/querymt/src/builder.rs</code></li>
+</ul>
+</li>
+<li>
 <p><strong><code>querymt::tool_decorator::CallFunctionTool</code></strong>: A trait that your <em>host-side Rust code</em> must implement for each function you want to make available to the LLM.</p>
 <ul>
 <li><code>descriptor()</code>: Returns the <code>Tool</code> definition (schema) for this function.</li>

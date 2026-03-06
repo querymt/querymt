@@ -1595,7 +1595,8 @@
 </ul>
 <p>It also includes optional methods related to tool usage:
 *   <code>tools()</code>: Returns a list of tools the provider is aware of or configured with.
-*   <code>call_tool()</code>: Allows the system to invoke a tool call identified by the LLM.</p>
+*   <code>call_tool()</code>: Allows the system to invoke a tool call identified by the LLM.
+*   <code>tool_server_name(&amp;tool_name)</code>: Returns the server name for a tool if available (e.g., for MCP tools). This is used to dispatch tool calls to the correct MCP server when multiple MCP servers are configured.</p>
 <p>By conforming to this trait, different LLM backends can be used interchangeably within QueryMT applications.</p>
 <h2 id="http-based-providers">HTTP-Based Providers</h2>
 <p>Many LLM services are accessed via HTTP APIs. QueryMT provides a specialized trait for these:</p>
