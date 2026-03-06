@@ -607,6 +607,16 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         })?)
         .map_err(|e| MeshError::SwarmError(e.to_string()))?;
 
+    // ── Dial explicit bootstrap peers ─────────────────────────────────────────
+    // These are already validated above so the parse() cannot fail.
+    for peer_addr in &config.bootstrap_peers {
+        let addr: Multiaddr = peer_addr.parse().expect("validated above");
+        match swarm.dial(addr.clone()) {
+            Ok(_) => log::info!("Dialing bootstrap peer: {}", addr),
+            Err(e) => log::warn!("Failed to dial bootstrap peer {}: {}", addr, e),
+        }
+    }
+
     let local_peer_id = *swarm.local_peer_id();
 
     // ── Swarm event loop ──────────────────────────────────────────────────────
@@ -741,6 +751,82 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                             );
                         }
                     }
+                }
+                SwarmEvent::ConnectionEstablished {
+                    peer_id, endpoint, ..
+                } => {
+                    // Fired for both inbound and outbound connections, including
+                    // explicitly-dialled bootstrap peers (when discovery = "none")
+                    // and peers that dial us first.
+                    //
+                    // We only emit PeerEvent::Discovered and run the re-registration
+                    // cascade when the peer is genuinely new (not already tracked via
+                    // mDNS).  This makes the handler safe to run alongside mDNS —
+                    // whichever fires first wins; the second is a no-op.
+                    let remote_addr = endpoint.get_remote_address().clone();
+
+                    // Populate Kademlia's routing table with the peer's address.
+                    // mDNS does this via the Discovered handler calling
+                    // swarm.add_peer_address(), which emits NewExternalAddrOfPeer,
+                    // which kameo's Behaviour routes to kademlia.add_address().
+                    // Without this call the routing table stays empty and
+                    // GET_PROVIDERS queries ("Failed to trigger bootstrap: No known
+                    // peers") fail even though we have a live TCP connection.
+                    swarm.add_peer_address(peer_id, remote_addr.clone());
+                    let is_new = {
+                        let mut peers = known_peers_loop.write().unwrap_or_else(|e| e.into_inner());
+                        let entry = peers.entry(peer_id).or_default();
+                        let was_empty = entry.is_empty();
+                        entry.insert(remote_addr.clone());
+                        was_empty
+                    };
+
+                    if is_new {
+                        log::info!("Connected to peer: {peer_id} at {remote_addr}");
+                        let _ = peer_events_tx_loop.send(PeerEvent::Discovered(peer_id));
+
+                        // Re-registration cascade: publish all local actors into
+                        // the new peer's Kademlia routing table immediately so
+                        // DHT lookups from that peer succeed right away.
+                        let fns: Vec<ReRegisterFn> = re_register_fns_loop
+                            .read()
+                            .map(|g| g.clone())
+                            .unwrap_or_default();
+                        if !fns.is_empty() {
+                            tokio::spawn(async move {
+                                for f in &fns {
+                                    f().await;
+                                }
+                            });
+                        }
+                    } else {
+                        log::debug!(
+                            "Additional connection to already-known peer {peer_id} at {remote_addr}"
+                        );
+                    }
+                }
+                SwarmEvent::ConnectionClosed {
+                    peer_id,
+                    num_established,
+                    ..
+                } => {
+                    // Only consider the peer fully gone when its last connection
+                    // closes.  Multiple simultaneous connections (TCP + QUIC, or
+                    // inbound + outbound) are normal; we must not evict early.
+                    if num_established == 0 {
+                        let was_known = {
+                            let mut peers =
+                                known_peers_loop.write().unwrap_or_else(|e| e.into_inner());
+                            peers.remove(&peer_id).is_some()
+                        };
+                        if was_known {
+                            log::info!("Peer disconnected (no remaining connections): {peer_id}");
+                            let _ = peer_events_tx_loop.send(PeerEvent::Expired(peer_id));
+                        }
+                    }
+                }
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    log::warn!("Outgoing connection error (peer={:?}): {}", peer_id, error);
                 }
                 SwarmEvent::NewListenAddr { address, .. } => {
                     log::info!("ActorSwarm listening on {address}");

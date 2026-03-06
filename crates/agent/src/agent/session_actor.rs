@@ -699,6 +699,27 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
                         self.relay_forwarder_handles
                             .insert(msg.relay_actor_id, handle);
 
+                        // Catch-up for subscribe-after-ready race:
+                        // if the workspace index finished before this relay subscribed,
+                        // re-emit WorkspaceIndexReady now that forwarding is installed.
+                        if let Some(workspace) = self.runtime.workspace_handle.get()
+                            && let Some(index) = workspace.file_index()
+                            && let Err(e) = self
+                                .config
+                                .emit_event_persisted(
+                                    &self.session_id,
+                                    crate::events::AgentEventKind::WorkspaceIndexReady {
+                                        workspace_root: index.root.display().to_string(),
+                                    },
+                                )
+                                .await
+                        {
+                            warn!(
+                                "Session {}: failed to emit WorkspaceIndexReady catch-up after SubscribeEvents: {}",
+                                self.session_id, e
+                            );
+                        }
+
                         log::debug!(
                             "Session {}: SubscribeEvents — EventForwarder started for relay '{}' (relay_actor_id={})",
                             self.session_id,

@@ -15,6 +15,7 @@ mod event_relay_mesh_tests {
     use crate::event_fanout::EventFanout;
     use crate::event_sink::EventSink;
     use crate::events::{AgentEvent, AgentEventKind, EventEnvelope, EventOrigin};
+    use crate::index::{FileIndexConfig, FunctionIndexConfig, WorkspaceIndexActor};
     use crate::session::backend::StorageBackend;
     use crate::session::sqlite_storage::SqliteStorage;
     use kameo::actor::Spawn;
@@ -329,6 +330,91 @@ mod event_relay_mesh_tests {
         assert!(
             result.is_ok(),
             "subscribe_events should return Ok even with no relay in DHT"
+        );
+    }
+
+    /// If the workspace index became ready before SubscribeEvents installs the
+    /// forwarder, the session should emit a catch-up WorkspaceIndexReady once
+    /// subscribe completes so the local side eventually observes readiness.
+    #[tokio::test]
+    async fn test_subscribe_events_reemits_workspace_index_ready_if_already_ready() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+
+        let f = AgentConfigFixture::new().await;
+        let session_id = format!("s-f5-ready-{}", test_id);
+
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let root = temp_dir.path().to_path_buf();
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").expect("write fixture file");
+
+        let runtime = SessionRuntime::new(
+            Some(root.clone()),
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+
+        // Simulate "index was already built" before SubscribeEvents by pre-setting
+        // runtime.workspace_handle.
+        let workspace = WorkspaceIndexActor::create(
+            root.clone(),
+            FileIndexConfig::default(),
+            FunctionIndexConfig::default(),
+        )
+        .await
+        .expect("create workspace index");
+        assert!(
+            runtime.workspace_handle.set(workspace).is_ok(),
+            "workspace handle should be unset"
+        );
+
+        let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
+            .with_mesh(Some(mesh.clone()));
+        let session_ref_local = SessionActor::spawn(actor);
+        let session_ref = SessionActorRef::Local(session_ref_local);
+
+        // Register relay expected by SubscribeEvents.
+        let relay_dht_name = crate::agent::remote::dht_name::event_relay(&session_id);
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let journal = storage.event_journal();
+        let fanout = Arc::new(EventFanout::new());
+        let relay_sink = Arc::new(EventSink::new(journal, fanout));
+        let relay = EventRelayActor::new(relay_sink.clone(), "f5-ready-relay".to_string());
+        let relay_ref = EventRelayActor::spawn(relay);
+        mesh.register_actor(relay_ref.clone(), relay_dht_name.clone())
+            .await;
+        let _ = relay_ref;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut rx = relay_sink.fanout().subscribe();
+
+        session_ref
+            .subscribe_events(123)
+            .await
+            .expect("subscribe_events should succeed");
+
+        // Catch-up event should be forwarded shortly after subscribe.
+        let mut saw_ready = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv()).await {
+                Ok(Ok(EventEnvelope::Durable(de)))
+                    if matches!(de.kind, AgentEventKind::WorkspaceIndexReady { .. })
+                        && de.session_id == session_id =>
+                {
+                    saw_ready = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        assert!(
+            saw_ready,
+            "expected catch-up WorkspaceIndexReady after SubscribeEvents for pre-ready workspace"
         );
     }
 
