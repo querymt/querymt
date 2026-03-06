@@ -1,0 +1,96 @@
+name: Test querymt
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'crates/querymt/**'
+      - 'crates/provider-common/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/test-querymt.yml'
+  pull_request:
+    paths:
+      - 'crates/querymt/**'
+      - 'crates/provider-common/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/test-querymt.yml'
+
+jobs:
+  # Job 1: Check formatting (fast, fails first)
+  format:
+    name: Check formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # Job 2: Run Clippy (parallel with format)
+  clippy:
+    name: Clippy lints
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+
+      - name: Run Clippy
+        run: cargo clippy --package querymt --all-targets --all-features -- -D warnings
+
+  # Job 3: Run tests with coverage
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: [format, clippy]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Create coverage directory
+        run: mkdir -p ./coverage
+
+      - name: Run tests with coverage
+        run: |
+          cargo llvm-cov nextest \
+            --package querymt \
+            --lib --tests \
+            --all-features \
+            --codecov --output-path ./coverage/codecov.json
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov.json
+          flags: querymt
+          verbose: true
+          fail_ci_if_error: false
