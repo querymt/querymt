@@ -1,0 +1,197 @@
+name: Test Native Providers
+
+# This workflow covers providers that require native compilation of large C++/ML
+# dependencies and therefore cannot run cheaply on every pull request:
+#
+#   qmt-llama-cpp  — links against llama-cpp-2 (C++ build, cmake required).
+#                    Tests are pure unit tests (message formatting); no model
+#                    weights are downloaded.
+#
+#   qmt-mrs        — links against mistralrs.  Tests try to instantiate a real
+#                    model, so they are excluded from the automated matrix and
+#                    must be triggered manually when model weights are available.
+#
+# Triggers
+# --------
+#   • Automatically on push/PR when the relevant provider paths change AND the
+#     pull request carries the label "test-native".  This prevents accidental
+#     multi-minute builds on every PR while still allowing opt-in CI.
+#   • Always on workflow_dispatch so maintainers can run it on demand.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_mrs:
+        description: 'Also run qmt-mrs tests (requires model weights — slow)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+  pull_request:
+    # Note: path filtering for PRs is enforced via the job-level 'if' conditions
+    # below (label check + paths-filter), not here, because GitHub Actions does
+    # not apply 'paths:' filters when a custom 'types:' list is specified.
+    types: [labeled, synchronize, reopened]
+
+  push:
+    branches: [main, master]
+    paths:
+      - 'crates/providers/llama-cpp/**'
+      - 'crates/providers/mrs/**'
+      - 'crates/querymt/**'
+      - 'crates/provider-common/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/test-providers-native.yml'
+
+# On pull_request events the workflow only proceeds when the 'test-native' label
+# is present, preventing expensive builds on regular PRs.
+# On push to main/master and workflow_dispatch there is no label requirement.
+jobs:
+  # ── Path-change detection ─────────────────────────────────────────────────
+  # Shared pre-check: detects whether any relevant paths changed so that the
+  # downstream jobs can skip themselves when the PR touches unrelated code.
+  detect-changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      llama-cpp: ${{ steps.filter.outputs.llama-cpp }}
+      mrs:        ${{ steps.filter.outputs.mrs }}
+      shared:     ${{ steps.filter.outputs.shared }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Detect path changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            llama-cpp:
+              - 'crates/providers/llama-cpp/**'
+            mrs:
+              - 'crates/providers/mrs/**'
+            shared:
+              - 'crates/querymt/**'
+              - 'crates/provider-common/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+
+  # ── qmt-llama-cpp ─────────────────────────────────────────────────────────
+  # Pure unit tests (message-formatting, multimodal helpers).  Requires cmake
+  # and a C++ compiler to build llama-cpp-2, but no model weights at runtime.
+  test-llama-cpp:
+    name: Test qmt-llama-cpp
+    runs-on: ubuntu-latest
+    needs: detect-changes
+
+    # For pull_request events: require the opt-in label AND a relevant path change.
+    # For push to main/master or workflow_dispatch: always run.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push') ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'test-native') &&
+       (needs.detect-changes.outputs.llama-cpp == 'true' ||
+        needs.detect-changes.outputs.shared == 'true'))
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # llama-cpp-2 requires cmake and a C++ toolchain
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake build-essential
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: native-llama-cpp
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Create coverage directory
+        run: mkdir -p ./coverage
+
+      - name: Run tests with coverage
+        run: |
+          cargo llvm-cov nextest \
+            --package qmt-llama-cpp \
+            --lib --tests \
+            --features native \
+            --codecov --output-path ./coverage/codecov-llama-cpp.json
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov-llama-cpp.json
+          flags: providers-native
+          verbose: true
+          fail_ci_if_error: false
+
+  # ── qmt-mrs ───────────────────────────────────────────────────────────────
+  # Tests instantiate a real mistralrs model (microsoft/Phi-3.5-mini-instruct).
+  # Disabled on automated triggers; only runs when explicitly requested via
+  # workflow_dispatch with run_mrs=true.
+  test-mrs:
+    name: Test qmt-mrs
+    runs-on: ubuntu-latest
+    needs: detect-changes
+
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      inputs.run_mrs == 'true'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake build-essential
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: native-mrs
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Create coverage directory
+        run: mkdir -p ./coverage
+
+      - name: Run tests with coverage
+        run: |
+          cargo llvm-cov nextest \
+            --package qmt-mrs \
+            --lib --tests \
+            --features native \
+            --codecov --output-path ./coverage/codecov-mrs.json
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov-mrs.json
+          flags: providers-native
+          verbose: true
+          fail_ci_if_error: false

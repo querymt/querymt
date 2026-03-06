@@ -1,0 +1,140 @@
+name: Test Providers
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'crates/providers/**'
+      - 'crates/querymt/**'
+      - 'crates/provider-common/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/test-providers.yml'
+  pull_request:
+    paths:
+      - 'crates/providers/**'
+      - 'crates/querymt/**'
+      - 'crates/provider-common/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/test-providers.yml'
+
+jobs:
+  # Job 1: Detect which providers (or their shared deps) have changed.
+  # Outputs one boolean per provider; downstream jobs use these to skip
+  # unchanged packages and avoid rebuilding the world on every push.
+  detect-changes:
+    name: Detect changed providers
+    runs-on: ubuntu-latest
+    outputs:
+      anthropic:    ${{ steps.filter.outputs.anthropic }}
+      codex:        ${{ steps.filter.outputs.codex }}
+      kimi-code:    ${{ steps.filter.outputs.kimi-code }}
+      ollama:       ${{ steps.filter.outputs.ollama }}
+      openai:       ${{ steps.filter.outputs.openai }}
+      # querymt / shared changes should re-test every provider
+      shared:       ${{ steps.filter.outputs.shared }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Detect path changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            anthropic:
+              - 'crates/providers/anthropic/**'
+            codex:
+              - 'crates/providers/codex/**'
+            kimi-code:
+              - 'crates/providers/kimi-code/**'
+            ollama:
+              - 'crates/providers/ollama/**'
+            openai:
+              - 'crates/providers/openai/**'
+            shared:
+              - 'crates/querymt/**'
+              - 'crates/provider-common/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+
+  # Job 2: Run tests for each wasm/extism-style provider.
+  # Each matrix entry only executes when its own paths changed OR when
+  # a shared dependency (querymt, Cargo.toml, …) changed.
+  test:
+    name: Test ${{ matrix.provider }}
+    runs-on: ubuntu-latest
+    needs: detect-changes
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: anthropic
+            package: qmt-anthropic
+            # 'native' feature gates the querymt dep that tests import
+            features: native
+            changed: ${{ needs.detect-changes.outputs.anthropic }}
+
+          - provider: codex
+            package: qmt-codex
+            features: native
+            changed: ${{ needs.detect-changes.outputs.codex }}
+
+          - provider: kimi-code
+            package: qmt-kimi-code
+            features: native
+            changed: ${{ needs.detect-changes.outputs.kimi-code }}
+
+          - provider: ollama
+            package: qmt-ollama
+            features: native
+            changed: ${{ needs.detect-changes.outputs.ollama }}
+
+          - provider: openai
+            package: qmt-openai
+            features: native
+            changed: ${{ needs.detect-changes.outputs.openai }}
+
+    # Run this job when the provider itself changed OR any shared dep changed.
+    if: ${{ matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: provider-${{ matrix.provider }}
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Create coverage directory
+        run: mkdir -p ./coverage
+
+      - name: Run tests with coverage
+        run: |
+          cargo llvm-cov nextest \
+            --package ${{ matrix.package }} \
+            --lib --tests \
+            --features ${{ matrix.features }} \
+            --codecov --output-path ./coverage/codecov-${{ matrix.provider }}.json
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov-${{ matrix.provider }}.json
+          flags: providers
+          verbose: true
+          fail_ci_if_error: false
