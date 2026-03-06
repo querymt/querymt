@@ -14,7 +14,7 @@ When publishing, ensure your image is built for the correct target platform(s).
 
 ## Configuration
 
-To use an OCI plugin, specify its path in the `extism_plugins.toml` (or equivalent JSON/YAML) configuration file using the `oci://` prefix:
+To use an OCI plugin, specify its path in the `plugins.toml` (or equivalent JSON/YAML) configuration file using the `oci://` prefix:
 
 ```toml
 [[providers]]
@@ -43,7 +43,7 @@ This means subsequent loads of the same plugin version will be much faster as th
 
 For enhanced security, QueryMT can verify OCI image signatures using [Sigstore Cosign](https://www.sigstore.dev/) before pulling and extracting the plugin. This helps ensure the plugin's authenticity and integrity.
 
-Signature verification is configured in the optional `[oci]` section of the `extism_plugins.toml` file:
+Signature verification is configured in the optional `[oci]` section of the `plugins.toml` file:
 
 ```toml
 [oci]

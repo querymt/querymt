@@ -263,13 +263,25 @@ $ qmt embed "This is a test" -p openai:text-embedding-3-small --dimensions 512
 #### Using Tools via MCP
 Create a file named `mcp-config.toml`. This file tells QueryMT how to launch and communicate with the tool server.
 
+Supported transport protocols:
+- **`stdio`**: Spawns an MCP server as a child process (requires `command`, optional `args` and `envs`)
+- **`http`**: Connects to an MCP server over HTTP using Streamable HTTP transport (requires `url`, optional `token`)
+
 ```toml
-# mcp-config.toml
+# mcp-config.toml - Stdio example
 [[mcp]]
 name = "mem_server"
 protocol = "stdio"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-memory"]
+# envs = { VAR1 = "value1" } # optional environment variables
+
+# HTTP example
+[[mcp]]
+name = "http_server"
+protocol = "http"
+url = "https://api.example.com/mcp"
+# token = "your-bearer-token" # optional
 ```
 
 When you ask a question that requires a tool, the LLM will request to use it, and `qmt` will handle the communication.

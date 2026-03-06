@@ -33,6 +33,9 @@ One of the powerful features of modern Large Language Models is their ability to
     *   `None`: The model is forbidden from calling any tools.
     *   Source: `crates/querymt/src/chat/mod.rs`
 
+*   **`LLMBuilder::disable_tools()`**: A convenience method to explicitly disable tool usage, even if tools are registered. This sets `tool_choice` to `ToolChoice::None`.
+    *   Source: `crates/querymt/src/builder.rs`
+
 *   **`querymt::tool_decorator::CallFunctionTool`**: A trait that your *host-side Rust code* must implement for each function you want to make available to the LLM.
     *   `descriptor()`: Returns the `Tool` definition (schema) for this function.
     *   `call(&self, args: Value)`: The actual Rust async function that gets executed when the LLM calls this tool. It receives parsed JSON arguments and should return a string result.
