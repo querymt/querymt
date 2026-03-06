@@ -257,7 +257,10 @@ impl querymt::chat::ChatProvider for SharedLlmProvider {
         tools: Option<&[Tool]>,
     ) -> Result<Box<dyn ChatResponse>, LLMError> {
         let provider = self.inner.lock().await;
-        provider.chat_with_tools(messages, tools).await
+        match tools {
+            Some(_) => provider.chat_with_tools(messages, tools).await,
+            None => provider.chat(messages).await,
+        }
     }
 }
 
