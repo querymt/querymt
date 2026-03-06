@@ -8,29 +8,36 @@ pub const DEFAULT_STT_MODEL: &str = "Qwen3-ASR-0.6B";
 pub const DEFAULT_AUDIO_FORMAT: &str = "wav";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct IzwiConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-
+    /// Default TTS model name from the izwi catalog.
+    /// Used when the request does not specify a model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tts_model: Option<String>,
 
+    /// Default STT model name from the izwi catalog.
+    /// Used when the request does not specify a model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stt_model: Option<String>,
 
+    /// Default voice/speaker hint for TTS (model-specific).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub voice: Option<String>,
 
+    /// Default output audio format (`wav`, `pcm`, `raw_f32`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
 
+    /// Default speech speed multiplier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<f32>,
 
+    /// Whether to automatically download models that are not locally available.
     #[serde(default)]
     pub auto_download: bool,
 
+    // -- Engine-level settings (affect RuntimeService construction) ----------
+    /// Directory where izwi stores downloaded models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models_dir: Option<String>,
 
@@ -59,7 +66,6 @@ pub struct IzwiConfig {
 impl Default for IzwiConfig {
     fn default() -> Self {
         Self {
-            model: None,
             tts_model: None,
             stt_model: None,
             voice: None,
@@ -99,8 +105,8 @@ impl IzwiConfig {
         if let Some(chunk_size) = self.chunk_size {
             cfg.chunk_size = chunk_size;
         }
-        if let Some(kv_cache_dtype) = self.kv_cache_dtype.clone() {
-            cfg.kv_cache_dtype = kv_cache_dtype;
+        if let Some(ref kv_cache_dtype) = self.kv_cache_dtype {
+            cfg.kv_cache_dtype = kv_cache_dtype.clone();
         }
         if let Some(kv_page_size) = self.kv_page_size {
             cfg.kv_page_size = kv_page_size;
@@ -116,21 +122,11 @@ impl IzwiConfig {
     }
 
     pub fn default_tts_model(&self) -> &str {
-        self.tts_model
-            .as_deref()
-            .or(self.model.as_deref())
-            .unwrap_or(DEFAULT_TTS_MODEL)
+        self.tts_model.as_deref().unwrap_or(DEFAULT_TTS_MODEL)
     }
 
     pub fn default_stt_model(&self) -> &str {
-        self.stt_model
-            .as_deref()
-            .or(self.model.as_deref())
-            .unwrap_or(DEFAULT_STT_MODEL)
-    }
-
-    pub fn default_voice(&self) -> Option<&str> {
-        self.voice.as_deref()
+        self.stt_model.as_deref().unwrap_or(DEFAULT_STT_MODEL)
     }
 
     pub fn default_audio_format(&self) -> &str {
