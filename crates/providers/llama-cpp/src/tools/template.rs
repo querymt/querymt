@@ -82,6 +82,16 @@ pub(crate) fn apply_template_for_thinking(
         messages.len()
     );
 
+    // Serialize the structured output schema to a JSON string for the FFI.
+    // When a grammar is active it constrains all output, so thinking blocks
+    // would violate the JSON grammar — disable thinking automatically.
+    let json_schema_str = cfg
+        .json_schema
+        .as_ref()
+        .and_then(|s| s.schema.as_ref())
+        .and_then(|v| serde_json::to_string(v).ok());
+    let has_schema = json_schema_str.is_some();
+
     let template = model
         .chat_template(cfg.chat_template.as_deref())
         .or_else(|_| LlamaChatTemplate::new("chatml"))
@@ -91,14 +101,18 @@ pub(crate) fn apply_template_for_thinking(
         messages_json: &messages_json,
         tools_json: None,
         tool_choice: None,
-        json_schema: None,
+        json_schema: json_schema_str.as_deref(),
         grammar: None,
         reasoning_format: None,
         chat_template_kwargs: None,
         add_generation_prompt: true,
         use_jinja: true,
         parallel_tool_calls: false,
-        enable_thinking: cfg.enable_thinking.unwrap_or(true),
+        enable_thinking: if has_schema {
+            false
+        } else {
+            cfg.enable_thinking.unwrap_or(true)
+        },
         add_bos: false,
         add_eos: false,
         parse_tool_calls: false,
@@ -136,6 +150,13 @@ pub(crate) fn apply_template_with_tools(
     log::debug!("Messages JSON: {}", messages_json);
     log::debug!("Tools JSON: {}", tools_json);
 
+    let json_schema_str = cfg
+        .json_schema
+        .as_ref()
+        .and_then(|s| s.schema.as_ref())
+        .and_then(|v| serde_json::to_string(v).ok());
+    let has_schema = json_schema_str.is_some();
+
     let template = model
         .chat_template(cfg.chat_template.as_deref())
         .or_else(|_| LlamaChatTemplate::new("chatml"))
@@ -145,14 +166,18 @@ pub(crate) fn apply_template_with_tools(
         messages_json: &messages_json,
         tools_json: Some(&tools_json),
         tool_choice: None,
-        json_schema: None,
+        json_schema: json_schema_str.as_deref(),
         grammar: None,
         reasoning_format: None,
         chat_template_kwargs: None,
         add_generation_prompt: true,
         use_jinja: true,
         parallel_tool_calls: false,
-        enable_thinking: cfg.enable_thinking.unwrap_or(true),
+        enable_thinking: if has_schema {
+            false
+        } else {
+            cfg.enable_thinking.unwrap_or(true)
+        },
         // BOS is handled by the tokenizer in generate_with_tools(),
         // not by the template engine, to avoid double-BOS.
         // See self.cfg.add_bos.

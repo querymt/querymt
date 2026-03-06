@@ -313,6 +313,7 @@ mod tests {
             mmproj_use_gpu: None,
             n_ubatch: None,
             text_only: None,
+            json_schema: None,
         }
     }
 

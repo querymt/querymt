@@ -360,6 +360,31 @@ impl ChatProvider for LlamaCppProvider {
             }
         }
 
+        // Structured output: use OAI-compat template so the schema is converted
+        // to a GBNF grammar that constrains sampling to valid JSON.
+        if self.cfg.json_schema.is_some() {
+            let template_result =
+                apply_template_for_thinking(&self.model, &self.cfg, messages, media_marker)?;
+            let generated = generate_with_tools(
+                &self.model,
+                &self.cfg,
+                &template_result,
+                max_tokens,
+                None,
+                self.multimodal.as_deref(),
+                &bitmaps,
+            )?;
+            let (content, thinking, _tool_calls, finish_reason) =
+                parse_tool_response(&template_result, &generated.text)?;
+            return Ok(Box::new(LlamaCppChatResponse {
+                text: content,
+                thinking,
+                tool_calls: None,
+                finish_reason,
+                usage: generated.usage,
+            }));
+        }
+
         // Standard generation (with or without images)
         let (prompt, used_chat_template) =
             build_prompt(&self.model, &self.cfg, messages, media_marker)?;

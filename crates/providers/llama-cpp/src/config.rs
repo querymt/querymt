@@ -1,3 +1,4 @@
+use querymt::chat::StructuredOutputFormat;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -119,6 +120,13 @@ pub struct LlamaCppConfig {
     /// when you only need text generation from a VL model.
     /// Defaults to `false`.
     pub text_only: Option<bool>,
+    /// Optional structured output schema.
+    ///
+    /// When set, llama.cpp converts the JSON Schema into a GBNF grammar that
+    /// constrains sampling to produce only valid JSON conforming to the schema.
+    /// The schema is forwarded to the chat template engine via
+    /// `OpenAIChatTemplateParams::json_schema`.
+    pub json_schema: Option<StructuredOutputFormat>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
