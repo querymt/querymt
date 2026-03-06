@@ -121,6 +121,7 @@ export function DelegationDetailPanel({
       <div className="flex-1 overflow-y-auto">
         <TurnCard
           turn={turn}
+          turnIndex={0}
           agents={agents}
           onToolClick={onToolClick}
           onDelegateClick={() => {}}

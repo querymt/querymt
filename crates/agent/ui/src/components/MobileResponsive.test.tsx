@@ -14,6 +14,9 @@ vi.mock('../context/SessionTimerContext', () => ({
     agentElapsedMs: new Map<string, number>(),
     isSessionActive: false,
   }),
+  useSessionTimerElapsed: () => 5000,
+  useSessionTimerAgents: () => new Map<string, number>(),
+  useSessionTimerActive: () => false,
 }));
 import { render, screen } from '@testing-library/react';
 import { TodoRail } from './TodoRail';

@@ -79,6 +79,7 @@ describe('TurnCard', () => {
 
   const defaultProps = {
     turn: makeTurn(),
+    turnIndex: 0,
     agents: defaultAgents,
     onToolClick: vi.fn(),
     onDelegateClick: vi.fn(),
@@ -222,7 +223,7 @@ describe('TurnCard', () => {
       userMessage: makeRow({ type: 'user', messageId: 'msg-undo-1' }),
     });
 
-    render(<TurnCard {...defaultProps} turn={turn} canUndo={true} onUndo={vi.fn()} />);
+    render(<TurnCard {...defaultProps} turn={turn} canUndo={true} onUndoTurn={vi.fn()} />);
 
     expect(screen.getByText('Undo')).toBeInTheDocument();
   });
@@ -233,7 +234,7 @@ describe('TurnCard', () => {
       userMessage: makeRow({ type: 'user', messageId: 'msg-active-1' }),
     });
 
-    render(<TurnCard {...defaultProps} turn={turn} canUndo={true} onUndo={vi.fn()} />);
+    render(<TurnCard {...defaultProps} turn={turn} canUndo={true} onUndoTurn={vi.fn()} />);
 
     expect(screen.queryByText('Undo')).not.toBeInTheDocument();
   });
@@ -280,21 +281,22 @@ describe('TurnCard', () => {
     expect(screen.getByText('+1 more file')).toBeInTheDocument();
   });
 
-  it('calls onUndo when undo button clicked', async () => {
+  it('calls onUndoTurn when undo button clicked', async () => {
     const user = userEvent.setup();
-    const onUndo = vi.fn();
+    const onUndoTurn = vi.fn();
     const turn = makeTurn({
       isActive: false,
       userMessage: makeRow({ type: 'user', messageId: 'msg-onundo-1' }),
     });
 
-    render(<TurnCard {...defaultProps} turn={turn} canUndo={true} onUndo={onUndo} />);
+    render(<TurnCard {...defaultProps} turn={turn} turnIndex={3} canUndo={true} onUndoTurn={onUndoTurn} />);
 
     const undoButton = screen.getByText('Undo').closest('button');
     expect(undoButton).toBeTruthy();
     await user.click(undoButton!);
 
-    expect(onUndo).toHaveBeenCalledTimes(1);
+    expect(onUndoTurn).toHaveBeenCalledTimes(1);
+    expect(onUndoTurn).toHaveBeenCalledWith(3);
   });
 
   it('calls onRedo when redo button clicked in undone overlay', async () => {
@@ -325,7 +327,7 @@ describe('TurnCard', () => {
       userMessage: makeRow({ type: 'user', messageId: 'msg-fork-1' }),
     });
 
-    render(<TurnCard {...defaultProps} turn={turn} onFork={vi.fn()} />);
+    render(<TurnCard {...defaultProps} turn={turn} onForkTurn={vi.fn()} />);
 
     expect(screen.getByText('Fork')).toBeInTheDocument();
   });
@@ -337,26 +339,27 @@ describe('TurnCard', () => {
       agentMessages: [makeRow({ type: 'agent', messageId: 'msg-fork-agent-1' })],
     });
 
-    render(<TurnCard {...defaultProps} turn={turn} onFork={vi.fn()} />);
+    render(<TurnCard {...defaultProps} turn={turn} onForkTurn={vi.fn()} />);
 
     expect(screen.getByText('Fork')).toBeInTheDocument();
   });
 
-  it('calls onFork when fork button clicked', async () => {
+  it('calls onForkTurn when fork button clicked', async () => {
     const user = userEvent.setup();
-    const onFork = vi.fn();
+    const onForkTurn = vi.fn();
     const turn = makeTurn({
       isActive: false,
       userMessage: makeRow({ type: 'user', messageId: 'msg-fork-2' }),
     });
 
-    render(<TurnCard {...defaultProps} turn={turn} onFork={onFork} />);
+    render(<TurnCard {...defaultProps} turn={turn} turnIndex={5} onForkTurn={onForkTurn} />);
 
     const forkButton = screen.getByText('Fork').closest('button');
     expect(forkButton).toBeTruthy();
     await user.click(forkButton!);
 
-    expect(onFork).toHaveBeenCalledTimes(1);
+    expect(onForkTurn).toHaveBeenCalledTimes(1);
+    expect(onForkTurn).toHaveBeenCalledWith(5);
   });
 
   // ==================== Edge Case Tests ====================
@@ -415,7 +418,7 @@ describe('TurnCard', () => {
         canUndo={true}
         isUndone={true}
         revertedFiles={['src/foo.ts']}
-        onUndo={vi.fn()}
+        onUndoTurn={vi.fn()}
       />
     );
 
@@ -480,7 +483,7 @@ describe('TurnCard', () => {
         turn={turn}
         canUndo={true}
         isStackedUndone={true}
-        onUndo={vi.fn()}
+        onUndoTurn={vi.fn()}
       />
     );
 
@@ -496,7 +499,7 @@ describe('TurnCard', () => {
         turn={turn}
         canUndo={true}
         isUndoPending={true}
-        onUndo={vi.fn()}
+        onUndoTurn={vi.fn()}
       />
     );
 

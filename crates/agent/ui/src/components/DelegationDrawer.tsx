@@ -223,6 +223,7 @@ export function DelegationDrawer({ delegation, agents, onClose, onToolClick, llm
                       <ToolSummary
                         event={event}
                         onClick={() => onToolClick(event)}
+                        isMobile={isMobile}
                       />
                       {event.elicitationData && (
                         <ElicitationCard data={event.elicitationData} />

@@ -18,7 +18,7 @@ import { useUiStore } from '../store/uiStore';
 import { useSessionManager } from '../hooks/useSessionManager';
 import { useFileMention } from '../hooks/useFileMention';
 import { useTodoState } from '../hooks/useTodoState';
-import { EventItem, EventRow, UiPromptBlock } from '../types';
+import { EventItem, EventRow, Turn, UiPromptBlock } from '../types';
 import { MentionInput } from './MentionInput';
 import { ToolDetailModal } from './ToolDetailModal';
 import { TurnCard } from './TurnCard';
@@ -34,6 +34,17 @@ import { RateLimitIndicator } from './RateLimitIndicator';
 import { useIsMobile } from '../hooks/useIsMobile';
 
 const FILE_MENTION_MARKUP_RE = /@\{(file|dir):([^}]+)\}/g;
+
+/** Stable empty array shared across TurnCard instances to avoid new allocations. */
+const emptyRevertedFiles: string[] = [];
+
+/** Pre-computed undo/overlay state for a single turn. */
+interface TurnUndoProps {
+  isUndone: boolean;
+  isUndoPending: boolean;
+  isStackedUndone: boolean;
+  revertedFiles: string[];
+}
 
 function buildPromptBlocksFromInput(input: string): UiPromptBlock[] {
   const links = new Map<string, UiPromptBlock>();
@@ -370,8 +381,42 @@ export function ChatView() {
     return -1;
   }, [filteredTurns, undoState?.frontierMessageId]);
 
-  // Handle undo for a specific turn
-  const handleUndo = useCallback((turnIndex: number) => {
+  // Pre-compute per-turn undo/overlay props so that itemContent doesn't
+  // need to recalculate on every render. This map is cheap to rebuild
+  // (only iterates filteredTurns when undoState changes) and keeps the
+  // Virtuoso itemContent closure free of undoState references.
+  const turnUndoPropsMap = useMemo(() => {
+    const map = new Map<number, TurnUndoProps>();
+    if (!undoState || undoState.stack.length === 0) return map;
+
+    const frontierFrame = undoState.frontierMessageId
+      ? undoState.stack.find((frame) => frame.messageId === undoState.frontierMessageId)
+      : undefined;
+    const effectiveFrontierFrame = frontierFrame
+      ?? undoState.stack[undoState.stack.length - 1];
+
+    for (let i = 0; i < filteredTurns.length; i++) {
+      const turnMessageId = filteredTurns[i].userMessage?.messageId;
+      if (!turnMessageId) continue;
+
+      const frameForTurn = undoState.stack.find(frame => frame.messageId === turnMessageId);
+      if (!frameForTurn) continue;
+
+      const isFrontierFrame = frameForTurn.messageId === effectiveFrontierFrame?.messageId;
+      map.set(i, {
+        isUndoPending: isFrontierFrame && effectiveFrontierFrame?.status === 'pending',
+        isUndone: isFrontierFrame && effectiveFrontierFrame?.status === 'confirmed',
+        isStackedUndone: frameForTurn.status === 'confirmed' && !isFrontierFrame,
+        revertedFiles: isFrontierFrame && effectiveFrontierFrame?.status === 'confirmed'
+          ? (effectiveFrontierFrame?.revertedFiles ?? [])
+          : [],
+      });
+    }
+    return map;
+  }, [filteredTurns, undoState]);
+
+  // Handle undo for a specific turn (stable: depends on filteredTurns ref, not per-item closure)
+  const handleUndoTurn = useCallback((turnIndex: number) => {
     const turn = filteredTurns[turnIndex];
     const userMessage = turn.userMessage;
     if (!userMessage?.messageId) {
@@ -388,7 +433,7 @@ export function ChatView() {
     sendRedo();
   }, [sendRedo]);
 
-  const handleFork = useCallback(async (turnIndex: number) => {
+  const handleForkTurn = useCallback(async (turnIndex: number) => {
     const turn = filteredTurns[turnIndex];
     const lastAssistantMessageId = [...turn.agentMessages]
       .reverse()
@@ -637,6 +682,58 @@ export function ChatView() {
     };
   }, []);
 
+  // Stable Virtuoso itemContent callback.  All per-item state is looked up
+  // from pre-computed maps / scalars so that the closure reference itself
+  // only changes when the maps or scalar dependencies change — NOT on every
+  // ChatView render.  This lets Virtuoso's internal memo wrapper bail out
+  // for items whose data hasn't changed.
+  const renderTurnItem = useCallback((index: number, turn: Turn) => {
+    const undoProps = turnUndoPropsMap.get(index);
+    const isLastTurn = index === filteredTurns.length - 1;
+
+    return (
+      <TurnCard
+        key={turn.id}
+        turn={turn}
+        turnIndex={index}
+        agents={agents}
+        onToolClick={handleToolClick}
+        onDelegateClick={handleDelegateClick}
+        isLastUserMessage={index === lastUserMessageTurnIndex}
+        showModelLabel={sessionHasMultipleModels}
+        llmConfigCache={llmConfigCache}
+        requestLlmConfig={requestLlmConfig}
+        activeView={activeTimelineView}
+        canUndo={index === undoTurnIndex}
+        isUndone={undoProps?.isUndone ?? false}
+        isUndoPending={undoProps?.isUndoPending ?? false}
+        isStackedUndone={undoProps?.isStackedUndone ?? false}
+        revertedFiles={undoProps?.revertedFiles ?? emptyRevertedFiles}
+        onUndoTurn={handleUndoTurn}
+        onForkTurn={handleForkTurn}
+        onRedo={handleRedo}
+        isCompacting={isLastTurn && !!compactingState}
+        compactingTokenEstimate={isLastTurn ? compactingState?.tokenEstimate : undefined}
+      />
+    );
+  }, [
+    filteredTurns.length,
+    turnUndoPropsMap,
+    agents,
+    handleToolClick,
+    handleDelegateClick,
+    lastUserMessageTurnIndex,
+    sessionHasMultipleModels,
+    llmConfigCache,
+    requestLlmConfig,
+    activeTimelineView,
+    undoTurnIndex,
+    handleUndoTurn,
+    handleForkTurn,
+    handleRedo,
+    compactingState,
+  ]);
+
   return (
     <div 
       className="flex flex-col flex-1 min-h-0 text-ui-primary relative"
@@ -768,52 +865,7 @@ export function ChatView() {
             <Virtuoso
               ref={virtuosoRef}
               data={filteredTurns}
-              itemContent={(index, turn) => {
-                const canUndo = index === undoTurnIndex;
-                const isLastTurn = index === filteredTurns.length - 1;
-                const turnMessageId = turn.userMessage?.messageId;
-                const frontierFrame = undoState?.frontierMessageId
-                  ? undoState.stack.find((frame) => frame.messageId === undoState.frontierMessageId)
-                  : undefined;
-                const effectiveFrontierFrame = frontierFrame
-                  ?? (undoState?.stack.length ? undoState.stack[undoState.stack.length - 1] : undefined);
-                const frameForTurn = turnMessageId
-                  ? undoState?.stack.find(frame => frame.messageId === turnMessageId)
-                  : undefined;
-
-                const isFrontierFrame =
-                  !!effectiveFrontierFrame && frameForTurn?.messageId === effectiveFrontierFrame.messageId;
-                const isUndoPending = isFrontierFrame && effectiveFrontierFrame?.status === 'pending';
-                const isUndone = isFrontierFrame && effectiveFrontierFrame?.status === 'confirmed';
-                const isStackedUndone =
-                  !!frameForTurn && frameForTurn.status === 'confirmed' && !isFrontierFrame;
-                const revertedFiles = isUndone ? (effectiveFrontierFrame?.revertedFiles ?? []) : [];
-
-                return (
-                  <TurnCard
-                    key={turn.id}
-                    turn={turn}
-                    agents={agents}
-                    onToolClick={handleToolClick}
-                    onDelegateClick={handleDelegateClick}
-                    isLastUserMessage={index === lastUserMessageTurnIndex}
-                    showModelLabel={sessionHasMultipleModels}
-                    llmConfigCache={llmConfigCache}
-                    requestLlmConfig={requestLlmConfig}
-                    activeView={activeTimelineView}
-                    canUndo={canUndo}
-                    isUndone={isUndone}
-                    isUndoPending={isUndoPending}
-                    isStackedUndone={isStackedUndone}
-                    revertedFiles={revertedFiles}
-                    onUndo={() => handleUndo(index)}
-                    onFork={() => handleFork(index)}
-                    onRedo={handleRedo}
-                    isCompacting={isLastTurn && !!compactingState}
-                    compactingTokenEstimate={isLastTurn ? compactingState?.tokenEstimate : undefined}
-                  />
-                );
-              }}
+              itemContent={renderTurnItem}
               atBottomStateChange={handleAtBottomStateChange}
               className="h-full"
             />

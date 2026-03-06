@@ -15,6 +15,9 @@ vi.mock('../context/SessionTimerContext', async (importOriginal) => {
       agentElapsedMs: new Map<string, number>(),
       isSessionActive: false,
     }),
+    useSessionTimerElapsed: () => 5000,
+    useSessionTimerAgents: () => new Map<string, number>(),
+    useSessionTimerActive: () => false,
   };
 });
 

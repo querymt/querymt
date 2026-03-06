@@ -150,7 +150,6 @@ export function useUiClient() {
     Record<string, { provider?: string; model?: string; contextLimit?: number; node?: string }>
   >({});
   const [sessionAudit, setSessionAudit] = useState<AuditView | null>(null);
-  const [thinkingAgentIds, setThinkingAgentIds] = useState<Set<string>>(new Set());
   const [isConversationComplete, setIsConversationComplete] = useState(false);
   // Track thinking state per session: Map<sessionId, Set<agentId>>
   const [thinkingBySession, setThinkingBySession] = useState<Map<string, Set<string>>>(new Map());
@@ -383,8 +382,6 @@ export function useUiClient() {
             next.set(d.session_id, sessionAgents);
             return next;
           });
-          // Also update global thinking state for backward compatibility
-          setThinkingAgentIds(prev => new Set(prev).add(d.agent_id));
           // Clear conversation complete flag for the main session
           if (d.session_id === mainSessionId) {
             setIsConversationComplete(false);
@@ -408,12 +405,6 @@ export function useUiClient() {
               }
               return next;
             });
-            // Also update global thinking state
-            setThinkingAgentIds(prev => {
-              const next = new Set(prev);
-              next.delete(d.agent_id);
-              return next;
-            });
           } else if (finishReason === 'tool_calls' || finishReason === 'ToolCalls') {
             // Tool calls requested, still thinking
           } else {
@@ -426,11 +417,6 @@ export function useUiClient() {
               } else {
                 next.set(d.session_id, sessionAgents);
               }
-              return next;
-            });
-            setThinkingAgentIds(prev => {
-              const next = new Set(prev);
-              next.delete(d.agent_id);
               return next;
             });
           }
@@ -455,11 +441,6 @@ export function useUiClient() {
             }
             return next;
           });
-          setThinkingAgentIds(prev => {
-            const next = new Set(prev);
-            next.delete(d.agent_id);
-            return next;
-          });
         } else if (eventKind === 'cancelled') {
           setThinkingBySession(prev => {
             const next = new Map(prev);
@@ -470,11 +451,6 @@ export function useUiClient() {
             } else {
               next.set(d.session_id, sessionAgents);
             }
-            return next;
-          });
-          setThinkingAgentIds(prev => {
-            const next = new Set(prev);
-            next.delete(d.agent_id);
             return next;
           });
         } else if (eventKind === 'delegation_cancelled') {
@@ -672,7 +648,7 @@ export function useUiClient() {
 
         // Connection-level errors have no session_id. Do not inject them into the
         // active session timeline, otherwise provider errors can bleed across sessions.
-        setThinkingAgentIds(new Set());
+        setThinkingBySession(new Map());
         // Check if this is a file index related error and notify
         if (
           fileIndexErrorCallbackRef.current &&
@@ -1256,6 +1232,18 @@ export function useUiClient() {
     llmConfigCallbacksRef.current.set(configId, callback);
     sendMessage({ type: 'get_llm_config', data: { config_id: configId } });
   }, [llmConfigCache]);
+
+  // Derive the flat thinkingAgentIds set from the per-session map so that
+  // consumers who need a global view (e.g. AppShell's isSessionActive indicator
+  // and the double-ESC cancel shortcut) still work correctly without maintaining
+  // a separate piece of state that can drift out of sync.
+  const thinkingAgentIds = useMemo(() => {
+    const all = new Set<string>();
+    for (const agents of thinkingBySession.values()) {
+      for (const a of agents) all.add(a);
+    }
+    return all;
+  }, [thinkingBySession]);
 
   // Derive thinkingAgentId for backward compatibility
   const thinkingAgentId = thinkingAgentIds.size > 0 ? Array.from(thinkingAgentIds).pop()! : null;
