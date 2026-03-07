@@ -1,18 +1,36 @@
-// Import required modules from the LLM library
-use llm::{
-    builder::{LLMBackend, LLMBuilder}, // Builder components for LLM configuration
-    chat::ChatMessage,                 // Chat-related structures
+//! Anthropic response validation example.
+//!
+//! Run:
+//! ```sh
+//! ANTHROPIC_API_KEY="your-key" cargo run -p querymt --example validator_example
+//! ```
+//!
+//! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
+
+use querymt::{
+    builder::LLMBuilder,
+    chat::ChatMessage,
+    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
 };
+
+fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
+    let cfg_path =
+        std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
+    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
+    registry.register_loader(Box::new(ExtismLoader));
+    Ok(registry)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Retrieve Anthropic API key from environment variable or use fallback
     let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or("anthro-key".into());
+    let registry = build_registry()?;
 
     // Initialize and configure the LLM client with validation
     let llm = LLMBuilder::new()
-        .backend(LLMBackend::Anthropic) // Use Anthropic's Claude model
-        .model("claude-3-5-sonnet-20240620") // Specify model version
+        .provider("anthropic") // Use Anthropic's Claude model
+        .model("claude-sonnet-4-6") // Specify model version
         .api_key(api_key) // Set API credentials
         .max_tokens(512) // Limit response length
         .temperature(0.7) // Control response randomness
@@ -24,12 +42,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| e.to_string())
         })
         .validator_attempts(3) // Allow up to 3 retries on validation failure
-        .build()
-        .expect("Failed to build LLM (Phind)");
+        .build(&registry)
+        .await?;
 
     // Prepare the chat message requesting JSON output
     let messages = vec![
-        ChatMessage::user().content("Please give me a valid JSON describing a cat named Garfield, color 'orange'. with format {name: string, color: string}. Return only the JSON, no other text").build(),
+        ChatMessage::user().text("Please give me a valid JSON describing a cat named Garfield, color 'orange'. with format {name: string, color: string}. Return only the JSON, no other text").build(),
     ];
 
     // Send chat request and handle the response
