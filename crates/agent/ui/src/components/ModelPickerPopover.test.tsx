@@ -12,7 +12,7 @@ const mockAgents: UiAgentInfo[] = [
     provider: 'anthropic',
     model: 'claude-3-opus',
     max_tokens: null,
-    thinking_budget_tokens: null,
+    reasoning_budget_tokens: null,
   },
 ];
 

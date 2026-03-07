@@ -118,7 +118,7 @@ pub struct Anthropic {
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<ToolChoice>,
     pub reasoning: Option<bool>,
-    pub thinking_budget_tokens: Option<u32>,
+    pub reasoning_budget_tokens: Option<u32>,
     /// Optional resolver for dynamic credential refresh (e.g., OAuth tokens).
     #[serde(skip)]
     #[schemars(skip)]
@@ -916,7 +916,7 @@ impl HTTPChatProvider for Anthropic {
         let thinking = if self.reasoning.unwrap_or(false) {
             Some(ThinkingConfig {
                 thinking_type: "enabled".to_string(),
-                budget_tokens: self.thinking_budget_tokens.unwrap_or(16000),
+                budget_tokens: self.reasoning_budget_tokens.unwrap_or(16000),
             })
         } else {
             None
@@ -1178,7 +1178,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             reasoning: None,
-            thinking_budget_tokens: None,
+            reasoning_budget_tokens: None,
             key_resolver: None,
             tool_state_buffer: Anthropic::default_tool_state_buffer(),
         }
@@ -1219,6 +1219,37 @@ mod tests {
 
         let anthropic_api15 = test_anthropic("sk-ant-api15-future");
         assert_eq!(anthropic_api15.determine_auth_type(), AuthType::ApiKey);
+    }
+
+    #[test]
+    fn test_reasoning_budget_tokens_from_config_is_used_for_thinking_budget() {
+        use querymt::chat::ChatMessage;
+
+        let cfg = serde_json::json!({
+            "api_key": "sk-ant-api03-test",
+            "model": "claude-3-7-sonnet-20250219",
+            "max_tokens": 2500,
+            "reasoning": true,
+            "reasoning_budget_tokens": 1024
+        });
+
+        let anthropic: Anthropic = serde_json::from_value(cfg)
+            .expect("reasoning_budget_tokens should be accepted in Anthropic config");
+
+        let messages = vec![
+            ChatMessage::user()
+                .text("How many r in strawberry?")
+                .build(),
+        ];
+        let req = anthropic
+            .chat_request(&messages, None)
+            .expect("chat request should build");
+
+        let body: serde_json::Value =
+            serde_json::from_slice(req.body()).expect("request body should be valid JSON");
+        assert_eq!(body["max_tokens"], serde_json::json!(2500));
+        assert_eq!(body["thinking"]["type"], serde_json::json!("enabled"));
+        assert_eq!(body["thinking"]["budget_tokens"], serde_json::json!(1024));
     }
 
     #[test]
