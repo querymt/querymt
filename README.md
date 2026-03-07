@@ -50,6 +50,8 @@ name = "openai"
 path = "oci://ghcr.io/querymt/openai:latest"
 ```
 
+For a full examples-oriented setup (GHCR providers, local wasm provider builds, and run commands), see `crates/querymt/examples/README.md`.
+
 ## Agent
 
 The `querymt-agent` crate (in `crates/agent`) is the high-level agent runtime for QueryMaTe.
