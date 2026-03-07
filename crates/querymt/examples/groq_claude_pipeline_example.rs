@@ -14,18 +14,18 @@ use llm::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize Claude model with API key and latest model version
+    // Initialize Claude model with API key and current model version
     let anthro_llm = LLMBuilder::new()
         .backend(LLMBackend::Anthropic)
         .api_key(std::env::var("ANTHROPIC_API_KEY").unwrap_or("anthro-key".into()))
-        .model("claude-3-5-sonnet-20240620")
+        .model("claude-sonnet-4-6")
         .build()?;
 
-    // Initialize Groq model with deepseek for creative thinking
+    // Initialize Groq model with the current default reasoning-capable model
     let groq_llm = LLMBuilder::new()
         .backend(LLMBackend::Groq)
         .api_key(std::env::var("GROQ_API_KEY").unwrap_or("sk-TESTKEY".into()))
-        .model("deepseek-r1-distill-llama-70b")
+        .model("openai/gpt-oss-20b")
         .build()?;
 
     // Create registry with both models
