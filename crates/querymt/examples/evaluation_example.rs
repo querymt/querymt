@@ -1,46 +1,67 @@
-//! Example demonstrating evaluation and comparison of multiple LLM providers
+//! Multi-provider evaluation example.
 //!
-//! This example shows how to:
-//! 1. Initialize multiple LLM providers (Anthropic, Phind, DeepSeek)
-//! 2. Configure scoring functions to evaluate responses
-//! 3. Send the same prompt to all providers
-//! 4. Compare and score the responses
+//! Run:
+//! ```sh
+//! OPENAI_API_KEY="your-key" \
+//! ANTHROPIC_API_KEY="your-key" \
+//! GROQ_API_KEY="your-key" \
+//! cargo run -p querymt --example evaluation_example
+//! ```
+//!
+//! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
 
-use llm::{
-    builder::{LLMBackend, LLMBuilder},
-    chat::{ChatMessage, ChatRole},
+use querymt::{
+    builder::LLMBuilder,
+    chat::ChatMessage,
     evaluator::{EvalResult, LLMEvaluator},
+    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
 };
+
+fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
+    let cfg_path =
+        std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
+    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
+    registry.register_loader(Box::new(ExtismLoader));
+    Ok(registry)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize Anthropic provider with Claude model
+    let registry = build_registry()?;
+
+    // Initialize OpenAI provider.
+    let openai = LLMBuilder::new()
+        .provider("openai")
+        .api_key(std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "openai-key".to_string()))
+        .model("gpt-4o")
+        .max_tokens(700)
+        .build(&registry)
+        .await?;
+
+    // Initialize Anthropic provider.
     let anthropic = LLMBuilder::new()
-        .backend(LLMBackend::Anthropic)
-        .model("claude-3-5-sonnet-20240620")
-        .api_key(std::env::var("ANTHROPIC_API_KEY").unwrap_or("anthropic-key".into()))
-        .build()?;
+        .provider("anthropic")
+        .api_key(std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "anthropic-key".to_string()))
+        .model("claude-sonnet-4-6")
+        .max_tokens(700)
+        .build(&registry)
+        .await?;
 
-    // Initialize Phind provider specialized for code
-    let phind = LLMBuilder::new()
-        .backend(LLMBackend::Phind)
-        .model("Phind-70B")
-        .build()?;
+    // Initialize Groq provider.
+    let groq = LLMBuilder::new()
+        .provider("groq")
+        .api_key(std::env::var("GROQ_API_KEY").unwrap_or_else(|_| "gsk-TESTKEY".to_string()))
+        .model("openai/gpt-oss-20b")
+        .max_tokens(700)
+        .build(&registry)
+        .await?;
 
-    // Initialize DeepSeek provider
-    let deepseek = LLMBuilder::new()
-        .backend(LLMBackend::DeepSeek)
-        .model("deepseek-chat")
-        .api_key(std::env::var("DEEPSEEK_API_KEY").unwrap_or("deepseek-key".into()))
-        .build()?;
-
-    // Create evaluator with multiple scoring functions
-    let evaluator = LLMEvaluator::new(vec![anthropic, phind, deepseek])
-        // First scoring function: Evaluate code quality and completeness
+    // Create evaluator with multiple scoring functions.
+    let evaluator = LLMEvaluator::new(vec![openai, anthropic, groq])
+        // First scoring function: evaluate code quality and completeness.
         .scoring(|response| {
             let mut score = 0.0;
 
-            // Check for code blocks and specific Rust features
             if response.contains("```") {
                 score += 1.0;
 
@@ -64,21 +85,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             score
         })
-        // Second scoring function: Evaluate explanation quality
+        // Second scoring function: evaluate explanation quality.
         .scoring(|response| {
             let mut score = 0.0;
 
-            // Check for explanatory phrases
             if response.contains("Here's how it works:") || response.contains("Let me explain:") {
                 score += 2.0;
             }
 
-            // Check for examples and practical usage
             if response.contains("For example") || response.contains("curl") {
                 score += 1.5;
             }
 
-            // Reward comprehensive responses
             let words = response.split_whitespace().count();
             if words > 100 {
                 score += 1.0;
@@ -87,9 +105,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             score
         });
 
-    // Define the evaluation prompt requesting a Rust microservice implementation
+    // Define the evaluation prompt requesting a Rust microservice implementation.
     let messages = vec![ChatMessage::user()
-        .content(
+        .text(
             "\
             Create a Rust microservice using Actix Web.
             It should have at least two routes:
@@ -102,12 +120,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .build()];
 
-    // Run evaluation across all providers
+    // Run evaluation across all providers.
     let results: Vec<EvalResult> = evaluator.evaluate_chat(&messages).await?;
 
-    // Display results with scores
+    // Display results with scores.
     for (i, item) in results.iter().enumerate() {
-        println!("\n=== LLM #{} ===", i);
+        println!("\n=== LLM #{} ===", i + 1);
         println!("Score: {:.2}", item.score);
         println!("Response:\n{}", item.text);
         println!("================\n");
