@@ -24,24 +24,22 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get Anthropic API key from environment variable or use test key as fallback
-    let api_key: String = std::env::var("ANTHROPIC_API_KEY").unwrap_or("anthro-key".into());
+    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or("anthropic-key".into());
     let registry = build_registry()?;
 
     // Initialize and configure the LLM client
     let llm = LLMBuilder::new()
         .provider("anthropic") // Use Anthropic (Claude) as the LLM provider
         .api_key(api_key) // Set the API key
-        .model("claude-sonnet-4-6") // Use Claude Instant model
+        .model("claude-sonnet-4-6") // Use Claude Sonnet model
         .max_tokens(1500) // Limit response length
         .temperature(1.0) // Control response randomness (0.0-1.0)
         .reasoning(true)
         .reasoning_budget_tokens(1024)
-        // Uncomment to set system prompt:
-        // .system("You are a helpful assistant specialized in concurrency.")
         .build(&registry)
         .await?;
 
-    // Prepare conversation history with example message about Rust concurrency
+    // Prepare conversation history with a reasoning puzzle
     let messages = vec![ChatMessage::user()
         .text("How much r in strawberry?")
         .build()];

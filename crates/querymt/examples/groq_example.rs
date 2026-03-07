@@ -24,7 +24,7 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get Groq API key from environment variable or use test key as fallback
-    let api_key = std::env::var("GROQ_API_KEY").unwrap_or("gsk-TESTKEY".into());
+    let api_key = std::env::var("GROQ_API_KEY").unwrap_or("groq-key".into());
     let registry = build_registry()?;
 
     // Initialize and configure the LLM client

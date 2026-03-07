@@ -92,10 +92,10 @@ async fn create_llm(
 
     builder = match provider.as_str() {
         "openai" => builder
-            .api_key(env::var("OPENAI_API_KEY").unwrap_or_else(|_| "sk-TESTKEY".to_string()))
+            .api_key(env::var("OPENAI_API_KEY").unwrap_or_else(|_| "openai-key".to_string()))
             .model(env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string())),
         "anthropic" => builder
-            .api_key(env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "anthro-key".to_string()))
+            .api_key(env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "anthropic-key".to_string()))
             .model(env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string())),
         "google" => builder
             .api_key(env::var("GOOGLE_API_KEY").unwrap_or_else(|_| "google-key".to_string()))

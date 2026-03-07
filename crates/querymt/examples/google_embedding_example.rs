@@ -21,12 +21,6 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
     Ok(registry)
 }
 
-/// Example demonstrating how to generate embeddings using Google's API
-///
-/// This example shows how to:
-/// - Configure a Google LLM provider
-/// - Generate embeddings for text input
-/// - Access and display the resulting embedding vector
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = build_registry()?;
@@ -35,13 +29,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let llm = LLMBuilder::new()
         .provider("google")
         // Get API key from environment variable or use test key
-        .api_key(std::env::var("GOOGLE_API_KEY").unwrap_or("YOUR-TEST-KEY".to_string()))
+        .api_key(std::env::var("GOOGLE_API_KEY").unwrap_or("google-key".into()))
         // Use Google's text embedding model
         .model("text-embedding-004")
         .build(&registry)
         .await?;
 
-    // TODO: This call fails at runtime until provider embedding support is implemented.
+    // TODO: This call fails at runtime until provider embedding support is implemented
     // Generate embedding vector for sample text
     let vector = llm.embed(vec!["Hello world!".to_string()]).await?;
 

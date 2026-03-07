@@ -24,13 +24,13 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Retrieve Anthropic API key from environment variable or use fallback
-    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or("anthro-key".into());
+    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or("anthropic-key".into());
     let registry = build_registry()?;
 
     // Initialize and configure the LLM client with validation
     let llm = LLMBuilder::new()
         .provider("anthropic") // Use Anthropic's Claude model
-        .model("claude-sonnet-4-6") // Specify model version
+        .model("claude-sonnet-4-6") // Use Claude Sonnet model
         .api_key(api_key) // Set API credentials
         .max_tokens(512) // Limit response length
         .temperature(0.7) // Control response randomness

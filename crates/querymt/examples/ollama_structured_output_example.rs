@@ -33,7 +33,8 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get Ollama server URL from environment variable or use default localhost
-    let base_url = std::env::var("OLLAMA_URL").unwrap_or("http://127.0.0.1:11434".into());
+    let base_url =
+        std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
     let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:0.6b".to_string());
     let registry = build_registry()?;
 

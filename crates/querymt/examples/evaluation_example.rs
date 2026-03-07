@@ -29,7 +29,7 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = build_registry()?;
 
-    // Initialize OpenAI provider.
+    // Initialize OpenAI provider
     let openai = LLMBuilder::new()
         .provider("openai")
         .api_key(std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "openai-key".to_string()))
@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build(&registry)
         .await?;
 
-    // Initialize Anthropic provider.
+    // Initialize Anthropic provider
     let anthropic = LLMBuilder::new()
         .provider("anthropic")
         .api_key(std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "anthropic-key".to_string()))
@@ -47,18 +47,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build(&registry)
         .await?;
 
-    // Initialize Groq provider.
+    // Initialize Groq provider
     let groq = LLMBuilder::new()
         .provider("groq")
-        .api_key(std::env::var("GROQ_API_KEY").unwrap_or_else(|_| "gsk-TESTKEY".to_string()))
+        .api_key(std::env::var("GROQ_API_KEY").unwrap_or_else(|_| "groq-key".to_string()))
         .model("openai/gpt-oss-20b")
         .max_tokens(700)
         .build(&registry)
         .await?;
 
-    // Create evaluator with multiple scoring functions.
+    // Create evaluator with multiple scoring functions
     let evaluator = LLMEvaluator::new(vec![openai, anthropic, groq])
-        // First scoring function: evaluate code quality and completeness.
+        // First scoring function: evaluate code quality and completeness
         .scoring(|response| {
             let mut score = 0.0;
 
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             score
         })
-        // Second scoring function: evaluate explanation quality.
+        // Second scoring function: evaluate explanation quality
         .scoring(|response| {
             let mut score = 0.0;
 
@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             score
         });
 
-    // Define the evaluation prompt requesting a Rust microservice implementation.
+    // Define the evaluation prompt requesting a Rust microservice implementation
     let messages = vec![ChatMessage::user()
         .text(
             "\
@@ -120,10 +120,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .build()];
 
-    // Run evaluation across all providers.
+    // Run evaluation across all providers
     let results: Vec<EvalResult> = evaluator.evaluate_chat(&messages).await?;
 
-    // Display results with scores.
+    // Display results with scores
     for (i, item) in results.iter().enumerate() {
         println!("\n=== LLM #{} ===", i + 1);
         println!("Score: {:.2}", item.score);

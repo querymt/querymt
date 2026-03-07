@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let llm = LLMBuilder::new()
         .provider("google") // Use Google as the LLM provider
         .api_key(api_key) // Set the API key
-        .model("gemini-3-flash-preview") // Use Gemini Pro model
+        .model("gemini-3-flash-preview") // Use Gemini Flash model
         .max_tokens(8512) // Limit response length
         .temperature(0.7) // Control response randomness (0.0-1.0)
         .stream(false) // Disable streaming responses

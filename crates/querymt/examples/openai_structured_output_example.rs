@@ -24,30 +24,31 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get OpenAI API key from environment variable or use test key as fallback
-    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or("sk-TESTKEY".into());
+    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or("openai-key".into());
     let registry = build_registry()?;
 
-    // Define a simple JSON schema for structured output.
-    // Note that the schema has some [odd requirements](https://platform.openai.com/docs/guides/structured-outputs?api-mode=chat&lang=curl#supported-schemas) for OpenAI. Make sure the provided schema is compatible with OpenAI's requirements.
+    // Define a simple JSON schema for structured output
+    // Note: the schema has some odd requirements for OpenAI structured outputs
+    // (see https://platform.openai.com/docs/guides/structured-outputs#supported-schemas)
     let schema = r#"
         {
             "name": "Student",
             "schema": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string"
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string"
+                    },
+                    "age": {
+                        "type": "integer"
+                    },
+                    "is_student": {
+                        "type": "boolean"
+                    }
                 },
-                "age": {
-                    "type": "integer"
-                },
-                "is_student": {
-                    "type": "boolean"
-                }
-            },
-            "required": ["name", "age", "is_student"],
-            "additionalProperties": false
-}
+                "required": ["name", "age", "is_student"],
+                "additionalProperties": false
+            }
         }
     "#;
 

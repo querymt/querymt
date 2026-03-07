@@ -1,3 +1,11 @@
+//! Text-to-speech example.
+//!
+//! Run:
+//! ```sh
+//! OPENAI_API_KEY="your-key" cargo run -p querymt --example tts_example -- \
+//!   ./providers.toml "hello world" ./out.mp3 openai gpt-4o-mini alloy mp3
+//! ```
+
 use anyhow::Result;
 use querymt::{
     builder::LLMBuilder,
@@ -51,7 +59,7 @@ async fn main() -> Result<()> {
         builder = builder.base_url(u);
     }
 
-    // OpenAI config requires model; pick a reasonable default.
+    // OpenAI config requires model; pick a reasonable default
     builder = builder.model(model.clone().unwrap_or_else(|| "gpt-4o-mini".to_string()));
 
     let llm = builder.build(&registry).await?;

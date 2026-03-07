@@ -25,35 +25,35 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = build_registry()?;
 
-    // Initialize the LLM with OpenAI provider and configuration.
+    // Initialize the LLM with OpenAI provider and configuration
     let llm = LLMBuilder::new()
         .provider("openai")
-        .api_key(std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "sk-TESTKEY".to_string()))
+        .api_key(std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "openai-key".to_string()))
         .model("gpt-4o")
         .max_tokens(200)
         .temperature(0.7)
         .build(&registry)
         .await?;
 
-    // Create and execute a 4-step prompt chain.
+    // Create and execute a 4-step prompt chain
     let chain_result = PromptChain::new(&*llm)
-        // Step 1: choose a programming language topic.
+        // Step 1: choose a programming language topic
         .step(
             ChainStepBuilder::new("topic", "Suggest an interesting technical topic to explore among: Rust, Python, JavaScript, Go. Answer with a single word only.", ChainStepMode::Chat)
                 .temperature(0.8) // Higher temperature for more variety in topic selection
                 .build()
         )
-        // Step 2: get advanced features for the chosen language.
+        // Step 2: get advanced features for the chosen language
         .step(
             ChainStepBuilder::new("features", "List 3 advanced features of {{topic}} that few developers know about. Format: one feature per line.", ChainStepMode::Chat)
                 .build()
         )
-        // Step 3: generate a code example for one feature.
+        // Step 3: generate a code example for one feature
         .step(
             ChainStepBuilder::new("example", "Choose one of the features listed in {{features}} and show a commented code example that illustrates it.", ChainStepMode::Chat)
                 .build()
         )
-        // Step 4: get a detailed explanation of the code example.
+        // Step 4: get a detailed explanation of the code example
         .step(
             ChainStepBuilder::new("explanation", "Explain in detail how the code example {{example}} works and why this feature is useful.", ChainStepMode::Chat)
                 .max_tokens(500) // Allow longer response for detailed explanation
@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .run().await?;
 
-    // Display the results from all chain steps.
+    // Display the results from all chain steps
     println!("Chain results: {:?}", chain_result);
 
     Ok(())

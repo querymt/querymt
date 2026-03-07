@@ -1,3 +1,11 @@
+//! Speech-to-text example.
+//!
+//! Run:
+//! ```sh
+//! OPENAI_API_KEY="your-key" cargo run -p querymt --example stt_example -- \
+//!   ./providers.toml ./audio.wav openai whisper-1
+//! ```
+
 use anyhow::Result;
 use querymt::{
     builder::LLMBuilder,

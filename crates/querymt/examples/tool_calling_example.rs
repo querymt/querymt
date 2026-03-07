@@ -54,7 +54,7 @@ fn execute_tool_call(name: &str, args: &Value) -> Value {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "sk-TESTKEY".to_string());
+    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "openai-key".to_string());
     let registry = build_registry()?;
 
     let llm = LLMBuilder::new()

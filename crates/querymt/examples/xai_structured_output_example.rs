@@ -24,34 +24,30 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get xAI API key from environment variable or use test key as fallback
-    let api_key = std::env::var("XAI_API_KEY").unwrap_or("sk-TESTKEY".into());
+    let api_key = std::env::var("XAI_API_KEY").unwrap_or("xai-key".into());
     let registry = build_registry()?;
 
     // Define a simple JSON schema for structured output
     // For XAI, the schema must be provided in the property "schema"
     let schema = r#"
-{
-    "name": "Student",
-    "schema": {
-        "properties": {
-            "age": {
-                "type": "integer"
-            },
-            "is_student": {
-                "type": "boolean"
-            },
-            "name": {
-                "type": "string"
+        {
+            "name": "Student",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string"
+                    },
+                    "age": {
+                        "type": "integer"
+                    },
+                    "is_student": {
+                        "type": "boolean"
+                    }
+                },
+                "required": ["name", "age", "is_student"]
             }
-        },
-        "required": [
-            "name",
-            "age",
-            "is_student"
-        ],
-        "type": "object"
-    }
-}
+        }
     "#;
     let schema: StructuredOutputFormat = serde_json::from_str(schema)?;
 

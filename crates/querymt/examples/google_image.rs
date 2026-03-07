@@ -35,19 +35,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let llm = LLMBuilder::new()
         .provider("google") // Use Google as the LLM provider
         .api_key(api_key) // Set the API key
-        .model("gemini-3-flash-preview") // Use Gemini Pro model
+        .model("gemini-3-flash-preview") // Use Gemini Flash model
         .max_tokens(8512) // Limit response length
         .temperature(0.7) // Control response randomness (0.0-1.0)
         .stream(false) // Disable streaming responses
-        // Optional: Set system prompt
-        .system("You are a helpful AI assistant specialized in programming.")
+        .system("You are a helpful AI assistant.")
         .build(&registry)
         .await?;
 
     let image_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/image001.jpg");
     let content = fs::read(image_path)?;
 
-    // Prepare conversation history with example messages
+    // Prepare conversation history asking about the image
     let messages = vec![
         ChatMessage::user()
             .text("Explain what you see in the image")

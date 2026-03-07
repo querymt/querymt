@@ -28,43 +28,43 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = build_registry()?;
 
-    // Initialize OpenAI provider with API key and model settings.
+    // Initialize OpenAI provider with API key and model settings
     let openai_llm = LLMBuilder::new()
         .provider("openai")
-        .api_key(std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "sk-OPENAI".to_string()))
+        .api_key(std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "openai-key".to_string()))
         .model("gpt-4o")
         .max_tokens(512)
         .build(&registry)
         .await?;
 
-    // Initialize Anthropic provider with API key and model settings.
+    // Initialize Anthropic provider with API key and model settings
     let anthropic_llm = LLMBuilder::new()
         .provider("anthropic")
-        .api_key(std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "anthro-key".to_string()))
+        .api_key(std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "anthropic-key".to_string()))
         .model("claude-sonnet-4-6")
         .max_tokens(512)
         .build(&registry)
         .await?;
 
-    // Initialize Groq provider with API key and model settings.
+    // Initialize Groq provider with API key and model settings
     let groq_llm = LLMBuilder::new()
         .provider("groq")
-        .api_key(std::env::var("GROQ_API_KEY").unwrap_or_else(|_| "gsk-TESTKEY".to_string()))
+        .api_key(std::env::var("GROQ_API_KEY").unwrap_or_else(|_| "groq-key".to_string()))
         .model("openai/gpt-oss-20b")
         .max_tokens(512)
         .build(&registry)
         .await?;
 
-    // Create registry to manage multiple providers.
+    // Create registry to manage multiple providers
     let registry = LLMRegistryBuilder::new()
         .register("openai", openai_llm)
         .register("anthropic", anthropic_llm)
         .register("groq", groq_llm)
         .build();
 
-    // Build multi-step chain using different providers.
+    // Build multi-step chain using different providers
     let chain_res = MultiPromptChain::new(&registry)
-        // Step 1: use OpenAI to analyze a code problem.
+        // Step 1: use OpenAI to analyze a code problem
         .step(
             MultiChainStepBuilder::new(MultiChainStepMode::Chat)
                 .provider_id("openai")
@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .temperature(0.7)
                 .build()?
         )
-        // Step 2: use Anthropic to suggest optimizations based on analysis.
+        // Step 2: use Anthropic to suggest optimizations based on analysis
         .step(
             MultiChainStepBuilder::new(MultiChainStepMode::Chat)
                 .provider_id("anthropic")
@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .top_p(0.9)
                 .build()?
         )
-        // Step 3: use Groq to generate optimized code.
+        // Step 3: use Groq to generate optimized code
         .step(
             MultiChainStepBuilder::new(MultiChainStepMode::Chat)
                 .provider_id("groq")
@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .run().await?;
 
-    // Display results from all steps.
+    // Display results from all steps
     println!("Results: {:?}", chain_res);
 
     Ok(())
