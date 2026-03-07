@@ -2,7 +2,7 @@
 //!
 //! Run:
 //! ```sh
-//! GOOGLE_API_KEY="your-key" cargo run -p querymt --example google_image
+//! GOOGLE_API_KEY="your-key" cargo run -p querymt --example google_vision_example
 //! ```
 //!
 //! Uses `examples/image001.jpg`.

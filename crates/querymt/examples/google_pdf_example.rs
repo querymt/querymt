@@ -2,7 +2,7 @@
 //!
 //! Run:
 //! ```sh
-//! GOOGLE_API_KEY="your-key" cargo run -p querymt --example google_pdf
+//! GOOGLE_API_KEY="your-key" cargo run -p querymt --example google_pdf_example
 //! ```
 //!
 //! Uses `examples/dummy.pdf`.
