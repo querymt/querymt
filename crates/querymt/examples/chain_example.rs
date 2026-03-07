@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize the LLM with OpenAI provider and configuration
     let llm = LLMBuilder::new()
         .provider("openai")
-        .api_key(std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "openai-key".to_string()))
+        .api_key(std::env::var("OPENAI_API_KEY").expect("Set OPENAI_API_KEY to run this example"))
         .model("gpt-4o")
         .max_tokens(200)
         .temperature(0.7)

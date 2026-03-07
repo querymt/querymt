@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize the LLM builder with OpenAI configuration
     let llm = LLMBuilder::new()
         .provider("openai")
-        .api_key(std::env::var("OPENAI_API_KEY").unwrap_or("openai-key".into()))
+        .api_key(std::env::var("OPENAI_API_KEY").expect("Set OPENAI_API_KEY to run this example"))
         .model("text-embedding-ada-002")
         // Optional: Uncomment to customize embedding format and dimensions
         // .embedding_encoding_format("base64")

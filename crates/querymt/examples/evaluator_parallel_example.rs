@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let openai = LLMBuilder::new()
         .provider("openai")
-        .api_key(std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "openai-key".to_string()))
+        .api_key(std::env::var("OPENAI_API_KEY").expect("Set OPENAI_API_KEY to run this example"))
         .model("gpt-4o")
         .max_tokens(512)
         .build(&registry)
@@ -39,7 +39,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let anthropic = LLMBuilder::new()
         .provider("anthropic")
-        .api_key(std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "anthropic-key".to_string()))
+        .api_key(
+            std::env::var("ANTHROPIC_API_KEY").expect("Set ANTHROPIC_API_KEY to run this example"),
+        )
         .model("claude-sonnet-4-6")
         .max_tokens(512)
         .build(&registry)
@@ -47,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let google = LLMBuilder::new()
         .provider("google")
-        .api_key(std::env::var("GOOGLE_API_KEY").unwrap_or_else(|_| "google-key".to_string()))
+        .api_key(std::env::var("GOOGLE_API_KEY").expect("Set GOOGLE_API_KEY to run this example"))
         .model("gemini-3-flash-preview")
         .max_tokens(512)
         .build(&registry)

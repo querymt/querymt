@@ -28,7 +28,7 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get OpenAI API key from environment variable or use test key as fallback
-    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or("openai-key".into());
+    let api_key = std::env::var("OPENAI_API_KEY").expect("Set OPENAI_API_KEY to run this example");
     let registry = build_registry()?;
 
     // Initialize and configure the LLM client

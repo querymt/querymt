@@ -28,8 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize the LLM builder with Google configuration
     let llm = LLMBuilder::new()
         .provider("google")
-        // Get API key from environment variable or use test key
-        .api_key(std::env::var("GOOGLE_API_KEY").unwrap_or("google-key".into()))
+        .api_key(std::env::var("GOOGLE_API_KEY").expect("Set GOOGLE_API_KEY to run this example"))
         // Use Google's text embedding model
         .model("text-embedding-004")
         .build(&registry)

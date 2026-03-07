@@ -30,7 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Claude model with API key and current model version
     let anthropic_llm = LLMBuilder::new()
         .provider("anthropic")
-        .api_key(std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "anthropic-key".to_string()))
+        .api_key(
+            std::env::var("ANTHROPIC_API_KEY").expect("Set ANTHROPIC_API_KEY to run this example"),
+        )
         .model("claude-sonnet-4-6")
         .max_tokens(4096)
         .build(&plugin_registry)
@@ -39,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Groq model with the current default reasoning-capable model
     let groq_llm = LLMBuilder::new()
         .provider("groq")
-        .api_key(std::env::var("GROQ_API_KEY").unwrap_or_else(|_| "groq-key".to_string()))
+        .api_key(std::env::var("GROQ_API_KEY").expect("Set GROQ_API_KEY to run this example"))
         .model("qwen/qwen3-32b")
         .max_tokens(4096)
         .build(&plugin_registry)

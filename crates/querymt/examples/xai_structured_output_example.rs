@@ -24,7 +24,7 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get xAI API key from environment variable or use test key as fallback
-    let api_key = std::env::var("XAI_API_KEY").unwrap_or("xai-key".into());
+    let api_key = std::env::var("XAI_API_KEY").expect("Set XAI_API_KEY to run this example");
     let registry = build_registry()?;
 
     // Define a simple JSON schema for structured output
