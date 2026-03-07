@@ -1,41 +1,115 @@
-// Import required modules from the LLM library for OpenAI integration
-use llm::{
+//! OpenAI tool-calling example.
+//!
+//! Run:
+//! ```sh
+//! OPENAI_API_KEY="your-key" cargo run -p querymt --example tool_calling_example
+//! ```
+//!
+//! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
+
+use querymt::{
     builder::{FunctionBuilder, LLMBuilder, ParamBuilder},
-    chat::ChatMessage, // Chat-related structures
+    chat::{ChatMessage, Content, Tool},
+    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
 };
+use serde_json::{json, Value};
+
+fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
+    let cfg_path =
+        std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
+    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
+    registry.register_loader(Box::new(ExtismLoader));
+    Ok(registry)
+}
+
+fn weather_tool() -> Tool {
+    FunctionBuilder::new("get_weather")
+        .description("Get the current weather in a specific location")
+        .param(
+            ParamBuilder::new("location")
+                .type_of("string")
+                .description("City and country, e.g. 'Tokyo, Japan'"),
+        )
+        .required(["location"])
+        .build()
+}
+
+fn execute_tool_call(name: &str, args: &Value) -> Value {
+    match name {
+        "get_weather" => {
+            let location = args
+                .get("location")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            json!({
+                "location": location,
+                "temperature_c": 22,
+                "conditions": "Partly cloudy",
+                "wind_kph": 11
+            })
+        }
+        _ => json!({"error": format!("Unknown tool: {name}")}),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Get OpenAI API key from environment variable or use test key as fallback
-    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or("sk-TESTKEY".into());
+    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "sk-TESTKEY".to_string());
+    let registry = build_registry()?;
 
-    // Initialize and configure the LLM client
     let llm = LLMBuilder::new()
-        .provider("openai".to_string())
-        .api_key(api_key) // Set the API key
+        .provider("openai")
+        .api_key(api_key)
         .model("gpt-4o")
-        .max_tokens(512) // Limit response length
-        .temperature(0.7) // Control response randomness (0.0-1.0)
-        .stream(false) // Disable streaming responses
-        .function(
-            FunctionBuilder::new("get_weather")
-                .description("Get the current weather in a specific location")
-                .param(ParamBuilder::new("location").type_of("string").description(
-                    "The city and state/country, e.g., 'San Francisco, CA' or 'Tokyo, Japan'",
-                ))
-                .required(vec!["location".to_string()]),
-        )
-        .build()
-        .expect("Failed to build LLM");
+        .max_tokens(512)
+        .temperature(0.2)
+        .stream(false)
+        .build(&registry)
+        .await?;
 
-    // Prepare conversation history with example messages
-    let messages = vec![ChatMessage::user().content("You are a weather assistant. What is the weather in Tokyo? Use the tools that you have available").build()];
+    let tools = vec![weather_tool()];
+    let mut messages = vec![ChatMessage::user()
+        .text("You are a weather assistant. What is the weather in Tokyo right now?")
+        .build()];
 
-    // Send chat request and handle the response
-    // this returns the response as a string. The tool call is also returned as a serialized string. We can deserialize if needed.
-    match llm.chat_with_tools(&messages, llm.tools()).await {
-        Ok(text) => println!("Chat response:\n{}", text),
-        Err(e) => eprintln!("Chat error: {}", e),
+    let first_response = llm.chat_with_tools(&messages, Some(&tools)).await?;
+    if let Some(tool_calls) = first_response.tool_calls() {
+        println!("Model requested {} tool(s)", tool_calls.len());
+
+        let mut assistant_message = ChatMessage::assistant();
+        if let Some(text) = first_response.text() {
+            if !text.is_empty() {
+                assistant_message = assistant_message.text(text);
+            }
+        }
+
+        for call in &tool_calls {
+            let args = serde_json::from_str::<Value>(&call.function.arguments)
+                .unwrap_or_else(|_| json!({}));
+            assistant_message =
+                assistant_message.tool_use(call.id.clone(), call.function.name.clone(), args);
+        }
+        messages.push(assistant_message.build());
+
+        let mut tool_result_message = ChatMessage::user();
+        for call in tool_calls {
+            let args = serde_json::from_str::<Value>(&call.function.arguments)
+                .unwrap_or_else(|_| json!({}));
+            let result = execute_tool_call(&call.function.name, &args);
+
+            tool_result_message = tool_result_message.tool_result(
+                call.id,
+                Some(call.function.name),
+                false,
+                vec![Content::text(serde_json::to_string(&result)?)],
+            );
+        }
+        messages.push(tool_result_message.build());
+
+        let final_response = llm.chat_with_tools(&messages, Some(&tools)).await?;
+        println!("Final response:\n{}", final_response);
+    } else {
+        println!("Model answered directly:\n{}", first_response);
     }
 
     Ok(())
