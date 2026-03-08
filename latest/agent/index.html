@@ -8,13 +8,13 @@
       
       
       
-        <link rel="canonical" href="https://docs.query.mt/latest/mcp/">
+        <link rel="canonical" href="https://docs.query.mt/latest/agent/">
       
       
-        <link rel="prev" href="../plugins/oci_plugins/">
+        <link rel="prev" href="../mcp/">
       
       
-        <link rel="next" href="../agent/">
+        <link rel="next" href="configuration/">
       
       
         
@@ -25,7 +25,7 @@
     
     
       
-        <title>MCP Integration - QueryMate</title>
+        <title>Overview - QueryMate</title>
       
     
     
@@ -76,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#mcp-integration" class="md-skip">
+        <a href="#querymt-agent-overview" class="md-skip">
           Skip to content
         </a>
       
@@ -114,7 +114,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              MCP Integration
+              Overview
             
           </span>
         </div>
@@ -313,11 +313,9 @@
   
   
   
-    
   
-  
-    <li class="md-tabs__item md-tabs__item--active">
-      <a href="./" class="md-tabs__link">
+    <li class="md-tabs__item">
+      <a href="../mcp/" class="md-tabs__link">
         
   
   
@@ -334,11 +332,13 @@
   
   
   
+    
+  
   
     
     
-      <li class="md-tabs__item">
-        <a href="../agent/" class="md-tabs__link">
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="./" class="md-tabs__link">
           
   
   
@@ -1119,6 +1119,90 @@
       
   
   
+  
+  
+    <li class="md-nav__item">
+      <a href="../mcp/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    MCP Integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Agent
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Agent
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
     
   
   
@@ -1138,7 +1222,7 @@
   <span class="md-ellipsis">
     
   
-    MCP Integration
+    Overview
   
 
     
@@ -1156,7 +1240,7 @@
   <span class="md-ellipsis">
     
   
-    MCP Integration
+    Overview
   
 
     
@@ -1182,10 +1266,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#core-concepts" class="md-nav__link">
+  <a href="#what-is-querymt-agent" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Core Concepts
+        What is QueryMT Agent?
       
     </span>
   </a>
@@ -1193,10 +1277,88 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#workflow" class="md-nav__link">
+  <a href="#architecture-overview" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Workflow
+        Architecture Overview
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Architecture Overview">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#core-components" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Core Components
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Core Components">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-agentconfig" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. AgentConfig
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-sessionactor" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. SessionActor
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-middleware-stack" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Middleware Stack
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#4-tool-registry" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Tool Registry
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#agent-modes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Agent Modes
       
     </span>
   </a>
@@ -1204,10 +1366,132 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#benefits-of-mcp-integration" class="md-nav__link">
+  <a href="#execution-flow" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Benefits of MCP Integration
+        Execution Flow
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#multi-agent-quorum-architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Multi-Agent (Quorum) Architecture
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#key-features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key Features
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Key Features">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#context-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Context Management
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#delegation-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Delegation System
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#mesh-networking" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Mesh Networking
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#getting-started" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Getting Started
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Getting Started">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#quick-start" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quick Start
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#programmatic-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Programmatic Usage
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#documentation-structure" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Documentation Structure
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#related-documentation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Related Documentation
       
     </span>
   </a>
@@ -1221,85 +1505,6 @@
     </li>
   
 
-    
-      
-      
-  
-  
-  
-  
-    
-    
-    
-    
-      
-      
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
-        
-          
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
-            
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Agent
-  
-
-    
-  </span>
-  
-  
-
-            <span class="md-nav__icon md-icon"></span>
-          </label>
-        
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_6">
-            <span class="md-nav__icon md-icon"></span>
-            
-  
-    Agent
-  
-
-          </label>
-          <ul class="md-nav__list" data-md-scrollfix>
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../agent/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Overview
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
               
             
               
@@ -1309,7 +1514,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../agent/configuration/" class="md-nav__link">
+      <a href="configuration/" class="md-nav__link">
         
   
   
@@ -1337,7 +1542,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../agent/agent_modes/" class="md-nav__link">
+      <a href="agent_modes/" class="md-nav__link">
         
   
   
@@ -1365,7 +1570,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../agent/middleware/" class="md-nav__link">
+      <a href="middleware/" class="md-nav__link">
         
   
   
@@ -1393,7 +1598,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../agent/delegation/" class="md-nav__link">
+      <a href="delegation/" class="md-nav__link">
         
   
   
@@ -1421,7 +1626,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../agent/mesh/" class="md-nav__link">
+      <a href="mesh/" class="md-nav__link">
         
   
   
@@ -1449,7 +1654,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../agent/api_reference/" class="md-nav__link">
+      <a href="api_reference/" class="md-nav__link">
         
   
   
@@ -1477,7 +1682,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../agent/examples/" class="md-nav__link">
+      <a href="examples/" class="md-nav__link">
         
   
   
@@ -1579,130 +1784,175 @@
   
 
 
-<h1 id="mcp-integration">MCP Integration</h1>
-<p>QueryMT includes support for integrating with <strong>Model Context Protocol (MCP)</strong> servers, leveraging the <code>rmcp</code> crate. In the context of QueryMT, MCP servers typically act as providers of tools or services that Large Language Models (LLMs) can interact with. This allows you to define complex functionalities or access external systems through a standardized MCP interface, and then make these capabilities available to your LLMs as tools.</p>
-<p>Key components for MCP integration are found in the <code>crates/querymt/src/mcp/</code> directory.</p>
-<h2 id="core-concepts">Core Concepts</h2>
+<h1 id="querymt-agent-overview">QueryMT Agent - Overview</h1>
+<p>The <code>querymt-agent</code> crate is a high-level agent runtime for QueryMaTe, providing a flexible framework for building AI agents with support for single-agent and multi-agent (quorum) configurations.</p>
+<h2 id="what-is-querymt-agent">What is QueryMT Agent?</h2>
+<p>QueryMT Agent is a Rust library that enables you to:</p>
 <ul>
-<li><strong>MCP Server:</strong> An external process or service implementing the MCP protocol (as defined by <code>rmcp</code>). It exposes a set of "tools" (in the MCP sense, which are similar to functions) that can be invoked.</li>
-<li><strong><code>querymt::mcp::config::McpServerConfig</code></strong>: A configuration struct in QueryMT that specifies how to connect to an MCP server.<ul>
-<li><code>name</code>: A unique name for this MCP server configuration.</li>
-<li><code>transport</code>: An <code>enum@querymt::mcp::config::McpServerTransportConfig</code> that defines the communication protocol and parameters. Supported transports include:<ul>
-<li><strong><code>Http</code></strong>: Connects to an MCP server over HTTP using the Streamable HTTP transport. Requires a <code>url</code> and optional <code>token</code>.</li>
-<li><strong><code>Stdio</code>:</strong> Spawns an MCP server as a child process and communicates with it over <code>stdin</code>/<code>stdout</code>. Requires the <code>command</code> to execute, optional <code>args</code>, and <code>envs</code>.</li>
+<li><strong>Build AI agents</strong> with configurable tools, models, and behaviors</li>
+<li><strong>Run agents in multiple modes</strong>: ACP stdio, web dashboard, or mesh networking</li>
+<li><strong>Support multi-agent workflows</strong> with planner-delegate delegation patterns</li>
+<li><strong>Manage context efficiently</strong> with automatic compaction and pruning</li>
+<li><strong>Enable cross-machine collaboration</strong> via libp2p mesh networking</li>
 </ul>
-</li>
-</ul>
-</li>
-<li><strong><code>rmcp::RoleClient</code></strong>: The <code>rmcp</code> client used by QueryMT to communicate with an MCP server.</li>
-<li><strong><code>querymt::mcp::adapter::McpToolAdapter</code></strong>: A crucial adapter that bridges the gap between an MCP tool (<code>rmcp::model::Tool</code>) and QueryMT's tool system (<code>struct@querymt::chat::Tool</code> and <code>trait@querymt::tool_decorator::CallFunctionTool</code>).<ul>
-<li>It converts the MCP tool's input schema into a <code>serde_json::Value</code> that QueryMT's LLMs can understand.</li>
-<li>It implements <code>CallFunctionTool</code>, so an MCP tool can be registered with <code>LLMBuilder</code> just like any other native Rust tool. When the LLM decides to call this tool, the <code>McpToolAdapter</code> forwards the call to the actual MCP server via the <code>rmcp</code> client.</li>
-</ul>
-</li>
-</ul>
-<h2 id="workflow">Workflow</h2>
+<h2 id="architecture-overview">Architecture Overview</h2>
+<pre class="mermaid"><code>graph TD
+    subgraph Runtime["Agent Runtime"]
+        SA1[Session Actor] &amp; SA2[Session Actor] &amp; SA3[Session Actor]
+        SA1 &amp; SA2 &amp; SA3 --&gt; AC
+
+        AC["AgentConfig&lt;br/&gt;(Shared State)"]
+
+        AC --&gt; MW &amp; TR &amp; PS
+
+        MW[Middleware Stack]
+        TR[Tools Registry]
+        PS[Provider System]
+    end</code></pre>
+<h3 id="core-components">Core Components</h3>
+<h4 id="1-agentconfig">1. AgentConfig</h4>
+<p>The central configuration structure containing:
+- <strong>Provider</strong>: LLM provider configuration (Anthropic, OpenAI, etc.)
+- <strong>Tool Registry</strong>: Available tools (built-in, MCP, provider-specific)
+- <strong>Middleware Stack</strong>: Processing pipeline for agent decisions
+- <strong>Event Sink</strong>: Event publishing and subscription
+- <strong>Session Provider</strong>: Session management and history storage</p>
+<h4 id="2-sessionactor">2. SessionActor</h4>
+<p>Per-session runtime state managed as a kameo actor:
+- <strong>Execution State</strong>: Current turn, step count, tool usage
+- <strong>Conversation Context</strong>: Message history with compaction
+- <strong>Runtime State</strong>: MCP tools, workspace index, permissions
+- <strong>Execution Permit</strong>: Ensures FIFO ordering of prompts</p>
+<h4 id="3-middleware-stack">3. Middleware Stack</h4>
+<p>A pluggable processing pipeline that intercepts and modifies agent behavior:
+- <strong>LimitsMiddleware</strong>: Step and turn limits
+- <strong>ContextMiddleware</strong>: Token management and compaction
+- <strong>AgentModeMiddleware</strong>: Mode-aware restrictions (build/plan/review)
+- <strong>DedupCheckMiddleware</strong>: Duplicate code detection
+- <strong>DelegationMiddleware</strong>: Multi-agent coordination</p>
+<h4 id="4-tool-registry">4. Tool Registry</h4>
+<p>Unified tool system supporting:
+- <strong>Built-in tools</strong>: <code>edit</code>, <code>read_tool</code>, <code>shell</code>, <code>glob</code>, etc.
+- <strong>Provider tools</strong>: Tools exposed by the LLM provider
+- <strong>MCP tools</strong>: Model Context Protocol servers</p>
+<h2 id="agent-modes">Agent Modes</h2>
+<p>QueryMT Agent supports three runtime modes, switchable at runtime:</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Description</th>
+<th>Use Case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Build</strong></td>
+<td>Full read/write access</td>
+<td>Implementing code changes</td>
+</tr>
+<tr>
+<td><strong>Plan</strong></td>
+<td>Read-only, planning focus</td>
+<td>Analyzing and planning before implementation</td>
+</tr>
+<tr>
+<td><strong>Review</strong></td>
+<td>Read-only, code review</td>
+<td>Reviewing code quality and providing feedback</td>
+</tr>
+</tbody>
+</table>
+<p>Switch modes with <code>Ctrl+M</code> (or <code>Cmd+M</code> on macOS) in dashboard mode.</p>
+<h2 id="execution-flow">Execution Flow</h2>
+<pre class="mermaid"><code>flowchart TD
+    A([User Request])
+    B[SessionActor]
+    C[Middleware Stack]
+    D[Tool Selection]
+    E[Tool Execution]
+    F[Context Management]
+    G[LLM Response]
+
+    A --&gt; B
+    B --&gt;|"Limits check, mode validation"| C
+    C --&gt; D
+    D --&gt;|"Agent chooses tools"| E
+    E --&gt;|"shell, file ops, etc."| F
+    F --&gt;|"Prune/compact if needed"| G
+    G --&gt;|"Next action"| B</code></pre>
+<h2 id="multi-agent-quorum-architecture">Multi-Agent (Quorum) Architecture</h2>
+<p>For complex tasks, QueryMT supports a planner-delegate pattern:</p>
+<pre class="mermaid"><code>flowchart TD
+    P["Planner Agent&lt;br/&gt;(Analyzes task, decides which delegate to use)"]
+    P --&gt;|"Delegation Request"| D1 &amp; D2
+    D1["Delegate 1&lt;br/&gt;(Code Reviewer)"]
+    D2["Delegate 2&lt;br/&gt;(Tester)"]</code></pre>
+<h2 id="key-features">Key Features</h2>
+<h3 id="context-management">Context Management</h3>
+<p>QueryMT implements a 3-layer context management system:</p>
 <ol>
-<li>
-<p><strong>Configure MCP Servers:</strong></p>
-<ul>
-<li>You define your MCP server connections in a configuration file (e.g., <code>mcp_config.toml</code>) that QueryMT can load using <code>mcp::config::Config::load()</code>. This file lists each MCP server and its transport details.</li>
-</ul>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># Example mcp_config.toml</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">[[mcp]]</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;my_calculator_service&quot;</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">protocol</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;stdio&quot;</span><span class="w"> </span><span class="c1"># or &quot;http&quot;</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">command</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/path/to/mcp_calculator_server_binary&quot;</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="c1"># args = [&quot;--port&quot;, &quot;8080&quot;] # if needed</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="c1"># envs = { VAR1 = &quot;value1&quot; } # optional environment variables</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="k">[[mcp]]</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;external_data_api&quot;</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="n">protocol</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;http&quot;</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="n">url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;https://api.example.com/mcp_endpoint&quot;</span>
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="c1"># token = &quot;some-secret-token&quot; # optional Bearer token</span>
-</code></pre></div>
-</li>
-<li>
-<p><strong>Start MCP Clients:</strong></p>
-<ul>
-<li>Your application uses <code>mcp::config::Config::create_mcp_clients()</code> to establish connections to all configured MCP servers. This returns a map of server names to <code>RunningService&lt;RoleClient, Box&lt;dyn DynService&lt;RoleClient&gt;&gt;&gt;</code> instances.</li>
-</ul>
-</li>
-<li>
-<p><strong>Discover Tools from MCP Server:</strong></p>
-<ul>
-<li>Once connected, you can query an MCP server for the list of tools it provides. The <code>rmcp</code> client would typically have a method like <code>list_tools()</code>. Each tool returned will be an <code>rmcp::model::Tool</code>.</li>
-</ul>
-</li>
-<li>
-<p><strong>Adapt MCP Tools for QueryMT:</strong></p>
-<ul>
-<li>For each <code>rmcp::model::Tool</code> you want to make available to your LLMs:<ul>
-<li>Create an <code>McpToolAdapter</code> instance using <code>McpToolAdapter::try_new(mcp_tool, server, server_name)</code>, where:<ul>
-<li><code>mcp_tool</code> is the <code>rmcp::model::Tool</code> from the server</li>
-<li><code>server</code> is the <code>ServerSink</code> from the <code>RunningService</code> for that MCP server</li>
-<li><code>server_name</code> is the unique name of the MCP server from your configuration
-This adapter converts the MCP tool's schema and handles the call forwarding.</li>
-</ul>
-</li>
-</ul>
-</li>
-</ul>
-</li>
-<li>
-<p><strong>Register Adapted Tools with <code>LLMBuilder</code>:</strong></p>
-<ul>
-<li>Add the <code>McpToolAdapter</code> instances to your <code>LLMBuilder</code> using the <code>add_tool()</code> method.</li>
-</ul>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1">// Conceptual Code</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">builder</span><span class="p">::</span><span class="n">LLMBuilder</span><span class="p">;</span>
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">mcp</span><span class="p">::{</span><span class="n">config</span><span class="p">::</span><span class="n">Config</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">McpConfig</span><span class="p">,</span><span class="w"> </span><span class="n">adapter</span><span class="p">::</span><span class="n">McpToolAdapter</span><span class="p">};</span>
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="c1">// ... other imports ...</span>
-<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>
-<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="kd">let</span><span class="w"> </span><span class="n">mcp_config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">McpConfig</span><span class="p">::</span><span class="n">load</span><span class="p">(</span><span class="s">&quot;mcp_config.toml&quot;</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="kd">let</span><span class="w"> </span><span class="n">mcp_clients</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mcp_config</span><span class="p">.</span><span class="n">create_mcp_clients</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>
-<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="kd">let</span><span class="w"> </span><span class="n">calculator_client_service</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mcp_clients</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="s">&quot;my_calculator_service&quot;</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
-<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="kd">let</span><span class="w"> </span><span class="n">server</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">calculator_client_service</span><span class="p">.</span><span class="n">peer</span><span class="p">();</span>
-<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="kd">let</span><span class="w"> </span><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">server</span><span class="p">.</span><span class="n">list_all_tools</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="kd">let</span><span class="w"> </span><span class="n">mcp_calc_tool_description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tools</span><span class="p">.</span><span class="n">into_iter</span><span class="p">().</span><span class="n">find</span><span class="p">(</span><span class="o">|</span><span class="n">t</span><span class="o">|</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">name</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s">&quot;add&quot;</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
-<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>
-<a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="kd">let</span><span class="w"> </span><span class="n">adapted_calc_tool</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">McpToolAdapter</span><span class="p">::</span><span class="n">try_new</span><span class="p">(</span>
-<a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="w">    </span><span class="n">mcp_calc_tool_description</span><span class="p">,</span>
-<a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a><span class="w">    </span><span class="n">calculator_client_service</span><span class="p">.</span><span class="n">client</span><span class="p">().</span><span class="n">sink</span><span class="p">().</span><span class="n">clone</span><span class="p">(),</span>
-<a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a><span class="w">    </span><span class="s">&quot;my_calculator_service&quot;</span><span class="p">.</span><span class="n">to_string</span><span class="p">()</span>
-<a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="p">)</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a>
-<a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a><span class="kd">let</span><span class="w"> </span><span class="n">llm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LLMBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">()</span>
-<a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a><span class="w">    </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">&quot;some_provider&quot;</span><span class="p">)</span>
-<a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a><span class="w">    </span><span class="c1">// ... other configs ...</span>
-<a id="__codelineno-1-23" name="__codelineno-1-23" href="#__codelineno-1-23"></a><span class="w">    </span><span class="p">.</span><span class="n">add_tool</span><span class="p">(</span><span class="n">adapted_calc_tool</span><span class="p">)</span><span class="w"> </span><span class="c1">// Register the MCP tool adapter</span>
-<a id="__codelineno-1-24" name="__codelineno-1-24" href="#__codelineno-1-24"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">(</span><span class="o">&amp;</span><span class="n">provider_registry</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
-</code></pre></div>
-</li>
-<li>
-<p><strong>LLM Interaction:</strong></p>
-<ul>
-<li>When the LLM (configured with the adapted MCP tools) decides to use one of these tools:<ul>
-<li>QueryMT's <code>ToolEnabledProvider</code> will invoke the <code>call()</code> method on the corresponding <code>McpToolAdapter</code>.</li>
-<li>The adapter will then use its <code>ServerSink</code> to send a <code>CallToolRequestParam</code> to the target MCP server.</li>
-<li>The MCP server executes its internal logic for that tool and returns a result.</li>
-<li>The <code>McpToolAdapter</code> receives this result and passes it back (as a JSON string) into the QueryMT tool-calling flow.</li>
-<li>The LLM receives this result and continues the conversation.</li>
-</ul>
-</li>
-</ul>
-</li>
+<li><strong>Tool Output Truncation</strong>: Limits tool output to configurable size</li>
+<li><strong>Pruning</strong>: Removes old tool results after every turn</li>
+<li><strong>AI Compaction</strong>: Summarizes history when context approaches limits</li>
 </ol>
-<h2 id="benefits-of-mcp-integration">Benefits of MCP Integration</h2>
+<h3 id="delegation-system">Delegation System</h3>
 <ul>
-<li><strong>Decoupling:</strong> Keep complex tool logic or integrations with external systems separate from your main LLM application code, managed within dedicated MCP servers.</li>
-<li><strong>Standardization:</strong> Use the MCP protocol as a standard way for LLMs to discover and invoke external capabilities.</li>
-<li><strong>Reusability:</strong> MCP servers and their tools can potentially be reused across multiple LLM applications or by other systems.</li>
-<li><strong>Language Independence (for MCP servers):</strong> MCP servers can be written in any language, as long as they implement the MCP protocol.</li>
+<li><strong>Automatic delegation</strong>: Agents can delegate tasks to specialized agents</li>
+<li><strong>Verification</strong>: Optional verification of delegate results</li>
+<li><strong>Planning context</strong>: Summarized context passed to delegates</li>
+<li><strong>Parallel execution</strong>: Multiple delegations can run concurrently</li>
 </ul>
-<p>By integrating with MCP servers, QueryMT allows LLMs to leverage a broader ecosystem of tools and services in a structured and maintainable way.</p>
+<h3 id="mesh-networking">Mesh Networking</h3>
+<ul>
+<li><strong>Cross-machine sessions</strong>: Share sessions across multiple machines</li>
+<li><strong>Peer discovery</strong>: mDNS or Kademlia DHT for finding peers</li>
+<li><strong>Remote agents</strong>: Access agents running on other machines</li>
+<li><strong>Provider routing</strong>: Route LLM calls to specific nodes</li>
+</ul>
+<h2 id="getting-started">Getting Started</h2>
+<h3 id="quick-start">Quick Start</h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># Run the coder agent example with dashboard</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nb">cd</span><span class="w"> </span>crates/agent
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>coder_agent<span class="w"> </span>--features<span class="w"> </span>dashboard<span class="w"> </span>--<span class="w"> </span>--dashboard
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="c1"># Run as ACP stdio server</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>coder_agent<span class="w"> </span>--<span class="w"> </span>--acp
+</code></pre></div>
+<h3 id="programmatic-usage">Programmatic Usage</h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="cp">#[tokio::main]</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="nb">Box</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">error</span><span class="p">::</span><span class="n">Error</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">    </span><span class="c1">// Create a single agent</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">        </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">&quot;anthropic&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;claude-sonnet-4-5-20250929&quot;</span><span class="p">)</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">        </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">&quot;.&quot;</span><span class="p">)</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">        </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;edit&quot;</span><span class="p">])</span>
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="w">        </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>
+<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="w">    </span><span class="c1">// Chat with the agent</span>
+<a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">&quot;Hello!&quot;</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;{}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">response</span><span class="p">);</span>
+<a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a>
+<a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a><span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="p">}</span>
+</code></pre></div>
+<h2 id="documentation-structure">Documentation Structure</h2>
+<ul>
+<li><strong>Overview</strong> (this document): Architecture and concepts</li>
+<li><strong>Configuration Guide</strong>: TOML configuration reference</li>
+<li><strong>API Reference</strong>: Rust API documentation</li>
+<li><strong>Middleware Guide</strong>: Custom middleware development</li>
+<li><strong>Examples</strong>: Usage examples and patterns</li>
+</ul>
+<h2 id="related-documentation">Related Documentation</h2>
+<ul>
+<li><a href="https://docs.query.mt">QueryMaTe Main Documentation</a></li>
+<li><a href="examples/">Agent Examples</a></li>
+<li><a href="configuration/">Configuration Examples</a></li>
+</ul>
 
 
 
