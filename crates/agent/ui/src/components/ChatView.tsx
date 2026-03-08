@@ -13,7 +13,7 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { Activity, Send, Loader, Plus, ChevronDown, Square } from 'lucide-react';
-import { useUiClientContext } from '../context/UiClientContext';
+import { useUiClientActions, useUiClientEvents, useUiClientSession } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
 import { useSessionManager } from '../hooks/useSessionManager';
 import { useFileMention } from '../hooks/useFileMention';
@@ -69,31 +69,39 @@ function buildPromptBlocksFromInput(input: string): UiPromptBlock[] {
 }
 
 export function ChatView() {
+  // Split context subscriptions — ChatView subscribes to Events + Session + Actions
+  // (no Config context), so auth/model-list/plugin changes won't trigger re-renders.
+  const {
+    sendPrompt,
+    cancelSession,
+    deleteSession,
+    setFileIndexCallback,
+    setFileIndexErrorCallback,
+    requestFileIndex,
+    requestLlmConfig,
+    sendUndo,
+    sendRedo,
+    forkSessionAtMessage,
+  } = useUiClientActions();
+
   const {
     events,
     eventsBySession,
     mainSessionId,
+  } = useUiClientEvents();
+
+  const {
     sessionId,
     connected,
-    sendPrompt,
-    cancelSession,
-    deleteSession,
     agents,
     sessionGroups,
     thinkingBySession,
     sessionParentMap,
     isConversationComplete,
-    setFileIndexCallback,
-    setFileIndexErrorCallback,
-    requestFileIndex,
     workspaceIndexStatus,
     llmConfigCache,
-    requestLlmConfig,
-    sendUndo,
-    sendRedo,
-    forkSessionAtMessage,
     undoState,
-  } = useUiClientContext();
+  } = useUiClientSession();
   
   // UI state from Zustand store
   const {

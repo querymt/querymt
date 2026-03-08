@@ -126,9 +126,9 @@ function makeTriggerLabel(currentProvider?: string, currentModel?: string): stri
     : 'Select model';
 }
 
-function makeTriggerTitle(currentProvider?: string, currentModel?: string, currentNode?: string): string {
+function makeTriggerTitle(currentProvider?: string, currentModel?: string, currentNodeLabel?: string): string {
   return currentProvider && currentModel
-    ? `${currentProvider} / ${currentModel}${currentNode ? ` on ${currentNode}` : ''} (${shortcutHint} to open)`
+    ? `${currentProvider} / ${currentModel}${currentNodeLabel ? ` on ${currentNodeLabel}` : ''} (${shortcutHint} to open)`
     : `Select model (${shortcutHint})`;
 }
 
@@ -187,9 +187,6 @@ const ModelPickerPanel = memo(function ModelPickerPanel({
   inputRef,
   commandListRef,
 }: ModelPickerPanelProps) {
-  // Profiler: mark panel render start
-  performance.mark('ModelPickerPanel-render-start');
-
   const [target, setTarget] = useState(TARGET_ACTIVE);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedValue, setSelectedValue] = useState('');
@@ -367,9 +364,6 @@ const ModelPickerPanel = memo(function ModelPickerPanel({
   }, [onDeleteCustomModel, selectedProviderEntry, selectedProvider]);
 
   const CloseComponent = isInMobileMenu ? Dialog.Close : Popover.Close;
-
-  // Profiler: measure panel render
-  performance.measure('ModelPickerPanel-render', 'ModelPickerPanel-render-start');
 
   return (
     <>
@@ -657,18 +651,18 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
   onAddCustomModelFromFile,
   onDeleteCustomModel,
 }: ModelPickerPopoverProps) {
-  // Profiler: mark outer trigger render (cheap — only trigger shown when closed)
-  performance.mark('ModelPickerPopover-render-start');
-
   const inputRef = useRef<HTMLInputElement>(null);
   const commandListRef = useRef<HTMLDivElement>(null);
   const { focusMainInput } = useUiStore();
 
   // Cheap trigger-only derivations — no allModels scan
   const triggerLabel = makeTriggerLabel(currentProvider, currentModel);
-  const triggerTitle = makeTriggerTitle(currentProvider, currentModel, currentNode);
-
-  performance.measure('ModelPickerPopover-render', 'ModelPickerPopover-render-start');
+  const currentNodeLabel = useMemo(() => {
+    if (!currentNode) return undefined;
+    const entry = allModels.find((m) => m.node_id === currentNode);
+    return entry?.node_label ?? currentNode;
+  }, [allModels, currentNode]);
+  const triggerTitle = makeTriggerTitle(currentProvider, currentModel, currentNodeLabel);
 
   // Shared panel props — passed through only when panel is mounted
   const panelProps: ModelPickerPanelProps = {
@@ -707,9 +701,9 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
             title={triggerTitle}
           >
             <span className="truncate">{triggerLabel}</span>
-            {currentNode && (
+            {currentNodeLabel && (
               <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                {currentNode}
+                {currentNodeLabel}
               </span>
             )}
             <ChevronDown className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
@@ -744,9 +738,9 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
           title={triggerTitle}
         >
           <span className="truncate">{triggerLabel}</span>
-          {currentNode && (
+          {currentNodeLabel && (
             <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-blue-500/10 text-blue-400 border border-blue-500/20">
-              {currentNode}
+              {currentNodeLabel}
             </span>
           )}
           <ChevronDown className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />

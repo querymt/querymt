@@ -26,7 +26,7 @@ interface TodoRailProps {
 export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyChangedIds }: TodoRailProps) {
   if (collapsed) {
     return (
-      <div className="w-8 border-l border-surface-border/50 bg-surface-canvas/60 backdrop-blur-sm hidden md:flex flex-col items-center py-4 relative">
+      <div className="w-8 border-l border-surface-border/50 bg-surface-canvas/80 hidden md:flex flex-col items-center py-4 relative">
         <button
           onClick={onToggleCollapse}
           className="
@@ -60,7 +60,7 @@ export function TodoRail({ todos, stats, collapsed, onToggleCollapse, recentlyCh
   }
   
   return (
-    <div className="w-72 border-l border-surface-border/50 bg-surface-canvas/60 backdrop-blur-sm hidden md:flex flex-col relative">
+    <div className="w-72 border-l border-surface-border/50 bg-surface-canvas/80 hidden md:flex flex-col relative">
       {/* Header */}
       <div className="px-4 py-2 border-b border-surface-border/50 bg-surface-elevated/40 flex items-center justify-between">
         <div className="flex items-center gap-2">

@@ -695,7 +695,7 @@ export function ProviderAuthSwitcher({
     <>
       <div
         data-testid="provider-auth-switcher-backdrop"
-        className="fixed inset-0 bg-surface-canvas/65 backdrop-blur-sm z-40 animate-fade-in"
+        className="fixed inset-0 bg-surface-canvas/80 z-40 animate-fade-in"
         onClick={close}
       />
 

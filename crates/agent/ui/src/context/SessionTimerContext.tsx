@@ -25,7 +25,7 @@
  */
 
 import { createContext, useContext, useMemo, ReactNode } from 'react';
-import { useUiClientContext } from './UiClientContext';
+import { useUiClientEvents, useUiClientSession } from './UiClientContext';
 import { useSessionTimer } from '../hooks/useSessionTimer';
 
 // ---------------------------------------------------------------------------
@@ -49,7 +49,8 @@ interface SessionTimerProviderProps {
  * only re-renders this provider and its subtree, not AppShell.
  */
 export function SessionTimerProvider({ children }: SessionTimerProviderProps) {
-  const { events, thinkingBySession, sessionId } = useUiClientContext();
+  const { events } = useUiClientEvents();
+  const { thinkingBySession, sessionId } = useUiClientSession();
 
   // Derive thinking agents scoped to the currently viewed session only.
   // Using the global thinkingAgentIds would start/run the timer whenever *any*

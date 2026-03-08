@@ -45,7 +45,7 @@ export function WorkspacePathDialog({
       }}
     >
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-surface-canvas/75 backdrop-blur-sm animate-fade-in" />
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-surface-canvas/85 animate-fade-in" />
         <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-[min(92vw,560px)] -translate-x-1/2 -translate-y-1/2 rounded-xl border-2 border-accent-primary/30 bg-surface-elevated shadow-[0_0_40px_rgba(var(--accent-primary-rgb),0.25)] p-5">
           <Dialog.Title className="text-base font-semibold text-accent-primary">
             Start New Session

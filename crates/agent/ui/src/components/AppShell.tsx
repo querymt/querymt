@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback, useMemo, useState } from 'react';
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
 import { Home, Copy, Check, Palette, Keyboard, Menu, X } from 'lucide-react';
-import { useUiClientContext } from '../context/UiClientContext';
+import { useUiClientActions, useUiClientSession, useUiClientConfig } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
 
 import { useIsMobile } from '../hooks/useIsMobile';
@@ -41,36 +41,18 @@ import { toggleDebugLog } from '../utils/debugLog';
  * - Expert mode toggle for per-agent breakdown
  */
 export function AppShell() {
+  // Split context subscriptions — AppShell does NOT subscribe to Events context
+  // (hot streaming data) so it won't re-render on every streaming delta.
   const {
-    connected,
     newSession,
     cancelSession,
     deleteSession,
-    thinkingAgentId,
-    thinkingAgentIds,
-    sessionId,
-    events,
-    agents,
-    agentModels,
-    sessionLimits,
-    isConversationComplete,
-    routingMode,
-    activeAgentId,
-    sessionsByAgent,
-    allModels,
-    providerCapabilities,
-    recentModelsByWorkspace,
-    authProviders,
-    oauthFlow,
-    oauthResult,
     refreshAllModels,
     requestAuthProviders,
-    modelDownloads,
     startOAuthLogin,
     completeOAuthLogin,
     disconnectOAuth,
     clearOAuthState,
-    apiTokenResult,
     setApiToken,
     clearApiToken,
     setAuthMethodPref,
@@ -79,24 +61,49 @@ export function AppShell() {
     addCustomModelFromHf,
     addCustomModelFromFile,
     deleteCustomModel,
+    cycleAgentMode,
+    submitWorkspacePathDialog,
+    cancelWorkspacePathDialog,
+    dismissConnectionError,
+    dismissSessionActionNotice,
+    updatePlugins,
+  } = useUiClientActions();
+
+  const {
+    connected,
+    thinkingAgentId,
+    thinkingAgentIds,
+    sessionId,
+    agents,
+    agentModels,
+    sessionLimits,
+    isConversationComplete,
+    routingMode,
+    activeAgentId,
+    sessionsByAgent,
     sessionGroups,
     thinkingBySession,
     agentMode,
-    cycleAgentMode,
+    remoteNodes,
+  } = useUiClientSession();
+
+  const {
+    allModels,
+    providerCapabilities,
+    recentModelsByWorkspace,
+    authProviders,
+    oauthFlow,
+    oauthResult,
+    modelDownloads,
+    apiTokenResult,
     workspacePathDialogOpen,
     workspacePathDialogDefaultValue,
-    submitWorkspacePathDialog,
-    cancelWorkspacePathDialog,
-    remoteNodes,
     connectionErrors,
-    dismissConnectionError,
     sessionActionNotices,
-    dismissSessionActionNotice,
-    updatePlugins,
     isUpdatingPlugins,
     pluginUpdateStatus,
     pluginUpdateResults,
-  } = useUiClientContext();
+  } = useUiClientConfig();
   
   const navigate = useNavigate();
   
@@ -585,7 +592,6 @@ export function AppShell() {
           {/* Inline stats bar — compact on mobile, full on desktop */}
           {sessionId && (
             <HeaderStatsBar
-              events={events}
               agentModels={agentModels}
               sessionLimits={sessionLimits}
               compact={isMobile}
@@ -822,7 +828,6 @@ export function AppShell() {
           <StatsDrawer
             open={statsDrawerOpen}
             onOpenChange={setStatsDrawerOpen}
-            events={events}
             agents={agents}
             agentModels={agentModels}
             sessionLimits={sessionLimits}

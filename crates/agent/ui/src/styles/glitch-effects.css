@@ -15,6 +15,12 @@
   color: rgb(var(--glitch-fg-rgb));
 }
 
+/* GPU layer promotion — avoids main-thread repaints for animated characters */
+.glitch [data-char] {
+  will-change: transform;
+  contain: layout style;
+}
+
 /* ===== GLITCH-0 VARIANT - Jump and translate (CodePen) ===== */
 .glitch--0 {
   animation: glitch--0 4s infinite steps(1);
