@@ -13,6 +13,7 @@ The primary interface for all providers is the `LLMProvider` trait (defined in `
 It also includes optional methods related to tool usage:
 *   `tools()`: Returns a list of tools the provider is aware of or configured with.
 *   `call_tool()`: Allows the system to invoke a tool call identified by the LLM.
+*   `tool_server_name(&tool_name)`: Returns the server name for a tool if available (e.g., for MCP tools). This is used to dispatch tool calls to the correct MCP server when multiple MCP servers are configured.
 
 By conforming to this trait, different LLM backends can be used interchangeably within QueryMT applications.
 

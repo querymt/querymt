@@ -1,15 +1,16 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Skill-level permissions in agent config
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct SkillPermissions {
     /// Pattern-based permissions: "skill-name" or "prefix-*"
     pub patterns: HashMap<String, PermissionLevel>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionLevel {
     /// Automatically allow (default)

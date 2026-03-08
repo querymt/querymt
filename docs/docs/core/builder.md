@@ -21,7 +21,7 @@ The `LLMBuilder` allows you to set various common and provider-specific paramete
 *   **`stream(enable: bool)`**: Enables or disables streaming responses (if supported by the provider).
 *   **`top_p(p: f32)`**, **`top_k(k: u32)`**: Parameters for nucleus and top-k sampling.
 *   **`embedding_encoding_format(format: String)`**, **`embedding_dimensions(dims: u32)`**: Configuration for embedding generation.
-*   **`schema(schema: StructuredOutputFormat)`**: Defines a JSON schema for structured output from the LLM.
+*   **`schema(schema: impl Into<StructuredOutputFormat>)`**: Defines a JSON schema for structured output from the LLM. The parameter can be any type that implements `Into<StructuredOutputFormat>`.
 *   **`validator(func: F)`**: Sets a custom validation function for LLM responses.
 *   **`validator_attempts(attempts: usize)`**: Sets the number of retries if validation fails.
 *   **`add_tool(tool: T)`**: Registers a tool (an implementation of `CallFunctionTool`) to be made available to the LLM. See [Tools & Function Calling](./tools.md).

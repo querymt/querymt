@@ -5,6 +5,7 @@
 use agent_client_protocol::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerStdio};
 use anyhow::{Context, Result, anyhow};
 use regex::{Captures, Regex};
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -74,7 +75,7 @@ fn default_backoff_multiplier() -> f64 {
 }
 
 /// Where to store overflow output when tool output is truncated
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OverflowStorage {
     /// Discard overflow (don't save)
@@ -88,7 +89,7 @@ pub enum OverflowStorage {
 }
 
 /// Configuration for tool output truncation (Layer 1)
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ToolOutputConfig {
     /// Maximum lines before truncation
@@ -115,7 +116,7 @@ impl Default for ToolOutputConfig {
 }
 
 /// Configuration for pruning (Layer 2) - runs after every turn
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PruningConfig {
     /// Enable/disable pruning
@@ -147,7 +148,7 @@ impl Default for PruningConfig {
 }
 
 /// Retry configuration for compaction LLM calls
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RetryConfig {
     /// Maximum retry attempts
@@ -174,7 +175,7 @@ impl Default for RetryConfig {
 }
 
 /// Configuration for AI compaction (Layer 3) - runs on context overflow
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionConfig {
     /// Enable/disable AI compaction (setting true auto-enables ContextMiddleware)
@@ -233,7 +234,7 @@ fn default_rate_limit_backoff_multiplier() -> f64 {
 }
 
 /// Configuration for rate limit retry behavior
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     /// Maximum number of retry attempts (default: 3)
@@ -271,7 +272,7 @@ impl Default for RateLimitConfig {
 /// Configuration for delegation summary LLM call
 /// This generates an Implementation Brief from the parent planning conversation
 /// before delegation to provide context to the coder agent
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DelegationSummaryConfig {
     /// LLM provider for the summary call (can be different from main agent)
@@ -348,19 +349,32 @@ fn default_max_age_days() -> Option<u64> {
     Some(30)
 }
 
-/// Configuration for snapshot backend (undo/redo support)
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Configuration for snapshot backend (undo/redo support).
+///
+/// Snapshots capture the state of modified files before each agent action,
+/// enabling undo/redo. Requires the `[agent.execution.snapshot]` section.
+///
+/// ```toml
+/// [agent.execution.snapshot]
+/// backend = "git"
+/// max_snapshots = 100
+/// max_age_days = 30
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotBackendConfig {
-    /// Backend type: "git" or "none" (default: "none")
+    /// Snapshot storage backend.
+    /// - `"git"`: Commits snapshots into the current git repository.
+    /// - `"none"`: Snapshots disabled (default).
     #[serde(default = "default_snapshot_backend")]
+    #[schemars(extend("enum" = ["git", "none"]))]
     pub backend: String,
 
-    /// Maximum number of snapshots to keep (oldest are removed first)
+    /// Maximum number of snapshots to retain. Oldest are removed first.
     #[serde(default = "default_max_snapshots")]
     pub max_snapshots: Option<usize>,
 
-    /// Maximum age of snapshots in days (older are removed)
+    /// Maximum age of snapshots in days. Older snapshots are pruned automatically.
     #[serde(default = "default_max_age_days")]
     pub max_age_days: Option<u64>,
 }
@@ -384,18 +398,32 @@ impl Default for SnapshotBackendConfig {
 // AgentSettings, PlannerConfig, and DelegateConfig.
 // ============================================================================
 
-/// Execution-policy configuration shared across agent, planner, and delegate
-/// config structs.
+/// Execution-policy configuration (3-layer context management system).
 ///
-/// In TOML this appears as a `[*.execution]` nested table, e.g.:
+/// - **Layer 1** `tool_output`: Truncates individual tool outputs exceeding
+///   size limits. Saves overflowed content to temp storage.
+/// - **Layer 2** `pruning`: Removes old tool output entries from the context
+///   window after every turn to reclaim token budget.
+/// - **Layer 3** `compaction`: AI-powered summarisation triggered when the
+///   context window fills. Condenses history to free space.
+///
+/// Also controls `snapshot` (undo/redo via git) and `rate_limit` (429 retry).
+///
 /// ```toml
 /// [agent.execution.tool_output]
 /// max_lines = 2000
+/// max_bytes = 51200
+///
+/// [agent.execution.pruning]
+/// protect_tokens = 40000
 ///
 /// [agent.execution.compaction]
 /// auto = true
+///
+/// [agent.execution.snapshot]
+/// backend = "git"
 /// ```
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ExecutionPolicy {
     /// Tool output truncation settings (Layer 1)
@@ -527,7 +555,7 @@ async fn resolve_system_parts(
 /// name = "dev-gpu"
 /// addr = "/ip4/192.168.1.100/tcp/9000"
 /// ```
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MeshPeerConfig {
     /// Human-readable label (referenced by `[[remote_agents]]`).
@@ -539,7 +567,7 @@ pub struct MeshPeerConfig {
 /// Discovery strategy for the libp2p swarm.
 ///
 /// In TOML: `discovery = "mdns"` | `"kademlia"` | `"none"`.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MeshDiscoveryConfig {
     /// Zero-config local-network discovery (mDNS multicast).
@@ -572,7 +600,7 @@ fn default_mesh_request_timeout_secs() -> u64 {
 /// name = "dev-gpu"
 /// addr = "/ip4/192.168.1.100/tcp/9000"
 /// ```
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MeshTomlConfig {
     /// Whether to start the mesh swarm at startup.  Default: `false`.
@@ -617,30 +645,43 @@ impl Default for MeshTomlConfig {
     }
 }
 
-/// A remote agent that lives on another mesh node.
+/// A remote agent running on another mesh node, used for task delegation.
 ///
-/// In TOML:
+/// Remote agents require `[mesh] enabled = true` and a matching peer in
+/// `[[mesh.peers]]`. This is for multi-machine agent delegation — it is
+/// NOT for MCP tool servers (use `[[mcp]]` for those).
+///
 /// ```toml
+/// [mesh]
+/// enabled = true
+///
+/// [[mesh.peers]]
+/// name = "dev-gpu"
+/// addr = "/ip4/192.168.1.100/tcp/9000"
+///
 /// [[remote_agents]]
 /// id = "gpu-coder"
 /// name = "GPU Coder"
-/// description = "Coder running on GPU server"
-/// peer = "dev-gpu"            # references [[mesh.peers]] name
-/// capabilities = ["shell", "filesystem", "gpu"]
+/// description = "Coder running on GPU server with fast model"
+/// peer = "dev-gpu"
+/// capabilities = ["gpu", "fast-model"]
 /// ```
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteAgentConfig {
-    /// Unique agent identifier (used in delegation target).
+    /// Unique agent identifier used when targeting this agent for delegation.
     pub id: String,
-    /// Human-readable display name.
+    /// Human-readable display name shown in delegation context.
     pub name: String,
-    /// Short description shown in the planner's delegation context.
+    /// Short description of the agent's purpose or specialisation,
+    /// shown to the planner when choosing which agent to delegate to.
     #[serde(default)]
     pub description: String,
-    /// Name of the peer in `[[mesh.peers]]` that runs this agent.
+    /// Name of the peer in `[[mesh.peers]]` that hosts this agent.
+    /// Must match the `name` field of a `[[mesh.peers]]` entry.
     pub peer: String,
-    /// Capability tags (e.g., `["gpu", "shell"]`).
+    /// Capability tags used by the planner to select suitable agents
+    /// (e.g. `["gpu", "shell", "filesystem"]`).
     #[serde(default)]
     pub capabilities: Vec<String>,
 }
@@ -656,71 +697,187 @@ pub enum Config {
     Multi(QuorumConfig),
 }
 
-/// Single agent configuration
-#[derive(Debug, Clone, Deserialize)]
+/// Single agent configuration.
+///
+/// Configures a single AI agent with tools, MCP servers, and middleware.
+/// The `[agent]` section is required; all other sections are optional.
+///
+/// ```toml
+/// [agent]
+/// provider = "anthropic"
+/// model = "claude-sonnet-4-5-20250929"
+/// tools = ["read_tool", "edit", "write_file", "shell", "glob", "search_text"]
+/// system = "You are a helpful coding assistant."
+/// ```
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [{
+    "agent": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5-20250929",
+        "tools": ["read_tool", "edit", "write_file", "shell", "glob", "search_text"],
+        "system": "You are a helpful coding assistant.",
+        "mutating_tools": ["edit", "write_file", "shell"],
+        "assume_mutating": false,
+        "execution": {
+            "snapshot": {"backend": "git"},
+            "compaction": {"auto": true}
+        }
+    },
+    "mcp": [
+        {"name": "filesystem", "transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}
+    ],
+    "middleware": [
+        {"type": "limits", "max_steps": 200, "max_turns": 50},
+        {"type": "context", "warn_at_percent": 80, "compact_at_percent": 90}
+    ]
+}]))]
 pub struct SingleAgentConfig {
+    /// Core agent settings: provider, model, tools, system prompt.
     pub agent: AgentSettings,
+
+    /// MCP (Model Context Protocol) servers that provide additional tools.
+    /// Use `transport = "stdio"` for local command-based servers,
+    /// `transport = "http"` for remote HTTP servers.
+    /// NOTE: this is NOT for remote agents — use `[[remote_agents]]` with `[mesh]` for that.
     #[serde(default)]
     pub mcp: Vec<McpServerConfig>,
+
+    /// Middleware stack applied in order. Controls execution limits, context
+    /// management, deduplication checks, and agent mode switching.
     #[serde(default)]
     pub middleware: Vec<MiddlewareEntry>,
-    /// Optional kameo mesh configuration.
+
+    /// Optional kameo libp2p mesh for cross-machine collaboration.
+    /// Required when using `[[remote_agents]]`.
     #[serde(default)]
     pub mesh: MeshTomlConfig,
-    /// Remote agents registered in the mesh.
+
+    /// Remote agents running on OTHER mesh nodes, used for delegation.
+    /// Requires `[mesh] enabled = true`.
+    /// NOTE: this is NOT for MCP servers — use `[[mcp]]` for those.
     #[serde(default, rename = "remote_agents")]
     pub remote_agents: Vec<RemoteAgentConfig>,
 }
 
-/// Raw middleware entry from TOML config
+/// A middleware entry in the agent's processing stack.
 ///
-/// The `type` field determines which middleware factory to use.
-/// All other fields are passed to the factory as a JSON value.
+/// The `type` field selects which middleware to use; all other fields are
+/// forwarded to that middleware as configuration.
 ///
-/// # Example
+/// Available middleware types:
+/// - `"limits"` — hard cap on steps and turns (`max_steps`, `max_turns`)
+/// - `"context"` — token-window management (`warn_at_percent`, `compact_at_percent`, `fallback_max_tokens`)
+/// - `"dedup_check"` — detects repeated/similar code output (`threshold`, `min_lines`)
+/// - `"agent_mode"` — build/plan/review mode switching (`default`, `reminder`, `review_reminder`)
+/// - `"plan_mode"` — legacy read-only mode (prefer `agent_mode`)
 ///
 /// ```toml
 /// [[middleware]]
-/// type = "dedup_check"
-/// threshold = 0.8
-/// min_lines = 5
+/// type = "limits"
+/// max_steps = 200
+/// max_turns = 50
+///
+/// [[middleware]]
+/// type = "context"
+/// warn_at_percent = 80
+/// compact_at_percent = 90
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(extend("examples" = [
+    {"type": "limits", "max_steps": 200, "max_turns": 50},
+    {"type": "context", "warn_at_percent": 80, "compact_at_percent": 90, "fallback_max_tokens": 128000},
+    {"type": "dedup_check", "threshold": 0.85, "min_lines": 10},
+    {"type": "agent_mode", "default": "build"}
+]))]
 pub struct MiddlewareEntry {
-    /// The middleware type name (e.g., "dedup_check")
+    /// The middleware type name. Built-in types: `"limits"`, `"context"`,
+    /// `"dedup_check"`, `"agent_mode"`, `"plan_mode"`.
+    /// Custom middleware types can be registered at runtime.
     #[serde(rename = "type")]
+    #[schemars(extend("enum" = ["limits", "context", "dedup_check", "agent_mode", "plan_mode"]))]
     pub middleware_type: String,
-    /// All other config fields, passed to the middleware factory
+
+    /// Middleware-specific configuration fields.
+    /// Valid keys depend on the `type` — see middleware documentation.
     #[serde(flatten)]
+    #[schemars(schema_with = "crate::config::schema_for_value")]
     pub config: serde_json::Value,
 }
 
 /// Agent settings for single agent mode
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSettings {
+    /// Working directory for the agent. Relative paths in tool calls are resolved
+    /// against this directory. Defaults to the process working directory.
     pub cwd: Option<PathBuf>,
+
+    /// Path to the SQLite database for session history.
+    /// Defaults to a platform-specific data directory when absent.
     pub db: Option<PathBuf>,
+
+    /// LLM provider name. Providers are loaded from `~/.qmt/providers.toml`.
+    /// Common values: `"anthropic"`, `"openai"`, `"ollama"`, `"llama_cpp"`.
     pub provider: String,
+
+    /// Model identifier passed to the provider.
+    /// Examples: `"claude-sonnet-4-5-20250929"` (Anthropic), `"gpt-4o"` (OpenAI),
+    /// `"llama3.1:latest"` (Ollama), `"qwen3-coder-30b"` (llama_cpp).
     pub model: String,
+
+    /// API key for the provider. Supports environment variable interpolation:
+    /// `"${ANTHROPIC_API_KEY}"` or `"${KEY:-fallback}"`.
+    /// Optional for local providers (ollama, llama_cpp).
     pub api_key: Option<String>,
+
+    /// Built-in tool names to enable, or MCP tool patterns.
+    /// When empty, all built-in tools are available.
+    ///
+    /// Built-in tools: `read_tool`, `edit`, `write_file`, `delete_file`, `shell`,
+    /// `glob`, `search_text`, `ls`, `web_fetch`, `browse`, `mdq`, `question`,
+    /// `delegate`, `create_task`, `todowrite`, `todoread`, `semantic_edit`,
+    /// `multiedit`, `apply_patch`.
+    ///
+    /// MCP patterns: `"server_name.*"` (all tools from server),
+    /// `"server_name.tool_name"` (specific tool).
     #[serde(default)]
+    #[schemars(extend("examples" = [
+        ["read_tool", "edit", "write_file", "shell", "glob", "search_text"],
+        ["read_tool", "edit", "write_file", "shell", "glob", "search_text", "ls", "web_fetch", "question", "create_task", "todowrite", "todoread"],
+        ["read_tool", "glob", "search_text", "filesystem.*"]
+    ]))]
     pub tools: Vec<String>,
+
+    /// System prompt. Accepts a plain string, an array of strings, or a mixed
+    /// array of inline strings and `{ file = "path" }` file references.
     #[serde(default, deserialize_with = "deserialize_system_parts")]
+    #[schemars(schema_with = "crate::config::schema_for_system_parts")]
     pub system: Vec<SystemPart>,
+
+    /// Extra parameters forwarded verbatim to the LLM provider API
+    /// (e.g. `temperature`, `max_tokens`, `top_p`).
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
-    /// Whether to treat unknown tools as mutating.
+
+    /// Whether to treat unknown tools (e.g. MCP tools not listed in
+    /// `mutating_tools`) as mutating, requiring permission confirmation.
+    /// Set to `false` and use `mutating_tools` for explicit control.
     #[serde(default = "default_assume_mutating")]
     pub assume_mutating: bool,
-    /// Explicit allowlist of mutating tools.
+
+    /// Explicit allowlist of tools that modify the filesystem or execute
+    /// commands and therefore require permission confirmation.
+    /// Common values: `["edit", "write_file", "delete_file", "shell", "apply_patch"]`.
     #[serde(default)]
+    #[schemars(extend("examples" = [["edit", "write_file", "shell"], ["edit", "write_file", "delete_file", "shell", "apply_patch"]]))]
     pub mutating_tools: Vec<String>,
-    /// Execution policy (tool output, pruning, compaction, snapshot, rate limit)
+
+    /// Execution policy (tool output truncation, pruning, compaction, snapshot, rate limit).
     #[serde(default)]
     pub execution: ExecutionPolicy,
-    /// Skills system configuration
+
+    /// Skills system configuration.
     #[serde(default)]
     pub skills: SkillsConfig,
 }
@@ -729,25 +886,57 @@ fn default_assume_mutating() -> bool {
     true
 }
 
-/// Multi-agent quorum configuration
-#[derive(Debug, Clone, Deserialize)]
+/// Multi-agent quorum configuration (planner + delegates).
+///
+/// A quorum consists of a planner agent that decomposes tasks and one or more
+/// delegate agents that execute them. The planner uses the `delegate` built-in
+/// tool to assign work.
+///
+/// ```toml
+/// [quorum]
+/// cwd = "."
+/// delegation = true
+///
+/// [planner]
+/// provider = "anthropic"
+/// model = "claude-sonnet-4-5-20250929"
+/// tools = ["delegate", "read_tool", "shell"]
+///
+/// [[delegates]]
+/// id = "coder"
+/// provider = "anthropic"
+/// model = "claude-sonnet-4-5-20250929"
+/// tools = ["edit", "write_file", "shell", "read_tool", "glob"]
+/// ```
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuorumConfig {
+    /// Top-level quorum orchestration settings.
     pub quorum: QuorumSettings,
+
+    /// MCP servers available to all agents in the quorum.
     #[serde(default)]
     pub mcp: Vec<McpServerConfig>,
+
+    /// The planner agent that decomposes tasks and delegates to workers.
+    /// Should have the `"delegate"` tool enabled.
     pub planner: PlannerConfig,
+
+    /// Delegate (worker) agents that execute tasks assigned by the planner.
     #[serde(default)]
     pub delegates: Vec<DelegateConfig>,
-    /// Optional kameo mesh configuration.
+
+    /// Optional kameo libp2p mesh for cross-machine delegation.
     #[serde(default)]
     pub mesh: MeshTomlConfig,
-    /// Remote agents registered in the mesh.
+
+    /// Remote agents on other mesh nodes available for delegation.
+    /// Requires `[mesh] enabled = true`.
     #[serde(default, rename = "remote_agents")]
     pub remote_agents: Vec<RemoteAgentConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationWaitPolicy {
     All,
@@ -767,26 +956,52 @@ fn default_max_parallel_delegations() -> usize {
     5
 }
 
-/// Quorum-level settings
-#[derive(Debug, Clone, Deserialize)]
+/// Top-level settings for a multi-agent quorum (planner + delegates).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuorumSettings {
+    /// Working directory for the quorum. Relative paths are resolved against this.
     pub cwd: Option<PathBuf>,
+
+    /// Path to the SQLite session database.
     pub db: Option<PathBuf>,
+
+    /// Enable task delegation from the planner to delegate agents. Default: `true`.
     #[serde(default = "default_true")]
     pub delegation: bool,
+
+    /// Enable verification pass after delegation completes. Default: `false`.
     #[serde(default)]
     pub verification: bool,
+
+    /// Snapshot policy for capturing file state during delegation.
+    /// - `"diff"`: Capture file diffs between snapshots.
+    /// - `"metadata"`: Capture file metadata only.
+    /// - absent / `null`: No snapshots.
     #[serde(default = "default_snapshot_policy")]
+    #[schemars(extend("enum" = ["diff", "metadata"]))]
     pub snapshot_policy: Option<String>,
-    /// Optional: Configure delegation summary LLM for enriching context
+
+    /// Optional LLM call that summarises the planner conversation before
+    /// handing off to a delegate, providing richer context.
     pub delegation_summary: Option<DelegationSummaryConfig>,
+
+    /// How to handle multiple concurrent delegations completing.
+    /// - `"any"` (default): proceed when the first delegate finishes.
+    /// - `"all"`: wait for all delegates to finish.
     #[serde(default)]
     pub delegation_wait_policy: DelegationWaitPolicy,
+
+    /// Timeout in seconds to wait for delegations to complete. Default: `120`.
     #[serde(default = "default_delegation_wait_timeout_secs")]
     pub delegation_wait_timeout_secs: u64,
+
+    /// Grace period in seconds to allow in-flight delegates to finish after
+    /// the wait policy threshold is met. Default: `5`.
     #[serde(default = "default_delegation_cancel_grace_secs")]
     pub delegation_cancel_grace_secs: u64,
+
+    /// Maximum number of delegates that can run in parallel. Default: `5`.
     #[serde(default = "default_max_parallel_delegations")]
     pub max_parallel_delegations: usize,
 }
@@ -799,79 +1014,177 @@ fn default_snapshot_policy() -> Option<String> {
     None
 }
 
-/// Planner agent configuration
-#[derive(Debug, Clone, Deserialize)]
+/// Planner agent configuration.
+///
+/// The planner decomposes tasks and delegates subtasks to worker agents.
+/// It should have the `"delegate"` built-in tool enabled.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlannerConfig {
+    /// LLM provider name (e.g. `"anthropic"`, `"openai"`).
     pub provider: String,
+
+    /// Model identifier for the planner (typically a capable reasoning model).
     pub model: String,
+
+    /// API key override. Supports `${VAR}` interpolation.
     pub api_key: Option<String>,
+
+    /// Tools available to the planner. The `"delegate"` tool is required for
+    /// task delegation. Typical set: `["delegate", "read_tool", "shell", "glob"]`.
     #[serde(default)]
+    #[schemars(extend("examples" = [
+        ["delegate", "read_tool", "shell", "glob"],
+        ["delegate", "read_tool", "shell", "glob", "search_text", "question"]
+    ]))]
     pub tools: Vec<String>,
+
+    /// System prompt for the planner. Accepts a string or mixed array of
+    /// inline strings and `{ file = "path" }` references.
     #[serde(default, deserialize_with = "deserialize_system_parts")]
+    #[schemars(schema_with = "crate::config::schema_for_system_parts")]
     pub system: Vec<SystemPart>,
+
+    /// Extra parameters forwarded to the LLM provider API.
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
+
+    /// Middleware stack for the planner (limits, context management, etc.).
     #[serde(default)]
     pub middleware: Vec<MiddlewareEntry>,
-    /// Execution policy (tool output, pruning, compaction, snapshot, rate limit)
+
+    /// Execution policy (tool output, pruning, compaction, snapshot, rate limit).
     #[serde(default)]
     pub execution: ExecutionPolicy,
 }
 
-/// Delegate agent configuration
-#[derive(Debug, Clone, Deserialize)]
+/// Delegate (worker) agent configuration.
+///
+/// Delegates execute tasks assigned by the planner. Each delegate has its own
+/// tool set, system prompt, and optionally its own MCP servers.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DelegateConfig {
+    /// Unique identifier for this delegate, used by the planner to target it.
     pub id: String,
+
+    /// LLM provider name (e.g. `"anthropic"`, `"openai"`, `"llama_cpp"`).
     pub provider: String,
+
+    /// Model identifier for this delegate.
     pub model: String,
+
+    /// API key override. Supports `${VAR}` interpolation.
     pub api_key: Option<String>,
+
+    /// Human-readable description shown to the planner when choosing a delegate.
     pub description: Option<String>,
+
+    /// Capability tags used by the planner to select suitable delegates
+    /// (e.g. `["coding", "filesystem", "gpu"]`).
     #[serde(default)]
     pub capabilities: Vec<String>,
+
+    /// Tools available to this delegate. Typical coder set:
+    /// `["edit", "write_file", "shell", "read_tool", "glob", "search_text"]`.
     #[serde(default)]
+    #[schemars(extend("examples" = [
+        ["edit", "write_file", "shell", "read_tool", "glob", "search_text"],
+        ["edit", "write_file", "read_tool", "glob"]
+    ]))]
     pub tools: Vec<String>,
+
+    /// System prompt for this delegate. Accepts a string or mixed array of
+    /// inline strings and `{ file = "path" }` references.
     #[serde(default, deserialize_with = "deserialize_system_parts")]
+    #[schemars(schema_with = "crate::config::schema_for_system_parts")]
     pub system: Vec<SystemPart>,
+
+    /// Extra parameters forwarded to the LLM provider API.
     #[serde(default)]
     pub parameters: Option<HashMap<String, Value>>,
+
+    /// MCP servers specific to this delegate (in addition to quorum-level MCP).
     #[serde(default)]
     pub mcp: Vec<McpServerConfig>,
+
+    /// Middleware stack for this delegate (limits, context management, etc.).
     #[serde(default)]
     pub middleware: Vec<MiddlewareEntry>,
-    /// Execution policy (tool output, pruning, compaction, snapshot, rate limit)
+
+    /// Execution policy (tool output, pruning, compaction, snapshot, rate limit).
     #[serde(default)]
     pub execution: ExecutionPolicy,
 
-    /// Optional mesh peer name (references `[[mesh.peers]]` name).
+    /// Optional mesh peer name (references a `[[mesh.peers]]` entry).
     ///
-    /// When set, LLM calls for this delegate are routed to the specified peer via
-    /// `MeshChatProvider` while tool execution continues to run locally on the
-    /// planner node. This is the "remote model, local session" pattern.
+    /// When set, LLM calls for this delegate are routed to the remote peer via
+    /// the mesh while tool execution continues locally on the planner node.
+    /// This is the "remote model, local session" pattern.
     ///
     /// Requires `[mesh] enabled = true`. Validated at startup.
     #[serde(default)]
     pub peer: Option<String>,
 }
 
-/// MCP server configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// MCP (Model Context Protocol) server configuration.
+///
+/// The `transport` field is the discriminator — it must be `"stdio"` or `"http"`.
+/// Note: the field is named `transport`, NOT `type`.
+///
+/// **stdio** — spawns a local process:
+/// ```toml
+/// [[mcp]]
+/// name = "filesystem"
+/// transport = "stdio"
+/// command = "npx"
+/// args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+/// ```
+///
+/// **http** — connects to a remote MCP endpoint:
+/// ```toml
+/// [[mcp]]
+/// name = "context7"
+/// transport = "http"
+/// url = "https://mcp.context7.com/mcp"
+/// headers = { AUTHORIZATION = "Bearer ${CONTEXT7_API_KEY}" }
+/// ```
+///
+/// To enable MCP tools, add them to `agent.tools`:
+/// - `"filesystem.*"` — all tools from the `filesystem` server
+/// - `"filesystem.read_file"` — a specific tool from the server
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "transport", rename_all = "lowercase")]
+#[schemars(extend("examples" = [
+    {"name": "filesystem", "transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]},
+    {"name": "github", "transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}},
+    {"name": "context7", "transport": "http", "url": "https://mcp.context7.com/mcp"}
+]))]
 pub enum McpServerConfig {
+    /// Local process-based MCP server launched via stdio.
     #[serde(rename_all = "snake_case")]
     Stdio {
+        /// Unique name for this server. Referenced in `agent.tools` as `"name.*"`.
         name: String,
+        /// Executable to run (e.g. `"npx"`, `"uvx"`, `"/path/to/binary"`).
         command: String,
+        /// Arguments passed to the command.
         #[serde(default)]
         args: Vec<String>,
+        /// Environment variables to set for the server process.
+        /// Supports `${VAR}` interpolation.
         #[serde(default)]
         env: HashMap<String, String>,
     },
+    /// Remote HTTP-based MCP server.
     #[serde(rename_all = "snake_case")]
     Http {
+        /// Unique name for this server. Referenced in `agent.tools` as `"name.*"`.
         name: String,
+        /// Full URL of the MCP HTTP endpoint.
         url: String,
+        /// HTTP headers to include in every request (e.g. auth tokens).
+        /// Supports `${VAR}` interpolation in values.
         #[serde(default)]
         headers: HashMap<String, String>,
     },
@@ -1274,7 +1587,7 @@ fn default_agent_id() -> String {
 }
 
 /// Configuration for skills system
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SkillsConfig {
     /// Enable skills system (default: true)
@@ -1317,6 +1630,59 @@ impl Default for SkillsConfig {
 
 // ============================================================================
 // End Skills Configuration
+// ============================================================================
+
+// ============================================================================
+// schemars helper functions
+// ============================================================================
+
+/// Schema for the `system` field: accepts a plain string or an array of
+/// inline strings / `{ file = "..." }` objects.
+pub fn schema_for_system_parts(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    serde_json::from_value(serde_json::json!({
+        "oneOf": [
+            {
+                "type": "string",
+                "description": "A single inline system prompt string"
+            },
+            {
+                "type": "array",
+                "description": "An array of inline strings and/or file references",
+                "items": {
+                    "oneOf": [
+                        {
+                            "type": "string",
+                            "description": "Inline system prompt text"
+                        },
+                        {
+                            "type": "object",
+                            "description": "A reference to a file whose contents will be used as a system prompt part",
+                            "required": ["file"],
+                            "properties": {
+                                "file": { "type": "string" }
+                            },
+                            "additionalProperties": false
+                        }
+                    ]
+                }
+            }
+        ]
+    }))
+    .expect("system schema is valid JSON Schema")
+}
+
+/// Schema for an open-ended JSON object (used for `MiddlewareEntry.config`).
+pub fn schema_for_value(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "description": "Middleware-specific configuration fields. Valid keys depend on the `type`.",
+        "additionalProperties": true
+    }))
+    .expect("value schema is valid JSON Schema")
+}
+
+// ============================================================================
+// End schemars helper functions
 // ============================================================================
 
 #[cfg(test)]
@@ -2037,5 +2403,117 @@ system = ["You are powered by {{ provider }}/{{ model }}."]
             }
             Config::Multi(_) => panic!("expected single-agent config"),
         }
+    }
+
+    // ── Schema enrichment tests ──────────────────────────────────────────────
+
+    /// Verifies that the generated JSON Schema for `AgentSettings.tools` mentions
+    /// every built-in tool name in its description, so models generating configs
+    /// know exactly which values are valid.
+    #[test]
+    fn test_schema_tools_description_covers_all_builtins() {
+        use crate::tools::builtins::all_builtin_tools;
+
+        let schema = schemars::schema_for!(SingleAgentConfig);
+        let schema_json = serde_json::to_value(&schema).unwrap();
+
+        // Navigate to agent.properties.tools.description
+        let description = schema_json
+            .pointer("/$defs/AgentSettings/properties/tools/description")
+            .and_then(|v| v.as_str())
+            .expect("AgentSettings.tools must have a description in the schema");
+
+        let builtin_names: Vec<String> = all_builtin_tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+
+        let mut missing = Vec::new();
+        for name in &builtin_names {
+            if !description.contains(name.as_str()) {
+                missing.push(name.as_str());
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "The following built-in tool names are missing from the \
+             AgentSettings.tools schema description: {missing:?}\n\
+             Update the doc comment on `AgentSettings.tools` in config.rs \
+             to include all built-in tool names."
+        );
+    }
+
+    /// Verifies that the `MiddlewareEntry.type` field has an enum constraint
+    /// listing all known middleware types.
+    #[test]
+    fn test_schema_middleware_type_has_enum() {
+        let schema = schemars::schema_for!(SingleAgentConfig);
+        let schema_json = serde_json::to_value(&schema).unwrap();
+
+        let enum_values = schema_json
+            .pointer("/$defs/MiddlewareEntry/properties/type/enum")
+            .and_then(|v| v.as_array())
+            .expect("MiddlewareEntry.type must have an enum in the schema");
+
+        let type_names: Vec<&str> = enum_values.iter().filter_map(|v| v.as_str()).collect();
+
+        for expected in &["limits", "context", "dedup_check", "agent_mode"] {
+            assert!(
+                type_names.contains(expected),
+                "middleware type {expected:?} missing from schema enum: {type_names:?}"
+            );
+        }
+    }
+
+    /// Verifies that `SnapshotBackendConfig.backend` has enum values `"git"` and `"none"`.
+    #[test]
+    fn test_schema_snapshot_backend_has_enum() {
+        let schema = schemars::schema_for!(SingleAgentConfig);
+        let schema_json = serde_json::to_value(&schema).unwrap();
+
+        let enum_values = schema_json
+            .pointer("/$defs/SnapshotBackendConfig/properties/backend/enum")
+            .and_then(|v| v.as_array())
+            .expect("SnapshotBackendConfig.backend must have an enum in the schema");
+
+        let values: Vec<&str> = enum_values.iter().filter_map(|v| v.as_str()).collect();
+
+        assert!(
+            values.contains(&"git"),
+            "\"git\" missing from backend enum: {values:?}"
+        );
+        assert!(
+            values.contains(&"none"),
+            "\"none\" missing from backend enum: {values:?}"
+        );
+    }
+
+    /// Verifies the top-level `SingleAgentConfig` schema has at least one example.
+    #[test]
+    fn test_schema_single_agent_config_has_example() {
+        let schema = schemars::schema_for!(SingleAgentConfig);
+        let schema_json = serde_json::to_value(&schema).unwrap();
+
+        let examples = schema_json
+            .get("examples")
+            .and_then(|v| v.as_array())
+            .expect("SingleAgentConfig schema must have examples");
+
+        assert!(
+            !examples.is_empty(),
+            "SingleAgentConfig schema must have at least one example"
+        );
+
+        // The example must have an "agent" key with "provider" and "model"
+        let first = &examples[0];
+        assert!(
+            first.get("agent").and_then(|a| a.get("provider")).is_some(),
+            "First example must have agent.provider"
+        );
+        assert!(
+            first.get("agent").and_then(|a| a.get("model")).is_some(),
+            "First example must have agent.model"
+        );
     }
 }

@@ -27,7 +27,7 @@ QueryMT provides comprehensive support for chat-based interactions with Large La
 
 ## How It Works
 
-1.  **Construct Messages:** Your application assembles a sequence of `ChatMessage` objects representing the conversation history using the `querymt::chat::ChatMessageBuilder`. This typically starts with alternating `User` and `Assistant` messages.
+1.  **Construct Messages:** Your application assembles a sequence of `ChatMessage` objects representing the conversation history. Use `ChatMessage::user()` for user messages and `ChatMessage::assistant()` for assistant messages. This typically starts with alternating `User` and `Assistant` messages.
 2.  **Initiate Chat:** You call the `chat` or `chat_with_tools` method on an `LLMProvider` instance, passing the message history and optionally, a list of available tools.
 3.  **Provider Interaction:** The `LLMProvider` (or its underlying implementation like `HTTPLLMProvider`) formats the request according to the specific LLM's API, sends it, and receives the raw response.
 4.  **Parse Response:** The provider parses the raw response into an object implementing `ChatResponse`.
@@ -58,13 +58,18 @@ async fn handle_tool_calling_loop(
     loop {
         let response = llm_provider.chat_with_tools(&messages, Some(my_tools)).await?;
 
-        // Add the assistant's response to the history. It might contain text and/or tool calls.
-        messages.push(
-            ChatMessage::assistant()
-                .content(response.text().unwrap_or_default())
-                .tool_use(response.tool_calls().unwrap_or_default()) // This will be empty if no tools were called
-                .build(),
-        );
+            // Add the assistant's response to the history. It might contain text and/or tool calls.
+            let mut msg_builder = ChatMessage::assistant().text(response.text().unwrap_or_default());
+            if let Some(tool_calls) = response.tool_calls() {
+                for tc in tool_calls {
+                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                    msg_builder = msg_builder.tool_use(tc.id.clone(), tc.function.name.clone(), args);
+                }
+            }
+            if let Some(thinking) = response.thinking() {
+                msg_builder = msg_builder.thinking(thinking);
+            }
+            messages.push(msg_builder.build());
 
         if let Some(tool_calls) = response.tool_calls() {
             if tool_calls.is_empty() {

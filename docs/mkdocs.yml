@@ -45,7 +45,11 @@ markdown_extensions:
       generic: true
   - footnotes
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.mark
   - attr_list
   - pymdownx.tabbed:
@@ -74,6 +78,15 @@ nav:
       - 'Data Structures': 'plugins/data_structures.md'
     - 'OCI Plugins': 'plugins/oci_plugins.md'
   - MCP Integration: mcp.md
+  - Agent:
+    - Overview: agent/index.md
+    - Configuration: agent/configuration.md
+    - Agent Modes: agent/agent_modes.md
+    - Middleware: agent/middleware.md
+    - Delegation: agent/delegation.md
+    - Mesh Networking: agent/mesh.md
+    - API Reference: agent/api_reference.md
+    - Examples: agent/examples.md
   - CLI: 'cli/index.md'
   - Blog: https://log.query.mt
 
