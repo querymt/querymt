@@ -162,15 +162,42 @@ impl IzwiProvider {
             gen_cfg.options.speed = speed;
         }
 
-        if let Some(voice) = req.voice.as_deref().or(self.cfg.voice.as_deref()) {
-            // izwi-core uses `speaker` for some model families (Kokoro) and
-            // `voice` for others (Qwen3-TTS). Set both so the right one is
-            // picked regardless of model.
-            gen_cfg.options.speaker = Some(voice.to_string());
-            gen_cfg.options.voice = Some(voice.to_string());
+        let mut gen_req = GenerationRequest::new(req.text.clone()).with_config(gen_cfg);
+
+        // Map language hint.
+        gen_req.language = req.language.clone();
+
+        // Map structured voice configuration.
+        match req.voice_config.as_ref() {
+            Some(tts::VoiceConfig::Preset { name }) => {
+                // izwi-core uses `speaker` for some model families (Kokoro)
+                // and `voice` for others (Qwen3-TTS). Set both so the right
+                // one is picked regardless of model.
+                gen_req.config.options.speaker = Some(name.clone());
+                gen_req.config.options.voice = Some(name.clone());
+            }
+            Some(tts::VoiceConfig::Clone {
+                reference_audio,
+                reference_text,
+            }) => {
+                // izwi-core expects base64-encoded reference audio.
+                gen_req.reference_audio =
+                    Some(base64::engine::general_purpose::STANDARD.encode(reference_audio));
+                gen_req.reference_text = Some(reference_text.clone());
+            }
+            Some(tts::VoiceConfig::Design { description }) => {
+                gen_req.voice_description = Some(description.clone());
+            }
+            None => {
+                // Fall back to provider-level default voice if configured.
+                if let Some(voice) = self.cfg.voice.as_deref() {
+                    gen_req.config.options.speaker = Some(voice.to_string());
+                    gen_req.config.options.voice = Some(voice.to_string());
+                }
+            }
         }
 
-        GenerationRequest::new(req.text.clone()).with_config(gen_cfg)
+        gen_req
     }
 
     fn resolve_audio_format(&self, req: &tts::TtsRequest) -> Result<AudioFormat, LLMError> {

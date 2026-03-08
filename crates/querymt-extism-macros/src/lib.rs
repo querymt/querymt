@@ -425,12 +425,18 @@ macro_rules! impl_extism_http_plugin {
         pub fn speech(
             Json(input): Json<ExtismTtsRequest<$Config>>,
         ) -> FnResult<Json<ExtismTtsResponse>> {
+            let voice_config = input
+                .voice_config
+                .map(|vc| vc.into_voice_config())
+                .transpose()
+                .map_err(llm_err_to_pdk)?;
             let tts_req = tts::TtsRequest {
                 text: input.text,
                 model: input.model,
-                voice: input.voice,
+                voice_config,
                 format: input.format,
                 speed: input.speed,
+                language: input.language,
             };
 
             let req = input.cfg.tts_request(&tts_req).map_err(llm_err_to_pdk)?;

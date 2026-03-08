@@ -7,15 +7,15 @@ use querymt::plugin::host::native::NativeLoader;
 use querymt::{
     builder::LLMBuilder,
     plugin::host::{PluginRegistry, ProviderConfig},
-    tts::TtsRequest,
+    tts::{TtsRequest, VoiceConfig},
 };
-use std::{env, path::Path, path::PathBuf};
+use std::{env, path::Path, path::PathBuf, time::Instant};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "tts_example",
     about = "Text-to-speech using QueryMT provider plugins",
-    after_help = "Examples:\n  tts_example --text \"hello world\" --out ./out.wav\n  tts_example --provider izwi --model Kokoro-82M --text \"hello\" --out ./out.wav --format wav\n  tts_example --provider openai --text \"hello\" --out ./out.mp3 --format mp3 --api-key $OPENAI_API_KEY"
+    after_help = "Examples:\n  # Preset voice (OpenAI)\n  tts_example --text \"hello world\" --out ./out.mp3 --voice alloy --api-key $OPENAI_API_KEY\n\n  # Preset voice (izwi)\n  tts_example --provider izwi --model Kokoro-82M --text \"hello\" --out ./out.wav --format wav\n\n  # Voice cloning (izwi)\n  tts_example --provider izwi --model Qwen3-TTS-12Hz-1.7B-CustomVoice --text \"hello\" --out ./out.wav --format wav --reference-audio ./ref.wav --reference-text \"sample transcript\"\n\n  # Voice design (izwi)\n  tts_example --provider izwi --model Qwen3-TTS-12Hz-1.7B-VoiceDesign --text \"hello\" --out ./out.wav --format wav --voice-description \"A warm female voice, mid-30s\""
 )]
 struct Args {
     /// Path to provider config file
@@ -43,9 +43,29 @@ struct Args {
     #[arg(short, long = "out", value_name = "FILE")]
     out_file: PathBuf,
 
-    /// Voice hint (provider-specific)
-    #[arg(long)]
+    /// Named preset voice/speaker (e.g. "Vivian", "alloy").
+    /// Mutually exclusive with --reference-audio and --voice-description.
+    #[arg(long, value_name = "NAME", group = "voice_mode")]
     voice: Option<String>,
+
+    /// Path to a reference audio file for voice cloning (5-30s, single speaker).
+    /// Requires --reference-text. Mutually exclusive with --voice and --voice-description.
+    #[arg(long, value_name = "FILE", group = "voice_mode")]
+    reference_audio: Option<PathBuf>,
+
+    /// Transcript of the reference audio (required with --reference-audio).
+    #[arg(long, value_name = "TEXT", requires = "reference_audio")]
+    reference_text: Option<String>,
+
+    /// Natural-language description of the desired voice for voice design
+    /// (e.g. "A warm female voice, mid-30s, slight British accent").
+    /// Mutually exclusive with --voice and --reference-audio.
+    #[arg(long, value_name = "DESC", group = "voice_mode")]
+    voice_description: Option<String>,
+
+    /// Language hint (e.g. "en", "zh").
+    #[arg(long)]
+    language: Option<String>,
 
     /// Output format (provider-specific, e.g. wav/mp3/pcm)
     #[arg(long)]
@@ -170,6 +190,7 @@ fn resolved_base_url(cli_base_url: Option<String>) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let total_start = Instant::now();
     let args = Args::parse();
 
     let registry = build_registry(&args.provider_config)?;
@@ -192,17 +213,42 @@ async fn main() -> Result<()> {
         builder = builder.base_url(base_url);
     }
 
+    let init_start = Instant::now();
     let llm = builder
         .build(&registry)
         .await
         .context("failed to initialize provider")?;
+    let init_elapsed = init_start.elapsed();
+
+    // Build voice configuration from mutually-exclusive CLI flags.
+    let voice_config = if let Some(name) = args.voice {
+        Some(VoiceConfig::preset(name))
+    } else if let Some(ref_audio_path) = args.reference_audio {
+        let reference_audio = std::fs::read(&ref_audio_path).with_context(|| {
+            format!(
+                "failed to read reference audio '{}'",
+                ref_audio_path.display()
+            )
+        })?;
+        let reference_text = args
+            .reference_text
+            .context("--reference-text is required when using --reference-audio")?;
+        Some(VoiceConfig::clone_voice(reference_audio, reference_text))
+    } else if let Some(description) = args.voice_description {
+        Some(VoiceConfig::design(description))
+    } else {
+        None
+    };
 
     let mut req = TtsRequest::new().text(args.text);
     if let Some(model) = model {
         req = req.model(model);
     }
-    if let Some(voice) = args.voice {
-        req = req.voice(voice);
+    if let Some(vc) = voice_config {
+        req = req.voice_config(vc);
+    }
+    if let Some(language) = args.language {
+        req = req.language(language);
     }
     if let Some(format) = args.format {
         req = req.format(format);
@@ -211,7 +257,10 @@ async fn main() -> Result<()> {
         req = req.speed(speed);
     }
 
+    let inference_start = Instant::now();
     let resp = llm.speech(&req).await.context("speech synthesis failed")?;
+    let inference_elapsed = inference_start.elapsed();
+
     std::fs::write(&args.out_file, &resp.audio).with_context(|| {
         format!(
             "failed to write synthesized audio to '{}'",
@@ -219,11 +268,17 @@ async fn main() -> Result<()> {
         )
     })?;
 
+    let total_elapsed = total_start.elapsed();
+
     if let Some(mime_type) = resp.mime_type {
         eprintln!("wrote {} ({})", args.out_file.display(), mime_type);
     } else {
         eprintln!("wrote {}", args.out_file.display());
     }
+    eprintln!(
+        "provider init: {:.2?}, inference: {:.2?}, total: {:.2?}",
+        init_elapsed, inference_elapsed, total_elapsed
+    );
 
     Ok(())
 }

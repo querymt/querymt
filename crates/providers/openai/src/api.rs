@@ -569,6 +569,24 @@ pub fn openai_tts_request<C: OpenAIProviderConfig>(
     cfg: &C,
     req: &TtsRequest,
 ) -> Result<Request<Vec<u8>>, LLMError> {
+    use querymt::tts::VoiceConfig;
+
+    // OpenAI only supports named preset voices.
+    let voice: Option<&str> = match &req.voice_config {
+        Some(VoiceConfig::Preset { name }) => Some(name.as_str()),
+        Some(VoiceConfig::Clone { .. }) => {
+            return Err(LLMError::NotImplemented(
+                "voice cloning is not supported by the OpenAI TTS API".into(),
+            ));
+        }
+        Some(VoiceConfig::Design { .. }) => {
+            return Err(LLMError::NotImplemented(
+                "voice design is not supported by the OpenAI TTS API".into(),
+            ));
+        }
+        None => None,
+    };
+
     let token = cfg.api_key();
     let auth = determine_effective_auth(token, cfg.auth_type(), cfg.base_url())?;
 
@@ -582,7 +600,7 @@ pub fn openai_tts_request<C: OpenAIProviderConfig>(
     let body = OpenAITtsRequestBody {
         model,
         text: &req.text,
-        voice: req.voice.as_deref(),
+        voice,
         format: req.format.as_deref(),
         speed: req.speed,
     };

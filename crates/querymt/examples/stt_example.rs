@@ -11,6 +11,7 @@ use querymt::{
 };
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -159,6 +160,7 @@ fn resolved_base_url(cli_base_url: Option<String>) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let total_start = Instant::now();
     let args = Args::parse();
 
     let registry = build_registry(&args.provider_config)?;
@@ -183,10 +185,12 @@ async fn main() -> Result<()> {
         builder = builder.base_url(base_url);
     }
 
+    let init_start = Instant::now();
     let llm = builder
         .build(&registry)
         .await
         .context("failed to initialize provider")?;
+    let init_elapsed = init_start.elapsed();
 
     let mut req = SttRequest::new().audio(audio_bytes);
     if let Some(filename) = args
@@ -204,8 +208,17 @@ async fn main() -> Result<()> {
         req = req.language(language);
     }
 
+    let inference_start = Instant::now();
     let resp = llm.transcribe(&req).await.context("transcription failed")?;
+    let inference_elapsed = inference_start.elapsed();
+
+    let total_elapsed = total_start.elapsed();
+
     println!("{}", resp.text);
+    eprintln!(
+        "provider init: {:.2?}, inference: {:.2?}, total: {:.2?}",
+        init_elapsed, inference_elapsed, total_elapsed
+    );
 
     Ok(())
 }
