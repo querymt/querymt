@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 pub struct LLMProviderFromHTTP {
@@ -59,7 +60,10 @@ impl ChatProvider for LLMProviderFromHTTP {
         self.inner.supports_streaming()
     }
 
-    #[instrument(name = "http_adapter.chat_with_tools", skip_all)]
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "http_adapter.chat_with_tools", skip_all)
+    )]
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -68,7 +72,10 @@ impl ChatProvider for LLMProviderFromHTTP {
         self.do_chat(messages, tools).await
     }
 
-    #[instrument(name = "http_adapter.chat_stream_with_tools", skip_all)]
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "http_adapter.chat_stream_with_tools", skip_all)
+    )]
     async fn chat_stream_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -149,7 +156,7 @@ impl ChatProvider for LLMProviderFromHTTP {
 
 #[async_trait]
 impl EmbeddingProvider for LLMProviderFromHTTP {
-    #[instrument(name = "http_adapter.embed", skip_all)]
+    #[cfg_attr(feature = "tracing", instrument(name = "http_adapter.embed", skip_all))]
     async fn embed(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
         self.ensure_credential_fresh().await?;
         let req = self.inner.embed_request(&inputs)?;
@@ -164,7 +171,10 @@ impl EmbeddingProvider for LLMProviderFromHTTP {
 
 #[async_trait]
 impl CompletionProvider for LLMProviderFromHTTP {
-    #[instrument(name = "http_adapter.complete", skip_all)]
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "http_adapter.complete", skip_all)
+    )]
     async fn complete(&self, req_obj: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
         self.ensure_credential_fresh().await?;
         let req = self.inner.complete_request(req_obj)?;
@@ -183,7 +193,10 @@ impl LLMProvider for LLMProviderFromHTTP {
         self.inner.tools()
     }
 
-    #[instrument(name = "http_adapter.transcribe", skip_all)]
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "http_adapter.transcribe", skip_all)
+    )]
     async fn transcribe(&self, req_obj: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
         self.ensure_credential_fresh().await?;
         let req = self.inner.stt_request(req_obj)?;
@@ -195,7 +208,10 @@ impl LLMProvider for LLMProviderFromHTTP {
             .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))
     }
 
-    #[instrument(name = "http_adapter.speech", skip_all)]
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "http_adapter.speech", skip_all)
+    )]
     async fn speech(&self, req_obj: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
         self.ensure_credential_fresh().await?;
         let req = self.inner.tts_request(req_obj)?;

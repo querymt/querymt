@@ -1,6 +1,7 @@
 use extism::{CurrentPlugin, UserData, Val};
 use futures::Stream;
 use std::pin::Pin;
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 #[cfg(feature = "http-client")]
@@ -73,7 +74,7 @@ pub(crate) fn qmt_http_request(
 }
 
 #[cfg(feature = "http-client")]
-#[instrument(name = "host_reqwest_http", skip_all)]
+#[cfg_attr(feature = "tracing", instrument(name = "host_reqwest_http", skip_all))]
 pub(crate) fn reqwest_http(
     plugin: &mut CurrentPlugin,
     inputs: &[Val],
