@@ -1,12 +1,11 @@
-//! Google embedding example.
+//! OpenAI embedding example.
 //!
 //! Run:
 //! ```sh
-//! GOOGLE_API_KEY="your-key" cargo run -p querymt --example google_embedding_example
+//! OPENAI_API_KEY="your-key" cargo run -p querymt --example openai_embedding_example
 //! ```
 //!
 //! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
-//! TODO: Google embedding support in the provider is not implemented yet.
 
 use querymt::{
     builder::LLMBuilder,
@@ -25,16 +24,17 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = build_registry()?;
 
-    // Initialize the LLM builder with Google configuration
+    // Initialize the LLM builder with OpenAI configuration
     let llm = LLMBuilder::new()
-        .provider("google")
-        .api_key(std::env::var("GOOGLE_API_KEY").expect("Set GOOGLE_API_KEY to run this example"))
-        // Use Google's text embedding model
-        .model("text-embedding-004")
+        .provider("openai")
+        .api_key(std::env::var("OPENAI_API_KEY").expect("Set OPENAI_API_KEY to run this example"))
+        .model("text-embedding-ada-002")
+        // Optional: Uncomment to customize embedding format and dimensions
+        // .embedding_encoding_format("base64")
+        // .embedding_dimensions(1536)
         .build(&registry)
         .await?;
 
-    // TODO: This call fails at runtime until provider embedding support is implemented
     // Generate embedding vector for sample text
     let vector = llm.embed(vec!["Hello world!".to_string()]).await?;
 

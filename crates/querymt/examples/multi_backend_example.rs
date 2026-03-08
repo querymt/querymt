@@ -1,56 +1,72 @@
-//! Example demonstrating how to chain multiple LLM backends together
+//! Multi-provider chain example.
 //!
-//! This example shows how to:
-//! 1. Initialize multiple LLM backends (OpenAI, Anthropic)
-//! 2. Create a registry to manage multiple backends
-//! 3. Build a multi-step chain that uses different backends at each step
-//! 4. Pass results between steps using template variables
+//! Run:
+//! ```sh
+//! OPENAI_API_KEY="your-key" \
+//! ANTHROPIC_API_KEY="your-key" \
+//! GROQ_API_KEY="your-key" \
+//! cargo run -p querymt --example multi_backend_example
+//! ```
+//!
+//! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
 
-use llm::{
-    builder::{LLMBackend, LLMBuilder},
+use querymt::{
+    builder::LLMBuilder,
     chain::{LLMRegistryBuilder, MultiChainStepBuilder, MultiChainStepMode, MultiPromptChain},
+    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
 };
+
+fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
+    let cfg_path =
+        std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
+    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
+    registry.register_loader(Box::new(ExtismLoader));
+    Ok(registry)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize OpenAI backend with API key and model settings
+    let registry = build_registry()?;
+
+    // Initialize OpenAI provider with API key and model settings
     let openai_llm = LLMBuilder::new()
-        .backend(LLMBackend::OpenAI)
-        .api_key(std::env::var("OPENAI_API_KEY").unwrap_or("sk-OPENAI".into()))
+        .provider("openai")
+        .api_key(std::env::var("OPENAI_API_KEY").expect("Set OPENAI_API_KEY to run this example"))
         .model("gpt-4o")
-        .build()?;
+        .max_tokens(512)
+        .build(&registry)
+        .await?;
 
-    // Initialize Anthropic backend with API key and model settings
-    let anthro_llm = LLMBuilder::new()
-        .backend(LLMBackend::Anthropic)
-        .api_key(std::env::var("ANTHROPIC_API_KEY").unwrap_or("anthro-key".into()))
-        .model("claude-3-5-sonnet-20240620")
-        .build()?;
+    // Initialize Anthropic provider with API key and model settings
+    let anthropic_llm = LLMBuilder::new()
+        .provider("anthropic")
+        .api_key(
+            std::env::var("ANTHROPIC_API_KEY").expect("Set ANTHROPIC_API_KEY to run this example"),
+        )
+        .model("claude-sonnet-4-6")
+        .max_tokens(512)
+        .build(&registry)
+        .await?;
 
-    let deepseek_llm = LLMBuilder::new()
-        .backend(LLMBackend::DeepSeek)
-        .api_key(std::env::var("DEEPSEEK_API_KEY").unwrap_or("sk-TESTKEY".into()))
-        .model("deepseek-chat")
-        .build()?;
+    // Initialize Groq provider with API key and model settings
+    let groq_llm = LLMBuilder::new()
+        .provider("groq")
+        .api_key(std::env::var("GROQ_API_KEY").expect("Set GROQ_API_KEY to run this example"))
+        .model("openai/gpt-oss-20b")
+        .max_tokens(512)
+        .build(&registry)
+        .await?;
 
-    // Ollama backend could also be added
-    // let ollama_llm = LLMBuilder::new()
-    //     .backend(LLMBackend::Ollama)
-    //     .base_url("http://localhost:11411")
-    //     .model("mistral")
-    //     .build()?;
-
-    // Create registry to manage multiple backends
+    // Create registry to manage multiple providers
     let registry = LLMRegistryBuilder::new()
         .register("openai", openai_llm)
-        .register("anthro", anthro_llm)
-        .register("deepseek", deepseek_llm)
-        // .register("ollama", ollama_llm)
+        .register("anthropic", anthropic_llm)
+        .register("groq", groq_llm)
         .build();
 
-    // Build multi-step chain using different backends
+    // Build multi-step chain using different providers
     let chain_res = MultiPromptChain::new(&registry)
-        // Step 1: Use OpenAI to analyze a code problem
+        // Step 1: use OpenAI to analyze a code problem
         .step(
             MultiChainStepBuilder::new(MultiChainStepMode::Chat)
                 .provider_id("openai")
@@ -59,29 +75,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .temperature(0.7)
                 .build()?
         )
-        // Step 2: Use Anthropic to suggest optimizations based on analysis
+        // Step 2: use Anthropic to suggest optimizations based on analysis
         .step(
             MultiChainStepBuilder::new(MultiChainStepMode::Chat)
-                .provider_id("anthro")
+                .provider_id("anthropic")
                 .id("optimization")
                 .template("Here is a code analysis: {{analysis}}\n\nSuggest concrete optimizations to improve performance, explaining why they would be beneficial.")
                 .max_tokens(500)
                 .top_p(0.9)
                 .build()?
         )
-        // Step 3: Use OpenAI to generate optimized code
+        // Step 3: use Groq to generate optimized code
         .step(
             MultiChainStepBuilder::new(MultiChainStepMode::Chat)
-                .provider_id("openai")
-                .id("final_code")
-                .template("Taking into account these optimization suggestions: {{optimization}}\n\nGenerate an optimized version of the code in Rust with explanatory comments.")
-                .temperature(0.2)
-                .build()?
-        )
-        .step(
-            MultiChainStepBuilder::new(MultiChainStepMode::Chat)
-                .provider_id("deepseek")
-                .id("final_code")
+                .provider_id("groq")
+                .id("implementation")
                 .template("Taking into account these optimization suggestions: {{optimization}}\n\nGenerate an optimized version of the code in Rust with explanatory comments.")
                 .temperature(0.2)
                 .build()?
@@ -90,10 +98,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Display results from all steps
     println!("Results: {:?}", chain_res);
-    // Example output format:
-    // chain_res["analysis"] => "The code has potential performance issues..."
-    // chain_res["optimization"] => "Here are some suggested optimizations..."
-    // chain_res["final_code"] => "// Optimized version with comments..."
 
     Ok(())
 }

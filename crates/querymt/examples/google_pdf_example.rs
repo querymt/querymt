@@ -1,11 +1,15 @@
-//! Anthropic chat example.
+//! Google Gemini PDF example.
 //!
 //! Run:
 //! ```sh
-//! ANTHROPIC_API_KEY="your-key" cargo run -p querymt --example anthropic_example
+//! GOOGLE_API_KEY="your-key" cargo run -p querymt --example google_pdf_example
 //! ```
 //!
+//! Uses `examples/dummy.pdf`.
 //! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
+
+use std::fs;
+use std::path::Path;
 
 use querymt::{
     builder::LLMBuilder,
@@ -23,31 +27,36 @@ fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Get Anthropic API key from environment variable or use test key as fallback
-    let api_key =
-        std::env::var("ANTHROPIC_API_KEY").expect("Set ANTHROPIC_API_KEY to run this example");
+    // Get Google API key from environment variable or use test key as fallback
+    let api_key = std::env::var("GOOGLE_API_KEY").expect("Set GOOGLE_API_KEY to run this example");
     let registry = build_registry()?;
 
     // Initialize and configure the LLM client
     let llm = LLMBuilder::new()
-        .provider("anthropic") // Use Anthropic (Claude) as the LLM provider
+        .provider("google") // Use Google as the LLM provider
         .api_key(api_key) // Set the API key
-        .model("claude-sonnet-4-6") // Use Claude Sonnet model
-        .max_tokens(512) // Limit response length
+        .model("gemini-3-flash-preview") // Use Gemini Flash model
+        .max_tokens(8512) // Limit response length
         .temperature(0.7) // Control response randomness (0.0-1.0)
-        // Uncomment to set system prompt:
-        // .system("You are a helpful assistant specialized in concurrency.")
+        .stream(false) // Disable streaming responses
+        .system("You are a helpful AI assistant.")
         .build(&registry)
         .await?;
 
-    // Prepare conversation history with example message about Rust concurrency
-    let messages = vec![ChatMessage::user()
-        .text("Tell me something about Rust concurrency")
-        .build()];
+    let pdf_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/dummy.pdf");
+    let content = fs::read(pdf_path)?;
+
+    // Prepare conversation history asking about the PDF
+    let messages = vec![
+        ChatMessage::user()
+            .text("Explain what is in the PDF")
+            .build(),
+        ChatMessage::user().pdf(content).build(),
+    ];
 
     // Send chat request and handle the response
     match llm.chat(&messages).await {
-        Ok(text) => println!("Anthropic chat response:\n{}", text),
+        Ok(text) => println!("Google Gemini response:\n{}", text),
         Err(e) => eprintln!("Chat error: {}", e),
     }
 

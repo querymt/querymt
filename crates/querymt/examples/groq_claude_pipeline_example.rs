@@ -1,48 +1,67 @@
-//! Example demonstrating a multi-LLM pipeline for system identification
+//! Groq + Claude pipeline example.
 //!
-//! This example shows how to:
-//! 1. Set up a pipeline using Groq and Claude models
-//! 2. Use Groq for creative system identification approaches
-//! 3. Use Claude to convert ideas into concrete commands
-//! 4. Transform and filter responses between steps
-//! 5. Handle results in a type-safe way with error handling
+//! Run:
+//! ```sh
+//! GROQ_API_KEY="your-key" \
+//! ANTHROPIC_API_KEY="your-key" \
+//! cargo run -p querymt --example groq_claude_pipeline_example
+//! ```
+//!
+//! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
 
-use llm::{
-    builder::{LLMBackend, LLMBuilder},
+use querymt::{
+    builder::LLMBuilder,
     chain::{LLMRegistryBuilder, MultiChainStepBuilder, MultiChainStepMode, MultiPromptChain},
+    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
 };
+
+fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
+    let cfg_path =
+        std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
+    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
+    registry.register_loader(Box::new(ExtismLoader));
+    Ok(registry)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize Claude model with API key and latest model version
-    let anthro_llm = LLMBuilder::new()
-        .backend(LLMBackend::Anthropic)
-        .api_key(std::env::var("ANTHROPIC_API_KEY").unwrap_or("anthro-key".into()))
-        .model("claude-3-5-sonnet-20240620")
-        .build()?;
+    let plugin_registry = build_registry()?;
 
-    // Initialize Groq model with deepseek for creative thinking
+    // Initialize Claude model with API key and current model version
+    let anthropic_llm = LLMBuilder::new()
+        .provider("anthropic")
+        .api_key(
+            std::env::var("ANTHROPIC_API_KEY").expect("Set ANTHROPIC_API_KEY to run this example"),
+        )
+        .model("claude-sonnet-4-6")
+        .max_tokens(4096)
+        .build(&plugin_registry)
+        .await?;
+
+    // Initialize Groq model with the current default reasoning-capable model
     let groq_llm = LLMBuilder::new()
-        .backend(LLMBackend::Groq)
-        .api_key(std::env::var("GROQ_API_KEY").unwrap_or("sk-TESTKEY".into()))
-        .model("deepseek-r1-distill-llama-70b")
-        .build()?;
+        .provider("groq")
+        .api_key(std::env::var("GROQ_API_KEY").expect("Set GROQ_API_KEY to run this example"))
+        .model("qwen/qwen3-32b")
+        .max_tokens(4096)
+        .build(&plugin_registry)
+        .await?;
 
-    // Create registry with both models
+    // Create chain registry with both models
     let registry = LLMRegistryBuilder::new()
-        .register("anthro", anthro_llm)
+        .register("anthropic", anthropic_llm)
         .register("groq", groq_llm)
         .build();
 
     // Build and execute the multi-step chain
     let chain_res = MultiPromptChain::new(&registry)
-        // Step 1: Use Groq to generate creative system identification approaches
+        // Step 1: use Groq to generate creative system identification approaches
         .step(
             MultiChainStepBuilder::new(MultiChainStepMode::Chat)
                 .provider_id("groq")
                 .id("thinking")
                 .template("Find an original way to identify the system without using default commands. I want a one-line command.")
-                .max_tokens(500)
+                .max_tokens(2048)
                 .top_p(0.9)
                 // Transform response to extract only content between <think> tags
                 .response_transform(|resp| {
@@ -56,16 +75,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .build()?
         )
-        // Step 2: Use Claude to convert the creative approach into a concrete command
+        // Step 2: use Claude to convert the creative approach into a concrete command
         .step(
             MultiChainStepBuilder::new(MultiChainStepMode::Chat)
-                .provider_id("anthro")
+                .provider_id("anthropic")
                 .id("command")
                 .template("Take the following command reasoning and generate a command to execute it on the system: {{thinking}}\n\nGenerate a command to execute it on the system. return only the command.")
                 .temperature(0.2) // Low temperature for more deterministic output
                 .build()?
         )
-        .run().await?;
+        .run()
+        .await?;
 
     // Display results from both steps
     println!("Results: {:?}", chain_res);

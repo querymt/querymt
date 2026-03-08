@@ -1,12 +1,18 @@
-// Example (stream cancel):
-//   RUST_LOG=info,querymt=debug \
-//   OPENAI_BASE_URL="http://localhost:8080/v1" \
-//   cargo run --manifest-path crates/querymt/examples/extism_cancel/Cargo.toml -- \
-//     stream \
-//     --provider-config providers.toml \
-//     --provider openai \
-//     --model "none" \
-//     --cancel-after-secs 2
+//! extism_cancel example.
+//!
+//! Run (stream cancellation):
+//! ```sh
+//! RUST_LOG=info,querymt=debug \
+//! OPENAI_BASE_URL="http://localhost:8080/v1" \
+//! cargo run --manifest-path crates/querymt/examples/extism_cancel/Cargo.toml -- \
+//!   stream \
+//!   --provider-config providers.toml \
+//!   --provider openai \
+//!   --model "none" \
+//!   --cancel-after-secs 2
+//! ```
+//!
+//! Use `chat` instead of `stream` to test non-streaming cancellation.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -142,7 +148,7 @@ async fn main() -> Result<()> {
     }
 
     let prompt = resolve_prompt(&args);
-    let messages = vec![ChatMessage::user().content(prompt).build()];
+    let messages = vec![ChatMessage::user().text(prompt).build()];
 
     match args.cmd {
         Cmd::Stream => {

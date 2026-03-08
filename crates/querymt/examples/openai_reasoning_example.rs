@@ -1,27 +1,45 @@
-// Import required modules from the LLM library for OpenAI integration
-use llm::{
-    builder::{LLMBackend, LLMBuilder},    // Builder pattern components
-    chat::{ChatMessage, ReasoningEffort}, // Chat-related structures
+//! OpenAI reasoning effort example.
+//!
+//! Run:
+//! ```sh
+//! OPENAI_API_KEY="your-key" cargo run -p querymt --example openai_reasoning_example
+//! ```
+//!
+//! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
+
+use querymt::{
+    builder::LLMBuilder,
+    chat::{ChatMessage, ReasoningEffort},
+    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
 };
+
+fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
+    let cfg_path =
+        std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
+    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
+    registry.register_loader(Box::new(ExtismLoader));
+    Ok(registry)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get OpenAI API key from environment variable or use test key as fallback
-    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or("sk-TESTKEY".into());
+    let api_key = std::env::var("OPENAI_API_KEY").expect("Set OPENAI_API_KEY to run this example");
+    let registry = build_registry()?;
 
     // Initialize and configure the LLM client
     let llm = LLMBuilder::new()
-        .backend(LLMBackend::OpenAI) // Use OpenAI as the LLM provider
+        .provider("openai") // Use OpenAI as the LLM provider
         .api_key(api_key) // Set the API key
-        .model("o1-preview") // Use GPT-3.5 Turbo model
+        .model("gpt-5.2") // Use GPT-5.2 model
         .stream(false) // Disable streaming responses
         .reasoning_effort(ReasoningEffort::High) // Enable reasoning effort
-        .build()
-        .expect("Failed to build LLM (OpenAI)");
+        .build(&registry)
+        .await?;
 
     // Prepare conversation history with example messages
     let messages = vec![ChatMessage::user()
-        .content("How muck r in strawberry")
+        .text("How many r's is in `strawberry`?")
         .build()];
 
     // Send chat request and handle the response

@@ -1,36 +1,54 @@
-use std::fs;
+//! Anthropic vision example.
+//!
+//! Run:
+//! ```sh
+//! ANTHROPIC_API_KEY="your-key" cargo run -p querymt --example anthropic_vision_example
+//! ```
+//!
+//! Uses `examples/image001.jpg`.
+//! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
 
-// Import required modules from the LLM library for Anthropic integration
-use llm::{
-    builder::{LLMBackend, LLMBuilder}, // Builder pattern components
-    chat::{ChatMessage, ImageMime},    // Chat-related structures
+use std::fs;
+use std::path::Path;
+
+use querymt::{
+    builder::LLMBuilder,
+    chat::ChatMessage,
+    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
 };
+
+fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
+    let cfg_path =
+        std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
+    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
+    registry.register_loader(Box::new(ExtismLoader));
+    Ok(registry)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get Anthropic API key from environment variable or use test key as fallback
-    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or("anthro-key".into());
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("Set ANTHROPIC_API_KEY to run this example");
+    let registry = build_registry()?;
 
     // Initialize and configure the LLM client
     let llm = LLMBuilder::new()
-        .backend(LLMBackend::Anthropic) // Use Anthropic (Claude) as the LLM provider
+        .provider("anthropic") // Use Anthropic (Claude) as the LLM provider
         .api_key(api_key) // Set the API key
-        .model("claude-3-5-sonnet-20240620") // Use Claude Instant model
+        .model("claude-sonnet-4-6") // Use Claude Sonnet model
         .max_tokens(512) // Limit response length
         .temperature(0.7) // Control response randomness (0.0-1.0)
-        // Uncomment to set system prompt:
-        // .system("You are a helpful assistant specialized in concurrency.")
-        .build()
-        .expect("Failed to build LLM (Anthropic)");
+        .build(&registry)
+        .await?;
 
-    let content = fs::read("./examples/image001.jpg").expect("The dummy.pdf file should exist");
+    let image_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/image001.jpg");
+    let content = fs::read(image_path)?;
 
-    // Prepare conversation history with example message about Rust concurrency
+    // Prepare conversation history asking about the image
     let messages = vec![
-        ChatMessage::user()
-            .content("What is in this image?")
-            .build(),
-        ChatMessage::user().image(ImageMime::JPEG, content).build(),
+        ChatMessage::user().text("What is in this image?").build(),
+        ChatMessage::user().image("image/jpeg", content).build(),
     ];
 
     // Send chat request and handle the response
