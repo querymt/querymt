@@ -98,31 +98,34 @@ jobs:
             features: native
             changed: ${{ needs.detect-changes.outputs.openai }}
 
-    # Run this job when the provider itself changed OR any shared dep changed.
-    if: ${{ matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true' }}
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
 
       - name: Install Rust toolchain
+        if: ${{ matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true' }}
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo dependencies
+        if: ${{ matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true' }}
         uses: swatinem/rust-cache@v2
         with:
           key: provider-${{ matrix.provider }}
 
       - name: Install cargo-llvm-cov
+        if: ${{ matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true' }}
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Install cargo-nextest
+        if: ${{ matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true' }}
         uses: taiki-e/install-action@nextest
 
       - name: Create coverage directory
+        if: ${{ matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true' }}
         run: mkdir -p ./coverage
 
       - name: Run tests with coverage
+        if: ${{ matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true' }}
         run: |
           cargo llvm-cov nextest \
             --package ${{ matrix.package }} \
@@ -131,6 +134,7 @@ jobs:
             --codecov --output-path ./coverage/codecov-${{ matrix.provider }}.json
 
       - name: Upload coverage to Codecov
+        if: ${{ matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true' }}
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
