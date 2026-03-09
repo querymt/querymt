@@ -695,6 +695,7 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
                             fanout,
                             relay_ref,
                             format!("session:{}", self.session_id),
+                            self.session_id.clone(),
                         );
                         self.relay_forwarder_handles
                             .insert(msg.relay_actor_id, handle);

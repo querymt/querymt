@@ -492,7 +492,7 @@ mod event_forwarder_stub {
     #[should_panic(expected = "requires the 'remote' feature")]
     fn test_stub_panics_on_start() {
         let fanout = std::sync::Arc::new(crate::event_fanout::EventFanout::new());
-        let _ = EventForwarder::start(fanout, (), "test".to_string());
+        let _ = EventForwarder::start(fanout, (), "test".to_string(), "sess".to_string());
     }
 }
 

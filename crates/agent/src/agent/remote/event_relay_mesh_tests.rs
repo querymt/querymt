@@ -82,6 +82,7 @@ mod event_relay_mesh_tests {
             source_fanout.clone(),
             remote_relay,
             "test-source-f1".to_string(),
+            "s-f1".to_string(),
         );
 
         // Publish a durable event to the source fanout
@@ -129,8 +130,12 @@ mod event_relay_mesh_tests {
         let source_fanout = Arc::new(EventFanout::new());
         let mut rx = event_sink.fanout().subscribe();
 
-        let _handle =
-            EventForwarder::start(source_fanout.clone(), remote_relay, "source-f2".to_string());
+        let _handle = EventForwarder::start(
+            source_fanout.clone(),
+            remote_relay,
+            "source-f2".to_string(),
+            "s-f2".to_string(),
+        );
 
         for i in 1u64..=5 {
             source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
@@ -418,6 +423,171 @@ mod event_relay_mesh_tests {
         );
     }
 
+    // ── F.5b — Session-id filtering ─────────────────────────────────────────
+
+    /// EventForwarder must only forward events whose session_id matches the
+    /// session it was created for.  Events for other sessions on the same
+    /// global fanout must be silently dropped.
+    #[tokio::test]
+    async fn test_event_forwarder_filters_by_session_id() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+        let (relay_ref, event_sink, dht_name) = setup_relay("f5b", &test_id).await;
+        let _ = relay_ref; // keep alive
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let remote_relay = mesh
+            .lookup_actor::<EventRelayActor>(&dht_name)
+            .await
+            .expect("DHT lookup")
+            .expect("relay not in DHT");
+
+        let source_fanout = Arc::new(EventFanout::new());
+        let mut rx = event_sink.fanout().subscribe();
+
+        // Forwarder is scoped to "target-session" only
+        let _handle = EventForwarder::start(
+            source_fanout.clone(),
+            remote_relay,
+            "test-source-f5b".to_string(),
+            "target-session".to_string(),
+        );
+
+        // Publish event for a DIFFERENT session — must be dropped by forwarder
+        source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
+            event_id: "e-other".into(),
+            stream_seq: 1,
+            session_id: "other-session".into(),
+            timestamp: 100,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionCreated,
+        }));
+
+        // Publish event for the TARGET session — must be forwarded
+        source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
+            event_id: "e-target".into(),
+            stream_seq: 2,
+            session_id: "target-session".into(),
+            timestamp: 200,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionCreated,
+        }));
+
+        // We should receive exactly the target-session event
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timeout — target event should arrive")
+            .expect("recv");
+
+        assert_eq!(
+            received.session_id(),
+            "target-session",
+            "forwarder must only forward events for its session_id"
+        );
+
+        // Give a generous window for any spurious second event to arrive
+        let spurious = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            spurious.is_err(),
+            "no second event should arrive — the other-session event must have been filtered out"
+        );
+    }
+
+    /// When multiple forwarders subscribe to the same fanout (simulating N
+    /// attached remote sessions), each must only forward events for its own
+    /// session.  This is the exact regression scenario: 3 sessions attached,
+    /// prompt on session A should NOT appear 3x.
+    #[tokio::test]
+    async fn test_multiple_forwarders_no_cross_session_duplication() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+
+        // Set up 3 relays (simulating 3 attached remote sessions on local side)
+        let (relay_ref_a, sink_a, dht_a) = setup_relay("multi-a", &test_id).await;
+        let (relay_ref_b, sink_b, dht_b) = setup_relay("multi-b", &test_id).await;
+        let (relay_ref_c, sink_c, dht_c) = setup_relay("multi-c", &test_id).await;
+        let _ = (relay_ref_a, relay_ref_b, relay_ref_c);
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let remote_a = mesh
+            .lookup_actor::<EventRelayActor>(&dht_a)
+            .await
+            .unwrap()
+            .unwrap();
+        let remote_b = mesh
+            .lookup_actor::<EventRelayActor>(&dht_b)
+            .await
+            .unwrap()
+            .unwrap();
+        let remote_c = mesh
+            .lookup_actor::<EventRelayActor>(&dht_c)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Shared source fanout (the global EventFanout on the NAS)
+        let source_fanout = Arc::new(EventFanout::new());
+
+        let mut rx_a = sink_a.fanout().subscribe();
+        let mut rx_b = sink_b.fanout().subscribe();
+        let mut rx_c = sink_c.fanout().subscribe();
+
+        // Each forwarder is scoped to its own session
+        let _h_a = EventForwarder::start(
+            source_fanout.clone(),
+            remote_a,
+            "fwd-a".to_string(),
+            "session-a".to_string(),
+        );
+        let _h_b = EventForwarder::start(
+            source_fanout.clone(),
+            remote_b,
+            "fwd-b".to_string(),
+            "session-b".to_string(),
+        );
+        let _h_c = EventForwarder::start(
+            source_fanout.clone(),
+            remote_c,
+            "fwd-c".to_string(),
+            "session-c".to_string(),
+        );
+
+        // Publish event for session-a only
+        source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
+            event_id: "e-a".into(),
+            stream_seq: 1,
+            session_id: "session-a".into(),
+            timestamp: 100,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionCreated,
+        }));
+
+        // Relay A should receive it
+        let got_a = tokio::time::timeout(std::time::Duration::from_millis(500), rx_a.recv())
+            .await
+            .expect("relay A should receive session-a event")
+            .expect("recv");
+        assert_eq!(got_a.session_id(), "session-a");
+
+        // Relay B and C must NOT receive it
+        let got_b = tokio::time::timeout(std::time::Duration::from_millis(300), rx_b.recv()).await;
+        assert!(
+            got_b.is_err(),
+            "relay B must not receive session-a events (cross-session leak)"
+        );
+
+        let got_c = tokio::time::timeout(std::time::Duration::from_millis(300), rx_c.recv()).await;
+        assert!(
+            got_c.is_err(),
+            "relay C must not receive session-a events (cross-session leak)"
+        );
+    }
+
     // ── F.6 — Unsubscribe lifecycle ──────────────────────────────────────────
 
     /// Verifies subscribe+unsubscribe stops the forwarder task.
@@ -464,5 +634,153 @@ mod event_relay_mesh_tests {
         // After unsubscribe, the forwarder task is aborted. We can't easily
         // observe this externally, but at minimum unsubscribe must succeed
         // without error.
+    }
+
+    // ── F.7 — Detach lifecycle (unsubscribe on remove) ───────────────────────
+
+    /// When a remote session is detached via `SessionRegistry::detach_remote_session`,
+    /// the registry must send `UnsubscribeEvents` to the remote session actor so
+    /// the forwarder task is stopped.  After detach, events published to the
+    /// session's fanout must NOT arrive at the local relay.
+    #[tokio::test]
+    async fn test_detach_remote_session_unsubscribes_and_stops_forwarding() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+
+        let f = AgentConfigFixture::new().await;
+        let session_id = format!("s-f7-{}", test_id);
+
+        // --- remote side: spawn SessionActor with mesh ---
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
+            .with_mesh(Some(mesh.clone()));
+        let session_ref_local = SessionActor::spawn(actor);
+
+        // Register session in DHT so attach can find it
+        let session_dht = crate::agent::remote::dht_name::session(&session_id);
+        mesh.register_actor(session_ref_local.clone(), session_dht)
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Resolve as RemoteActorRef (simulates the attach path)
+        let remote_session = mesh
+            .lookup_actor::<SessionActor>(crate::agent::remote::dht_name::session(&session_id))
+            .await
+            .expect("DHT lookup")
+            .expect("session not in DHT");
+
+        // --- local side: attach via registry ---
+        let mut registry = crate::agent::session_registry::SessionRegistry::new(f.config.clone());
+        let _ref = registry
+            .attach_remote_session(
+                session_id.clone(),
+                remote_session,
+                "test-peer".to_string(),
+                Some(mesh.clone()),
+            )
+            .await;
+
+        // Verify events flow before detach: publish → relay → local fanout
+        let mut rx = f.config.event_sink.fanout().subscribe();
+
+        // Wait for the forwarder to fully start
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut flowing = false;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            f.config.event_sink.fanout().publish(EventEnvelope::Durable(
+                crate::events::DurableEvent {
+                    event_id: "e-f7-pre".into(),
+                    stream_seq: 1,
+                    session_id: session_id.clone(),
+                    timestamp: 100,
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::SessionCreated,
+                },
+            ));
+            // We'll see our own publish on the local fanout plus potentially the relayed copy.
+            // Drain and look for a Remote-origin event (relayed back from the forwarder).
+            match tokio::time::timeout(std::time::Duration::from_millis(300), async {
+                loop {
+                    match rx.recv().await {
+                        Ok(env) if env.is_durable() => {
+                            if let EventEnvelope::Durable(de) = &env
+                                && matches!(de.origin, EventOrigin::Remote)
+                            {
+                                return true;
+                            }
+                        }
+                        Ok(_) => continue,
+                        Err(_) => return false,
+                    }
+                }
+            })
+            .await
+            {
+                Ok(true) => {
+                    flowing = true;
+                    break;
+                }
+                _ => {
+                    rx = f.config.event_sink.fanout().subscribe();
+                }
+            }
+        }
+        assert!(flowing, "events should flow through relay before detach");
+
+        // --- detach ---
+        registry.detach_remote_session(&session_id).await;
+
+        // After detach the session should be removed from the registry
+        assert!(
+            registry.get(&session_id).is_none(),
+            "session must be removed from registry after detach"
+        );
+
+        // Give the forwarder task time to be aborted
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Re-subscribe to get a clean receiver
+        let mut rx2 = f.config.event_sink.fanout().subscribe();
+
+        // Publish event — it should NOT be relayed back anymore
+        f.config
+            .event_sink
+            .fanout()
+            .publish(EventEnvelope::Durable(crate::events::DurableEvent {
+                event_id: "e-f7-post".into(),
+                stream_seq: 99,
+                session_id: session_id.clone(),
+                timestamp: 999,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::SessionCreated,
+            }));
+
+        // We should see the local publish but NO Remote-origin relay copy
+        let mut saw_remote = false;
+        let check_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while tokio::time::Instant::now() < check_deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx2.recv()).await {
+                Ok(Ok(EventEnvelope::Durable(de)))
+                    if matches!(de.origin, EventOrigin::Remote) && de.session_id == session_id =>
+                {
+                    saw_remote = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            !saw_remote,
+            "after detach_remote_session, no Remote-origin events should arrive"
+        );
     }
 }

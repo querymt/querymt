@@ -269,7 +269,16 @@ pub async fn handle_delete_session(
 
     {
         let mut registry = state.agent.registry.lock().await;
-        registry.remove(session_id);
+        // For remote sessions, send UnsubscribeEvents before removing so the
+        // remote EventForwarder task is properly cleaned up.
+        #[cfg(feature = "remote")]
+        {
+            registry.detach_remote_session(session_id).await;
+        }
+        #[cfg(not(feature = "remote"))]
+        {
+            registry.remove(session_id);
+        }
     }
 
     {

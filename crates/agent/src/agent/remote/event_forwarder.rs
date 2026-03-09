@@ -29,17 +29,28 @@ pub struct EventForwarder;
 impl EventForwarder {
     /// Start forwarding events from the given fanout to the relay actor.
     ///
+    /// Only events whose `session_id` matches `filter_session_id` are
+    /// forwarded.  All other events on the (global) fanout are silently
+    /// skipped.  This prevents N-times duplication when multiple remote
+    /// sessions share the same `EventFanout`.
+    ///
     /// Returns a `JoinHandle` that can be used to abort the forwarder task.
     pub fn start(
         fanout: Arc<crate::event_fanout::EventFanout>,
         relay_ref: RemoteActorRef<EventRelayActor>,
         source_label: String,
+        filter_session_id: String,
     ) -> tokio::task::JoinHandle<()> {
         let mut rx = fanout.subscribe();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(envelope) => {
+                        // Only forward events belonging to our session.
+                        if envelope.session_id() != filter_session_id {
+                            continue;
+                        }
+
                         let event: AgentEvent = match &envelope {
                             EventEnvelope::Durable(de) => de.clone().into(),
                             EventEnvelope::Ephemeral(ee) => ee.clone().into(),
@@ -100,6 +111,7 @@ impl EventForwarder {
         _fanout: std::sync::Arc<crate::event_fanout::EventFanout>,
         _relay_ref: (),
         _source_label: String,
+        _filter_session_id: String,
     ) -> tokio::task::JoinHandle<()> {
         panic!("EventForwarder requires the 'remote' feature to be enabled")
     }

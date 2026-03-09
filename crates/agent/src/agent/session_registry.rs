@@ -53,6 +53,11 @@ fn config_options(mode: AgentMode) -> Vec<SessionConfigOption> {
 pub struct SessionRegistry {
     pub config: Arc<AgentConfig>,
     sessions: HashMap<String, SessionActorRef>,
+    /// Tracks the `relay_actor_id` spawned for each remote session so that
+    /// `detach_remote_session` can send `UnsubscribeEvents` to the remote
+    /// `SessionActor` and stop the `EventForwarder` task.
+    #[cfg(feature = "remote")]
+    relay_actor_ids: HashMap<String, u64>,
 }
 
 impl SessionRegistry {
@@ -60,6 +65,8 @@ impl SessionRegistry {
         Self {
             config,
             sessions: HashMap::new(),
+            #[cfg(feature = "remote")]
+            relay_actor_ids: HashMap::new(),
         }
     }
 
@@ -217,9 +224,10 @@ impl SessionRegistry {
             );
         }
 
-        // 5. Insert into registry
+        // 5. Insert into registry and track relay id for later cleanup.
         self.sessions
             .insert(session_id.clone(), session_ref.clone());
+        self.relay_actor_ids.insert(session_id.clone(), relay_id);
 
         log::info!(
             "Attached remote session {} from {} (relay_actor_id={}, event relay {})",
@@ -234,6 +242,43 @@ impl SessionRegistry {
         );
 
         session_ref
+    }
+
+    /// Detach a remote session: send `UnsubscribeEvents` to stop the remote
+    /// `EventForwarder`, then remove the session from the registry.
+    ///
+    /// This is the counterpart to [`attach_remote_session`](Self::attach_remote_session).
+    /// Call this instead of bare `remove()` for remote sessions so the
+    /// forwarder task on the remote node is properly cleaned up.
+    ///
+    /// For local sessions (or if the session is not in the registry) this
+    /// falls back to a plain `remove()`.
+    #[cfg(feature = "remote")]
+    pub async fn detach_remote_session(&mut self, session_id: &str) -> Option<SessionActorRef> {
+        // Send UnsubscribeEvents before removing so the remote forwarder is aborted.
+        if let (Some(session_ref), Some(relay_id)) = (
+            self.sessions.get(session_id),
+            self.relay_actor_ids.get(session_id).copied(),
+        ) && session_ref.is_remote()
+        {
+            if let Err(e) = session_ref.unsubscribe_events(relay_id).await {
+                log::warn!(
+                    "detach_remote_session: UnsubscribeEvents failed for {} (relay_actor_id={}): {}",
+                    session_id,
+                    relay_id,
+                    e
+                );
+            } else {
+                log::info!(
+                    "detach_remote_session: sent UnsubscribeEvents for {} (relay_actor_id={})",
+                    session_id,
+                    relay_id,
+                );
+            }
+        }
+
+        self.relay_actor_ids.remove(session_id);
+        self.sessions.remove(session_id)
     }
 
     /// Create a new session: build runtime, spawn SessionActor, return session_id.
