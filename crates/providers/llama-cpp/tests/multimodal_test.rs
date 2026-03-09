@@ -67,6 +67,7 @@ fn make_provider(model: String, mmproj_path: Option<String>) -> Box<dyn querymt:
         mmproj_use_gpu: None,
         n_ubatch: None,
         text_only: None,
+        json_schema: None,
     };
     create_provider(cfg).expect("Failed to create provider")
 }
@@ -306,6 +307,7 @@ fn test_config_with_multimodal_fields() {
         kv_cache_type_v: None,
         n_ubatch: None,
         text_only: None,
+        json_schema: None,
     };
 
     let json = serde_json::to_string(&config).expect("serialize");
