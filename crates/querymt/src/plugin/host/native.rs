@@ -12,6 +12,7 @@ use libloading::Library;
 use std::ffi::CStr;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 struct NativeFactoryWrapper {
@@ -94,7 +95,7 @@ impl PluginLoader for NativeLoader {
         PluginType::Native
     }
 
-    #[instrument(name = "native_loader.load_plugin", skip_all, fields(plugin = %plugin.file_path.display(), name = %plugin_cfg.name))]
+    #[cfg_attr(feature = "tracing", instrument(name = "native_loader.load_plugin", skip_all, fields(plugin = %plugin.file_path.display(), name = %plugin_cfg.name)))]
     async fn load_plugin(
         &self,
         plugin: ProviderPlugin,

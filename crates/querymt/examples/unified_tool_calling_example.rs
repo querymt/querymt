@@ -198,7 +198,7 @@ fn build_tool_result_message(tool_calls: &[ToolCall]) -> ExampleResult<ChatMessa
 }
 
 async fn run_until_final_answer(
-    llm: &Box<dyn LLMProvider>,
+    llm: &dyn LLMProvider,
     tools: &[Tool],
     conversation: &mut Vec<ChatMessage>,
 ) -> ExampleResult<String> {
@@ -222,7 +222,7 @@ async fn run_until_final_answer(
     }
 }
 
-async fn run_simple_scenario(llm: &Box<dyn LLMProvider>, tools: &[Tool]) -> ExampleResult<()> {
+async fn run_simple_scenario(llm: &dyn LLMProvider, tools: &[Tool]) -> ExampleResult<()> {
     println!("SCENARIO: simple");
     let mut conversation = vec![ChatMessage::user()
         .text("What's the weather in Tokyo? Use tools if needed.")
@@ -233,7 +233,7 @@ async fn run_simple_scenario(llm: &Box<dyn LLMProvider>, tools: &[Tool]) -> Exam
     Ok(())
 }
 
-async fn run_multi_turn_scenario(llm: &Box<dyn LLMProvider>, tools: &[Tool]) -> ExampleResult<()> {
+async fn run_multi_turn_scenario(llm: &dyn LLMProvider, tools: &[Tool]) -> ExampleResult<()> {
     println!("SCENARIO: multi");
     let mut conversation = Vec::new();
 
@@ -271,7 +271,7 @@ async fn run_tool_choice_scenario(provider_name: &str, tools: &[Tool]) -> Exampl
         println!("\n--- Tool choice: {} ---", label);
         let llm = create_llm(provider_name, Some(choice)).await?;
         let mut conversation = vec![ChatMessage::user().text(query).build()];
-        let final_text = run_until_final_answer(&llm, tools, &mut conversation).await?;
+        let final_text = run_until_final_answer(llm.as_ref(), tools, &mut conversation).await?;
         println!("Assistant: {}", final_text);
     }
 
@@ -294,11 +294,11 @@ async fn main() -> ExampleResult<()> {
     match scenario {
         "simple" => {
             let llm = create_llm(provider, None).await?;
-            run_simple_scenario(&llm, &tools).await?
+            run_simple_scenario(llm.as_ref(), &tools).await?
         }
         "multi" => {
             let llm = create_llm(provider, None).await?;
-            run_multi_turn_scenario(&llm, &tools).await?
+            run_multi_turn_scenario(llm.as_ref(), &tools).await?
         }
         "choice" => run_tool_choice_scenario(provider, &tools).await?,
         _ => {

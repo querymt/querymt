@@ -8,6 +8,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::sync::Arc;
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 pub struct ExtismLoader;
@@ -18,7 +19,7 @@ impl PluginLoader for ExtismLoader {
         PluginType::Wasm
     }
 
-    #[instrument(name = "extism_loader.load_plugin", skip_all, fields(plugin = %plugin.file_path.display()))]
+    #[cfg_attr(feature = "tracing", instrument(name = "extism_loader.load_plugin", skip_all, fields(plugin = %plugin.file_path.display())))]
     async fn load_plugin(
         &self,
         plugin: ProviderPlugin,

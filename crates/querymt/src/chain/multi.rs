@@ -8,6 +8,7 @@ use crate::{
     LLMProvider,
 };
 use std::collections::HashMap;
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 /// Stores multiple LLM backends (OpenAI, Anthropic, etc.) identified by a key
@@ -198,7 +199,10 @@ impl<'a> MultiPromptChain<'a> {
     }
 
     /// Executes all steps
-    #[instrument(name = "multi_prompt_chain.run", skip_all)]
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "multi_prompt_chain.run", skip_all)
+    )]
     pub async fn run(mut self) -> Result<HashMap<String, String>, LLMError> {
         for step in &self.steps {
             // 1) Replace {{xyz}} in template with existing memory

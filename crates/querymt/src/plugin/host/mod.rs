@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::{collections::HashMap, path::PathBuf};
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 pub mod config;
@@ -89,7 +90,10 @@ impl PluginRegistry {
         self.loaders.insert(loader.supported_type(), loader);
     }
 
-    #[instrument(name = "plugin_registry.load_all_plugins", skip_all)]
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "plugin_registry.load_all_plugins", skip_all)
+    )]
     pub async fn load_all_plugins(&self) {
         // Skip providers that are already loaded (idempotency)
         // We need to collect loaded provider names to avoid holding the lock
@@ -141,7 +145,7 @@ impl PluginRegistry {
         }
     }
 
-    #[instrument(name = "plugin_registry.load_and_process_plugin", skip_all, fields(provider = %provider_cfg.name))]
+    #[cfg_attr(feature = "tracing", instrument(name = "plugin_registry.load_and_process_plugin", skip_all, fields(provider = %provider_cfg.name)))]
     pub async fn load_and_process_plugin(
         &self,
         provider_cfg: &ProviderConfig,

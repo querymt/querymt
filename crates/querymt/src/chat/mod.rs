@@ -1028,7 +1028,7 @@ impl ChatMessageBuilder {
     }
 
     /// Append a tool use content block.
-    pub fn tool_use(mut self, id: String, name: String, args: Value) -> Self {
+    pub fn tool_use(mut self, id: impl Into<String>, name: impl Into<String>, args: Value) -> Self {
         self.content.push(Content::tool_use(id, name, args));
         self
     }
@@ -1161,11 +1161,7 @@ mod tests {
     fn chat_message_has_tool_use() {
         let msg = ChatMessage::assistant()
             .text("Let me search")
-            .tool_use(
-                "t1".into(),
-                "search".into(),
-                serde_json::json!({"q": "rust"}),
-            )
+            .tool_use("t1", "search", serde_json::json!({"q": "rust"}))
             .build();
 
         assert!(msg.has_tool_use());

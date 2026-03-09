@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 // ── Progress types ────────────────────────────────────────────────────────────
@@ -194,7 +195,7 @@ async fn setup_trust_repository(
     Ok(Box::new(data))
 }
 
-#[instrument(name = "oci.verify_image_signature", skip_all, fields(image = %image_reference))]
+#[cfg_attr(feature = "tracing", instrument(name = "oci.verify_image_signature", skip_all, fields(image = %image_reference)))]
 async fn verify_image_signature(
     config: &OciDownloaderConfig,
     image_reference: &str,
@@ -576,7 +577,7 @@ impl OciDownloader {
         }
     }
 
-    #[instrument(name = "oci.pull_and_extract", skip_all, fields(image = %image_reference))]
+    #[cfg_attr(feature = "tracing", instrument(name = "oci.pull_and_extract", skip_all, fields(image = %image_reference)))]
     pub async fn pull_and_extract(
         &self,
         image_reference: &str,
