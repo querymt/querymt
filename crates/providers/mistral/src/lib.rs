@@ -274,7 +274,7 @@ impl HTTPLLMProviderFactory for MistralFactory {
 }
 
 #[cfg(feature = "native")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
     Box::into_raw(Box::new(MistralFactory)) as *mut _
 }

@@ -130,7 +130,7 @@ jobs:
           cargo llvm-cov nextest \
             --package ${{ matrix.package }} \
             --lib --tests \
-            --features ${{ matrix.features }} \
+            --features ${{ matrix.features }} --no-default-features \
             --codecov --output-path ./coverage/codecov-${{ matrix.provider }}.json
 
       - name: Upload coverage to Codecov

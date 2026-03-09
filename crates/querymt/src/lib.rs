@@ -262,12 +262,16 @@ impl Usage {
 #[macro_export]
 macro_rules! get_env_var {
     ($key:expr) => {{
-        if cfg!(feature = "extism") {
+        #[cfg(feature = "extism")]
+        {
             match extism_pdk::config::get($key) {
                 Ok(value) => value,
                 _ => None,
             }
-        } else {
+        }
+
+        #[cfg(not(feature = "extism"))]
+        {
             std::env::var($key).ok()
         }
     }};

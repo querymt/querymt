@@ -323,7 +323,7 @@ fn get_pricing(model: &str) -> Option<ModelPricing> {
 }
 
 #[cfg(feature = "native")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
     Box::into_raw(Box::new(OpenAIFactory)) as *mut _
 }
