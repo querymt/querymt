@@ -14,13 +14,13 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    get_env_var, handle_http_error,
+    handle_http_error,
     plugin::HTTPLLMProviderFactory,
-    providers::{ModelPricing, ProvidersRegistry},
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 use url::Url;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -227,16 +227,6 @@ impl Mistral {
     }
 }
 
-#[warn(dead_code)]
-fn get_pricing(model: &str) -> Option<ModelPricing> {
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
-        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
-    {
-        return registry.get_pricing("mistral", model).cloned();
-    }
-    None
-}
-
 struct MistralFactory;
 
 impl HTTPLLMProviderFactory for MistralFactory {
@@ -271,6 +261,11 @@ impl HTTPLLMProviderFactory for MistralFactory {
 
         Ok(Box::new(provider))
     }
+}
+
+/// Creates a Mistral HTTP factory for direct static registration.
+pub fn create_http_factory() -> Arc<dyn HTTPLLMProviderFactory> {
+    Arc::new(MistralFactory)
 }
 
 #[cfg(feature = "native")]

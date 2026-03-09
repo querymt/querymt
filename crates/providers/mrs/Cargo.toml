@@ -9,7 +9,8 @@ type = "native"
 
 [features]
 default = ["native"]
-native = ["querymt", "querymt/tracing"]
+api = ["querymt", "querymt/tracing"]
+native = ["api"]
 cuda = ["mistralrs/cuda"]
 cudnn = ["mistralrs/cudnn"]
 metal = ["mistralrs/metal"]

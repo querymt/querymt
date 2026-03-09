@@ -11,13 +11,12 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    get_env_var,
     plugin::HTTPLLMProviderFactory,
-    providers::{ModelPricing, ProvidersRegistry},
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 use url::Url;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -215,14 +214,9 @@ impl HTTPLLMProviderFactory for OpenRouterFactory {
     }
 }
 
-#[warn(dead_code)]
-fn get_pricing(model: &str) -> Option<ModelPricing> {
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
-        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
-    {
-        return registry.get_pricing("openrouter", model).cloned();
-    }
-    None
+/// Creates an OpenRouter HTTP factory for direct static registration.
+pub fn create_http_factory() -> Arc<dyn HTTPLLMProviderFactory> {
+    Arc::new(OpenRouterFactory)
 }
 
 #[cfg(feature = "native")]

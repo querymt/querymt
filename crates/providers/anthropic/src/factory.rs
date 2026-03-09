@@ -4,9 +4,15 @@ use querymt::{
 };
 use schemars::schema_for;
 use serde_json::Value;
+use std::sync::Arc;
 use url::Url;
 
 use crate::{Anthropic, detect_auth_type};
+
+/// Creates an Anthropic HTTP factory for direct static registration.
+pub fn create_http_factory() -> Arc<dyn HTTPLLMProviderFactory> {
+    Arc::new(AnthropicFactory)
+}
 
 struct AnthropicFactory;
 

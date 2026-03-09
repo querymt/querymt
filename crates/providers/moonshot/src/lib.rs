@@ -16,6 +16,7 @@ use querymt::{
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::sync::Arc;
 use url::Url;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -208,10 +209,15 @@ impl HTTPLLMProviderFactory for MoonshotAIFactory {
     }
 }
 
+/// Creates a MoonshotAI HTTP factory for direct static registration.
+pub fn create_http_factory() -> Arc<dyn HTTPLLMProviderFactory> {
+    Arc::new(MoonshotAIFactory)
+}
+
 #[cfg(feature = "native")]
 #[unsafe(no_mangle)]
 pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
-    Box::into_raw(Box::new(MistralFactory)) as *mut _
+    Box::into_raw(Box::new(MoonshotAIFactory)) as *mut _
 }
 
 #[cfg(feature = "extism")]
@@ -224,17 +230,4 @@ mod extism_exports {
         factory = MoonshotAIFactory,
         name   = "moonshotai",
     }
-}
-
-#[allow(dead_code)]
-fn get_pricing(model: &str) -> Option<querymt::providers::ModelPricing> {
-    use querymt::get_env_var;
-    use querymt::providers::ProvidersRegistry;
-
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
-        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
-    {
-        return registry.get_pricing("moonshotai", model).cloned();
-    }
-    None
 }

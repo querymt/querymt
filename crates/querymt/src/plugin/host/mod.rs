@@ -86,8 +86,48 @@ impl PluginRegistry {
         })
     }
 
+    /// Create a minimal empty registry for static-only registration.
+    ///
+    /// No config file, no cache directory, no OCI downloader.
+    /// Factories are added exclusively via [`register_static`](Self::register_static).
+    pub fn empty() -> Self {
+        PluginRegistry {
+            loaders: HashMap::new(),
+            factories: RwLock::new(HashMap::new()),
+            oci_downloader: Arc::new(oci::OciDownloader::new(None)),
+            config: config::PluginConfig {
+                providers: Vec::new(),
+                oci: None,
+            },
+            cache_path: PathBuf::new(),
+        }
+    }
+
     pub fn register_loader(&mut self, loader: Box<dyn PluginLoader>) {
         self.loaders.insert(loader.supported_type(), loader);
+    }
+
+    /// Register a pre-built factory for direct embedding.
+    ///
+    /// This is the primary API for binaries that link provider crates
+    /// statically instead of loading them as runtime plugins.
+    pub fn register_static(&self, factory: Arc<dyn LLMProviderFactory>) {
+        let name = factory.name().to_string();
+        self.factories.write().unwrap().insert(name, factory);
+    }
+
+    /// Register an HTTP provider factory, wrapping it in the adapter that
+    /// provides the full [`LLMProviderFactory`] interface.
+    ///
+    /// This is a convenience method for HTTP-based providers that implement
+    /// [`HTTPLLMProviderFactory`](super::HTTPLLMProviderFactory) rather than
+    /// the full [`LLMProviderFactory`] trait.
+    #[cfg(feature = "http-client")]
+    pub fn register_static_http(&self, factory: Arc<dyn super::HTTPLLMProviderFactory>) {
+        let name = factory.name().to_string();
+        let adapted: Arc<dyn LLMProviderFactory> =
+            Arc::new(super::adapters::HTTPFactoryAdapter::new(factory));
+        self.factories.write().unwrap().insert(name, adapted);
     }
 
     #[cfg_attr(

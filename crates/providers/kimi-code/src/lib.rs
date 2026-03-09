@@ -775,6 +775,11 @@ mod tests {
     }
 }
 
+/// Creates a Kimi Code HTTP factory for direct static registration.
+pub fn create_http_factory() -> Arc<dyn HTTPLLMProviderFactory> {
+    Arc::new(KimiCodeFactory)
+}
+
 #[cfg(feature = "native")]
 #[unsafe(no_mangle)]
 pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {

@@ -51,9 +51,8 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    get_env_var, handle_http_error,
+    handle_http_error,
     plugin::HTTPLLMProviderFactory,
-    providers::{ModelPricing, ProvidersRegistry},
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -1275,14 +1274,9 @@ impl HTTPLLMProviderFactory for GoogleFactory {
     }
 }
 
-#[warn(dead_code)]
-fn get_pricing(model: &str) -> Option<ModelPricing> {
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
-        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
-    {
-        return registry.get_pricing("google", model).cloned();
-    }
-    None
+/// Creates a Google HTTP factory for direct static registration.
+pub fn create_http_factory() -> Arc<dyn HTTPLLMProviderFactory> {
+    Arc::new(GoogleFactory)
 }
 
 #[cfg(feature = "native")]
