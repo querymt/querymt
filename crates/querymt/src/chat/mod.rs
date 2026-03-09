@@ -1028,7 +1028,12 @@ impl ChatMessageBuilder {
     }
 
     /// Append a tool use content block.
-    pub fn tool_use(mut self, id: String, name: String, args: Value) -> Self {
+    pub fn tool_use(
+        mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        args: Value,
+    ) -> Self {
         self.content.push(Content::tool_use(id, name, args));
         self
     }
