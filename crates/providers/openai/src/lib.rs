@@ -12,9 +12,7 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    get_env_var,
     plugin::HTTPLLMProviderFactory,
-    providers::{ModelPricing, ProvidersRegistry},
     stt, tts,
 };
 use schemars::{JsonSchema, schema_for};
@@ -311,15 +309,9 @@ mod tests {
     }
 }
 
-#[cfg(not(feature = "api"))]
-#[warn(dead_code)]
-fn get_pricing(model: &str) -> Option<ModelPricing> {
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
-        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
-    {
-        return registry.get_pricing("openai", model).cloned();
-    }
-    None
+/// Creates an OpenAI HTTP factory for direct static registration.
+pub fn create_http_factory() -> Arc<dyn HTTPLLMProviderFactory> {
+    Arc::new(OpenAIFactory)
 }
 
 #[cfg(feature = "native")]

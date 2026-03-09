@@ -9,7 +9,8 @@ type = "native"
 
 [features]
 default = ["native"]
-native = ["querymt", "querymt/tracing", "llama-cpp-2/openmp"]
+api = ["querymt", "querymt/tracing"]
+native = ["api", "llama-cpp-2/openmp"]
 cuda = ["llama-cpp-2/cuda"]
 metal = ["llama-cpp-2/metal"]
 openmp = ["llama-cpp-2/openmp"]

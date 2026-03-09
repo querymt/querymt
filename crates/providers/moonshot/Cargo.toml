@@ -9,8 +9,9 @@ type = "wasm"
 
 [features]
 default = ["extism"]
-native = ["querymt"]
-extism = ["extism-pdk", "querymt", "querymt-extism-macros"]
+api = ["querymt"]
+native = ["api"]
+extism = ["extism-pdk", "api", "querymt-extism-macros"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

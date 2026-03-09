@@ -11,13 +11,12 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    get_env_var,
     plugin::HTTPLLMProviderFactory,
-    providers::{ModelPricing, ProvidersRegistry},
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::sync::Arc;
 use url::Url;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -243,18 +242,13 @@ impl HTTPLLMProviderFactory for AlibabaFactory {
     }
 }
 
-#[warn(dead_code)]
-fn get_pricing(model: &str) -> Option<ModelPricing> {
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
-        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
-    {
-        return registry.get_pricing("alibaba", model).cloned();
-    }
-    None
+/// Creates an Alibaba HTTP factory for direct static registration.
+pub fn create_http_factory() -> Arc<dyn HTTPLLMProviderFactory> {
+    Arc::new(AlibabaFactory)
 }
 
 #[cfg(feature = "native")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
     Box::into_raw(Box::new(AlibabaFactory)) as *mut _
 }

@@ -25,6 +25,16 @@ use querymt::error::LLMError;
 use querymt::plugin::{Fut, LLMProviderFactory};
 use schemars::schema_for;
 
+/// Create a factory that can be statically registered in a `PluginRegistry`.
+///
+/// This is the preferred entry-point for embedding targets that link provider
+/// crates directly instead of loading them as runtime plugins.
+pub fn create_factory() -> std::sync::Arc<dyn LLMProviderFactory> {
+    std::sync::Arc::new(LlamaCppFactory {
+        model_cache: std::sync::Mutex::new(None),
+    })
+}
+
 struct LlamaCppFactory {
     /// Single-slot model cache. Stores the most recently loaded model
     /// (`Arc<LlamaModel>` + `Arc<MultimodalContext>`) keyed on hardware

@@ -9,6 +9,7 @@ mod tools;
 pub use config::{
     MistralRSConfig, MistralRSDeviceMap, MistralRSModelKind, MistralRSPagedCacheType,
 };
+pub use factory::create_factory;
 pub use model::MistralRS;
 
 #[cfg(test)]

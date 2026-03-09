@@ -6,6 +6,11 @@ use serde_json::Value;
 use crate::config::MistralRSConfig;
 use crate::model::MistralRS;
 
+/// Creates a mistral.rs factory for direct static registration.
+pub fn create_factory() -> std::sync::Arc<dyn LLMProviderFactory> {
+    std::sync::Arc::new(MistralRSFactory)
+}
+
 pub(crate) struct MistralRSFactory;
 
 impl LLMProviderFactory for MistralRSFactory {

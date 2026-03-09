@@ -19,6 +19,7 @@ use querymt::{
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 use url::Url;
 
 pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
@@ -708,6 +709,11 @@ impl HTTPLLMProviderFactory for OllamaFactory {
         let provider: Ollama = serde_json::from_str(cfg)?;
         Ok(Box::new(provider))
     }
+}
+
+/// Creates an Ollama HTTP factory for direct static registration.
+pub fn create_http_factory() -> Arc<dyn HTTPLLMProviderFactory> {
+    Arc::new(OllamaFactory)
 }
 
 #[cfg(feature = "native")]

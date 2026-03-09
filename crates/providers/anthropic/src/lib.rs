@@ -25,8 +25,7 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    get_env_var, handle_http_error,
-    providers::{ModelPricing, ProvidersRegistry},
+    handle_http_error,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1146,17 +1145,8 @@ impl HTTPLLMProvider for Anthropic {
     }
 }
 
-#[warn(dead_code)]
-fn get_pricing(model: &str) -> Option<ModelPricing> {
-    if let Some(models) = get_env_var!("PROVIDERS_REGISTRY_DATA")
-        && let Ok(registry) = serde_json::from_str::<ProvidersRegistry>(&models)
-    {
-        return registry.get_pricing("anthropic", model).cloned();
-    }
-    None
-}
-
 mod factory;
+pub use factory::create_http_factory;
 
 #[cfg(test)]
 mod tests {
