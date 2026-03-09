@@ -1161,11 +1161,7 @@ mod tests {
     fn chat_message_has_tool_use() {
         let msg = ChatMessage::assistant()
             .text("Let me search")
-            .tool_use(
-                "t1".into(),
-                "search".into(),
-                serde_json::json!({"q": "rust"}),
-            )
+            .tool_use("t1", "search", serde_json::json!({"q": "rust"}))
             .build();
 
         assert!(msg.has_tool_use());
