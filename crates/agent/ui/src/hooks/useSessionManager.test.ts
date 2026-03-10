@@ -13,14 +13,17 @@ vi.mock('react-router-dom', () => ({
 
 // Mock UiClientContext
 const mockLoadSession = vi.fn();
+const mockAttachRemoteSession = vi.fn();
 const mockNewSession = vi.fn();
 const mockSessionCreatingRef = { current: false };
 let mockServerSessionId: string | null = null;
 let mockConnected = true;
+let mockLastLoadErrorSessionId: string | null = null;
 
 vi.mock('../context/UiClientContext', () => ({
   useUiClientActions: () => ({
     loadSession: mockLoadSession,
+    attachRemoteSession: mockAttachRemoteSession,
     newSession: mockNewSession,
     sessionCreatingRef: mockSessionCreatingRef,
   }),
@@ -28,6 +31,7 @@ vi.mock('../context/UiClientContext', () => ({
     sessionId: mockServerSessionId,
     connected: mockConnected,
     sessionGroups: [],
+    lastLoadErrorSessionId: mockLastLoadErrorSessionId,
   }),
 }));
 
@@ -46,6 +50,7 @@ describe('useSessionManager', () => {
     mockServerSessionId = null;
     mockConnected = true;
     mockSessionCreatingRef.current = false;
+    mockLastLoadErrorSessionId = null;
   });
 
   describe('selectSession', () => {
@@ -118,7 +123,7 @@ describe('useSessionManager', () => {
       
       renderHook(() => useSessionManager());
       
-      expect(mockLoadSession).toHaveBeenCalledWith('session-A');
+      expect(mockLoadSession).toHaveBeenCalledWith('session-A', undefined);
     });
 
     it('does not call loadSession when URL matches server session', () => {
