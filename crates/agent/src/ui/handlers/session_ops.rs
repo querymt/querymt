@@ -82,6 +82,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                     updated_at: s.updated_at.and_then(|t| t.format(&Rfc3339).ok()),
                     parent_session_id: s.parent_session_id,
                     fork_origin: s.fork_origin,
+                    session_kind: s.session_kind,
                     has_children: s.has_children,
                     node: None,     // local sessions have no node label
                     node_id: None,  // not applicable for local sessions
@@ -153,6 +154,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                             updated_at: None,
                             parent_session_id: None,
                             fork_origin: None,
+                            session_kind: None,
                             has_children: false,
                             node: Some(peer_label),
                             node_id,
@@ -210,6 +212,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                                 updated_at: None,
                                 parent_session_id: None,
                                 fork_origin: None,
+                                session_kind: None,
                                 has_children: false,
                                 node: Some(peer_label.clone()),
                                 node_id: Some(node_id_str.clone()),

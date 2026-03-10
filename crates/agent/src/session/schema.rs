@@ -28,6 +28,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             llm_config_id INTEGER,
             parent_session_id INTEGER,
             fork_origin TEXT,
+            session_kind TEXT,
             fork_point_type TEXT,
             fork_point_ref TEXT,
             fork_instructions TEXT,

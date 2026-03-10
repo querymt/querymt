@@ -120,6 +120,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
   const renderSessionCard = (session: SessionSummary & { children?: SessionSummary[] }, sessionIndex: number, depth: number = 0) => {
     const isChild = !!session.parent_session_id;
     const isDelegation = session.fork_origin === 'delegation';
+    const isRecurring = session.session_kind === 'recurring';
     const isUnattached = session.attached === false;
     const indentClass = depth > 0 ? `ml-${depth * 6}` : '';
     const isActive = activeSessionId === session.session_id;
@@ -171,6 +172,11 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
               {isDelegation && (
                 <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30">
                   delegated
+                </span>
+              )}
+              {isRecurring && (
+                <span className="text-[10px] px-1.5 py-0.5 bg-accent-secondary/20 text-accent-secondary rounded border border-accent-secondary/30">
+                  recurring
                 </span>
               )}
               {session.node && (
