@@ -1632,6 +1632,17 @@ impl ViewStore for SqliteStorage {
 
         let total_count = sessions.len();
 
+        // Derive recurring sessions from task data so recurring task sessions are
+        // visible in the normal session list without extra plumbing.
+        let recurring_session_ids: HashSet<i64> = self
+            .run_blocking(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT DISTINCT session_id FROM tasks WHERE kind = 'recurring'")?;
+                let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+                rows.collect::<Result<HashSet<_>, _>>()
+            })
+            .await?;
+
         // Build a map of internal ID -> public ID for parent resolution
         let mut id_to_public_id: HashMap<i64, String> = HashMap::new();
         for session in &sessions {
@@ -1677,6 +1688,13 @@ impl ViewStore for SqliteStorage {
             // Check if this session has children
             let has_children = sessions_with_children.contains(&session.public_id);
 
+            // Mark session kind for recurring task workflows.
+            let session_kind = if recurring_session_ids.contains(&session.id) {
+                Some("recurring".to_string())
+            } else {
+                session.session_kind.clone()
+            };
+
             // Convert fork_origin to string
             let fork_origin = session.fork_origin.map(|fo| fo.to_string());
 
@@ -1689,6 +1707,7 @@ impl ViewStore for SqliteStorage {
                 updated_at: session.updated_at,
                 parent_session_id,
                 fork_origin,
+                session_kind,
                 has_children,
             });
         }
@@ -2204,6 +2223,10 @@ const MIGRATIONS: &[Migration] = &[
         version: "0002_drop_legacy_events",
         apply: migration_0002_drop_legacy_events,
     },
+    Migration {
+        version: "0003_add_session_kind",
+        apply: migration_0003_add_session_kind,
+    },
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -2283,6 +2306,24 @@ fn migration_0002_drop_legacy_events(conn: &mut Connection) -> Result<(), rusqli
     Ok(())
 }
 
+fn migration_0003_add_session_kind(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    // Add optional session kind metadata (e.g. "recurring") for UI labeling.
+    let has_session_kind = {
+        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|name| name == "session_kind")
+    };
+
+    if !has_session_kind {
+        conn.execute("ALTER TABLE sessions ADD COLUMN session_kind TEXT", [])?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2328,6 +2369,23 @@ mod tests {
             )
             .expect("check event_journal table");
         assert_eq!(journal_table_count, 1, "event_journal table should exist");
+    }
+
+    #[test]
+    fn migration_0003_adds_session_kind_column() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        apply_migrations(&mut conn).expect("apply migrations");
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .expect("table info query");
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("load column names")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect columns");
+
+        assert!(columns.into_iter().any(|name| name == "session_kind"));
     }
 
     #[test]

@@ -100,6 +100,7 @@ pub fn mock_session(session_id: &str) -> Session {
         llm_config_id: Some(1),
         parent_session_id: None,
         fork_origin: None,
+        session_kind: None,
         fork_point_type: None,
         fork_point_ref: None,
         fork_instructions: None,
