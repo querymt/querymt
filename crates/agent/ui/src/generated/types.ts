@@ -605,6 +605,8 @@ export interface SessionSummary {
 	parent_session_id?: string;
 	/** Fork origin: "user" or "delegation" */
 	fork_origin?: string;
+	/** Session kind for specialized workflows (e.g. "recurring") */
+	session_kind?: string;
 	/** Whether this session has child sessions */
 	has_children: boolean;
 	/**

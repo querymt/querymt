@@ -113,7 +113,7 @@ impl SessionRepository for SqliteSessionRepository {
         let inserted_id = self
             .run_blocking(move |conn| {
                 conn.execute(
-                    "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, fork_instructions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, session_kind, fork_point_type, fork_point_ref, fork_instructions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         public_id_for_insert,
                         name_for_insert,
@@ -125,6 +125,7 @@ impl SessionRepository for SqliteSessionRepository {
                         Option::<i64>::None,
                         parent_internal_id,
                         fork_origin_str,
+                        Option::<String>::None,
                         Option::<String>::None,
                         Option::<String>::None,
                         Option::<String>::None,
@@ -146,6 +147,7 @@ impl SessionRepository for SqliteSessionRepository {
             llm_config_id: None,
             parent_session_id: parent_internal_id,
             fork_origin: fork_origin_clone,
+            session_kind: None,
             fork_point_type: None,
             fork_point_ref: None,
             fork_instructions: None,
@@ -156,7 +158,7 @@ impl SessionRepository for SqliteSessionRepository {
         let session_id = session_id.to_string();
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT id, public_id, name, cwd, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, fork_instructions FROM sessions WHERE public_id = ?",
+                "SELECT id, public_id, name, cwd, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, session_kind, fork_point_type, fork_point_ref, fork_instructions FROM sessions WHERE public_id = ?",
                 params![session_id],
                 map_row_to_session,
             )
@@ -168,7 +170,7 @@ impl SessionRepository for SqliteSessionRepository {
     async fn list_sessions(&self) -> SessionResult<Vec<Session>> {
         self.run_blocking(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, public_id, name, cwd, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, fork_instructions FROM sessions ORDER BY updated_at DESC",
+                "SELECT id, public_id, name, cwd, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, session_kind, fork_point_type, fork_point_ref, fork_instructions FROM sessions ORDER BY updated_at DESC",
             )?;
             let sessions_iter = stmt.query_map([], map_row_to_session)?;
             sessions_iter.collect::<Result<Vec<_>, _>>()
@@ -270,7 +272,7 @@ impl SessionRepository for SqliteSessionRepository {
         self.run_blocking(move |conn| {
             let tx = conn.transaction()?;
             tx.execute(
-                "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref, fork_instructions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, llm_config_id, parent_session_id, fork_origin, session_kind, fork_point_type, fork_point_ref, fork_instructions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     new_public_id_for_insert,
                     fork_name,
@@ -280,6 +282,7 @@ impl SessionRepository for SqliteSessionRepository {
                     parent_llm_config_id,
                     parent_internal_id,
                     fork_origin_str,
+                    Option::<String>::None,
                     fork_point_type_str,
                     fork_point_ref_str,
                     instructions_for_insert,
@@ -350,11 +353,12 @@ fn map_row_to_session(row: &rusqlite::Row) -> Result<Session, rusqlite::Error> {
         fork_origin: row
             .get::<_, Option<String>>(10)?
             .and_then(|s| s.parse::<ForkOrigin>().ok()),
+        session_kind: row.get(11)?,
         fork_point_type: row
-            .get::<_, Option<String>>(11)?
+            .get::<_, Option<String>>(12)?
             .and_then(|s| s.parse::<ForkPointType>().ok()),
-        fork_point_ref: row.get(12)?,
-        fork_instructions: row.get(13)?,
+        fork_point_ref: row.get(13)?,
+        fork_instructions: row.get(14)?,
     })
 }
 

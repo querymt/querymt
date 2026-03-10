@@ -139,6 +139,8 @@ pub struct SessionSummary {
     pub parent_session_id: Option<String>,
     /// Fork origin: "user" or "delegation"
     pub fork_origin: Option<String>,
+    /// Session kind for specialized workflows (e.g. "recurring")
+    pub session_kind: Option<String>,
     /// Whether this session has child sessions
     pub has_children: bool,
     /// Node label where this session lives. "local" for local sessions,
