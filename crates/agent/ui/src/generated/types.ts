@@ -614,8 +614,8 @@ export interface SessionSummary {
 	node?: string;
 	/**
 	 * Whether this remote session is currently attached (has a live actor ref).
-	 * `true` = attached, `false` = discovered but not attached,
-	 * `undefined` = local session (not applicable).
+	 * `Some(true)` = attached, `Some(false)` = discovered but not attached,
+	 * `None` = local session (not applicable).
 	 */
 	attached?: boolean;
 }
