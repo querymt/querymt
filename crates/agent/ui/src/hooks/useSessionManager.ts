@@ -18,7 +18,7 @@
 
 import { useCallback, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { useUiClientContext } from '../context/UiClientContext';
+import { useUiClientActions, useUiClientSession } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
 
 export interface SessionManager {
@@ -38,13 +38,15 @@ export interface SessionManager {
 
 export function useSessionManager(): SessionManager {
   const {
-    sessionId: serverSessionId,
     loadSession,
     newSession,
+    sessionCreatingRef,
+  } = useUiClientActions();
+  const {
+    sessionId: serverSessionId,
     connected,
     sessionGroups: rawSessionGroups,
-    sessionCreatingRef,
-  } = useUiClientContext();
+  } = useUiClientSession();
   const sessionGroups = rawSessionGroups ?? [];
   const { sessionId: urlSessionId } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();

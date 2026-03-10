@@ -14,9 +14,11 @@ import { EventItem, SessionLimits } from '../types';
 import { calculateStats } from '../utils/statsCalculator';
 import { formatDurationCompact, formatTokensAbbrev, formatCost, formatPercentage } from '../utils/formatters';
 import { useSessionTimerElapsed, useSessionTimerActive } from '../context/SessionTimerContext';
+import { useUiClientEvents } from '../context/UiClientContext';
 
 interface HeaderStatsBarProps {
-  events: EventItem[];
+  /** @deprecated events are now read from UiClientEventsContext internally */
+  events?: EventItem[];
   agentModels: Record<string, { provider?: string; model?: string; contextLimit?: number; node?: string }>;
   sessionLimits?: SessionLimits | null;
   onClick?: () => void;
@@ -25,12 +27,14 @@ interface HeaderStatsBarProps {
 }
 
 export function HeaderStatsBar({
-  events,
+  events: eventsProp,
   agentModels,
   sessionLimits,
   onClick,
   compact = false,
 }: HeaderStatsBarProps) {
+  const { events: eventsCtx } = useUiClientEvents();
+  const events = eventsProp ?? eventsCtx;
   const globalElapsedMs = useSessionTimerElapsed();
   const isSessionActive = useSessionTimerActive();
   const { session, perAgent } = useMemo(() => calculateStats(events, sessionLimits), [events, sessionLimits]);

@@ -19,12 +19,15 @@ let mockServerSessionId: string | null = null;
 let mockConnected = true;
 
 vi.mock('../context/UiClientContext', () => ({
-  useUiClientContext: () => ({
-    sessionId: mockServerSessionId,
+  useUiClientActions: () => ({
     loadSession: mockLoadSession,
     newSession: mockNewSession,
-    connected: mockConnected,
     sessionCreatingRef: mockSessionCreatingRef,
+  }),
+  useUiClientSession: () => ({
+    sessionId: mockServerSessionId,
+    connected: mockConnected,
+    sessionGroups: [],
   }),
 }));
 

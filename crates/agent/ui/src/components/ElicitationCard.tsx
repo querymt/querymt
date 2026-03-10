@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
 import { ElicitationData } from '../types';
-import { useUiClientContext } from '../context/UiClientContext';
+import { useUiClientActions } from '../context/UiClientContext';
 import { Check, Circle, Square, CheckSquare, Send, X, Ban } from 'lucide-react';
 
 interface ElicitationCardProps {
@@ -81,7 +81,7 @@ function parseSchema(schema: any): FormField[] {
 }
 
 export function ElicitationCard({ data }: ElicitationCardProps) {
-  const { sendElicitationResponse } = useUiClientContext();
+  const { sendElicitationResponse } = useUiClientActions();
   const [formState, setFormState] = useState<Record<string, any>>({});
   const [submitted, setSubmitted] = useState(false);
   const [action, setAction] = useState<'accept' | 'decline' | 'cancel' | null>(null);

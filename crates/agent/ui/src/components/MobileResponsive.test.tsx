@@ -18,6 +18,18 @@ vi.mock('../context/SessionTimerContext', () => ({
   useSessionTimerAgents: () => new Map<string, number>(),
   useSessionTimerActive: () => false,
 }));
+
+vi.mock('../context/UiClientContext', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../context/UiClientContext')>();
+  return {
+    ...actual,
+    useUiClientEvents: () => ({
+      events: [],
+      eventsBySession: new Map(),
+      mainSessionId: null,
+    }),
+  };
+});
 import { render, screen } from '@testing-library/react';
 import { TodoRail } from './TodoRail';
 import { HeaderStatsBar } from './HeaderStatsBar';

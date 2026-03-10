@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Plus, Loader } from 'lucide-react';
 import { useSessionManager } from '../hooks/useSessionManager';
-import { useUiClientContext } from '../context/UiClientContext';
+import { useUiClientActions, useUiClientSession } from '../context/UiClientContext';
 import { SessionPicker } from './SessionPicker';
 import { GlitchText } from './GlitchText';
 
@@ -14,14 +14,14 @@ import { GlitchText } from './GlitchText';
 export function HomePage() {
   const { selectSession, createSession, goHome } = useSessionManager();
   
+  const { deleteSession } = useUiClientActions();
   const { 
     connected, 
     sessionGroups, 
     sessionId,
     thinkingBySession,
     sessionParentMap,
-    deleteSession,
-  } = useUiClientContext();
+  } = useUiClientSession();
   
   const [loading, setLoading] = useState(false);
 

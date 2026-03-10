@@ -21,6 +21,20 @@ vi.mock('../context/SessionTimerContext', async (importOriginal) => {
   };
 });
 
+// Mock UiClientContext so HeaderStatsBar can resolve useUiClientEvents without a provider.
+// Tests pass events as a prop, so the context value is just a fallback.
+vi.mock('../context/UiClientContext', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../context/UiClientContext')>();
+  return {
+    ...actual,
+    useUiClientEvents: () => ({
+      events: [],
+      eventsBySession: new Map(),
+      mainSessionId: null,
+    }),
+  };
+});
+
 // Minimal events to make the stats bar render (needs at least 1 message or tool call)
 const mockEvents: EventItem[] = [
   {

@@ -7,6 +7,7 @@ import { getAgentDisplayName } from '../utils/agentNames';
 import { TodoStats } from '../hooks/useTodoState';
 import { formatDuration, formatCost, formatTokensAbbrev, formatPercentage } from '../utils/formatters';
 import { useSessionTimerContext } from '../context/SessionTimerContext';
+import { useUiClientEvents } from '../context/UiClientContext';
 
 /**
  * StatsDrawer - Top-sliding drawer for detailed session statistics
@@ -20,7 +21,8 @@ import { useSessionTimerContext } from '../context/SessionTimerContext';
 interface StatsDrawerProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  events: EventItem[];
+  /** @deprecated events are now read from UiClientEventsContext internally */
+  events?: EventItem[];
   agents: UiAgentInfo[];
   agentModels: Record<string, { provider?: string; model?: string; contextLimit?: number; node?: string }>;
   sessionLimits?: SessionLimits | null;
@@ -31,13 +33,15 @@ interface StatsDrawerProps {
 export function StatsDrawer({
   open,
   onOpenChange,
-  events,
+  events: eventsProp,
   agents,
   agentModels,
   sessionLimits,
   todoStats = null,
   hasTodos = false,
 }: StatsDrawerProps) {
+  const { events: eventsCtx } = useUiClientEvents();
+  const events = eventsProp ?? eventsCtx;
   const { globalElapsedMs, agentElapsedMs, isSessionActive } = useSessionTimerContext();
   const [expertMode, setExpertMode] = useState(false);
   const [expandedAgents, setExpandedAgents] = useState<Set<string>>(new Set());
@@ -81,7 +85,7 @@ export function StatsDrawer({
       {/* Drawer */}
       <div className="fixed left-0 right-0 top-[52px] md:top-[72px] z-40 animate-slide-down">
         <div className="max-w-6xl mx-auto px-2 md:px-6">
-          <div className="bg-surface-elevated/95 backdrop-blur-sm border-2 border-accent-primary/30 rounded-b-xl shadow-[0_8px_40px_rgba(var(--accent-primary-rgb),0.2)]">
+          <div className="bg-surface-elevated border-2 border-accent-primary/30 rounded-b-xl shadow-[0_8px_40px_rgba(var(--accent-primary-rgb),0.2)]">
             {/* Header */}
             <div className="flex items-center justify-between px-3 md:px-6 py-3 border-b border-surface-border/40">
               <div className="flex items-center gap-3">

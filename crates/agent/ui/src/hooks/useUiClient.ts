@@ -134,6 +134,8 @@ export function useUiClient() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [agentMode, setAgentModeState] = useState<string>('build');
+  const agentModeRef = useRef(agentMode);
+  agentModeRef.current = agentMode;
   // @ts-expect-error - setAvailableModes reserved for future backend integration
   const [availableModes, setAvailableModes] = useState<string[]>(['build', 'plan']);
   const [sessionGroups, setSessionGroups] = useState<SessionGroup[]>([]);
@@ -1315,10 +1317,10 @@ export function useUiClient() {
   }, []);
 
   const cycleAgentMode = useCallback(() => {
-    const currentIndex = availableModes.indexOf(agentMode);
+    const currentIndex = availableModes.indexOf(agentModeRef.current);
     const nextMode = availableModes[(currentIndex + 1) % availableModes.length];
     setAgentMode(nextMode);
-  }, [agentMode, setAgentMode, availableModes]);
+}, [setAgentMode, availableModes]);
 
   const updatePlugins = useCallback(() => {
     setIsUpdatingPlugins(true);
