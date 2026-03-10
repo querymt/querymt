@@ -20,6 +20,7 @@ import { useCallback, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useUiClientActions, useUiClientSession } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
+import type { SessionSummary } from '../types';
 
 export interface SessionManager {
   /** The session ID from the URL — what the user intends to view */
@@ -39,6 +40,7 @@ export interface SessionManager {
 export function useSessionManager(): SessionManager {
   const {
     loadSession,
+    attachRemoteSession,
     newSession,
     sessionCreatingRef,
   } = useUiClientActions();
@@ -46,17 +48,39 @@ export function useSessionManager(): SessionManager {
     sessionId: serverSessionId,
     connected,
     sessionGroups: rawSessionGroups,
+    lastLoadErrorSessionId,
   } = useUiClientSession();
   const sessionGroups = rawSessionGroups ?? [];
   const { sessionId: urlSessionId } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
   const { saveAndSwitchSession } = useUiStore();
-  
+
+  // Keep a ref to sessionGroups so the URL-sync effect can look up session
+  // metadata without taking sessionGroups as a reactive dependency (which would
+  // cause an infinite retry loop when a load error triggers list_sessions and
+  // sessionGroups updates).
+  const sessionGroupsRef = useRef(sessionGroups);
+  sessionGroupsRef.current = sessionGroups;
+
+  // --- Load failure guard (Fix B3) ---
+  // If the session the URL is pointing at just failed to load (e.g. a remote
+  // session whose node_id was missing or stale), navigate back to home so the
+  // URL-sync effect above doesn't keep retrying forever.
+  useEffect(() => {
+    if (lastLoadErrorSessionId && lastLoadErrorSessionId === urlSessionId) {
+      console.log('[useSessionManager] Load failed for current session, navigating home:', lastLoadErrorSessionId);
+      navigate('/');
+    }
+  }, [lastLoadErrorSessionId, urlSessionId, navigate]);
+
   // Track previous URL session for save/restore
   const prevUrlSessionIdRef = useRef<string | undefined>(undefined);
   
   // --- URL → Server sync (replaces useSessionRoute) ---
-  // When URL changes, load the session on the server
+  // When URL changes, load the session on the server.
+  // NOTE: sessionGroups is intentionally NOT in the dependency array — we read
+  // it via a ref to prevent the error→list_sessions→effect re-trigger loop that
+  // occurs when a remote-session load fails and refreshes the session list.
   useEffect(() => {
     if (!connected) return; // Wait for WebSocket
     if (!urlSessionId) return; // On home page, nothing to load
@@ -73,17 +97,31 @@ export function useSessionManager(): SessionManager {
     // so skip the loadSession call to avoid re-loading what was just created.
     if (sessionCreatingRef.current) return;
     
-    console.log('[useSessionManager] URL changed, loading session:', urlSessionId);
-    const currentGroup =
-      sessionGroups.find((group) => group.sessions.some((session) => session.session_id === urlSessionId));
-    const currentSession = currentGroup?.sessions.find((session) => session.session_id === urlSessionId);
-    const sessionLabel = currentSession ? currentSession.title || currentSession.name || currentSession.session_id : undefined;
-    if (sessionLabel) {
-      loadSession(urlSessionId, sessionLabel);
-    } else {
-      loadSession(urlSessionId);
+    // Look up this session in the current groups (via ref — not a reactive dep).
+    let currentSession: SessionSummary | undefined;
+    for (const group of sessionGroupsRef.current) {
+      const found = group.sessions.find((s) => s.session_id === urlSessionId);
+      if (found) { currentSession = found; break; }
     }
-  }, [urlSessionId, serverSessionId, connected, loadSession, sessionGroups, sessionCreatingRef]);
+    const sessionLabel = currentSession
+      ? currentSession.title || currentSession.name || currentSession.session_id
+      : undefined;
+
+    // Remote sessions that have not yet been attached need attach_remote_session
+    // (which does a DHT lookup and wires up the actor), not load_session (which
+    // only queries the local database and would always fail with "Query returned
+    // no rows" for sessions that live on a remote peer).
+    if (currentSession?.node_id && currentSession.attached === false) {
+      console.log('[useSessionManager] Attaching remote session:', urlSessionId, 'on node', currentSession.node_id);
+      attachRemoteSession(currentSession.node_id, urlSessionId, sessionLabel);
+      return;
+    }
+
+    console.log('[useSessionManager] URL changed, loading session:', urlSessionId);
+    loadSession(urlSessionId, sessionLabel);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urlSessionId, serverSessionId, connected, loadSession, attachRemoteSession, sessionCreatingRef]);
+  // ^ sessionGroups is deliberately omitted — use sessionGroupsRef instead.
   
   // --- View state save/restore on URL change ---
   // Save the previous session's view state and restore the new session's view state

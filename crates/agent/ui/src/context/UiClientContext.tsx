@@ -33,6 +33,7 @@ export interface UiClientActionsContextValue {
   cancelSession: () => void;
   deleteSession: (sessionId: string, sessionLabel?: string) => void;
   loadSession: (sessionId: string, sessionLabel?: string) => void;
+  attachRemoteSession: (nodeId: string, sessionId: string, sessionLabel?: string) => void;
   refreshAllModels: () => void;
   fetchRecentModels: () => void;
   requestAuthProviders: () => void;
@@ -110,6 +111,8 @@ export interface UiClientSessionContextValue {
   agentMode: string;
   availableModes: string[];
   remoteNodes: RemoteNodeInfo[];
+  /** Session ID of the last session that failed to load. Used to navigate away and stop retry loops. */
+  lastLoadErrorSessionId: string | null;
 }
 
 const UiClientSessionContext = createContext<UiClientSessionContextValue | undefined>(undefined);
@@ -168,6 +171,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     cancelSession: uiClient.cancelSession,
     deleteSession: uiClient.deleteSession,
     loadSession: uiClient.loadSession,
+    attachRemoteSession: uiClient.attachRemoteSession,
     refreshAllModels: uiClient.refreshAllModels,
     fetchRecentModels: uiClient.fetchRecentModels,
     requestAuthProviders: uiClient.requestAuthProviders,
@@ -237,6 +241,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     agentMode: uiClient.agentMode,
     availableModes: uiClient.availableModes,
     remoteNodes: uiClient.remoteNodes,
+    lastLoadErrorSessionId: uiClient.lastLoadErrorSessionId,
   }), [
     uiClient.sessionId,
     uiClient.connected,
@@ -258,6 +263,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.agentMode,
     uiClient.availableModes,
     uiClient.remoteNodes,
+    uiClient.lastLoadErrorSessionId,
   ]);
 
   // -- Config (low frequency) --

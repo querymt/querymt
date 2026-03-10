@@ -169,6 +169,9 @@ export function useUiClient() {
   const [sessionActionNotices, setSessionActionNotices] = useState<
     { id: number; kind: 'success' | 'error'; message: string }[]
   >([]);
+  // Tracks the most recent session ID that failed to load so consumers
+  // (e.g. useSessionManager) can navigate away rather than retrying.
+  const [lastLoadErrorSessionId, setLastLoadErrorSessionId] = useState<string | null>(null);
   const [pluginUpdateStatus, setPluginUpdateStatus] = useState<Record<string, PluginUpdateStatus>>({});
   const [pluginUpdateResults, setPluginUpdateResults] = useState<PluginUpdateResult[] | null>(null);
   const [isUpdatingPlugins, setIsUpdatingPlugins] = useState(false);
@@ -637,7 +640,8 @@ export function useUiClient() {
         }
 
         if (isLoadError) {
-          const pendingLabel = Array.from(pendingLoadLabelsRef.current.values()).pop();
+          const pendingEntries = Array.from(pendingLoadLabelsRef.current.entries());
+          const [failedSessionId, pendingLabel] = pendingEntries[pendingEntries.length - 1] ?? [null, undefined];
           pendingLoadLabelsRef.current.clear();
           pushSessionActionNotice(
             'error',
@@ -645,6 +649,9 @@ export function useUiClient() {
               ? `Failed to open session: ${pendingLabel}`
               : d.message
           );
+          if (failedSessionId) {
+            setLastLoadErrorSessionId(failedSessionId);
+          }
           sendMessage({ type: 'list_sessions' } as UiClientMessage);
         }
 
@@ -1097,6 +1104,12 @@ export function useUiClient() {
     sendMessage({ type: 'load_session', data: { session_id: sessionId } });
   }, []);
 
+  const attachRemoteSession = useCallback((nodeId: string, sessionId: string, sessionLabel?: string) => {
+    const label = sessionLabel && sessionLabel.trim().length > 0 ? sessionLabel : sessionId;
+    pendingLoadLabelsRef.current.set(sessionId, label);
+    sendMessage({ type: 'attach_remote_session', data: { node_id: nodeId, session_id: sessionId } });
+  }, []);
+
   const refreshAllModels = useCallback(() => {
     sendMessage({ type: 'list_all_models', data: { refresh: true } });
   }, []);
@@ -1355,6 +1368,7 @@ export function useUiClient() {
     sessionsByAgent,
     agentModels,
     loadSession,
+    attachRemoteSession,
     refreshAllModels,
     fetchRecentModels,
     requestAuthProviders,
@@ -1406,6 +1420,7 @@ export function useUiClient() {
     dismissConnectionError,
     sessionActionNotices,
     dismissSessionActionNotice,
+    lastLoadErrorSessionId,
     pluginUpdateStatus,
     pluginUpdateResults,
     isUpdatingPlugins,

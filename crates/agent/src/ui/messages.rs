@@ -145,6 +145,10 @@ pub struct SessionSummary {
     /// peer hostname/label for remote sessions (display only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// Stable PeerId of the remote node. Required by the frontend to send
+    /// `attach_remote_session`. Only set for remote sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     /// Whether this remote session is currently attached (has a live actor ref).
     /// `Some(true)` = attached, `Some(false)` = discovered but not attached,
     /// `None` = local session (not applicable).

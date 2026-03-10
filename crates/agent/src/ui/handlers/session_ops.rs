@@ -83,6 +83,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                     fork_origin: s.fork_origin,
                     has_children: s.has_children,
                     node: None,     // local sessions have no node label
+                    node_id: None,  // not applicable for local sessions
                     attached: None, // not applicable for local sessions
                 })
                 .collect(),
@@ -117,11 +118,28 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
             let mut by_node: std::collections::HashMap<String, Vec<SessionSummary>> =
                 std::collections::HashMap::new();
 
+            // Build a peer_label -> node_id_str map from live remote nodes so we
+            // can populate SessionSummary::node_id for both attached and discovered
+            // sessions.  The frontend needs node_id to send attach_remote_session.
+            let node_id_by_label: std::collections::HashMap<String, String> =
+                if state.agent.mesh().is_some() {
+                    state
+                        .agent
+                        .list_remote_nodes()
+                        .await
+                        .into_iter()
+                        .map(|n| (n.hostname, n.node_id.to_string()))
+                        .collect()
+                } else {
+                    std::collections::HashMap::new()
+                };
+
             if !remote.is_empty() {
                 let cwds = state.session_cwds.lock().await;
 
                 for (session_id, peer_label) in remote {
                     let cwd = cwds.get(&session_id).map(|p| p.display().to_string());
+                    let node_id = node_id_by_label.get(&peer_label).cloned();
                     by_node
                         .entry(peer_label.clone())
                         .or_default()
@@ -136,6 +154,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                             fork_origin: None,
                             has_children: false,
                             node: Some(peer_label),
+                            node_id,
                             attached: Some(true), // in-memory remote sessions are attached
                         });
                 }
@@ -145,15 +164,11 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
             //    unattached ones so the UI can show "available" remote
             //    sessions after restart (Bug 2 fix).
             if state.agent.mesh().is_some() {
-                let remote_nodes = state.agent.list_remote_nodes().await;
-                for node_info in remote_nodes {
-                    let node_id_str = node_info.node_id.to_string();
-                    let peer_label = node_info.hostname.clone();
-
+                for (peer_label, node_id_str) in &node_id_by_label {
                     // Query the peer's sessions with a short timeout.
                     let sessions =
                         match tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                            let nm_ref = state.agent.find_node_manager(&node_id_str).await?;
+                            let nm_ref = state.agent.find_node_manager(node_id_str).await?;
                             state.agent.list_remote_sessions(&nm_ref).await
                         })
                         .await
@@ -196,6 +211,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                                 fork_origin: None,
                                 has_children: false,
                                 node: Some(peer_label.clone()),
+                                node_id: Some(node_id_str.clone()),
                                 attached: Some(false), // discovered but not attached
                             });
                     }

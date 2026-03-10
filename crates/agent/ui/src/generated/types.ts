@@ -613,6 +613,11 @@ export interface SessionSummary {
 	 */
 	node?: string;
 	/**
+	 * Stable PeerId of the remote node. Required by the frontend to send
+	 * `attach_remote_session`. Only set for remote sessions.
+	 */
+	node_id?: string;
+	/**
 	 * Whether this remote session is currently attached (has a live actor ref).
 	 * `Some(true)` = attached, `Some(false)` = discovered but not attached,
 	 * `None` = local session (not applicable).
