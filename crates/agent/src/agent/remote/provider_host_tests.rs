@@ -394,7 +394,7 @@ mod provider_host_tests {
     #[tokio::test]
     async fn test_stream_receiver_actor_kill_on_done_chunk() {
         let (tx, mut rx) = mpsc::channel(8);
-        let actor = StreamReceiverActor::new(tx, "test-done".to_string());
+        let actor = StreamReceiverActor::new(tx, "test-done".to_string(), None);
         let actor_ref = StreamReceiverActor::spawn(actor);
 
         let done_relay = StreamChunkRelay {
@@ -431,7 +431,7 @@ mod provider_host_tests {
     #[tokio::test]
     async fn test_stream_receiver_actor_kill_on_error_chunk() {
         let (tx, mut rx) = mpsc::channel(8);
-        let actor = StreamReceiverActor::new(tx, "test-err".to_string());
+        let actor = StreamReceiverActor::new(tx, "test-err".to_string(), None);
         let actor_ref = StreamReceiverActor::spawn(actor);
 
         let error_relay = StreamChunkRelay {

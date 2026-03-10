@@ -672,7 +672,7 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
             use crate::agent::remote::event_relay::EventRelayActor;
 
             if let Some(ref mesh) = self.mesh {
-                let relay_name = crate::agent::remote::dht_name::event_relay(&self.session_id);
+                let relay_name = msg.relay_dht_name.clone();
                 match mesh
                     .lookup_actor::<EventRelayActor>(relay_name.clone())
                     .await
@@ -1740,12 +1740,18 @@ mod tests {
         let f = ActorFixture::new().await;
         // Without remote feature, these are no-ops that return Ok(())
         f.actor_ref
-            .ask(crate::agent::messages::SubscribeEvents { relay_actor_id: 42 })
+            .ask(crate::agent::messages::SubscribeEvents {
+                relay_actor_id: 42,
+                relay_dht_name: "event_relay::test::peer-X".to_string(),
+            })
             .await
             .expect("ask SubscribeEvents");
 
         f.actor_ref
-            .ask(crate::agent::messages::UnsubscribeEvents { relay_actor_id: 42 })
+            .ask(crate::agent::messages::UnsubscribeEvents {
+                relay_actor_id: 42,
+                relay_dht_name: "event_relay::test::peer-X".to_string(),
+            })
             .await
             .expect("ask UnsubscribeEvents");
     }

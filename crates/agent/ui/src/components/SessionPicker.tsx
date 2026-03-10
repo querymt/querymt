@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react';
 import * as Collapsible from '@radix-ui/react-collapsible';
 import { SessionGroup, SessionSummary } from '../types';
 import { GlitchText } from './GlitchText';
-import { ChevronDown, ChevronRight, Search, Plus, Clock, GitBranch, Globe, Trash2 } from 'lucide-react';
+import { ChevronDown, ChevronRight, Search, Plus, Clock, GitBranch, Globe, Trash2, Plug } from 'lucide-react';
 import { useThinkingSessionIds } from '../hooks/useThinkingSessionIds';
 
 interface SessionPickerProps {
@@ -120,6 +120,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
   const renderSessionCard = (session: SessionSummary & { children?: SessionSummary[] }, sessionIndex: number, depth: number = 0) => {
     const isChild = !!session.parent_session_id;
     const isDelegation = session.fork_origin === 'delegation';
+    const isUnattached = session.attached === false;
     const indentClass = depth > 0 ? `ml-${depth * 6}` : '';
     const isActive = activeSessionId === session.session_id;
     const isThinking = thinkingSessionIds.has(session.session_id);
@@ -176,6 +177,12 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
                 <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 bg-accent-secondary/20 text-accent-secondary rounded border border-accent-secondary/30">
                   <Globe className="w-2.5 h-2.5" />
                   {session.node}
+                </span>
+              )}
+              {isUnattached && (
+                <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 bg-ui-secondary/20 text-ui-secondary rounded border border-ui-secondary/30">
+                  <Plug className="w-2.5 h-2.5" />
+                  click to attach
                 </span>
               )}
             </div>

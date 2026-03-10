@@ -534,6 +534,10 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                                  visible after all retries — peer may not have registered its actors yet"
                             );
                         }
+
+                        // Refresh session list so the UI session picker updates
+                        // with any newly-discoverable remote sessions (Bug 2 fix).
+                        super::handlers::handle_list_sessions(&state, &tx).await;
                     } else {
                         // Expired: push the updated (node-removed) list immediately.
                         let nodes = state.agent.list_remote_nodes().await;
@@ -610,6 +614,10 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                         if send_message(&tx, msg).await.is_err() {
                             break;
                         }
+
+                        // Refresh session list so expired peer's sessions are
+                        // removed from the UI (Bug 2 fix).
+                        super::handlers::handle_list_sessions(&state, &tx).await;
 
                         // Schedule a delayed re-check to catch any stale DHT
                         // records that resolved between the immediate push and

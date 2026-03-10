@@ -53,11 +53,15 @@ fn config_options(mode: AgentMode) -> Vec<SessionConfigOption> {
 pub struct SessionRegistry {
     pub config: Arc<AgentConfig>,
     sessions: HashMap<String, SessionActorRef>,
-    /// Tracks the `relay_actor_id` spawned for each remote session so that
-    /// `detach_remote_session` can send `UnsubscribeEvents` to the remote
-    /// `SessionActor` and stop the `EventForwarder` task.
+    /// Tracks the `(relay_actor_id, relay_dht_name)` spawned for each remote
+    /// session so that `detach_remote_session` can send `UnsubscribeEvents`
+    /// with both values.
     #[cfg(feature = "remote")]
-    relay_actor_ids: HashMap<String, u64>,
+    relay_actor_ids: HashMap<String, (u64, String)>,
+    /// Mesh handle for cleaning up re-registration closures when sessions
+    /// are removed (Phase 4 of Bug 1 fix).
+    #[cfg(feature = "remote")]
+    mesh: Option<crate::agent::remote::MeshHandle>,
 }
 
 impl SessionRegistry {
@@ -67,7 +71,16 @@ impl SessionRegistry {
             sessions: HashMap::new(),
             #[cfg(feature = "remote")]
             relay_actor_ids: HashMap::new(),
+            #[cfg(feature = "remote")]
+            mesh: None,
         }
+    }
+
+    /// Set the mesh handle so that `remove()` and `detach_remote_session()`
+    /// can deregister actors from the re-registration map.
+    #[cfg(feature = "remote")]
+    pub fn set_mesh(&mut self, mesh: Option<crate::agent::remote::MeshHandle>) {
+        self.mesh = mesh;
     }
 
     /// Merge MCP servers from the agent config with any client-supplied servers.
@@ -115,7 +128,15 @@ impl SessionRegistry {
     }
 
     /// Remove a session actor from the registry.
+    ///
+    /// Also deregisters the session's re-registration closure from the mesh
+    /// (if available) so dead actors don't accumulate (Phase 4 of Bug 1 fix).
     pub fn remove(&mut self, session_id: &str) -> Option<SessionActorRef> {
+        #[cfg(feature = "remote")]
+        if let Some(ref mesh) = self.mesh {
+            let session_dht_name = crate::agent::remote::dht_name::session(session_id);
+            mesh.deregister_actor(&session_dht_name);
+        }
         self.sessions.remove(session_id)
     }
 
@@ -199,24 +220,30 @@ impl SessionRegistry {
 
         // 3. Register the relay in REMOTE_REGISTRY + DHT so the remote
         //    SessionActor can look it up by name and install an EventForwarder.
+        //    Use peer-scoped name so multiple peers can attach to the same
+        //    session without overwriting each other's relay (Bug 3 fix).
         let mesh_active = mesh.is_some();
-        if let Some(ref mesh) = mesh {
-            mesh.register_actor(
-                relay_ref.clone(),
-                crate::agent::remote::dht_name::event_relay(&session_id),
-            )
-            .await;
+        let relay_dht_name = if let Some(ref mesh) = mesh {
+            let name = crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
+            mesh.register_actor(relay_ref.clone(), name.clone()).await;
+            name
         } else {
             log::debug!(
                 "attach_remote_session: no mesh, DHT registration skipped for relay (session {})",
                 session_id
             );
-        }
+            // Fallback name when there is no mesh (shouldn't happen in practice
+            // but keeps the type system happy).
+            format!("event_relay::{}::local", session_id)
+        };
 
         // 4. Send SubscribeEvents to the remote session.
         //    The remote SubscribeEvents handler uses mesh.lookup_actor to find
         //    the relay and install an EventForwarder on its EventBus.
-        if let Err(e) = session_ref.subscribe_events(relay_id).await {
+        if let Err(e) = session_ref
+            .subscribe_events(relay_id, relay_dht_name.clone())
+            .await
+        {
             log::warn!(
                 "attach_remote_session: SubscribeEvents failed for {} (event relay may not be active): {}",
                 session_id,
@@ -224,10 +251,11 @@ impl SessionRegistry {
             );
         }
 
-        // 5. Insert into registry and track relay id for later cleanup.
+        // 5. Insert into registry and track relay id + dht name for later cleanup.
         self.sessions
             .insert(session_id.clone(), session_ref.clone());
-        self.relay_actor_ids.insert(session_id.clone(), relay_id);
+        self.relay_actor_ids
+            .insert(session_id.clone(), (relay_id, relay_dht_name));
 
         log::info!(
             "Attached remote session {} from {} (relay_actor_id={}, event relay {})",
@@ -256,24 +284,40 @@ impl SessionRegistry {
     #[cfg(feature = "remote")]
     pub async fn detach_remote_session(&mut self, session_id: &str) -> Option<SessionActorRef> {
         // Send UnsubscribeEvents before removing so the remote forwarder is aborted.
-        if let (Some(session_ref), Some(relay_id)) = (
+        if let (Some(session_ref), Some((relay_id, relay_dht_name))) = (
             self.sessions.get(session_id),
-            self.relay_actor_ids.get(session_id).copied(),
+            self.relay_actor_ids.get(session_id).cloned(),
         ) && session_ref.is_remote()
         {
-            if let Err(e) = session_ref.unsubscribe_events(relay_id).await {
+            if let Err(e) = session_ref
+                .unsubscribe_events(relay_id, relay_dht_name.clone())
+                .await
+            {
                 log::warn!(
-                    "detach_remote_session: UnsubscribeEvents failed for {} (relay_actor_id={}): {}",
+                    "detach_remote_session: UnsubscribeEvents failed for {} (relay_actor_id={}, relay_dht_name={}): {}",
                     session_id,
                     relay_id,
+                    relay_dht_name,
                     e
                 );
             } else {
                 log::info!(
-                    "detach_remote_session: sent UnsubscribeEvents for {} (relay_actor_id={})",
+                    "detach_remote_session: sent UnsubscribeEvents for {} (relay_actor_id={}, relay_dht_name={})",
                     session_id,
                     relay_id,
+                    relay_dht_name,
                 );
+            }
+        }
+
+        // Deregister the session and relay actors from the re-registration map
+        // so dead closures don't accumulate (Phase 4 of Bug 1 fix).
+        if let Some(ref mesh) = self.mesh {
+            let session_dht_name = crate::agent::remote::dht_name::session(session_id);
+            mesh.deregister_actor(&session_dht_name);
+
+            if let Some((_, relay_name)) = self.relay_actor_ids.get(session_id) {
+                mesh.deregister_actor(relay_name);
             }
         }
 

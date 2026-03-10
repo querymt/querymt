@@ -25,7 +25,7 @@
 //! |------------------------|-------------------------------------|
 //! | `ProviderHostActor`    | `provider_host::peer::{peer_id}`    |
 //! | `SessionActor`         | `session::{session_id}`             |
-//! | `EventRelayActor`      | `event_relay::{session_id}`         |
+//! | `EventRelayActor`      | `event_relay::{session_id}::{peer_id}` |
 //! | `StreamReceiverActor`  | `stream_rx::{request_id}`           |
 //! | `RemoteNodeManager`    | `node_manager`                      |
 
@@ -71,12 +71,16 @@ pub fn session(session_id: &str) -> String {
     format!("session::{}", session_id)
 }
 
-/// DHT name for an `EventRelayActor` associated with a session.
+/// DHT name for an `EventRelayActor` associated with a session and peer.
 ///
 /// The local node registers this actor so that the remote `SessionActor`
 /// can look it up and install an `EventForwarder` that streams events back.
-pub fn event_relay(session_id: &str) -> String {
-    format!("event_relay::{}", session_id)
+///
+/// Scoped per `peer_id` so that multiple peers attaching to the same remote
+/// session each get their own relay entry in the DHT, preventing a 3rd agent
+/// from overwriting the first agent's relay (Bug 3 fix).
+pub fn event_relay(session_id: &str, peer_id: &impl fmt::Display) -> String {
+    format!("event_relay::{}::{}", session_id, peer_id)
 }
 
 /// DHT name for an ephemeral `StreamReceiverActor`.
@@ -121,7 +125,20 @@ mod tests {
 
     #[test]
     fn event_relay_format() {
-        assert_eq!(event_relay("abc-123"), "event_relay::abc-123");
+        assert_eq!(
+            event_relay("abc-123", &"12D3KooWABC"),
+            "event_relay::abc-123::12D3KooWABC"
+        );
+    }
+
+    #[test]
+    fn event_relay_different_peers_produce_different_names() {
+        let name_a = event_relay("session-1", &"peerA");
+        let name_b = event_relay("session-1", &"peerB");
+        assert_ne!(
+            name_a, name_b,
+            "different peers must produce different relay names"
+        );
     }
 
     #[test]

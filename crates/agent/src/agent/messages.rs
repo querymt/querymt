@@ -188,6 +188,13 @@ pub struct GetHistory;
 #[derive(Serialize, Deserialize)]
 pub struct SubscribeEvents {
     pub relay_actor_id: u64,
+    /// Peer-scoped DHT name for the relay actor.
+    ///
+    /// Format: `event_relay::{session_id}::{peer_id}`.  Provided by the
+    /// attaching peer so the `SessionActor` looks up the correct per-peer
+    /// relay instead of a shared name that would collide when multiple
+    /// peers attach to the same session (Bug 3 fix).
+    pub relay_dht_name: String,
 }
 
 /// Unsubscribe a previously registered event relay.
@@ -196,6 +203,8 @@ pub struct SubscribeEvents {
 #[derive(Serialize, Deserialize)]
 pub struct UnsubscribeEvents {
     pub relay_actor_id: u64,
+    /// Peer-scoped DHT name, matching the one sent in `SubscribeEvents`.
+    pub relay_dht_name: String,
 }
 
 /// Set planning context on a delegate session.
@@ -404,18 +413,26 @@ mod tests {
 
     #[test]
     fn subscribe_events_message_serializes() {
-        let msg = SubscribeEvents { relay_actor_id: 42 };
+        let msg = SubscribeEvents {
+            relay_actor_id: 42,
+            relay_dht_name: "event_relay::sess-1::peer-A".to_string(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let rt: SubscribeEvents = serde_json::from_str(&json).unwrap();
         assert_eq!(rt.relay_actor_id, 42);
+        assert_eq!(rt.relay_dht_name, "event_relay::sess-1::peer-A");
     }
 
     #[test]
     fn unsubscribe_events_message_serializes() {
-        let msg = UnsubscribeEvents { relay_actor_id: 99 };
+        let msg = UnsubscribeEvents {
+            relay_actor_id: 99,
+            relay_dht_name: "event_relay::sess-2::peer-B".to_string(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let rt: UnsubscribeEvents = serde_json::from_str(&json).unwrap();
         assert_eq!(rt.relay_actor_id, 99);
+        assert_eq!(rt.relay_dht_name, "event_relay::sess-2::peer-B");
     }
 
     #[test]

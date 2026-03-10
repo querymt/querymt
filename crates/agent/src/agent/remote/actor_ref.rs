@@ -355,6 +355,10 @@ impl SessionActorRef {
     ///
     /// Registers an event forwarder on the session that sends events to the
     /// specified relay actor (identified by its ActorId as u64).
+    ///
+    /// `relay_dht_name` is the peer-scoped DHT name under which the relay
+    /// actor is registered, so the remote `SessionActor` can look up the
+    /// correct per-peer relay.
     #[tracing::instrument(
         name = "remote.session_ref.subscribe_events",
         skip(self),
@@ -362,18 +366,29 @@ impl SessionActorRef {
             is_remote = self.is_remote(),
             peer_label = %self.node_label(),
             relay_actor_id,
+            relay_dht_name = %relay_dht_name,
         )
     )]
-    pub async fn subscribe_events(&self, relay_actor_id: u64) -> Result<(), AcpError> {
+    pub async fn subscribe_events(
+        &self,
+        relay_actor_id: u64,
+        relay_dht_name: String,
+    ) -> Result<(), AcpError> {
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(messages::SubscribeEvents { relay_actor_id })
+                .ask(messages::SubscribeEvents {
+                    relay_actor_id,
+                    relay_dht_name,
+                })
                 .await
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::SubscribeEvents { relay_actor_id })
+                .ask(&messages::SubscribeEvents {
+                    relay_actor_id,
+                    relay_dht_name,
+                })
                 .await
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
         }
@@ -401,16 +416,26 @@ impl SessionActorRef {
     }
 
     /// Unsubscribe from events (remove event forwarder).
-    pub async fn unsubscribe_events(&self, relay_actor_id: u64) -> Result<(), AcpError> {
+    pub async fn unsubscribe_events(
+        &self,
+        relay_actor_id: u64,
+        relay_dht_name: String,
+    ) -> Result<(), AcpError> {
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(messages::UnsubscribeEvents { relay_actor_id })
+                .ask(messages::UnsubscribeEvents {
+                    relay_actor_id,
+                    relay_dht_name,
+                })
                 .await
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::UnsubscribeEvents { relay_actor_id })
+                .ask(&messages::UnsubscribeEvents {
+                    relay_actor_id,
+                    relay_dht_name,
+                })
                 .await
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
         }

@@ -612,6 +612,12 @@ export interface SessionSummary {
 	 * peer hostname/label for remote sessions (display only).
 	 */
 	node?: string;
+	/**
+	 * Whether this remote session is currently attached (has a live actor ref).
+	 * `true` = attached, `false` = discovered but not attached,
+	 * `undefined` = local session (not applicable).
+	 */
+	attached?: boolean;
 }
 
 /** Group of sessions by working directory. */

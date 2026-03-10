@@ -169,6 +169,8 @@ pub struct StreamReceiverActor {
     /// The name this actor is registered under in the Kademlia DHT.
     /// Used to deregister on stop so the entry doesn't linger.
     dht_name: String,
+    /// Optional mesh handle for cleaning up re-registration closures on stop.
+    mesh: Option<super::mesh::MeshHandle>,
 }
 
 impl kameo::Actor for StreamReceiverActor {
@@ -187,6 +189,12 @@ impl kameo::Actor for StreamReceiverActor {
         _actor_ref: kameo::actor::WeakActorRef<Self>,
         _reason: kameo::error::ActorStopReason,
     ) -> Result<(), Self::Error> {
+        // Remove the re-registration closure so dead actors don't accumulate
+        // in the MeshHandle's re_register_fns map (Bug 1 fix).
+        if let Some(ref mesh) = self.mesh {
+            mesh.deregister_actor(&self.dht_name);
+        }
+
         // Deregister from the Kademlia DHT so the ephemeral name entry is cleaned up.
         if let Err(e) = kameo::remote::unregister(self.dht_name.clone()).await {
             log::debug!(
@@ -205,8 +213,12 @@ impl kameo::Actor for StreamReceiverActor {
 }
 
 impl StreamReceiverActor {
-    pub fn new(tx: mpsc::Sender<Result<StreamChunk, String>>, dht_name: String) -> Self {
-        Self { tx, dht_name }
+    pub fn new(
+        tx: mpsc::Sender<Result<StreamChunk, String>>,
+        dht_name: String,
+        mesh: Option<super::mesh::MeshHandle>,
+    ) -> Self {
+        Self { tx, dht_name, mesh }
     }
 }
 

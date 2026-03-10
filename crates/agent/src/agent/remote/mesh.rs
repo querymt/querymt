@@ -198,7 +198,7 @@ pub struct MeshHandle {
     /// Populated by `register_actor`; invoked by the event loop whenever mDNS
     /// discovers a new peer so the new peer's Kademlia routing table is
     /// populated immediately rather than waiting for the next republish cycle.
-    re_register_fns: Arc<RwLock<Vec<ReRegisterFn>>>,
+    re_register_fns: Arc<RwLock<HashMap<String, ReRegisterFn>>>,
 }
 
 impl std::fmt::Debug for MeshHandle {
@@ -220,7 +220,7 @@ impl MeshHandle {
         peer_events_tx: broadcast::Sender<PeerEvent>,
         known_peers: Arc<RwLock<HashMap<PeerId, HashSet<Multiaddr>>>>,
         local_hostname: String,
-        re_register_fns: Arc<RwLock<Vec<ReRegisterFn>>>,
+        re_register_fns: Arc<RwLock<HashMap<String, ReRegisterFn>>>,
     ) -> Self {
         Self {
             peer_id,
@@ -327,7 +327,7 @@ impl MeshHandle {
             })
         });
         if let Ok(mut fns) = self.re_register_fns.write() {
-            fns.push(re_register);
+            fns.insert(name.clone(), re_register);
         }
     }
 
@@ -468,6 +468,38 @@ impl MeshHandle {
         None
     }
 
+    /// Remove the re-registration closure for a named actor.
+    ///
+    /// Call this when a mesh-registered actor is stopped so that its closure
+    /// does not accumulate in the re-registration map and fire uselessly on
+    /// every future peer discovery event.
+    ///
+    /// No-op if `name` is not present.
+    pub fn deregister_actor(&self, name: &str) {
+        if let Ok(mut fns) = self.re_register_fns.write() {
+            fns.remove(name);
+        }
+    }
+
+    /// Return the number of currently registered re-registration closures.
+    ///
+    /// Useful for tests and debug logging to verify that dead actors are
+    /// cleaned up properly.
+    pub fn re_register_fns_count(&self) -> usize {
+        self.re_register_fns.read().map(|g| g.len()).unwrap_or(0)
+    }
+
+    /// Check whether a re-registration closure exists for the given name.
+    ///
+    /// Useful in tests to verify register/deregister without relying on
+    /// absolute counts (the test mesh is shared across concurrent tests).
+    pub fn has_re_register_fn(&self, name: &str) -> bool {
+        self.re_register_fns
+            .read()
+            .map(|g| g.contains_key(name))
+            .unwrap_or(false)
+    }
+
     /// Return all currently-known peer IDs (alive, not expired).
     pub fn known_peer_ids(&self) -> Vec<PeerId> {
         self.known_peers
@@ -531,7 +563,8 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
     // Re-registration closures — populated by register_actor, consumed by the
     // event loop on mDNS Discovered to re-publish all local actors into the
     // new peer's Kademlia routing table immediately (Phase 1c).
-    let re_register_fns: Arc<RwLock<Vec<ReRegisterFn>>> = Arc::new(RwLock::new(Vec::new()));
+    let re_register_fns: Arc<RwLock<HashMap<String, ReRegisterFn>>> =
+        Arc::new(RwLock::new(HashMap::new()));
     let re_register_fns_loop = Arc::clone(&re_register_fns);
 
     // Cache hostname once at bootstrap time (same logic as RemoteNodeManager).
@@ -696,7 +729,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                         // waiting for the next Kademlia republish cycle.
                         let fns: Vec<ReRegisterFn> = re_register_fns_loop
                             .read()
-                            .map(|g| g.clone())
+                            .map(|g| g.values().cloned().collect())
                             .unwrap_or_default();
                         if !fns.is_empty() {
                             tokio::spawn(async move {
@@ -790,7 +823,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                         // DHT lookups from that peer succeed right away.
                         let fns: Vec<ReRegisterFn> = re_register_fns_loop
                             .read()
-                            .map(|g| g.clone())
+                            .map(|g| g.values().cloned().collect())
                             .unwrap_or_default();
                         if !fns.is_empty() {
                             tokio::spawn(async move {
@@ -917,5 +950,70 @@ mod tests {
         let mesh = get_test_mesh().await.clone();
         let result = mesh.resolve_peer_node_id("nonexistent-peer-xyz").await;
         assert!(result.is_none());
+    }
+
+    /// `re_register_fns_count` returns a valid count (test mesh is shared,
+    /// so the count may be non-zero if other tests have registered actors).
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn re_register_fns_count_is_accessible() {
+        use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
+
+        let mesh = get_test_mesh().await.clone();
+        // Just verify the method works and returns a sane value.
+        let count = mesh.re_register_fns_count();
+        assert!(
+            count < 10_000,
+            "re_register_fns_count should be finite, got {}",
+            count
+        );
+    }
+
+    /// `deregister_actor` removes the re-registration closure for a given name.
+    ///
+    /// The test mesh is shared across all tests so we cannot rely on absolute
+    /// counts. Instead we verify the specific key is present after register
+    /// and absent after deregister.
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn deregister_actor_removes_re_register_fn() {
+        use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
+
+        let mesh = get_test_mesh().await.clone();
+
+        // Register a dummy actor under a unique name
+        let test_name = format!("test_deregister_{}", uuid::Uuid::now_v7());
+        use crate::agent::remote::provider_host::StreamReceiverActor;
+        use kameo::actor::Spawn;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let actor = StreamReceiverActor::new(tx, test_name.clone(), None);
+        let actor_ref = StreamReceiverActor::spawn(actor);
+        mesh.register_actor(actor_ref, test_name.clone()).await;
+
+        // Verify the key is present
+        assert!(
+            mesh.has_re_register_fn(&test_name),
+            "register_actor should insert a re-register fn under the given name"
+        );
+
+        // Deregister
+        mesh.deregister_actor(&test_name);
+
+        assert!(
+            !mesh.has_re_register_fn(&test_name),
+            "deregister_actor should remove the re-register fn"
+        );
+    }
+
+    /// `deregister_actor` is a no-op for unknown names (no panic).
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn deregister_actor_unknown_name_is_noop() {
+        use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
+
+        let mesh = get_test_mesh().await.clone();
+        let before = mesh.re_register_fns_count();
+        mesh.deregister_actor("nonexistent_actor_name");
+        assert_eq!(mesh.re_register_fns_count(), before);
     }
 }

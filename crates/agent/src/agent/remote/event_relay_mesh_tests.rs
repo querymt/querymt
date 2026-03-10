@@ -43,8 +43,10 @@ mod event_relay_mesh_tests {
         let relay = EventRelayActor::new(event_sink.clone(), label.to_string());
         let relay_ref = EventRelayActor::spawn(relay);
 
-        let dht_name =
-            crate::agent::remote::dht_name::event_relay(&format!("{}-{}", label, test_id));
+        let dht_name = crate::agent::remote::dht_name::event_relay(
+            &format!("{}-{}", label, test_id),
+            mesh.peer_id(),
+        );
         mesh.register_actor(relay_ref.clone(), dht_name.clone())
             .await;
 
@@ -237,7 +239,8 @@ mod event_relay_mesh_tests {
         let session_ref = SessionActorRef::Local(session_ref_local);
 
         // Register a relay under the name the SubscribeEvents handler looks for.
-        let relay_dht_name = crate::agent::remote::dht_name::event_relay(&session_id);
+        let relay_dht_name =
+            crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let journal = storage.event_journal();
         let fanout = Arc::new(EventFanout::new());
@@ -254,8 +257,10 @@ mod event_relay_mesh_tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // SubscribeEvents with any relay_actor_id — the handler looks up
-        // "event_relay::{session_id}" in the DHT.
-        let result = session_ref.subscribe_events(1).await;
+        // the relay via the peer-scoped DHT name.
+        let result = session_ref
+            .subscribe_events(1, relay_dht_name.clone())
+            .await;
         assert!(result.is_ok(), "subscribe_events should succeed");
 
         // Verify the forwarder is working by publishing an event to the session's
@@ -329,9 +334,11 @@ mod event_relay_mesh_tests {
         let session_ref = SessionActorRef::Local(session_ref_local);
 
         // Intentionally do NOT register the relay in the DHT.
+        let relay_dht_name =
+            crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
 
         // Should return Ok (no panic), just logs a warning.
-        let result = session_ref.subscribe_events(99).await;
+        let result = session_ref.subscribe_events(99, relay_dht_name).await;
         assert!(
             result.is_ok(),
             "subscribe_events should return Ok even with no relay in DHT"
@@ -379,7 +386,8 @@ mod event_relay_mesh_tests {
         let session_ref = SessionActorRef::Local(session_ref_local);
 
         // Register relay expected by SubscribeEvents.
-        let relay_dht_name = crate::agent::remote::dht_name::event_relay(&session_id);
+        let relay_dht_name =
+            crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let journal = storage.event_journal();
         let fanout = Arc::new(EventFanout::new());
@@ -395,7 +403,7 @@ mod event_relay_mesh_tests {
         let mut rx = relay_sink.fanout().subscribe();
 
         session_ref
-            .subscribe_events(123)
+            .subscribe_events(123, relay_dht_name.clone())
             .await
             .expect("subscribe_events should succeed");
 
@@ -610,23 +618,28 @@ mod event_relay_mesh_tests {
         let session_ref = SessionActorRef::Local(session_ref_local);
 
         // Register a relay so subscribe actually starts a forwarder.
-        let relay_dht_name = crate::agent::remote::dht_name::event_relay(&session_id);
+        let relay_dht_name =
+            crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let journal = storage.event_journal();
         let fanout = Arc::new(EventFanout::new());
         let relay_sink = Arc::new(EventSink::new(journal, fanout));
         let relay = EventRelayActor::new(relay_sink, "f6-relay".to_string());
         let relay_ref = EventRelayActor::spawn(relay);
-        mesh.register_actor(relay_ref.clone(), relay_dht_name).await;
+        mesh.register_actor(relay_ref.clone(), relay_dht_name.clone())
+            .await;
         let _ = relay_ref;
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        session_ref.subscribe_events(7).await.expect("subscribe");
+        session_ref
+            .subscribe_events(7, relay_dht_name.clone())
+            .await
+            .expect("subscribe");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Unsubscribe — the forwarder task should be aborted.
-        let result = session_ref.unsubscribe_events(7).await;
+        let result = session_ref.unsubscribe_events(7, relay_dht_name).await;
         assert!(result.is_ok(), "unsubscribe_events should return Ok");
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

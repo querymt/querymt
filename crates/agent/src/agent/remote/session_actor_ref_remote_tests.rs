@@ -166,10 +166,14 @@ mod session_actor_ref_remote_tests {
     async fn test_remote_ref_subscribe_unsubscribe_roundtrip() {
         let (session_ref, _local) = remote_session_ref("e8").await;
 
-        let result = session_ref.subscribe_events(99).await;
+        let result = session_ref
+            .subscribe_events(99, "event_relay::test::peer-e8".to_string())
+            .await;
         assert!(result.is_ok(), "subscribe_events should return Ok");
 
-        let result = session_ref.unsubscribe_events(99).await;
+        let result = session_ref
+            .unsubscribe_events(99, "event_relay::test::peer-e8".to_string())
+            .await;
         assert!(result.is_ok(), "unsubscribe_events should return Ok");
     }
 

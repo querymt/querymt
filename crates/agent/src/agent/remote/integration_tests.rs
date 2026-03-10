@@ -486,8 +486,10 @@ mod remote_session_lifecycle_integration_tests {
         let relay = EventRelayActor::new(alpha_sink.clone(), "alpha-relay-g8".to_string());
         let relay_ref = EventRelayActor::spawn(relay);
 
-        let relay_dht_name = crate::agent::remote::dht_name::event_relay(&resp.session_id);
-        mesh.register_actor(relay_ref.clone(), relay_dht_name).await;
+        let relay_dht_name =
+            crate::agent::remote::dht_name::event_relay(&resp.session_id, mesh.peer_id());
+        mesh.register_actor(relay_ref.clone(), relay_dht_name.clone())
+            .await;
         let _ = relay_ref;
 
         // Allow DHT propagation before subscribing (mitigates Bug #5 for this test).
@@ -506,7 +508,10 @@ mod remote_session_lifecycle_integration_tests {
             peer_label: "beta".to_string(),
         };
 
-        session_ref.subscribe_events(1).await.expect("subscribe");
+        session_ref
+            .subscribe_events(1, relay_dht_name)
+            .await
+            .expect("subscribe");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Trigger an event on Beta's session by changing mode.

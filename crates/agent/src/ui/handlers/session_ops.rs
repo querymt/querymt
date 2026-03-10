@@ -82,7 +82,8 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                     parent_session_id: s.parent_session_id,
                     fork_origin: s.fork_origin,
                     has_children: s.has_children,
-                    node: None, // local sessions have no node label
+                    node: None,     // local sessions have no node label
+                    attached: None, // not applicable for local sessions
                 })
                 .collect(),
         })
@@ -103,16 +104,21 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
     #[cfg(feature = "remote")]
     {
         async {
+            // 1. Collect already-attached remote sessions from the registry.
+            let attached_sessions: std::collections::HashSet<String>;
             let remote = {
                 let registry = state.agent.registry.lock().await;
-                registry.remote_sessions()
+                let sessions = registry.remote_sessions();
+                attached_sessions = sessions.iter().map(|(id, _)| id.clone()).collect();
+                sessions
             };
+
+            // Collect per-node groups: node_label -> Vec<SessionSummary>
+            let mut by_node: std::collections::HashMap<String, Vec<SessionSummary>> =
+                std::collections::HashMap::new();
+
             if !remote.is_empty() {
                 let cwds = state.session_cwds.lock().await;
-
-                // Collect per-node groups: node_label -> Vec<SessionSummary>
-                let mut by_node: std::collections::HashMap<String, Vec<SessionSummary>> =
-                    std::collections::HashMap::new();
 
                 for (session_id, peer_label) in remote {
                     let cwd = cwds.get(&session_id).map(|p| p.display().to_string());
@@ -130,20 +136,82 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                             fork_origin: None,
                             has_children: false,
                             node: Some(peer_label),
+                            attached: Some(true), // in-memory remote sessions are attached
                         });
                 }
+            }
 
-                for (node_label, sessions) in by_node {
-                    remote_group_count += 1;
-                    remote_session_count += sessions.len();
-                    // Use a synthetic cwd like "remote::<node>" so the group header
-                    // is recognisable without requiring a real path.
-                    groups.push(SessionGroup {
-                        cwd: Some(format!("remote::{}", node_label)),
-                        sessions,
-                        latest_activity: None,
-                    });
+            // 2. Query each live peer for their sessions and include
+            //    unattached ones so the UI can show "available" remote
+            //    sessions after restart (Bug 2 fix).
+            if state.agent.mesh().is_some() {
+                let remote_nodes = state.agent.list_remote_nodes().await;
+                for node_info in remote_nodes {
+                    let node_id_str = node_info.node_id.to_string();
+                    let peer_label = node_info.hostname.clone();
+
+                    // Query the peer's sessions with a short timeout.
+                    let sessions =
+                        match tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                            let nm_ref = state.agent.find_node_manager(&node_id_str).await?;
+                            state.agent.list_remote_sessions(&nm_ref).await
+                        })
+                        .await
+                        {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                log::debug!(
+                                    "handle_list_sessions: failed to query sessions from {}: {}",
+                                    peer_label,
+                                    e.message
+                                );
+                                continue;
+                            }
+                            Err(_) => {
+                                log::debug!(
+                                    "handle_list_sessions: timeout querying sessions from {}",
+                                    peer_label
+                                );
+                                continue;
+                            }
+                        };
+
+                    for session_info in sessions {
+                        // Skip sessions that are already attached.
+                        if attached_sessions.contains(&session_info.session_id) {
+                            continue;
+                        }
+
+                        by_node
+                            .entry(peer_label.clone())
+                            .or_default()
+                            .push(SessionSummary {
+                                session_id: session_info.session_id,
+                                name: None,
+                                cwd: session_info.cwd,
+                                title: None,
+                                created_at: None,
+                                updated_at: None,
+                                parent_session_id: None,
+                                fork_origin: None,
+                                has_children: false,
+                                node: Some(peer_label.clone()),
+                                attached: Some(false), // discovered but not attached
+                            });
+                    }
                 }
+            }
+
+            for (node_label, sessions) in by_node {
+                remote_group_count += 1;
+                remote_session_count += sessions.len();
+                // Use a synthetic cwd like "remote::<node>" so the group header
+                // is recognisable without requiring a real path.
+                groups.push(SessionGroup {
+                    cwd: Some(format!("remote::{}", node_label)),
+                    sessions,
+                    latest_activity: None,
+                });
             }
         }
         .instrument(tracing::info_span!("ui.handle_list_sessions.remote_merge"))

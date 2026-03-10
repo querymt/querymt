@@ -217,7 +217,8 @@ impl ChatProvider for MeshChatProvider {
                 "remote.mesh_provider.dht_register_receiver",
                 stream_rx_name = %stream_rx_name,
             );
-            let receiver_actor = StreamReceiverActor::new(tx, stream_rx_name.clone());
+            let receiver_actor =
+                StreamReceiverActor::new(tx, stream_rx_name.clone(), Some(self.mesh.clone()));
             let receiver_ref = StreamReceiverActor::spawn(receiver_actor);
 
             // Register in REMOTE_REGISTRY + DHT so the remote ProviderHostActor can

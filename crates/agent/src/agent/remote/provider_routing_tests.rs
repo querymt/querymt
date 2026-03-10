@@ -362,7 +362,7 @@ mod provider_routing_integration_tests {
         let (tx, _rx) = mpsc::channel(16);
         let stream_rx_name =
             crate::agent::remote::dht_name::stream_receiver(&format!("h9-{}", test_id));
-        let receiver_actor = StreamReceiverActor::new(tx, stream_rx_name.clone());
+        let receiver_actor = StreamReceiverActor::new(tx, stream_rx_name.clone(), None);
         let receiver_ref = StreamReceiverActor::spawn(receiver_actor);
         mesh.register_actor(receiver_ref.clone(), stream_rx_name.clone())
             .await;

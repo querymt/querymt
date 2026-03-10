@@ -435,7 +435,13 @@ impl LocalAgentHandle {
     #[cfg(feature = "remote")]
     pub fn set_mesh(&self, mesh: crate::agent::remote::MeshHandle) {
         *self.mesh.lock().unwrap_or_else(|e| e.into_inner()) = Some(mesh.clone());
-        self.config.provider.set_mesh(Some(mesh));
+        self.config.provider.set_mesh(Some(mesh.clone()));
+
+        // Propagate to the session registry so remove/detach can clean up
+        // re-registration closures (Phase 4 of Bug 1 fix).
+        if let Ok(mut registry) = self.registry.try_lock() {
+            registry.set_mesh(Some(mesh));
+        }
     }
 
     /// Enable/disable automatic mesh fallback for unpinned provider resolution.

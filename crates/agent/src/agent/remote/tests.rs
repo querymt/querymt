@@ -152,12 +152,12 @@ async fn test_local_ref_subscribe_unsubscribe_events() {
 
     // Subscribe with a dummy relay_actor_id
     session_ref
-        .subscribe_events(42)
+        .subscribe_events(42, "event_relay::test-events-1::local".to_string())
         .await
         .expect("subscribe_events");
     // Unsubscribe
     session_ref
-        .unsubscribe_events(42)
+        .unsubscribe_events(42, "event_relay::test-events-1::local".to_string())
         .await
         .expect("unsubscribe_events");
 }
