@@ -424,5 +424,52 @@ describe('ModelPickerPopover', () => {
       // Should only show 5 items
       expect(recentItems.length).toBe(5);
     });
+
+    describe('node badge — local model on remote session', () => {
+      const LOCAL_PEER_ID = '12D3KooWAbcDefGhiJklMnoPqrStuVwxYz0123456789';
+      const REMOTE_NODE_ID = '12D3KooWRemoteNode111111111111111111111111111';
+
+      it('hides node badge when currentNode is the local peer (not in remoteNodes)', () => {
+        render(
+          <ModelPickerPopover
+            {...defaultProps}
+            currentProvider="anthropic"
+            currentModel="claude-3-opus"
+            currentNode={LOCAL_PEER_ID}
+            remoteNodes={[{ id: REMOTE_NODE_ID, label: 'remote-host', capabilities: [], active_sessions: 0 }]}
+          />
+        );
+        // The raw peer id should never appear anywhere
+        expect(screen.queryByText(LOCAL_PEER_ID)).not.toBeInTheDocument();
+        // The model name is still visible (may appear in both trigger and panel footer)
+        expect(screen.getAllByText(/anthropic \/ claude-3-opus/).length).toBeGreaterThanOrEqual(1);
+      });
+
+      it('hides node badge when remoteNodes is not provided', () => {
+        render(
+          <ModelPickerPopover
+            {...defaultProps}
+            currentProvider="anthropic"
+            currentModel="claude-3-opus"
+            currentNode={LOCAL_PEER_ID}
+          />
+        );
+        expect(screen.queryByText(LOCAL_PEER_ID)).not.toBeInTheDocument();
+      });
+
+      it('shows node badge with hostname when currentNode matches a known remote peer', () => {
+        render(
+          <ModelPickerPopover
+            {...defaultProps}
+            currentProvider="anthropic"
+            currentModel="claude-3-opus"
+            currentNode={REMOTE_NODE_ID}
+            remoteNodes={[{ id: REMOTE_NODE_ID, label: 'remote-host', capabilities: [], active_sessions: 0 }]}
+          />
+        );
+        expect(screen.getByText('remote-host')).toBeInTheDocument();
+        expect(screen.queryByText(REMOTE_NODE_ID)).not.toBeInTheDocument();
+      });
+    });
   });
 });

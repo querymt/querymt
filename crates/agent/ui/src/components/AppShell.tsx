@@ -616,6 +616,7 @@ export function AppShell() {
                 currentProvider={activeAgentModel?.provider}
                 currentModel={activeAgentModel?.model}
                 currentNode={activeAgentModel?.node}
+                remoteNodes={remoteNodes}
                 currentWorkspace={currentWorkspace}
                 recentModelsByWorkspace={recentModelsByWorkspace}
                 agentMode={agentMode}
@@ -694,6 +695,7 @@ export function AppShell() {
             currentProvider={activeAgentModel?.provider}
             currentModel={activeAgentModel?.model}
             currentNode={activeAgentModel?.node}
+            remoteNodes={remoteNodes}
             currentWorkspace={currentWorkspace}
             recentModelsByWorkspace={recentModelsByWorkspace}
             agentMode={agentMode}

@@ -8,6 +8,7 @@ import type {
   ModelEntry,
   ProviderCapabilityEntry,
   RecentModelEntry,
+  RemoteNodeInfo,
   RoutingMode,
   UiAgentInfo,
 } from '../types';
@@ -32,6 +33,8 @@ interface ModelPickerPopoverProps {
   currentModel?: string;
   /** Mesh node running the current provider, if any. Absent for local providers. */
   currentNode?: string;
+  /** Known remote nodes — used to resolve a human-readable label for currentNode. */
+  remoteNodes?: RemoteNodeInfo[];
   currentWorkspace: string | null;
   recentModelsByWorkspace: Record<string, RecentModelEntry[]>;
   agentMode: string;
@@ -640,6 +643,7 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
   currentProvider,
   currentModel,
   currentNode,
+  remoteNodes,
   currentWorkspace,
   recentModelsByWorkspace,
   agentMode,
@@ -655,13 +659,15 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
   const commandListRef = useRef<HTMLDivElement>(null);
   const { focusMainInput } = useUiStore();
 
-  // Cheap trigger-only derivations — no allModels scan
-  const triggerLabel = makeTriggerLabel(currentProvider, currentModel);
+  // Resolve node badge label from the known remote-nodes list.
+  // If currentNode is not found in remoteNodes it is the local peer — show no badge.
   const currentNodeLabel = useMemo(() => {
     if (!currentNode) return undefined;
-    const entry = allModels.find((m) => m.node_id === currentNode);
-    return entry?.node_label ?? currentNode;
-  }, [allModels, currentNode]);
+    return remoteNodes?.find((n) => n.id === currentNode)?.label;
+  }, [currentNode, remoteNodes]);
+
+  // Cheap trigger-only derivations — no allModels scan
+  const triggerLabel = makeTriggerLabel(currentProvider, currentModel);
   const triggerTitle = makeTriggerTitle(currentProvider, currentModel, currentNodeLabel);
 
   // Shared panel props — passed through only when panel is mounted
