@@ -234,10 +234,8 @@ async fn main() -> Result<()> {
             .reference_text
             .context("--reference-text is required when using --reference-audio")?;
         Some(VoiceConfig::clone_voice(reference_audio, reference_text))
-    } else if let Some(description) = args.voice_description {
-        Some(VoiceConfig::design(description))
     } else {
-        None
+        args.voice_description.map(VoiceConfig::design)
     };
 
     let mut req = TtsRequest::new().text(args.text);
