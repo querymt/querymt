@@ -37,6 +37,12 @@ export interface UiState {
   todoRailCollapsed: boolean;
   setTodoRailCollapsed: (collapsed: boolean) => void;
   
+  schedulePanelCollapsed: boolean;
+  setSchedulePanelCollapsed: (collapsed: boolean) => void;
+  
+  createScheduleDialogOpen: boolean;
+  setCreateScheduleDialogOpen: (open: boolean) => void;
+  
   delegationsPanelCollapsed: boolean;
   setDelegationsPanelCollapsed: (collapsed: boolean) => void;
   
@@ -125,6 +131,8 @@ export const useUiStore = create<UiState>((set, get) => ({
   // Initial state
   mainInputRef: null,
   todoRailCollapsed: false,
+  schedulePanelCollapsed: true,
+  createScheduleDialogOpen: false,
   delegationsPanelCollapsed: false,
   sessionCopied: false,
   activeTimelineView: 'chat',
@@ -162,6 +170,13 @@ export const useUiStore = create<UiState>((set, get) => ({
     // Persist to localStorage
     localStorage.setItem('todoRailCollapsed', collapsed.toString());
   },
+  
+  setSchedulePanelCollapsed: (collapsed) => {
+    set({ schedulePanelCollapsed: collapsed });
+    localStorage.setItem('schedulePanelCollapsed', collapsed.toString());
+  },
+  
+  setCreateScheduleDialogOpen: (open) => set({ createScheduleDialogOpen: open }),
   
   setDelegationsPanelCollapsed: (collapsed) => set({ delegationsPanelCollapsed: collapsed }),
   
@@ -310,6 +325,7 @@ export const useUiStore = create<UiState>((set, get) => ({
   // Load persisted state from localStorage
   loadPersistedState: () => {
     const todoRailCollapsed = localStorage.getItem('todoRailCollapsed') === 'true';
+    const schedulePanelCollapsed = localStorage.getItem('schedulePanelCollapsed') !== 'false'; // default collapsed
     const modeModelPreferencesRaw = localStorage.getItem('modeModelPreferences');
     const modeModelPreferences = modeModelPreferencesRaw ? JSON.parse(modeModelPreferencesRaw) : {};
     const followNewMessages = localStorage.getItem('followNewMessages') !== 'false';
@@ -317,6 +333,6 @@ export const useUiStore = create<UiState>((set, get) => ({
     const selectedTheme = selectedThemeRaw
       ? (normalizeDashboardThemeId(selectedThemeRaw) ?? DEFAULT_DASHBOARD_THEME_ID)
       : DEFAULT_DASHBOARD_THEME_ID;
-    set({ todoRailCollapsed, modeModelPreferences, followNewMessages, selectedTheme });
+    set({ todoRailCollapsed, schedulePanelCollapsed, modeModelPreferences, followNewMessages, selectedTheme });
   },
 }));
