@@ -428,7 +428,6 @@ pub enum AgentEventKind {
     // ── Explicit scheduled execution terminal events ────────────────────
     // Emitted by SessionActor so SchedulerActor does not infer completion
     // from generic task events. Correlation is deterministic.
-
     /// SessionActor finished a scheduled execution cycle successfully.
     ScheduledExecutionCompleted {
         schedule_public_id: String,
@@ -442,7 +441,6 @@ pub enum AgentEventKind {
     },
 
     // ── Internal scheduler events ────────────────────────────────────────
-    
     /// Debounce window completed for an event-driven schedule.
     /// Internal event used by the scheduler to trigger after debounce.
     ScheduleDebounceCompleted {
@@ -450,7 +448,6 @@ pub enum AgentEventKind {
     },
 
     // ── Knowledge layer events ───────────────────────────────────────────
-
     /// A new knowledge entry was ingested.
     KnowledgeIngested {
         scope: String,

@@ -4,7 +4,7 @@ use crate::knowledge::ConsolidateRequest;
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub struct KnowledgeConsolidateTool;
 
@@ -193,8 +193,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut context =
-            AgentToolContext::basic("test_session".to_string(), Some(temp_dir.path().to_path_buf()));
+        let mut context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
         context.with_knowledge_store(knowledge_store);
 
         let tool = KnowledgeConsolidateTool::new();
@@ -214,8 +216,10 @@ mod tests {
     #[tokio::test]
     async fn test_knowledge_consolidate_missing_fields() {
         let temp_dir = TempDir::new().unwrap();
-        let context =
-            AgentToolContext::basic("test_session".to_string(), Some(temp_dir.path().to_path_buf()));
+        let context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
         let tool = KnowledgeConsolidateTool::new();
 
         let args = json!({
@@ -232,8 +236,10 @@ mod tests {
         let db = sqlite_conn_with_schema();
         let knowledge_store = Arc::new(SqliteKnowledgeStore::new(db));
 
-        let mut context =
-            AgentToolContext::basic("test_session".to_string(), Some(temp_dir.path().to_path_buf()));
+        let mut context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
         context.with_knowledge_store(knowledge_store);
 
         let tool = KnowledgeConsolidateTool::new();

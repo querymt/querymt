@@ -4,7 +4,7 @@
 //! `run_blocking` helper that acquires the shared `Arc<Mutex<Connection>>`.
 
 use crate::knowledge::{
-    Consolidation, ConsolidateRequest, IngestRequest, KnowledgeEntry, KnowledgeError,
+    ConsolidateRequest, Consolidation, IngestRequest, KnowledgeEntry, KnowledgeError,
     KnowledgeFilter, KnowledgeQueryResult, KnowledgeStats, KnowledgeStore, QueryOpts,
     RetentionPolicy, RetentionResult, RetrievalMode,
 };
@@ -49,8 +49,9 @@ fn format_dt(dt: &OffsetDateTime) -> String {
 
 /// Parse an RFC 3339 string back into `OffsetDateTime`.
 fn parse_dt(s: &str) -> Result<OffsetDateTime, KnowledgeError> {
-    OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
-        .map_err(|e| KnowledgeError::DatabaseError(format!("Failed to parse datetime '{}': {}", s, e)))
+    OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).map_err(|e| {
+        KnowledgeError::DatabaseError(format!("Failed to parse datetime '{}': {}", s, e))
+    })
 }
 
 /// Parse an optional RFC 3339 string.
@@ -69,12 +70,9 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> Result<KnowledgeEntry, rusqlite::Err
     let created_at_str: String = row.get("created_at")?;
     let consolidated_at_str: Option<String> = row.get("consolidated_at")?;
 
-    let entities: Vec<String> =
-        serde_json::from_str(&entities_json).unwrap_or_default();
-    let topics: Vec<String> =
-        serde_json::from_str(&topics_json).unwrap_or_default();
-    let connections: Vec<String> =
-        serde_json::from_str(&connections_json).unwrap_or_default();
+    let entities: Vec<String> = serde_json::from_str(&entities_json).unwrap_or_default();
+    let topics: Vec<String> = serde_json::from_str(&topics_json).unwrap_or_default();
+    let connections: Vec<String> = serde_json::from_str(&connections_json).unwrap_or_default();
 
     let created_at = OffsetDateTime::parse(
         &created_at_str,
@@ -113,8 +111,7 @@ fn row_to_consolidation(row: &rusqlite::Row<'_>) -> Result<Consolidation, rusqli
 
     let source_entry_public_ids: Vec<String> =
         serde_json::from_str(&source_ids_json).unwrap_or_default();
-    let connections: Vec<String> =
-        serde_json::from_str(&connections_json).unwrap_or_default();
+    let connections: Vec<String> = serde_json::from_str(&connections_json).unwrap_or_default();
 
     let created_at = OffsetDateTime::parse(
         &created_at_str,
@@ -268,7 +265,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                         let cond = format!("topics_json LIKE ?{}", param_idx);
                         bindings.push((
                             param_idx,
-                            Value::Text(format!("%\"{}\"%" , t.replace('"', ""))),
+                            Value::Text(format!("%\"{}\"%", t.replace('"', ""))),
                         ));
                         param_idx += 1;
                         cond
@@ -286,7 +283,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                         let cond = format!("entities_json LIKE ?{}", param_idx);
                         bindings.push((
                             param_idx,
-                            Value::Text(format!("%\"{}\"%" , e.replace('"', ""))),
+                            Value::Text(format!("%\"{}\"%", e.replace('"', ""))),
                         ));
                         param_idx += 1;
                         cond
@@ -489,8 +486,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
             // Age-based retention
             if let Some(max_age_days) = policy.max_age_days {
-                let cutoff = OffsetDateTime::now_utc()
-                    - time::Duration::days(max_age_days as i64);
+                let cutoff = OffsetDateTime::now_utc() - time::Duration::days(max_age_days as i64);
                 let cutoff_str = format_dt(&cutoff);
 
                 if policy.archive_raw_text {
@@ -617,19 +613,16 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 /// Strips common stop words and returns lowercase tokens.
 fn extract_keywords(question: &str) -> Vec<String> {
     const STOP_WORDS: &[&str] = &[
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "need", "dare", "ought",
-        "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
-        "as", "into", "through", "during", "before", "after", "above", "below",
-        "between", "out", "off", "over", "under", "again", "further", "then",
-        "once", "here", "there", "when", "where", "why", "how", "all", "both",
-        "each", "few", "more", "most", "other", "some", "such", "no", "nor",
-        "not", "only", "own", "same", "so", "than", "too", "very", "just",
-        "don", "now", "and", "but", "or", "if", "it", "its", "i", "me", "my",
-        "we", "our", "you", "your", "he", "she", "they", "them", "his", "her",
-        "what", "which", "who", "whom", "this", "that", "these", "those",
-        "am", "about", "up",
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "need", "dare", "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
+        "as", "into", "through", "during", "before", "after", "above", "below", "between", "out",
+        "off", "over", "under", "again", "further", "then", "once", "here", "there", "when",
+        "where", "why", "how", "all", "both", "each", "few", "more", "most", "other", "some",
+        "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "just",
+        "don", "now", "and", "but", "or", "if", "it", "its", "i", "me", "my", "we", "our", "you",
+        "your", "he", "she", "they", "them", "his", "her", "what", "which", "who", "whom", "this",
+        "that", "these", "those", "am", "about", "up",
     ];
 
     question
@@ -659,8 +652,10 @@ fn query_entries(
                  WHERE scope = ?1 ORDER BY created_at DESC LIMIT ?2"
             ))
             .map_err(KnowledgeError::from)?;
-        stmt.raw_bind_parameter(1, scope).map_err(KnowledgeError::from)?;
-        stmt.raw_bind_parameter(2, opts.limit as i64).map_err(KnowledgeError::from)?;
+        stmt.raw_bind_parameter(1, scope)
+            .map_err(KnowledgeError::from)?;
+        stmt.raw_bind_parameter(2, opts.limit as i64)
+            .map_err(KnowledgeError::from)?;
         let mut rows = stmt.raw_query();
         let mut results = Vec::new();
         while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
@@ -716,10 +711,7 @@ fn query_entries(
         }
     }
 
-    let where_clause = format!(
-        "scope = ?1 AND ({})",
-        like_parts.join(" OR ")
-    );
+    let where_clause = format!("scope = ?1 AND ({})", like_parts.join(" OR "));
 
     let score_expr = if score_parts.is_empty() {
         "0".to_string()
@@ -747,7 +739,8 @@ fn query_entries(
 
     let mut stmt = conn.prepare(&sql).map_err(KnowledgeError::from)?;
     for (idx, val) in &bindings {
-        stmt.raw_bind_parameter(*idx, val).map_err(KnowledgeError::from)?;
+        stmt.raw_bind_parameter(*idx, val)
+            .map_err(KnowledgeError::from)?;
     }
     let mut rows = stmt.raw_query();
     let mut results = Vec::new();
@@ -772,8 +765,10 @@ fn query_consolidations(
                  WHERE scope = ?1 ORDER BY created_at DESC LIMIT ?2"
             ))
             .map_err(KnowledgeError::from)?;
-        stmt.raw_bind_parameter(1, scope).map_err(KnowledgeError::from)?;
-        stmt.raw_bind_parameter(2, limit as i64).map_err(KnowledgeError::from)?;
+        stmt.raw_bind_parameter(1, scope)
+            .map_err(KnowledgeError::from)?;
+        stmt.raw_bind_parameter(2, limit as i64)
+            .map_err(KnowledgeError::from)?;
         let mut rows = stmt.raw_query();
         let mut results = Vec::new();
         while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
@@ -806,10 +801,7 @@ fn query_consolidations(
         ));
     }
 
-    let where_clause = format!(
-        "scope = ?1 AND ({})",
-        like_parts.join(" OR ")
-    );
+    let where_clause = format!("scope = ?1 AND ({})", like_parts.join(" OR "));
 
     let score_expr = score_parts.join(" + ");
 
@@ -826,7 +818,8 @@ fn query_consolidations(
 
     let mut stmt = conn.prepare(&sql).map_err(KnowledgeError::from)?;
     for (idx, val) in &bindings {
-        stmt.raw_bind_parameter(*idx, val).map_err(KnowledgeError::from)?;
+        stmt.raw_bind_parameter(*idx, val)
+            .map_err(KnowledgeError::from)?;
     }
     let mut rows = stmt.raw_query();
     let mut results = Vec::new();
@@ -876,7 +869,10 @@ mod tests {
         assert_eq!(entry.scope, "test-scope");
         assert_eq!(entry.source, "user");
         assert_eq!(entry.summary, "Test summary");
-        assert_eq!(entry.raw_text.as_deref(), Some("Raw text for: Test summary"));
+        assert_eq!(
+            entry.raw_text.as_deref(),
+            Some("Raw text for: Test summary")
+        );
         assert!(entry.consolidated_at.is_none());
     }
 
@@ -915,7 +911,11 @@ mod tests {
         let unconsolidated = store.list_unconsolidated("scope1", 10).await.unwrap();
         assert_eq!(unconsolidated.len(), 2);
         // Should not contain entry3
-        assert!(unconsolidated.iter().all(|e| e.public_id != entry3.public_id));
+        assert!(
+            unconsolidated
+                .iter()
+                .all(|e| e.public_id != entry3.public_id)
+        );
     }
 
     #[tokio::test]
@@ -1040,7 +1040,10 @@ mod tests {
         let store = SqliteKnowledgeStore::new(db);
 
         store
-            .ingest("scope", make_ingest("src", "Rust memory management patterns"))
+            .ingest(
+                "scope",
+                make_ingest("src", "Rust memory management patterns"),
+            )
             .await
             .unwrap();
         store
@@ -1143,7 +1146,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.entries.len() >= 1);
+        assert!(!result.entries.is_empty());
         // The entry with matching entity+topic and high importance should rank first
         assert_eq!(result.entries[0].summary, "General coding notes");
     }
@@ -1335,12 +1338,20 @@ mod tests {
 
         assert!(!store.is_source_ingested("scope", "doc:123").await.unwrap());
 
-        store.mark_source_ingested("scope", "doc:123").await.unwrap();
+        store
+            .mark_source_ingested("scope", "doc:123")
+            .await
+            .unwrap();
 
         assert!(store.is_source_ingested("scope", "doc:123").await.unwrap());
 
         // Different scope should not collide
-        assert!(!store.is_source_ingested("other-scope", "doc:123").await.unwrap());
+        assert!(
+            !store
+                .is_source_ingested("other-scope", "doc:123")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

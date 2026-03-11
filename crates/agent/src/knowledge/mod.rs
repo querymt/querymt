@@ -480,10 +480,7 @@ mod scope_policy_tests {
 
     #[test]
     fn restricted_allows_prefixed_scopes() {
-        let policy = RestrictedScopePolicy::new(vec![
-            "global".to_string(),
-            "project:".to_string(),
-        ]);
+        let policy = RestrictedScopePolicy::new(vec!["global".to_string(), "project:".to_string()]);
         assert!(policy.validate_scope("sess-1", "global").is_ok());
         assert!(policy.validate_scope("sess-1", "project:myapp").is_ok());
     }

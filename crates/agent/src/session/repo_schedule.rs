@@ -51,10 +51,7 @@ pub trait ScheduleRepository: Send + Sync {
     async fn delete_schedule(&self, schedule_public_id: &str) -> SessionResult<()>;
 
     /// Find the schedule associated with a task (by task public ID).
-    async fn get_schedule_for_task(
-        &self,
-        task_public_id: &str,
-    ) -> SessionResult<Option<Schedule>>;
+    async fn get_schedule_for_task(&self, task_public_id: &str) -> SessionResult<Option<Schedule>>;
 
     // ── Reconciliation / operations helpers ──────────────────────────────
 
@@ -331,10 +328,7 @@ impl ScheduleRepository for SqliteScheduleRepository {
         Ok(())
     }
 
-    async fn get_schedule_for_task(
-        &self,
-        task_public_id: &str,
-    ) -> SessionResult<Option<Schedule>> {
+    async fn get_schedule_for_task(&self, task_public_id: &str) -> SessionResult<Option<Schedule>> {
         let tpid = task_public_id.to_string();
         self.run_blocking(move |conn| {
             conn.query_row(
@@ -372,8 +366,7 @@ impl ScheduleRepository for SqliteScheduleRepository {
         let oid = owner_id.to_string();
         let now = OffsetDateTime::now_utc();
         let now_str = format_dt(&now);
-        let expires_str =
-            format_dt(&(now + time::Duration::seconds(ttl_seconds as i64)));
+        let expires_str = format_dt(&(now + time::Duration::seconds(ttl_seconds as i64)));
 
         self.run_blocking(move |conn| {
             // Try to insert if not exists, or update if expired
@@ -392,16 +385,11 @@ impl ScheduleRepository for SqliteScheduleRepository {
         .await
     }
 
-    async fn renew_scheduler_lease(
-        &self,
-        owner_id: &str,
-        ttl_seconds: u64,
-    ) -> SessionResult<bool> {
+    async fn renew_scheduler_lease(&self, owner_id: &str, ttl_seconds: u64) -> SessionResult<bool> {
         let oid = owner_id.to_string();
         let now = OffsetDateTime::now_utc();
         let now_str = format_dt(&now);
-        let expires_str =
-            format_dt(&(now + time::Duration::seconds(ttl_seconds as i64)));
+        let expires_str = format_dt(&(now + time::Duration::seconds(ttl_seconds as i64)));
 
         self.run_blocking(move |conn| {
             let affected = conn.execute(
@@ -455,7 +443,11 @@ mod tests {
     }
 
     /// Insert prerequisite session + task rows so FK constraints are satisfied.
-    fn insert_prerequisites(conn: &Arc<Mutex<Connection>>, session_pub: &str, task_pub: &str) -> (i64, i64) {
+    fn insert_prerequisites(
+        conn: &Arc<Mutex<Connection>>,
+        session_pub: &str,
+        task_pub: &str,
+    ) -> (i64, i64) {
         let c = conn.lock().unwrap();
         let now = format_dt(&OffsetDateTime::now_utc());
         c.execute(
@@ -543,14 +535,22 @@ mod tests {
 
         // Valid CAS: Armed -> Running
         let ok = repo
-            .update_schedule_state(&created.public_id, ScheduleState::Armed, ScheduleState::Running)
+            .update_schedule_state(
+                &created.public_id,
+                ScheduleState::Armed,
+                ScheduleState::Running,
+            )
             .await
             .unwrap();
         assert!(ok);
 
         // Duplicate CAS should fail (state is now Running, not Armed)
         let dup = repo
-            .update_schedule_state(&created.public_id, ScheduleState::Armed, ScheduleState::Running)
+            .update_schedule_state(
+                &created.public_id,
+                ScheduleState::Armed,
+                ScheduleState::Running,
+            )
             .await
             .unwrap();
         assert!(!dup);
@@ -631,13 +631,20 @@ mod tests {
 
         // Update last_run_at to a time in the past
         let past = OffsetDateTime::now_utc() - time::Duration::hours(2);
-        let mut updated = repo.get_schedule(&created.public_id).await.unwrap().unwrap();
+        let mut updated = repo
+            .get_schedule(&created.public_id)
+            .await
+            .unwrap()
+            .unwrap();
         updated.last_run_at = Some(past);
         updated.updated_at = OffsetDateTime::now_utc();
         repo.update_schedule(updated).await.unwrap();
 
         let cutoff = OffsetDateTime::now_utc() - time::Duration::hours(1);
-        let stale = repo.list_running_schedules_older_than(cutoff).await.unwrap();
+        let stale = repo
+            .list_running_schedules_older_than(cutoff)
+            .await
+            .unwrap();
         assert_eq!(stale.len(), 1);
     }
 
@@ -660,7 +667,11 @@ mod tests {
 
         repo.update_schedule(updated).await.unwrap();
 
-        let fetched = repo.get_schedule(&created.public_id).await.unwrap().unwrap();
+        let fetched = repo
+            .get_schedule(&created.public_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.run_count, 5);
         assert_eq!(fetched.consecutive_failures, 2);
         assert_eq!(fetched.state, ScheduleState::Running);
@@ -712,7 +723,11 @@ mod tests {
         };
 
         let created = repo.create_schedule(sched).await.unwrap();
-        let fetched = repo.get_schedule(&created.public_id).await.unwrap().unwrap();
+        let fetched = repo
+            .get_schedule(&created.public_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         if let ScheduleTrigger::EventDriven {
             event_filter,
@@ -721,10 +736,7 @@ mod tests {
         {
             assert_eq!(event_filter.threshold, 5);
             assert_eq!(*debounce_seconds, 30);
-            assert_eq!(
-                event_filter.session_public_id.as_deref(),
-                Some("sess-trig")
-            );
+            assert_eq!(event_filter.session_public_id.as_deref(), Some("sess-trig"));
         } else {
             panic!("Expected EventDriven trigger");
         }

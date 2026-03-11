@@ -236,7 +236,9 @@ impl LocalAgentHandle {
         let schedule_repo = match &self.config.schedule_repository {
             Some(repo) => repo.clone(),
             None => {
-                log::debug!("LocalAgentHandle: no schedule repository configured, skipping scheduler");
+                log::debug!(
+                    "LocalAgentHandle: no schedule repository configured, skipping scheduler"
+                );
                 return false;
             }
         };
@@ -301,8 +303,7 @@ impl LocalAgentHandle {
         trigger: crate::session::domain_schedule::ScheduleTrigger,
     ) -> Result<String, agent_client_protocol::Error> {
         let scheduler = self.scheduler().ok_or_else(|| {
-            agent_client_protocol::Error::internal_error()
-                .data("Scheduler not running".to_string())
+            agent_client_protocol::Error::internal_error().data("Scheduler not running".to_string())
         })?;
 
         let schedule = crate::session::domain_schedule::Schedule::new(
@@ -312,9 +313,10 @@ impl LocalAgentHandle {
         );
         let public_id = schedule.public_id.clone();
 
-        scheduler.add_schedule(schedule).await.map_err(|e| {
-            agent_client_protocol::Error::internal_error().data(e.to_string())
-        })?;
+        scheduler
+            .add_schedule(schedule)
+            .await
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))?;
 
         Ok(public_id)
     }
@@ -325,12 +327,12 @@ impl LocalAgentHandle {
         schedule_public_id: &str,
     ) -> Result<(), agent_client_protocol::Error> {
         let scheduler = self.scheduler().ok_or_else(|| {
-            agent_client_protocol::Error::internal_error()
-                .data("Scheduler not running".to_string())
+            agent_client_protocol::Error::internal_error().data("Scheduler not running".to_string())
         })?;
-        scheduler.trigger_now(schedule_public_id).await.map_err(|e| {
-            agent_client_protocol::Error::internal_error().data(e.to_string())
-        })
+        scheduler
+            .trigger_now(schedule_public_id)
+            .await
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))
     }
 
     /// Pause a schedule.
@@ -339,12 +341,12 @@ impl LocalAgentHandle {
         schedule_public_id: &str,
     ) -> Result<(), agent_client_protocol::Error> {
         let scheduler = self.scheduler().ok_or_else(|| {
-            agent_client_protocol::Error::internal_error()
-                .data("Scheduler not running".to_string())
+            agent_client_protocol::Error::internal_error().data("Scheduler not running".to_string())
         })?;
-        scheduler.pause_schedule(schedule_public_id).await.map_err(|e| {
-            agent_client_protocol::Error::internal_error().data(e.to_string())
-        })
+        scheduler
+            .pause_schedule(schedule_public_id)
+            .await
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))
     }
 
     /// Resume a paused schedule.
@@ -353,12 +355,12 @@ impl LocalAgentHandle {
         schedule_public_id: &str,
     ) -> Result<(), agent_client_protocol::Error> {
         let scheduler = self.scheduler().ok_or_else(|| {
-            agent_client_protocol::Error::internal_error()
-                .data("Scheduler not running".to_string())
+            agent_client_protocol::Error::internal_error().data("Scheduler not running".to_string())
         })?;
-        scheduler.resume_schedule(schedule_public_id).await.map_err(|e| {
-            agent_client_protocol::Error::internal_error().data(e.to_string())
-        })
+        scheduler
+            .resume_schedule(schedule_public_id)
+            .await
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))
     }
 
     /// Delete a schedule.
@@ -367,12 +369,12 @@ impl LocalAgentHandle {
         schedule_public_id: &str,
     ) -> Result<(), agent_client_protocol::Error> {
         let scheduler = self.scheduler().ok_or_else(|| {
-            agent_client_protocol::Error::internal_error()
-                .data("Scheduler not running".to_string())
+            agent_client_protocol::Error::internal_error().data("Scheduler not running".to_string())
         })?;
-        scheduler.remove_schedule(schedule_public_id).await.map_err(|e| {
-            agent_client_protocol::Error::internal_error().data(e.to_string())
-        })
+        scheduler
+            .remove_schedule(schedule_public_id)
+            .await
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))
     }
 
     /// List schedules, optionally filtered by session.
@@ -381,18 +383,16 @@ impl LocalAgentHandle {
         session_public_id: Option<&str>,
     ) -> Result<Vec<crate::session::domain_schedule::Schedule>, agent_client_protocol::Error> {
         let scheduler = self.scheduler().ok_or_else(|| {
-            agent_client_protocol::Error::internal_error()
-                .data("Scheduler not running".to_string())
+            agent_client_protocol::Error::internal_error().data("Scheduler not running".to_string())
         })?;
-        scheduler.list_schedules(session_public_id).await.map_err(|e| {
-            agent_client_protocol::Error::internal_error().data(e.to_string())
-        })
+        scheduler
+            .list_schedules(session_public_id)
+            .await
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))
     }
 
     /// Get scheduler metrics snapshot.
-    pub async fn scheduler_metrics(
-        &self,
-    ) -> Option<crate::scheduler::SchedulerMetrics> {
+    pub async fn scheduler_metrics(&self) -> Option<crate::scheduler::SchedulerMetrics> {
         let scheduler = self.scheduler()?;
         Some(scheduler.metrics().await)
     }
