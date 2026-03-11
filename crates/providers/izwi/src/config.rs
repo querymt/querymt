@@ -33,7 +33,6 @@ pub struct IzwiConfig {
     pub speed: Option<f32>,
 
     /// Whether to automatically download models that are not locally available.
-    #[serde(default)]
     pub auto_download: bool,
 
     // -- Engine-level settings (affect RuntimeService construction) ----------
@@ -112,7 +111,19 @@ impl IzwiConfig {
             cfg.kv_page_size = kv_page_size;
         }
         if let Some(use_metal) = self.use_metal {
-            cfg.use_metal = use_metal;
+            if use_metal && !cfg!(feature = "metal") {
+                log::warn!(
+                    "use_metal is enabled in config but the `metal` feature was not compiled in; \
+                     falling back to CPU"
+                );
+                cfg.use_metal = false;
+            } else {
+                cfg.use_metal = use_metal;
+            }
+        } else if !cfg!(feature = "metal") {
+            // Without the `metal` feature compiled in, force CPU regardless of
+            // izwi-core's platform default (which would be `true` on macOS).
+            cfg.use_metal = false;
         }
         if let Some(num_threads) = self.num_threads {
             cfg.num_threads = num_threads;
