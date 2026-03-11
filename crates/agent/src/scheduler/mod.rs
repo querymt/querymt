@@ -205,10 +205,7 @@ impl SchedulerHandle {
 
     /// Get a snapshot of the current scheduler metrics.
     pub async fn metrics(&self) -> SchedulerMetrics {
-        self.actor_ref
-            .ask(GetMetrics)
-            .await
-            .unwrap_or_default()
+        self.actor_ref.ask(GetMetrics).await.unwrap_or_default()
     }
 
     /// Shutdown the scheduler and its background tasks.
@@ -324,12 +321,8 @@ impl Message<CycleFailed> for SchedulerActor {
         msg: CycleFailed,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.handle_cycle_failed_inner(
-            &msg.schedule_public_id,
-            msg.turn_id.as_deref(),
-            &msg.error,
-        )
-        .await;
+        self.handle_cycle_failed_inner(&msg.schedule_public_id, msg.turn_id.as_deref(), &msg.error)
+            .await;
     }
 }
 
@@ -520,12 +513,7 @@ impl SchedulerActor {
         config: Arc<AgentConfig>,
         scheduler_config: SchedulerConfig,
     ) -> Option<SchedulerHandle> {
-        let mut actor = Self::new(
-            schedule_store,
-            session_registry,
-            config,
-            scheduler_config,
-        );
+        let mut actor = Self::new(schedule_store, session_registry, config, scheduler_config);
 
         // Try to acquire lease and initialize (before spawning the actor).
         // Direct mutable access is safe here — actor is not yet shared.
@@ -549,9 +537,7 @@ impl SchedulerActor {
         // any background loop messages arrive.
         {
             let r = actor_ref.clone();
-            let _ = actor_ref
-                .tell(SetSelfRef { actor_ref: r })
-                .await;
+            let _ = actor_ref.tell(SetSelfRef { actor_ref: r }).await;
         }
 
         // Start background loops — each sends typed messages via ActorRef.
@@ -579,10 +565,7 @@ impl SchedulerActor {
             .await
         {
             Ok(true) => {
-                info!(
-                    "SchedulerActor: lease acquired (owner={})",
-                    self.owner_id
-                );
+                info!("SchedulerActor: lease acquired (owner={})", self.owner_id);
             }
             Ok(false) => {
                 info!("SchedulerActor: lease not acquired, staying passive");
@@ -615,12 +598,7 @@ impl SchedulerActor {
         scheduler_config: &SchedulerConfig,
         owner_id: &str,
     ) {
-        Self::start_lease_renewal_loop(
-            actor_ref,
-            schedule_store,
-            scheduler_config,
-            owner_id,
-        );
+        Self::start_lease_renewal_loop(actor_ref, schedule_store, scheduler_config, owner_id);
         Self::start_event_subscription_loop(actor_ref, agent_config);
         Self::start_reconciliation_loop(actor_ref, scheduler_config);
         // Deadline wakes are handled by `reschedule_wake()` inside the actor
@@ -654,25 +632,16 @@ impl SchedulerActor {
 
                 match store.renew_scheduler_lease(&owner, ttl_secs).await {
                     Ok(true) => {
-                        debug!(
-                            "SchedulerActor: lease renewed for {}",
-                            owner
-                        );
+                        debug!("SchedulerActor: lease renewed for {}", owner);
                     }
                     Ok(false) => {
-                        warn!(
-                            "SchedulerActor: lease lost for {}",
-                            owner
-                        );
+                        warn!("SchedulerActor: lease lost for {}", owner);
                         // Lost lease — shut down the actor
                         let _ = actor.tell(Shutdown).await;
                         break;
                     }
                     Err(e) => {
-                        warn!(
-                            "SchedulerActor: lease renewal error for {}: {}",
-                            owner, e
-                        );
+                        warn!("SchedulerActor: lease renewal error for {}: {}", owner, e);
                         // Continue trying on transient errors
                     }
                 }
@@ -686,10 +655,7 @@ impl SchedulerActor {
     ///
     /// Subscribes to the `AgentConfig` event broadcast and forwards each
     /// envelope as a `ProcessEvent` message to the actor.
-    fn start_event_subscription_loop(
-        actor_ref: &ActorRef<Self>,
-        agent_config: &Arc<AgentConfig>,
-    ) {
+    fn start_event_subscription_loop(actor_ref: &ActorRef<Self>, agent_config: &Arc<AgentConfig>) {
         let mut event_rx = agent_config.subscribe_events();
         let actor = actor_ref.clone();
 
@@ -703,16 +669,11 @@ impl SchedulerActor {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        info!(
-                            "SchedulerActor: event fanout closed, exiting subscription loop"
-                        );
+                        info!("SchedulerActor: event fanout closed, exiting subscription loop");
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(
-                            "SchedulerActor: event subscription lagged by {} events",
-                            n
-                        );
+                        warn!("SchedulerActor: event subscription lagged by {} events", n);
                     }
                 }
             }
@@ -722,16 +683,12 @@ impl SchedulerActor {
     /// Start the reconciliation background task.
     ///
     /// Periodically sends a `Reconcile` message to the actor.
-    fn start_reconciliation_loop(
-        actor_ref: &ActorRef<Self>,
-        scheduler_config: &SchedulerConfig,
-    ) {
+    fn start_reconciliation_loop(actor_ref: &ActorRef<Self>, scheduler_config: &SchedulerConfig) {
         let interval_secs = scheduler_config.reconcile_interval_secs;
         let actor = actor_ref.clone();
 
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
@@ -768,7 +725,11 @@ impl SchedulerActor {
             return; // self_ref not yet set (pre-spawn initialization)
         };
 
-        let Some((next_time, schedule_public_id)) = self.deadline_queue.peek().map(|(dt, id)| (dt, id.to_string())) else {
+        let Some((next_time, schedule_public_id)) = self
+            .deadline_queue
+            .peek()
+            .map(|(dt, id)| (dt, id.to_string()))
+        else {
             return; // Queue is empty, nothing to schedule
         };
 
@@ -777,11 +738,7 @@ impl SchedulerActor {
 
         self.wake_handle = Some(tokio::spawn(async move {
             tokio::time::sleep(std_delay).await;
-            let _ = actor_ref
-                .tell(DeadlineReached {
-                    schedule_public_id,
-                })
-                .await;
+            let _ = actor_ref.tell(DeadlineReached { schedule_public_id }).await;
         }));
     }
 
@@ -843,8 +800,7 @@ impl SchedulerActor {
         match &schedule.trigger {
             ScheduleTrigger::Interval { .. } => {
                 if let Some(next) = schedule.next_run_at {
-                    self.deadline_queue
-                        .insert(next, schedule.public_id.clone());
+                    self.deadline_queue.insert(next, schedule.public_id.clone());
                     // Queue head may have changed — reschedule wake
                     self.reschedule_wake();
                 }
@@ -982,10 +938,7 @@ impl SchedulerActor {
                     .tell(CycleFailed {
                         schedule_public_id: schedule_id_for_timeout,
                         turn_id: None,
-                        error: format!(
-                            "cycle exceeded max_runtime_seconds ({})",
-                            max_runtime
-                        ),
+                        error: format!("cycle exceeded max_runtime_seconds ({})", max_runtime),
                     })
                     .await;
             })
@@ -1024,10 +977,7 @@ impl SchedulerActor {
     /// Handle successful cycle completion.
     pub async fn handle_cycle_completed(&mut self, schedule_public_id: &str, turn_id: &str) {
         // Idempotency guard
-        let key = (
-            schedule_public_id.to_string(),
-            Some(turn_id.to_string()),
-        );
+        let key = (schedule_public_id.to_string(), Some(turn_id.to_string()));
         if self.processed_terminals.contains(&key) {
             self.metrics.idempotent_drops_total += 1;
             debug!(
@@ -1123,7 +1073,11 @@ impl SchedulerActor {
                 "SchedulerActor: executing deferred delete for {}",
                 schedule_public_id
             );
-            if let Err(e) = self.schedule_store.delete_schedule(schedule_public_id).await {
+            if let Err(e) = self
+                .schedule_store
+                .delete_schedule(schedule_public_id)
+                .await
+            {
                 warn!(
                     "SchedulerActor: deferred delete failed for {}: {}",
                     schedule_public_id, e
@@ -1199,8 +1153,8 @@ impl SchedulerActor {
         updated.last_run_at = Some(OffsetDateTime::now_utc());
         updated.updated_at = OffsetDateTime::now_utc();
 
-        let failure_threshold_reached = updated.consecutive_failures
-            >= updated.config.max_consecutive_failures;
+        let failure_threshold_reached =
+            updated.consecutive_failures >= updated.config.max_consecutive_failures;
 
         if failure_threshold_reached {
             updated.state = ScheduleState::Failed;
@@ -1247,7 +1201,11 @@ impl SchedulerActor {
                 "SchedulerActor: executing deferred delete after failure for {}",
                 schedule_public_id
             );
-            if let Err(e) = self.schedule_store.delete_schedule(schedule_public_id).await {
+            if let Err(e) = self
+                .schedule_store
+                .delete_schedule(schedule_public_id)
+                .await
+            {
                 warn!(
                     "SchedulerActor: deferred delete failed for {}: {}",
                     schedule_public_id, e
@@ -1380,10 +1338,7 @@ impl SchedulerActor {
             },
         );
 
-        info!(
-            "SchedulerActor: paused schedule {}",
-            schedule_public_id
-        );
+        info!("SchedulerActor: paused schedule {}", schedule_public_id);
     }
 
     /// Resume a paused schedule.
@@ -1407,11 +1362,7 @@ impl SchedulerActor {
         }
 
         // Reload and re-enqueue
-        if let Ok(Some(schedule)) = self
-            .schedule_store
-            .get_schedule(schedule_public_id)
-            .await
-        {
+        if let Ok(Some(schedule)) = self.schedule_store.get_schedule(schedule_public_id).await {
             // Recompute next_run_at for interval schedules
             if let ScheduleTrigger::Interval { seconds } = &schedule.trigger {
                 let mut updated = schedule.clone();
@@ -1435,18 +1386,11 @@ impl SchedulerActor {
             },
         );
 
-        info!(
-            "SchedulerActor: resumed schedule {}",
-            schedule_public_id
-        );
+        info!("SchedulerActor: resumed schedule {}", schedule_public_id);
     }
 
     /// Handle an incoming event from EventFanout that may match an event-driven schedule.
-    pub async fn handle_event_received(
-        &mut self,
-        schedule_public_id: &str,
-        _event_kind: &str,
-    ) {
+    pub async fn handle_event_received(&mut self, schedule_public_id: &str, _event_kind: &str) {
         let Some(acc) = self.event_counters.get_mut(schedule_public_id) else {
             return;
         };
@@ -1498,10 +1442,8 @@ impl SchedulerActor {
                         if let Some(actor_ref) = self.self_ref.clone() {
                             let schedule_id = schedule_public_id.to_string();
                             let debounce_handle = tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_secs(
-                                    debounce_secs,
-                                ))
-                                .await;
+                                tokio::time::sleep(std::time::Duration::from_secs(debounce_secs))
+                                    .await;
                                 let _ = actor_ref
                                     .tell(DebounceCompleted {
                                         schedule_public_id: schedule_id,
@@ -1558,10 +1500,7 @@ impl SchedulerActor {
     }
 
     /// List schedules, optionally filtered by session.
-    pub async fn handle_list_schedules(
-        &self,
-        session_public_id: Option<&str>,
-    ) -> Vec<Schedule> {
+    pub async fn handle_list_schedules(&self, session_public_id: Option<&str>) -> Vec<Schedule> {
         match session_public_id {
             Some(spid) => self
                 .schedule_store
@@ -1579,7 +1518,10 @@ impl SchedulerActor {
     /// Run the periodic reconciliation sweep.
     pub async fn reconcile(&mut self) {
         self.metrics.reconciliation_sweeps_total += 1;
-        debug!("SchedulerActor: running reconciliation sweep (sweep={})", self.metrics.reconciliation_sweeps_total);
+        debug!(
+            "SchedulerActor: running reconciliation sweep (sweep={})",
+            self.metrics.reconciliation_sweeps_total
+        );
 
         // 1. Recover stale running schedules
         let cutoff = OffsetDateTime::now_utc() - time::Duration::seconds(300);
@@ -1610,15 +1552,15 @@ impl SchedulerActor {
         if let Ok(armed) = self.schedule_store.list_all_armed_schedules().await {
             let now = OffsetDateTime::now_utc();
             for schedule in armed {
-                if let Some(next_run) = schedule.next_run_at {
-                    if next_run <= now {
-                        self.metrics.reconciliation_overdue_fires_total += 1;
-                        info!(
-                            "SchedulerActor: reconciliation firing overdue schedule: {} (overdue_fires_total={})",
-                            schedule.public_id, self.metrics.reconciliation_overdue_fires_total
-                        );
-                        self.fire_schedule(&schedule.public_id).await;
-                    }
+                if let Some(next_run) = schedule.next_run_at
+                    && next_run <= now
+                {
+                    self.metrics.reconciliation_overdue_fires_total += 1;
+                    info!(
+                        "SchedulerActor: reconciliation firing overdue schedule: {} (overdue_fires_total={})",
+                        schedule.public_id, self.metrics.reconciliation_overdue_fires_total
+                    );
+                    self.fire_schedule(&schedule.public_id).await;
                 }
             }
         }
@@ -1650,12 +1592,8 @@ impl SchedulerActor {
                 turn_id,
                 error,
             } => {
-                self.handle_cycle_failed_inner(
-                    schedule_public_id,
-                    turn_id.as_deref(),
-                    error,
-                )
-                .await;
+                self.handle_cycle_failed_inner(schedule_public_id, turn_id.as_deref(), error)
+                    .await;
             }
             // ScheduleDebounceCompleted is now handled via direct DebounceCompleted
             // messages to the actor (no longer routed through the event fanout).
@@ -1664,24 +1602,27 @@ impl SchedulerActor {
             _ => {
                 // Check if any event accumulator cares about this event kind
                 let event_kind_name = event_kind_name(envelope.kind());
-                
+
                 // Check each event-driven schedule to see if this event matches its filter
                 let schedule_ids: Vec<String> = self.event_counters.keys().cloned().collect();
-                
+
                 for schedule_id in schedule_ids {
                     // Load the schedule to check if the event matches its filter
-                    if let Ok(Some(schedule)) = self.schedule_store.get_schedule(&schedule_id).await {
-                        if let ScheduleTrigger::EventDriven { event_filter, .. } = &schedule.trigger {
-                            // Check if event kind matches filter
-                            if event_filter.event_kinds.contains(&event_kind_name) {
-                                // Check session scope filter if specified
-                                let session_matches = event_filter.session_public_id.as_ref()
-                                    .map(|filter_session| filter_session == envelope.session_id())
-                                    .unwrap_or(true); // None = any session
-                                
-                                if session_matches {
-                                    self.handle_event_received(&schedule_id, &event_kind_name).await;
-                                }
+                    if let Ok(Some(schedule)) = self.schedule_store.get_schedule(&schedule_id).await
+                        && let ScheduleTrigger::EventDriven { event_filter, .. } = &schedule.trigger
+                    {
+                        // Check if event kind matches filter
+                        if event_filter.event_kinds.contains(&event_kind_name) {
+                            // Check session scope filter if specified
+                            let session_matches = event_filter
+                                .session_public_id
+                                .as_ref()
+                                .map(|filter_session| filter_session == envelope.session_id())
+                                .unwrap_or(true); // None = any session
+
+                            if session_matches {
+                                self.handle_event_received(&schedule_id, &event_kind_name)
+                                    .await;
                             }
                         }
                     }
@@ -1694,10 +1635,10 @@ impl SchedulerActor {
 /// Extract a snake_case name from an `AgentEventKind` for event filter matching.
 fn event_kind_name(kind: &AgentEventKind) -> String {
     // Use serde serialization to get the tag name
-    if let Ok(value) = serde_json::to_value(kind) {
-        if let Some(type_name) = value.get("type").and_then(|v| v.as_str()) {
-            return type_name.to_string();
-        }
+    if let Ok(value) = serde_json::to_value(kind)
+        && let Some(type_name) = value.get("type").and_then(|v| v.as_str())
+    {
+        return type_name.to_string();
     }
     "unknown".to_string()
 }

@@ -4,7 +4,7 @@ use crate::knowledge::{QueryOpts, RetrievalMode};
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub struct KnowledgeQueryTool;
 
@@ -90,7 +90,7 @@ impl ToolTrait for KnowledgeQueryTool {
                 return Err(ToolError::InvalidRequest(format!(
                     "Invalid retrieval_mode '{}'. Must be 'keyword' or 'hybrid'",
                     other
-                )))
+                )));
             }
         };
 
@@ -130,13 +130,13 @@ impl ToolTrait for KnowledgeQueryTool {
 
         // Format response
         let mut response = String::new();
-        response.push_str(&format!(
-            "Found {} entries",
-            result.entries.len()
-        ));
+        response.push_str(&format!("Found {} entries", result.entries.len()));
 
         if include_consolidations && !result.consolidations.is_empty() {
-            response.push_str(&format!(" and {} consolidations", result.consolidations.len()));
+            response.push_str(&format!(
+                " and {} consolidations",
+                result.consolidations.len()
+            ));
         }
         response.push_str(&format!(" for scope '{}':\n\n", scope));
 
@@ -144,11 +144,7 @@ impl ToolTrait for KnowledgeQueryTool {
         if !result.entries.is_empty() {
             response.push_str("## Knowledge Entries\n\n");
             for (idx, entry) in result.entries.iter().enumerate() {
-                response.push_str(&format!(
-                    "**[Entry {}]** ({})\n",
-                    idx + 1,
-                    entry.public_id
-                ));
+                response.push_str(&format!("**[Entry {}]** ({})\n", idx + 1, entry.public_id));
                 response.push_str(&format!("Summary: {}\n", entry.summary));
                 if !entry.topics.is_empty() {
                     response.push_str(&format!("Topics: {}\n", entry.topics.join(", ")));
@@ -175,7 +171,7 @@ impl ToolTrait for KnowledgeQueryTool {
                 if !cons.connections.is_empty() {
                     response.push_str(&format!("Connections: {}\n", cons.connections.join(", ")));
                 }
-                response.push_str("\n");
+                response.push('\n');
             }
         }
 
@@ -220,8 +216,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut context =
-            AgentToolContext::basic("test_session".to_string(), Some(temp_dir.path().to_path_buf()));
+        let mut context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
         context.with_knowledge_store(knowledge_store);
 
         let tool = KnowledgeQueryTool::new();
@@ -240,8 +238,10 @@ mod tests {
     #[tokio::test]
     async fn test_knowledge_query_missing_question() {
         let temp_dir = TempDir::new().unwrap();
-        let context =
-            AgentToolContext::basic("test_session".to_string(), Some(temp_dir.path().to_path_buf()));
+        let context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
         let tool = KnowledgeQueryTool::new();
 
         let args = json!({});

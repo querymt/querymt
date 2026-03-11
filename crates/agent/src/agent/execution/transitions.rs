@@ -709,9 +709,7 @@ pub(super) async fn transition_after_llm(
                         );
                     }
                     TaskKind::Finite | TaskKind::Evolving => {
-                        if let Err(e) =
-                            exec_ctx.state.update_task_status(TaskStatus::Done).await
-                        {
+                        if let Err(e) = exec_ctx.state.update_task_status(TaskStatus::Done).await {
                             debug!("Failed to auto-complete task on stop: {}", e);
                         } else if let Some(task) = exec_ctx.state.active_task.clone() {
                             config.emit_event(
