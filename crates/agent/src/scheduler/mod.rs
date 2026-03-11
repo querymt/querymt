@@ -19,15 +19,70 @@ use crate::agent::messages::ScheduledPrompt;
 use crate::agent::session_registry::SessionRegistry;
 use crate::events::{AgentEventKind, EventEnvelope};
 use crate::session::domain_schedule::{Schedule, ScheduleState, ScheduleTrigger};
-use crate::session::repo_schedule::ScheduleRepository;
 use crate::session::error::SessionResult;
+use crate::session::repo_schedule::ScheduleRepository;
+use kameo::Actor;
+use kameo::actor::ActorRef;
+use kameo::message::{Context, Message};
 use log::{debug, info, warn};
+use messages::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use wake::{ActiveCycle, DeadlineQueue, EventAccumulator};
+
+// ── Metrics ──────────────────────────────────────────────────────────────────
+
+/// Operational metrics for the scheduler actor.
+///
+/// All counters are monotonically increasing. Gauges reflect current state.
+/// These are designed for export to Prometheus/StatsD or structured log sinks.
+#[derive(Debug, Clone, Default)]
+pub struct SchedulerMetrics {
+    // ── Counters ──
+    /// Total number of schedule fires (CAS Armed→Running succeeded).
+    pub fires_total: u64,
+    /// Total number of successful cycle completions.
+    pub completions_total: u64,
+    /// Total number of cycle failures (timeout, error, reconciliation recovery).
+    pub failures_total: u64,
+    /// Number of CAS transitions that returned false (already running/paused/terminal).
+    pub cas_conflicts_total: u64,
+    /// Number of times a duplicate terminal event was dropped (idempotency guard).
+    pub idempotent_drops_total: u64,
+    /// Number of state transition denials (invalid from→to).
+    pub transition_denials_total: u64,
+    /// Total reconciliation sweeps run.
+    pub reconciliation_sweeps_total: u64,
+    /// Number of stale schedules recovered during reconciliation.
+    pub reconciliation_recoveries_total: u64,
+    /// Number of overdue armed schedules fired during reconciliation.
+    pub reconciliation_overdue_fires_total: u64,
+    /// Lease acquisition attempts.
+    pub lease_acquisitions_total: u64,
+    /// Lease renewals (successful).
+    pub lease_renewals_total: u64,
+    /// Lease renewal failures (lost ownership).
+    pub lease_losses_total: u64,
+
+    // ── Gauges ──
+    /// Number of currently active (in-flight) cycles.
+    pub active_cycles: u64,
+    /// Number of armed schedules in the deadline queue.
+    pub armed_interval_schedules: u64,
+    /// Number of event-driven schedules being tracked.
+    pub armed_event_schedules: u64,
+    /// Number of schedules pending deletion (running + delete requested).
+    pub pending_deletes: u64,
+
+    // ── Histograms (last value; for full histogram, use external sink) ──
+    /// Last observed schedule lag in seconds (time between next_run_at and actual fire).
+    pub last_fire_lag_secs: f64,
+    /// Last observed cycle runtime in seconds.
+    pub last_cycle_runtime_secs: f64,
+}
 
 /// Configuration for the scheduler actor.
 #[derive(Debug, Clone)]
@@ -47,69 +102,89 @@ impl Default for SchedulerConfig {
     }
 }
 
-/// Handle for interacting with a running `SchedulerActor` from background tasks.
+/// Handle for interacting with a running `SchedulerActor`.
 ///
-/// This is a lightweight handle that allows background loops (lease renewal,
-/// event subscription, reconciliation) to call back into the scheduler actor.
+/// Wraps a kameo `ActorRef<SchedulerActor>`. All methods send typed messages
+/// through the actor mailbox, ensuring serialized access without explicit locks.
 #[derive(Clone)]
 pub struct SchedulerHandle {
-    inner: Arc<Mutex<SchedulerActor>>,
+    actor_ref: ActorRef<SchedulerActor>,
 }
 
 impl SchedulerHandle {
-    /// Create a new handle wrapping a scheduler actor.
-    pub fn new(actor: SchedulerActor) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(actor)),
-        }
+    /// Create a new handle wrapping a kameo actor ref.
+    pub fn new(actor_ref: ActorRef<SchedulerActor>) -> Self {
+        Self { actor_ref }
     }
 
     /// Process an event from the fanout.
     pub async fn process_event(&self, envelope: EventEnvelope) -> SessionResult<()> {
-        let mut actor = self.inner.lock().await;
-        actor.process_event(&envelope).await;
+        self.actor_ref
+            .tell(ProcessEvent { envelope })
+            .await
+            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
         Ok(())
     }
 
     /// Run reconciliation.
     pub async fn reconcile(&self) -> SessionResult<()> {
-        let mut actor = self.inner.lock().await;
-        actor.reconcile().await;
+        self.actor_ref
+            .tell(Reconcile)
+            .await
+            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
         Ok(())
     }
 
     /// Fire a schedule by public ID (for TriggerNow).
     pub async fn trigger_now(&self, schedule_public_id: &str) -> SessionResult<()> {
-        let mut actor = self.inner.lock().await;
-        actor.handle_trigger_now(schedule_public_id).await;
+        self.actor_ref
+            .tell(TriggerNow {
+                schedule_public_id: schedule_public_id.to_string(),
+            })
+            .await
+            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
         Ok(())
     }
 
     /// Add a schedule.
     pub async fn add_schedule(&self, schedule: Schedule) -> SessionResult<()> {
-        let mut actor = self.inner.lock().await;
-        actor.handle_add_schedule(schedule).await;
+        self.actor_ref
+            .tell(AddSchedule { schedule })
+            .await
+            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
         Ok(())
     }
 
     /// Remove a schedule.
     pub async fn remove_schedule(&self, schedule_public_id: &str) -> SessionResult<()> {
-        let mut actor = self.inner.lock().await;
-        actor.handle_remove_schedule(schedule_public_id).await;
+        self.actor_ref
+            .tell(RemoveSchedule {
+                schedule_public_id: schedule_public_id.to_string(),
+            })
+            .await
+            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
         Ok(())
     }
 
     /// Pause a schedule.
     pub async fn pause_schedule(&self, schedule_public_id: &str) -> SessionResult<()> {
-        let mut actor = self.inner.lock().await;
-        actor.handle_pause_schedule(schedule_public_id).await;
+        self.actor_ref
+            .tell(PauseSchedule {
+                schedule_public_id: schedule_public_id.to_string(),
+            })
+            .await
+            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
         Ok(())
     }
 
     /// Resume a schedule.
     pub async fn resume_schedule(&self, schedule_public_id: &str) -> SessionResult<()> {
-        let mut actor = self.inner.lock().await;
-        actor.handle_resume_schedule(schedule_public_id).await;
+        self.actor_ref
+            .tell(ResumeSchedule {
+                schedule_public_id: schedule_public_id.to_string(),
+            })
+            .await
+            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
         Ok(())
     }
 
@@ -118,55 +193,37 @@ impl SchedulerHandle {
         &self,
         session_public_id: Option<&str>,
     ) -> SessionResult<Vec<Schedule>> {
-        let actor = self.inner.lock().await;
-        Ok(actor.handle_list_schedules(session_public_id).await)
+        let schedules = self
+            .actor_ref
+            .ask(ListSchedules {
+                session_public_id: session_public_id.map(|s| s.to_string()),
+            })
+            .await
+            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
+        Ok(schedules)
     }
 
-    /// Handle cycle completed event.
-    pub async fn handle_cycle_completed(
-        &self,
-        schedule_public_id: &str,
-        turn_id: &str,
-    ) -> SessionResult<()> {
-        let mut actor = self.inner.lock().await;
-        actor.handle_cycle_completed(schedule_public_id, turn_id).await;
-        Ok(())
-    }
-
-    /// Handle deadline reached event (internal, called by deadline wake loop).
-    async fn handle_deadline_reached_internal(
-        &self,
-        schedule_public_id: &str,
-    ) -> SessionResult<()> {
-        let mut actor = self.inner.lock().await;
-        actor.handle_deadline_reached(schedule_public_id).await;
-        Ok(())
+    /// Get a snapshot of the current scheduler metrics.
+    pub async fn metrics(&self) -> SchedulerMetrics {
+        self.actor_ref
+            .ask(GetMetrics)
+            .await
+            .unwrap_or_default()
     }
 
     /// Shutdown the scheduler and its background tasks.
     pub async fn shutdown(&self) {
-        let mut actor = self.inner.lock().await;
-        
-        // Abort all background tasks
-        if let Some(handle) = actor.wake_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = actor.reconcile_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = actor.lease_renew_handle.take() {
-            handle.abort();
-        }
-        
-        info!("SchedulerActor: shutdown complete");
+        let _ = self.actor_ref.tell(Shutdown).await;
+        // Give the actor a moment to process shutdown before the ref is dropped
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
 /// The scheduler actor. Manages deadline-based and event-driven schedule firing.
 ///
-/// Not derived with `#[derive(Actor)]` because kameo derive may not be available;
-/// instead we implement the actor message handlers manually and the actor is
-/// managed as a plain struct with a message-processing loop.
+/// A kameo actor — all interactions go through typed `Message<T>` handlers,
+/// ensuring serialized access to mutable state without explicit locks.
+#[derive(Actor)]
 pub struct SchedulerActor {
     schedule_store: Arc<dyn ScheduleRepository>,
     session_registry: Arc<Mutex<SessionRegistry>>,
@@ -186,11 +243,246 @@ pub struct SchedulerActor {
     /// Prevents double-application of completion/failure from duplicate events.
     processed_terminals: HashSet<(String, Option<String>)>,
 
-    // Background task handles
+    /// Self-reference set after spawn. Used to schedule deadline wake tasks
+    /// that send `DeadlineReached` back to this actor.
+    self_ref: Option<ActorRef<Self>>,
+    /// Handle to the current deadline wake task (aborted when the queue head changes).
     wake_handle: Option<JoinHandle<()>>,
-    reconcile_handle: Option<JoinHandle<()>>,
-    lease_renew_handle: Option<JoinHandle<()>>,
+
+    /// Operational metrics for observability (Phase 6).
+    metrics: SchedulerMetrics,
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+//  Message Handlers
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── DeadlineReached (internal, from deadline wake loop) ──────────────────
+
+impl Message<DeadlineReached> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: DeadlineReached,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_deadline_reached(&msg.schedule_public_id).await;
+    }
+}
+
+// ── ProcessEvent (internal, from event subscription loop) ────────────────
+
+impl Message<ProcessEvent> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: ProcessEvent,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.process_event(&msg.envelope).await;
+    }
+}
+
+// ── Reconcile (internal, from reconciliation loop) ───────────────────────
+
+impl Message<Reconcile> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: Reconcile,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.reconcile().await;
+    }
+}
+
+// ── CycleCompleted (internal, from process_event) ────────────────────────
+
+impl Message<CycleCompleted> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: CycleCompleted,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_cycle_completed(&msg.schedule_public_id, &msg.turn_id)
+            .await;
+    }
+}
+
+// ── CycleFailed (internal, from process_event / timeout) ─────────────────
+
+impl Message<CycleFailed> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: CycleFailed,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_cycle_failed_inner(
+            &msg.schedule_public_id,
+            msg.turn_id.as_deref(),
+            &msg.error,
+        )
+        .await;
+    }
+}
+
+// ── DebounceCompleted (internal, from debounce timer) ────────────────────
+
+impl Message<DebounceCompleted> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: DebounceCompleted,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_debounce_completed(&msg.schedule_public_id)
+            .await;
+    }
+}
+
+// ── TriggerNow (control) ─────────────────────────────────────────────────
+
+impl Message<TriggerNow> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: TriggerNow,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_trigger_now(&msg.schedule_public_id).await;
+    }
+}
+
+// ── AddSchedule (control) ────────────────────────────────────────────────
+
+impl Message<AddSchedule> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: AddSchedule,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_add_schedule(msg.schedule).await;
+    }
+}
+
+// ── RemoveSchedule (control) ─────────────────────────────────────────────
+
+impl Message<RemoveSchedule> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: RemoveSchedule,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_remove_schedule(&msg.schedule_public_id).await;
+    }
+}
+
+// ── PauseSchedule (control) ──────────────────────────────────────────────
+
+impl Message<PauseSchedule> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: PauseSchedule,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_pause_schedule(&msg.schedule_public_id).await;
+    }
+}
+
+// ── ResumeSchedule (control) ─────────────────────────────────────────────
+
+impl Message<ResumeSchedule> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: ResumeSchedule,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_resume_schedule(&msg.schedule_public_id).await;
+    }
+}
+
+// ── ListSchedules (query, uses ask) ──────────────────────────────────────
+
+impl Message<ListSchedules> for SchedulerActor {
+    type Reply = Result<Vec<Schedule>, kameo::error::Infallible>;
+
+    async fn handle(
+        &mut self,
+        msg: ListSchedules,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self
+            .handle_list_schedules(msg.session_public_id.as_deref())
+            .await)
+    }
+}
+
+// ── GetMetrics (query, uses ask) ─────────────────────────────────────────
+
+impl Message<GetMetrics> for SchedulerActor {
+    type Reply = Result<SchedulerMetrics, kameo::error::Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetMetrics,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self.metrics.clone())
+    }
+}
+
+// ── Shutdown ─────────────────────────────────────────────────────────────
+
+impl Message<Shutdown> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: Shutdown,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.abort_background_tasks();
+        // Stop the actor after this message is processed
+        ctx.stop();
+    }
+}
+
+// ── SetSelfRef (internal, sent once after spawn) ─────────────────────────
+
+impl Message<SetSelfRef> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SetSelfRef,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.self_ref = Some(msg.actor_ref);
+        // Now that we have a self-ref, schedule the first deadline wake
+        self.reschedule_wake();
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  Construction, spawn, and background loops
+// ══════════════════════════════════════════════════════════════════════════
 
 impl SchedulerActor {
     /// Create a new `SchedulerActor`.
@@ -212,9 +504,9 @@ impl SchedulerActor {
             active_cycles: HashMap::new(),
             pending_deletes: HashSet::new(),
             processed_terminals: HashSet::new(),
+            self_ref: None,
             wake_handle: None,
-            reconcile_handle: None,
-            lease_renew_handle: None,
+            metrics: SchedulerMetrics::default(),
         }
     }
 
@@ -235,33 +527,53 @@ impl SchedulerActor {
             scheduler_config,
         );
 
-        // Try to acquire lease and initialize
+        // Try to acquire lease and initialize (before spawning the actor).
+        // Direct mutable access is safe here — actor is not yet shared.
         let acquired = actor.initialize().await;
         if !acquired {
             info!("SchedulerActor: not starting (lease not acquired)");
             return None;
         }
 
-        // Create handle and start background loops
-        let handle = SchedulerHandle::new(actor);
-        
-        // Start background loops
+        // Capture data needed by background loops before move into spawn.
+        let agent_config = actor.config.clone();
+        let sched_store = actor.schedule_store.clone();
+        let sched_config = actor.scheduler_config.clone();
+        let owner_id = actor.owner_id.clone();
+
+        // Spawn as a kameo actor
+        let actor_ref = kameo::actor::Spawn::spawn(actor);
+
+        // Store self_ref in the actor so it can schedule deadline wakes.
+        // We use tell() which is fine here — the actor processes it before
+        // any background loop messages arrive.
         {
-            let mut actor_guard = handle.inner.lock().await;
-            actor_guard.start_background_loops(handle.clone());
+            let r = actor_ref.clone();
+            let _ = actor_ref
+                .tell(SetSelfRef { actor_ref: r })
+                .await;
         }
 
+        // Start background loops — each sends typed messages via ActorRef.
+        Self::start_background_loops(
+            &actor_ref,
+            &agent_config,
+            &sched_store,
+            &sched_config,
+            &owner_id,
+        );
+
         info!("SchedulerActor: started successfully");
-        Some(handle)
+        Some(SchedulerHandle::new(actor_ref))
     }
 
     /// Initialize the scheduler: acquire lease, recover state, populate queues.
     ///
-    /// Should be called once after construction. Returns `true` if the lease
-    /// was acquired (this scheduler is the active leader).
-    pub async fn initialize(&mut self) -> bool {
+    /// Called before the actor is spawned (direct mutable access is safe here).
+    /// Returns `true` if the lease was acquired (this scheduler is the active leader).
+    async fn initialize(&mut self) -> bool {
         // 1. Acquire lease
-        let acquired = match self
+        match self
             .schedule_store
             .try_acquire_scheduler_lease(&self.owner_id, self.scheduler_config.lease_ttl_secs)
             .await
@@ -271,7 +583,6 @@ impl SchedulerActor {
                     "SchedulerActor: lease acquired (owner={})",
                     self.owner_id
                 );
-                true
             }
             Ok(false) => {
                 info!("SchedulerActor: lease not acquired, staying passive");
@@ -281,10 +592,6 @@ impl SchedulerActor {
                 warn!("SchedulerActor: failed to acquire lease: {}", e);
                 return false;
             }
-        };
-
-        if !acquired {
-            return false;
         }
 
         // 2. Recover stale Running schedules
@@ -296,61 +603,75 @@ impl SchedulerActor {
         true
     }
 
-    /// Start background loops: lease renewal, event fanout subscription, reconciliation.
+    /// Start background loops that send typed messages to the actor.
     ///
-    /// Should be called after successful `initialize()`.
-    pub fn start_background_loops(
-        &mut self,
-        self_handle: SchedulerHandle,
+    /// Each loop owns a clone of the `ActorRef` and uses `tell()` to deliver
+    /// messages through the actor's mailbox. Data from the actor that the loops
+    /// need is passed in explicitly (captured before the actor was spawned).
+    fn start_background_loops(
+        actor_ref: &ActorRef<Self>,
+        agent_config: &Arc<AgentConfig>,
+        schedule_store: &Arc<dyn ScheduleRepository>,
+        scheduler_config: &SchedulerConfig,
+        owner_id: &str,
     ) {
-        // Start lease renewal loop
-        self.start_lease_renewal_loop(self_handle.clone());
-
-        // Start event fanout subscription loop
-        self.start_event_subscription_loop(self_handle.clone());
-
-        // Start reconciliation loop
-        self.start_reconciliation_loop(self_handle.clone());
-
-        // Start deadline wake loop
-        self.start_deadline_wake_loop(self_handle);
+        Self::start_lease_renewal_loop(
+            actor_ref,
+            schedule_store,
+            scheduler_config,
+            owner_id,
+        );
+        Self::start_event_subscription_loop(actor_ref, agent_config);
+        Self::start_reconciliation_loop(actor_ref, scheduler_config);
+        // Deadline wakes are handled by `reschedule_wake()` inside the actor
+        // (triggered via the SetSelfRef message after spawn).
     }
 
     /// Start the lease renewal background task.
-    fn start_lease_renewal_loop(&mut self, handle: SchedulerHandle) {
-        let owner_id = self.owner_id.clone();
-        let schedule_store = self.schedule_store.clone();
-        let ttl_secs = self.scheduler_config.lease_ttl_secs;
-        let renew_interval = ttl_secs / 2; // Renew at half TTL
+    ///
+    /// Talks directly to the schedule store — lease renewal does not need
+    /// actor state mutation (the `Reconcile` handler also renews, but this
+    /// dedicated loop runs at half the TTL for faster detection of lease loss).
+    fn start_lease_renewal_loop(
+        actor_ref: &ActorRef<Self>,
+        schedule_store: &Arc<dyn ScheduleRepository>,
+        scheduler_config: &SchedulerConfig,
+        owner_id: &str,
+    ) {
+        let store = schedule_store.clone();
+        let owner = owner_id.to_string();
+        let ttl_secs = scheduler_config.lease_ttl_secs;
+        let renew_interval = ttl_secs / 2;
+        let actor = actor_ref.clone();
 
-        let renew_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_secs(renew_interval)
-            );
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(renew_interval));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 interval.tick().await;
 
-                match schedule_store
-                    .renew_scheduler_lease(&owner_id, ttl_secs)
-                    .await
-                {
+                match store.renew_scheduler_lease(&owner, ttl_secs).await {
                     Ok(true) => {
-                        debug!("SchedulerActor: lease renewed for {}", owner_id);
+                        debug!(
+                            "SchedulerActor: lease renewed for {}",
+                            owner
+                        );
                     }
                     Ok(false) => {
                         warn!(
-                            "SchedulerActor: lease renewal failed for {} (lost ownership)",
-                            owner_id
+                            "SchedulerActor: lease lost for {}",
+                            owner
                         );
-                        // Lost lease — should stop processing
+                        // Lost lease — shut down the actor
+                        let _ = actor.tell(Shutdown).await;
                         break;
                     }
                     Err(e) => {
                         warn!(
                             "SchedulerActor: lease renewal error for {}: {}",
-                            owner_id, e
+                            owner, e
                         );
                         // Continue trying on transient errors
                     }
@@ -359,107 +680,109 @@ impl SchedulerActor {
 
             info!("SchedulerActor: lease renewal loop exited");
         });
-
-        self.lease_renew_handle = Some(renew_handle);
     }
 
     /// Start the event fanout subscription background task.
-    fn start_event_subscription_loop(&mut self, handle: SchedulerHandle) {
-        let mut event_rx = self.config.subscribe_events();
+    ///
+    /// Subscribes to the `AgentConfig` event broadcast and forwards each
+    /// envelope as a `ProcessEvent` message to the actor.
+    fn start_event_subscription_loop(
+        actor_ref: &ActorRef<Self>,
+        agent_config: &Arc<AgentConfig>,
+    ) {
+        let mut event_rx = agent_config.subscribe_events();
+        let actor = actor_ref.clone();
 
-        let event_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
                     Ok(envelope) => {
-                        // Forward event to handle for processing
-                        if let Err(e) = handle.process_event(envelope).await {
-                            warn!("SchedulerActor: failed to process event: {}", e);
+                        if let Err(e) = actor.tell(ProcessEvent { envelope }).await {
+                            warn!("SchedulerActor: failed to send ProcessEvent: {}", e);
+                            break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        info!("SchedulerActor: event fanout closed, exiting subscription loop");
+                        info!(
+                            "SchedulerActor: event fanout closed, exiting subscription loop"
+                        );
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("SchedulerActor: event subscription lagged by {} events", n);
-                        // Continue processing
+                        warn!(
+                            "SchedulerActor: event subscription lagged by {} events",
+                            n
+                        );
                     }
                 }
             }
         });
-
-        // Note: We don't store this handle in the actor state because it
-        // needs to run independently. It will be aborted when the actor is dropped.
-        drop(event_handle);
     }
 
     /// Start the reconciliation background task.
-    fn start_reconciliation_loop(&mut self, handle: SchedulerHandle) {
-        let interval_secs = self.scheduler_config.reconcile_interval_secs;
+    ///
+    /// Periodically sends a `Reconcile` message to the actor.
+    fn start_reconciliation_loop(
+        actor_ref: &ActorRef<Self>,
+        scheduler_config: &SchedulerConfig,
+    ) {
+        let interval_secs = scheduler_config.reconcile_interval_secs;
+        let actor = actor_ref.clone();
 
-        let reconcile_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_secs(interval_secs)
-            );
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 interval.tick().await;
 
-                if let Err(e) = handle.reconcile().await {
-                    warn!("SchedulerActor: reconciliation failed: {}", e);
+                if let Err(e) = actor.tell(Reconcile).await {
+                    warn!("SchedulerActor: failed to send Reconcile: {}", e);
+                    break;
                 }
             }
         });
-
-        self.reconcile_handle = Some(reconcile_handle);
     }
 
-    /// Start the deadline wake loop for interval-based schedules.
+    /// Abort the current deadline wake task (if any).
+    fn abort_background_tasks(&mut self) {
+        if let Some(handle) = self.wake_handle.take() {
+            handle.abort();
+        }
+        info!("SchedulerActor: background tasks aborted");
+    }
+
+    /// Schedule (or reschedule) the deadline wake task.
     ///
-    /// This loop wakes when the next deadline is reached and fires the schedule.
-    fn start_deadline_wake_loop(&mut self, handle: SchedulerHandle) {
-        let wake_handle = tokio::spawn(async move {
-            loop {
-                // Get the next deadline from the queue
-                let next_deadline = {
-                    let actor = handle.inner.lock().await;
-                    actor.deadline_queue.peek().map(|(dt, id)| (dt, id.to_string()))
-                };
+    /// Aborts the current wake task and spawns a new one that sleeps until the
+    /// earliest deadline in the queue, then sends `DeadlineReached` to the actor.
+    /// Called after any mutation to the deadline queue head.
+    fn reschedule_wake(&mut self) {
+        // Abort any existing wake task
+        if let Some(handle) = self.wake_handle.take() {
+            handle.abort();
+        }
 
-                match next_deadline {
-                    Some((deadline_time, schedule_id)) => {
-                        let now = OffsetDateTime::now_utc();
-                        
-                        if deadline_time <= now {
-                            // Deadline has passed, fire immediately
-                            if let Err(e) = handle.handle_deadline_reached_internal(&schedule_id).await {
-                                warn!("SchedulerActor: failed to handle deadline: {}", e);
-                            }
-                        } else {
-                            // Sleep until deadline
-                            let duration = (deadline_time - now).max(time::Duration::ZERO);
-                            let std_duration = std::time::Duration::from_secs(
-                                duration.whole_seconds().max(0) as u64
-                            );
-                            
-                            tokio::time::sleep(std_duration).await;
-                            
-                            // Fire the schedule
-                            if let Err(e) = handle.handle_deadline_reached_internal(&schedule_id).await {
-                                warn!("SchedulerActor: failed to handle deadline: {}", e);
-                            }
-                        }
-                    }
-                    None => {
-                        // No deadlines, sleep for a while and check again
-                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    }
-                }
-            }
-        });
+        let Some(actor_ref) = self.self_ref.clone() else {
+            return; // self_ref not yet set (pre-spawn initialization)
+        };
 
-        self.wake_handle = Some(wake_handle);
+        let Some((next_time, schedule_public_id)) = self.deadline_queue.peek().map(|(dt, id)| (dt, id.to_string())) else {
+            return; // Queue is empty, nothing to schedule
+        };
+
+        let delay = (next_time - OffsetDateTime::now_utc()).max(time::Duration::ZERO);
+        let std_delay = std::time::Duration::from_secs(delay.whole_seconds().max(0) as u64);
+
+        self.wake_handle = Some(tokio::spawn(async move {
+            tokio::time::sleep(std_delay).await;
+            let _ = actor_ref
+                .tell(DeadlineReached {
+                    schedule_public_id,
+                })
+                .await;
+        }));
     }
 
     /// Recover schedules stuck in `Running` state (from crashes/restarts).
@@ -513,12 +836,17 @@ impl SchedulerActor {
     }
 
     /// Add a schedule to the appropriate in-memory queue based on its trigger.
+    ///
+    /// Automatically reschedules the deadline wake task if the queue head may
+    /// have changed (interval schedules).
     fn enqueue_schedule(&mut self, schedule: &Schedule) {
         match &schedule.trigger {
             ScheduleTrigger::Interval { .. } => {
                 if let Some(next) = schedule.next_run_at {
                     self.deadline_queue
                         .insert(next, schedule.public_id.clone());
+                    // Queue head may have changed — reschedule wake
+                    self.reschedule_wake();
                 }
             }
             ScheduleTrigger::EventDriven {
@@ -531,6 +859,8 @@ impl SchedulerActor {
                 );
             }
         }
+        self.metrics.armed_interval_schedules = self.deadline_queue.len() as u64;
+        self.metrics.armed_event_schedules = self.event_counters.len() as u64;
     }
 
     // ── Firing flow ──────────────────────────────────────────────────────
@@ -558,9 +888,10 @@ impl SchedulerActor {
         };
 
         if !cas_ok {
+            self.metrics.cas_conflicts_total += 1;
             debug!(
-                "SchedulerActor: CAS returned false for {} (already running, paused, or terminal)",
-                schedule_public_id
+                "SchedulerActor: CAS conflict for {} (Armed→Running denied, schedule_public_id={}, cas_conflicts_total={})",
+                schedule_public_id, schedule_public_id, self.metrics.cas_conflicts_total
             );
             return;
         }
@@ -620,9 +951,10 @@ impl SchedulerActor {
 
         match actor_ref.tell_scheduled_prompt(scheduled_prompt).await {
             Ok(()) => {
+                self.metrics.fires_total += 1;
                 info!(
-                    "SchedulerActor: fired schedule {} → session {}",
-                    schedule_public_id, schedule.session_public_id
+                    "SchedulerActor: fired schedule {} → session {} (fires_total={})",
+                    schedule_public_id, schedule.session_public_id, self.metrics.fires_total
                 );
             }
             Err(e) => {
@@ -640,34 +972,42 @@ impl SchedulerActor {
             }
         }
 
-        // Set up timeout handle
+        // Set up timeout handle — sends CycleFailed directly to this actor
         let max_runtime = schedule.config.max_runtime_seconds;
         let schedule_id_for_timeout = schedule_public_id.to_string();
-        let config_for_timeout = self.config.clone();
-        let session_id_for_timeout = schedule.session_public_id.clone();
-        let timeout_handle = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(max_runtime)).await;
-            // Emit a timeout failure event — the scheduler will pick this up
-            // via the EventFanout subscription.
-            config_for_timeout.emit_event(
-                &session_id_for_timeout,
-                AgentEventKind::ScheduledExecutionFailed {
-                    schedule_public_id: schedule_id_for_timeout,
-                    turn_id: None,
-                    error: format!("cycle exceeded max_runtime_seconds ({})", max_runtime),
-                },
-            );
-        });
+        let timeout_handle = if let Some(actor_ref) = self.self_ref.clone() {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(max_runtime)).await;
+                let _ = actor_ref
+                    .tell(CycleFailed {
+                        schedule_public_id: schedule_id_for_timeout,
+                        turn_id: None,
+                        error: format!(
+                            "cycle exceeded max_runtime_seconds ({})",
+                            max_runtime
+                        ),
+                    })
+                    .await;
+            })
+        } else {
+            // Fallback: no self_ref (should not happen in normal operation)
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(max_runtime)).await;
+                warn!(
+                    "SchedulerActor: timeout for {} but no self_ref to send CycleFailed",
+                    schedule_id_for_timeout
+                );
+            })
+        };
 
         self.active_cycles.insert(
             schedule_public_id.to_string(),
             ActiveCycle {
-                schedule_public_id: schedule_public_id.to_string(),
-                session_public_id: schedule.session_public_id.clone(),
                 started_at: OffsetDateTime::now_utc(),
                 timeout_handle,
             },
         );
+        self.metrics.active_cycles = self.active_cycles.len() as u64;
 
         // Emit ScheduleFired event
         self.config.emit_event(
@@ -689,18 +1029,23 @@ impl SchedulerActor {
             Some(turn_id.to_string()),
         );
         if self.processed_terminals.contains(&key) {
+            self.metrics.idempotent_drops_total += 1;
             debug!(
-                "SchedulerActor: duplicate CycleCompleted for ({}, {}), ignoring",
-                schedule_public_id, turn_id
+                "SchedulerActor: duplicate CycleCompleted dropped (schedule={}, turn={}, idempotent_drops_total={})",
+                schedule_public_id, turn_id, self.metrics.idempotent_drops_total
             );
             return;
         }
         self.processed_terminals.insert(key);
 
-        // Remove active cycle and abort timeout
+        // Remove active cycle, abort timeout, and track runtime
         if let Some(cycle) = self.active_cycles.remove(schedule_public_id) {
             cycle.timeout_handle.abort();
+            let runtime = (OffsetDateTime::now_utc() - cycle.started_at).as_seconds_f64();
+            self.metrics.last_cycle_runtime_secs = runtime;
         }
+        self.metrics.active_cycles = self.active_cycles.len() as u64;
+        self.metrics.completions_total += 1;
 
         // Load and update schedule
         let schedule = match self.schedule_store.get_schedule(schedule_public_id).await {
@@ -812,18 +1157,23 @@ impl SchedulerActor {
             turn_id.map(|s| s.to_string()),
         );
         if self.processed_terminals.contains(&key) {
+            self.metrics.idempotent_drops_total += 1;
             debug!(
-                "SchedulerActor: duplicate CycleFailed for ({}, {:?}), ignoring",
-                schedule_public_id, turn_id
+                "SchedulerActor: duplicate CycleFailed dropped (schedule={}, turn={:?}, idempotent_drops_total={})",
+                schedule_public_id, turn_id, self.metrics.idempotent_drops_total
             );
             return;
         }
         self.processed_terminals.insert(key);
 
-        // Remove active cycle and abort timeout
+        // Remove active cycle, abort timeout, and track runtime
         if let Some(cycle) = self.active_cycles.remove(schedule_public_id) {
             cycle.timeout_handle.abort();
+            let runtime = (OffsetDateTime::now_utc() - cycle.started_at).as_seconds_f64();
+            self.metrics.last_cycle_runtime_secs = runtime;
         }
+        self.metrics.active_cycles = self.active_cycles.len() as u64;
+        self.metrics.failures_total += 1;
 
         // Load and update schedule
         let schedule = match self.schedule_store.get_schedule(schedule_public_id).await {
@@ -956,12 +1306,16 @@ impl SchedulerActor {
                 schedule_public_id
             );
             self.pending_deletes.insert(schedule_public_id.to_string());
+            self.metrics.pending_deletes = self.pending_deletes.len() as u64;
             return;
         }
 
         // Remove from in-memory queues
         self.deadline_queue.remove(schedule_public_id);
         self.event_counters.remove(schedule_public_id);
+        self.metrics.armed_interval_schedules = self.deadline_queue.len() as u64;
+        self.metrics.armed_event_schedules = self.event_counters.len() as u64;
+        self.reschedule_wake();
 
         // Delete from store
         if let Err(e) = self
@@ -1017,6 +1371,7 @@ impl SchedulerActor {
         if let Some(acc) = self.event_counters.get_mut(schedule_public_id) {
             acc.reset();
         }
+        self.reschedule_wake();
 
         self.config.emit_event(
             "", // Session ID not easily available here; use empty for scheduler-level events
@@ -1138,26 +1493,23 @@ impl SchedulerActor {
                             + time::Duration::seconds(debounce_secs as i64);
                         acc.debounce_until = Some(debounce_until);
 
-                        // Spawn a debounce timer task
-                        let schedule_id = schedule_public_id.to_string();
-                        let config = self.config.clone();
-                        let session_id = schedule.session_public_id.clone();
-                        let debounce_handle = tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_secs(
-                                debounce_secs,
-                            ))
-                            .await;
-
-                            // Emit a debounce completed event (internal)
-                            config.emit_event(
-                                &session_id,
-                                AgentEventKind::ScheduleDebounceCompleted {
-                                    schedule_public_id: schedule_id,
-                                },
-                            );
-                        });
-
-                        acc.debounce_handle = Some(debounce_handle);
+                        // Spawn a debounce timer that sends DebounceCompleted
+                        // directly to the actor via self_ref.
+                        if let Some(actor_ref) = self.self_ref.clone() {
+                            let schedule_id = schedule_public_id.to_string();
+                            let debounce_handle = tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(
+                                    debounce_secs,
+                                ))
+                                .await;
+                                let _ = actor_ref
+                                    .tell(DebounceCompleted {
+                                        schedule_public_id: schedule_id,
+                                    })
+                                    .await;
+                            });
+                            acc.debounce_handle = Some(debounce_handle);
+                        }
                     } else {
                         // No debounce, fire immediately
                         acc.reset();
@@ -1194,12 +1546,14 @@ impl SchedulerActor {
     pub async fn handle_deadline_reached(&mut self, schedule_public_id: &str) {
         // Remove from queue (it was the top entry)
         self.deadline_queue.remove(schedule_public_id);
+        self.reschedule_wake();
         self.fire_schedule(schedule_public_id).await;
     }
 
     /// Handle a TriggerNow request — fire immediately regardless of deadline.
     pub async fn handle_trigger_now(&mut self, schedule_public_id: &str) {
         self.deadline_queue.remove(schedule_public_id);
+        self.reschedule_wake();
         self.fire_schedule(schedule_public_id).await;
     }
 
@@ -1224,7 +1578,8 @@ impl SchedulerActor {
 
     /// Run the periodic reconciliation sweep.
     pub async fn reconcile(&mut self) {
-        debug!("SchedulerActor: running reconciliation sweep");
+        self.metrics.reconciliation_sweeps_total += 1;
+        debug!("SchedulerActor: running reconciliation sweep (sweep={})", self.metrics.reconciliation_sweeps_total);
 
         // 1. Recover stale running schedules
         let cutoff = OffsetDateTime::now_utc() - time::Duration::seconds(300);
@@ -1236,9 +1591,10 @@ impl SchedulerActor {
             for schedule in stale {
                 // Only recover if we don't have it as an active cycle
                 if !self.active_cycles.contains_key(&schedule.public_id) {
+                    self.metrics.reconciliation_recoveries_total += 1;
                     warn!(
-                        "SchedulerActor: reconciliation recovering stale schedule: {}",
-                        schedule.public_id
+                        "SchedulerActor: reconciliation recovering stale schedule: {} (recoveries_total={})",
+                        schedule.public_id, self.metrics.reconciliation_recoveries_total
                     );
                     self.handle_cycle_failed_inner(
                         &schedule.public_id,
@@ -1256,9 +1612,10 @@ impl SchedulerActor {
             for schedule in armed {
                 if let Some(next_run) = schedule.next_run_at {
                     if next_run <= now {
+                        self.metrics.reconciliation_overdue_fires_total += 1;
                         info!(
-                            "SchedulerActor: reconciliation firing overdue schedule: {}",
-                            schedule.public_id
+                            "SchedulerActor: reconciliation firing overdue schedule: {} (overdue_fires_total={})",
+                            schedule.public_id, self.metrics.reconciliation_overdue_fires_total
                         );
                         self.fire_schedule(&schedule.public_id).await;
                     }
@@ -1300,11 +1657,9 @@ impl SchedulerActor {
                 )
                 .await;
             }
-            AgentEventKind::ScheduleDebounceCompleted {
-                schedule_public_id,
-            } => {
-                self.handle_debounce_completed(schedule_public_id).await;
-            }
+            // ScheduleDebounceCompleted is now handled via direct DebounceCompleted
+            // messages to the actor (no longer routed through the event fanout).
+            AgentEventKind::ScheduleDebounceCompleted { .. } => {}
             // Match event-driven schedule triggers
             _ => {
                 // Check if any event accumulator cares about this event kind

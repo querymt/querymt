@@ -29,6 +29,7 @@ interface FlatSession extends SessionSummary {
   isChild: boolean;
   isDelegation: boolean;
   isRecurring: boolean;
+  isMemory: boolean;
   isRemote: boolean;
 }
 
@@ -62,6 +63,7 @@ export function SessionSwitcher({
           isChild: !!session.parent_session_id,
           isDelegation: session.fork_origin === 'delegation',
           isRecurring: session.session_kind === 'recurring',
+          isMemory: session.session_kind === 'memory',
           isRemote: !!session.node,
         });
       }
@@ -317,9 +319,14 @@ export function SessionSwitcher({
                               delegated
                             </span>
                           )}
-                          {session.isRecurring && (
+                          {session.isRecurring && !session.isMemory && (
                             <span className="text-[10px] px-1.5 py-0.5 bg-accent-secondary/20 text-accent-secondary rounded border border-accent-secondary/30 flex-shrink-0">
                               recurring
+                            </span>
+                          )}
+                          {session.isMemory && (
+                            <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded border border-purple-500/30 flex-shrink-0">
+                              memory
                             </span>
                           )}
                           {session.isRemote && (
@@ -417,9 +424,14 @@ export function SessionSwitcher({
                               delegated
                             </span>
                           )}
-                          {session.isRecurring && (
+                          {session.isRecurring && !session.isMemory && (
                             <span className="text-[10px] px-1.5 py-0.5 bg-accent-secondary/20 text-accent-secondary rounded border border-accent-secondary/30 flex-shrink-0">
                               recurring
+                            </span>
+                          )}
+                          {session.isMemory && (
+                            <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded border border-purple-500/30 flex-shrink-0">
+                              memory
                             </span>
                           )}
                           {session.isRemote && (

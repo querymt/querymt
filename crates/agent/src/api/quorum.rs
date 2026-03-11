@@ -364,6 +364,10 @@ impl QuorumBuilder {
         #[cfg(feature = "remote")]
         let routing_actor_for_planner = routing_actor_ref.clone();
 
+        // Extract schedule_repository and knowledge_store from backend for planner.
+        let schedule_repo_for_planner = backend.schedule_repository();
+        let knowledge_store_for_planner = backend.knowledge_store();
+
         let planner_llm = build_llm_config(&planner_config)?;
         let planner_tools = planner_config.tools.clone();
         let planner_middleware = planner_config.middleware.clone();
@@ -415,6 +419,14 @@ impl QuorumBuilder {
                 log::info!(
                     "Registered routing planner tools: route_delegation_to_peer, use_remote_provider"
                 );
+            }
+
+            // Wire schedule repository and knowledge store into the planner config.
+            if let Some(ref repo) = schedule_repo_for_planner {
+                b = b.with_schedule_repository(repo.clone());
+            }
+            if let Some(ref ks) = knowledge_store_for_planner {
+                b = b.with_knowledge_store(ks.clone());
             }
 
             let config = Arc::new(b.build());
