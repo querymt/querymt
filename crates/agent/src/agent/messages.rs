@@ -46,6 +46,23 @@ pub(crate) struct PromptFinished {
     pub generation: u64,
 }
 
+/// Run a scheduled prompt on this session.
+///
+/// Sent by the `SchedulerActor` when a schedule fires. Carries per-cycle
+/// execution limits and the `ExecutionOrigin::Scheduled` correlation so
+/// the session emits explicit terminal events back to the scheduler.
+///
+/// NOT serializable across the mesh — scheduled execution is always local
+/// to the scheduler leader node.
+pub struct ScheduledPrompt {
+    /// Public ID of the schedule that triggered this execution.
+    pub schedule_public_id: String,
+    /// Prompt text derived from the task's `expected_deliverable`.
+    pub prompt_text: String,
+    /// Optional per-cycle execution limits (max_steps, max_cost_usd).
+    pub execution_limits: Option<crate::session::domain_schedule::ScheduleExecutionLimits>,
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 //  Configuration
 // ══════════════════════════════════════════════════════════════════════════

@@ -17,7 +17,7 @@ use crate::middleware::{
     calculate_context_tokens,
 };
 use crate::model::{AgentMessage, MessagePart};
-use crate::session::domain::TaskStatus;
+use crate::session::domain::{TaskKind, TaskStatus};
 use agent_client_protocol::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
 use anyhow::Context as _;
 use futures_util::StreamExt;
@@ -671,14 +671,29 @@ pub(super) async fn transition_after_llm(
         }
 
         Some(FinishReason::Stop) => {
-            if exec_ctx.state.active_task.is_some() {
-                if let Err(e) = exec_ctx.state.update_task_status(TaskStatus::Done).await {
-                    debug!("Failed to auto-complete task on stop: {}", e);
-                } else if let Some(task) = exec_ctx.state.active_task.clone() {
-                    config.emit_event(
-                        &exec_ctx.session_id,
-                        AgentEventKind::TaskStatusChanged { task },
-                    );
+            if let Some(task) = exec_ctx.state.active_task.as_ref() {
+                match task.kind {
+                    TaskKind::Recurring => {
+                        // Do NOT mark Done. The SchedulerActor handles cycle
+                        // completion and next_run_at computation. The task stays
+                        // Active so the next scheduled cycle can re-use it.
+                        debug!(
+                            "Recurring task {} cycle completed (not marking Done)",
+                            task.public_id
+                        );
+                    }
+                    TaskKind::Finite | TaskKind::Evolving => {
+                        if let Err(e) =
+                            exec_ctx.state.update_task_status(TaskStatus::Done).await
+                        {
+                            debug!("Failed to auto-complete task on stop: {}", e);
+                        } else if let Some(task) = exec_ctx.state.active_task.clone() {
+                            config.emit_event(
+                                &exec_ctx.session_id,
+                                AgentEventKind::TaskStatusChanged { task },
+                            );
+                        }
+                    }
                 }
             }
             Ok(ExecutionState::Complete)

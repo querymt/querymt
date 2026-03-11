@@ -32,6 +32,7 @@ pub mod repo_decision;
 pub mod repo_delegation;
 pub mod repo_intent;
 pub mod repo_progress;
+pub mod repo_schedule;
 pub mod repo_session;
 pub mod repo_task;
 
@@ -40,8 +41,17 @@ pub use repo_decision::SqliteDecisionRepository;
 pub use repo_delegation::SqliteDelegationRepository;
 pub use repo_intent::SqliteIntentRepository;
 pub use repo_progress::SqliteProgressRepository;
+pub use repo_schedule::SqliteScheduleRepository;
 pub use repo_session::SqliteSessionRepository;
 pub use repo_task::SqliteTaskRepository;
+
+// Schedule domain types
+pub mod domain_schedule;
+pub use domain_schedule::{
+    EventTriggerFilter, Schedule, ScheduleConfig, ScheduleExecutionLimits, ScheduleState,
+    ScheduleTrigger,
+};
+pub use repo_schedule::ScheduleRepository;
 
 // Projection stores
 pub mod projection;
