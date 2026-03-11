@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use crate::knowledge::{KnowledgeStore, ScopePolicy};
+
 /// Capability requirements that tools may need
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -35,6 +37,21 @@ pub enum ToolError {
 pub trait ToolContext: Send + Sync {
     /// Get the current session ID
     fn session_id(&self) -> &str;
+
+    /// Get the current session public ID (defaults to `session_id`).
+    fn session_public_id(&self) -> Option<String> {
+        Some(self.session_id().to_string())
+    }
+
+    /// Optional knowledge store access for knowledge tools.
+    fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
+        None
+    }
+
+    /// Scope policy for knowledge tools. Defaults to permissive (allow all scopes).
+    fn scope_policy(&self) -> Arc<dyn ScopePolicy> {
+        Arc::new(crate::knowledge::PermissiveScopePolicy)
+    }
 
     /// Get the current working directory, if set.
     fn cwd(&self) -> Option<&Path>;

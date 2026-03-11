@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::elicitation::{ElicitationAction, ElicitationResponse};
+use crate::knowledge::{KnowledgeStore, ScopePolicy};
 use crate::tools::context::{ToolContext, ToolError};
 
 /// A request to elicit information from the user, sent from tool context to the agent
@@ -27,6 +28,8 @@ pub struct AgentToolContext {
     agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry>>,
     elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
     cancellation_token: CancellationToken,
+    knowledge_store: Option<Arc<dyn KnowledgeStore>>,
+    scope_policy: Arc<dyn ScopePolicy>,
 }
 
 impl AgentToolContext {
@@ -42,6 +45,8 @@ impl AgentToolContext {
             agent_registry,
             elicitation_tx,
             cancellation_token: CancellationToken::new(),
+            knowledge_store: None,
+            scope_policy: Arc::new(crate::knowledge::PermissiveScopePolicy),
         }
     }
 
@@ -49,6 +54,16 @@ impl AgentToolContext {
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
         self
+    }
+
+    /// Attach a knowledge store to this context.
+    pub fn with_knowledge_store(&mut self, knowledge_store: Arc<dyn KnowledgeStore>) {
+        self.knowledge_store = Some(knowledge_store);
+    }
+
+    /// Set the scope policy for knowledge tools.
+    pub fn with_scope_policy(&mut self, policy: Arc<dyn ScopePolicy>) {
+        self.scope_policy = policy;
     }
 
     /// Create a basic context for testing or simple operations
@@ -69,6 +84,18 @@ impl ToolContext for AgentToolContext {
 
     fn agent_registry(&self) -> Option<Arc<dyn crate::delegation::AgentRegistry>> {
         self.agent_registry.clone()
+    }
+
+    fn session_public_id(&self) -> Option<String> {
+        Some(self.session_id.clone())
+    }
+
+    fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
+        self.knowledge_store.clone()
+    }
+
+    fn scope_policy(&self) -> Arc<dyn ScopePolicy> {
+        self.scope_policy.clone()
     }
 
     async fn record_progress(
