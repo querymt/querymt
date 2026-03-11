@@ -1,0 +1,162 @@
+name: Native Provider Build & Publish
+description: >
+  Shared build-and-publish steps for native provider plugins: cargo build,
+  package the shared library, push to GHCR via ORAS, and upload manifest
+  data for multi-platform index creation.
+
+inputs:
+  crate:
+    description: Provider crate name (e.g. mrs, llama-cpp)
+    required: true
+  os:
+    description: Target OS (linux, darwin, windows)
+    required: true
+  arch:
+    description: Target architecture (amd64, arm64)
+    required: true
+  target:
+    description: Rust target triple
+    required: true
+  features:
+    description: Space-separated cargo features (empty string for default)
+    required: false
+    default: ""
+  feature_tag:
+    description: OCI tag suffix (e.g. default, metal, cuda12.8-sm80)
+    required: true
+  github_token:
+    description: GitHub token for GHCR authentication
+    required: true
+  github_actor:
+    description: GitHub actor for GHCR authentication
+    required: true
+  repository_owner:
+    description: GitHub repository owner for GHCR image path
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Build native library
+      shell: bash
+      run: |
+        if [[ "${{ inputs.os }}" == "windows" ]]; then
+          # Remove Git's link.exe to prevent it from shadowing MSVC's linker.
+          # This is a known issue when using bash on Windows GHA runners.
+          rm -f /usr/bin/link.exe
+
+          # Use a short target dir to avoid Windows MAX_PATH issues with
+          # deeply nested CMake ExternalProject builds (e.g. vulkan-shaders-gen)
+          export CARGO_TARGET_DIR='C:\b'
+        fi
+
+        FEATURES="${{ inputs.features }}"
+        FEATURE_ARGS=()
+        if [ -n "$FEATURES" ]; then
+          FEATURE_ARGS=( --features "$FEATURES" )
+        fi
+
+        cargo build -p qmt-${{ inputs.crate }} \
+          --release \
+          --target ${{ inputs.target }} \
+          "${FEATURE_ARGS[@]}"
+
+    - name: Package native library
+      shell: bash
+      run: |
+        # Convert hyphens to underscores (Rust cdylib naming convention)
+        LIB_BASE="qmt_$(echo '${{ inputs.crate }}' | tr '-' '_')"
+        case "${{ inputs.os }}" in
+          linux) LIB_FILE="lib${LIB_BASE}.so" ;;
+          darwin) LIB_FILE="lib${LIB_BASE}.dylib" ;;
+          windows) LIB_FILE="${LIB_BASE}.dll" ;;
+        esac
+
+        TARGET_DIR="target"
+        if [[ "${{ inputs.os }}" == "windows" ]]; then
+          TARGET_DIR="C:/b"
+        fi
+
+        mkdir -p dist
+        tar -czf dist/plugin.tar.gz -C "${TARGET_DIR}/${{ inputs.target }}/release" "$LIB_FILE"
+        echo "PLUGIN_TAR=dist/plugin.tar.gz" >> $GITHUB_ENV
+
+    - name: Cleanup build artifacts (non-Windows)
+      if: inputs.os != 'windows'
+      shell: bash
+      run: |
+        # Free runner disk before cache post-job runs.
+        rm -rf target
+
+    - name: Cleanup build artifacts (Windows)
+      if: inputs.os == 'windows'
+      shell: powershell
+      run: |
+        # Free runner disk before cache post-job runs.
+        Remove-Item -Recurse -Force C:\b
+
+    - name: Install Oras CLI
+      uses: oras-project/setup-oras@v1
+
+    - name: Log in to GHCR
+      shell: bash
+      run: |
+        echo "${{ inputs.github_token }}" | oras login ghcr.io \
+          --username "${{ inputs.github_actor }}" \
+          --password-stdin
+
+    - name: Create OCI config file with platform info
+      shell: bash
+      run: |
+        # Create config with platform information
+        cat > oci-config.json <<EOF
+        {
+          "architecture": "${{ inputs.arch }}",
+          "os": "${{ inputs.os }}"
+        }
+        EOF
+        cat oci-config.json
+
+    - name: Push native artifact to GHCR with Oras
+      shell: bash
+      run: |
+        IMAGE_BASE="ghcr.io/${{ inputs.repository_owner }}/${{ inputs.crate }}"
+        VERSIONED="${{ env.VERSION }}-${{ inputs.os }}-${{ inputs.arch }}-${{ inputs.feature_tag }}"
+        ALIAS="${{ inputs.os }}-${{ inputs.arch }}-${{ inputs.feature_tag }}"
+
+        echo "Pushing native artifact to ${IMAGE_BASE} with tags ${VERSIONED} and ${ALIAS}"
+
+        oras push "${IMAGE_BASE}:${VERSIONED},${ALIAS}" \
+          --config oci-config.json:application/vnd.oci.image.config.v1+json \
+          --annotation "mt.query.plugin.type=native" \
+          --annotation "mt.query.plugin.feature=${{ inputs.feature_tag }}" \
+          --annotation "org.opencontainers.image.version=${{ env.VERSION }}" \
+          --annotation "org.opencontainers.image.os=${{ inputs.os }}" \
+          --annotation "org.opencontainers.image.architecture=${{ inputs.arch }}" \
+          ${PLUGIN_TAR}:application/vnd.oci.image.layer.v1.tar+gzip
+
+        echo "Verifying manifest has platform fields..."
+        oras manifest fetch "${IMAGE_BASE}:${VERSIONED}" | jq '.'
+
+    - name: Save manifest data for aggregation
+      shell: bash
+      run: |
+        IMAGE_BASE="ghcr.io/${{ inputs.repository_owner }}/${{ inputs.crate }}"
+        VERSIONED="${{ env.VERSION }}-${{ inputs.os }}-${{ inputs.arch }}-${{ inputs.feature_tag }}"
+
+        mkdir -p manifest-data
+        cat > manifest-data/data.txt <<EOF
+        PROVIDER=${{ inputs.crate }}
+        VERSION=${{ env.VERSION }}
+        OS=${{ inputs.os }}
+        ARCH=${{ inputs.arch }}
+        FEATURE_TAG=${{ inputs.feature_tag }}
+        IMAGE_REF=${IMAGE_BASE}:${VERSIONED}
+        EOF
+
+    - name: Upload manifest data artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: manifest-${{ inputs.crate }}-${{ inputs.os }}-${{ inputs.arch }}-${{ inputs.feature_tag }}
+        path: manifest-data/data.txt
+        retention-days: 1

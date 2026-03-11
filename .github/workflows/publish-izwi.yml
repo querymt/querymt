@@ -1,0 +1,165 @@
+name: "Build & Publish: Izwi Provider"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/providers/izwi/**'
+      - 'crates/querymt/**'
+      - 'crates/provider-common/**'
+      - '.github/actions/native-setup/**'
+      - '.github/actions/native-publish/**'
+      - '.github/workflows/publish-izwi.yml'
+      - '.github/workflows/native-create-manifests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux ───────────────────────────────────────────────────────
+          - os: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: ""
+            feature_tag: default
+            needs_cuda: "false"
+
+          - os: linux
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: ""
+            feature_tag: default
+            needs_cuda: "false"
+
+          # ── Linux CUDA ─────────────────────────────────────────────────
+          - os: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: cuda
+            feature_tag: cuda12.8
+            needs_cuda: "true"
+            cuda_version: "12.8"
+
+          - os: linux
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            features: cuda
+            feature_tag: cuda12.8
+            needs_cuda: "true"
+            cuda_version: "12.8"
+
+          # ── Linux CUDA + flash-attn (amd64 only) ───────────────────────
+          - os: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: "cuda flash-attn"
+            feature_tag: cuda12.8-flash
+            needs_cuda: "true"
+            cuda_version: "12.8"
+
+          # ── macOS ───────────────────────────────────────────────────────
+          - os: darwin
+            arch: amd64
+            target: x86_64-apple-darwin
+            runner: macos-latest
+            features: metal
+            feature_tag: metal
+            needs_cuda: "false"
+
+          - os: darwin
+            arch: arm64
+            target: aarch64-apple-darwin
+            runner: macos-latest
+            features: metal
+            feature_tag: metal
+            needs_cuda: "false"
+
+          - os: darwin
+            arch: amd64
+            target: x86_64-apple-darwin
+            runner: macos-latest
+            features: accelerate
+            feature_tag: accelerate
+            needs_cuda: "false"
+
+          - os: darwin
+            arch: arm64
+            target: aarch64-apple-darwin
+            runner: macos-latest
+            features: accelerate
+            feature_tag: accelerate
+            needs_cuda: "false"
+
+          # ── Windows ─────────────────────────────────────────────────────
+          - os: windows
+            arch: amd64
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            features: ""
+            feature_tag: default
+            needs_cuda: "false"
+
+          - os: windows
+            arch: amd64
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            features: cuda
+            feature_tag: cuda12.8
+            needs_cuda: "true"
+            cuda_version: "12.8"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Setup
+        uses: ./.github/actions/native-setup
+        with:
+          crate: izwi
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
+          target: ${{ matrix.target }}
+          features: ${{ matrix.features }}
+          feature_tag: ${{ matrix.feature_tag }}
+          needs_cuda: ${{ matrix.needs_cuda }}
+          cuda_version: ${{ matrix.cuda_version || '12.8' }}
+          extra_env: ${{ matrix.extra_env || '{}' }}
+
+      # izwi-core is a pure Rust dependency — no provider-specific
+      # build dependencies are required.
+
+      # ── Build & Publish ─────────────────────────────────────────────────
+
+      - name: Build & Publish
+        uses: ./.github/actions/native-publish
+        with:
+          crate: izwi
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
+          target: ${{ matrix.target }}
+          features: ${{ matrix.features }}
+          feature_tag: ${{ matrix.feature_tag }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_actor: ${{ github.actor }}
+          repository_owner: ${{ github.repository_owner }}
+
+  create-manifests:
+    needs: build
+    if: needs.build.result == 'success'
+    uses: ./.github/workflows/native-create-manifests.yml
+    with:
+      provider: izwi
+    secrets: inherit
