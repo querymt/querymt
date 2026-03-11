@@ -278,6 +278,100 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 
         CREATE INDEX IF NOT EXISTS idx_custom_models_provider
             ON custom_models(provider);
+
+        -- ========================================================================
+        -- TIER 1: SCHEDULES (with public_id) — Autonomous scheduled work
+        -- ========================================================================
+
+        CREATE TABLE IF NOT EXISTS schedules (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            task_id INTEGER NOT NULL,
+            task_public_id TEXT NOT NULL,
+            session_id INTEGER NOT NULL,
+            session_public_id TEXT NOT NULL,
+            trigger_json TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'armed',
+            last_run_at TEXT,
+            next_run_at TEXT,
+            run_count INTEGER NOT NULL DEFAULT 0,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            config_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_schedules_state_next_run
+            ON schedules(state, next_run_at) WHERE state = 'armed';
+        CREATE INDEX IF NOT EXISTS idx_schedules_running_last_run
+            ON schedules(last_run_at) WHERE state = 'running';
+        CREATE INDEX IF NOT EXISTS idx_schedules_terminal_updated
+            ON schedules(state, updated_at) WHERE state IN ('failed', 'exhausted');
+        CREATE INDEX IF NOT EXISTS idx_schedules_session_public
+            ON schedules(session_public_id);
+        CREATE INDEX IF NOT EXISTS idx_schedules_task_public
+            ON schedules(task_public_id);
+
+        -- Scheduler lease table (single-row, DB-backed leadership)
+        CREATE TABLE IF NOT EXISTS scheduler_lease (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            owner_id TEXT NOT NULL,
+            acquired_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+
+        -- ========================================================================
+        -- TIER 1: KNOWLEDGE LAYER (with public_id) — Pluggable structured memory
+        -- ========================================================================
+
+        CREATE TABLE IF NOT EXISTS knowledge_entries (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            scope TEXT NOT NULL,
+            source TEXT NOT NULL,
+            raw_text TEXT,
+            summary TEXT NOT NULL,
+            entities_json TEXT NOT NULL DEFAULT '[]',
+            topics_json TEXT NOT NULL DEFAULT '[]',
+            connections_json TEXT NOT NULL DEFAULT '[]',
+            importance REAL NOT NULL DEFAULT 0.5,
+            consolidated_at TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_knowledge_entries_scope
+            ON knowledge_entries(scope);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_entries_unconsolidated
+            ON knowledge_entries(scope, consolidated_at)
+            WHERE consolidated_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_knowledge_entries_created
+            ON knowledge_entries(scope, created_at);
+
+        CREATE TABLE IF NOT EXISTS knowledge_consolidations (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            scope TEXT NOT NULL,
+            source_entry_public_ids_json TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            insight TEXT NOT NULL,
+            connections_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_knowledge_consolidations_scope
+            ON knowledge_consolidations(scope);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_consolidations_created
+            ON knowledge_consolidations(scope, created_at);
+
+        CREATE TABLE IF NOT EXISTS knowledge_ingestion_log (
+            id INTEGER PRIMARY KEY,
+            scope TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            processed_at TEXT NOT NULL,
+            UNIQUE(scope, source_key)
+        );
         "#,
     )?;
 
