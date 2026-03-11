@@ -1,0 +1,165 @@
+use izwi_core::EngineConfig;
+use izwi_core::backends::BackendPreference;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+pub const DEFAULT_TTS_MODEL: &str = "Qwen3-TTS-12Hz-0.6B-Base-4bit";
+pub const DEFAULT_STT_MODEL: &str = "Qwen3-ASR-0.6B";
+pub const DEFAULT_AUDIO_FORMAT: &str = "wav";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct IzwiConfig {
+    /// Default TTS model name from the izwi catalog.
+    /// Used when the request does not specify a model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tts_model: Option<String>,
+
+    /// Default STT model name from the izwi catalog.
+    /// Used when the request does not specify a model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stt_model: Option<String>,
+
+    /// Default voice/speaker hint for TTS (model-specific).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+
+    /// Default output audio format (`wav`, `pcm`, `raw_f32`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+
+    /// Default speech speed multiplier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f32>,
+
+    /// Whether to automatically download models that are not locally available.
+    pub auto_download: bool,
+
+    // -- Engine-level settings (affect RuntimeService construction) ----------
+    /// Directory where izwi stores downloaded models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models_dir: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_batch_size: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_sequence_length: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_size: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_cache_dtype: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_page_size: Option<usize>,
+
+    /// Preferred compute backend: `auto`, `cpu`, `metal`, `cuda`.
+    /// When omitted izwi-core picks the best available backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_threads: Option<usize>,
+}
+
+impl Default for IzwiConfig {
+    fn default() -> Self {
+        Self {
+            auto_download: true,
+            tts_model: None,
+            stt_model: None,
+            voice: None,
+            format: None,
+            speed: None,
+            models_dir: None,
+            max_batch_size: None,
+            max_sequence_length: None,
+            chunk_size: None,
+            kv_cache_dtype: None,
+            kv_page_size: None,
+            backend: None,
+            num_threads: None,
+        }
+    }
+}
+
+impl IzwiConfig {
+    pub fn engine_config(&self) -> EngineConfig {
+        let mut cfg = EngineConfig::default();
+
+        if let Some(models_dir) = self
+            .models_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            cfg.models_dir = PathBuf::from(models_dir);
+        }
+        if let Some(max_batch_size) = self.max_batch_size {
+            cfg.max_batch_size = max_batch_size;
+        }
+        if let Some(max_sequence_length) = self.max_sequence_length {
+            cfg.max_sequence_length = max_sequence_length;
+        }
+        if let Some(chunk_size) = self.chunk_size {
+            cfg.chunk_size = chunk_size;
+        }
+        if let Some(ref kv_cache_dtype) = self.kv_cache_dtype {
+            cfg.kv_cache_dtype = kv_cache_dtype.clone();
+        }
+        if let Some(kv_page_size) = self.kv_page_size {
+            cfg.kv_page_size = kv_page_size;
+        }
+        if let Some(ref backend) = self.backend {
+            if let Some(pref) = BackendPreference::parse(backend) {
+                cfg.backend = self.validate_backend(pref);
+            } else {
+                log::warn!("unknown backend '{}'; using auto selection", backend);
+            }
+        } else {
+            cfg.backend = self.validate_backend(BackendPreference::Auto);
+        }
+        if let Some(num_threads) = self.num_threads {
+            cfg.num_threads = num_threads;
+        }
+
+        cfg
+    }
+
+    /// Validate a backend preference against compiled features, warning and
+    /// falling back to CPU when the requested accelerator is unavailable.
+    fn validate_backend(&self, pref: BackendPreference) -> BackendPreference {
+        match pref {
+            BackendPreference::Metal if !cfg!(feature = "metal") => {
+                log::warn!(
+                    "backend 'metal' requested but the `metal` feature was not compiled in; \
+                     falling back to CPU"
+                );
+                BackendPreference::Cpu
+            }
+            BackendPreference::Cuda if !cfg!(feature = "cuda") => {
+                log::warn!(
+                    "backend 'cuda' requested but the `cuda` feature was not compiled in; \
+                     falling back to CPU"
+                );
+                BackendPreference::Cpu
+            }
+            other => other,
+        }
+    }
+
+    pub fn default_tts_model(&self) -> &str {
+        self.tts_model.as_deref().unwrap_or(DEFAULT_TTS_MODEL)
+    }
+
+    pub fn default_stt_model(&self) -> &str {
+        self.stt_model.as_deref().unwrap_or(DEFAULT_STT_MODEL)
+    }
+
+    pub fn default_audio_format(&self) -> &str {
+        self.format.as_deref().unwrap_or(DEFAULT_AUDIO_FORMAT)
+    }
+}

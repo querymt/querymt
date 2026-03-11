@@ -277,6 +277,70 @@ pub struct ExtismSttResponse {
     pub text: String,
 }
 
+/// Voice configuration for the extism WASM boundary.
+///
+/// Mirrors [`tts::VoiceConfig`] but encodes audio bytes as base64 strings
+/// so the payload stays JSON-friendly across the WASM boundary (same pattern
+/// as [`ExtismSttRequest::audio_base64`]).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExtismVoiceConfig {
+    Preset {
+        name: String,
+    },
+    Clone {
+        /// Base64-encoded reference audio.
+        reference_audio_base64: String,
+        reference_text: String,
+    },
+    Design {
+        description: String,
+    },
+}
+
+impl ExtismVoiceConfig {
+    /// Convert from the core [`tts::VoiceConfig`] to the extism wire format.
+    pub fn from_voice_config(vc: &tts::VoiceConfig) -> Self {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        match vc {
+            tts::VoiceConfig::Preset { name } => Self::Preset { name: name.clone() },
+            tts::VoiceConfig::Clone {
+                reference_audio,
+                reference_text,
+            } => Self::Clone {
+                reference_audio_base64: BASE64.encode(reference_audio),
+                reference_text: reference_text.clone(),
+            },
+            tts::VoiceConfig::Design { description } => Self::Design {
+                description: description.clone(),
+            },
+        }
+    }
+
+    /// Convert back to the core [`tts::VoiceConfig`], decoding base64 audio.
+    pub fn into_voice_config(self) -> Result<tts::VoiceConfig, crate::error::LLMError> {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        match self {
+            Self::Preset { name } => Ok(tts::VoiceConfig::Preset { name }),
+            Self::Clone {
+                reference_audio_base64,
+                reference_text,
+            } => {
+                let reference_audio = BASE64
+                    .decode(reference_audio_base64)
+                    .map_err(|e| crate::error::LLMError::InvalidRequest(e.to_string()))?;
+                Ok(tts::VoiceConfig::Clone {
+                    reference_audio,
+                    reference_text,
+                })
+            }
+            Self::Design { description } => Ok(tts::VoiceConfig::Design { description }),
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 pub struct ExtismTtsRequest<C> {
     pub cfg: C,
@@ -284,11 +348,13 @@ pub struct ExtismTtsRequest<C> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub voice: Option<String>,
+    pub voice_config: Option<ExtismVoiceConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

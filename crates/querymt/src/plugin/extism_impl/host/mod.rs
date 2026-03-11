@@ -9,7 +9,7 @@ use crate::{
     plugin::{
         extism_impl::{
             ExtismChatRequest, ExtismChatResponse, ExtismEmbedRequest, ExtismSttRequest,
-            ExtismSttResponse, ExtismTtsRequest, ExtismTtsResponse,
+            ExtismSttResponse, ExtismTtsRequest, ExtismTtsResponse, ExtismVoiceConfig,
         },
         Fut, HTTPLLMProviderFactory, LLMProviderFactory,
     },
@@ -817,9 +817,13 @@ impl LLMProvider for ExtismProvider {
 
         let text = req.text.clone();
         let model = req.model.clone();
-        let voice = req.voice.clone();
+        let voice_config = req
+            .voice_config
+            .as_ref()
+            .map(ExtismVoiceConfig::from_voice_config);
         let format = req.format.clone();
         let speed = req.speed;
+        let language = req.language.clone();
 
         let out = self
             .call_blocking_with_cancel("speech", move |plug| {
@@ -833,9 +837,10 @@ impl LLMProvider for ExtismProvider {
                     cfg,
                     text,
                     model,
-                    voice,
+                    voice_config,
                     format,
                     speed,
+                    language,
                 };
 
                 let out: Json<ExtismTtsResponse> = plug

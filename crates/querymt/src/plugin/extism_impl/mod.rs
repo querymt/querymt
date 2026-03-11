@@ -2,7 +2,7 @@ mod interface;
 pub use interface::{
     BinaryCodec, ExtismChatChunk, ExtismChatRequest, ExtismChatResponse, ExtismCompleteRequest,
     ExtismEmbedRequest, ExtismLogRecord, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
-    ExtismTtsResponse, PluginError, StreamOpenResult,
+    ExtismTtsResponse, ExtismVoiceConfig, PluginError, StreamOpenResult,
 };
 
 #[cfg(feature = "extism_host")]
