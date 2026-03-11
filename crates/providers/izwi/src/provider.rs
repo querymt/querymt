@@ -310,7 +310,7 @@ pub(crate) struct RuntimeCacheKey {
     pub chunk_size: usize,
     pub kv_cache_dtype: String,
     pub kv_page_size: usize,
-    pub use_metal: bool,
+    pub backend: String,
     pub num_threads: usize,
 }
 
@@ -324,7 +324,7 @@ impl RuntimeCacheKey {
             chunk_size: engine.chunk_size,
             kv_cache_dtype: engine.kv_cache_dtype.clone(),
             kv_page_size: engine.kv_page_size,
-            use_metal: engine.use_metal,
+            backend: engine.backend.as_str().to_string(),
             num_threads: engine.num_threads,
         }
     }

@@ -1,4 +1,5 @@
 use izwi_core::EngineConfig;
+use izwi_core::backends::BackendPreference;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -55,8 +56,10 @@ pub struct IzwiConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_page_size: Option<usize>,
 
+    /// Preferred compute backend: `auto`, `cpu`, `metal`, `cuda`.
+    /// When omitted izwi-core picks the best available backend.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub use_metal: Option<bool>,
+    pub backend: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_threads: Option<usize>,
@@ -77,7 +80,7 @@ impl Default for IzwiConfig {
             chunk_size: None,
             kv_cache_dtype: None,
             kv_page_size: None,
-            use_metal: None,
+            backend: None,
             num_threads: None,
         }
     }
@@ -110,26 +113,42 @@ impl IzwiConfig {
         if let Some(kv_page_size) = self.kv_page_size {
             cfg.kv_page_size = kv_page_size;
         }
-        if let Some(use_metal) = self.use_metal {
-            if use_metal && !cfg!(feature = "metal") {
-                log::warn!(
-                    "use_metal is enabled in config but the `metal` feature was not compiled in; \
-                     falling back to CPU"
-                );
-                cfg.use_metal = false;
+        if let Some(ref backend) = self.backend {
+            if let Some(pref) = BackendPreference::parse(backend) {
+                cfg.backend = self.validate_backend(pref);
             } else {
-                cfg.use_metal = use_metal;
+                log::warn!("unknown backend '{}'; using auto selection", backend);
             }
-        } else if !cfg!(feature = "metal") {
-            // Without the `metal` feature compiled in, force CPU regardless of
-            // izwi-core's platform default (which would be `true` on macOS).
-            cfg.use_metal = false;
+        } else {
+            cfg.backend = self.validate_backend(BackendPreference::Auto);
         }
         if let Some(num_threads) = self.num_threads {
             cfg.num_threads = num_threads;
         }
 
         cfg
+    }
+
+    /// Validate a backend preference against compiled features, warning and
+    /// falling back to CPU when the requested accelerator is unavailable.
+    fn validate_backend(&self, pref: BackendPreference) -> BackendPreference {
+        match pref {
+            BackendPreference::Metal if !cfg!(feature = "metal") => {
+                log::warn!(
+                    "backend 'metal' requested but the `metal` feature was not compiled in; \
+                     falling back to CPU"
+                );
+                BackendPreference::Cpu
+            }
+            BackendPreference::Cuda if !cfg!(feature = "cuda") => {
+                log::warn!(
+                    "backend 'cuda' requested but the `cuda` feature was not compiled in; \
+                     falling back to CPU"
+                );
+                BackendPreference::Cpu
+            }
+            other => other,
+        }
     }
 
     pub fn default_tts_model(&self) -> &str {
