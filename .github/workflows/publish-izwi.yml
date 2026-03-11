@@ -41,34 +41,57 @@ jobs:
             feature_tag: default
             needs_cuda: "false"
 
-          # ── Linux CUDA ─────────────────────────────────────────────────
-          - os: linux
-            arch: amd64
-            target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            features: cuda
-            feature_tag: cuda12.8
-            needs_cuda: "true"
-            cuda_version: "12.8"
-
-          - os: linux
-            arch: arm64
-            target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            features: cuda
-            feature_tag: cuda12.8
-            needs_cuda: "true"
-            cuda_version: "12.8"
-
-          # ── Linux CUDA + flash-attn (amd64 only) ───────────────────────
+          # ── Linux CUDA (x86_64, split by SM) ────────────────────────────
           - os: linux
             arch: amd64
             target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             features: "cuda flash-attn"
-            feature_tag: cuda12.8-flash
+            feature_tag: cuda12.8-sm80
             needs_cuda: "true"
             cuda_version: "12.8"
+            extra_env: '{"CUDA_COMPUTE_CAP":"80"}'
+
+          - os: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: "cuda flash-attn"
+            feature_tag: cuda12.8-sm86
+            needs_cuda: "true"
+            cuda_version: "12.8"
+            extra_env: '{"CUDA_COMPUTE_CAP":"86"}'
+
+          - os: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: "cuda flash-attn"
+            feature_tag: cuda12.8-sm89
+            needs_cuda: "true"
+            cuda_version: "12.8"
+            extra_env: '{"CUDA_COMPUTE_CAP":"89"}'
+
+          - os: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: "cuda flash-attn"
+            feature_tag: cuda12.8-sm120
+            needs_cuda: "true"
+            cuda_version: "12.8"
+            extra_env: '{"CUDA_COMPUTE_CAP":"120"}'
+
+          # ── Linux CUDA (aarch64) ────────────────────────────────────────
+          - os: linux
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            features: "cuda flash-attn"
+            feature_tag: cuda12.8-sm87
+            needs_cuda: "true"
+            cuda_version: "12.8"
+            extra_env: '{"CUDA_COMPUTE_CAP":"87"}'
 
           # ── macOS ───────────────────────────────────────────────────────
           - os: darwin
@@ -111,15 +134,6 @@ jobs:
             features: ""
             feature_tag: default
             needs_cuda: "false"
-
-          - os: windows
-            arch: amd64
-            target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            features: cuda
-            feature_tag: cuda12.8
-            needs_cuda: "true"
-            cuda_version: "12.8"
 
     steps:
       - name: Check out code
