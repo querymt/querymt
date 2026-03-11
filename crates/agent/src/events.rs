@@ -386,6 +386,88 @@ pub enum AgentEventKind {
     WorkspaceIndexReady {
         workspace_root: String,
     },
+
+    // ── Schedule lifecycle events ───────────────────────────────────────
+    /// A new schedule was created and armed.
+    ScheduleCreated {
+        schedule_public_id: String,
+        session_public_id: String,
+        task_public_id: String,
+    },
+    /// A schedule cycle was fired (ScheduledPrompt sent to SessionActor).
+    ScheduleFired {
+        schedule_public_id: String,
+        session_public_id: String,
+    },
+    /// A scheduled cycle completed successfully.
+    ScheduleCycleCompleted {
+        schedule_public_id: String,
+        turn_id: String,
+        run_count: u32,
+    },
+    /// A scheduled cycle failed.
+    ScheduleCycleFailed {
+        schedule_public_id: String,
+        turn_id: Option<String>,
+        error: String,
+    },
+    /// A schedule was paused by user/API.
+    SchedulePaused {
+        schedule_public_id: String,
+    },
+    /// A schedule was resumed by user/API.
+    ScheduleResumed {
+        schedule_public_id: String,
+    },
+    /// A schedule reached max_runs and is now exhausted.
+    ScheduleExhausted {
+        schedule_public_id: String,
+    },
+    /// A schedule exceeded its failure threshold.
+    ScheduleFailed {
+        schedule_public_id: String,
+        consecutive_failures: u32,
+    },
+
+    // ── Explicit scheduled execution terminal events ────────────────────
+    // Emitted by SessionActor so SchedulerActor does not infer completion
+    // from generic task events. Correlation is deterministic.
+
+    /// SessionActor finished a scheduled execution cycle successfully.
+    ScheduledExecutionCompleted {
+        schedule_public_id: String,
+        turn_id: String,
+    },
+    /// SessionActor's scheduled execution cycle failed.
+    ScheduledExecutionFailed {
+        schedule_public_id: String,
+        turn_id: Option<String>,
+        error: String,
+    },
+
+    // ── Internal scheduler events ────────────────────────────────────────
+    
+    /// Debounce window completed for an event-driven schedule.
+    /// Internal event used by the scheduler to trigger after debounce.
+    ScheduleDebounceCompleted {
+        schedule_public_id: String,
+    },
+
+    // ── Knowledge layer events ───────────────────────────────────────────
+
+    /// A new knowledge entry was ingested.
+    KnowledgeIngested {
+        scope: String,
+        entry_public_id: String,
+        source: String,
+    },
+    /// Knowledge entries were consolidated into an insight.
+    KnowledgeConsolidated {
+        scope: String,
+        consolidation_public_id: String,
+        #[typeshare(serialized_as = "number")]
+        source_count: u32,
+    },
 }
 
 // ============================================================================

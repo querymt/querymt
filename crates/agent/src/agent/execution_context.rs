@@ -7,9 +7,27 @@ use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::{LLMConfig, SessionExecutionConfig};
 use crate::tools::AgentToolContext;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+/// Describes the origin of an execution cycle.
+///
+/// Used to correlate scheduled executions with the `SchedulerActor` so that
+/// terminal events (`ScheduledExecutionCompleted` / `ScheduledExecutionFailed`)
+/// carry the correct `schedule_public_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExecutionOrigin {
+    /// Interactive prompt from a user or delegation.
+    Interactive,
+    /// Prompt fired by the scheduler for a recurring schedule.
+    Scheduled {
+        /// Public ID of the schedule that triggered this execution.
+        schedule_public_id: String,
+    },
+}
 
 /// Bundles all execution state needed for a single agent run.
 ///
@@ -46,6 +64,14 @@ pub(crate) struct ExecutionContext {
     /// `SetDeniedTools`, and `SetToolPolicy` messages are honoured during execution.
     /// Falls back to `AgentConfig.tool_config` when not overridden.
     pub tool_config: ToolConfig,
+
+    /// Origin of this execution cycle — interactive (user/delegation) or scheduled.
+    ///
+    /// When `Scheduled`, the `SessionActor` emits explicit terminal events
+    /// (`ScheduledExecutionCompleted` / `ScheduledExecutionFailed`) so the
+    /// `SchedulerActor` can correlate cycle completion without relying on
+    /// generic task events.
+    pub execution_origin: ExecutionOrigin,
 }
 
 impl ExecutionContext {
@@ -64,12 +90,19 @@ impl ExecutionContext {
             session_handle,
             cancellation_token: CancellationToken::new(),
             tool_config,
+            execution_origin: ExecutionOrigin::Interactive,
         }
     }
 
     /// Attach a cancellation token, replacing the default no-op token.
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
+        self
+    }
+
+    /// Set the execution origin for this context.
+    pub fn with_execution_origin(mut self, origin: ExecutionOrigin) -> Self {
+        self.execution_origin = origin;
         self
     }
 

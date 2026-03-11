@@ -26,12 +26,14 @@ pub mod events;
 pub mod export;
 pub mod hash;
 pub mod index;
+pub mod knowledge;
 pub mod middleware;
 pub mod model;
 pub mod model_heuristics;
 pub mod model_info;
 pub mod model_registry;
 pub mod quorum;
+pub mod scheduler;
 pub mod send_agent;
 #[cfg(feature = "dashboard")]
 pub mod server;
