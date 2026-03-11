@@ -7,6 +7,10 @@ name: Test Native Providers
 #                    Tests are pure unit tests (message formatting); no model
 #                    weights are downloaded.
 #
+#   qmt-izwi       — links against izwi-core (pure Rust, no C++ deps).
+#                    Tests are pure unit/smoke tests (validation, format
+#                    parsing); no model weights are downloaded.
+#
 #   qmt-mrs        — links against mistralrs.  Tests try to instantiate a real
 #                    model, so they are excluded from the automated matrix and
 #                    must be triggered manually when model weights are available.
@@ -37,6 +41,7 @@ on:
   push:
     branches: [main, master]
     paths:
+      - 'crates/providers/izwi/**'
       - 'crates/providers/llama-cpp/**'
       - 'crates/providers/mrs/**'
       - 'crates/querymt/**'
@@ -56,6 +61,7 @@ jobs:
     name: Detect relevant changes
     runs-on: ubuntu-latest
     outputs:
+      izwi:       ${{ steps.filter.outputs.izwi }}
       llama-cpp: ${{ steps.filter.outputs.llama-cpp }}
       mrs:        ${{ steps.filter.outputs.mrs }}
       shared:     ${{ steps.filter.outputs.shared }}
@@ -68,6 +74,8 @@ jobs:
         uses: dorny/paths-filter@v3
         with:
           filters: |
+            izwi:
+              - 'crates/providers/izwi/**'
             llama-cpp:
               - 'crates/providers/llama-cpp/**'
             mrs:
@@ -77,6 +85,61 @@ jobs:
               - 'crates/provider-common/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+
+  # ── qmt-izwi ─────────────────────────────────────────────────────────────
+  # Pure smoke tests (provider construction, input validation, format parsing).
+  # izwi-core is a pure Rust dependency — no cmake or C++ toolchain needed.
+  # No model weights are downloaded at test time.
+  test-izwi:
+    name: Test qmt-izwi
+    runs-on: ubuntu-latest
+    needs: detect-changes
+
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push') ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'test-native') &&
+       (needs.detect-changes.outputs.izwi == 'true' ||
+        needs.detect-changes.outputs.shared == 'true'))
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: native-izwi
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Create coverage directory
+        run: mkdir -p ./coverage
+
+      - name: Run tests with coverage
+        run: |
+          cargo llvm-cov nextest \
+            --package qmt-izwi \
+            --lib --tests \
+            --features native \
+            --codecov --output-path ./coverage/codecov-izwi.json
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/codecov-izwi.json
+          flags: providers-native
+          verbose: true
+          fail_ci_if_error: false
 
   # ── qmt-llama-cpp ─────────────────────────────────────────────────────────
   # Pure unit tests (message-formatting, multimodal helpers).  Requires cmake

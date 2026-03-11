@@ -1,0 +1,134 @@
+name: Native Provider Setup
+description: >
+  Shared setup steps for native provider builds: Rust toolchain,
+  cross-compilation, cargo cache, CUDA toolkit, cuDNN, and MSVC.
+  NOTE: The caller must checkout the repo before invoking this action.
+
+inputs:
+  crate:
+    description: Provider crate name (e.g. mrs, llama-cpp)
+    required: true
+  os:
+    description: Target OS (linux, darwin, windows)
+    required: true
+  arch:
+    description: Target architecture (amd64, arm64)
+    required: true
+  target:
+    description: Rust target triple
+    required: true
+  features:
+    description: Space-separated cargo features (empty string for default)
+    required: false
+    default: ""
+  feature_tag:
+    description: OCI tag suffix (e.g. default, metal, cuda12.8-sm80)
+    required: true
+  needs_cuda:
+    description: Whether this build requires CUDA ("true" or "false")
+    required: false
+    default: "false"
+  cuda_version:
+    description: CUDA toolkit version (e.g. 12.8)
+    required: false
+    default: "12.8"
+  extra_env:
+    description: >
+      JSON object of additional environment variables to export
+      (e.g. '{"CUDA_COMPUTE_CAP":"80"}')
+    required: false
+    default: "{}"
+
+runs:
+  using: composite
+  steps:
+    - name: Read crate version
+      id: get-version
+      shell: bash
+      run: |
+        v=$(grep '^version' crates/providers/${{ inputs.crate }}/Cargo.toml \
+              | head -n1 | cut -d'"' -f2)
+        echo "VERSION=$v" >> $GITHUB_ENV
+
+    - name: Export extra environment variables
+      shell: bash
+      run: |
+        echo '${{ inputs.extra_env }}' | python3 -c "
+        import json, sys, os
+        env = json.load(sys.stdin)
+        gh_env = os.environ.get('GITHUB_ENV', '')
+        if gh_env and env:
+            with open(gh_env, 'a') as f:
+                for k, v in env.items():
+                    f.write(k + '=' + str(v) + '\n')
+        "
+
+    - name: Install Rust toolchain & target
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        targets: ${{ inputs.target }}
+
+    - name: Install cross-compilation toolchain
+      if: inputs.os == 'linux'
+      uses: taiki-e/setup-cross-toolchain-action@v1
+      with:
+        target: ${{ inputs.target }}
+
+    - name: Cache Cargo dependencies
+      uses: swatinem/rust-cache@v2
+      with:
+        key: native-${{ inputs.target }}-${{ inputs.feature_tag }}
+        cache-targets: "false"
+
+    # ── CUDA steps (conditional) ──────────────────────────────────────────
+
+    - name: Set up CUDA toolkit
+      if: inputs.needs_cuda == 'true'
+      uses: mjun0812/setup-cuda@v1
+      with:
+        version: ${{ inputs.cuda_version }}
+
+    - name: Set CUDA_PATH_vX_Y for MSBuild (Windows)
+      if: inputs.os == 'windows' && inputs.needs_cuda == 'true'
+      shell: powershell
+      run: |
+        $cudaPath = $env:CUDA_PATH
+        if (-not $cudaPath) {
+          $cudaPath = (Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*" -Directory |
+                       Sort-Object Name -Descending | Select-Object -First 1).FullName
+        }
+        if (-not $cudaPath) {
+          Write-Error "CUDA_PATH not found"
+          exit 1
+        }
+        $versionDir = Split-Path $cudaPath -Leaf
+        $versionNum = $versionDir -replace '^v', '' -replace '\.', '_'
+        $envVarName = "CUDA_PATH_v$versionNum"
+        Write-Host "Setting $envVarName = $cudaPath"
+        echo "$envVarName=$cudaPath" >> $env:GITHUB_ENV
+
+    - name: Install cuDNN (Linux)
+      if: inputs.os == 'linux' && inputs.needs_cuda == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libcudnn9-dev-cuda-12
+
+    - name: Install cuDNN (Windows)
+      if: inputs.os == 'windows' && inputs.needs_cuda == 'true'
+      shell: powershell
+      run: |
+        $url = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.0.0.312_cuda12-archive.zip"
+        Invoke-WebRequest -Uri $url -OutFile cudnn.zip
+        Expand-Archive cudnn.zip -DestinationPath .
+        $folder = Get-ChildItem -Directory -Filter "cudnn-windows-x86_64-9*" | Select-Object -First 1
+        Copy-Item -Path "$($folder.FullName)\bin\*" -Destination "$env:CUDA_PATH\bin" -Recurse -Force
+        Copy-Item -Path "$($folder.FullName)\include\*" -Destination "$env:CUDA_PATH\include" -Recurse -Force
+        Copy-Item -Path "$($folder.FullName)\lib\x64\*" -Destination "$env:CUDA_PATH\lib\x64" -Recurse -Force
+
+    - name: Set up MSVC (Windows CUDA)
+      if: inputs.os == 'windows' && inputs.needs_cuda == 'true'
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64

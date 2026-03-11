@@ -1,0 +1,197 @@
+name: "Build & Publish: llama-cpp Provider"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/providers/llama-cpp/**'
+      - 'crates/querymt/**'
+      - 'crates/provider-common/**'
+      - '.github/actions/native-setup/**'
+      - '.github/actions/native-publish/**'
+      - '.github/workflows/publish-llama-cpp.yml'
+      - '.github/workflows/native-create-manifests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux ───────────────────────────────────────────────────────
+          - os: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: ""
+            feature_tag: default
+            needs_cuda: "false"
+
+          - os: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: vulkan
+            feature_tag: vulkan
+            needs_cuda: "false"
+
+          - os: linux
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: ""
+            feature_tag: default
+            needs_cuda: "false"
+
+          - os: linux
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            features: vulkan
+            feature_tag: vulkan
+            needs_cuda: "false"
+
+          # ── Linux CUDA (combined strategy — wide GPU range) ─────────────
+          - os: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: cuda
+            feature_tag: cuda12.8
+            needs_cuda: "true"
+            cuda_version: "12.8"
+            extra_env: '{"CMAKE_POSITION_INDEPENDENT_CODE":"ON"}'
+
+          - os: linux
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            features: cuda
+            feature_tag: cuda12.8
+            needs_cuda: "true"
+            cuda_version: "12.8"
+            extra_env: '{"CMAKE_POSITION_INDEPENDENT_CODE":"ON"}'
+
+          # ── macOS ───────────────────────────────────────────────────────
+          - os: darwin
+            arch: amd64
+            target: x86_64-apple-darwin
+            runner: macos-latest
+            features: metal
+            feature_tag: metal
+            needs_cuda: "false"
+
+          - os: darwin
+            arch: arm64
+            target: aarch64-apple-darwin
+            runner: macos-latest
+            features: metal
+            feature_tag: metal
+            needs_cuda: "false"
+
+          # ── Windows ─────────────────────────────────────────────────────
+          - os: windows
+            arch: amd64
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            features: ""
+            feature_tag: default
+            needs_cuda: "false"
+
+          # TODO: Re-enable Vulkan on Windows after fixing llama-cpp-sys-2's
+          # CMake ExternalProject install step. Currently fails with
+          # "cmake_install.cmake: Not a file" on MSBuild.
+          # - os: windows
+          #   arch: amd64
+          #   target: x86_64-pc-windows-msvc
+          #   runner: windows-latest
+          #   features: vulkan
+          #   feature_tag: vulkan
+          #   needs_cuda: "false"
+
+          - os: windows
+            arch: amd64
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            features: cuda
+            feature_tag: cuda12.8
+            needs_cuda: "true"
+            cuda_version: "12.8"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Setup
+        uses: ./.github/actions/native-setup
+        with:
+          crate: llama-cpp
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
+          target: ${{ matrix.target }}
+          features: ${{ matrix.features }}
+          feature_tag: ${{ matrix.feature_tag }}
+          needs_cuda: ${{ matrix.needs_cuda }}
+          cuda_version: ${{ matrix.cuda_version || '12.8' }}
+          extra_env: ${{ matrix.extra_env || '{}' }}
+
+      # ── llama-cpp-specific build dependencies ───────────────────────────
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libomp
+
+      - name: Set LIBCLANG_PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\lib" >> $env:GITHUB_ENV
+
+      - name: Install Vulkan SDK (Linux)
+        if: runner.os == 'Linux' && contains(matrix.features, 'vulkan')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev glslc
+
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows' && contains(matrix.features, 'vulkan')
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
+      # ── Build & Publish ─────────────────────────────────────────────────
+
+      - name: Build & Publish
+        uses: ./.github/actions/native-publish
+        with:
+          crate: llama-cpp
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
+          target: ${{ matrix.target }}
+          features: ${{ matrix.features }}
+          feature_tag: ${{ matrix.feature_tag }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_actor: ${{ github.actor }}
+          repository_owner: ${{ github.repository_owner }}
+
+  create-manifests:
+    needs: build
+    if: needs.build.result == 'success'
+    uses: ./.github/workflows/native-create-manifests.yml
+    with:
+      provider: llama-cpp
+    secrets: inherit
