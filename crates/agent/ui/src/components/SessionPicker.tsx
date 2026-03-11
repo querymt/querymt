@@ -121,6 +121,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
     const isChild = !!session.parent_session_id;
     const isDelegation = session.fork_origin === 'delegation';
     const isRecurring = session.session_kind === 'recurring';
+    const isMemory = session.session_kind === 'memory';
     const isUnattached = session.attached === false;
     const indentClass = depth > 0 ? `ml-${depth * 6}` : '';
     const isActive = activeSessionId === session.session_id;
@@ -174,9 +175,14 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
                   delegated
                 </span>
               )}
-              {isRecurring && (
+              {isRecurring && !isMemory && (
                 <span className="text-[10px] px-1.5 py-0.5 bg-accent-secondary/20 text-accent-secondary rounded border border-accent-secondary/30">
                   recurring
+                </span>
+              )}
+              {isMemory && (
+                <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded border border-purple-500/30">
+                  memory
                 </span>
               )}
               {session.node && (

@@ -238,6 +238,76 @@ export type AgentEventKind =
 	 */
 	| { type: "workspace_index_ready", data: {
 	workspace_root: string;
+}}
+	/** A new schedule was created and armed. */
+	| { type: "schedule_created", data: {
+	schedule_public_id: string;
+	session_public_id: string;
+	task_public_id: string;
+}}
+	/** A schedule cycle was fired (ScheduledPrompt sent to SessionActor). */
+	| { type: "schedule_fired", data: {
+	schedule_public_id: string;
+	session_public_id: string;
+}}
+	/** A scheduled cycle completed successfully. */
+	| { type: "schedule_cycle_completed", data: {
+	schedule_public_id: string;
+	turn_id: string;
+	run_count: number;
+}}
+	/** A scheduled cycle failed. */
+	| { type: "schedule_cycle_failed", data: {
+	schedule_public_id: string;
+	turn_id?: string;
+	error: string;
+}}
+	/** A schedule was paused by user/API. */
+	| { type: "schedule_paused", data: {
+	schedule_public_id: string;
+}}
+	/** A schedule was resumed by user/API. */
+	| { type: "schedule_resumed", data: {
+	schedule_public_id: string;
+}}
+	/** A schedule reached max_runs and is now exhausted. */
+	| { type: "schedule_exhausted", data: {
+	schedule_public_id: string;
+}}
+	/** A schedule exceeded its failure threshold. */
+	| { type: "schedule_failed", data: {
+	schedule_public_id: string;
+	consecutive_failures: number;
+}}
+	/** SessionActor finished a scheduled execution cycle successfully. */
+	| { type: "scheduled_execution_completed", data: {
+	schedule_public_id: string;
+	turn_id: string;
+}}
+	/** SessionActor's scheduled execution cycle failed. */
+	| { type: "scheduled_execution_failed", data: {
+	schedule_public_id: string;
+	turn_id?: string;
+	error: string;
+}}
+	/**
+	 * Debounce window completed for an event-driven schedule.
+	 * Internal event used by the scheduler to trigger after debounce.
+	 */
+	| { type: "schedule_debounce_completed", data: {
+	schedule_public_id: string;
+}}
+	/** A new knowledge entry was ingested. */
+	| { type: "knowledge_ingested", data: {
+	scope: string;
+	entry_public_id: string;
+	source: string;
+}}
+	/** Knowledge entries were consolidated into an insight. */
+	| { type: "knowledge_consolidated", data: {
+	scope: string;
+	consolidation_public_id: string;
+	source_count: number;
 }};
 
 /**

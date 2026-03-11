@@ -188,6 +188,41 @@ pub struct Schedule {
 }
 
 impl Schedule {
+    /// Create a new armed schedule with default configuration.
+    ///
+    /// The `id`, `task_id`, and `session_id` (internal row IDs) are set to 0
+    /// and will be populated by the repository on insert.
+    pub fn new(
+        task_public_id: String,
+        session_public_id: String,
+        trigger: ScheduleTrigger,
+    ) -> Self {
+        let now = OffsetDateTime::now_utc();
+        let next_run_at = match &trigger {
+            ScheduleTrigger::Interval { seconds } => {
+                Some(now + time::Duration::seconds(*seconds as i64))
+            }
+            ScheduleTrigger::EventDriven { .. } => None,
+        };
+        Self {
+            id: 0,
+            public_id: uuid::Uuid::now_v7().to_string(),
+            task_public_id,
+            session_public_id,
+            task_id: 0,
+            session_id: 0,
+            trigger,
+            state: ScheduleState::Armed,
+            last_run_at: None,
+            next_run_at,
+            run_count: 0,
+            consecutive_failures: 0,
+            config: ScheduleConfig::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     /// Check if a state transition is valid per the schedule state machine.
     pub fn is_valid_transition(from: ScheduleState, to: ScheduleState) -> bool {
         matches!(

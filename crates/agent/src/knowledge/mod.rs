@@ -375,3 +375,123 @@ impl From<serde_json::Error> for KnowledgeError {
         KnowledgeError::SerializationError(err.to_string())
     }
 }
+
+// ─── Scope Policy ────────────────────────────────────────────────────────────
+
+/// Pluggable policy for validating knowledge scope access.
+///
+/// ## Policy Modes
+///
+/// - **Default (single-user local mode):** Permit any scope string.
+/// - **Multi-tenant:** Restrict to caller-owned scopes and explicit allowlist
+///   prefixes (e.g. `session:*`, `project:*`, `global`).
+/// - Violations return authorization errors; no best-effort fallback.
+pub trait ScopePolicy: Send + Sync {
+    /// Validate that the given session is allowed to access the requested scope.
+    ///
+    /// Returns `Ok(())` if access is permitted, or `Err(KnowledgeError)` with
+    /// an authorization error if denied.
+    fn validate_scope(
+        &self,
+        session_public_id: &str,
+        requested_scope: &str,
+    ) -> Result<(), KnowledgeError>;
+}
+
+/// Default scope policy: permit any scope string.
+///
+/// Suitable for single-user local mode where there is no multi-tenant concern.
+#[derive(Debug, Clone, Default)]
+pub struct PermissiveScopePolicy;
+
+impl ScopePolicy for PermissiveScopePolicy {
+    fn validate_scope(
+        &self,
+        _session_public_id: &str,
+        _requested_scope: &str,
+    ) -> Result<(), KnowledgeError> {
+        Ok(())
+    }
+}
+
+/// Multi-tenant scope policy: restrict access to owned scopes and allowlisted prefixes.
+///
+/// A session can access:
+/// - Its own session scope (scope == session_public_id)
+/// - Any scope matching an allowed prefix (e.g. `"global"`, `"project:"`)
+///
+/// All other scopes are denied by default.
+#[derive(Debug, Clone)]
+pub struct RestrictedScopePolicy {
+    /// Allowed scope prefixes (e.g. `["global", "project:"]`).
+    /// An exact match on the prefix or a scope starting with the prefix is permitted.
+    pub allowed_prefixes: Vec<String>,
+}
+
+impl RestrictedScopePolicy {
+    pub fn new(allowed_prefixes: Vec<String>) -> Self {
+        Self { allowed_prefixes }
+    }
+}
+
+impl ScopePolicy for RestrictedScopePolicy {
+    fn validate_scope(
+        &self,
+        session_public_id: &str,
+        requested_scope: &str,
+    ) -> Result<(), KnowledgeError> {
+        // Own session scope is always allowed
+        if requested_scope == session_public_id {
+            return Ok(());
+        }
+
+        // Check allowed prefixes
+        for prefix in &self.allowed_prefixes {
+            if requested_scope == prefix || requested_scope.starts_with(prefix) {
+                return Ok(());
+            }
+        }
+
+        Err(KnowledgeError::Other(format!(
+            "Scope access denied: session '{}' cannot access scope '{}'. \
+             Allowed: own session scope or prefixes {:?}",
+            session_public_id, requested_scope, self.allowed_prefixes
+        )))
+    }
+}
+
+#[cfg(test)]
+mod scope_policy_tests {
+    use super::*;
+
+    #[test]
+    fn permissive_allows_everything() {
+        let policy = PermissiveScopePolicy;
+        assert!(policy.validate_scope("sess-1", "sess-1").is_ok());
+        assert!(policy.validate_scope("sess-1", "global").is_ok());
+        assert!(policy.validate_scope("sess-1", "other-session").is_ok());
+    }
+
+    #[test]
+    fn restricted_allows_own_session() {
+        let policy = RestrictedScopePolicy::new(vec![]);
+        assert!(policy.validate_scope("sess-1", "sess-1").is_ok());
+    }
+
+    #[test]
+    fn restricted_allows_prefixed_scopes() {
+        let policy = RestrictedScopePolicy::new(vec![
+            "global".to_string(),
+            "project:".to_string(),
+        ]);
+        assert!(policy.validate_scope("sess-1", "global").is_ok());
+        assert!(policy.validate_scope("sess-1", "project:myapp").is_ok());
+    }
+
+    #[test]
+    fn restricted_denies_other_scopes() {
+        let policy = RestrictedScopePolicy::new(vec!["global".to_string()]);
+        assert!(policy.validate_scope("sess-1", "other-session").is_err());
+        assert!(policy.validate_scope("sess-1", "project:myapp").is_err());
+    }
+}
