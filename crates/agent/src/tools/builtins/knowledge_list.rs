@@ -1,10 +1,9 @@
 //! Knowledge list unconsolidated tool implementation.
 
-
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub struct KnowledgeListTool;
 
@@ -123,13 +122,15 @@ impl ToolTrait for KnowledgeListTool {
             response.push_str(&format!("   Importance: {:.2}\n", entry.importance));
             response.push_str(&format!(
                 "   Created: {}\n\n",
-                entry.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| "unknown".to_string())
+                entry
+                    .created_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string())
             ));
         }
 
-        response.push_str(&format!(
-            "\nUse knowledge_consolidate with the public IDs to create consolidations."
-        ));
+        response
+            .push_str("\nUse knowledge_consolidate with the public IDs to create consolidations.");
 
         Ok(response)
     }
@@ -184,8 +185,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut context =
-            AgentToolContext::basic("test_session".to_string(), Some(temp_dir.path().to_path_buf()));
+        let mut context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
         context.with_knowledge_store(knowledge_store);
 
         let tool = KnowledgeListTool::new();
@@ -208,8 +211,10 @@ mod tests {
         let db = sqlite_conn_with_schema();
         let knowledge_store = Arc::new(SqliteKnowledgeStore::new(db));
 
-        let mut context =
-            AgentToolContext::basic("test_session".to_string(), Some(temp_dir.path().to_path_buf()));
+        let mut context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
         context.with_knowledge_store(knowledge_store);
 
         let tool = KnowledgeListTool::new();

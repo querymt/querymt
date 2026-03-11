@@ -1,10 +1,9 @@
 //! Knowledge stats tool implementation.
 
-
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub struct KnowledgeStatsTool;
 
@@ -91,7 +90,8 @@ impl ToolTrait for KnowledgeStatsTool {
         if let Some(latest_entry_at) = stats.latest_entry_at {
             response.push_str(&format!(
                 "Latest entry: {}\n",
-                latest_entry_at.format(&time::format_description::well_known::Rfc3339)
+                latest_entry_at
+                    .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_else(|_| "unknown".to_string())
             ));
         } else {
@@ -137,8 +137,10 @@ mod tests {
         let db = sqlite_conn_with_schema();
         let knowledge_store = Arc::new(SqliteKnowledgeStore::new(db));
 
-        let mut context =
-            AgentToolContext::basic("test_session".to_string(), Some(temp_dir.path().to_path_buf()));
+        let mut context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
         context.with_knowledge_store(knowledge_store);
 
         let tool = KnowledgeStatsTool::new();
@@ -190,8 +192,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut context =
-            AgentToolContext::basic("test_session".to_string(), Some(temp_dir.path().to_path_buf()));
+        let mut context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
         context.with_knowledge_store(knowledge_store);
 
         let tool = KnowledgeStatsTool::new();

@@ -168,8 +168,7 @@ pub(crate) fn compute_backoff(
     let raw_delay = backoff_base_seconds.saturating_mul(exp).min(3600);
     let now = OffsetDateTime::now_utc();
     let jittered = compute_next_run_at(raw_delay, jitter_percent, now);
-    let delay = (jittered - now).max(time::Duration::seconds(1));
-    delay
+    (jittered - now).max(time::Duration::seconds(1))
 }
 
 #[cfg(test)]
