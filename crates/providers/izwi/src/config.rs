@@ -7,7 +7,7 @@ pub const DEFAULT_TTS_MODEL: &str = "Qwen3-TTS-12Hz-0.6B-Base-4bit";
 pub const DEFAULT_STT_MODEL: &str = "Qwen3-ASR-0.6B";
 pub const DEFAULT_AUDIO_FORMAT: &str = "wav";
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct IzwiConfig {
     /// Default TTS model name from the izwi catalog.
@@ -61,6 +61,27 @@ pub struct IzwiConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_threads: Option<usize>,
+}
+
+impl Default for IzwiConfig {
+    fn default() -> Self {
+        Self {
+            auto_download: true,
+            tts_model: None,
+            stt_model: None,
+            voice: None,
+            format: None,
+            speed: None,
+            models_dir: None,
+            max_batch_size: None,
+            max_sequence_length: None,
+            chunk_size: None,
+            kv_cache_dtype: None,
+            kv_page_size: None,
+            use_metal: None,
+            num_threads: None,
+        }
+    }
 }
 
 impl IzwiConfig {
