@@ -69,6 +69,12 @@ pub struct AgentConfig {
     pub snapshot_gc_config: crate::snapshot::GcConfig,
     pub delegation_context_config: DelegationContextConfig,
     pub pending_elicitations: crate::elicitation::PendingElicitationMap,
+
+    // ── Scheduling & Knowledge (optional) ─────────────────────────
+    /// Schedule repository for the scheduler actor.
+    pub schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
+    /// Knowledge store for the knowledge tools.
+    pub knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
 }
 
 impl AgentConfig {
@@ -207,6 +213,11 @@ impl AgentConfig {
     /// Access the pending elicitations map.
     pub fn pending_elicitations(&self) -> crate::elicitation::PendingElicitationMap {
         self.pending_elicitations.clone()
+    }
+
+    /// Access the knowledge store, if configured.
+    pub fn knowledge_store(&self) -> Option<Arc<dyn crate::knowledge::KnowledgeStore>> {
+        self.knowledge_store.clone()
     }
 
     /// Determines if a tool should trigger snapshotting.

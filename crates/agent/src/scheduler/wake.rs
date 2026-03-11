@@ -47,15 +47,6 @@ impl DeadlineQueue {
         })
     }
 
-    /// Remove and return the earliest deadline.
-    pub fn pop(&mut self) -> Option<(OffsetDateTime, String)> {
-        self.heap.pop().map(|Reverse((nanos, id))| {
-            let dt = OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)
-                .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-            (dt, id)
-        })
-    }
-
     /// Remove all entries for a given schedule public ID.
     ///
     /// This is O(n) but acceptable since the number of active schedules is
@@ -66,11 +57,6 @@ impl DeadlineQueue {
             .into_iter()
             .filter(|Reverse((_, id))| id != schedule_public_id)
             .collect();
-    }
-
-    /// Check if the queue is empty.
-    pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
     }
 
     /// Number of entries in the queue.
@@ -136,10 +122,11 @@ impl EventAccumulator {
 }
 
 /// Metadata for an active (in-flight) scheduled execution cycle.
+///
+/// Keyed by `schedule_public_id` in the actor's `active_cycles` HashMap,
+/// so the schedule/session IDs are not duplicated here.
 #[derive(Debug)]
 pub(crate) struct ActiveCycle {
-    pub schedule_public_id: String,
-    pub session_public_id: String,
     pub started_at: OffsetDateTime,
     /// Handle to the timeout task that sends `CycleFailed` if
     /// `max_runtime_seconds` is exceeded.
@@ -194,8 +181,7 @@ mod tests {
 
     #[test]
     fn deadline_queue_insert_and_peek() {
-        let mut q = DeadlineQueue::new();
-        assert!(q.is_empty());
+        let q = &mut DeadlineQueue::new();
         assert_eq!(q.len(), 0);
 
         let t1 = OffsetDateTime::now_utc() + time::Duration::hours(2);
@@ -213,27 +199,8 @@ mod tests {
     }
 
     #[test]
-    fn deadline_queue_pop_returns_earliest_first() {
-        let mut q = DeadlineQueue::new();
-        let now = OffsetDateTime::now_utc();
-
-        q.insert(now + time::Duration::hours(3), "c".to_string());
-        q.insert(now + time::Duration::hours(1), "a".to_string());
-        q.insert(now + time::Duration::hours(2), "b".to_string());
-
-        let (_, id1) = q.pop().unwrap();
-        let (_, id2) = q.pop().unwrap();
-        let (_, id3) = q.pop().unwrap();
-
-        assert_eq!(id1, "a");
-        assert_eq!(id2, "b");
-        assert_eq!(id3, "c");
-        assert!(q.is_empty());
-    }
-
-    #[test]
     fn deadline_queue_remove_by_id() {
-        let mut q = DeadlineQueue::new();
+        let q = &mut DeadlineQueue::new();
         let now = OffsetDateTime::now_utc();
 
         q.insert(now + time::Duration::hours(1), "keep".to_string());
@@ -243,10 +210,10 @@ mod tests {
         q.remove("remove");
 
         assert_eq!(q.len(), 2);
-        let (_, id1) = q.pop().unwrap();
-        let (_, id2) = q.pop().unwrap();
-        assert_eq!(id1, "keep");
-        assert_eq!(id2, "keep2");
+
+        // Peek returns earliest remaining
+        let (_, id) = q.peek().unwrap();
+        assert_eq!(id, "keep");
     }
 
     #[test]

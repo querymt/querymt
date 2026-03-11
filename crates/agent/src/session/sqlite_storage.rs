@@ -71,6 +71,13 @@ pub struct SqliteStorage {
 }
 
 impl SqliteStorage {
+    /// Expose the raw connection for sharing with other SQLite-backed components
+    /// (e.g. `SqliteScheduleRepository`, `SqliteKnowledgeStore`) that operate
+    /// on the same database.
+    pub fn conn(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
+    }
+
     /// Expose the raw connection for test assertions (e.g. querying legacy tables).
     #[cfg(test)]
     pub fn conn_for_test(&self) -> Arc<Mutex<Connection>> {

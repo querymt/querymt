@@ -1,7 +1,21 @@
 //! Actor message types for `SchedulerActor`.
 //!
-//! Each message struct corresponds to a single actor interaction.
+//! Each message struct corresponds to a single kameo actor message.
 //! All public-facing identifiers use `schedule_public_id` (never row IDs).
+//!
+//! ## Convention
+//!
+//! - **Internal messages** (`DeadlineReached`, `EventReceived`, `Reconcile`,
+//!   `CycleCompleted`, `CycleFailed`, `ProcessEvent`, `GetMetrics`) are
+//!   `pub(crate)` — only background loops and the scheduler itself send them.
+//! - **Control messages** (`AddSchedule`, `RemoveSchedule`, `PauseSchedule`,
+//!   `ResumeSchedule`, `TriggerNow`, `ListSchedules`) are `pub` — sent by
+//!   `SchedulerHandle` on behalf of the API layer.
+
+use crate::events::EventEnvelope;
+use crate::session::domain_schedule::Schedule;
+
+// ── Internal messages (sent by background loops) ─────────────────────────
 
 /// Timer fired for an interval schedule.
 pub(crate) struct DeadlineReached {
@@ -9,14 +23,39 @@ pub(crate) struct DeadlineReached {
 }
 
 /// Matching event received from EventFanout.
-pub(crate) struct EventReceived {
-    pub schedule_public_id: String,
-    pub event_kind: String,
+///
+/// The raw `EventEnvelope` is forwarded so the actor can inspect the event
+/// kind and match it against event-driven schedule filters.
+pub(crate) struct ProcessEvent {
+    pub envelope: EventEnvelope,
 }
 
 /// Periodic safety pass — re-reads due armed schedules and stale running
 /// schedules from storage, repairs in-memory queues.
 pub(crate) struct Reconcile;
+
+/// Received when a scheduled execution cycle completes successfully.
+///
+/// Constructed by `ProcessEvent` handler when it observes a
+/// `ScheduledExecutionCompleted` event.
+pub(crate) struct CycleCompleted {
+    pub schedule_public_id: String,
+    pub turn_id: String,
+}
+
+/// Received when a scheduled execution cycle fails.
+pub(crate) struct CycleFailed {
+    pub schedule_public_id: String,
+    pub turn_id: Option<String>,
+    pub error: String,
+}
+
+/// Internal: debounce window for an event-driven schedule has elapsed.
+pub(crate) struct DebounceCompleted {
+    pub schedule_public_id: String,
+}
+
+// ── Control messages (sent by SchedulerHandle / API layer) ───────────────
 
 /// User/API: fire a schedule immediately regardless of deadline/threshold.
 pub struct TriggerNow {
@@ -25,7 +64,7 @@ pub struct TriggerNow {
 
 /// User/API: register a new schedule.
 pub struct AddSchedule {
-    pub schedule: crate::session::domain_schedule::Schedule,
+    pub schedule: Schedule,
 }
 
 /// User/API: remove a schedule.
@@ -43,25 +82,23 @@ pub struct ResumeSchedule {
     pub schedule_public_id: String,
 }
 
-/// Received when a scheduled execution cycle completes successfully.
-///
-/// Sent by SchedulerActor's EventFanout subscriber when it observes a
-/// `ScheduledExecutionCompleted` event.
-pub(crate) struct CycleCompleted {
-    pub schedule_public_id: String,
-    pub turn_id: String,
-}
-
-/// Received when a scheduled execution cycle fails.
-pub(crate) struct CycleFailed {
-    pub schedule_public_id: String,
-    pub turn_id: Option<String>,
-    pub error: String,
-}
-
 /// Query: list schedules, optionally filtered by session.
 pub struct ListSchedules {
     pub session_public_id: Option<String>,
+}
+
+/// Query: get a snapshot of the scheduler's operational metrics.
+pub(crate) struct GetMetrics;
+
+/// Graceful shutdown: abort background tasks and stop the actor.
+pub struct Shutdown;
+
+/// Internal: set the actor's self-reference after spawn.
+///
+/// Sent once by `SchedulerActor::spawn()` immediately after kameo spawn
+/// so the actor can schedule deadline-wake tasks that `tell()` back to itself.
+pub(crate) struct SetSelfRef {
+    pub actor_ref: kameo::actor::ActorRef<super::SchedulerActor>,
 }
 
 #[cfg(test)]
@@ -76,16 +113,6 @@ mod tests {
             schedule_public_id: "sched-1".to_string(),
         };
         assert_eq!(msg.schedule_public_id, "sched-1");
-    }
-
-    #[test]
-    fn event_received_construction() {
-        let msg = EventReceived {
-            schedule_public_id: "sched-2".to_string(),
-            event_kind: "knowledge_ingested".to_string(),
-        };
-        assert_eq!(msg.schedule_public_id, "sched-2");
-        assert_eq!(msg.event_kind, "knowledge_ingested");
     }
 
     #[test]

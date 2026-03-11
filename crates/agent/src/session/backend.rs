@@ -4,8 +4,10 @@
 //! enabling clean separation between session persistence (command side)
 //! and event/projection handling (query side).
 
+use crate::knowledge::KnowledgeStore;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::projection::{EventJournal, ViewStore};
+use crate::session::repo_schedule::ScheduleRepository;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::SessionStore;
 use async_trait::async_trait;
@@ -36,6 +38,8 @@ pub fn default_agent_db_path() -> SessionResult<PathBuf> {
 /// - `session_store()`: For session/message persistence (command side)
 /// - `event_journal()`: For durable event persistence
 /// - `view_store()`: For generating views (query side, optional)
+/// - `schedule_repository()`: For schedule persistence (optional)
+/// - `knowledge_store()`: For knowledge persistence (optional)
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     /// Session persistence (command side).
@@ -47,6 +51,18 @@ pub trait StorageBackend: Send + Sync {
     /// Projection queries (query side).
     /// Returns None if backend doesn't support local projections (e.g., Kafka).
     fn view_store(&self) -> Option<Arc<dyn ViewStore>>;
+
+    /// Schedule persistence for the scheduler actor.
+    /// Returns None if backend doesn't support scheduling.
+    fn schedule_repository(&self) -> Option<Arc<dyn ScheduleRepository>> {
+        None
+    }
+
+    /// Knowledge store for the knowledge tools.
+    /// Returns None if backend doesn't support knowledge storage.
+    fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
+        None
+    }
 }
 
 /// SQLite implementation of StorageBackend.
@@ -65,6 +81,18 @@ impl StorageBackend for SqliteStorage {
 
     fn view_store(&self) -> Option<Arc<dyn ViewStore>> {
         Some(Arc::new(self.clone()))
+    }
+
+    fn schedule_repository(&self) -> Option<Arc<dyn ScheduleRepository>> {
+        Some(Arc::new(
+            crate::session::repo_schedule::SqliteScheduleRepository::new(self.conn()),
+        ))
+    }
+
+    fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
+        Some(Arc::new(
+            crate::knowledge::sqlite::SqliteKnowledgeStore::new(self.conn()),
+        ))
     }
 }
 
