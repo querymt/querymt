@@ -15,6 +15,7 @@ import { ShortcutGateway } from './ShortcutGateway';
 import { PluginUpdateIndicator } from './PluginUpdateIndicator';
 import { ProviderAuthSwitcher } from './ProviderAuthSwitcher';
 import { WorkspacePathDialog } from './WorkspacePathDialog';
+import { CreateScheduleDialog } from './CreateScheduleDialog';
 import { RemoteNodeIndicator } from './RemoteNodeIndicator';
 import { copyToClipboard } from '../utils/clipboard';
 import { SessionTimerProvider } from '../context/SessionTimerContext';
@@ -69,6 +70,7 @@ export function AppShell() {
     dismissConnectionError,
     dismissSessionActionNotice,
     updatePlugins,
+    createSchedule,
   } = useUiClientActions();
 
   const {
@@ -124,6 +126,8 @@ export function AppShell() {
     selectedToolEvent,
     selectedTheme,
     setSelectedTheme,
+    createScheduleDialogOpen,
+    setCreateScheduleDialogOpen,
   } = useUiStore();
   
   const location = useLocation();
@@ -157,7 +161,8 @@ export function AppShell() {
       shortcutGatewayOpen ||
       themeSwitcherOpen ||
       providerAuthOpen ||
-      workspacePathDialogOpen;
+      workspacePathDialogOpen ||
+      createScheduleDialogOpen;
 
     document.body.classList.toggle('modal-open', hasOpenOverlay);
 
@@ -174,6 +179,7 @@ export function AppShell() {
     themeSwitcherOpen,
     providerAuthOpen,
     workspacePathDialogOpen,
+    createScheduleDialogOpen,
     isMobile,
   ]);
 
@@ -327,6 +333,12 @@ export function AppShell() {
           cancelWorkspacePathDialog();
           return;
         }
+        if (createScheduleDialogOpen) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          setCreateScheduleDialogOpen(false);
+          return;
+        }
         if (shortcutGatewayOpen) {
           e.preventDefault();
           e.stopImmediatePropagation();
@@ -377,6 +389,8 @@ export function AppShell() {
     providerAuthOpen,
     workspacePathDialogOpen,
     cancelWorkspacePathDialog,
+    createScheduleDialogOpen,
+    setCreateScheduleDialogOpen,
     setSessionSwitcherOpen,
     setModelPickerOpen,
     setShortcutGatewayOpen,
@@ -840,6 +854,13 @@ export function AppShell() {
         remoteNodes={remoteNodes}
         onSubmit={submitWorkspacePathDialog}
         onCancel={cancelWorkspacePathDialog}
+      />
+
+      <CreateScheduleDialog
+        open={createScheduleDialogOpen}
+        sessionId={sessionId}
+        onOpenChange={setCreateScheduleDialogOpen}
+        onCreate={createSchedule}
       />
       
       {/* Stats Drawer - Phase 4 */}

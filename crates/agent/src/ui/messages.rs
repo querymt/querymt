@@ -329,6 +329,50 @@ pub enum UiClientMessage {
     },
     /// Trigger an update of all OCI provider plugins.
     UpdatePlugins,
+    /// Create a new schedule (recurring task + schedule trigger)
+    #[serde(rename = "create_schedule")]
+    CreateSchedule {
+        session_id: String,
+        /// Prompt text for each cycle (becomes the task's expected_deliverable)
+        prompt: String,
+        /// Trigger configuration as JSON (ScheduleTrigger)
+        #[typeshare(serialized_as = "any")]
+        trigger: serde_json::Value,
+        /// Optional execution limits
+        #[serde(default)]
+        max_steps: Option<u32>,
+        #[serde(default)]
+        max_cost_usd: Option<f64>,
+        /// Optional max runs before exhaustion
+        #[serde(default)]
+        max_runs: Option<u32>,
+    },
+    /// List schedules for a session (or all if session_id is None)
+    #[serde(rename = "list_schedules")]
+    ListSchedules {
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    /// Pause a schedule
+    #[serde(rename = "pause_schedule")]
+    PauseSchedule {
+        schedule_public_id: String,
+    },
+    /// Resume a paused schedule
+    #[serde(rename = "resume_schedule")]
+    ResumeSchedule {
+        schedule_public_id: String,
+    },
+    /// Trigger a schedule to fire immediately
+    #[serde(rename = "trigger_schedule")]
+    TriggerSchedule {
+        schedule_public_id: String,
+    },
+    /// Delete a schedule
+    #[serde(rename = "delete_schedule")]
+    DeleteSchedule {
+        schedule_public_id: String,
+    },
 }
 
 #[typeshare]
@@ -344,6 +388,28 @@ pub struct PluginUpdateResult {
     pub plugin_name: String,
     pub success: bool,
     pub message: Option<String>,
+}
+
+/// Schedule information DTO for the UI.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleInfo {
+    pub public_id: String,
+    pub task_public_id: String,
+    pub session_public_id: String,
+    /// Serialized trigger config
+    #[typeshare(serialized_as = "any")]
+    pub trigger: serde_json::Value,
+    /// Current state: armed, running, paused, exhausted, failed
+    pub state: String,
+    pub last_run_at: Option<String>,
+    pub next_run_at: Option<String>,
+    pub run_count: u32,
+    pub consecutive_failures: u32,
+    pub max_runs: Option<u32>,
+    pub max_runtime_seconds: u64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[typeshare]
@@ -680,6 +746,26 @@ pub enum UiServerMessage {
         success: bool,
         message: String,
     },
+    /// Schedule list response
+    #[serde(rename = "schedule_list")]
+    ScheduleList {
+        schedules: Vec<ScheduleInfo>,
+    },
+    /// Schedule created successfully
+    #[serde(rename = "schedule_created_result")]
+    ScheduleCreatedResult {
+        success: bool,
+        schedule_public_id: Option<String>,
+        message: Option<String>,
+    },
+    /// Schedule action result (pause/resume/trigger/delete)
+    #[serde(rename = "schedule_action_result")]
+    ScheduleActionResult {
+        success: bool,
+        schedule_public_id: String,
+        action: String,
+        message: Option<String>,
+    },
 }
 
 impl UiServerMessage {
@@ -713,6 +799,9 @@ impl UiServerMessage {
             Self::PluginUpdateStatus { .. } => "plugin_update_status",
             Self::PluginUpdateComplete { .. } => "plugin_update_complete",
             Self::ApiTokenResult { .. } => "api_token_result",
+            Self::ScheduleList { .. } => "schedule_list",
+            Self::ScheduleCreatedResult { .. } => "schedule_created_result",
+            Self::ScheduleActionResult { .. } => "schedule_action_result",
         }
     }
 }

@@ -21,6 +21,7 @@ import type {
   AuditView,
   UiPromptBlock,
   FileIndexEntry,
+  ScheduleInfo,
 } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -71,6 +72,12 @@ export interface UiClientActionsContextValue {
   dismissConnectionError: (errorId: number) => void;
   dismissSessionActionNotice: (noticeId: number) => void;
   updatePlugins: () => void;
+  listSchedules: (sessionId?: string) => void;
+  createSchedule: (sessionId: string, prompt: string, trigger: any, opts?: { maxSteps?: number; maxCostUsd?: number; maxRuns?: number }) => void;
+  pauseSchedule: (schedulePublicId: string) => void;
+  resumeSchedule: (schedulePublicId: string) => void;
+  triggerScheduleNow: (schedulePublicId: string) => void;
+  deleteSchedule: (schedulePublicId: string) => void;
   sessionCreatingRef: MutableRefObject<boolean>;
 }
 
@@ -116,6 +123,7 @@ export interface UiClientSessionContextValue {
   remoteNodes: RemoteNodeInfo[];
   /** Session ID of the last session that failed to load. Used to navigate away and stop retry loops. */
   lastLoadErrorSessionId: string | null;
+  schedules: ScheduleInfo[];
 }
 
 const UiClientSessionContext = createContext<UiClientSessionContextValue | undefined>(undefined);
@@ -212,6 +220,12 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     dismissConnectionError: uiClient.dismissConnectionError,
     dismissSessionActionNotice: uiClient.dismissSessionActionNotice,
     updatePlugins: uiClient.updatePlugins,
+    listSchedules: uiClient.listSchedules,
+    createSchedule: uiClient.createSchedule,
+    pauseSchedule: uiClient.pauseSchedule,
+    resumeSchedule: uiClient.resumeSchedule,
+    triggerScheduleNow: uiClient.triggerScheduleNow,
+    deleteSchedule: uiClient.deleteSchedule,
     sessionCreatingRef: uiClient.sessionCreatingRef,
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }), []);
@@ -248,6 +262,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     reasoningEffort: uiClient.reasoningEffort,
     remoteNodes: uiClient.remoteNodes,
     lastLoadErrorSessionId: uiClient.lastLoadErrorSessionId,
+    schedules: uiClient.schedules,
   }), [
     uiClient.sessionId,
     uiClient.connected,
@@ -271,6 +286,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.reasoningEffort,
     uiClient.remoteNodes,
     uiClient.lastLoadErrorSessionId,
+    uiClient.schedules,
   ]);
 
   // -- Config (low frequency) --

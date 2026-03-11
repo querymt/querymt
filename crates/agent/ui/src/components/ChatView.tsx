@@ -25,6 +25,7 @@ import { TurnCard } from './TurnCard';
 import { DelegationsView } from './DelegationsView';
 import { DelegationDrawer } from './DelegationDrawer';
 import { TodoRail } from './TodoRail';
+import { SchedulePanel } from './SchedulePanel';
 import { SessionPicker } from './SessionPicker';
 import { ThinkingIndicator } from './ThinkingIndicator';
 import { SystemLog } from './SystemLog';
@@ -83,6 +84,11 @@ export function ChatView() {
     sendUndo,
     sendRedo,
     forkSessionAtMessage,
+    listSchedules,
+    pauseSchedule,
+    resumeSchedule,
+    triggerScheduleNow,
+    deleteSchedule,
   } = useUiClientActions();
 
   const {
@@ -102,6 +108,7 @@ export function ChatView() {
     workspaceIndexStatus,
     llmConfigCache,
     undoState,
+    schedules,
   } = useUiClientSession();
 
   // UI state from Zustand store
@@ -129,9 +136,22 @@ export function ChatView() {
     compactingBySession,
     setCompactingState,
     setMainInputRef,
+    schedulePanelCollapsed,
+    setSchedulePanelCollapsed,
+    setCreateScheduleDialogOpen,
   } = useUiStore();
 
   const isMobile = useIsMobile();
+
+  // Fetch schedules when session changes
+  useEffect(() => {
+    if (sessionId) {
+      listSchedules(sessionId);
+    }
+  }, [sessionId, listSchedules]);
+
+  // Whether to show the schedule panel (has schedules or panel was explicitly opened)
+  const showSchedulePanel = schedules.length > 0;
 
   // Get rate limit state for current session
   const rateLimitState = sessionId ? rateLimitBySession.get(sessionId) : undefined;
@@ -994,6 +1014,19 @@ export function ChatView() {
               onClear={handleClearSystemEvents}
             />
           </div>
+
+        {/* Schedule Panel */}
+        {showSchedulePanel && (
+          <SchedulePanel
+            schedules={schedules}
+            collapsed={schedulePanelCollapsed}
+            onToggleCollapse={() => setSchedulePanelCollapsed(!schedulePanelCollapsed)}
+            onPause={pauseSchedule}
+            onResume={resumeSchedule}
+            onTriggerNow={triggerScheduleNow}
+            onDelete={deleteSchedule}
+            onCreateNew={() => setCreateScheduleDialogOpen(true)}
+          />
         )}
       </div>
 

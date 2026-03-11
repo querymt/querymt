@@ -12,6 +12,7 @@ mod models;
 mod oauth;
 mod plugins;
 mod remote;
+mod schedules;
 mod session_ops;
 
 // ── Re-exports consumed by sibling modules ────────────────────────────────────
@@ -26,6 +27,12 @@ pub use oauth::handle_disconnect_oauth;
 pub use oauth::handle_start_oauth_login;
 pub(crate) use oauth::stop_oauth_callback_listener_for_connection;
 pub use plugins::handle_update_plugins;
+pub use schedules::handle_create_schedule;
+pub use schedules::handle_delete_schedule;
+pub use schedules::handle_list_schedules;
+pub use schedules::handle_pause_schedule;
+pub use schedules::handle_resume_schedule;
+pub use schedules::handle_trigger_schedule;
 pub use remote::handle_attach_remote_session;
 pub use remote::handle_create_remote_session;
 pub use remote::handle_list_remote_nodes;
@@ -309,6 +316,49 @@ pub async fn handle_ui_message(
         }
         UiClientMessage::UpdatePlugins => {
             handle_update_plugins(state, tx).await;
+        }
+        UiClientMessage::CreateSchedule {
+            session_id,
+            prompt,
+            trigger,
+            max_steps,
+            max_cost_usd,
+            max_runs,
+        } => {
+            handle_create_schedule(
+                state,
+                &session_id,
+                &prompt,
+                &trigger,
+                max_steps,
+                max_cost_usd,
+                max_runs,
+                tx,
+            )
+            .await;
+        }
+        UiClientMessage::ListSchedules { session_id } => {
+            handle_list_schedules(state, session_id.as_deref(), tx).await;
+        }
+        UiClientMessage::PauseSchedule {
+            schedule_public_id,
+        } => {
+            handle_pause_schedule(state, &schedule_public_id, tx).await;
+        }
+        UiClientMessage::ResumeSchedule {
+            schedule_public_id,
+        } => {
+            handle_resume_schedule(state, &schedule_public_id, tx).await;
+        }
+        UiClientMessage::TriggerSchedule {
+            schedule_public_id,
+        } => {
+            handle_trigger_schedule(state, &schedule_public_id, tx).await;
+        }
+        UiClientMessage::DeleteSchedule {
+            schedule_public_id,
+        } => {
+            schedules::handle_delete_schedule(state, &schedule_public_id, tx).await;
         }
     }
 }
