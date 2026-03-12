@@ -154,6 +154,8 @@ export const TurnCard = memo(function TurnCard({
   const agentName = turn.agentId ? getAgentShortName(turn.agentId, agents) : 'Agent';
   const agentColor = turn.agentId ? getAgentColor(turn.agentId) : undefined;
   const hasUndoOverlay = isUndone || isUndoPending || isStackedUndone;
+  const showUndoneMarker = isUndone || isStackedUndone;
+  const rootOpacityClass = isStackedUndone ? 'opacity-45' : isUndone ? 'opacity-80' : 'opacity-100';
   const canShowUndoButton = !!onUndoTurn && canUndo && !turn.isActive && !hasUndoOverlay;
   const canShowForkButton =
     !!onForkTurn &&
@@ -199,9 +201,7 @@ export const TurnCard = memo(function TurnCard({
 
   return (
     <div
-      className={`turn-card max-w-6xl mx-auto px-2 md:px-4 py-3 group transition-opacity overflow-hidden ${
-        isStackedUndone ? 'opacity-45' : 'opacity-100'
-      }`}
+      className={`turn-card max-w-6xl mx-auto px-2 md:px-4 py-3 group transition-opacity overflow-hidden ${rootOpacityClass}`}
       data-stacked-undone={isStackedUndone ? 'true' : 'false'}
     >
       {/* Pinned user message (appears when scrolled past) - only in chat view */}
@@ -306,13 +306,26 @@ export const TurnCard = memo(function TurnCard({
         </div>
 
         <div
-          className="bg-surface-elevated/40 border rounded-lg px-4 py-3 relative"
+          data-agent-card="true"
+          className={`bg-surface-elevated/40 border rounded-lg px-4 py-3 relative ${showUndoneMarker ? 'pr-6' : ''}`}
           style={{
             borderColor: agentColor ? colorWithAlpha(agentColor, 0.22) : 'rgba(var(--agent-accent-1-rgb), 0.14)',
             borderLeftWidth: '3px',
             borderLeftColor: agentColor || 'rgb(var(--agent-accent-1-rgb))',
+            borderRightWidth: showUndoneMarker ? '0px' : undefined,
           }}
         >
+          {showUndoneMarker && (
+            <div
+              aria-hidden="true"
+              data-undone-marker="true"
+              className="pointer-events-none absolute inset-y-0 right-0 w-[3px] rounded-r-lg"
+              style={{
+                background: 'repeating-linear-gradient(135deg, rgba(var(--status-warning-rgb), 0.95) 0 6px, rgba(var(--surface-canvas-rgb), 0.14) 6px 12px)',
+              }}
+            />
+          )}
+
           {/* Pending undo state (top stack frame awaiting confirmation) */}
           {isUndoPending && !isUndone && (
             <div className="mb-3 rounded-lg border border-status-warning/35 bg-status-warning/10 px-4 py-3 text-center">
