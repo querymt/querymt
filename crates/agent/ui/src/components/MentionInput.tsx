@@ -26,7 +26,7 @@ const mentionsInputStyle: MentionsInputStyle = {
     overflow: 'hidden',
     borderRadius: '8px',
     border: '2px solid transparent',
-    transition: 'all 0.2s',
+    transition: 'border-color 0.2s, box-shadow 0.2s',
     boxSizing: 'border-box',
   },
   '&singleLine': {

@@ -281,8 +281,25 @@ export function applyDashboardTheme(
   root.setAttribute('data-theme', theme.id);
   root.style.setProperty('color-scheme', theme.variant);
 
+  const vars: Record<string, string> = {};
   for (const [cssVar, token] of Object.entries(TOKEN_BY_CSS_VAR)) {
-    root.style.setProperty(cssVar, hexToRgbTuple(theme.palette[token]));
+    const value = hexToRgbTuple(theme.palette[token]);
+    root.style.setProperty(cssVar, value);
+    vars[cssVar] = value;
+  }
+
+  root.style.backgroundColor = `rgb(${hexToRgbTuple(theme.palette.base00)})`;
+  root.style.color = `rgb(${hexToRgbTuple(theme.palette.base05)})`;
+
+  // Persist computed CSS vars so the inline script in index.html can restore
+  // them before React loads, preventing a flash of the default theme.
+  try {
+    localStorage.setItem(
+      'dashboardThemeCssVars',
+      JSON.stringify({ id: theme.id, variant: theme.variant, vars }),
+    );
+  } catch {
+    // localStorage may be unavailable; ignore.
   }
 
   return theme;
