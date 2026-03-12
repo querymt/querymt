@@ -4,6 +4,54 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>QueryMT Agent Dashboard</title>
+    <style id="theme-vars">
+      :root {
+        --surface-canvas-rgb: 10, 14, 39;
+        --surface-elevated-rgb: 20, 27, 61;
+        --surface-border-rgb: 30, 42, 94;
+        --accent-primary-rgb: 0, 255, 249;
+        --accent-secondary-rgb: 255, 0, 255;
+        --accent-tertiary-rgb: 176, 38, 255;
+        --status-success-rgb: 57, 255, 20;
+        --status-warning-rgb: 255, 107, 53;
+        --ui-text-primary-rgb: 243, 244, 246;
+        --ui-text-secondary-rgb: 156, 163, 175;
+        --ui-text-muted-rgb: 107, 114, 128;
+        --code-bg-rgb: 10, 14, 39;
+        --glitch-fg-rgb: 255, 255, 255;
+        --glitch-shadow-red-rgb: 255, 0, 0;
+        --glitch-shadow-cyan-rgb: 0, 255, 249;
+        --agent-accent-1-rgb: 176, 38, 255;
+        --agent-accent-2-rgb: 255, 0, 255;
+        --agent-accent-3-rgb: 127, 255, 0;
+        --mode-rgb: 163, 190, 140;
+        --mode-color: rgb(163, 190, 140);
+      }
+      html {
+        background-color: rgb(10, 14, 39);
+        color: rgb(243, 244, 246);
+        color-scheme: dark;
+      }
+    </style>
+    <script>
+      // Restore cached theme as inline styles on <html>.
+      // Inline styles override the <style id="theme-vars"> defaults via
+      // specificity, but the stylesheet's --mode-rgb / --mode-color survive
+      // as fallbacks until AppShell.tsx sets them properly.
+      try {
+        var c = localStorage.getItem('dashboardThemeCssVars');
+        if (c) {
+          var d = JSON.parse(c), r = document.documentElement;
+          for (var k in d.vars) r.style.setProperty(k, d.vars[k]);
+          r.style.colorScheme = d.variant || 'dark';
+          if (d.vars['--surface-canvas-rgb'])
+            r.style.backgroundColor = 'rgb(' + d.vars['--surface-canvas-rgb'] + ')';
+          if (d.vars['--ui-text-primary-rgb'])
+            r.style.color = 'rgb(' + d.vars['--ui-text-primary-rgb'] + ')';
+          if (d.id) r.setAttribute('data-theme', d.id);
+        }
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -141,7 +141,13 @@ export const useUiStore = create<UiState>((set, get) => ({
   delegationDrawerOpen: false,
   sessionViewCache: new Map(),
   modeModelPreferences: {},
-  selectedTheme: DEFAULT_DASHBOARD_THEME_ID,
+  selectedTheme: (() => {
+    try {
+      const raw = localStorage.getItem('dashboardTheme');
+      if (raw) return normalizeDashboardThemeId(raw) ?? DEFAULT_DASHBOARD_THEME_ID;
+    } catch { /* localStorage unavailable */ }
+    return DEFAULT_DASHBOARD_THEME_ID;
+  })(),
   rateLimitBySession: new Map(),
   compactingBySession: new Map(),
   sessionTimerCache: new Map(),
