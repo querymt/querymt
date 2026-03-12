@@ -242,7 +242,7 @@ describe('TurnCard', () => {
   it('shows "Changes Undone" overlay when isUndone is true', () => {
     const turn = makeTurn();
 
-    render(
+    const { container } = render(
       <TurnCard
         {...defaultProps}
         turn={turn}
@@ -255,6 +255,13 @@ describe('TurnCard', () => {
     expect(screen.getByText('Changes Undone')).toBeInTheDocument();
     expect(screen.getByText('2 files reverted')).toBeInTheDocument();
     expect(screen.getByText('Redo Changes')).toBeInTheDocument();
+
+    const root = container.querySelector('.turn-card');
+    expect(root).toHaveClass('opacity-80');
+    expect(container.querySelector('[data-undone-marker="true"]')).toHaveClass('w-[3px]');
+
+    const agentCard = container.querySelector('[data-agent-card="true"]');
+    expect(agentCard).toHaveStyle({ borderRightWidth: '0px' });
   });
 
   it('shows file count in undone overlay', () => {
@@ -456,12 +463,16 @@ describe('TurnCard', () => {
     const root = container.querySelector('.turn-card');
     expect(root).toHaveAttribute('data-stacked-undone', 'true');
     expect(root).toHaveClass('opacity-45');
+    expect(container.querySelector('[data-undone-marker="true"]')).toHaveClass('w-[3px]');
+
+    const agentCard = container.querySelector('[data-agent-card="true"]');
+    expect(agentCard).toHaveStyle({ borderRightWidth: '0px' });
   });
 
   it('shows pending undo overlay and hides redo action', () => {
     const turn = makeTurn({ isActive: false });
 
-    render(
+    const { container } = render(
       <TurnCard
         {...defaultProps}
         turn={turn}
@@ -472,6 +483,10 @@ describe('TurnCard', () => {
 
     expect(screen.getByText('Undoing Changes...')).toBeInTheDocument();
     expect(screen.queryByText('Redo Changes')).not.toBeInTheDocument();
+    expect(container.querySelector('[data-undone-marker="true"]')).toBeNull();
+
+    const agentCard = container.querySelector('[data-agent-card="true"]');
+    expect(agentCard).not.toHaveStyle({ borderRightWidth: '0px' });
   });
 
   it('undo button hidden when turn is stacked undone', () => {

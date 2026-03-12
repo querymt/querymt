@@ -66,9 +66,9 @@ export function SystemLog({ events, onClear }: SystemLogProps) {
   };
 
   return (
-    <div className="w-full px-6 pb-2">
+    <div className="w-full px-6 pb-2 pointer-events-auto">
       <div
-        className={`mx-auto w-full max-w-[960px] rounded-2xl border border-status-warning/50 bg-surface-elevated/95 shadow-lg shadow-status-warning/25 transition-all duration-300 ${
+        className={`mx-auto w-full max-w-[960px] rounded-2xl border border-status-warning/50 bg-surface-elevated shadow-lg shadow-status-warning/25 backdrop-blur-sm transition-all duration-300 ${
           justOpened ? 'animate-fade-in-up' : ''
         }`}
       >
