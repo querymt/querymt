@@ -1,6 +1,6 @@
 /**
  * ChatView.tsx - Session chat view component
- * 
+ *
  * Displays the chat timeline for an active session, including:
  * - Turn-based message view (Virtuoso)
  * - Chat/Delegations tabs
@@ -102,7 +102,7 @@ export function ChatView() {
     llmConfigCache,
     undoState,
   } = useUiClientSession();
-  
+
   // UI state from Zustand store
   const {
     prompt,
@@ -129,7 +129,7 @@ export function ChatView() {
     setCompactingState,
     setMainInputRef,
   } = useUiStore();
-  
+
   const isMobile = useIsMobile();
 
   // Get rate limit state for current session
@@ -137,7 +137,7 @@ export function ChatView() {
 
   // Get live compaction state for current session
   const compactingState = sessionId ? compactingBySession.get(sessionId) : undefined;
-  
+
   // Session-scoped thinking state (replaces global thinkingAgentId)
   const sessionThinkingAgentId = useMemo(() => {
     if (!sessionId || !thinkingBySession) return null;
@@ -145,10 +145,10 @@ export function ChatView() {
     if (!agentSet || agentSet.size === 0) return null;
     return Array.from(agentSet).pop()!;
   }, [sessionId, thinkingBySession]);
-  
+
   // Session-scoped conversation complete state (only for main session)
   const sessionConversationComplete = sessionId === mainSessionId ? isConversationComplete : false;
-  
+
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const chatTimelineRef = useRef<HTMLDivElement | null>(null);
   const followArmedRef = useRef(false);
@@ -158,16 +158,16 @@ export function ChatView() {
   const mentionInputRef = useRef<HTMLTextAreaElement>(null);
   const activeIndexStatus = sessionId ? workspaceIndexStatus[sessionId]?.status : undefined;
 
-  
+
   // File mention hook
   const fileMention = useFileMention(requestFileIndex);
-  
+
   // Register main input ref for focus management
   useEffect(() => {
     setMainInputRef(mentionInputRef);
     return () => setMainInputRef(null);
   }, [setMainInputRef]);
-  
+
   // Register file index callback
   useEffect(() => {
     setFileIndexCallback(fileMention.handleFileIndex);
@@ -194,7 +194,7 @@ export function ChatView() {
   // Process rate limit events
   useEffect(() => {
     if (!sessionId) return;
-    
+
     const sessionEvents = events;
     const latestEvent = sessionEvents[sessionEvents.length - 1];
     if (latestEvent && isRateLimitEvent(latestEvent)) {
@@ -293,7 +293,7 @@ export function ChatView() {
     hasMultipleModels: sessionHasMultipleModels,
   } = useMemo(() => {
     const result = buildTurns(events, sessionThinkingAgentId);
-    
+
     // Enrich delegations with child session events from eventsBySession
     for (const delegation of result.delegations) {
       // Use the childSessionId directly if available (set from session_forked event)
@@ -317,7 +317,7 @@ export function ChatView() {
         }
       }
     }
-    
+
     return result;
   }, [events, eventsBySession, mainSessionId, sessionThinkingAgentId]);
   const systemEvents = useMemo(
@@ -509,7 +509,7 @@ export function ChatView() {
         setTodoRailCollapsed(!todoRailCollapsed);
       }
     };
-    
+
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [showTodoRail, todoRailCollapsed, setTodoRailCollapsed]);
@@ -743,7 +743,7 @@ export function ChatView() {
   ]);
 
   return (
-    <div 
+    <div
       className="flex flex-col flex-1 min-h-0 text-ui-primary relative"
       style={{ ['--todo-rail-width' as any]: showTodoRail ? (todoRailCollapsed ? '2rem' : '18rem') : '0px' }}
     >
@@ -908,19 +908,22 @@ export function ChatView() {
             recentlyChangedIds={recentlyChangedIds}
           />
         )}
+
+        {/* System Log - positioned as overlay so it doesn't clip the chat scroll area */}
+        {visibleSystemEvents.length > 0 && (
+          <div className="absolute bottom-0 left-0 right-0 z-20 pointer-events-none">
+            <SystemLog
+              events={visibleSystemEvents}
+              onClear={handleClearSystemEvents}
+            />
+          </div>
+        )}
       </div>
 
       {/* Thinking/Completion Indicator */}
       {sessionThinkingAgentId !== null && <ThinkingIndicator agentId={sessionThinkingAgentId} agents={agents} />}
       {sessionThinkingAgentId === null && sessionConversationComplete && (
         <ThinkingIndicator agentId={sessionThinkingAgentId} agents={agents} isComplete={true} />
-      )}
-
-      {visibleSystemEvents.length > 0 && (
-        <SystemLog
-          events={visibleSystemEvents}
-          onClear={handleClearSystemEvents}
-        />
       )}
 
       {/* Rate Limit Indicator */}
@@ -941,10 +944,10 @@ export function ChatView() {
 
       {/* Input Area */}
       <div className="px-3 md:px-6 py-3 md:py-4 pb-safe bg-surface-elevated border-t border-surface-border shadow-[0_-4px_20px_rgba(var(--accent-primary-rgb),0.05)]">
-        <div 
+        <div
           className="flex gap-2 md:gap-3 relative items-end p-0.5 rounded-lg transition-colors duration-200"
-          style={{ 
-            background: `linear-gradient(90deg, rgba(var(--mode-rgb), 0.08) 0%, transparent 100%)` 
+          style={{
+            background: `linear-gradient(90deg, rgba(var(--mode-rgb), 0.08) 0%, transparent 100%)`
           }}
         >
           <div className="flex gap-3 relative items-stretch flex-1">
@@ -954,8 +957,8 @@ export function ChatView() {
             onChange={setPrompt}
             onSubmit={handleSendPrompt}
             placeholder={
-              !sessionId 
-                ? "Create a session to start chatting..." 
+              !sessionId
+                ? "Create a session to start chatting..."
                 : rateLimitState?.isRateLimited
                   ? "Waiting for rate limit..."
                   : isMobile ? "Enter your prompt..." : "Enter your prompt... (use @ to mention files)"
