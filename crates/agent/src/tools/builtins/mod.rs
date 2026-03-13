@@ -6,6 +6,7 @@ pub mod delete_file;
 pub mod edit;
 pub mod glob;
 pub mod helpers;
+pub mod language_query;
 pub mod ls;
 pub mod mdq;
 pub mod multiedit;
@@ -34,6 +35,7 @@ pub use delegate::DelegateTool;
 pub use delete_file::DeleteFileTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
+pub use language_query::LanguageQueryTool;
 pub use ls::ListTool;
 pub use mdq::MdqTool;
 pub use multiedit::MultiEditTool;
@@ -63,6 +65,7 @@ pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(DeleteFileTool::new()),
         Arc::new(EditTool::new()),
         Arc::new(GlobTool::new()),
+        Arc::new(LanguageQueryTool::new()),
         Arc::new(ListTool::new()),
         Arc::new(MdqTool::new()),
         Arc::new(MultiEditTool::new()),

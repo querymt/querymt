@@ -43,6 +43,7 @@ pub mod tools;
 #[cfg(feature = "dashboard")]
 pub mod ui;
 pub mod verification;
+pub mod workspace_query;
 
 #[cfg(test)]
 pub mod test_utils;

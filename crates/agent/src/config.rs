@@ -837,7 +837,7 @@ pub struct AgentSettings {
     /// Built-in tools: `read_tool`, `edit`, `write_file`, `delete_file`, `shell`,
     /// `glob`, `search_text`, `ls`, `web_fetch`, `browse`, `mdq`, `question`,
     /// `delegate`, `create_task`, `todowrite`, `todoread`, `semantic_edit`,
-    /// `multiedit`, `apply_patch`.
+    /// `multiedit`, `apply_patch`, `language_query`.
     ///
     /// MCP patterns: `"server_name.*"` (all tools from server),
     /// `"server_name.tool_name"` (specific tool).
