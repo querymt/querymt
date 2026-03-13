@@ -401,6 +401,7 @@ pub struct ScheduleInfo {
     pub run_count: u32,
     pub consecutive_failures: u32,
     pub max_runs: Option<u32>,
+    #[typeshare(serialized_as = "number")]
     pub max_runtime_seconds: u64,
     pub created_at: String,
     pub updated_at: String,

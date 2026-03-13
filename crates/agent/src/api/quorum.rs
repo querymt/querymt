@@ -588,6 +588,9 @@ impl QuorumBuilder {
             }
         }
 
+        // Start the scheduler actor on the planner handle if the backend supports it.
+        planner_handle.start_scheduler().await;
+
         Ok(super::agent::Agent {
             inner: planner_handle,
             storage: backend,

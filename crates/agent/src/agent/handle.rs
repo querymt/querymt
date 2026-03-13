@@ -393,13 +393,18 @@ impl LocalAgentHandle {
     }
 
     /// List schedules, optionally filtered by session.
+    ///
+    /// Returns an empty list if the scheduler is not running (rather than an
+    /// error), since the frontend polls this on every session load and an
+    /// absent scheduler simply means no schedules exist yet.
     pub async fn list_schedules(
         &self,
         session_public_id: Option<&str>,
     ) -> Result<Vec<crate::session::domain_schedule::Schedule>, agent_client_protocol::Error> {
-        let scheduler = self.scheduler().ok_or_else(|| {
-            agent_client_protocol::Error::internal_error().data("Scheduler not running".to_string())
-        })?;
+        let scheduler = match self.scheduler() {
+            Some(s) => s,
+            None => return Ok(vec![]),
+        };
         scheduler
             .list_schedules(session_public_id)
             .await

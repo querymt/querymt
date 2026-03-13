@@ -669,6 +669,25 @@ export interface RemoteSessionInfo {
 	peer_label: string;
 }
 
+/** Schedule information DTO for the UI. */
+export interface ScheduleInfo {
+	public_id: string;
+	task_public_id: string;
+	session_public_id: string;
+	/** Serialized trigger config */
+	trigger: any;
+	/** Current state: armed, running, paused, exhausted, failed */
+	state: string;
+	last_run_at?: string;
+	next_run_at?: string;
+	run_count: number;
+	consecutive_failures: number;
+	max_runs?: number;
+	max_runtime_seconds: number;
+	created_at: string;
+	updated_at: string;
+}
+
 /** Summary of a session for listing. */
 export interface SessionSummary {
 	session_id: string;
@@ -721,23 +740,6 @@ export interface SessionLimits {
 	max_turns?: number;
 	/** Maximum cost in USD */
 	max_cost_usd?: number;
-}
-
-/** Schedule information DTO for the UI. */
-export interface ScheduleInfo {
-	public_id: string;
-	task_public_id: string;
-	session_public_id: string;
-	trigger: any;
-	state: string;
-	last_run_at?: string;
-	next_run_at?: string;
-	run_count: number;
-	consecutive_failures: number;
-	max_runs?: number;
-	max_runtime_seconds: number;
-	created_at: string;
-	updated_at: string;
 }
 
 export interface StreamCursor {
@@ -1023,10 +1025,14 @@ export type UiClientMessage =
 	/** Create a new schedule (recurring task + schedule trigger) */
 	| { type: "create_schedule", data: {
 	session_id: string;
+	/** Prompt text for each cycle (becomes the task's expected_deliverable) */
 	prompt: string;
+	/** Trigger configuration as JSON (ScheduleTrigger) */
 	trigger: any;
+	/** Optional execution limits */
 	max_steps?: number;
 	max_cost_usd?: number;
+	/** Optional max runs before exhaustion */
 	max_runs?: number;
 }}
 	/** List schedules for a session (or all if session_id is None) */
