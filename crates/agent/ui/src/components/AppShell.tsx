@@ -246,6 +246,13 @@ export function AppShell() {
         return;
       }
 
+      if (shortcutGatewayOpen && !e.altKey && !e.shiftKey && normalizedKey === 's') {
+        e.preventDefault();
+        setShortcutGatewayOpen(false);
+        setCreateScheduleDialogOpen(true);
+        return;
+      }
+
       if (shortcutGatewayOpen && !e.altKey && !e.shiftKey && normalizedKey === 'd') {
         e.preventDefault();
         setShortcutGatewayOpen(false);
@@ -812,6 +819,10 @@ export function AppShell() {
         onUpdatePlugins={() => {
           setShortcutGatewayOpen(false);
           updatePlugins();
+        }}
+        onCreateSchedule={() => {
+          setShortcutGatewayOpen(false);
+          setCreateScheduleDialogOpen(true);
         }}
         isUpdatingPlugins={isUpdatingPlugins}
       />

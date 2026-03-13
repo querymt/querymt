@@ -327,6 +327,15 @@ impl AgentBuilder {
             builder = builder.with_agent_registry(registry);
         }
 
+        // Wire schedule repository and knowledge store from the storage backend.
+        // These are optional — backends that don't support them return None.
+        if let Some(repo) = backend.schedule_repository() {
+            builder = builder.with_schedule_repository(repo);
+        }
+        if let Some(ks) = backend.knowledge_store() {
+            builder = builder.with_knowledge_store(ks);
+        }
+
         if let Some(assume_mutating) = self.assume_mutating {
             builder = builder.with_assume_mutating(assume_mutating);
         }
@@ -482,6 +491,9 @@ impl AgentBuilder {
         let final_config = Arc::new(initial.with_middleware(middleware_drivers));
 
         let handle = Arc::new(AgentHandle::from_config(final_config));
+
+        // Start the scheduler actor if the backend supports scheduling.
+        handle.start_scheduler().await;
 
         Ok(Agent {
             inner: handle,
