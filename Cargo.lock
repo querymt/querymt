@@ -10046,7 +10046,7 @@ dependencies = [
  "http 1.4.0",
  "http-serde-ext",
  "jsonschema",
- "libloading 0.8.9",
+ "libloading 0.9.0",
  "log",
  "oci-client",
  "once_cell",
