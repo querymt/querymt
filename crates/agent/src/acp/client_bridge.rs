@@ -79,6 +79,17 @@ pub enum ClientBridgeMessage {
         source: String,
         response_tx: oneshot::Sender<crate::elicitation::ElicitationResponse>,
     },
+
+    /// Workspace query request (agent → client → VS Code LSP).
+    ///
+    /// The bridge task serializes this as an `ExtRequest` with method `"workspace/query"`,
+    /// which the ACP SDK sends as `"_workspace/query"` on the wire.
+    /// The client (VS Code extension) handles it by calling VS Code language APIs
+    /// and returns the result.
+    WorkspaceQuery {
+        query: crate::workspace_query::WorkspaceQueryRequest,
+        response_tx: oneshot::Sender<Result<crate::workspace_query::WorkspaceQueryResponse, Error>>,
+    },
 }
 
 /// Send-side handle for the client bridge.
@@ -155,6 +166,35 @@ impl ClientBridgeSender {
         response_rx
             .await
             .map_err(|_| Error::from(crate::error::AgentError::PermissionChannelDropped))?
+    }
+
+    /// Send a workspace query to the client (VS Code) and wait for response.
+    ///
+    /// This enables the agent to access language intelligence (LSP data) from
+    /// the editor: diagnostics, references, definitions, symbols, hover info.
+    ///
+    /// Only available when connected to a client that supports workspace queries
+    /// (currently the VS Code extension). In CLI mode, this is not available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The bridge channel is closed
+    /// - The client disconnects before responding
+    /// - The client does not support workspace queries
+    pub async fn workspace_query(
+        &self,
+        query: crate::workspace_query::WorkspaceQueryRequest,
+    ) -> Result<crate::workspace_query::WorkspaceQueryResponse, Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(ClientBridgeMessage::WorkspaceQuery { query, response_tx })
+            .await
+            .map_err(|_| Error::from(crate::error::AgentError::ClientBridgeClosed))?;
+
+        response_rx
+            .await
+            .map_err(|_| Error::from(crate::error::AgentError::WorkspaceQueryChannelDropped))?
     }
 
     /// Request elicitation from the user and wait for response.

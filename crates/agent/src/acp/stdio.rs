@@ -39,7 +39,9 @@ use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
 use crate::send_agent::ApcAgentAdapter;
-use agent_client_protocol::{AgentSideConnection, Client, SessionId, SessionNotification};
+use agent_client_protocol::{
+    AgentSideConnection, Client, ExtRequest, SessionId, SessionNotification,
+};
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -84,19 +86,107 @@ async fn run_bridge_task(
                 }
             }
             ClientBridgeMessage::Elicit {
-                elicitation_id: _,
-                message: _,
-                requested_schema: _,
-                source: _,
+                elicitation_id,
+                message,
+                requested_schema,
+                source,
                 response_tx,
             } => {
-                // Elicitations are not supported over stdio transport yet
-                // They should be handled through events and elicitation_result RPC
-                log::warn!("Elicit not implemented for stdio transport");
-                let _ = response_tx.send(crate::elicitation::ElicitationResponse {
-                    action: crate::elicitation::ElicitationAction::Decline,
-                    content: None,
+                let _span = info_span!("acp.elicit").entered();
+                log::debug!(
+                    "Bridge: forwarding elicitation via ext_method: {}",
+                    elicitation_id
+                );
+
+                // Serialize elicitation as an ext_method request to the client
+                let params = serde_json::json!({
+                    "elicitationId": elicitation_id,
+                    "message": message,
+                    "requestedSchema": requested_schema,
+                    "source": source,
                 });
+                let params_json = serde_json::to_string(&params).unwrap();
+                let raw_value = serde_json::value::RawValue::from_string(params_json)
+                    .expect("valid JSON from serde_json::to_string");
+
+                let ext_req = agent_client_protocol::ExtRequest::new(
+                    "querymt/elicit",
+                    std::sync::Arc::from(raw_value),
+                );
+
+                let result = _connection.ext_method(ext_req).await;
+
+                let parsed = match result {
+                    Ok(ext_resp) => {
+                        #[derive(serde::Deserialize)]
+                        struct ElicitResponse {
+                            action: String,
+                            content: Option<serde_json::Value>,
+                        }
+                        match serde_json::from_str::<ElicitResponse>(ext_resp.0.get()) {
+                            Ok(resp) => {
+                                let action = match resp.action.as_str() {
+                                    "accept" => crate::elicitation::ElicitationAction::Accept,
+                                    "cancel" => crate::elicitation::ElicitationAction::Cancel,
+                                    _ => crate::elicitation::ElicitationAction::Decline,
+                                };
+                                crate::elicitation::ElicitationResponse {
+                                    action,
+                                    content: resp.content,
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to parse elicitation response: {}", e);
+                                crate::elicitation::ElicitationResponse {
+                                    action: crate::elicitation::ElicitationAction::Decline,
+                                    content: None,
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Elicitation ext_method failed: {:?}", e);
+                        crate::elicitation::ElicitationResponse {
+                            action: crate::elicitation::ElicitationAction::Decline,
+                            content: None,
+                        }
+                    }
+                };
+
+                if response_tx.send(parsed).is_err() {
+                    log::error!("Bridge: failed to send elicitation response (receiver dropped)");
+                }
+            }
+            ClientBridgeMessage::WorkspaceQuery { query, response_tx } => {
+                let _span = info_span!("acp.workspace_query").entered();
+                log::debug!("Bridge: forwarding workspace query: {:?}", query);
+
+                // Serialize the query as raw JSON for ExtRequest
+                let params_json = serde_json::to_string(&query).unwrap();
+                let raw_value = serde_json::value::RawValue::from_string(params_json)
+                    .expect("valid JSON from serde_json::to_string");
+
+                let ext_req = ExtRequest::new("workspace/query", Arc::from(raw_value));
+
+                // Send via connection.ext_method() which becomes "_workspace/query" on the wire
+                let result = _connection.ext_method(ext_req).await;
+
+                let parsed = match result {
+                    Ok(ext_resp) => {
+                        // Parse the raw JSON response into WorkspaceQueryResponse
+                        serde_json::from_str(ext_resp.0.get()).map_err(|e| {
+                            agent_client_protocol::Error::internal_error()
+                                .data(format!("Failed to parse workspace query response: {}", e))
+                        })
+                    }
+                    Err(e) => Err(e),
+                };
+
+                if response_tx.send(parsed).is_err() {
+                    log::error!(
+                        "Bridge: failed to send workspace query response (receiver dropped)"
+                    );
+                }
             }
         }
     }

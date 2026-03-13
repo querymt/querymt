@@ -62,6 +62,9 @@ pub enum AgentError {
     #[error("permission response channel dropped")]
     PermissionChannelDropped,
 
+    #[error("workspace query response channel dropped")]
+    WorkspaceQueryChannelDropped,
+
     // --- Remote / Mesh ---
     #[error("remote actor error: {0}")]
     RemoteActor(String),
