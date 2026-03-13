@@ -69,6 +69,11 @@ pub(crate) async fn execute_cycle_state_machine(
 
     let driver = config.create_driver();
 
+    // Reset middleware state at the start of each turn.
+    // This ensures middleware guards (e.g., DedupCheckMiddleware's already_reviewed_this_turn)
+    // are cleared before turn execution, preventing stale state from blocking analysis.
+    driver.reset();
+
     info!(
         "Session {}: state machine loading history, cancelled={}",
         exec_ctx.session_id,
