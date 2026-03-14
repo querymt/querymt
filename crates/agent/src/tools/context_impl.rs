@@ -27,6 +27,7 @@ pub struct AgentToolContext {
     agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry>>,
     elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
     cancellation_token: CancellationToken,
+    workspace_query_bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
 }
 
 impl AgentToolContext {
@@ -42,12 +43,25 @@ impl AgentToolContext {
             agent_registry,
             elicitation_tx,
             cancellation_token: CancellationToken::new(),
+            workspace_query_bridge: None,
         }
     }
 
     /// Create a context with an explicit cancellation token.
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
+        self
+    }
+
+    /// Set the workspace query bridge for language intelligence queries.
+    ///
+    /// When set, the `language_query` tool can access VS Code's language APIs
+    /// (diagnostics, references, definitions, etc.) through this bridge.
+    pub fn with_workspace_query_bridge(
+        mut self,
+        bridge: crate::acp::client_bridge::ClientBridgeSender,
+    ) -> Self {
+        self.workspace_query_bridge = Some(bridge);
         self
     }
 
@@ -191,6 +205,10 @@ impl ToolContext for AgentToolContext {
             <dyn ToolContext>::ask_question(self, question_id, question, header, options, multiple)
                 .await
         }
+    }
+
+    fn workspace_query_bridge(&self) -> Option<&crate::acp::client_bridge::ClientBridgeSender> {
+        self.workspace_query_bridge.as_ref()
     }
 
     fn cancellation_token(&self) -> CancellationToken {

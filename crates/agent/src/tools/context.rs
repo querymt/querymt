@@ -69,6 +69,15 @@ pub trait ToolContext: Send + Sync {
     /// Access to tool-specific context extensions
     fn as_any(&self) -> &dyn Any;
 
+    /// Access the workspace query bridge for language intelligence queries.
+    ///
+    /// Returns `Some` when connected to a client that supports workspace queries
+    /// (e.g., VS Code extension). Returns `None` in CLI mode or when the client
+    /// does not advertise workspace query support.
+    fn workspace_query_bridge(&self) -> Option<&crate::acp::client_bridge::ClientBridgeSender> {
+        None
+    }
+
     /// A cancellation token that is cancelled when the session is cancelled.
     ///
     /// Tools should poll this to abort long-running work cooperatively. The
