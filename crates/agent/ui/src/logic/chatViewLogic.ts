@@ -213,6 +213,16 @@ export function buildDelegationTurn(group: DelegationGroupInfo): Turn {
   const modelTimeline = buildModelTimeline(group.events);
   const activeModel = getActiveModelAt(modelTimeline, firstTimestamp);
 
+  const completedCompactions = group.events
+    .filter((event) => event.type === 'system' && !!event.compactionSummary)
+    .map((event) => ({
+      tokenEstimate: event.compactionTokenEstimate ?? 0,
+      summary: event.compactionSummary!,
+      summaryLen: event.compactionSummaryLen ?? event.compactionSummary!.length,
+      timestamp: event.timestamp,
+    }))
+    .sort((a, b) => a.timestamp - b.timestamp);
+
   return {
     id: `delegation-${group.id}`,
     userMessage: undefined,
@@ -225,6 +235,7 @@ export function buildDelegationTurn(group: DelegationGroupInfo): Turn {
     isActive: group.status === 'in_progress',
     modelLabel: activeModel?.label,
     modelConfigId: activeModel?.configId,
+    compaction: completedCompactions[completedCompactions.length - 1],
   };
 }
 
@@ -307,14 +318,26 @@ export function buildEventRowsWithDelegations(events: EventItem[]): {
   };
 
   for (const event of events) {
-    if (event.type === 'system') {
-      continue;
-    }
     let depth = 0;
     let parentId: string | undefined;
     let toolName: string | undefined;
     let isDelegateToolCall = false;
     let delegationGroupId: string | undefined;
+
+    if (event.type === 'system') {
+      if (event.compactionSummary) {
+        const row: EventRow = {
+          ...event,
+          depth,
+          parentId,
+          toolName,
+          delegationGroupId,
+        };
+        depthMap.set(event.id, depth);
+        rows.push(row);
+      }
+      continue;
+    }
 
      if (event.delegationEventType === 'requested' && event.delegationId) {
        const targetAgentId = event.delegationTargetAgentId;

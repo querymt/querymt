@@ -300,7 +300,7 @@ describe('buildEventRowsWithDelegations', () => {
       expect(rows[1].isMessage).toBe(true);
     });
 
-    it('skips system events entirely', () => {
+    it('skips non-compaction system events entirely', () => {
       const events = [
         makeUserEvent('Hello'),
         makeSystemEvent('System message'),
@@ -311,8 +311,26 @@ describe('buildEventRowsWithDelegations', () => {
       expect(rows).toHaveLength(2);
       expect(rows[0].type).toBe('user');
       expect(rows[1].type).toBe('agent');
-      // System event is not in rows
+      // Non-compaction system event is not in rows
       expect(rows.find(r => r.type === 'system')).toBeUndefined();
+    });
+
+    it('keeps compaction_end system events in rows for delegation timelines', () => {
+      const events = [
+        makeAgentEvent('Working...', { agentId: 'specialist' }),
+        makeSystemEvent('Context compacted', {
+          agentId: 'specialist',
+          compactionSummary: 'Trimmed prior tool output',
+          compactionSummaryLen: 25,
+          compactionTokenEstimate: 12000,
+        }),
+      ];
+
+      const { rows } = buildEventRowsWithDelegations(events);
+
+      expect(rows).toHaveLength(2);
+      expect(rows[1].type).toBe('system');
+      expect(rows[1].compactionSummary).toBe('Trimmed prior tool output');
     });
   });
 
@@ -984,6 +1002,47 @@ describe('buildDelegationTurn', () => {
     const turn = buildDelegationTurn(group);
     
     expect(turn.agentId).toBe('fallback-agent');
+  });
+
+  it('attaches latest compaction summary from delegation system events', () => {
+    const events = [
+      makeAgentEvent('Working', { timestamp: 1001, agentId: 'specialist' }),
+      makeSystemEvent('Context compacted', {
+        timestamp: 1002,
+        agentId: 'specialist',
+        compactionSummary: 'First summary',
+        compactionSummaryLen: 13,
+        compactionTokenEstimate: 9000,
+      }),
+      makeToolCallEvent('analyze', { timestamp: 1003, agentId: 'specialist' }),
+      makeSystemEvent('Context compacted', {
+        timestamp: 1004,
+        agentId: 'specialist',
+        compactionSummary: 'Second summary',
+        compactionSummaryLen: 14,
+        compactionTokenEstimate: 12000,
+      }),
+    ];
+    const { rows } = buildEventRowsWithDelegations(events);
+
+    const group = {
+      id: 'del-1',
+      delegateToolCallId: 'delegate:123',
+      delegateEvent: rows[0],
+      targetAgentId: 'specialist',
+      events: rows,
+      status: 'completed' as const,
+      startTime: 1000,
+      endTime: 2000,
+    };
+
+    const turn = buildDelegationTurn(group);
+
+    expect(turn.compaction).toBeDefined();
+    expect(turn.compaction?.summary).toBe('Second summary');
+    expect(turn.compaction?.summaryLen).toBe(14);
+    expect(turn.compaction?.tokenEstimate).toBe(12000);
+    expect(turn.compaction?.timestamp).toBe(1004);
   });
 });
 
