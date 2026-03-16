@@ -29,7 +29,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json.workspace = true
 log.workspace = true
 dirs = "6.0"
-toml = "0.9"
+toml.workspace = true
 futures = "0.3"
 async-trait = "0.1"
 open = "5"

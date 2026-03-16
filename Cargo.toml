@@ -33,3 +33,4 @@ regex = "1"
 heck = "0.5"
 dirs = "6"
 hf-hub = { version = "0.5", default-features = false, features = [ "rustls-tls", "tokio", "ureq"] }
+toml = "1"
