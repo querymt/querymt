@@ -1151,11 +1151,81 @@ impl SendAgent for LocalAgentHandle {
         session_ref.set_session_model(req).await
     }
 
-    async fn ext_method(&self, _req: ExtRequest) -> Result<ExtResponse, Error> {
-        // Return empty response - extensions not yet implemented
-        let raw_value = serde_json::value::RawValue::from_string("null".to_string())
-            .map_err(|e| Error::from(crate::error::AgentError::Serialization(e.to_string())))?;
-        Ok(ExtResponse::new(Arc::from(raw_value)))
+    async fn ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+        match req.method.as_ref() {
+            "querymt/models" => {
+                // Enumerate all configured providers and their models.
+                // For now, return the default provider/model from config.
+                let initial = self.config.provider.initial_config();
+                let provider_name = initial.provider.as_deref().unwrap_or("unknown");
+                let model_name = initial.model.as_deref().unwrap_or("unknown");
+                let model_info = crate::model_info::get_model_info(provider_name, model_name);
+
+                let max_input: u64 = model_info
+                    .as_ref()
+                    .and_then(|m| m.context_limit())
+                    .unwrap_or(128_000);
+                let max_output: u64 = model_info
+                    .as_ref()
+                    .and_then(|m| m.output_limit())
+                    .unwrap_or(8_192);
+                let supports_attachments = model_info
+                    .as_ref()
+                    .map(|m| m.capabilities.attachment)
+                    .unwrap_or(false);
+
+                let model_entry = serde_json::json!({
+                    "models": [{
+                        "id": model_name,
+                        "name": model_name,
+                        "family": provider_name,
+                        "version": "1",
+                        "provider": provider_name,
+                        "maxInputTokens": max_input,
+                        "maxOutputTokens": max_output,
+                        "capabilities": {
+                            "imageInput": supports_attachments,
+                            "toolCalling": true
+                        }
+                    }]
+                });
+
+                let json = serde_json::to_string(&model_entry).map_err(|e| {
+                    Error::from(crate::error::AgentError::Serialization(e.to_string()))
+                })?;
+                let raw = serde_json::value::RawValue::from_string(json).map_err(|e| {
+                    Error::from(crate::error::AgentError::Serialization(e.to_string()))
+                })?;
+                Ok(ExtResponse::new(Arc::from(raw)))
+            }
+            "querymt/chat" => {
+                // One-shot chat completion using specified model.
+                // This is a stub — full implementation requires wiring up the
+                // provider registry for arbitrary model routing and streaming.
+                // For now, return an error indicating it is not yet implemented.
+                Err(Error::from(
+                    crate::error::AgentError::MethodNotImplemented {
+                        method: "querymt/chat".to_string(),
+                    },
+                ))
+            }
+            "querymt/tokenCount" => {
+                // Token counting — stub for now.
+                Err(Error::from(
+                    crate::error::AgentError::MethodNotImplemented {
+                        method: "querymt/tokenCount".to_string(),
+                    },
+                ))
+            }
+            _ => {
+                // Unknown extension method — return null
+                let raw_value = serde_json::value::RawValue::from_string("null".to_string())
+                    .map_err(|e| {
+                        Error::from(crate::error::AgentError::Serialization(e.to_string()))
+                    })?;
+                Ok(ExtResponse::new(Arc::from(raw_value)))
+            }
+        }
     }
 
     async fn ext_notification(&self, _notif: ExtNotification) -> Result<(), Error> {
