@@ -7,7 +7,7 @@ import * as Dialog from '@radix-ui/react-dialog';
 import { X, Clock, CheckCircle, XCircle, Loader, Copy, Check } from 'lucide-react';
 import { PatchDiff } from '@pierre/diffs/react';
 import { EventItem } from '../types';
-import { generateToolSummary } from '../utils/toolSummary';
+import { generateToolSummary, normalizeToolName } from '../utils/toolSummary';
 import { HighlightedCode } from './HighlightedCode';
 import { isMarkdownFile } from '../utils/languageDetection';
 import { MessageContent } from './MessageContent';
@@ -45,10 +45,11 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
   const { copiedValue: copiedSection, copy: copyToClipboard } = useCopyToClipboard();
 
   // Check for special tool types
-  const isEdit = toolKind === 'edit' || toolKind === 'mcp_edit';
-  const isPatch = toolKind === 'apply_patch' || toolKind === 'mcp_apply_patch';
-  const isShell = toolKind === 'shell' || toolKind === 'bash' || toolKind === 'mcp_bash';
-  const isRead = toolKind === 'read' || toolKind === 'read_tool' || toolKind === 'mcp_read';
+  const normalizedToolKind = normalizeToolName(toolKind || toolName);
+  const isEdit = normalizedToolKind === 'edit';
+  const isPatch = normalizedToolKind === 'apply_patch';
+  const isShell = normalizedToolKind === 'shell' || normalizedToolKind === 'bash';
+  const isRead = normalizedToolKind === 'read' || normalizedToolKind === 'read_tool';
 
   return (
     <Dialog.Root open onOpenChange={(open) => { if (!open) onClose(); }}>
@@ -178,7 +179,7 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
               >
                 {(isEdit || isPatch) ? (
                   <DiffView
-                    toolKind={toolKind}
+                    toolKind={toolKind || toolName}
                     rawInput={rawInput}
                     resultEvent={resultEvent}
                     diffTheme={diffTheme}
@@ -302,10 +303,11 @@ function DiffView({
   const isMobile = useIsMobile();
   const preferredDiffStyle = isMobile ? 'unified' : 'split' as const;
   const diffContainerClass = `event-diff-container${isMobile ? ' diff-mobile' : ''}`;
+  const normalizedToolKind = normalizeToolName(toolKind);
   const input = rawInput as Record<string, unknown>;
   
   // Handle write tool - show as diff with empty left side
-  if (toolKind === 'write' || toolKind === 'mcp_write' || toolKind === 'write_file') {
+  if (normalizedToolKind === 'write' || normalizedToolKind === 'write_file') {
     const filePath = input.filePath || input.file_path || input.path;
     const content = input.content;
     
@@ -349,7 +351,7 @@ function DiffView({
   }
   
   // Handle edit tool
-  if (toolKind === 'edit' || toolKind === 'mcp_edit') {
+  if (normalizedToolKind === 'edit') {
     const resultPayload = parseJsonMaybe(resultEvent?.toolCall?.raw_output ?? resultEvent?.content);
     const editInput = extractEditInput(input, resultPayload);
     if (editInput?.oldString || editInput?.newString) {

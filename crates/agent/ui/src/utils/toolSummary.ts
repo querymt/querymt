@@ -14,6 +14,17 @@ export interface ToolSummaryInfo {
   };
 }
 
+/**
+ * Normalize tool identifiers from different transports/namespaces.
+ * Examples: mcp_edit -> edit, functions.edit -> edit.
+ */
+export function normalizeToolName(tool: string | undefined): string {
+  if (!tool) return '';
+  const lowered = tool.toLowerCase().trim();
+  const withoutMcp = lowered.replace(/^mcp_/, '');
+  return withoutMcp.includes('.') ? (withoutMcp.split('.').pop() || withoutMcp) : withoutMcp;
+}
+
 // Tool icon mapping
 const TOOL_ICONS: Record<string, string> = {
   // File operations
@@ -74,8 +85,8 @@ const TOOL_ICONS: Record<string, string> = {
  * Get icon for a tool
  */
 export function getToolIcon(toolKind: string | undefined): string {
-  if (!toolKind) return TOOL_ICONS.default;
-  const normalized = toolKind.toLowerCase();
+  const normalized = normalizeToolName(toolKind);
+  if (!normalized) return TOOL_ICONS.default;
   return TOOL_ICONS[normalized] || TOOL_ICONS.default;
 }
 
@@ -85,14 +96,12 @@ export function getToolIcon(toolKind: string | undefined): string {
 export function getToolDisplayName(toolKind: string | undefined, toolName: string | undefined): string {
   // If we have an actual toolName (from tool_call_id or description), use it as-is
   if (toolName) {
-    // Remove mcp_ prefix if present, but don't capitalize
-    return toolName.replace(/^mcp_/, '');
+    return normalizeToolName(toolName);
   }
-  
+
   // Fallback to toolKind processing
   if (!toolKind) return 'Tool';
-  // Remove mcp_ prefix if present, but don't capitalize
-  return toolKind.replace(/^mcp_/, '');
+  return normalizeToolName(toolKind);
 }
 
 /**
@@ -105,7 +114,7 @@ export function extractKeyParam(toolKind: string | undefined, rawInput: unknown)
   if (!input || typeof input !== 'object') return undefined;
   
   const obj = input as Record<string, unknown>;
-  const normalized = toolKind?.toLowerCase().replace(/^mcp_/, '') || '';
+  const normalized = normalizeToolName(toolKind);
   
   switch (normalized) {
     case 'read':
@@ -176,7 +185,7 @@ export function calculateDiffStats(toolKind: string | undefined, rawInput: unkno
   if (!input || typeof input !== 'object') return undefined;
   
   const obj = input as Record<string, unknown>;
-  const normalized = toolKind?.toLowerCase().replace(/^mcp_/, '') || '';
+  const normalized = normalizeToolName(toolKind);
   
   if (normalized === 'edit') {
     const oldString = String(obj.oldString || obj.old_string || '');

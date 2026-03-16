@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.16.0",
-    "@pierre/diffs": "^1.0.4",
+    "@pierre/diffs": "1.1.0",
     "@radix-ui/react-accordion": "^1.2.12",
     "@radix-ui/react-collapsible": "^1.1.12",
     "@radix-ui/react-dialog": "^1.1.15",

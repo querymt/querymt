@@ -5,7 +5,7 @@
 import { memo, useState, useMemo, useRef, useEffect } from 'react';
 import { Loader, CheckCircle, XCircle, ChevronRight, ChevronDown, Eye, Pause } from 'lucide-react';
 import { PatchDiff } from '@pierre/diffs/react';
-import { generateToolSummary } from '../utils/toolSummary';
+import { generateToolSummary, normalizeToolName } from '../utils/toolSummary';
 import { EventItem } from '../types';
 import { getDashboardThemeVariant, getDiffThemeForDashboard } from '../utils/dashboardThemes';
 
@@ -86,7 +86,7 @@ export const ToolSummary = memo(function ToolSummary({
   const isFailed = status === 'failed';
 
   // Inline preview state - auto-expand for edits/patches
-  const normalized = (toolKind || toolName || '').toLowerCase().replace(/^mcp_/, '');
+  const normalized = normalizeToolName(toolKind || toolName);
   const isEdit = normalized === 'edit';
   const isPatch = normalized === 'apply_patch';
   const isWrite = normalized === 'write' || normalized === 'write_file';
@@ -100,7 +100,7 @@ export const ToolSummary = memo(function ToolSummary({
     if (!hasInlinePreview) return null;
 
     if ((isEdit || isPatch || isWrite) && rawInput && typeof rawInput === 'object') {
-      return buildDiffPreview(toolKind, rawInput as Record<string, unknown>, event.mergedResult);
+      return buildDiffPreview(toolKind || toolName, rawInput as Record<string, unknown>, event.mergedResult);
     }
 
     if (isShell && hasMergedResult && event.mergedResult) {
@@ -283,7 +283,7 @@ function buildDiffPreview(
   input: Record<string, unknown>,
   mergedResult?: EventItem,
 ): PreviewData | null {
-  const normalized = (toolKind || '').toLowerCase().replace(/^mcp_/, '');
+  const normalized = normalizeToolName(toolKind);
 
   if (normalized === 'edit') {
     const filePath = (input.filePath || input.file_path || input.path || 'file') as string;

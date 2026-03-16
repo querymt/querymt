@@ -64,13 +64,32 @@ describe('ToolDetailModal diff style', () => {
     agentId: 'agent-0',
     toolCall: {
       name: 'Edit',
-      kind: 'edit',
+      kind: '',
+      tool_call_id: 'functions.edit:99',
       raw_input: {
         filePath: '/test/file.ts',
         oldString: 'const a = 1;',
         newString: 'const a = 2;',
       },
       status: 'completed',
+    },
+    mergedResult: {
+      id: 'e2',
+      type: 'tool_result' as const,
+      content: '{"success":true}',
+      timestamp: 1001,
+      agentId: 'agent-0',
+      toolCall: {
+        tool_call_id: 'functions.edit:99',
+        kind: 'functions.edit',
+        status: 'completed',
+        raw_output: {
+          success: true,
+          startLineOld: 3,
+          oldLineCount: 1,
+          newLineCount: 1,
+        },
+      },
     },
   } as any;
 

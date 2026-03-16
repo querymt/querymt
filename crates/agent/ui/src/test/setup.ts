@@ -1,5 +1,23 @@
 import '@testing-library/jest-dom';
 
+// JSDOM does not implement constructable stylesheets, but @pierre/diffs uses them.
+if (!(globalThis as any).CSSStyleSheet) {
+  class CSSStyleSheetMock {
+    replaceSync(_css: string) {}
+  }
+  (globalThis as any).CSSStyleSheet = CSSStyleSheetMock;
+}
+
+if (!(ShadowRoot.prototype as any).adoptedStyleSheets) {
+  Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', {
+    configurable: true,
+    get() {
+      return [];
+    },
+    set(_value) {},
+  });
+}
+
 // Mock localStorage for tests
 class LocalStorageMock implements Storage {
   private store: Record<string, string> = {};
