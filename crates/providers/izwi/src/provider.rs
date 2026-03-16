@@ -116,7 +116,7 @@ impl IzwiProvider {
             .iter()
             .copied()
             .filter(|v| {
-                v.is_enabled() && (v.is_tts() || v.is_asr() || v.is_lfm2() || v.is_voxtral())
+                v.is_enabled() && (v.is_tts() || v.is_asr() || v.is_voxtral() || v.is_audio_chat())
             })
             .map(|v| v.dir_name().to_string())
             .collect()
