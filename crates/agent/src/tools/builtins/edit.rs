@@ -9,6 +9,13 @@ use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
 /// Edit tool for precise string replacement with fuzzy matching
 pub struct EditTool;
 
+struct ReplacementResult {
+    content: String,
+    start_line_old: usize,
+    old_line_count: usize,
+    new_line_count: usize,
+}
+
 impl EditTool {
     pub fn new() -> Self {
         Self
@@ -430,13 +437,17 @@ impl EditTool {
         matches
     }
 
-    /// Main replace function that tries all strategies
-    pub fn replace(
+    fn line_number_at(content: &str, byte_idx: usize) -> usize {
+        content[..byte_idx].bytes().filter(|b| *b == b'\n').count() + 1
+    }
+
+    /// Main replace function that tries all strategies and returns metadata for diff rendering.
+    fn replace_with_metadata(
         content: &str,
         old_string: &str,
         new_string: &str,
         replace_all: bool,
-    ) -> Result<String, String> {
+    ) -> Result<ReplacementResult, String> {
         if old_string.is_empty() {
             return Err("oldString cannot be empty".to_string());
         }
@@ -464,9 +475,17 @@ impl EditTool {
             for search in matches {
                 if let Some(idx) = content.find(&search) {
                     found_any = true;
+                    let start_line_old = Self::line_number_at(content, idx);
+                    let old_line_count = search.split('\n').count();
+                    let new_line_count = new_string.split('\n').count();
 
                     if replace_all {
-                        return Ok(content.replace(&search, new_string));
+                        return Ok(ReplacementResult {
+                            content: content.replace(&search, new_string),
+                            start_line_old,
+                            old_line_count,
+                            new_line_count,
+                        });
                     }
 
                     // Check if there's only one occurrence
@@ -477,7 +496,12 @@ impl EditTool {
                         result.push_str(&content[..idx]);
                         result.push_str(new_string);
                         result.push_str(&content[idx + search.len()..]);
-                        return Ok(result);
+                        return Ok(ReplacementResult {
+                            content: result,
+                            start_line_old,
+                            old_line_count,
+                            new_line_count,
+                        });
                     }
                     // Multiple occurrences found, continue to next replacer
                 }
@@ -489,6 +513,17 @@ impl EditTool {
         } else {
             Err("oldString found multiple times and requires more code context to uniquely identify the intended match. Either provide a larger string with more surrounding context to make it unique or use `replaceAll` to change every instance of `oldString`.".to_string())
         }
+    }
+
+    /// Main replace function that tries all strategies
+    pub fn replace(
+        content: &str,
+        old_string: &str,
+        new_string: &str,
+        replace_all: bool,
+    ) -> Result<String, String> {
+        Self::replace_with_metadata(content, old_string, new_string, replace_all)
+            .map(|replacement| replacement.content)
     }
 }
 
@@ -585,19 +620,23 @@ impl Tool for EditTool {
             .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {}", e)))?;
 
         // Perform replacement
-        let new_content = Self::replace(&content, old_string, new_string, replace_all)
-            .map_err(ToolError::ProviderError)?;
+        let replacement =
+            Self::replace_with_metadata(&content, old_string, new_string, replace_all)
+                .map_err(ToolError::ProviderError)?;
 
         // Write new content
-        tokio::fs::write(&file_path, &new_content)
+        tokio::fs::write(&file_path, &replacement.content)
             .await
             .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
 
-        // Generate diff for output
+        // Generate diff metadata for output
         let result = json!({
             "success": true,
             "file": file_path.display().to_string(),
             "replaced": if replace_all { "all occurrences" } else { "single occurrence" },
+            "startLineOld": replacement.start_line_old,
+            "oldLineCount": replacement.old_line_count,
+            "newLineCount": replacement.new_line_count,
         });
 
         serde_json::to_string_pretty(&result)

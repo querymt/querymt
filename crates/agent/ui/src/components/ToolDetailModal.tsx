@@ -180,6 +180,7 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
                   <DiffView
                     toolKind={toolKind}
                     rawInput={rawInput}
+                    resultEvent={resultEvent}
                     diffTheme={diffTheme}
                     diffThemeType={diffThemeType}
                   />
@@ -288,11 +289,13 @@ function JsonView({ data }: { data: unknown }) {
 function DiffView({
   toolKind,
   rawInput,
+  resultEvent,
   diffTheme,
   diffThemeType,
 }: {
   toolKind?: string;
   rawInput: unknown;
+  resultEvent?: EventItem;
   diffTheme: string;
   diffThemeType: 'dark' | 'light';
 }) {
@@ -347,7 +350,8 @@ function DiffView({
   
   // Handle edit tool
   if (toolKind === 'edit' || toolKind === 'mcp_edit') {
-    const editInput = extractEditInput(input);
+    const resultPayload = parseJsonMaybe(resultEvent?.toolCall?.raw_output ?? resultEvent?.content);
+    const editInput = extractEditInput(input, resultPayload);
     if (editInput?.oldString || editInput?.newString) {
       const patch = buildEditPatch(editInput);
       return (
@@ -557,38 +561,49 @@ type EditInput = {
   filePath?: string;
   oldString?: string;
   newString?: string;
+  startLineOld?: number;
+  oldLineCount?: number;
+  newLineCount?: number;
 };
 
-function extractEditInput(rawInput: unknown): EditInput | undefined {
+function extractEditInput(rawInput: unknown, resultPayload?: any): EditInput | undefined {
   if (!rawInput) return undefined;
+
+  const withMetadata = (input: EditInput): EditInput => ({
+    ...input,
+    startLineOld: Number.isInteger(resultPayload?.startLineOld) ? resultPayload.startLineOld : undefined,
+    oldLineCount: Number.isInteger(resultPayload?.oldLineCount) ? resultPayload.oldLineCount : undefined,
+    newLineCount: Number.isInteger(resultPayload?.newLineCount) ? resultPayload.newLineCount : undefined,
+  });
+
   if (typeof rawInput === 'object' && rawInput !== null) {
     const direct = rawInput as EditInput & { arguments?: unknown };
     if (direct.oldString || direct.newString || direct.filePath) {
-      return {
+      return withMetadata({
         filePath: direct.filePath,
         oldString: direct.oldString,
         newString: direct.newString,
-      };
+      });
     }
     const args = direct.arguments;
     if (typeof args === 'string') {
       const parsed = parseJsonMaybe(args);
       if (parsed && typeof parsed === 'object') {
         const parsedEdit = parsed as EditInput;
-        return {
+        return withMetadata({
           filePath: parsedEdit.filePath,
           oldString: parsedEdit.oldString,
           newString: parsedEdit.newString,
-        };
+        });
       }
     }
     if (typeof args === 'object' && args !== null) {
       const parsedEdit = args as EditInput;
-      return {
+      return withMetadata({
         filePath: parsedEdit.filePath,
         oldString: parsedEdit.oldString,
         newString: parsedEdit.newString,
-      };
+      });
     }
   }
   return undefined;
@@ -599,8 +614,9 @@ function buildEditPatch(editInput: EditInput): string {
   const normalizedPath = rawPath.replace(/^\/+/, '') || 'file';
   const oldText = editInput.oldString ?? '';
   const newText = editInput.newString ?? '';
-  const oldLines = oldText.split('\n').length;
-  const newLines = newText.split('\n').length;
+  const oldLines = Number.isInteger(editInput.oldLineCount) ? editInput.oldLineCount : oldText.split('\n').length;
+  const newLines = Number.isInteger(editInput.newLineCount) ? editInput.newLineCount : newText.split('\n').length;
+  const startLine = Number.isInteger(editInput.startLineOld) ? editInput.startLineOld : 1;
   const oldBlock = oldText
     .split('\n')
     .map((line) => `-${line}`)
@@ -613,7 +629,7 @@ function buildEditPatch(editInput: EditInput): string {
     `diff --git a/${normalizedPath} b/${normalizedPath}`,
     `--- a/${normalizedPath}`,
     `+++ b/${normalizedPath}`,
-    `@@ -1,${oldLines} +1,${newLines} @@`,
+    `@@ -${startLine},${oldLines} +${startLine},${newLines} @@`,
     oldBlock,
     newBlock,
   ].join('\n');
