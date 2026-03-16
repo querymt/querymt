@@ -616,16 +616,14 @@
 
 /* ===== Pinned User Message - Top Bar ===== */
 
-/* Container handles fixed positioning and width reservation */
+/* Container handles layout-flow positioning (no longer fixed overlay) */
 .pinned-user-bar-container {
-  position: fixed;
-  top: 124px; /* Below header (80px) + tab bar (44px) */
-  left: 0;
-  right: var(--todo-rail-width, 0px);
-  z-index: 40;
+  position: relative;
+  z-index: 5;
   padding: 0 8px;
   display: flex;
   justify-content: center;
+  flex-shrink: 0;
 
   /* Slide-in animation */
   animation: slide-in-top 0.3s ease-out;

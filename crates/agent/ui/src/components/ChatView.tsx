@@ -11,7 +11,7 @@
  */
 
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
+import { Virtuoso, type VirtuosoHandle, type ListRange } from 'react-virtuoso';
 import { Activity, Send, Loader, Plus, ChevronDown, Square } from 'lucide-react';
 import { useUiClientActions, useUiClientEvents, useUiClientSession } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
@@ -28,6 +28,7 @@ import { TodoRail } from './TodoRail';
 import { SessionPicker } from './SessionPicker';
 import { ThinkingIndicator } from './ThinkingIndicator';
 import { SystemLog } from './SystemLog';
+import { PinnedUserMessage } from './PinnedUserMessage';
 import { GlitchText } from './GlitchText';
 import { buildTurns, buildDelegationTurn, buildEventRowsWithDelegations, isRateLimitEvent, processRateLimitEvent } from '../logic/chatViewLogic';
 import { RateLimitIndicator } from './RateLimitIndicator';
@@ -355,15 +356,35 @@ export function ChatView() {
   const hasTurns = filteredTurns.length > 0;
   const hasDelegations = delegations.length > 0;
 
-  // Calculate last user message turn index for pinned message
-  const lastUserMessageTurnIndex = useMemo(() => {
-    for (let i = filteredTurns.length - 1; i >= 0; i--) {
-      if (filteredTurns[i].userMessage) {
-        return i;
+  // --- Pinned user-message bar (scroll-based, cascading) ---
+  // Uses Virtuoso's visible range instead of IntersectionObserver so it
+  // works correctly with virtualisation and naturally cascades through
+  // all user messages as the user scrolls.
+  const [visibleRange, setVisibleRange] = useState<ListRange>({ startIndex: 0, endIndex: 0 });
+
+  const handleRangeChanged = useCallback((range: ListRange) => {
+    setVisibleRange(range);
+  }, []);
+
+  // Derive the pinned message from the visible range.
+  // Walk backward from the first visible turn to find the closest
+  // user message that's completely above the viewport.
+  const pinnedMessage = useMemo<{ content: string; timestamp: number; turnIndex: number } | null>(() => {
+    if (isAtBottom || filteredTurns.length === 0) return null;
+    for (let i = visibleRange.startIndex; i >= 0; i--) {
+      const msg = filteredTurns[i]?.userMessage;
+      if (msg) {
+        return { content: msg.content, timestamp: msg.timestamp, turnIndex: i };
       }
     }
-    return -1;
-  }, [filteredTurns]);
+    return null;
+  }, [isAtBottom, filteredTurns, visibleRange.startIndex]);
+
+  const handleJumpBackToPinnedMessage = useCallback(() => {
+    if (pinnedMessage) {
+      virtuosoRef.current?.scrollToIndex({ index: pinnedMessage.turnIndex, behavior: 'smooth', align: 'start' });
+    }
+  }, [pinnedMessage]);
 
   // Calculate current undo candidate. If we already undid a turn, move left from that message frontier.
   const undoTurnIndex = useMemo(() => {
@@ -707,11 +728,9 @@ export function ChatView() {
         agents={agents}
         onToolClick={handleToolClick}
         onDelegateClick={handleDelegateClick}
-        isLastUserMessage={index === lastUserMessageTurnIndex}
         showModelLabel={sessionHasMultipleModels}
         llmConfigCache={llmConfigCache}
         requestLlmConfig={requestLlmConfig}
-        activeView={activeTimelineView}
         canUndo={index === undoTurnIndex}
         isUndone={undoProps?.isUndone ?? false}
         isUndoPending={undoProps?.isUndoPending ?? false}
@@ -730,11 +749,9 @@ export function ChatView() {
     agents,
     handleToolClick,
     handleDelegateClick,
-    lastUserMessageTurnIndex,
     sessionHasMultipleModels,
     llmConfigCache,
     requestLlmConfig,
-    activeTimelineView,
     undoTurnIndex,
     handleUndoTurn,
     handleForkTurn,
@@ -791,6 +808,14 @@ export function ChatView() {
               )}
             </button>
           </div>
+        )}
+        {/* Pinned user-message bar — in-flow above the scroll area so it doesn't overlap content */}
+        {activeTimelineView === 'chat' && pinnedMessage && (
+          <PinnedUserMessage
+            message={pinnedMessage.content}
+            timestamp={pinnedMessage.timestamp}
+            onJumpBack={handleJumpBackToPinnedMessage}
+          />
         )}
         <div ref={chatTimelineRef} className="flex-1 overflow-hidden relative">
           {activeTimelineView === 'delegations' ? (
@@ -875,6 +900,7 @@ export function ChatView() {
               data={filteredTurns}
               itemContent={renderTurnItem}
               atBottomStateChange={handleAtBottomStateChange}
+              rangeChanged={handleRangeChanged}
               className="h-full"
             />
           )}
