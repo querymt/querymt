@@ -6049,13 +6049,13 @@ dependencies = [
 
 [[package]]
 name = "izwi-asr-toolkit"
-version = "0.1.0-beta-7"
-source = "git+https://github.com/agentem-ai/izwi?tag=v0.1.0-beta-7#004bee1a67338dbf5216428b0b01df6039db1020"
+version = "0.1.0-beta-8"
+source = "git+https://github.com/agentem-ai/izwi?tag=v0.1.0-beta-8#b482b13bf76bd45230238dfca4b950f1ccc9fa98"
 
 [[package]]
 name = "izwi-core"
-version = "0.1.0-beta-7"
-source = "git+https://github.com/agentem-ai/izwi?tag=v0.1.0-beta-7#004bee1a67338dbf5216428b0b01df6039db1020"
+version = "0.1.0-beta-8"
+source = "git+https://github.com/agentem-ai/izwi?tag=v0.1.0-beta-8#b482b13bf76bd45230238dfca4b950f1ccc9fa98"
 dependencies = [
  "anyhow",
  "async-stream",

@@ -22,7 +22,7 @@ crate-type = ["cdylib", "rlib"]
 async-trait.workspace = true
 base64.workspace = true
 futures.workspace = true
-izwi-core = { git = "https://github.com/agentem-ai/izwi", tag = "v0.1.0-beta-7", package = "izwi-core" }
+izwi-core = { git = "https://github.com/agentem-ai/izwi", tag = "v0.1.0-beta-8", package = "izwi-core" }
 log.workspace = true
 querymt = { path = "../../querymt", default-features = false, optional = true }
 schemars.workspace = true
