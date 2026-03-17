@@ -54,17 +54,18 @@ function formatRelativeTime(iso: string | undefined): string {
 
 function describeTrigger(trigger: any): string {
   if (!trigger) return 'Unknown';
-  // Interval trigger: { type: "interval", data: { interval_seconds: N } }
-  if (trigger.type === 'interval' || trigger.Interval) {
-    const secs = trigger.data?.interval_seconds ?? trigger.Interval?.interval_seconds ?? trigger.interval_seconds;
+  // Interval trigger: { type: "interval", seconds: N }
+  if (trigger.type === 'interval') {
+    const secs = trigger.seconds;
     if (!secs) return 'Interval';
     if (secs < 60) return `Every ${secs}s`;
     if (secs < 3600) return `Every ${Math.round(secs / 60)}m`;
     return `Every ${Math.round(secs / 3600)}h`;
   }
-  // Event trigger
-  if (trigger.type === 'event' || trigger.Event) {
-    const kind = trigger.data?.event_kind ?? trigger.Event?.event_kind ?? 'event';
+  // Event-driven trigger: { type: "event_driven", event_filter: { event_kinds: [...] }, debounce_seconds: N }
+  if (trigger.type === 'event_driven') {
+    const kinds: string[] = trigger.event_filter?.event_kinds ?? [];
+    const kind = kinds.length > 0 ? kinds[0] : 'event';
     return `On ${kind}`;
   }
   return 'Custom';

@@ -63,16 +63,17 @@ export function CreateScheduleDialog({
       if (intervalUnit === 'minutes') seconds *= 60;
       if (intervalUnit === 'hours') seconds *= 3600;
       if (seconds <= 0) return;
-      trigger = { type: 'interval', data: { interval_seconds: seconds } };
+      trigger = { type: 'interval', seconds };
     } else {
       if (!eventKind.trim()) return;
       trigger = {
-        type: 'event',
-        data: {
-          event_kind: eventKind.trim(),
+        type: 'event_driven',
+        event_filter: {
+          event_kinds: [eventKind.trim()],
           threshold: parseInt(eventThreshold, 10) || 1,
-          debounce_seconds: parseInt(eventDebounceSeconds, 10) || 30,
+          session_public_id: null,
         },
+        debounce_seconds: parseInt(eventDebounceSeconds, 10) || 30,
       };
     }
 
