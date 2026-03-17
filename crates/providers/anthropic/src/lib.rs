@@ -5,10 +5,11 @@
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 
-use regex::Regex;
-
 /// Tool name prefix used for OAuth requests to avoid conflicts with server-side tools
 const TOOL_PREFIX: &str = "mcp_";
+
+/// OAuth system prompt
+const OAUTH_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use http::{
@@ -665,34 +666,43 @@ impl Anthropic {
     }
 
     /// Sanitizes the system prompt for OAuth requests.
+    ///
+    /// For OAuth: always prepends `OAUTH_SYSTEM_PROMPT` as the first block,
+    /// converting a plain `Text` prompt to `Blocks` in the process.
+    /// When no system prompt is configured and OAuth is active, returns the
+    /// `OAUTH_SYSTEM_PROMPT` const wrapped in a single-element `Blocks`.
+    ///
+    /// For non-OAuth: returns the configured system prompt unchanged.
     fn sanitize_system_prompt(&self) -> Option<AnthropicSystemPrompt> {
-        self.system.as_ref().map(|prompt| {
-            if self.is_oauth() {
-                let re = Regex::new(r"(?i)querymt").unwrap();
-                match prompt {
-                    AnthropicSystemPrompt::Text(s) => {
-                        let result = s.replace("QueryMT", "Claude Code");
-                        AnthropicSystemPrompt::Text(re.replace_all(&result, "Claude").to_string())
-                    }
-                    AnthropicSystemPrompt::Blocks(blocks) => AnthropicSystemPrompt::Blocks(
-                        blocks
-                            .iter()
-                            .map(|block| {
-                                let result = block.text.replace("QueryMT", "Claude Code");
-                                TextBlockParam {
-                                    block_type: block.block_type.clone(),
-                                    text: re.replace_all(&result, "Claude").to_string(),
-                                    cache_control: block.cache_control.clone(),
-                                    citations: block.citations.clone(),
-                                }
-                            })
-                            .collect(),
-                    ),
-                }
-            } else {
-                prompt.clone()
+        if !self.is_oauth() {
+            return self.system.clone();
+        }
+
+        let oauth_block = TextBlockParam {
+            block_type: "text".to_string(),
+            text: OAUTH_SYSTEM_PROMPT.to_string(),
+            cache_control: None,
+            citations: None,
+        };
+
+        match &self.system {
+            None => Some(AnthropicSystemPrompt::Blocks(vec![oauth_block])),
+            Some(AnthropicSystemPrompt::Text(s)) => Some(AnthropicSystemPrompt::Blocks(vec![
+                oauth_block,
+                TextBlockParam {
+                    block_type: "text".to_string(),
+                    text: s.clone(),
+                    cache_control: None,
+                    citations: None,
+                },
+            ])),
+            Some(AnthropicSystemPrompt::Blocks(blocks)) => {
+                let mut result = Vec::with_capacity(1 + blocks.len());
+                result.push(oauth_block);
+                result.extend(blocks.iter().cloned());
+                Some(AnthropicSystemPrompt::Blocks(result))
             }
-        })
+        }
     }
 
     /// Prefixes a tool name with TOOL_PREFIX if using OAuth
@@ -1410,25 +1420,42 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_system_prompt_oauth_no_system() {
+        // OAuth with no system prompt → OAUTH_SYSTEM_PROMPT injected as the sole block
+        let anthropic = test_anthropic("sk-ant-oat01-abc123");
+        let sanitized = anthropic.sanitize_system_prompt();
+        match sanitized {
+            Some(AnthropicSystemPrompt::Blocks(blocks)) => {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].text, OAUTH_SYSTEM_PROMPT);
+                assert!(blocks[0].cache_control.is_none());
+            }
+            other => panic!("Expected Blocks with one OAuth block, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_sanitize_system_prompt_oauth_text() {
+        // OAuth with a plain Text prompt → OAUTH_SYSTEM_PROMPT prepended, original preserved
         let mut anthropic = test_anthropic("sk-ant-oat01-abc123");
-        anthropic.temperature = None;
         anthropic.system = Some(AnthropicSystemPrompt::Text(
             "You are QueryMT assistant.".to_string(),
         ));
         let sanitized = anthropic.sanitize_system_prompt();
-        assert_eq!(
-            sanitized,
-            Some(AnthropicSystemPrompt::Text(
-                "You are Claude Code assistant.".to_string()
-            ))
-        );
+        match sanitized {
+            Some(AnthropicSystemPrompt::Blocks(blocks)) => {
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks[0].text, OAUTH_SYSTEM_PROMPT);
+                assert_eq!(blocks[1].text, "You are QueryMT assistant.");
+            }
+            other => panic!("Expected Blocks with two entries, got {:?}", other),
+        }
     }
 
     #[test]
     fn test_sanitize_system_prompt_oauth_blocks() {
+        // OAuth with existing Blocks → OAUTH_SYSTEM_PROMPT prepended, original blocks preserved
         let mut anthropic = test_anthropic("sk-ant-oat01-abc123");
-        anthropic.temperature = None;
         anthropic.system = Some(AnthropicSystemPrompt::Blocks(vec![TextBlockParam {
             block_type: "text".to_string(),
             text: "You are QueryMT assistant.".to_string(),
@@ -1441,12 +1468,31 @@ mod tests {
         let sanitized = anthropic.sanitize_system_prompt();
         match sanitized {
             Some(AnthropicSystemPrompt::Blocks(blocks)) => {
-                assert_eq!(blocks[0].text, "You are Claude Code assistant.");
-                // cache_control should be preserved
-                assert!(blocks[0].cache_control.is_some());
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks[0].text, OAUTH_SYSTEM_PROMPT);
+                assert!(blocks[0].cache_control.is_none());
+                assert_eq!(blocks[1].text, "You are QueryMT assistant.");
+                // cache_control on the original block should be preserved
+                assert!(blocks[1].cache_control.is_some());
             }
-            other => panic!("Expected Blocks variant, got {:?}", other),
+            other => panic!("Expected Blocks with two entries, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_sanitize_system_prompt_non_oauth_passthrough() {
+        // Non-OAuth: system prompt returned unchanged, no blocks injected
+        let mut anthropic = test_anthropic("sk-ant-api03-xyz789");
+        anthropic.system = Some(AnthropicSystemPrompt::Text(
+            "You are QueryMT assistant.".to_string(),
+        ));
+        let sanitized = anthropic.sanitize_system_prompt();
+        assert_eq!(
+            sanitized,
+            Some(AnthropicSystemPrompt::Text(
+                "You are QueryMT assistant.".to_string()
+            ))
+        );
     }
 
     #[test]
