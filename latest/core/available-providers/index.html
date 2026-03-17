@@ -1805,12 +1805,12 @@
 <p>QueryMT ships with 15 providers split across two types: <strong>WASM</strong> (API-based, cloud services) and <strong>Native</strong> (local inference, runs models on your hardware). This page covers how to configure each type, how to pick the right build variant for your hardware, and provides copy-pasteable configuration recipes.</p>
 <hr />
 <h2 id="provider-repository-repoquerymt">Provider Repository (<code>repo.query.mt</code>)</h2>
-<p>QueryMT maintains an always-up-to-date provider repository at <strong><code>https://repo.query.mt</code></strong>.</p>
+<p>QueryMT maintains an always-up-to-date provider repository at <strong><a href="https://repo.query.mt"><code>https://repo.query.mt</code></a></strong>.</p>
 <ul>
-<li><strong><code>nightly.json</code></strong> — updated on every push to <code>main</code> (default)</li>
-<li><strong><code>stable.json</code></strong> — updated on every tagged release</li>
+<li><strong><a href="https://repo.query.mt/latest.json"><code>latest.json</code></a></strong> — updated on every push to <code>main</code> (default)</li>
+<li><strong><a href="https://repo.query.mt/stable.json"><code>stable.json</code></a></strong> — updated on every tagged release</li>
 </ul>
-<p>If no providers config exists at <code>~/.qmt/providers.toml</code> (or <code>.json</code> / <code>.yaml</code>), QueryMT automatically fetches <code>nightly.json</code> and caches it to <code>~/.qmt/providers.json</code> on first run.</p>
+<p>If no providers config exists at <code>~/.qmt/providers.toml</code> (or <code>.json</code> / <code>.yaml</code>), QueryMT automatically fetches <code>latest.json</code> and caches it to <code>~/.qmt/providers.json</code> on first run.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># Refresh to the latest provider list</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>qmt<span class="w"> </span>update
 </code></pre></div>
