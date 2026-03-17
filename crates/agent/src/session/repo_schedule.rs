@@ -76,6 +76,13 @@ pub trait ScheduleRepository: Send + Sync {
     /// Returns `true` if the lease was renewed (the row still belongs to
     /// `owner_id` and hasn't expired).
     async fn renew_scheduler_lease(&self, owner_id: &str, ttl_seconds: u64) -> SessionResult<bool>;
+
+    /// Release the scheduler lease owned by `owner_id`.
+    ///
+    /// Deletes the lease row only if it belongs to `owner_id`, preventing
+    /// a node from releasing a lease it no longer owns.
+    /// Returns `true` if the lease was released.
+    async fn release_scheduler_lease(&self, owner_id: &str) -> SessionResult<bool>;
 }
 
 // ─── SQLite implementation ───────────────────────────────────────────────────
@@ -397,6 +404,18 @@ impl ScheduleRepository for SqliteScheduleRepository {
                  SET acquired_at = ?, expires_at = ?
                  WHERE id = 1 AND owner_id = ? AND expires_at >= ?",
                 params![now_str, expires_str, oid, now_str],
+            )?;
+            Ok(affected == 1)
+        })
+        .await
+    }
+
+    async fn release_scheduler_lease(&self, owner_id: &str) -> SessionResult<bool> {
+        let oid = owner_id.to_string();
+        self.run_blocking(move |conn| {
+            let affected = conn.execute(
+                "DELETE FROM scheduler_lease WHERE id = 1 AND owner_id = ?",
+                params![oid],
             )?;
             Ok(affected == 1)
         })

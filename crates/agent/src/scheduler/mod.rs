@@ -21,6 +21,7 @@ use crate::events::{AgentEventKind, EventEnvelope};
 use crate::session::domain_schedule::{Schedule, ScheduleState, ScheduleTrigger};
 use crate::session::error::SessionResult;
 use crate::session::repo_schedule::ScheduleRepository;
+use crate::session::store::SessionStore;
 use kameo::Actor;
 use kameo::actor::ActorRef;
 use kameo::message::{Context, Message};
@@ -223,6 +224,7 @@ impl SchedulerHandle {
 #[derive(Actor)]
 pub struct SchedulerActor {
     schedule_store: Arc<dyn ScheduleRepository>,
+    session_store: Arc<dyn SessionStore>,
     session_registry: Arc<Mutex<SessionRegistry>>,
     config: Arc<AgentConfig>,
     scheduler_config: SchedulerConfig,
@@ -452,6 +454,23 @@ impl Message<Shutdown> for SchedulerActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.abort_background_tasks();
+        // Best-effort lease release so the next instance can acquire immediately
+        // rather than waiting for TTL expiry. Errors are logged but don't block shutdown.
+        match self
+            .schedule_store
+            .release_scheduler_lease(&self.owner_id)
+            .await
+        {
+            Ok(true) => info!("SchedulerActor: lease released (owner={})", self.owner_id),
+            Ok(false) => warn!(
+                "SchedulerActor: lease release skipped — not owner or already expired (owner={})",
+                self.owner_id
+            ),
+            Err(e) => warn!(
+                "SchedulerActor: lease release failed (owner={}): {}",
+                self.owner_id, e
+            ),
+        }
         // Stop the actor after this message is processed
         ctx.stop();
     }
@@ -481,6 +500,7 @@ impl SchedulerActor {
     /// Create a new `SchedulerActor`.
     pub fn new(
         schedule_store: Arc<dyn ScheduleRepository>,
+        session_store: Arc<dyn SessionStore>,
         session_registry: Arc<Mutex<SessionRegistry>>,
         config: Arc<AgentConfig>,
         scheduler_config: SchedulerConfig,
@@ -488,6 +508,7 @@ impl SchedulerActor {
         let owner_id = uuid::Uuid::now_v7().to_string();
         Self {
             schedule_store,
+            session_store,
             session_registry,
             config,
             scheduler_config,
@@ -509,11 +530,18 @@ impl SchedulerActor {
     /// Returns `Some(SchedulerHandle)` if this scheduler became the active leader.
     pub async fn spawn(
         schedule_store: Arc<dyn ScheduleRepository>,
+        session_store: Arc<dyn SessionStore>,
         session_registry: Arc<Mutex<SessionRegistry>>,
         config: Arc<AgentConfig>,
         scheduler_config: SchedulerConfig,
     ) -> Option<SchedulerHandle> {
-        let mut actor = Self::new(schedule_store, session_registry, config, scheduler_config);
+        let mut actor = Self::new(
+            schedule_store,
+            session_store,
+            session_registry,
+            config,
+            scheduler_config,
+        );
 
         // Try to acquire lease and initialize (before spawning the actor).
         // Direct mutable access is safe here — actor is not yet shared.
@@ -892,11 +920,38 @@ impl SchedulerActor {
             return;
         };
 
-        // Build prompt text from the task's expected_deliverable or a default
-        let prompt_text = format!(
-            "Scheduled execution cycle for schedule {}. Execute the recurring task.",
-            schedule_public_id
-        );
+        // Load the task to get the actual prompt the user entered.
+        let prompt_text = match self.session_store.get_task(&schedule.task_public_id).await {
+            Ok(Some(task)) => task
+                .expected_deliverable
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    format!(
+                        "Execute the recurring task for schedule {}.",
+                        schedule_public_id
+                    )
+                }),
+            Ok(None) => {
+                warn!(
+                    "SchedulerActor: task {} not found for schedule {}",
+                    schedule.task_public_id, schedule_public_id
+                );
+                format!(
+                    "Execute the recurring task for schedule {}.",
+                    schedule_public_id
+                )
+            }
+            Err(e) => {
+                warn!(
+                    "SchedulerActor: failed to load task {} for schedule {}: {}",
+                    schedule.task_public_id, schedule_public_id, e
+                );
+                format!(
+                    "Execute the recurring task for schedule {}.",
+                    schedule_public_id
+                )
+            }
+        };
 
         // Send ScheduledPrompt to the SessionActor
         let scheduled_prompt = ScheduledPrompt {

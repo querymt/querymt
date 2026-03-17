@@ -45,17 +45,16 @@ pub async fn handle_list_schedules(
 
 /// Handle `CreateSchedule` — create a recurring task + schedule.
 ///
-/// The `task_public_id` is generated here and passed to `enable_memory_mode`,
-/// which creates the `Schedule` in the scheduler. The scheduler's
-/// `handle_add_schedule` persists via `ScheduleRepository::create_schedule`.
+/// Creates a `Task` row first (so FK constraints are satisfied), then creates
+/// the `Schedule` referencing it and registers it with the SchedulerActor.
 pub async fn handle_create_schedule(
     state: &ServerState,
     session_id: &str,
-    _prompt: &str,
+    prompt: &str,
     trigger_json: &serde_json::Value,
-    _max_steps: Option<u32>,
-    _max_cost_usd: Option<f64>,
-    _max_runs: Option<u32>,
+    max_steps: Option<u32>,
+    max_cost_usd: Option<f64>,
+    max_runs: Option<u32>,
     tx: &mpsc::Sender<String>,
 ) {
     use crate::session::domain_schedule::ScheduleTrigger;
@@ -77,14 +76,16 @@ pub async fn handle_create_schedule(
         }
     };
 
-    // Generate a task public ID — the scheduler uses this to correlate
-    // with the task on each cycle firing.
-    let task_public_id = uuid::Uuid::now_v7().to_string();
-
-    // enable_memory_mode creates a Schedule and registers it with the SchedulerActor.
     match state
         .agent
-        .enable_memory_mode(session_id, &task_public_id, trigger)
+        .create_scheduled_task(
+            session_id,
+            prompt,
+            trigger,
+            max_steps,
+            max_cost_usd,
+            max_runs,
+        )
         .await
     {
         Ok(schedule_public_id) => {

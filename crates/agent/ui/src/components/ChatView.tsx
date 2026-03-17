@@ -1004,6 +1004,7 @@ export function ChatView() {
               onClear={handleClearSystemEvents}
             />
           </div>
+        )}
 
         {/* Schedule Panel */}
         {showSchedulePanel && (
