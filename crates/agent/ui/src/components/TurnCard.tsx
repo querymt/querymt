@@ -378,7 +378,8 @@ export const TurnCard = memo(function TurnCard({
           )}
 
           {/* Interleaved content: messages and activities in chronological order */}
-          {interleaved.length > 0 ? (
+          {/* Hidden when an undo overlay is active — the overlay replaces the turn content */}
+          {!hasUndoOverlay && (interleaved.length > 0 ? (
             <div className="space-y-3">
               {interleaved.map((item, idx) => {
                 if (item.type === 'message') {
@@ -454,7 +455,7 @@ export const TurnCard = memo(function TurnCard({
             </div>
           ) : turn.isActive ? (
             <div className="text-sm text-ui-muted italic">Working...</div>
-          ) : null}
+          ) : null)}
         </div>
 
         {/* Turn actions - subtly visible, fully visible on hover */}
