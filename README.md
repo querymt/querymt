@@ -1,7 +1,7 @@
 # QueryMaTe
 [![Discord](https://img.shields.io/badge/Chat-Join%20Discord-7289da?logo=discord&logoColor=white)](https://discord.gg/vArq2xssXt)
-![Codecov](https://img.shields.io/codecov/c/github/querymt/querymt)
-![GitHub contributors](https://img.shields.io/github/contributors/querymt/querymt)
+[![Codecov](https://img.shields.io/codecov/c/github/querymt/querymt)](https://app.codecov.io/gh/querymt/querymt)
+[![GitHub contributors](https://img.shields.io/github/contributors/querymt/querymt)](https://github.com/querymt/querymt/graphs/contributors)
 [![Visual Studio Marketplace Version](https://img.shields.io/visual-studio-marketplace/v/querymt.vscode-querymt?label=VS%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=querymt.vscode-querymt)
 
 A unified interface for Large Language Models (LLMs) with support for various providers via a plugin-based architecture.
