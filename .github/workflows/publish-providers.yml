@@ -114,47 +114,44 @@ jobs:
         run: |
           set -euo pipefail
 
-          providers=$(python - <<'PY'
-          import json
-          matrix = json.loads(r'''${{ needs.detect-changes.outputs.matrix }}''')
-          providers = []
-          for entry in matrix.get("include", []):
-            if entry.get("crate") == "noop":
-              continue
-            if entry.get("provider_type") != "wasm":
-              continue
-            providers.append(entry["crate"])
-          print("\n".join(sorted(set(providers))))
-          PY
-          )
-
-          if [[ -z "$providers" ]]; then
-            echo "No wasm providers in matrix, skipping JSON publish"
-            exit 0
-          fi
-
           output="providers.json"
           echo '{"providers":[' > "$output"
 
           first=1
-          while IFS= read -r name; do
-            if [[ -z "$name" ]]; then
+          for toml in crates/providers/*/Cargo.toml; do
+            name=$(basename "$(dirname "$toml")")
+
+            detected_type=$(
+              awk -F'=' '
+                $0 ~ /^\[package\.metadata\.qmt\]/ {in_qmt=1; next}
+                in_qmt && $0 ~ /^\[/ {in_qmt=0}
+                in_qmt {
+                  key=$1
+                  gsub(/^[ \t]+|[ \t]+$/, "", key)
+                  if (key == "type") {
+                    gsub(/"/, "", $2); gsub(/ /, "", $2); print $2; exit
+                  }
+                }
+              ' "$toml"
+            )
+
+            if [[ "$detected_type" != "wasm" ]]; then
               continue
-            fi
-            if [[ "$first" -eq 0 ]]; then
-              echo ',' >> "$output"
             fi
 
             if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-              version=$(grep '^version' "crates/providers/$name/Cargo.toml" | head -n1 | cut -d'"' -f2)
+              version=$(grep '^version' "$toml" | head -n1 | cut -d'"' -f2)
               image_tag="$version"
             else
               image_tag="latest"
             fi
 
+            if [[ "$first" -eq 0 ]]; then
+              echo ',' >> "$output"
+            fi
             echo "{\"name\":\"$name\",\"path\":\"oci://ghcr.io/${{ github.repository_owner }}/$name:$image_tag\"}" >> "$output"
             first=0
-          done <<< "$providers"
+          done
 
           echo ']}' >> "$output"
           cat "$output"
@@ -163,7 +160,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          target="nightly.json"
+          target="latest.json"
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             target="stable.json"
           fi

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 
-const DEFAULT_PROVIDERS_URL: &str = "https://repo.query.mt/nightly.json";
+const DEFAULT_PROVIDERS_URL: &str = "https://repo.query.mt/latest.json";
 
 pub fn default_remote_url() -> String {
     std::env::var("QMT_PROVIDERS_URL").unwrap_or_else(|_| DEFAULT_PROVIDERS_URL.to_string())
