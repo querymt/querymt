@@ -1226,6 +1226,8 @@ async fn execute_prompt_detached(
         },
     );
 
+    config.emit_event(&session_id, AgentEventKind::TurnStarted);
+
     debug!(
         "Session {}: user_message_stored, starting pre-turn snapshot",
         session_id

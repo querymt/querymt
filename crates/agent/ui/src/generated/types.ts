@@ -16,6 +16,12 @@ export type AgentEventKind =
 	| { type: "user_message_stored", data: {
 	content: string;
 }}
+	/**
+	 * Emitted after the user message is stored and before the execution
+	 * state machine begins. Signals the UI that preparation is underway
+	 * (loading history, snapshotting, building tools, running middleware).
+	 */
+	| { type: "turn_started", data?: undefined }
 	| { type: "assistant_message_stored", data: {
 	content: string;
 	thinking?: string;

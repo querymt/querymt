@@ -379,7 +379,10 @@ export function useUiClient() {
         }
         
         // Track LLM thinking state per session
-        if (eventKind === 'llm_request_start') {
+        // turn_started fires right after user_message_stored, before history
+        // loading / middleware / tool collection, so the UI can show the
+        // "thinking..." indicator immediately instead of an empty card.
+        if (eventKind === 'turn_started' || eventKind === 'llm_request_start') {
           setThinkingBySession(prev => {
             const next = new Map(prev);
             const sessionAgents = new Set(next.get(d.session_id) ?? []);
@@ -390,6 +393,11 @@ export function useUiClient() {
           // Clear conversation complete flag for the main session
           if (d.session_id === mainSessionId) {
             setIsConversationComplete(false);
+          }
+          // turn_started is a side-effect-only event (sets thinking state).
+          // Don't append it to the event list — it has no display purpose.
+          if (eventKind === 'turn_started') {
+            break;
           }
         } else if (eventKind === 'llm_request_end') {
           const finishReason = kindData.finish_reason;

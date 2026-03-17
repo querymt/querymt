@@ -144,6 +144,10 @@ pub enum AgentEventKind {
     UserMessageStored {
         content: String,
     },
+    /// Emitted after the user message is stored and before the execution
+    /// state machine begins. Signals the UI that preparation is underway
+    /// (loading history, snapshotting, building tools, running middleware).
+    TurnStarted,
     AssistantMessageStored {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]

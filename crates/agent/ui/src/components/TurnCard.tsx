@@ -169,6 +169,10 @@ export const TurnCard = memo(function TurnCard({
     isCompacting ? undefined : turn.compaction, // compaction goes inline once complete
   );
 
+  // Only render the agent response section when there is something to show.
+  // This avoids an empty bordered box between prompt_received and turn_started/llm_request_start.
+  const hasAgentContent = interleaved.length > 0 || turn.isActive || hasUndoOverlay || isCompacting;
+
   // Track pinned state for last user message
   const userMessageRef = useRef<HTMLDivElement>(null);
   const [isPinned, setIsPinned] = useState(false);
@@ -241,8 +245,8 @@ export const TurnCard = memo(function TurnCard({
         </div>
       )}
 
-      {/* Agent response */}
-      <div className="agent-response">
+      {/* Agent response — hidden until there is content, the turn is active, or an overlay applies */}
+      {hasAgentContent && <div className="agent-response">
         <div className="flex items-baseline justify-between gap-2 mb-1">
           {/* Left: agent name, timestamp, thinking indicator */}
           <div className="flex items-baseline gap-2">
@@ -483,7 +487,7 @@ export const TurnCard = memo(function TurnCard({
         {isCompacting && (
           <CompactingIndicator tokenEstimate={compactingTokenEstimate} />
         )}
-      </div>
+      </div>}
     </div>
   );
 });

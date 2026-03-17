@@ -101,7 +101,7 @@ describe('TurnCard', () => {
   });
 
   it('renders agent name from agents list', () => {
-    const turn = makeTurn({ agentId: 'agent-1' });
+    const turn = makeTurn({ agentId: 'agent-1', agentMessages: [makeRow({ content: 'Hi' })] });
     const agents: UiAgentInfo[] = [{ id: 'agent-1', name: 'Code Agent', description: 'Code agent', capabilities: [] }];
 
     render(<TurnCard {...defaultProps} turn={turn} agents={agents} />);
@@ -110,7 +110,7 @@ describe('TurnCard', () => {
   });
 
   it('falls back to "Agent" when agentId is undefined', () => {
-    const turn = makeTurn({ agentId: undefined });
+    const turn = makeTurn({ agentId: undefined, agentMessages: [makeRow({ content: 'Hi' })] });
 
     render(<TurnCard {...defaultProps} turn={turn} />);
 
@@ -195,10 +195,24 @@ describe('TurnCard', () => {
     expect(screen.getByText('Working...')).toBeInTheDocument();
   });
 
+  it('does NOT render agent response section when turn is inactive with no content', () => {
+    const turn = makeTurn({
+      isActive: false,
+      agentMessages: [],
+      toolCalls: [],
+    });
+
+    render(<TurnCard {...defaultProps} turn={turn} />);
+
+    expect(screen.queryByText('Working...')).not.toBeInTheDocument();
+    expect(screen.queryByText('Agent')).not.toBeInTheDocument();
+  });
+
   it('shows model label when showModelLabel is true', () => {
     const turn = makeTurn({
       modelLabel: 'anthropic / claude-3',
       modelConfigId: 1,
+      agentMessages: [makeRow({ content: 'Hi' })],
     });
 
     render(<TurnCard {...defaultProps} turn={turn} showModelLabel={true} />);
@@ -221,6 +235,7 @@ describe('TurnCard', () => {
     const turn = makeTurn({
       isActive: false,
       userMessage: makeRow({ type: 'user', messageId: 'msg-undo-1' }),
+      agentMessages: [makeRow({ content: 'Done' })],
     });
 
     render(<TurnCard {...defaultProps} turn={turn} canUndo={true} onUndoTurn={vi.fn()} />);
@@ -287,6 +302,7 @@ describe('TurnCard', () => {
     const turn = makeTurn({
       isActive: false,
       userMessage: makeRow({ type: 'user', messageId: 'msg-onundo-1' }),
+      agentMessages: [makeRow({ content: 'Done' })],
     });
 
     render(<TurnCard {...defaultProps} turn={turn} turnIndex={3} canUndo={true} onUndoTurn={onUndoTurn} />);
@@ -325,6 +341,7 @@ describe('TurnCard', () => {
     const turn = makeTurn({
       isActive: false,
       userMessage: makeRow({ type: 'user', messageId: 'msg-fork-1' }),
+      agentMessages: [makeRow({ content: 'Done' })],
     });
 
     render(<TurnCard {...defaultProps} turn={turn} onForkTurn={vi.fn()} />);
@@ -350,6 +367,7 @@ describe('TurnCard', () => {
     const turn = makeTurn({
       isActive: false,
       userMessage: makeRow({ type: 'user', messageId: 'msg-fork-2' }),
+      agentMessages: [makeRow({ content: 'Done' })],
     });
 
     render(<TurnCard {...defaultProps} turn={turn} turnIndex={5} onForkTurn={onForkTurn} />);
