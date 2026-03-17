@@ -61,6 +61,7 @@ nav:
   - Core Concepts:
     - Overview: core/index.md
     - LLM Providers: core/providers.md
+    - Available Providers: core/available-providers.md
     - Chat Interactions: core/chat.md
     - Text Completion: core/completion.md
     - Embeddings: core/embeddings.md

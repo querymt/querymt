@@ -1,3 +1,16 @@
+# QueryMT Provider Configuration
+#
+# Copy this file to ~/.qmt/providers.toml and uncomment the providers you need.
+# For full configuration reference, GPU selection, and copy-pasteable recipes see:
+# https://docs.query.mt/core/available-providers/
+#
+# WASM providers (API-based) are also available automatically via the provider
+# repository at https://repo.query.mt -- no manual configuration required unless
+# you want to pin a specific version or supply your own config. Run `qmt update`
+# to refresh.
+
+# ─── WASM Providers (API-based, cross-platform) ───────────────────────────────
+
 [[providers]]
 name = "alibaba"
 path = "oci://ghcr.io/querymt/alibaba:latest"
@@ -7,12 +20,28 @@ name = "anthropic"
 path = "oci://ghcr.io/querymt/anthropic:latest"
 
 [[providers]]
+name = "codex"
+path = "oci://ghcr.io/querymt/codex:latest"
+
+[[providers]]
 name = "google"
 path = "oci://ghcr.io/querymt/google:latest"
 
 [[providers]]
+name = "groq"
+path = "oci://ghcr.io/querymt/groq:latest"
+
+[[providers]]
+name = "kimi-code"
+path = "oci://ghcr.io/querymt/kimi-code:latest"
+
+[[providers]]
 name = "mistral"
 path = "oci://ghcr.io/querymt/mistral:latest"
+
+[[providers]]
+name = "moonshot"
+path = "oci://ghcr.io/querymt/moonshot:latest"
 
 [[providers]]
 name = "ollama"
@@ -23,9 +52,36 @@ name = "openai"
 path = "oci://ghcr.io/querymt/openai:latest"
 
 [[providers]]
-name = "codex"
-path = "oci://ghcr.io/querymt/codex:latest"
-
-[[providers]]
 name = "openrouter"
 path = "oci://ghcr.io/querymt/openrouter:latest"
+
+[[providers]]
+name = "xai"
+path = "oci://ghcr.io/querymt/xai:latest"
+
+# ─── Native Providers (local inference, platform-specific) ────────────────────
+# Native providers run models locally on your hardware. The `latest` tag selects
+# the CPU-only build; use feature tags for GPU acceleration (Metal, CUDA, Vulkan).
+# See https://docs.query.mt/core/available-providers/#native-providers for the
+# full list of feature tags and a GPU-to-SM mapping table.
+
+[[providers]]
+name = "llama-cpp"
+path = "oci://ghcr.io/querymt/llama-cpp:latest"
+# GPU variants: latest-metal  latest-vulkan  latest-cuda12.8
+[providers.config]
+model = "/path/to/model.gguf"
+
+[[providers]]
+name = "izwi"
+path = "oci://ghcr.io/querymt/izwi:latest"
+# GPU variants: latest-metal  latest-accelerate  latest-cuda12.8-sm{80,86,87,89,120}
+[providers.config]
+model = "/path/to/model"
+
+[[providers]]
+name = "mrs"
+path = "oci://ghcr.io/querymt/mrs:latest"
+# GPU variants: latest-metal  latest-accelerate  latest-cuda12.8-sm{80,86,87,89,120}
+[providers.config]
+model = "/path/to/model"
