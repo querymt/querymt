@@ -5,7 +5,7 @@
 
 mod parallel;
 
-use crate::{chat::ChatMessage, error::LLMError, LLMProvider};
+use crate::{LLMProvider, chat::ChatMessage, error::LLMError};
 
 pub use parallel::{ParallelEvalResult, ParallelEvaluator};
 

@@ -69,9 +69,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let messages = vec![ChatMessage::user()
-        .text("Explain Einstein's theory of relativity in simple terms.")
-        .build()];
+    let messages = vec![
+        ChatMessage::user()
+            .text("Explain Einstein's theory of relativity in simple terms.")
+            .build(),
+    ];
 
     let results: Vec<ParallelEvalResult> = evaluator.evaluate_chat_parallel(&messages).await?;
 

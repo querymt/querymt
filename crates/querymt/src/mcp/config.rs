@@ -1,13 +1,13 @@
 use anyhow::Result;
-use http::{header::AUTHORIZATION, HeaderValue};
+use http::{HeaderValue, header::AUTHORIZATION};
 use reqwest::header::HeaderMap;
 use rmcp::{
+    RoleClient, ServiceExt,
     model::{ClientCapabilities, ClientInfo, Implementation},
     service::{DynService, RunningService},
     transport::{
-        streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
-    RoleClient, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path, process::Stdio};

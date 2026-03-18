@@ -451,7 +451,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mcp_clients = cfg
             .create_mcp_clients(&querymt::mcp::Implementation::new(
                 "querymt-cli",
-                env!("CARGO_PKG_VERSION"),
+                env!("QMT_BUILD_VERSION"),
             ))
             .await?;
         for (server_name, client) in mcp_clients.iter() {

@@ -2,8 +2,8 @@ use super::ExtismFactory;
 use crate::{
     error::LLMError,
     plugin::{
-        host::{PluginLoader, PluginType, ProviderConfig, ProviderPlugin},
         LLMProviderFactory,
+        host::{PluginLoader, PluginType, ProviderConfig, ProviderPlugin},
     },
 };
 use async_trait::async_trait;

@@ -1,10 +1,10 @@
 use crate::{
     error::LLMError,
     plugin::{
-        adapters::HTTPFactoryAdapter,
-        host::{PluginLoader, PluginType, ProviderConfig, ProviderPlugin},
         FactoryCtor, HTTPFactoryCtor, HTTPLLMProviderFactory, LLMProviderFactory,
         PluginInitLoggingFn,
+        adapters::HTTPFactoryAdapter,
+        host::{PluginLoader, PluginType, ProviderConfig, ProviderPlugin},
     },
 };
 use async_trait::async_trait;

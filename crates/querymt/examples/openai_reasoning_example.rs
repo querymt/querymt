@@ -38,9 +38,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Prepare conversation history with example messages
-    let messages = vec![ChatMessage::user()
-        .text("How many r's is in `strawberry`?")
-        .build()];
+    let messages = vec![
+        ChatMessage::user()
+            .text("How many r's is in `strawberry`?")
+            .build(),
+    ];
 
     // Send chat request and handle the response
     match llm.chat(&messages).await {

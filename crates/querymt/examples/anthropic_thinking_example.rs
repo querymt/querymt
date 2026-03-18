@@ -41,9 +41,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Prepare conversation history with a reasoning puzzle
-    let messages = vec![ChatMessage::user()
-        .text("How much r in strawberry?")
-        .build()];
+    let messages = vec![
+        ChatMessage::user()
+            .text("How much r in strawberry?")
+            .build(),
+    ];
 
     // Send chat request and handle the response
     match llm.chat(&messages).await {

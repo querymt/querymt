@@ -4,10 +4,10 @@ use docker_credential::{CredentialRetrievalError, DockerCredential};
 use futures::StreamExt;
 use hex;
 use oci_client::{
+    Client, Reference,
     errors::{OciDistributionError, OciErrorCode},
     manifest::{OciImageManifest, OciManifest, Platform},
     secrets::RegistryAuth,
-    Client, Reference,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,7 +15,7 @@ use sigstore::cosign::verification_constraint::cert_subject_email_verifier::Stri
 use sigstore::cosign::verification_constraint::{
     CertSubjectEmailVerifier, CertSubjectUrlVerifier, VerificationConstraintVec,
 };
-use sigstore::cosign::{verify_constraints, ClientBuilder, CosignCapabilities};
+use sigstore::cosign::{ClientBuilder, CosignCapabilities, verify_constraints};
 use sigstore::errors::SigstoreVerifyConstraintsError;
 use sigstore::registry::{Auth, OciReference};
 use sigstore::trust::sigstore::SigstoreTrustRoot;
@@ -755,7 +755,8 @@ impl OciDownloader {
                                 discovered_type = PluginType::Wasm;
                             } else {
                                 // --- Failure Case: Neither native nor Wasm was found ---
-                                let msg = format!("Image index contains no manifest for the host platform ({}/{}) and no wasi/wasm fallback was found.",
+                                let msg = format!(
+                                    "Image index contains no manifest for the host platform ({}/{}) and no wasi/wasm fallback was found.",
                                     OS, ARCH
                                 );
                                 progress(OciDownloadProgress {
@@ -1038,10 +1039,12 @@ mod tests {
         let result = load_from_cache(&meta, &blob_path);
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid plugin type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid plugin type")
+        );
     }
 
     #[test]

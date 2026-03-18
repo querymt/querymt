@@ -41,9 +41,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Prepare conversation history with example message about Rust concurrency
-    let messages = vec![ChatMessage::user()
-        .text("Tell me something about Rust concurrency")
-        .build()];
+    let messages = vec![
+        ChatMessage::user()
+            .text("Tell me something about Rust concurrency")
+            .build(),
+    ];
 
     // Send chat request and handle the response
     match llm.chat(&messages).await {

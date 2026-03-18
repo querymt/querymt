@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 #[cfg(feature = "extism_host")]
 use querymt::plugin::extism_impl::host::ExtismLoader;
+use querymt::plugin::host::PluginRegistry;
 #[cfg(feature = "native")]
 use querymt::plugin::host::native::NativeLoader;
-use querymt::plugin::host::PluginRegistry;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]

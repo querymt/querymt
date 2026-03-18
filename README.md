@@ -8,6 +8,30 @@ A unified interface for Large Language Models (LLMs) with support for various pr
 
 ## Installation
 
+Install the `qmt` and `coder_agent` binaries:
+
+```bash
+curl -sSf https://query.mt/install.sh | sh
+```
+
+Nightly channel:
+
+```bash
+curl -sSf https://query.mt/install.sh | sh -s -- --nightly
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://query.mt/install.ps1 | iex
+```
+
+Windows nightly channel:
+
+```powershell
+$env:QMT_CHANNEL='nightly'; irm https://query.mt/install.ps1 | iex
+```
+
 Add `querymt` to your `Cargo.toml` with the `extism_host` feature:
 
 ```toml

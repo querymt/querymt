@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::{error::LLMError, ToolCall, Usage};
+use crate::{ToolCall, Usage, error::LLMError};
 use futures::Stream;
 use std::pin::Pin;
 

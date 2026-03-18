@@ -410,8 +410,8 @@ mod tests {
 
     #[tokio::test]
     async fn update_oci_plugins_invokes_progress_callback_for_oci_providers() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let cache_path = unique_tmp_path("update-oci-cb");
         // Use a non-resolvable fake OCI reference so pull fails quickly.
         let cfg = config::PluginConfig {

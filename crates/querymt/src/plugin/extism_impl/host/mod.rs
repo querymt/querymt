@@ -1,25 +1,26 @@
 use crate::{
+    HTTPLLMProvider, LLMProvider,
     auth::ApiKeyResolver,
-    chat::{http::HTTPChatProvider, ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool},
+    chat::{ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool, http::HTTPChatProvider},
     completion::{
-        http::HTTPCompletionProvider, CompletionProvider, CompletionRequest, CompletionResponse,
+        CompletionProvider, CompletionRequest, CompletionResponse, http::HTTPCompletionProvider,
     },
-    embedding::{http::HTTPEmbeddingProvider, EmbeddingProvider},
+    embedding::{EmbeddingProvider, http::HTTPEmbeddingProvider},
     error::LLMError,
     plugin::{
+        Fut, HTTPLLMProviderFactory, LLMProviderFactory,
         extism_impl::{
             ExtismChatRequest, ExtismChatResponse, ExtismEmbedRequest, ExtismSttRequest,
             ExtismSttResponse, ExtismTtsRequest, ExtismTtsResponse, ExtismVoiceConfig,
         },
-        Fut, HTTPLLMProviderFactory, LLMProviderFactory,
     },
     providers::read_providers_from_cache,
-    stt, tts, HTTPLLMProvider, LLMProvider,
+    stt, tts,
 };
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use extism::{convert::Json, Manifest, Plugin, PluginBuilder, Wasm};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use extism::{Manifest, Plugin, PluginBuilder, Wasm, convert::Json};
 use futures::FutureExt;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -260,7 +261,7 @@ impl LLMProviderFactory for ExtismFactory {
                         "Invalid JSON config: {:#}",
                         e
                     )))
-                })
+                });
             }
         };
         let plugin = self.plugin.clone();

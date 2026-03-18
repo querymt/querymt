@@ -1,8 +1,9 @@
 use crate::{
+    ToolCall, Usage,
     chat::{ChatMessage, ChatResponse, FinishReason, Tool},
     completion::CompletionRequest,
     error::LLMError,
-    stt, tts, ToolCall, Usage,
+    stt, tts,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -256,7 +257,7 @@ pub struct ExtismSttRequest<C> {
 
 impl<C> ExtismSttRequest<C> {
     pub fn into_stt_request(self) -> Result<stt::SttRequest, crate::error::LLMError> {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
         let audio = BASE64
             .decode(self.audio_base64)
@@ -301,7 +302,7 @@ pub enum ExtismVoiceConfig {
 impl ExtismVoiceConfig {
     /// Convert from the core [`tts::VoiceConfig`] to the extism wire format.
     pub fn from_voice_config(vc: &tts::VoiceConfig) -> Self {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
         match vc {
             tts::VoiceConfig::Preset { name } => Self::Preset { name: name.clone() },
@@ -320,7 +321,7 @@ impl ExtismVoiceConfig {
 
     /// Convert back to the core [`tts::VoiceConfig`], decoding base64 audio.
     pub fn into_voice_config(self) -> Result<tts::VoiceConfig, crate::error::LLMError> {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
         match self {
             Self::Preset { name } => Ok(tts::VoiceConfig::Preset { name }),
@@ -366,7 +367,7 @@ pub struct ExtismTtsResponse {
 
 impl ExtismTtsResponse {
     pub fn into_tts_response(self) -> Result<tts::TtsResponse, crate::error::LLMError> {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
         let audio = BASE64
             .decode(self.audio_base64)

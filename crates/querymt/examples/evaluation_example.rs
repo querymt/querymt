@@ -108,9 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
     // Define the evaluation prompt requesting a Rust microservice implementation
-    let messages = vec![ChatMessage::user()
-        .text(
-            "\
+    let messages = vec![
+        ChatMessage::user()
+            .text(
+                "\
             Create a Rust microservice using Actix Web.
             It should have at least two routes:
             1) A GET route returning a simple JSON status.
@@ -119,8 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             and show how to run it.\n\
             Provide code blocks, comments, and a brief explanation of how it works.\
         ",
-        )
-        .build()];
+            )
+            .build(),
+    ];
 
     // Run evaluation across all providers
     let results: Vec<EvalResult> = evaluator.evaluate_chat(&messages).await?;

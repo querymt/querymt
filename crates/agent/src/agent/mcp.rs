@@ -58,5 +58,5 @@ pub fn mcp_server_requires_network(server: &McpServer) -> bool {
 
 /// Returns the standard `Implementation` descriptor for the querymt-agent.
 pub fn agent_implementation() -> rmcp::model::Implementation {
-    rmcp::model::Implementation::new("querymt-agent", env!("CARGO_PKG_VERSION"))
+    rmcp::model::Implementation::new("querymt-agent", env!("QMT_BUILD_VERSION"))
 }

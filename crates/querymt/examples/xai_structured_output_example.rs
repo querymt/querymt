@@ -65,9 +65,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Prepare conversation history with example messages
-    let messages = vec![ChatMessage::user()
-        .text("Please generate a random student using the provided JSON schema.")
-        .build()];
+    let messages = vec![
+        ChatMessage::user()
+            .text("Please generate a random student using the provided JSON schema.")
+            .build(),
+    ];
 
     // Send chat request and handle the response
     match llm.chat(&messages).await {
