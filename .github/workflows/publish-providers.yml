@@ -141,15 +141,7 @@ jobs:
 
             if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
               pkg="qmt-$name"
-              version=$(cargo metadata --format-version 1 --no-deps | python3 -c '
-import json,sys
-pkg = sys.argv[1]
-data = json.load(sys.stdin)
-for p in data.get("packages", []):
-    if p.get("name") == pkg:
-        print(p.get("version", ""))
-        break
-' "$pkg")
+              version=$(cargo pkgid -p "$pkg" | sed -E 's/.*@([^ ]+)$/\1/')
               if [[ -z "$version" ]] || [[ "$version" == *" "* ]] || [[ "$version" == *"="* ]] || [[ "$version" == *"workspace"* ]]; then
                 echo "Invalid resolved version for $pkg: '$version'" >&2
                 exit 1
@@ -211,16 +203,7 @@ for p in data.get("packages", []):
         run: |
           set -euo pipefail
           pkg="qmt-${{ matrix.crate }}"
-
-          v=$(cargo metadata --format-version 1 --no-deps | python3 -c '
-import json,sys
-pkg = sys.argv[1]
-data = json.load(sys.stdin)
-for p in data.get("packages", []):
-    if p.get("name") == pkg:
-        print(p.get("version", ""))
-        break
-' "$pkg")
+          v=$(cargo pkgid -p "$pkg" | sed -E 's/.*@([^ ]+)$/\1/')
 
           if [[ -z "$v" ]] || [[ "$v" == *" "* ]] || [[ "$v" == *"="* ]] || [[ "$v" == *"workspace"* ]]; then
             echo "Invalid resolved version for $pkg: '$v'" >&2
