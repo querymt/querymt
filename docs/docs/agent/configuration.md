@@ -54,7 +54,7 @@ let agent = from_config(ConfigSource::Toml(config.to_string())).await?;
 
 ### Embedded Configuration
 
-The `coder_agent` example uses embedded configuration:
+The `qmtcode` example uses embedded configuration:
 
 ```rust
 const EMBEDDED_CONFIG: &str = include_str!("confs/single_coder.toml");

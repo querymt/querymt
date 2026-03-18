@@ -398,7 +398,7 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
 ///
 /// This is called by `from_config` immediately after the agent/quorum is built,
 /// once an `AgentConfig` is available. It replicates the registration that
-/// `coder_agent --mesh` does manually, making mesh-enabled configs self-contained.
+/// `qmtcode --mesh` does manually, making mesh-enabled configs self-contained.
 #[cfg(feature = "remote")]
 async fn spawn_and_register_mesh_actors(
     handle: &crate::agent::LocalAgentHandle,

@@ -1618,7 +1618,7 @@ mod tests {
     #[test]
     fn find_node_manager_fast_path_dht_name_matches_registration_name() {
         // The DHT name used in find_node_manager's fast path must be exactly
-        // the same string that coder_agent/remote_setup registers the actor
+        // the same string that qmtcode/remote_setup registers the actor
         // under. Any mismatch here would cause the fast path to always miss.
         let peer_id = "12D3KooWCMGRXFFXJynyAG9dsgq9dukbVXRv5RofzbTXVEQaUsZv";
         let fast_path_name = crate::agent::remote::dht_name::node_manager_for_peer(&peer_id);

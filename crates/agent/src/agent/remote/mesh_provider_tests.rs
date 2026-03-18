@@ -130,14 +130,14 @@ mod mesh_provider_tests {
 
     // ── B.6 — Bug #2 (FIXED) ─────────────────────────────────────────────────
 
-    /// **Bug #2 — FIXED.** The root cause was `coder_agent.rs` registering
+    /// **Bug #2 — FIXED.** The root cause was `qmtcode.rs` registering
     /// `ProviderHostActor` under `"provider_host::{hostname}"` instead of
     /// `dht_name::provider_host(peer_id)` (`"provider_host::peer::{peer_id}"`).
     ///
     /// The fix was two-fold:
     /// 1. Introduced `agent::remote::dht_name` module to centralise all DHT
     ///    naming conventions, eliminating ad-hoc `format!` strings.
-    /// 2. Changed `coder_agent.rs` (and all other call sites) to use
+    /// 2. Changed `qmtcode.rs` (and all other call sites) to use
     ///    `dht_name::provider_host(mesh.peer_id())`.
     ///
     /// `find_provider_on_mesh` itself was correct — it returns `node_info.node_id`

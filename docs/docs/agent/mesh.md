@@ -33,20 +33,20 @@ flowchart LR
 
 ```bash
 # Start mesh node (default: /ip4/0.0.0.0/tcp/9000)
-cargo run --example coder_agent --features remote -- --mesh
+cargo run --example qmtcode --features remote -- --mesh
 
 # Start on custom port
-cargo run --example coder_agent --features remote -- --mesh=/ip4/0.0.0.0/tcp/9001
+cargo run --example qmtcode --features remote -- --mesh=/ip4/0.0.0.0/tcp/9001
 
 # Start with dashboard and mesh
-cargo run --example coder_agent --features "dashboard remote" -- --dashboard --mesh
+cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
 ```
 
 ### Connecting to a Mesh
 
 ```bash
 # Connect to specific peer
-cargo run --example coder_agent --features remote -- --mesh=/ip4/192.168.1.100/tcp/9000
+cargo run --example qmtcode --features remote -- --mesh=/ip4/192.168.1.100/tcp/9000
 ```
 
 ## Configuration

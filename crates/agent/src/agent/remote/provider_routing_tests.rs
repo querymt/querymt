@@ -774,7 +774,7 @@ mod set_mesh_after_build_tests {
 
     // ── K.1 — set_mesh after Arc is shared makes mesh visible to build_provider ─
 
-    /// Simulates the exact `coder_agent` startup order:
+    /// Simulates the exact `qmtcode` startup order:
     ///   1. Build `SessionProvider` (mesh = None).
     ///   2. Wrap in `Arc`.
     ///   3. Clone the `Arc` into a "RemoteNodeManager-like" holder.
@@ -914,7 +914,7 @@ mod set_mesh_after_build_tests {
 
     /// Verifies that `AgentHandle::set_mesh` propagates the mesh handle into
     /// `config.provider`, which is the path exercised in production by
-    /// `coder_agent.rs` after `bootstrap_mesh` succeeds.
+    /// `qmtcode.rs` after `bootstrap_mesh` succeeds.
     #[tokio::test]
     async fn test_agent_handle_set_mesh_propagates_to_session_provider() {
         use crate::agent::agent_config_builder::AgentConfigBuilder;

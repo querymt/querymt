@@ -60,7 +60,7 @@ For a full examples-oriented setup (GHCR providers, local wasm provider builds, 
 
 The `querymt-agent` crate (in `crates/agent`) is the high-level agent runtime for QueryMaTe.
 
-If you're new, the easiest way to try it is the `coder_agent` example at `crates/agent/examples/coder_agent.rs`.
+If you're new, the easiest way to try it is the `qmtcode` example at `crates/agent/examples/qmtcode.rs`.
 It loads an agent from a TOML config file and can run in two modes:
 
 - `--stdio`: runs as an ACP stdio server (great for integrations and tooling)
@@ -74,13 +74,13 @@ From the workspace root:
 cd crates/agent
 
 # ACP stdio mode
-cargo run --example coder_agent --features dashboard -- --stdio
+cargo run --example qmtcode --features dashboard -- --stdio
 
 # Dashboard mode (default http://127.0.0.1:3000)
-cargo run --example coder_agent --features dashboard -- --dashboard
+cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Dashboard mode on a custom address
-cargo run --example coder_agent --features dashboard -- --dashboard=0.0.0.0:8080
+cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 ```
 
 By default it reads config from `examples/confs/coder_agent.toml`.
@@ -98,10 +98,10 @@ This regenerates TypeScript (and Swift when the sibling iOS repo exists) typesha
 
 ### macOS Silicon releases
 
-macOS Silicon users who download the `coder_agent` release binary need to clear the quarantine flag before running it:
+macOS Silicon users who download the `qmtcode` release binary need to clear the quarantine flag before running it:
 
 ```bash
-xattr -dr com.apple.quarantine coder_agent
+xattr -dr com.apple.quarantine qmtcode
 ```
 
 ## Documentation

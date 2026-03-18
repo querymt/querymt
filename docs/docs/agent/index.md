@@ -137,10 +137,10 @@ QueryMT implements a 3-layer context management system:
 ```bash
 # Run the coder agent example with dashboard
 cd crates/agent
-cargo run --example coder_agent --features dashboard -- --dashboard
+cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Run as ACP stdio server
-cargo run --example coder_agent -- --acp
+cargo run --example qmtcode -- --acp
 ```
 
 ### Programmatic Usage

@@ -1,4 +1,4 @@
-//! Coder Agent Example
+//! QMT Code Agent Example
 //!
 //! Multi-mode agent that can run as ACP stdio server, web dashboard, or mesh node.
 //!
@@ -6,22 +6,22 @@
 //!
 //! ```bash
 //! # ACP stdio mode
-//! cargo run --example coder_agent -- --acp
+//! cargo run --example qmtcode -- --acp
 //!
 //! # Web dashboard mode
-//! cargo run --example coder_agent --features dashboard -- --dashboard
-//! cargo run --example coder_agent --features dashboard -- --dashboard=0.0.0.0:8080
+//! cargo run --example qmtcode --features dashboard -- --dashboard
+//! cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 //!
 //! # Mesh-only mode (runs until Ctrl+C)
-//! cargo run --example coder_agent --features remote -- --mesh
-//! cargo run --example coder_agent --features remote -- --mesh=/ip4/0.0.0.0/tcp/9000
+//! cargo run --example qmtcode --features remote -- --mesh
+//! cargo run --example qmtcode --features remote -- --mesh=/ip4/0.0.0.0/tcp/9000
 //!
 //! # Dashboard mode with kameo mesh enabled (cross-machine sessions)
-//! cargo run --example coder_agent --features "dashboard remote" -- --dashboard --mesh
-//! cargo run --example coder_agent --features "dashboard remote" -- --dashboard --mesh=/ip4/0.0.0.0/tcp/9000
+//! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
+//! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh=/ip4/0.0.0.0/tcp/9000
 //!
 //! # Running a built binary with embedded default config
-//! ./coder_agent --mesh
+//! ./qmtcode --mesh
 //! ```
 
 #[cfg(feature = "dashboard")]
@@ -42,10 +42,10 @@ const EMBEDDED_CONFIG: &str = include_str!("confs/single_coder.toml");
 struct EmbeddedPromptAssets;
 
 #[derive(Debug, Parser)]
-#[command(name = "coder_agent")]
+#[command(name = "qmtcode")]
 #[command(about = "Run QueryMT coder agent in ACP mode, dashboard mode, or as a mesh node")]
 #[command(
-    after_help = "Examples:\n  coder_agent --acp\n  coder_agent --dashboard\n  coder_agent --dashboard=0.0.0.0:8080\n  coder_agent --mesh\n  coder_agent --mesh=/ip4/0.0.0.0/tcp/9001\n  coder_agent --dashboard --mesh\n  coder_agent path/to/config.toml --acp"
+    after_help = "Examples:\n  qmtcode --acp\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --dashboard --mesh\n  qmtcode path/to/config.toml --acp"
 )]
 #[cfg_attr(
     feature = "dashboard",
@@ -195,7 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if is_acp {
         setup_stdio_logging();
     } else {
-        querymt_utils::telemetry::setup_telemetry("querymt-coder-agent", env!("CARGO_PKG_VERSION"));
+        querymt_utils::telemetry::setup_telemetry("qmtcode", env!("CARGO_PKG_VERSION"));
     }
 
     let runner = if let Some(config_path) = &cli.config_file {
