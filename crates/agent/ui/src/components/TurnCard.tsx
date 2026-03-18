@@ -2,11 +2,10 @@
  * Turn card component - groups user prompt, agent responses, and tool activity
  */
 
-import { useRef, useEffect, useState, memo } from 'react';
+import { useState, memo } from 'react';
 import { Turn, UiAgentInfo, EventRow, DelegationGroupInfo, LlmConfigDetails, TurnCompaction } from '../types';
 import { MessageContent } from './MessageContent';
 import { ActivitySection } from './ActivitySection';
-import { PinnedUserMessage } from './PinnedUserMessage';
 import { ModelConfigPopover } from './ModelConfigPopover';
 import { ElicitationCard } from './ElicitationCard';
 import { CompactionCard, CompactingIndicator } from './CompactionCard';
@@ -20,11 +19,9 @@ export interface TurnCardProps {
   agents: UiAgentInfo[];
   onToolClick: (event: EventRow) => void;
   onDelegateClick: (delegationId: string) => void;
-  isLastUserMessage?: boolean;
   showModelLabel?: boolean; // Show model label when session has multiple models
   llmConfigCache?: Record<number, LlmConfigDetails>; // Cached LLM configs
   requestLlmConfig?: (configId: number, callback: (config: LlmConfigDetails) => void) => void;
-  activeView?: 'chat' | 'delegations'; // Current view - only show pinned message in chat view
   /** Index of this turn in the filtered list — used for stable undo/fork callbacks */
   turnIndex: number;
   onUndoTurn?: (index: number) => void; // Stable callback: undo turn at index
@@ -134,11 +131,9 @@ export const TurnCard = memo(function TurnCard({
   agents,
   onToolClick,
   onDelegateClick,
-  isLastUserMessage = false,
   showModelLabel = false,
   llmConfigCache = {},
   requestLlmConfig,
-  activeView = 'chat',
   turnIndex,
   onUndoTurn,
   onForkTurn,
@@ -173,33 +168,12 @@ export const TurnCard = memo(function TurnCard({
   // This avoids an empty bordered box between prompt_received and turn_started/llm_request_start.
   const hasAgentContent = interleaved.length > 0 || turn.isActive || hasUndoOverlay || isCompacting;
 
-  // Track pinned state for last user message
-  const userMessageRef = useRef<HTMLDivElement>(null);
-  const [isPinned, setIsPinned] = useState(false);
-  
+
   // Model config popover state
   const [showConfigPopover, setShowConfigPopover] = useState(false);
 
   // Copy to clipboard hook
   const { copiedValue: copiedSection, copy: copyToClipboard } = useCopyToClipboard();
-
-  useEffect(() => {
-    if (!isLastUserMessage || !userMessageRef.current || !turn.userMessage) return;
-    
-    const observer = new IntersectionObserver(
-      ([entry]) => setIsPinned(!entry.isIntersecting),
-      { threshold: 0, rootMargin: '-80px 0px 0px 0px' } // Account for header
-    );
-    
-    observer.observe(userMessageRef.current);
-    return () => observer.disconnect();
-  }, [isLastUserMessage, turn.userMessage]);
-
-  const handleJumpBack = () => {
-    if (userMessageRef.current) {
-      userMessageRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }
-  };
 
   return (
     <div
@@ -208,18 +182,9 @@ export const TurnCard = memo(function TurnCard({
       }`}
       data-stacked-undone={isStackedUndone ? 'true' : 'false'}
     >
-      {/* Pinned user message (appears when scrolled past) - only in chat view */}
-      {isPinned && turn.userMessage && activeView === 'chat' && (
-        <PinnedUserMessage
-          message={turn.userMessage.content}
-          timestamp={turn.userMessage.timestamp}
-          onJumpBack={handleJumpBack}
-        />
-      )}
-
       {/* User message (if present) */}
       {turn.userMessage && (
-        <div ref={isLastUserMessage ? userMessageRef : null} className="user-message mb-3">
+        <div className="user-message mb-3" data-turn-index={turnIndex}>
           <div className="flex items-center gap-2 mb-1">
             <span className="text-xs font-semibold text-accent-secondary uppercase tracking-wide">
               User

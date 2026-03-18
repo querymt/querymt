@@ -616,19 +616,24 @@
 
 /* ===== Pinned User Message - Top Bar ===== */
 
-/* Container handles fixed positioning and width reservation */
 .pinned-user-bar-container {
-  position: fixed;
-  top: 124px; /* Below header (80px) + tab bar (44px) */
+  position: absolute;
+  top: 0;
   left: 0;
-  right: var(--todo-rail-width, 0px);
-  z-index: 40;
+  right: 0;
+  z-index: 10;
   padding: 0 8px;
   display: flex;
   justify-content: center;
 
-  /* Slide-in animation */
-  animation: slide-in-top 0.3s ease-out;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease-out;
+}
+
+.pinned-user-bar-container.pinned-visible {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 /* Inner bar handles background and content */
@@ -681,17 +686,6 @@
 }
 
 /* ===== Animations ===== */
-
-@keyframes slide-in-top {
-  from {
-    transform: translateY(-100%);
-    opacity: 0;
-  }
-  to {
-    transform: translateY(0);
-    opacity: 1;
-  }
-}
 
 @keyframes scale-in {
   from {

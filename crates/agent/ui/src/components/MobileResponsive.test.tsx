@@ -6,7 +6,7 @@
  *
  * These are structural tests — they assert CSS class presence, not pixel-level layout.
  */
-import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('../context/SessionTimerContext', () => ({
   useSessionTimerContext: () => ({
@@ -46,9 +46,6 @@ vi.mock('./ActivitySection', () => ({
     <div data-testid="activity-section">{toolCalls.length} tool calls</div>
   ),
 }));
-vi.mock('./PinnedUserMessage', () => ({
-  PinnedUserMessage: () => <div data-testid="pinned-message" />,
-}));
 vi.mock('./ModelConfigPopover', () => ({
   ModelConfigPopover: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
@@ -58,15 +55,6 @@ vi.mock('./ElicitationCard', () => ({
 vi.mock('../utils/clipboard', () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
 }));
-
-beforeAll(() => {
-  const mockIntersectionObserver = vi.fn().mockImplementation(() => ({
-    observe: vi.fn(),
-    unobserve: vi.fn(),
-    disconnect: vi.fn(),
-  }));
-  vi.stubGlobal('IntersectionObserver', mockIntersectionObserver);
-});
 
 // ---- Helpers ----
 

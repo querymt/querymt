@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TurnCard } from './TurnCard';
@@ -15,10 +15,6 @@ vi.mock('./ActivitySection', () => ({
   ),
 }));
 
-vi.mock('./PinnedUserMessage', () => ({
-  PinnedUserMessage: () => <div data-testid="pinned-message" />,
-}));
-
 vi.mock('./ModelConfigPopover', () => ({
   ModelConfigPopover: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
@@ -31,16 +27,6 @@ vi.mock('./ElicitationCard', () => ({
 vi.mock('../utils/clipboard', () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
 }));
-
-// Mock IntersectionObserver for TurnCard
-beforeAll(() => {
-  const mockIntersectionObserver = vi.fn().mockImplementation(() => ({
-    observe: vi.fn(),
-    unobserve: vi.fn(),
-    disconnect: vi.fn(),
-  }));
-  vi.stubGlobal('IntersectionObserver', mockIntersectionObserver);
-});
 
 // Helper: Create Turn objects
 function makeTurn(overrides: Partial<Turn> = {}): Turn {

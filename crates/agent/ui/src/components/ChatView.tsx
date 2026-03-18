@@ -28,6 +28,7 @@ import { TodoRail } from './TodoRail';
 import { SessionPicker } from './SessionPicker';
 import { ThinkingIndicator } from './ThinkingIndicator';
 import { SystemLog } from './SystemLog';
+import { PinnedUserMessage } from './PinnedUserMessage';
 import { GlitchText } from './GlitchText';
 import { buildTurns, buildDelegationTurn, buildEventRowsWithDelegations, isRateLimitEvent, processRateLimitEvent } from '../logic/chatViewLogic';
 import { RateLimitIndicator } from './RateLimitIndicator';
@@ -355,15 +356,76 @@ export function ChatView() {
   const hasTurns = filteredTurns.length > 0;
   const hasDelegations = delegations.length > 0;
 
-  // Calculate last user message turn index for pinned message
-  const lastUserMessageTurnIndex = useMemo(() => {
-    for (let i = filteredTurns.length - 1; i >= 0; i--) {
-      if (filteredTurns[i].userMessage) {
-        return i;
+  // --- Pinned user-message bar (DOM-based scroll detection) ---
+  const scrollerNodeRef = useRef<HTMLElement | null>(null);
+  const pinnedRafRef = useRef<number | null>(null);
+  const [pinnedMessage, setPinnedMessage] = useState<{ content: string; timestamp: number; turnIndex: number } | null>(null);
+
+  const scrollerRefCallback = useCallback((ref: HTMLElement | Window | null) => {
+    scrollerNodeRef.current = ref instanceof HTMLElement ? ref : null;
+  }, []);
+
+  const updatePinnedMessage = useCallback(() => {
+    const scroller = scrollerNodeRef.current;
+    if (!scroller || filteredTurns.length === 0) {
+      setPinnedMessage(null);
+      return;
+    }
+
+    if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 10) {
+      setPinnedMessage(null);
+      return;
+    }
+
+    const scrollerRect = scroller.getBoundingClientRect();
+    const nodes = scroller.querySelectorAll<HTMLElement>('.user-message[data-turn-index]');
+
+    let candidate: { content: string; timestamp: number; turnIndex: number } | null = null;
+    for (const node of nodes) {
+      if (node.getBoundingClientRect().bottom <= scrollerRect.top) {
+        const idx = Number(node.dataset.turnIndex);
+        const msg = filteredTurns[idx]?.userMessage;
+        if (msg && (!candidate || idx > candidate.turnIndex)) {
+          candidate = { content: msg.content, timestamp: msg.timestamp, turnIndex: idx };
+        }
       }
     }
-    return -1;
+    setPinnedMessage(candidate);
   }, [filteredTurns]);
+
+  useEffect(() => {
+    const scroller = scrollerNodeRef.current;
+    if (!scroller) return;
+
+    const onScroll = () => {
+      if (pinnedRafRef.current !== null) return;
+      pinnedRafRef.current = requestAnimationFrame(() => {
+        pinnedRafRef.current = null;
+        updatePinnedMessage();
+      });
+    };
+
+    scroller.addEventListener('scroll', onScroll, { passive: true });
+    updatePinnedMessage();
+
+    return () => {
+      scroller.removeEventListener('scroll', onScroll);
+      if (pinnedRafRef.current !== null) {
+        cancelAnimationFrame(pinnedRafRef.current);
+        pinnedRafRef.current = null;
+      }
+    };
+  }, [updatePinnedMessage]);
+
+  useEffect(() => {
+    updatePinnedMessage();
+  }, [updatePinnedMessage]);
+
+  const handleJumpBackToPinnedMessage = useCallback(() => {
+    if (pinnedMessage) {
+      virtuosoRef.current?.scrollToIndex({ index: pinnedMessage.turnIndex, behavior: 'smooth', align: 'start' });
+    }
+  }, [pinnedMessage]);
 
   // Calculate current undo candidate. If we already undid a turn, move left from that message frontier.
   const undoTurnIndex = useMemo(() => {
@@ -707,11 +769,9 @@ export function ChatView() {
         agents={agents}
         onToolClick={handleToolClick}
         onDelegateClick={handleDelegateClick}
-        isLastUserMessage={index === lastUserMessageTurnIndex}
         showModelLabel={sessionHasMultipleModels}
         llmConfigCache={llmConfigCache}
         requestLlmConfig={requestLlmConfig}
-        activeView={activeTimelineView}
         canUndo={index === undoTurnIndex}
         isUndone={undoProps?.isUndone ?? false}
         isUndoPending={undoProps?.isUndoPending ?? false}
@@ -730,11 +790,9 @@ export function ChatView() {
     agents,
     handleToolClick,
     handleDelegateClick,
-    lastUserMessageTurnIndex,
     sessionHasMultipleModels,
     llmConfigCache,
     requestLlmConfig,
-    activeTimelineView,
     undoTurnIndex,
     handleUndoTurn,
     handleForkTurn,
@@ -875,7 +933,16 @@ export function ChatView() {
               data={filteredTurns}
               itemContent={renderTurnItem}
               atBottomStateChange={handleAtBottomStateChange}
+              scrollerRef={scrollerRefCallback}
               className="h-full"
+            />
+          )}
+          {activeTimelineView === 'chat' && (
+            <PinnedUserMessage
+              message={pinnedMessage?.content ?? ''}
+              timestamp={pinnedMessage?.timestamp ?? 0}
+              onJumpBack={handleJumpBackToPinnedMessage}
+              visible={!!pinnedMessage}
             />
           )}
         </div>

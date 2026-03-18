@@ -9,11 +9,13 @@ interface PinnedUserMessageProps {
   message: string;
   timestamp: number;
   onJumpBack: () => void;
+  visible: boolean;
 }
 
 export function PinnedUserMessage({ 
   message, 
-  onJumpBack 
+  onJumpBack,
+  visible,
 }: PinnedUserMessageProps) {
   const cleanMessage = message.trim();
 
@@ -22,7 +24,7 @@ export function PinnedUserMessage({
     : cleanMessage;
 
   return (
-    <div className="pinned-user-bar-container">
+    <div className={`pinned-user-bar-container ${visible ? 'pinned-visible' : ''}`}>
       <div className="pinned-user-bar">
         <MessageSquare className="w-4 h-4 text-accent-secondary flex-shrink-0" />
         <span className="pinned-user-bar-text">
