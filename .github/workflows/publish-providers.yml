@@ -140,7 +140,20 @@ jobs:
             fi
 
             if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-              version=$(grep '^version' "$toml" | head -n1 | cut -d'"' -f2)
+              pkg="qmt-$name"
+              version=$(cargo metadata --format-version 1 --no-deps | python3 -c '
+import json,sys
+pkg = sys.argv[1]
+data = json.load(sys.stdin)
+for p in data.get("packages", []):
+    if p.get("name") == pkg:
+        print(p.get("version", ""))
+        break
+' "$pkg")
+              if [[ -z "$version" ]] || [[ "$version" == *" "* ]] || [[ "$version" == *"="* ]] || [[ "$version" == *"workspace"* ]]; then
+                echo "Invalid resolved version for $pkg: '$version'" >&2
+                exit 1
+              fi
               image_tag="$version"
             else
               image_tag="latest"
@@ -196,9 +209,26 @@ jobs:
         if: matrix.crate != 'noop'
         id: get-version
         run: |
-          v=$(grep '^version' crates/providers/${{ matrix.crate }}/Cargo.toml \
-                | head -n1 | cut -d'"' -f2)
-          echo "VERSION=$v" >> $GITHUB_ENV
+          set -euo pipefail
+          pkg="qmt-${{ matrix.crate }}"
+
+          v=$(cargo metadata --format-version 1 --no-deps | python3 -c '
+import json,sys
+pkg = sys.argv[1]
+data = json.load(sys.stdin)
+for p in data.get("packages", []):
+    if p.get("name") == pkg:
+        print(p.get("version", ""))
+        break
+' "$pkg")
+
+          if [[ -z "$v" ]] || [[ "$v" == *" "* ]] || [[ "$v" == *"="* ]] || [[ "$v" == *"workspace"* ]]; then
+            echo "Invalid resolved version for $pkg: '$v'" >&2
+            exit 1
+          fi
+
+          echo "Resolved $pkg version: $v"
+          echo "VERSION=$v" >> "$GITHUB_ENV"
 
       - name: Set up Rust toolchain
         if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'

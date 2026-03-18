@@ -46,9 +46,26 @@ runs:
       id: get-version
       shell: bash
       run: |
-        v=$(grep '^version' crates/providers/${{ inputs.crate }}/Cargo.toml \
-              | head -n1 | cut -d'"' -f2)
-        echo "VERSION=$v" >> $GITHUB_ENV
+        set -euo pipefail
+        pkg="qmt-${{ inputs.crate }}"
+
+        v=$(cargo metadata --format-version 1 --no-deps | python3 -c '
+import json,sys
+pkg = sys.argv[1]
+data = json.load(sys.stdin)
+for p in data.get("packages", []):
+    if p.get("name") == pkg:
+        print(p.get("version", ""))
+        break
+' "$pkg")
+
+        if [[ -z "$v" ]] || [[ "$v" == *" "* ]] || [[ "$v" == *"="* ]] || [[ "$v" == *"workspace"* ]]; then
+          echo "Invalid resolved version for $pkg: '$v'" >&2
+          exit 1
+        fi
+
+        echo "Resolved $pkg version: $v"
+        echo "VERSION=$v" >> "$GITHUB_ENV"
 
     - name: Export extra environment variables
       shell: bash
