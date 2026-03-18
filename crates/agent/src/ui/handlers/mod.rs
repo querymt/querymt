@@ -325,17 +325,15 @@ pub async fn handle_ui_message(
             max_cost_usd,
             max_runs,
         } => {
-            handle_create_schedule(
-                state,
-                &session_id,
-                &prompt,
-                &trigger,
+            let params = schedules::CreateScheduleParams {
+                session_id: &session_id,
+                prompt: &prompt,
+                trigger_json: &trigger,
                 max_steps,
                 max_cost_usd,
                 max_runs,
-                tx,
-            )
-            .await;
+            };
+            handle_create_schedule(state, &params, tx).await;
         }
         UiClientMessage::ListSchedules { session_id } => {
             handle_list_schedules(state, session_id.as_deref(), tx).await;
@@ -350,7 +348,7 @@ pub async fn handle_ui_message(
             handle_trigger_schedule(state, &schedule_public_id, tx).await;
         }
         UiClientMessage::DeleteSchedule { schedule_public_id } => {
-            schedules::handle_delete_schedule(state, &schedule_public_id, tx).await;
+            handle_delete_schedule(state, &schedule_public_id, tx).await;
         }
     }
 }
