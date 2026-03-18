@@ -1276,6 +1276,7 @@ async fn execute_prompt_detached(
 
     // Create execution context — attach the cancellation token so it propagates
     // into individual tool calls for cooperative cancellation.
+    // The knowledge store is propagated so knowledge tools can access it.
     let mut exec_ctx = ExecutionContext::new(
         session_id.clone(),
         runtime.clone(),
@@ -1284,7 +1285,9 @@ async fn execute_prompt_detached(
         tool_config,
     )
     .with_cancellation_token(cancel_token.clone())
-    .with_execution_origin(execution_origin);
+    .with_execution_origin(execution_origin)
+    .with_knowledge_store(config.knowledge_store())
+    .with_event_sink(config.event_sink.clone());
 
     // 4. Store User Messages
     // Keep separate projections for user-visible events vs LLM replay context.

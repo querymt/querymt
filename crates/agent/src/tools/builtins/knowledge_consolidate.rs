@@ -130,10 +130,18 @@ impl ToolTrait for KnowledgeConsolidateTool {
         };
 
         // Store consolidation
+        let source_count = source_ids.len() as u32;
         let result = knowledge_store
             .consolidate(&scope, consolidation)
             .await
             .map_err(|e| ToolError::ProviderError(format!("Consolidation failed: {}", e)))?;
+
+        // Emit KnowledgeConsolidated event so the scheduler can react
+        context.emit_event(crate::events::AgentEventKind::KnowledgeConsolidated {
+            scope: scope.clone(),
+            consolidation_public_id: result.public_id.clone(),
+            source_count,
+        });
 
         Ok(format!(
             "Created consolidation {} from {} entries (scope: {})",
@@ -253,5 +261,72 @@ mod tests {
         let result = tool.call(args, &context).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("at least one"));
+    }
+
+    #[tokio::test]
+    async fn test_knowledge_consolidate_emits_event() {
+        use crate::event_fanout::EventFanout;
+        use crate::event_sink::EventSink;
+        use crate::session::backend::StorageBackend;
+        use crate::session::sqlite_storage::SqliteStorage;
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let fanout = Arc::new(EventFanout::new());
+        let event_sink = Arc::new(EventSink::new(storage.event_journal(), fanout.clone()));
+
+        let mut rx = fanout.subscribe();
+
+        let knowledge_store = Arc::new(SqliteKnowledgeStore::new(sqlite_conn_with_schema()));
+
+        // Ingest entries first
+        let entry1 = knowledge_store
+            .ingest(
+                "test_session",
+                IngestRequest {
+                    source: "test".to_string(),
+                    raw_text: "Fact A".to_string(),
+                    summary: "Fact A".to_string(),
+                    entities: vec![],
+                    topics: vec![],
+                    connections: vec![],
+                    importance: 0.5,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
+        context.with_knowledge_store(knowledge_store);
+        context.with_event_sink(event_sink);
+
+        let tool = KnowledgeConsolidateTool::new();
+        let args = json!({
+            "source_ids": [entry1.public_id],
+            "summary": "Consolidated fact",
+            "insight": "Key insight"
+        });
+
+        let result = tool.call(args, &context).await;
+        assert!(result.is_ok(), "Failed: {:?}", result);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut found = false;
+        while let Ok(envelope) = rx.try_recv() {
+            if let crate::events::EventEnvelope::Durable(ev) = envelope
+                && matches!(
+                    ev.kind,
+                    crate::events::AgentEventKind::KnowledgeConsolidated { .. }
+                )
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "Expected KnowledgeConsolidated event to be emitted");
     }
 }

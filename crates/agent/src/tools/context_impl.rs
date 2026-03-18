@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::elicitation::{ElicitationAction, ElicitationResponse};
+use crate::event_sink::EventSink;
 use crate::knowledge::{KnowledgeStore, ScopePolicy};
 use crate::tools::context::{ToolContext, ToolError};
 
@@ -31,6 +32,7 @@ pub struct AgentToolContext {
     workspace_query_bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
     knowledge_store: Option<Arc<dyn KnowledgeStore>>,
     scope_policy: Arc<dyn ScopePolicy>,
+    event_sink: Option<Arc<EventSink>>,
 }
 
 impl AgentToolContext {
@@ -49,6 +51,7 @@ impl AgentToolContext {
             workspace_query_bridge: None,
             knowledge_store: None,
             scope_policy: Arc::new(crate::knowledge::PermissiveScopePolicy),
+            event_sink: None,
         }
     }
 
@@ -78,6 +81,11 @@ impl AgentToolContext {
     /// Set the scope policy for knowledge tools.
     pub fn with_scope_policy(&mut self, policy: Arc<dyn ScopePolicy>) {
         self.scope_policy = policy;
+    }
+
+    /// Attach an event sink so tools can emit agent events.
+    pub fn with_event_sink(&mut self, sink: Arc<EventSink>) {
+        self.event_sink = Some(sink);
     }
 
     /// Create a basic context for testing or simple operations
@@ -110,6 +118,29 @@ impl ToolContext for AgentToolContext {
 
     fn scope_policy(&self) -> Arc<dyn ScopePolicy> {
         self.scope_policy.clone()
+    }
+
+    fn emit_event(&self, kind: crate::events::AgentEventKind) {
+        if let Some(ref sink) = self.event_sink {
+            use crate::events::{Durability, classify_durability};
+
+            let session_id = self.session_id.clone();
+
+            if classify_durability(&kind) == Durability::Ephemeral {
+                sink.emit_ephemeral(&session_id, kind);
+            } else {
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = sink.emit_durable(&session_id, kind).await {
+                        log::warn!(
+                            "failed to emit durable event for session {}: {}",
+                            session_id,
+                            err
+                        );
+                    }
+                });
+            }
+        }
     }
 
     async fn record_progress(

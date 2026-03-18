@@ -53,6 +53,13 @@ pub trait ToolContext: Send + Sync {
         Arc::new(crate::knowledge::PermissiveScopePolicy)
     }
 
+    /// Emit an agent event (durable or ephemeral).
+    ///
+    /// Knowledge tools use this to emit `KnowledgeIngested` / `KnowledgeConsolidated`
+    /// events so the scheduler can react to them. The default implementation is a
+    /// no-op — only `AgentToolContext` (which carries an `EventSink`) actually emits.
+    fn emit_event(&self, _kind: crate::events::AgentEventKind) {}
+
     /// Get the current working directory, if set.
     fn cwd(&self) -> Option<&Path>;
 

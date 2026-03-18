@@ -503,6 +503,16 @@ export interface AuthProviderEntry {
 	preferred_method?: AuthMethod;
 }
 
+/** Knowledge consolidation DTO for the UI (read-only). */
+export interface ConsolidationInfo {
+	public_id: string;
+	scope: string;
+	summary: string;
+	insight: string;
+	source_count: number;
+	created_at: string;
+}
+
 /** Location of a function in source code */
 export interface FunctionLocation {
 	file_path: string;
@@ -585,6 +595,19 @@ export interface FunctionToolInfo {
 	description: string;
 	/** JSON Schema for the function parameters */
 	parameters: any;
+}
+
+/** Knowledge entry DTO for the UI (read-only). */
+export interface KnowledgeEntryInfo {
+	public_id: string;
+	scope: string;
+	source: string;
+	summary: string;
+	entities: string[];
+	topics: string[];
+	importance: number;
+	consolidated_at?: string;
+	created_at: string;
 }
 
 /**
@@ -1054,6 +1077,22 @@ export type UiClientMessage =
 	/** Delete a schedule */
 	| { type: "delete_schedule", data: {
 	schedule_public_id: string;
+}}
+	/** Query the knowledge store */
+	| { type: "query_knowledge", data: {
+	scope: string;
+	question: string;
+	limit?: number;
+}}
+	/** List knowledge entries for a scope */
+	| { type: "list_knowledge", data: {
+	scope: string;
+	/** Optional filter as JSON (topics, entities, since, consolidated, limit) */
+	filter?: any;
+}}
+	/** Get knowledge stats for a scope */
+	| { type: "knowledge_stats", data: {
+	scope: string;
 }};
 
 /**
@@ -1240,5 +1279,22 @@ export type UiServerMessage =
 	schedule_public_id: string;
 	action: string;
 	message?: string;
+}}
+	/** Knowledge query result (entries + consolidations) */
+	| { type: "knowledge_query_result", data: {
+	entries: KnowledgeEntryInfo[];
+	consolidations: ConsolidationInfo[];
+}}
+	/** Knowledge list result */
+	| { type: "knowledge_list_result", data: {
+	entries: KnowledgeEntryInfo[];
+}}
+	/** Knowledge stats result */
+	| { type: "knowledge_stats_result", data: {
+	total_entries: number;
+	unconsolidated_entries: number;
+	total_consolidations: number;
+	latest_entry_at?: string;
+	latest_consolidation_at?: string;
 }};
 
