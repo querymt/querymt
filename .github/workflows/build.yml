@@ -107,6 +107,20 @@ jobs:
             cargo_features: oauth,dashboard,remote
             rust_flags: "-C target-feature=+crt-static"
 
+          # ─── FreeBSD ──────────────────────────────────────────────────────────────
+          - os: freebsd
+            target: x86_64-unknown-freebsd
+            binary: qmt
+            bin_name: qmt
+            archive_ext: tar.gz
+          - os: freebsd
+            target: x86_64-unknown-freebsd
+            binary: coder_agent
+            bin_name: coder_agent
+            archive_ext: tar.gz
+            cargo_package: querymt-agent
+            cargo_features: oauth,dashboard,remote
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -129,7 +143,7 @@ jobs:
           key: ${{ matrix.target }}-${{ matrix.binary }}
 
       - name: Setup Bun
-        if: matrix.binary == 'coder_agent'
+        if: matrix.binary == 'coder_agent' && matrix.target != 'x86_64-unknown-freebsd'
         uses: oven-sh/setup-bun@v2
 
       # Build qmt binary (default package)
@@ -146,7 +160,7 @@ jobs:
           RUSTFLAGS: ${{ matrix.rust_flags || '' }}
         run: cargo build --release -p ${{ matrix.cargo_package }} --example coder_agent --features ${{ matrix.cargo_features }} --target ${{ matrix.target }}
 
-      - name: Prepare artifact for upload (Linux & macOS)
+      - name: Prepare artifact for upload (Linux, macOS & FreeBSD)
         if: ${{ runner.os != 'Windows' }}
         shell: bash
         run: |
