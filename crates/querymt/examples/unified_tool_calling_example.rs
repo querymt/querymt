@@ -23,12 +23,12 @@
 //! Scenarios: `simple`, `multi`, `choice`.
 
 use querymt::{
+    LLMProvider, ToolCall,
     builder::{FunctionBuilder, LLMBuilder, ParamBuilder},
     chat::{ChatMessage, Content, Tool, ToolChoice},
     plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
-    LLMProvider, ToolCall,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{env, error::Error};
 
 type ExampleResult<T> = Result<T, Box<dyn Error>>;
@@ -119,7 +119,7 @@ async fn create_llm(
             return Err(format!(
                 "Unsupported provider '{provider}'. Use one of: openai, anthropic, google, ollama"
             )
-            .into())
+            .into());
         }
     };
 
@@ -224,9 +224,11 @@ async fn run_until_final_answer(
 
 async fn run_simple_scenario(llm: &dyn LLMProvider, tools: &[Tool]) -> ExampleResult<()> {
     println!("SCENARIO: simple");
-    let mut conversation = vec![ChatMessage::user()
-        .text("What's the weather in Tokyo? Use tools if needed.")
-        .build()];
+    let mut conversation = vec![
+        ChatMessage::user()
+            .text("What's the weather in Tokyo? Use tools if needed.")
+            .build(),
+    ];
 
     let final_text = run_until_final_answer(llm, tools, &mut conversation).await?;
     println!("Assistant: {}", final_text);
@@ -302,9 +304,10 @@ async fn main() -> ExampleResult<()> {
         }
         "choice" => run_tool_choice_scenario(provider, &tools).await?,
         _ => {
-            return Err(
-                format!("Unknown scenario '{scenario}'. Use one of: simple, multi, choice").into(),
+            return Err(format!(
+                "Unknown scenario '{scenario}'. Use one of: simple, multi, choice"
             )
+            .into());
         }
     }
 

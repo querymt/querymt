@@ -31,7 +31,7 @@ use crate::embedding::EmbeddingProvider;
 use crate::error::LLMError;
 use crate::stt;
 use crate::tts;
-use crate::{builder::ValidatorFn, LLMProvider};
+use crate::{LLMProvider, builder::ValidatorFn};
 
 /// A wrapper around an LLM provider that validates responses before returning them.
 ///

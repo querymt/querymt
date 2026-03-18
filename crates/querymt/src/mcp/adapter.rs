@@ -49,10 +49,10 @@ impl TryFrom<RmcpTool> for FunctionTool {
         })?;
 
         let mut description = r.description.clone().unwrap_or_default().to_string();
-        if let Some(output_schema) = r.output_schema {
-            if let Ok(os_str) = serde_json::to_string(&output_schema) {
-                description = format!("{}. Returns {}", description, os_str);
-            }
+        if let Some(output_schema) = r.output_schema
+            && let Ok(os_str) = serde_json::to_string(&output_schema)
+        {
+            description = format!("{}. Returns {}", description, os_str);
         }
 
         Ok(FunctionTool {

@@ -13,14 +13,12 @@ const CACHE_DURATION: u64 = 86_400; // 24 hours in seconds
 const API_URL: &str = "https://models.dev/api.json";
 
 fn is_cache_fresh(file_path: &Path) -> bool {
-    if let Ok(metadata) = fs::metadata(file_path) {
-        if let Ok(modified) = metadata.modified() {
-            if let Ok(modified_time) = modified.duration_since(UNIX_EPOCH) {
-                if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
-                    return now.as_secs() - modified_time.as_secs() < CACHE_DURATION;
-                }
-            }
-        }
+    if let Ok(metadata) = fs::metadata(file_path)
+        && let Ok(modified) = metadata.modified()
+        && let Ok(modified_time) = modified.duration_since(UNIX_EPOCH)
+        && let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH)
+    {
+        return now.as_secs() - modified_time.as_secs() < CACHE_DURATION;
     }
     false
 }

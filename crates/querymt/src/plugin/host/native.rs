@@ -1,10 +1,10 @@
 use crate::{
     error::LLMError,
     plugin::{
-        adapters::HTTPFactoryAdapter,
-        host::{PluginLoader, PluginType, ProviderConfig, ProviderPlugin},
         FactoryCtor, HTTPFactoryCtor, HTTPLLMProviderFactory, LLMProviderFactory,
         PluginInitLoggingFn,
+        adapters::HTTPFactoryAdapter,
+        host::{PluginLoader, PluginType, ProviderConfig, ProviderPlugin},
     },
 };
 use async_trait::async_trait;
@@ -64,13 +64,15 @@ unsafe extern "C" fn host_log_callback(
     let target_str = if target.is_null() {
         "plugin"
     } else {
-        CStr::from_ptr(target).to_str().unwrap_or("plugin")
+        unsafe { CStr::from_ptr(target) }
+            .to_str()
+            .unwrap_or("plugin")
     };
 
     let message_str = if message.is_null() {
         ""
     } else {
-        CStr::from_ptr(message).to_str().unwrap_or("")
+        unsafe { CStr::from_ptr(message) }.to_str().unwrap_or("")
     };
 
     // Convert usize level to log::Level

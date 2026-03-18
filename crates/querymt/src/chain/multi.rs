@@ -2,10 +2,10 @@
 //! Each step can reference a distinct provider_id ("openai", "anthro", etc.).
 
 use crate::{
+    LLMProvider,
     chat::{ChatMessage, ChatRole, Content},
     completion::CompletionRequest,
     error::LLMError,
-    LLMProvider,
 };
 use std::collections::HashMap;
 #[cfg(feature = "tracing")]

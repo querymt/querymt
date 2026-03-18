@@ -1,7 +1,7 @@
 use crate::{
+    Tool,
     chat::{ChatMessage, ChatResponse},
     error::LLMError,
-    Tool,
 };
 use http::{Request, Response};
 

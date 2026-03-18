@@ -1,4 +1,4 @@
-use crate::{error::LLMError, LLMProvider};
+use crate::{LLMProvider, error::LLMError};
 use futures::future::BoxFuture;
 
 #[cfg(feature = "http-client")]

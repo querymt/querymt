@@ -1,5 +1,7 @@
 pub mod telemetry;
 
+pub const BUILD_VERSION: &str = env!("QMT_BUILD_VERSION");
+
 #[cfg(feature = "secret-store")]
 pub mod secret_store;
 

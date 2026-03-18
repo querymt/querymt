@@ -4,10 +4,10 @@ use docker_credential::{CredentialRetrievalError, DockerCredential};
 use futures::StreamExt;
 use hex;
 use oci_client::{
+    Client, Reference,
     errors::{OciDistributionError, OciErrorCode},
     manifest::{OciImageManifest, OciManifest, Platform},
     secrets::RegistryAuth,
-    Client, Reference,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,7 +15,7 @@ use sigstore::cosign::verification_constraint::cert_subject_email_verifier::Stri
 use sigstore::cosign::verification_constraint::{
     CertSubjectEmailVerifier, CertSubjectUrlVerifier, VerificationConstraintVec,
 };
-use sigstore::cosign::{verify_constraints, ClientBuilder, CosignCapabilities};
+use sigstore::cosign::{ClientBuilder, CosignCapabilities, verify_constraints};
 use sigstore::errors::SigstoreVerifyConstraintsError;
 use sigstore::registry::{Auth, OciReference};
 use sigstore::trust::sigstore::SigstoreTrustRoot;
@@ -534,14 +534,14 @@ fn determine_plugin_type(image_manifest: &OciImageManifest) -> Result<PluginType
         }
     }
 
-    if let Some(annotations) = &image_manifest.annotations {
-        if let Some(plugin_type_str) = annotations.get(PLUGIN_TYPE_ANNOTATION) {
-            return match plugin_type_str.as_str() {
-                "extism" => Ok(PluginType::Wasm),
-                "native" => Ok(PluginType::Native),
-                _ => todo!(),
-            };
-        }
+    if let Some(annotations) = &image_manifest.annotations
+        && let Some(plugin_type_str) = annotations.get(PLUGIN_TYPE_ANNOTATION)
+    {
+        return match plugin_type_str.as_str() {
+            "extism" => Ok(PluginType::Wasm),
+            "native" => Ok(PluginType::Native),
+            _ => todo!(),
+        };
     }
 
     for layer in &image_manifest.layers {
@@ -605,19 +605,17 @@ impl OciDownloader {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
 
-        if !force_update {
-            if let Some(meta) = &local_metadata {
-                let blob_path = get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
-                if blob_path.exists() {
-                    log::debug!("Found cached OCI plugin. Using local version.");
-                    progress(OciDownloadProgress {
-                        phase: OciDownloadPhase::Completed,
-                        bytes_downloaded: 0,
-                        bytes_total: None,
-                        percent: Some(100.0),
-                    });
-                    return load_from_cache(meta, &blob_path);
-                }
+        if !force_update && let Some(meta) = &local_metadata {
+            let blob_path = get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
+            if blob_path.exists() {
+                log::debug!("Found cached OCI plugin. Using local version.");
+                progress(OciDownloadProgress {
+                    phase: OciDownloadPhase::Completed,
+                    bytes_downloaded: 0,
+                    bytes_total: None,
+                    percent: Some(100.0),
+                });
+                return load_from_cache(meta, &blob_path);
             }
         }
 
@@ -755,7 +753,8 @@ impl OciDownloader {
                                 discovered_type = PluginType::Wasm;
                             } else {
                                 // --- Failure Case: Neither native nor Wasm was found ---
-                                let msg = format!("Image index contains no manifest for the host platform ({}/{}) and no wasi/wasm fallback was found.",
+                                let msg = format!(
+                                    "Image index contains no manifest for the host platform ({}/{}) and no wasi/wasm fallback was found.",
                                     OS, ARCH
                                 );
                                 progress(OciDownloadProgress {
@@ -1038,10 +1037,12 @@ mod tests {
         let result = load_from_cache(&meta, &blob_path);
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid plugin type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid plugin type")
+        );
     }
 
     #[test]

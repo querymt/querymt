@@ -12,7 +12,7 @@ use querymt::{
     chat::{ChatMessage, Content, Tool},
     plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
     let cfg_path =
@@ -68,19 +68,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let tools = vec![weather_tool()];
-    let mut messages = vec![ChatMessage::user()
-        .text("You are a weather assistant. What is the weather in Tokyo right now?")
-        .build()];
+    let mut messages = vec![
+        ChatMessage::user()
+            .text("You are a weather assistant. What is the weather in Tokyo right now?")
+            .build(),
+    ];
 
     let first_response = llm.chat_with_tools(&messages, Some(&tools)).await?;
     if let Some(tool_calls) = first_response.tool_calls() {
         println!("Model requested {} tool(s)", tool_calls.len());
 
         let mut assistant_message = ChatMessage::assistant();
-        if let Some(text) = first_response.text() {
-            if !text.is_empty() {
-                assistant_message = assistant_message.text(text);
-            }
+        if let Some(text) = first_response.text()
+            && !text.is_empty()
+        {
+            assistant_message = assistant_message.text(text);
         }
 
         for call in &tool_calls {

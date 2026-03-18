@@ -1,7 +1,7 @@
-use super::{http::HTTPLLMProviderFactory, Fut, LLMProviderFactory};
+use super::{Fut, LLMProviderFactory, http::HTTPLLMProviderFactory};
 use crate::{
-    adapters::LLMProviderFromHTTP, error::LLMError, outbound::call_outbound, HTTPLLMProvider,
-    LLMProvider,
+    HTTPLLMProvider, LLMProvider, adapters::LLMProviderFromHTTP, error::LLMError,
+    outbound::call_outbound,
 };
 use futures::future::FutureExt;
 use http::{Request, Response};

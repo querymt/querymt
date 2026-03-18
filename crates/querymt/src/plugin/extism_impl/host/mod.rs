@@ -1,25 +1,26 @@
 use crate::{
+    HTTPLLMProvider, LLMProvider,
     auth::ApiKeyResolver,
-    chat::{http::HTTPChatProvider, ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool},
+    chat::{ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool, http::HTTPChatProvider},
     completion::{
-        http::HTTPCompletionProvider, CompletionProvider, CompletionRequest, CompletionResponse,
+        CompletionProvider, CompletionRequest, CompletionResponse, http::HTTPCompletionProvider,
     },
-    embedding::{http::HTTPEmbeddingProvider, EmbeddingProvider},
+    embedding::{EmbeddingProvider, http::HTTPEmbeddingProvider},
     error::LLMError,
     plugin::{
+        Fut, HTTPLLMProviderFactory, LLMProviderFactory,
         extism_impl::{
             ExtismChatRequest, ExtismChatResponse, ExtismEmbedRequest, ExtismSttRequest,
             ExtismSttResponse, ExtismTtsRequest, ExtismTtsResponse, ExtismVoiceConfig,
         },
-        Fut, HTTPLLMProviderFactory, LLMProviderFactory,
     },
     providers::read_providers_from_cache,
-    stt, tts, HTTPLLMProvider, LLMProvider,
+    stt, tts,
 };
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use extism::{convert::Json, Manifest, Plugin, PluginBuilder, Wasm};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use extism::{Manifest, Plugin, PluginBuilder, Wasm, convert::Json};
 use futures::FutureExt;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -154,15 +155,15 @@ impl ExtismFactory {
         ));
 
         let mut allowed_hosts: Vec<String> = Vec::new();
-        if let Some(runtime_cfg) = config {
-            if let Some(hosts) = runtime_cfg.get("allowed_hosts") {
-                allowed_hosts.append(
-                    &mut hosts
-                        .clone()
-                        .try_into()
-                        .map_err(|e| LLMError::GenericError(format!("{:#}", e)))?,
-                );
-            }
+        if let Some(runtime_cfg) = config
+            && let Some(hosts) = runtime_cfg.get("allowed_hosts")
+        {
+            allowed_hosts.append(
+                &mut hosts
+                    .clone()
+                    .try_into()
+                    .map_err(|e| LLMError::GenericError(format!("{:#}", e)))?,
+            );
         }
 
         let name = call_plugin_str(init_plugin.clone(), "name", &Value::Null)
@@ -260,7 +261,7 @@ impl LLMProviderFactory for ExtismFactory {
                         "Invalid JSON config: {:#}",
                         e
                     )))
-                })
+                });
             }
         };
         let plugin = self.plugin.clone();
@@ -273,12 +274,12 @@ impl LLMProviderFactory for ExtismFactory {
                 // (e.g. a cancelled chat/stream call). Without this reset, the cancel_watch_rx is
                 // still `true`, causing qmt_http_request to return HTTP 499 immediately and the
                 // plugin to surface {"kind":"Cancelled"} on every subsequent list_models call.
-                if let Some(ud) = &user_data {
-                    if let Ok(state) = ud.get() {
-                        let mut state_guard = state.lock().unwrap();
-                        state_guard.cancel_state = functions::CancelState::NotCancelled;
-                        let _ = state_guard.cancel_watch_tx.send(false);
-                    }
+                if let Some(ud) = &user_data
+                    && let Ok(state) = ud.get()
+                {
+                    let mut state_guard = state.lock().unwrap();
+                    state_guard.cancel_state = functions::CancelState::NotCancelled;
+                    let _ = state_guard.cancel_watch_tx.send(false);
                 }
 
                 let out: Json<Vec<String>> = plug

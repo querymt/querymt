@@ -1,4 +1,4 @@
-use crate::{error::LLMError, HTTPLLMProvider};
+use crate::{HTTPLLMProvider, error::LLMError};
 use http::{Request, Response};
 
 /// Parse retry-after duration from HTTP headers.

@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::{error::LLMError, ToolCall, Usage};
+use crate::{ToolCall, Usage, error::LLMError};
 use futures::Stream;
 use std::pin::Pin;
 
@@ -720,15 +720,15 @@ impl From<&dyn ChatResponse> for ChatMessage {
     fn from(response: &dyn ChatResponse) -> Self {
         let mut content = Vec::new();
 
-        if let Some(t) = response.thinking() {
-            if !t.is_empty() {
-                content.push(Content::thinking(t));
-            }
+        if let Some(t) = response.thinking()
+            && !t.is_empty()
+        {
+            content.push(Content::thinking(t));
         }
-        if let Some(text) = response.text() {
-            if !text.is_empty() {
-                content.push(Content::text(text));
-            }
+        if let Some(text) = response.text()
+            && !text.is_empty()
+        {
+            content.push(Content::text(text));
         }
         if let Some(calls) = response.tool_calls() {
             for call in calls {

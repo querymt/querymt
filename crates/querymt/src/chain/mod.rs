@@ -1,6 +1,6 @@
 mod multi;
 
-use crate::{error::LLMError, LLMProvider};
+use crate::{LLMProvider, error::LLMError};
 use std::collections::HashMap;
 
 pub use multi::{

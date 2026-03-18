@@ -150,6 +150,7 @@ jobs:
       - name: Build qmt with Cargo
         if: matrix.binary == 'qmt'
         env:
+          QMT_VERSION: ${{ inputs.version_name }}
           RUSTFLAGS: ${{ matrix.rust_flags || '' }}
         run: cargo build --release --bin qmt --target ${{ matrix.target }}
 
@@ -157,6 +158,7 @@ jobs:
       - name: Build qmtcode with Cargo
         if: matrix.binary == 'qmtcode'
         env:
+          QMT_VERSION: ${{ inputs.version_name }}
           RUSTFLAGS: ${{ matrix.rust_flags || '' }}
         run: cargo build --release -p ${{ matrix.cargo_package }} --example qmtcode --features ${{ matrix.cargo_features }} --target ${{ matrix.target }}
 

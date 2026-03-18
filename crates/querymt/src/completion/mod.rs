@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 
 use crate::{
+    ToolCall, Usage,
     chat::{ChatResponse, FinishReason},
     error::LLMError,
-    ToolCall, Usage,
 };
 use serde::{Deserialize, Serialize};
 

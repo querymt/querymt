@@ -195,7 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if is_acp {
         setup_stdio_logging();
     } else {
-        querymt_utils::telemetry::setup_telemetry("qmtcode", env!("CARGO_PKG_VERSION"));
+        querymt_utils::telemetry::setup_telemetry("qmtcode", env!("QMT_BUILD_VERSION"));
     }
 
     let runner = if let Some(config_path) = &cli.config_file {

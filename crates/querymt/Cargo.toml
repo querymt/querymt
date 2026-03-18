@@ -1,9 +1,9 @@
 [package]
 name = "querymt"
-version = "0.2.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "A Rust library unifying multiple LLM backends."
-license = "MIT"
+license.workspace = true
 authors = [
     "Viktor Gal <viktor@query.mt>"
 ]

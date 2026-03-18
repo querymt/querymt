@@ -24,6 +24,7 @@ pub struct ToolConfig {
 #[clap(
     name = "qmt",
     about = "Interactive CLI interface for chatting with LLM providers",
+    version = env!("QMT_BUILD_VERSION"),
     allow_hyphen_values = true
 )]
 pub struct CliArgs {
