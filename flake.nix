@@ -94,7 +94,7 @@
               "-p"
               "querymt-agent"
               "--example"
-              "coder_agent"
+              "qmtcode"
               "--features"
               "dashboard,oauth,dbus-secret-service"
             ];
@@ -119,7 +119,7 @@
             installPhase = ''
               runHook preInstall
               mkdir -p $out/bin
-              install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/examples/coder_agent $out/bin/querymt-agent
+              install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/examples/qmtcode $out/bin/qmtcode
               runHook postInstall
             '';
           };
@@ -167,7 +167,7 @@
         apps = {
           querymt-agent = {
             type = "app";
-            program = "${self.packages.${system}.querymt-agent}/bin/querymt-agent";
+            program = "${self.packages.${system}.querymt-agent}/bin/qmtcode";
           };
           qmt = {
             type = "app";

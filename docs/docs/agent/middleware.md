@@ -494,7 +494,7 @@ Errors can:
 
 See `examples/` for middleware usage:
 
-- `coder_agent.rs` - Uses agent_mode, limits, context middleware
+- `qmtcode.rs` - Uses agent_mode, limits, context middleware
 - Custom middleware examples in tests
 
 ## Related Documentation

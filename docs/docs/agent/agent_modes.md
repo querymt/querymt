@@ -411,7 +411,7 @@ When switching modes, communicate with the user:
 
 ## Examples
 
-See `examples/confs/coder_agent.toml` for a complete configuration with mode-aware middleware.
+See `examples/confs/single_coder.toml` for a complete configuration with mode-aware middleware.
 
 ## Related Documentation
 

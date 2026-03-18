@@ -38,15 +38,15 @@ jobs:
             archive_ext: tar.gz
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            binary: coder_agent
-            bin_name: coder_agent
+            binary: qmtcode
+            bin_name: qmtcode
             archive_ext: tar.gz
             cargo_package: querymt-agent
             cargo_features: oauth,dashboard,remote
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            binary: coder_agent
-            bin_name: coder_agent
+            binary: qmtcode
+            bin_name: qmtcode
             archive_ext: tar.gz
             cargo_package: querymt-agent
             cargo_features: oauth,dashboard,remote
@@ -64,15 +64,15 @@ jobs:
             archive_ext: tar.gz
           - os: macos-14
             target: x86_64-apple-darwin
-            binary: coder_agent
-            bin_name: coder_agent
+            binary: qmtcode
+            bin_name: qmtcode
             archive_ext: tar.gz
             cargo_package: querymt-agent
             cargo_features: oauth,dashboard,remote
           - os: macos-14
             target: aarch64-apple-darwin
-            binary: coder_agent
-            bin_name: coder_agent
+            binary: qmtcode
+            bin_name: qmtcode
             archive_ext: tar.gz
             cargo_package: querymt-agent
             cargo_features: oauth,dashboard,remote
@@ -92,16 +92,16 @@ jobs:
             rust_flags: "-C target-feature=+crt-static"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary: coder_agent
-            bin_name: coder_agent.exe
+            binary: qmtcode
+            bin_name: qmtcode.exe
             archive_ext: zip
             cargo_package: querymt-agent
             cargo_features: oauth,dashboard,remote
             rust_flags: "-C target-feature=+crt-static"
           - os: windows-latest
             target: aarch64-pc-windows-msvc
-            binary: coder_agent
-            bin_name: coder_agent.exe
+            binary: qmtcode
+            bin_name: qmtcode.exe
             archive_ext: zip
             cargo_package: querymt-agent
             cargo_features: oauth,dashboard,remote
@@ -115,8 +115,8 @@ jobs:
             archive_ext: tar.gz
           - os: freebsd
             target: x86_64-unknown-freebsd
-            binary: coder_agent
-            bin_name: coder_agent
+            binary: qmtcode
+            bin_name: qmtcode
             archive_ext: tar.gz
             cargo_package: querymt-agent
             cargo_features: oauth,dashboard,remote
@@ -143,7 +143,7 @@ jobs:
           key: ${{ matrix.target }}-${{ matrix.binary }}
 
       - name: Setup Bun
-        if: matrix.binary == 'coder_agent' && matrix.target != 'x86_64-unknown-freebsd'
+        if: matrix.binary == 'qmtcode' && matrix.target != 'x86_64-unknown-freebsd'
         uses: oven-sh/setup-bun@v2
 
       # Build qmt binary (default package)
@@ -153,12 +153,12 @@ jobs:
           RUSTFLAGS: ${{ matrix.rust_flags || '' }}
         run: cargo build --release --bin qmt --target ${{ matrix.target }}
 
-      # Build coder_agent example binary
-      - name: Build coder_agent with Cargo
-        if: matrix.binary == 'coder_agent'
+      # Build qmtcode example binary
+      - name: Build qmtcode with Cargo
+        if: matrix.binary == 'qmtcode'
         env:
           RUSTFLAGS: ${{ matrix.rust_flags || '' }}
-        run: cargo build --release -p ${{ matrix.cargo_package }} --example coder_agent --features ${{ matrix.cargo_features }} --target ${{ matrix.target }}
+        run: cargo build --release -p ${{ matrix.cargo_package }} --example qmtcode --features ${{ matrix.cargo_features }} --target ${{ matrix.target }}
 
       - name: Prepare artifact for upload (Linux, macOS & FreeBSD)
         if: ${{ runner.os != 'Windows' }}

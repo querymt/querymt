@@ -6,7 +6,7 @@ This document covers the example programs provided in `crates/agent/examples/`.
 
 | Example | Description | Features Required |
 |---------|-------------|-------------------|
-| `coder_agent` | Full-featured coding agent | `dashboard`, `remote` |
+| `qmtcode` | Full-featured coding agent | `dashboard`, `remote` |
 | `acp_agent` | Minimal ACP stdio server | none |
 | `auto_delegation_example` | Multi-agent delegation | none |
 | `from_config` | Config-file-based agent | none |
@@ -19,28 +19,28 @@ This document covers the example programs provided in `crates/agent/examples/`.
 
 ---
 
-## coder_agent
+## qmtcode
 
 The primary example — a full-featured coding assistant with multiple run modes.
 
 ```bash
 # ACP stdio mode (for subprocess integration)
-cargo run --example coder_agent -- --acp
+cargo run --example qmtcode -- --acp
 
 # Web dashboard (default: http://127.0.0.1:3000)
-cargo run --example coder_agent --features dashboard -- --dashboard
+cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Dashboard on custom address
-cargo run --example coder_agent --features dashboard -- --dashboard=0.0.0.0:8080
+cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 
 # Mesh-only mode (runs until Ctrl+C)
-cargo run --example coder_agent --features remote -- --mesh
+cargo run --example qmtcode --features remote -- --mesh
 
 # Dashboard + mesh (cross-machine sessions)
-cargo run --example coder_agent --features "dashboard remote" -- --dashboard --mesh
+cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
 
 # Use a custom config file
-cargo run --example coder_agent --features dashboard -- path/to/config.toml --dashboard
+cargo run --example qmtcode --features dashboard -- path/to/config.toml --dashboard
 ```
 
 **Key behaviors:**
@@ -245,7 +245,7 @@ cargo run --example replay_session -- <session-id>
 
 ## web_dashboard
 
-Starts a standalone web dashboard without using the `coder_agent` binary.
+Starts a standalone web dashboard without using the `qmtcode` binary.
 
 ```bash
 cargo run --example web_dashboard --features dashboard
@@ -415,10 +415,10 @@ system = [{ file = "../prompts/coder.md" }]
 
 ```bash
 # Single agent - interactive ACP
-cargo run --example coder_agent -- --acp
+cargo run --example qmtcode -- --acp
 
 # Single agent - web dashboard
-cargo run --example coder_agent --features dashboard -- --dashboard
+cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Multi-agent delegation
 cargo run --example auto_delegation_example
@@ -440,13 +440,13 @@ cargo run --example morning_brief
 
 ```bash
 # Build optimized binary
-cargo build --release --example coder_agent --features dashboard
+cargo build --release --example qmtcode --features dashboard
 
 # Clear macOS quarantine flag
-xattr -dr com.apple.quarantine target/release/examples/coder_agent
+xattr -dr com.apple.quarantine target/release/examples/qmtcode
 
 # Run the binary
-./target/release/examples/coder_agent --dashboard
+./target/release/examples/qmtcode --dashboard
 ```
 
 ## Related Documentation

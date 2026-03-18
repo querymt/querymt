@@ -497,7 +497,7 @@ impl RemoteSession {
 
 See `examples/` directory for complete usage examples:
 
-- `coder_agent.rs` - Full-featured coder agent
+- `qmtcode.rs` - Full-featured coder agent
 - `acp_agent.rs` - ACP stdio server
 - `auto_delegation_example.rs` - Multi-agent delegation
 - `from_config.rs` - Configuration-based agent
