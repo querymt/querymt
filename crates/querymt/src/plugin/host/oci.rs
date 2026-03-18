@@ -605,9 +605,7 @@ impl OciDownloader {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
 
-        if !force_update
-            && let Some(meta) = &local_metadata
-        {
+        if !force_update && let Some(meta) = &local_metadata {
             let blob_path = get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
             if blob_path.exists() {
                 log::debug!("Found cached OCI plugin. Using local version.");

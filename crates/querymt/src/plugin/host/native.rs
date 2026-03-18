@@ -64,7 +64,9 @@ unsafe extern "C" fn host_log_callback(
     let target_str = if target.is_null() {
         "plugin"
     } else {
-        unsafe { CStr::from_ptr(target) }.to_str().unwrap_or("plugin")
+        unsafe { CStr::from_ptr(target) }
+            .to_str()
+            .unwrap_or("plugin")
     };
 
     let message_str = if message.is_null() {
