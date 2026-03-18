@@ -166,13 +166,13 @@ impl ModelInfo {
 
     /// Check if requested output tokens are within model's limit
     pub fn validate_output_limit(&self, requested_tokens: u64) -> Result<(), String> {
-        if let Some(limit) = self.constraints.output {
-            if requested_tokens > limit {
-                return Err(format!(
-                    "Requested {} output tokens exceeds model limit of {}",
-                    requested_tokens, limit
-                ));
-            }
+        if let Some(limit) = self.constraints.output
+            && requested_tokens > limit
+        {
+            return Err(format!(
+                "Requested {} output tokens exceeds model limit of {}",
+                requested_tokens, limit
+            ));
         }
         Ok(())
     }

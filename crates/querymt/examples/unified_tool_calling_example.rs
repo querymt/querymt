@@ -304,9 +304,10 @@ async fn main() -> ExampleResult<()> {
         }
         "choice" => run_tool_choice_scenario(provider, &tools).await?,
         _ => {
-            return Err(
-                format!("Unknown scenario '{scenario}'. Use one of: simple, multi, choice").into(),
-            );
+            return Err(format!(
+                "Unknown scenario '{scenario}'. Use one of: simple, multi, choice"
+            )
+            .into());
         }
     }
 

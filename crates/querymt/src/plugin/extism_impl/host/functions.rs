@@ -96,23 +96,22 @@ pub(crate) fn reqwest_http(
     let state = user_data.get()?;
     let (handle_tokio, cancel_rx) = {
         let state_guard = state.lock().unwrap();
-        if let Some(host) = http_req.uri().host() {
-            if !state_guard.allowed_hosts.is_empty()
-                && !state_guard.allowed_hosts.iter().any(|h| h == host)
-            {
-                log::warn!("Blocked request to non-allowed host: {}", host);
-                let error_resp = http::Response::builder()
-                    .status(403)
-                    .body(format!("Host '{}' not in allowlist", host).into_bytes())
-                    .unwrap();
+        if let Some(host) = http_req.uri().host()
+            && !state_guard.allowed_hosts.is_empty()
+            && !state_guard.allowed_hosts.iter().any(|h| h == host)
+        {
+            log::warn!("Blocked request to non-allowed host: {}", host);
+            let error_resp = http::Response::builder()
+                .status(403)
+                .body(format!("Host '{}' not in allowlist", host).into_bytes())
+                .unwrap();
 
-                let ser_resp = SerializableHttpResponse { resp: error_resp };
-                let resp_json = serde_json::to_vec(&ser_resp)
-                    .map_err(|e| extism::Error::msg(format!("Serialization error: {}", e)))?;
-                let handle = plugin.memory_new(resp_json)?;
-                outputs[0] = Val::I64(handle.offset as i64);
-                return Ok(());
-            }
+            let ser_resp = SerializableHttpResponse { resp: error_resp };
+            let resp_json = serde_json::to_vec(&ser_resp)
+                .map_err(|e| extism::Error::msg(format!("Serialization error: {}", e)))?;
+            let handle = plugin.memory_new(resp_json)?;
+            outputs[0] = Val::I64(handle.offset as i64);
+            return Ok(());
         }
         (
             state_guard.tokio_handle.clone(),
@@ -238,15 +237,14 @@ pub(crate) fn qmt_http_stream_open(
         let state = user_data.get()?;
         let (handle_tokio, cancel_rx) = {
             let state_guard = state.lock().unwrap();
-            if let Some(host) = http_req.uri().host() {
-                if !state_guard.allowed_hosts.is_empty()
-                    && !state_guard.allowed_hosts.iter().any(|h| h == host)
-                {
-                    return Err(extism::Error::msg(format!(
-                        "Host '{}' not in allowlist",
-                        host
-                    )));
-                }
+            if let Some(host) = http_req.uri().host()
+                && !state_guard.allowed_hosts.is_empty()
+                && !state_guard.allowed_hosts.iter().any(|h| h == host)
+            {
+                return Err(extism::Error::msg(format!(
+                    "Host '{}' not in allowlist",
+                    host
+                )));
             }
             (
                 state_guard.tokio_handle.clone(),

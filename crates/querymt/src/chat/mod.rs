@@ -720,15 +720,15 @@ impl From<&dyn ChatResponse> for ChatMessage {
     fn from(response: &dyn ChatResponse) -> Self {
         let mut content = Vec::new();
 
-        if let Some(t) = response.thinking() {
-            if !t.is_empty() {
-                content.push(Content::thinking(t));
-            }
+        if let Some(t) = response.thinking()
+            && !t.is_empty()
+        {
+            content.push(Content::thinking(t));
         }
-        if let Some(text) = response.text() {
-            if !text.is_empty() {
-                content.push(Content::text(text));
-            }
+        if let Some(text) = response.text()
+            && !text.is_empty()
+        {
+            content.push(Content::text(text));
         }
         if let Some(calls) = response.tool_calls() {
             for call in calls {

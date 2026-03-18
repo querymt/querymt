@@ -534,14 +534,14 @@ fn determine_plugin_type(image_manifest: &OciImageManifest) -> Result<PluginType
         }
     }
 
-    if let Some(annotations) = &image_manifest.annotations {
-        if let Some(plugin_type_str) = annotations.get(PLUGIN_TYPE_ANNOTATION) {
-            return match plugin_type_str.as_str() {
-                "extism" => Ok(PluginType::Wasm),
-                "native" => Ok(PluginType::Native),
-                _ => todo!(),
-            };
-        }
+    if let Some(annotations) = &image_manifest.annotations
+        && let Some(plugin_type_str) = annotations.get(PLUGIN_TYPE_ANNOTATION)
+    {
+        return match plugin_type_str.as_str() {
+            "extism" => Ok(PluginType::Wasm),
+            "native" => Ok(PluginType::Native),
+            _ => todo!(),
+        };
     }
 
     for layer in &image_manifest.layers {
@@ -605,19 +605,19 @@ impl OciDownloader {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
 
-        if !force_update {
-            if let Some(meta) = &local_metadata {
-                let blob_path = get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
-                if blob_path.exists() {
-                    log::debug!("Found cached OCI plugin. Using local version.");
-                    progress(OciDownloadProgress {
-                        phase: OciDownloadPhase::Completed,
-                        bytes_downloaded: 0,
-                        bytes_total: None,
-                        percent: Some(100.0),
-                    });
-                    return load_from_cache(meta, &blob_path);
-                }
+        if !force_update
+            && let Some(meta) = &local_metadata
+        {
+            let blob_path = get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
+            if blob_path.exists() {
+                log::debug!("Found cached OCI plugin. Using local version.");
+                progress(OciDownloadProgress {
+                    phase: OciDownloadPhase::Completed,
+                    bytes_downloaded: 0,
+                    bytes_total: None,
+                    percent: Some(100.0),
+                });
+                return load_from_cache(meta, &blob_path);
             }
         }
 

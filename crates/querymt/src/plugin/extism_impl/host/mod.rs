@@ -155,15 +155,15 @@ impl ExtismFactory {
         ));
 
         let mut allowed_hosts: Vec<String> = Vec::new();
-        if let Some(runtime_cfg) = config {
-            if let Some(hosts) = runtime_cfg.get("allowed_hosts") {
-                allowed_hosts.append(
-                    &mut hosts
-                        .clone()
-                        .try_into()
-                        .map_err(|e| LLMError::GenericError(format!("{:#}", e)))?,
-                );
-            }
+        if let Some(runtime_cfg) = config
+            && let Some(hosts) = runtime_cfg.get("allowed_hosts")
+        {
+            allowed_hosts.append(
+                &mut hosts
+                    .clone()
+                    .try_into()
+                    .map_err(|e| LLMError::GenericError(format!("{:#}", e)))?,
+            );
         }
 
         let name = call_plugin_str(init_plugin.clone(), "name", &Value::Null)
@@ -274,12 +274,12 @@ impl LLMProviderFactory for ExtismFactory {
                 // (e.g. a cancelled chat/stream call). Without this reset, the cancel_watch_rx is
                 // still `true`, causing qmt_http_request to return HTTP 499 immediately and the
                 // plugin to surface {"kind":"Cancelled"} on every subsequent list_models call.
-                if let Some(ud) = &user_data {
-                    if let Ok(state) = ud.get() {
-                        let mut state_guard = state.lock().unwrap();
-                        state_guard.cancel_state = functions::CancelState::NotCancelled;
-                        let _ = state_guard.cancel_watch_tx.send(false);
-                    }
+                if let Some(ud) = &user_data
+                    && let Ok(state) = ud.get()
+                {
+                    let mut state_guard = state.lock().unwrap();
+                    state_guard.cancel_state = functions::CancelState::NotCancelled;
+                    let _ = state_guard.cancel_watch_tx.send(false);
                 }
 
                 let out: Json<Vec<String>> = plug
