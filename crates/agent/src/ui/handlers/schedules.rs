@@ -37,6 +37,21 @@ fn schedule_to_info(s: &Schedule) -> ScheduleInfo {
     }
 }
 
+/// Resolve the `session_public_id` that owns a schedule.
+///
+/// Used by action handlers (pause/resume/trigger/delete) so the follow-up
+/// `handle_list_schedules` refresh is scoped to the correct session instead
+/// of falling back to an unscoped query.
+async fn resolve_session_id(state: &ServerState, schedule_public_id: &str) -> Option<String> {
+    state
+        .agent
+        .get_schedule(schedule_public_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.session_public_id)
+}
+
 /// Handle `ListSchedules` — list schedules for a session or all.
 pub async fn handle_list_schedules(
     state: &ServerState,
@@ -127,6 +142,7 @@ pub async fn handle_pause_schedule(
     schedule_public_id: &str,
     tx: &mpsc::Sender<String>,
 ) {
+    let session_id = resolve_session_id(state, schedule_public_id).await;
     let (success, message) = match state.agent.pause_schedule(schedule_public_id).await {
         Ok(()) => (true, None),
         Err(e) => (false, Some(e.to_string())),
@@ -142,7 +158,7 @@ pub async fn handle_pause_schedule(
     )
     .await;
     if success {
-        handle_list_schedules(state, None, tx).await;
+        handle_list_schedules(state, session_id.as_deref(), tx).await;
     }
 }
 
@@ -152,6 +168,7 @@ pub async fn handle_resume_schedule(
     schedule_public_id: &str,
     tx: &mpsc::Sender<String>,
 ) {
+    let session_id = resolve_session_id(state, schedule_public_id).await;
     let (success, message) = match state.agent.resume_schedule(schedule_public_id).await {
         Ok(()) => (true, None),
         Err(e) => (false, Some(e.to_string())),
@@ -167,7 +184,7 @@ pub async fn handle_resume_schedule(
     )
     .await;
     if success {
-        handle_list_schedules(state, None, tx).await;
+        handle_list_schedules(state, session_id.as_deref(), tx).await;
     }
 }
 
@@ -177,6 +194,7 @@ pub async fn handle_trigger_schedule(
     schedule_public_id: &str,
     tx: &mpsc::Sender<String>,
 ) {
+    let session_id = resolve_session_id(state, schedule_public_id).await;
     let (success, message) = match state.agent.trigger_schedule_now(schedule_public_id).await {
         Ok(()) => (true, None),
         Err(e) => (false, Some(e.to_string())),
@@ -192,7 +210,7 @@ pub async fn handle_trigger_schedule(
     )
     .await;
     if success {
-        handle_list_schedules(state, None, tx).await;
+        handle_list_schedules(state, session_id.as_deref(), tx).await;
     }
 }
 
@@ -202,6 +220,8 @@ pub async fn handle_delete_schedule(
     schedule_public_id: &str,
     tx: &mpsc::Sender<String>,
 ) {
+    // Resolve session before deletion — the record won't exist afterwards.
+    let session_id = resolve_session_id(state, schedule_public_id).await;
     let (success, message) = match state.agent.delete_schedule(schedule_public_id).await {
         Ok(()) => (true, None),
         Err(e) => (false, Some(e.to_string())),
@@ -217,6 +237,6 @@ pub async fn handle_delete_schedule(
     )
     .await;
     if success {
-        handle_list_schedules(state, None, tx).await;
+        handle_list_schedules(state, session_id.as_deref(), tx).await;
     }
 }

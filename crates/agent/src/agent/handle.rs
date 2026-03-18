@@ -466,6 +466,24 @@ impl LocalAgentHandle {
             .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))
     }
 
+    /// Get a single schedule by public ID.
+    ///
+    /// Returns `None` if the scheduler is not running or the schedule does not exist.
+    pub async fn get_schedule(
+        &self,
+        schedule_public_id: &str,
+    ) -> Result<Option<crate::session::domain_schedule::Schedule>, agent_client_protocol::Error>
+    {
+        let scheduler = match self.scheduler() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        scheduler
+            .get_schedule(schedule_public_id)
+            .await
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))
+    }
+
     /// Get scheduler metrics snapshot.
     pub async fn scheduler_metrics(&self) -> Option<crate::scheduler::SchedulerMetrics> {
         let scheduler = self.scheduler()?;

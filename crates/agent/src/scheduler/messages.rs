@@ -87,6 +87,11 @@ pub struct ListSchedules {
     pub session_public_id: Option<String>,
 }
 
+/// Query: get a single schedule by public ID.
+pub struct GetSchedule {
+    pub schedule_public_id: String,
+}
+
 /// Query: get a snapshot of the scheduler's operational metrics.
 pub(crate) struct GetMetrics;
 
