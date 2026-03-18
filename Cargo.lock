@@ -101,9 +101,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "0.11.2"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0497b9a95a404e35799904835c57c6f8c69b9d08ccfd3cb5b7d746425cd6789"
+checksum = "96daddd0d00f2eab88f8099d38190881bf8d6c5e46b6fa21751f482775d0dba7"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -5490,7 +5490,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -9602,7 +9602,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -10046,7 +10046,7 @@ name = "querymt-agent"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
- "agent-client-protocol-schema 0.11.2",
+ "agent-client-protocol-schema 0.11.3",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -12123,7 +12123,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
