@@ -11,7 +11,7 @@
  */
 
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { Virtuoso, type VirtuosoHandle, type ListRange } from 'react-virtuoso';
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { Activity, Send, Loader, Plus, ChevronDown, Square } from 'lucide-react';
 import { useUiClientActions, useUiClientEvents, useUiClientSession } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
@@ -356,29 +356,70 @@ export function ChatView() {
   const hasTurns = filteredTurns.length > 0;
   const hasDelegations = delegations.length > 0;
 
-  // --- Pinned user-message bar (scroll-based, cascading) ---
-  // Uses Virtuoso's visible range instead of IntersectionObserver so it
-  // works correctly with virtualisation and naturally cascades through
-  // all user messages as the user scrolls.
-  const [visibleRange, setVisibleRange] = useState<ListRange>({ startIndex: 0, endIndex: 0 });
+  // --- Pinned user-message bar (DOM-based scroll detection) ---
+  const scrollerNodeRef = useRef<HTMLElement | null>(null);
+  const pinnedRafRef = useRef<number | null>(null);
+  const [pinnedMessage, setPinnedMessage] = useState<{ content: string; timestamp: number; turnIndex: number } | null>(null);
 
-  const handleRangeChanged = useCallback((range: ListRange) => {
-    setVisibleRange(range);
+  const scrollerRefCallback = useCallback((ref: HTMLElement | Window | null) => {
+    scrollerNodeRef.current = ref instanceof HTMLElement ? ref : null;
   }, []);
 
-  // Derive the pinned message from the visible range.
-  // Walk backward from the first visible turn to find the closest
-  // user message that's completely above the viewport.
-  const pinnedMessage = useMemo<{ content: string; timestamp: number; turnIndex: number } | null>(() => {
-    if (isAtBottom || filteredTurns.length === 0) return null;
-    for (let i = visibleRange.startIndex; i >= 0; i--) {
-      const msg = filteredTurns[i]?.userMessage;
-      if (msg) {
-        return { content: msg.content, timestamp: msg.timestamp, turnIndex: i };
+  const updatePinnedMessage = useCallback(() => {
+    const scroller = scrollerNodeRef.current;
+    if (!scroller || filteredTurns.length === 0) {
+      setPinnedMessage(null);
+      return;
+    }
+
+    if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 10) {
+      setPinnedMessage(null);
+      return;
+    }
+
+    const scrollerRect = scroller.getBoundingClientRect();
+    const nodes = scroller.querySelectorAll<HTMLElement>('.user-message[data-turn-index]');
+
+    let candidate: { content: string; timestamp: number; turnIndex: number } | null = null;
+    for (const node of nodes) {
+      if (node.getBoundingClientRect().bottom <= scrollerRect.top) {
+        const idx = Number(node.dataset.turnIndex);
+        const msg = filteredTurns[idx]?.userMessage;
+        if (msg && (!candidate || idx > candidate.turnIndex)) {
+          candidate = { content: msg.content, timestamp: msg.timestamp, turnIndex: idx };
+        }
       }
     }
-    return null;
-  }, [isAtBottom, filteredTurns, visibleRange.startIndex]);
+    setPinnedMessage(candidate);
+  }, [filteredTurns]);
+
+  useEffect(() => {
+    const scroller = scrollerNodeRef.current;
+    if (!scroller) return;
+
+    const onScroll = () => {
+      if (pinnedRafRef.current !== null) return;
+      pinnedRafRef.current = requestAnimationFrame(() => {
+        pinnedRafRef.current = null;
+        updatePinnedMessage();
+      });
+    };
+
+    scroller.addEventListener('scroll', onScroll, { passive: true });
+    updatePinnedMessage();
+
+    return () => {
+      scroller.removeEventListener('scroll', onScroll);
+      if (pinnedRafRef.current !== null) {
+        cancelAnimationFrame(pinnedRafRef.current);
+        pinnedRafRef.current = null;
+      }
+    };
+  }, [updatePinnedMessage]);
+
+  useEffect(() => {
+    updatePinnedMessage();
+  }, [updatePinnedMessage]);
 
   const handleJumpBackToPinnedMessage = useCallback(() => {
     if (pinnedMessage) {
@@ -809,14 +850,6 @@ export function ChatView() {
             </button>
           </div>
         )}
-        {/* Pinned user-message bar — in-flow above the scroll area so it doesn't overlap content */}
-        {activeTimelineView === 'chat' && pinnedMessage && (
-          <PinnedUserMessage
-            message={pinnedMessage.content}
-            timestamp={pinnedMessage.timestamp}
-            onJumpBack={handleJumpBackToPinnedMessage}
-          />
-        )}
         <div ref={chatTimelineRef} className="flex-1 overflow-hidden relative">
           {activeTimelineView === 'delegations' ? (
             <DelegationsView
@@ -900,8 +933,16 @@ export function ChatView() {
               data={filteredTurns}
               itemContent={renderTurnItem}
               atBottomStateChange={handleAtBottomStateChange}
-              rangeChanged={handleRangeChanged}
+              scrollerRef={scrollerRefCallback}
               className="h-full"
+            />
+          )}
+          {activeTimelineView === 'chat' && (
+            <PinnedUserMessage
+              message={pinnedMessage?.content ?? ''}
+              timestamp={pinnedMessage?.timestamp ?? 0}
+              onJumpBack={handleJumpBackToPinnedMessage}
+              visible={!!pinnedMessage}
             />
           )}
         </div>

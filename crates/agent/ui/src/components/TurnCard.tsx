@@ -184,7 +184,7 @@ export const TurnCard = memo(function TurnCard({
     >
       {/* User message (if present) */}
       {turn.userMessage && (
-        <div className="user-message mb-3">
+        <div className="user-message mb-3" data-turn-index={turnIndex}>
           <div className="flex items-center gap-2 mb-1">
             <span className="text-xs font-semibold text-accent-secondary uppercase tracking-wide">
               User

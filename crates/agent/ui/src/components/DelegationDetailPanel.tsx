@@ -125,7 +125,7 @@ export function DelegationDetailPanel({
           agents={agents}
           onToolClick={onToolClick}
           onDelegateClick={() => {}}
-           showModelLabel={true}
+          showModelLabel={true}
           llmConfigCache={llmConfigCache}
           requestLlmConfig={requestLlmConfig}
         />
