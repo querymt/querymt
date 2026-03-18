@@ -43,6 +43,7 @@ struct EmbeddedPromptAssets;
 
 #[derive(Debug, Parser)]
 #[command(name = "qmtcode")]
+#[command(version = env!("QMT_BUILD_VERSION"))]
 #[command(about = "Run QueryMT coder agent in ACP mode, dashboard mode, or as a mesh node")]
 #[command(
     after_help = "Examples:\n  qmtcode --acp\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --dashboard --mesh\n  qmtcode path/to/config.toml --acp"
