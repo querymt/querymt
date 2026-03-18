@@ -79,10 +79,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Model requested {} tool(s)", tool_calls.len());
 
         let mut assistant_message = ChatMessage::assistant();
-        if let Some(text) = first_response.text() {
-            if !text.is_empty() {
-                assistant_message = assistant_message.text(text);
-            }
+        if let Some(text) = first_response.text()
+            && !text.is_empty()
+        {
+            assistant_message = assistant_message.text(text);
         }
 
         for call in &tool_calls {
