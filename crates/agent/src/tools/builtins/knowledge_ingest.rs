@@ -164,6 +164,13 @@ impl ToolTrait for KnowledgeIngestTool {
             .await
             .map_err(|e| ToolError::ProviderError(format!("Failed to ingest: {}", e)))?;
 
+        // Emit KnowledgeIngested event so the scheduler can react
+        context.emit_event(crate::events::AgentEventKind::KnowledgeIngested {
+            scope: scope.clone(),
+            entry_public_id: entry.public_id.clone(),
+            source: entry.source.clone(),
+        });
+
         Ok(format!(
             "Ingested knowledge entry {} (scope: {}, importance: {:.2})",
             entry.public_id, scope, importance
@@ -222,5 +229,56 @@ mod tests {
 
         let result = tool.call(args, &context).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_knowledge_ingest_emits_event() {
+        use crate::event_fanout::EventFanout;
+        use crate::event_sink::EventSink;
+        use crate::session::backend::StorageBackend;
+        use crate::session::sqlite_storage::SqliteStorage;
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let fanout = Arc::new(EventFanout::new());
+        let event_sink = Arc::new(EventSink::new(storage.event_journal(), fanout.clone()));
+
+        // Subscribe to events before the tool call
+        let mut rx = fanout.subscribe();
+
+        let knowledge_store = Arc::new(SqliteKnowledgeStore::new(sqlite_conn_with_schema()));
+        let mut context = AgentToolContext::basic(
+            "test_session".to_string(),
+            Some(temp_dir.path().to_path_buf()),
+        );
+        context.with_knowledge_store(knowledge_store);
+        context.with_event_sink(event_sink);
+
+        let tool = KnowledgeIngestTool::new();
+        let args = json!({
+            "text": "Dark mode preference",
+            "source": "user_message",
+        });
+
+        let result = tool.call(args, &context).await;
+        assert!(result.is_ok(), "Failed: {:?}", result);
+
+        // Give the spawned event task time to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Check that a KnowledgeIngested event was emitted
+        let mut found = false;
+        while let Ok(envelope) = rx.try_recv() {
+            if let crate::events::EventEnvelope::Durable(ev) = envelope
+                && matches!(
+                    ev.kind,
+                    crate::events::AgentEventKind::KnowledgeIngested { .. }
+                )
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "Expected KnowledgeIngested event to be emitted");
     }
 }

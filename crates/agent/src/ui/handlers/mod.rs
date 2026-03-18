@@ -8,6 +8,7 @@
 //! - [`session_ops`] — session list/load/cancel/subscribe/undo/redo/elicitation/mode
 //! - [`remote`]      — remote node and session management
 
+mod knowledge;
 mod models;
 mod oauth;
 mod plugins;
@@ -349,6 +350,19 @@ pub async fn handle_ui_message(
         }
         UiClientMessage::DeleteSchedule { schedule_public_id } => {
             handle_delete_schedule(state, &schedule_public_id, tx).await;
+        }
+        UiClientMessage::QueryKnowledge {
+            scope,
+            question,
+            limit,
+        } => {
+            knowledge::handle_query_knowledge(state, &scope, &question, limit, tx).await;
+        }
+        UiClientMessage::ListKnowledge { scope, filter } => {
+            knowledge::handle_list_knowledge(state, &scope, filter.as_ref(), tx).await;
+        }
+        UiClientMessage::KnowledgeStats { scope } => {
+            knowledge::handle_knowledge_stats(state, &scope, tx).await;
         }
     }
 }
