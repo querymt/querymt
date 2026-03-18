@@ -6,6 +6,17 @@ use super::super::messages::{ScheduleInfo, UiServerMessage};
 use crate::session::domain_schedule::Schedule;
 use tokio::sync::mpsc;
 
+/// Parameters for creating a new schedule, bundled to stay within clippy's
+/// argument-count limit.
+pub struct CreateScheduleParams<'a> {
+    pub session_id: &'a str,
+    pub prompt: &'a str,
+    pub trigger_json: &'a serde_json::Value,
+    pub max_steps: Option<u32>,
+    pub max_cost_usd: Option<f64>,
+    pub max_runs: Option<u32>,
+}
+
 /// Convert a domain `Schedule` to a UI `ScheduleInfo` DTO.
 fn schedule_to_info(s: &Schedule) -> ScheduleInfo {
     let fmt = &time::format_description::well_known::Rfc3339;
@@ -49,18 +60,13 @@ pub async fn handle_list_schedules(
 /// the `Schedule` referencing it and registers it with the SchedulerActor.
 pub async fn handle_create_schedule(
     state: &ServerState,
-    session_id: &str,
-    prompt: &str,
-    trigger_json: &serde_json::Value,
-    max_steps: Option<u32>,
-    max_cost_usd: Option<f64>,
-    max_runs: Option<u32>,
+    params: &CreateScheduleParams<'_>,
     tx: &mpsc::Sender<String>,
 ) {
     use crate::session::domain_schedule::ScheduleTrigger;
 
     // Parse the trigger from JSON
-    let trigger: ScheduleTrigger = match serde_json::from_value(trigger_json.clone()) {
+    let trigger: ScheduleTrigger = match serde_json::from_value(params.trigger_json.clone()) {
         Ok(t) => t,
         Err(e) => {
             let _ = send_message(
@@ -79,12 +85,12 @@ pub async fn handle_create_schedule(
     match state
         .agent
         .create_scheduled_task(
-            session_id,
-            prompt,
+            params.session_id,
+            params.prompt,
             trigger,
-            max_steps,
-            max_cost_usd,
-            max_runs,
+            params.max_steps,
+            params.max_cost_usd,
+            params.max_runs,
         )
         .await
     {
@@ -99,7 +105,7 @@ pub async fn handle_create_schedule(
             )
             .await;
             // Send updated list
-            handle_list_schedules(state, Some(session_id), tx).await;
+            handle_list_schedules(state, Some(params.session_id), tx).await;
         }
         Err(e) => {
             let _ = send_message(
