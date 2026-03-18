@@ -17,7 +17,7 @@ while [ "$#" -gt 0 ]; do
             cat <<'EOF'
 Usage: install.sh [--nightly|--latest]
 
-Installs qmt and coder_agent into ~/.local/bin (or $QMT_INSTALL_DIR).
+Installs qmt and qmtcode into ~/.local/bin (or $QMT_INSTALL_DIR).
 Set QMT_CHANNEL=nightly as an alternative to --nightly.
 EOF
             exit 0
@@ -150,7 +150,7 @@ install_binary() {
 }
 
 install_binary "qmt"
-install_binary "coder_agent"
+install_binary "qmtcode"
 
 echo "Installed to: $INSTALL_DIR"
 if command -v qmt >/dev/null 2>&1; then
@@ -158,10 +158,10 @@ if command -v qmt >/dev/null 2>&1; then
 else
     "$INSTALL_DIR/qmt" --version || true
 fi
-if command -v coder_agent >/dev/null 2>&1; then
-    coder_agent --version || true
+if command -v qmtcode >/dev/null 2>&1; then
+    qmtcode --version || true
 else
-    "$INSTALL_DIR/coder_agent" --version || true
+    "$INSTALL_DIR/qmtcode" --version || true
 fi
 
 case ":$PATH:" in

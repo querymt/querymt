@@ -8,7 +8,7 @@ A unified interface for Large Language Models (LLMs) with support for various pr
 
 ## Installation
 
-Install the `qmt` and `coder_agent` binaries:
+Install the `qmt` and `qmtcode` binaries:
 
 ```bash
 curl -sSf https://query.mt/install.sh | sh

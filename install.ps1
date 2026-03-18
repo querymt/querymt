@@ -62,7 +62,7 @@ function Install-Binary([string]$Binary) {
 }
 
 Install-Binary -Binary "qmt"
-Install-Binary -Binary "coder_agent"
+Install-Binary -Binary "qmtcode"
 
 Write-Host "Installed to: $InstallDir"
 
@@ -78,4 +78,4 @@ if ($pathParts -notcontains $InstallDir) {
 }
 
 & (Join-Path $InstallDir "qmt.exe") --version
-& (Join-Path $InstallDir "coder_agent.exe") --version
+& (Join-Path $InstallDir "qmtcode.exe") --version
