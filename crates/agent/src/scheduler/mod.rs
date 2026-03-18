@@ -204,6 +204,18 @@ impl SchedulerHandle {
         Ok(schedules)
     }
 
+    /// Get a single schedule by public ID.
+    pub async fn get_schedule(&self, schedule_public_id: &str) -> SessionResult<Option<Schedule>> {
+        let schedule = self
+            .actor_ref
+            .ask(GetSchedule {
+                schedule_public_id: schedule_public_id.to_string(),
+            })
+            .await
+            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
+        Ok(schedule)
+    }
+
     /// Get a snapshot of the current scheduler metrics.
     pub async fn metrics(&self) -> SchedulerMetrics {
         self.actor_ref.ask(GetMetrics).await.unwrap_or_default()
@@ -426,6 +438,24 @@ impl Message<ListSchedules> for SchedulerActor {
         Ok(self
             .handle_list_schedules(msg.session_public_id.as_deref())
             .await)
+    }
+}
+
+// ── GetSchedule (query, uses ask) ─────────────────────────────────────────
+
+impl Message<GetSchedule> for SchedulerActor {
+    type Reply = Result<Option<Schedule>, kameo::error::Infallible>;
+
+    async fn handle(
+        &mut self,
+        msg: GetSchedule,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self
+            .schedule_store
+            .get_schedule(&msg.schedule_public_id)
+            .await
+            .unwrap_or(None))
     }
 }
 
