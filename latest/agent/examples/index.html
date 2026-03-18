@@ -1501,10 +1501,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#coder_agent" class="md-nav__link">
+  <a href="#qmtcode" class="md-nav__link">
     <span class="md-ellipsis">
       
-        coder_agent
+        qmtcode
       
     </span>
   </a>
@@ -1796,7 +1796,7 @@
 </thead>
 <tbody>
 <tr>
-<td><code>coder_agent</code></td>
+<td><code>qmtcode</code></td>
 <td>Full-featured coding agent</td>
 <td><code>dashboard</code>, <code>remote</code></td>
 </tr>
@@ -1848,25 +1848,25 @@
 </tbody>
 </table>
 <hr />
-<h2 id="coder_agent">coder_agent</h2>
+<h2 id="qmtcode">qmtcode</h2>
 <p>The primary example — a full-featured coding assistant with multiple run modes.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># ACP stdio mode (for subprocess integration)</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>coder_agent<span class="w"> </span>--<span class="w"> </span>--acp
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--<span class="w"> </span>--acp
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
 <a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="c1"># Web dashboard (default: http://127.0.0.1:3000)</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>coder_agent<span class="w"> </span>--features<span class="w"> </span>dashboard<span class="w"> </span>--<span class="w"> </span>--dashboard
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>dashboard<span class="w"> </span>--<span class="w"> </span>--dashboard
 <a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>
 <a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="c1"># Dashboard on custom address</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>coder_agent<span class="w"> </span>--features<span class="w"> </span>dashboard<span class="w"> </span>--<span class="w"> </span>--dashboard<span class="o">=</span><span class="m">0</span>.0.0.0:8080
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>dashboard<span class="w"> </span>--<span class="w"> </span>--dashboard<span class="o">=</span><span class="m">0</span>.0.0.0:8080
 <a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>
 <a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="c1"># Mesh-only mode (runs until Ctrl+C)</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>coder_agent<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
 <a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>
 <a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="c1"># Dashboard + mesh (cross-machine sessions)</span>
-<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>coder_agent<span class="w"> </span>--features<span class="w"> </span><span class="s2">&quot;dashboard remote&quot;</span><span class="w"> </span>--<span class="w"> </span>--dashboard<span class="w"> </span>--mesh
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span><span class="s2">&quot;dashboard remote&quot;</span><span class="w"> </span>--<span class="w"> </span>--dashboard<span class="w"> </span>--mesh
 <a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>
 <a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="c1"># Use a custom config file</span>
-<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>coder_agent<span class="w"> </span>--features<span class="w"> </span>dashboard<span class="w"> </span>--<span class="w"> </span>path/to/config.toml<span class="w"> </span>--dashboard
+<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>dashboard<span class="w"> </span>--<span class="w"> </span>path/to/config.toml<span class="w"> </span>--dashboard
 </code></pre></div>
 <p><strong>Key behaviors:</strong>
 - Loads embedded <code>single_coder.toml</code> if no config path is given
@@ -2021,7 +2021,7 @@
 - Useful for debugging and auditing</p>
 <hr />
 <h2 id="web_dashboard">web_dashboard</h2>
-<p>Starts a standalone web dashboard without using the <code>coder_agent</code> binary.</p>
+<p>Starts a standalone web dashboard without using the <code>qmtcode</code> binary.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>web_dashboard<span class="w"> </span>--features<span class="w"> </span>dashboard
 <a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>web_dashboard<span class="w"> </span>--features<span class="w"> </span>dashboard<span class="w"> </span>--<span class="w"> </span>--addr<span class="o">=</span><span class="m">0</span>.0.0.0:8080
 </code></pre></div>
@@ -2158,10 +2158,10 @@
 <hr />
 <h2 id="running-all-examples">Running All Examples</h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a><span class="c1"># Single agent - interactive ACP</span>
-<a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>coder_agent<span class="w"> </span>--<span class="w"> </span>--acp
+<a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--<span class="w"> </span>--acp
 <a id="__codelineno-19-3" name="__codelineno-19-3" href="#__codelineno-19-3"></a>
 <a id="__codelineno-19-4" name="__codelineno-19-4" href="#__codelineno-19-4"></a><span class="c1"># Single agent - web dashboard</span>
-<a id="__codelineno-19-5" name="__codelineno-19-5" href="#__codelineno-19-5"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>coder_agent<span class="w"> </span>--features<span class="w"> </span>dashboard<span class="w"> </span>--<span class="w"> </span>--dashboard
+<a id="__codelineno-19-5" name="__codelineno-19-5" href="#__codelineno-19-5"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>dashboard<span class="w"> </span>--<span class="w"> </span>--dashboard
 <a id="__codelineno-19-6" name="__codelineno-19-6" href="#__codelineno-19-6"></a>
 <a id="__codelineno-19-7" name="__codelineno-19-7" href="#__codelineno-19-7"></a><span class="c1"># Multi-agent delegation</span>
 <a id="__codelineno-19-8" name="__codelineno-19-8" href="#__codelineno-19-8"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>auto_delegation_example
@@ -2180,13 +2180,13 @@
 </code></pre></div>
 <h2 id="building-a-release-binary">Building a Release Binary</h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a><span class="c1"># Build optimized binary</span>
-<a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--example<span class="w"> </span>coder_agent<span class="w"> </span>--features<span class="w"> </span>dashboard
+<a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>dashboard
 <a id="__codelineno-20-3" name="__codelineno-20-3" href="#__codelineno-20-3"></a>
 <a id="__codelineno-20-4" name="__codelineno-20-4" href="#__codelineno-20-4"></a><span class="c1"># Clear macOS quarantine flag</span>
-<a id="__codelineno-20-5" name="__codelineno-20-5" href="#__codelineno-20-5"></a>xattr<span class="w"> </span>-dr<span class="w"> </span>com.apple.quarantine<span class="w"> </span>target/release/examples/coder_agent
+<a id="__codelineno-20-5" name="__codelineno-20-5" href="#__codelineno-20-5"></a>xattr<span class="w"> </span>-dr<span class="w"> </span>com.apple.quarantine<span class="w"> </span>target/release/examples/qmtcode
 <a id="__codelineno-20-6" name="__codelineno-20-6" href="#__codelineno-20-6"></a>
 <a id="__codelineno-20-7" name="__codelineno-20-7" href="#__codelineno-20-7"></a><span class="c1"># Run the binary</span>
-<a id="__codelineno-20-8" name="__codelineno-20-8" href="#__codelineno-20-8"></a>./target/release/examples/coder_agent<span class="w"> </span>--dashboard
+<a id="__codelineno-20-8" name="__codelineno-20-8" href="#__codelineno-20-8"></a>./target/release/examples/qmtcode<span class="w"> </span>--dashboard
 </code></pre></div>
 <h2 id="related-documentation">Related Documentation</h2>
 <ul>
