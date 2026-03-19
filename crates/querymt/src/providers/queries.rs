@@ -45,12 +45,21 @@ impl ProvidersRegistry {
         self.get_model(provider, model).map(|m| &m.pricing)
     }
 
+    pub fn get_limits(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<&super::types::ModelLimits> {
+        self.get_model(provider, model).map(|m| &m.limits)
+    }
+
+    /// Backward-compatible alias for `get_limits`.
     pub fn get_constraints(
         &self,
         provider: &str,
         model: &str,
-    ) -> Option<&super::types::ModelConstraints> {
-        self.get_model(provider, model).map(|m| &m.constraints)
+    ) -> Option<&super::types::ModelLimits> {
+        self.get_limits(provider, model)
     }
 
     pub fn get_capabilities(

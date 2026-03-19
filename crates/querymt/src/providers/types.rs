@@ -33,11 +33,17 @@ pub struct ProviderInfo {
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
+    #[serde(flatten)]
     pub capabilities: ModelCapabilities,
     #[serde(rename = "limit", default)]
-    pub constraints: ModelConstraints,
+    pub limits: ModelLimits,
     #[serde(rename = "cost", default)]
     pub pricing: ModelPricing,
+    // Top-level metadata fields from the API
+    pub knowledge: Option<String>,
+    pub release_date: Option<String>,
+    pub last_updated: Option<String>,
+    pub open_weights: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -61,14 +67,13 @@ pub struct Modalities {
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(default)]
-pub struct ModelConstraints {
-    pub knowledge: Option<String>,
-    pub release_date: Option<String>,
-    pub last_updated: Option<String>,
+pub struct ModelLimits {
     pub context: Option<u64>,
     pub output: Option<u64>,
-    pub open_weights: Option<bool>,
 }
+
+/// Kept as a type alias for backward compatibility.
+pub type ModelConstraints = ModelLimits;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(default)]
@@ -156,17 +161,17 @@ impl ModelInfo {
 
     /// Get context window limit in tokens
     pub fn context_limit(&self) -> Option<u64> {
-        self.constraints.context
+        self.limits.context
     }
 
     /// Get maximum output tokens
     pub fn output_limit(&self) -> Option<u64> {
-        self.constraints.output
+        self.limits.output
     }
 
     /// Check if requested output tokens are within model's limit
     pub fn validate_output_limit(&self, requested_tokens: u64) -> Result<(), String> {
-        if let Some(limit) = self.constraints.output
+        if let Some(limit) = self.limits.output
             && requested_tokens > limit
         {
             return Err(format!(
@@ -258,12 +263,11 @@ mod tests {
         let model = ModelInfo {
             id: "test-model".to_string(),
             name: "Test Model".to_string(),
-            capabilities: ModelCapabilities::default(),
-            constraints: ModelConstraints {
+            limits: ModelLimits {
                 output: Some(4096),
                 ..Default::default()
             },
-            pricing: ModelPricing::default(),
+            ..Default::default()
         };
 
         assert!(model.validate_output_limit(4000).is_ok());
@@ -276,15 +280,49 @@ mod tests {
         let model = ModelInfo {
             id: "test-model".to_string(),
             name: "Test Model".to_string(),
-            capabilities: ModelCapabilities::default(),
-            constraints: ModelConstraints {
+            limits: ModelLimits {
                 output: None,
                 ..Default::default()
             },
-            pricing: ModelPricing::default(),
+            ..Default::default()
         };
 
         // Should pass with any value when no limit is set
         assert!(model.validate_output_limit(999999).is_ok());
+    }
+
+    #[test]
+    fn test_deserialize_flat_api_format() {
+        let json = r#"{
+            "id": "mistral-nemo",
+            "name": "Mistral Nemo",
+            "attachment": false,
+            "reasoning": false,
+            "tool_call": true,
+            "temperature": true,
+            "knowledge": "2024-07",
+            "release_date": "2024-07-01",
+            "last_updated": "2024-07-01",
+            "modalities": { "input": ["text"], "output": ["text"] },
+            "open_weights": true,
+            "cost": { "input": 0.15, "output": 0.15 },
+            "limit": { "context": 128000, "output": 128000 }
+        }"#;
+        let model: ModelInfo = serde_json::from_str(json).unwrap();
+
+        assert_eq!(model.id, "mistral-nemo");
+        assert!(model.capabilities.tool_call);
+        assert!(model.capabilities.temperature);
+        assert!(!model.capabilities.attachment);
+        assert!(!model.capabilities.reasoning);
+        assert_eq!(model.capabilities.modalities.input, vec!["text"]);
+        assert_eq!(model.capabilities.modalities.output, vec!["text"]);
+        assert_eq!(model.knowledge.as_deref(), Some("2024-07"));
+        assert_eq!(model.release_date.as_deref(), Some("2024-07-01"));
+        assert_eq!(model.open_weights, Some(true));
+        assert_eq!(model.limits.context, Some(128000));
+        assert_eq!(model.limits.output, Some(128000));
+        assert_eq!(model.pricing.input, Some(0.15));
+        assert_eq!(model.pricing.output, Some(0.15));
     }
 }
