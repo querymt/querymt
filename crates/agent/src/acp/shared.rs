@@ -13,10 +13,10 @@ use crate::session::domain::ForkOrigin;
 use agent_client_protocol::{
     Content, ContentBlock, ContentChunk, Error, Plan, PlanEntry, PlanEntryPriority,
     PlanEntryStatus, RequestPermissionOutcome, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, TextContent,
-    ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind,
+    SessionConfigOptionValue, SessionConfigSelectOption, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol_schema::AGENT_METHOD_NAMES;
 use serde::{Deserialize, Serialize};
@@ -363,7 +363,12 @@ async fn handle_set_session_config_option<S: SendAgent>(
         })));
     }
 
-    let mode = params.value.0.parse::<AgentMode>().map_err(|e| {
+    let SessionConfigOptionValue::ValueId { value: value_id } = params.value else {
+        return Err(Error::invalid_params().data(serde_json::json!({
+            "error": "mode config option requires a value id",
+        })));
+    };
+    let mode = value_id.0.parse::<AgentMode>().map_err(|e| {
         Error::invalid_params().data(serde_json::json!({
             "error": e,
         }))

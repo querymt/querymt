@@ -1055,7 +1055,7 @@ impl SendAgent for LocalAgentHandle {
     async fn authenticate(&self, req: AuthenticateRequest) -> Result<AuthenticateResponse, Error> {
         let auth_methods = &self.config.auth_methods;
 
-        if !auth_methods.is_empty() && !auth_methods.iter().any(|m| m.id == req.method_id) {
+        if !auth_methods.is_empty() && !auth_methods.iter().any(|m| *m.id() == req.method_id) {
             return Err(Error::invalid_params().data(serde_json::json!({
                 "message": "unknown auth method",
                 "methodId": req.method_id.to_string(),
