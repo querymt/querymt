@@ -139,7 +139,6 @@ async fn forwarder_drops_event_when_seq_is_at_or_below_cursor() -> Result<()> {
         workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
             crate::index::WorkspaceIndexManagerConfig::default(),
         ),
-        model_cache: moka::future::Cache::new(100),
         oauth_flows: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
     };
@@ -271,7 +270,6 @@ async fn forwarder_does_not_drop_ephemeral_events_despite_cursor() -> Result<()>
         workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
             crate::index::WorkspaceIndexManagerConfig::default(),
         ),
-        model_cache: moka::future::Cache::new(100),
         oauth_flows: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
     };

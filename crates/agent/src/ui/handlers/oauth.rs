@@ -284,7 +284,7 @@ pub async fn handle_complete_oauth_login(
                 stop_active_oauth_callback_listener_for_flow(state, flow_id, false).await;
 
                 state.agent.config.invalidate_provider_cache().await;
-                state.model_cache.invalidate(&()).await;
+                state.agent.model_registry.invalidate_all().await;
 
                 let _ = send_message(
                     tx,
@@ -418,7 +418,7 @@ pub async fn handle_disconnect_oauth(
                 .await;
 
                 state.agent.config.invalidate_provider_cache().await;
-                state.model_cache.invalidate(&()).await;
+                state.agent.model_registry.invalidate_all().await;
 
                 let _ = send_message(
                     tx,
@@ -829,7 +829,7 @@ async fn run_oauth_callback_listener_task(
             }
 
             state.agent.config.invalidate_provider_cache().await;
-            state.model_cache.invalidate(&()).await;
+            state.agent.model_registry.invalidate_all().await;
 
             let _ = send_message(
                 &tx,

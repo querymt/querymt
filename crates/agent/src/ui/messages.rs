@@ -47,33 +47,8 @@ pub enum RoutingMode {
     Broadcast,
 }
 
-/// Cached model list entry with canonical identity.
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelEntry {
-    /// Canonical internal identifier (e.g., "hf:repo:file.gguf", "file:/path/to/model.gguf", or provider-specific ID)
-    pub id: String,
-    /// Human-readable display label
-    pub label: String,
-    /// Model source: "preset", "cached", "custom", "catalog"
-    pub source: String,
-    /// Provider name
-    pub provider: String,
-    /// Original model identifier (for backwards compatibility)
-    pub model: String,
-    /// Stable node id where this provider lives. `None` = local node.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_id: Option<String>,
-    /// Human-readable node label for display purposes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_label: Option<String>,
-    /// Model family/repo for grouping (e.g., "Qwen2.5-Coder-32B-Instruct")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub family: Option<String>,
-    /// Quantization level (e.g., "Q8_0", "Q6_K", "unknown")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quant: Option<String>,
-}
+/// Re-export `ModelEntry` from the shared model registry.
+pub use crate::model_registry::ModelEntry;
 
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]

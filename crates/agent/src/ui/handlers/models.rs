@@ -1,88 +1,25 @@
 //! Model listing and selection handlers.
 //!
-//! - `handle_list_all_models` — fetch all models from all providers (with moka cache)
+//! - `handle_list_all_models` — fetch all models via shared `ModelRegistry`
 //! - `handle_get_recent_models` — recent models from ViewStore
 //! - `handle_set_session_model` — update the model for a specific session
 //! - `handle_list_auth_providers` — list all providers with auth status (OAuth + API key)
 //! - `handle_set_api_token` / `handle_clear_api_token` / `handle_set_auth_method` — API token management
-//! - `fetch_all_models` / `resolve_provider_api_key` / `resolve_base_url_for_provider` — helpers
 
 use super::super::ServerState;
 use super::super::connection::{send_error, send_message};
 use super::super::messages::{
-    AuthMethod, AuthProviderEntry, ModelEntry, OAuthStatus, ProviderCapabilityEntry,
-    UiServerMessage,
+    AuthMethod, AuthProviderEntry, OAuthStatus, ProviderCapabilityEntry, UiServerMessage,
 };
 use super::session_ops::ensure_session_loaded;
 use crate::session::store::CustomModel;
-#[cfg(feature = "remote")]
-use futures_util::StreamExt;
-use futures_util::future;
-use querymt::LLMParams;
-use querymt::plugin::{HTTPLLMProviderFactory, LLMProviderFactory};
 use querymt_provider_common::{
     DownloadProgress, DownloadStatus, HfModelRef, canonical_id_from_file, canonical_id_from_hf,
-    download_hf_gguf_with_progress, list_cached_hf_gguf_models, parse_gguf_metadata,
+    download_hf_gguf_with_progress, parse_gguf_metadata,
 };
-use serde_json::Value;
 use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
-
-// ── Provider config helpers ───────────────────────────────────────────────────
-
-pub(super) fn resolve_base_url_for_provider(state: &ServerState, provider: &str) -> Option<String> {
-    let cfg: &LLMParams = state.agent.config.provider.initial_config();
-    if cfg.provider.as_deref()? != provider {
-        return None;
-    }
-    if let Some(base_url) = &cfg.base_url {
-        return Some(base_url.clone());
-    }
-    cfg.custom
-        .as_ref()
-        .and_then(|m| m.get("base_url"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-pub(super) fn resolve_model_for_provider(state: &ServerState, provider: &str) -> Option<String> {
-    let cfg: &LLMParams = state.agent.config.provider.initial_config();
-    if cfg.provider.as_deref()? != provider {
-        return None;
-    }
-
-    cfg.model.clone().or_else(|| {
-        cfg.custom
-            .as_ref()
-            .and_then(|m| m.get("model"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    })
-}
-
-/// Resolve API key for a provider from OAuth token store, stored API key, or environment variable.
-///
-/// OAuth resolution does not require `api_key_name()` — it uses the provider name
-/// to look up tokens. This allows OAuth-only providers (like Codex) that return
-/// `api_key_name() = None` to still resolve credentials.
-///
-/// Resolution order respects the provider's preferred auth method (if configured).
-async fn resolve_provider_api_key(
-    provider: &str,
-    factory: &dyn HTTPLLMProviderFactory,
-) -> Option<String> {
-    let preferred_method = crate::session::provider::preferred_auth_method(provider);
-    let mut use_oauth_resolver = false;
-
-    crate::session::provider::resolve_api_key_with_preference(
-        provider,
-        factory.api_key_name().as_deref(),
-        preferred_method.as_ref(),
-        &mut use_oauth_resolver,
-    )
-    .await
-}
 
 // ── Public handlers ───────────────────────────────────────────────────────────
 
@@ -246,7 +183,7 @@ pub async fn handle_set_api_token(
         Some(name) => match crate::SecretStore::new() {
             Ok(mut store) => match store.set(&name, api_key) {
                 Ok(()) => {
-                    state.model_cache.invalidate(&()).await;
+                    state.agent.model_registry.invalidate_all().await;
                     Ok(format!("API key stored for {} ({})", provider, name))
                 }
                 Err(e) => Err(format!("Failed to store API key: {}", e)),
@@ -272,7 +209,7 @@ pub async fn handle_clear_api_token(
         Some(name) => match crate::SecretStore::new() {
             Ok(mut store) => match store.delete(&name) {
                 Ok(()) => {
-                    state.model_cache.invalidate(&()).await;
+                    state.agent.model_registry.invalidate_all().await;
                     Ok(format!("API key cleared for {} ({})", provider, name))
                 }
                 Err(e) => Err(format!("Failed to clear API key: {}", e)),
@@ -308,33 +245,34 @@ pub async fn handle_set_auth_method(
     finish_auth_op(state, provider, result, tx).await;
 }
 
-/// Handle model listing request using moka cache.
+/// Handle model listing request using the shared `ModelRegistry`.
 pub async fn handle_list_all_models(state: &ServerState, refresh: bool, tx: &mpsc::Sender<String>) {
     if refresh {
-        state.model_cache.invalidate(&()).await;
+        state.agent.model_registry.invalidate_all().await;
     }
 
-    let result = state
-        .model_cache
-        .try_get_with((), fetch_all_models(state, tx))
+    #[cfg(feature = "remote")]
+    let models = state
+        .agent
+        .model_registry
+        .get_all_models(&state.agent.config, state.agent.mesh().as_ref())
+        .await;
+    #[cfg(not(feature = "remote"))]
+    let models = state
+        .agent
+        .model_registry
+        .get_all_models(&state.agent.config)
         .await;
 
-    match result {
-        Ok(models) => {
-            let _ = send_message(tx, UiServerMessage::AllModelsList { models }).await;
-            let capabilities = fetch_provider_capabilities(state).await;
-            let _ = send_message(
-                tx,
-                UiServerMessage::ProviderCapabilities {
-                    providers: capabilities,
-                },
-            )
-            .await;
-        }
-        Err(e) => {
-            let _ = send_error(tx, format!("Failed to fetch models: {}", e)).await;
-        }
-    }
+    let _ = send_message(tx, UiServerMessage::AllModelsList { models }).await;
+    let capabilities = fetch_provider_capabilities(state).await;
+    let _ = send_message(
+        tx,
+        UiServerMessage::ProviderCapabilities {
+            providers: capabilities,
+        },
+    )
+    .await;
 }
 
 /// Handle request for recent models from event history.
@@ -492,7 +430,7 @@ pub async fn handle_add_custom_model_from_hf(
                     .await;
                     return;
                 }
-                state_clone.model_cache.invalidate(&()).await;
+                state_clone.agent.model_registry.invalidate_all().await;
             }
             Err(err) => {
                 let _ = send_message(
@@ -563,7 +501,7 @@ pub async fn handle_add_custom_model_from_file(
         .upsert_custom_model(&custom)
         .await
         .map_err(|e| e.to_string())?;
-    state.model_cache.invalidate(&()).await;
+    state.agent.model_registry.invalidate_all().await;
     Ok(())
 }
 
@@ -578,7 +516,7 @@ pub async fn handle_delete_custom_model(
         .delete_custom_model(provider, model_id)
         .await
         .map_err(|e| e.to_string())?;
-    state.model_cache.invalidate(&()).await;
+    state.agent.model_registry.invalidate_all().await;
     Ok(())
 }
 
@@ -653,240 +591,6 @@ pub async fn handle_set_session_model(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Fetch models from all providers in parallel (local + remote mesh nodes).
-async fn fetch_all_models(
-    state: &ServerState,
-    tx: &mpsc::Sender<String>,
-) -> Result<Vec<ModelEntry>, String> {
-    // ── Local providers ───────────────────────────────────────────────────────
-    let local_models = fetch_local_models(state, tx).await;
-
-    // ── Remote mesh peers (requires `remote` feature) ─────────────────────────
-    #[cfg(feature = "remote")]
-    let remote_models = fetch_remote_models(state).await;
-    #[cfg(not(feature = "remote"))]
-    let remote_models: Vec<ModelEntry> = Vec::new();
-
-    let mut all = local_models;
-    all.extend(remote_models);
-    Ok(all)
-}
-
-/// Fetch models from the local plugin registry.
-async fn fetch_local_models(state: &ServerState, tx: &mpsc::Sender<String>) -> Vec<ModelEntry> {
-    let registry = state.agent.config.provider.plugin_registry();
-    registry.load_all_plugins().await;
-
-    let factories = registry.list();
-    let provider_names: Vec<String> = factories
-        .iter()
-        .map(|factory| factory.name().to_string())
-        .collect();
-    log::debug!(
-        "fetch_local_models: loaded {} providers: {:?}",
-        provider_names.len(),
-        provider_names
-    );
-
-    let futures: Vec<_> = factories
-        .into_iter()
-        .map(|factory| {
-            let tx = tx.clone();
-            let state = state.clone();
-            async move {
-                let provider_name = factory.name().to_string();
-                let mut models = fetch_catalog_models(&state, &factory, &provider_name, &tx).await;
-                let catalog_count = models.len();
-
-                if factory.supports_custom_models() {
-                    let cached = fetch_cached_gguf_models(&provider_name).await;
-                    let cached_count = cached.len();
-                    models.extend(cached);
-
-                    let custom = fetch_custom_models(&state, &provider_name).await;
-                    let custom_count = custom.len();
-                    models.extend(custom);
-
-                    let deduped = dedupe_models(models);
-                    log::debug!(
-                        "fetch_local_models: provider='{}' supports_custom_models=true catalog={} cached={} custom={} final={}",
-                        provider_name,
-                        catalog_count,
-                        cached_count,
-                        custom_count,
-                        deduped.len()
-                    );
-                    deduped
-                } else {
-                    let deduped = dedupe_models(models);
-                    log::debug!(
-                        "fetch_local_models: provider='{}' supports_custom_models=false catalog={} final={}",
-                        provider_name,
-                        catalog_count,
-                        deduped.len()
-                    );
-                    deduped
-                }
-            }
-        })
-        .collect();
-
-    let results: Vec<Vec<ModelEntry>> = future::join_all(futures).await;
-    let all: Vec<ModelEntry> = results.into_iter().flatten().collect();
-    log::debug!("fetch_local_models: returning {} total models", all.len());
-    all
-}
-
-async fn fetch_catalog_models(
-    state: &ServerState,
-    factory: &std::sync::Arc<dyn LLMProviderFactory>,
-    provider_name: &str,
-    tx: &mpsc::Sender<String>,
-) -> Vec<ModelEntry> {
-    let mut cfg = if let Some(http_factory) = factory.as_http() {
-        if let Some(api_key) = resolve_provider_api_key(provider_name, http_factory).await {
-            serde_json::json!({"api_key": api_key})
-        } else {
-            return Vec::new();
-        }
-    } else {
-        serde_json::json!({})
-    };
-
-    if let Some(base_url) = resolve_base_url_for_provider(state, provider_name) {
-        cfg["base_url"] = base_url.into();
-    }
-
-    // Non-HTTP providers like llama_cpp require `model` in config even for list_models.
-    if factory.as_http().is_none() {
-        if let Some(model) = resolve_model_for_provider(state, provider_name) {
-            cfg["model"] = model.into();
-        } else {
-            log::debug!(
-                "fetch_catalog_models: skipping provider='{}' catalog list because no configured model was found",
-                provider_name
-            );
-            return Vec::new();
-        }
-    }
-
-    let cfg_str = serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".to_string());
-    match factory.list_models(&cfg_str).await {
-        Ok(model_list) => model_list
-            .into_iter()
-            .map(|model| ModelEntry {
-                id: model.clone(),
-                label: model.clone(),
-                source: "catalog".to_string(),
-                provider: provider_name.to_string(),
-                model,
-                node_id: None,
-                node_label: None,
-                family: None,
-                quant: None,
-            })
-            .collect(),
-        Err(err) => {
-            let _ = send_error(
-                tx,
-                format!("Failed to list models for {}: {}", provider_name, err),
-            )
-            .await;
-            Vec::new()
-        }
-    }
-}
-
-async fn fetch_cached_gguf_models(provider: &str) -> Vec<ModelEntry> {
-    if provider != "llama_cpp" && provider != "mistralrs" {
-        return Vec::new();
-    }
-
-    let cached = match list_cached_hf_gguf_models() {
-        Ok(cached) => cached,
-        Err(err) => {
-            log::warn!(
-                "fetch_cached_gguf_models: provider='{}' failed to read HF GGUF cache: {}",
-                provider,
-                err
-            );
-            return Vec::new();
-        }
-    };
-
-    log::debug!(
-        "fetch_cached_gguf_models: provider='{}' discovered {} cached GGUF files",
-        provider,
-        cached.len()
-    );
-
-    cached
-        .into_iter()
-        .map(|cached_model| {
-            let id = canonical_id_from_hf(&cached_model.repo, &cached_model.filename);
-            let metadata = parse_gguf_metadata(&cached_model.filename);
-            ModelEntry {
-                id: id.clone(),
-                label: cached_model.filename,
-                source: "cached".to_string(),
-                provider: provider.to_string(),
-                model: id,
-                node_id: None,
-                node_label: None,
-                family: Some(metadata.family),
-                quant: Some(metadata.quant),
-            }
-        })
-        .collect()
-}
-
-async fn fetch_custom_models(state: &ServerState, provider: &str) -> Vec<ModelEntry> {
-    let Ok(custom_models) = state.session_store.list_custom_models(provider).await else {
-        return Vec::new();
-    };
-
-    custom_models
-        .into_iter()
-        .map(|m| {
-            let model = m
-                .config_json
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| m.model_id.clone());
-            ModelEntry {
-                id: m.model_id,
-                label: m.display_name,
-                source: "custom".to_string(),
-                provider: m.provider,
-                model,
-                node_id: None,
-                node_label: None,
-                family: m.family,
-                quant: m.quant,
-            }
-        })
-        .collect()
-}
-
-fn dedupe_models(models: Vec<ModelEntry>) -> Vec<ModelEntry> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-
-    for source in ["custom", "cached", "catalog", "preset"] {
-        for model in &models {
-            if model.source == source {
-                let key = format!("{}:{}", model.provider, model.id);
-                if seen.insert(key) {
-                    out.push(model.clone());
-                }
-            }
-        }
-    }
-
-    out
-}
-
 async fn validate_provider_supports_custom_models(
     state: &ServerState,
     provider: &str,
@@ -930,90 +634,6 @@ async fn fetch_provider_capabilities(state: &ServerState) -> Vec<ProviderCapabil
         .collect();
     providers.sort_by(|a, b| a.provider.cmp(&b.provider));
     providers
-}
-
-/// Query all reachable mesh peers for their available models.
-///
-/// This is best-effort: nodes that are unreachable or return errors are logged
-/// and skipped — the local model list is returned regardless.
-#[cfg(feature = "remote")]
-async fn fetch_remote_models(state: &ServerState) -> Vec<ModelEntry> {
-    use crate::agent::remote::{GetNodeInfo, ListAvailableModels, NodeId, RemoteNodeManager};
-
-    let Some(mesh) = state.agent.mesh() else {
-        return Vec::new();
-    };
-
-    let local_peer_id = *mesh.peer_id();
-    let mut stream =
-        mesh.lookup_all_actors::<RemoteNodeManager>(crate::agent::remote::dht_name::NODE_MANAGER);
-    let mut all_remote = Vec::new();
-
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(node_manager_ref) => {
-                // Skip local node — its models are already fetched via fetch_local_models.
-                if node_manager_ref.id().peer_id() == Some(&local_peer_id) {
-                    continue;
-                }
-
-                // Get the node's identity/label for tagging.
-                let node_info = match node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
-                    Ok(info) => info,
-                    Err(e) => {
-                        log::warn!("fetch_remote_models: GetNodeInfo failed: {}", e);
-                        continue;
-                    }
-                };
-                if NodeId::parse(&node_info.node_id.to_string()).is_err() {
-                    log::warn!(
-                        "fetch_remote_models: ignoring node with invalid id '{}'",
-                        node_info.node_id
-                    );
-                    continue;
-                }
-
-                // Query available models
-                match node_manager_ref
-                    .ask::<ListAvailableModels>(&ListAvailableModels)
-                    .await
-                {
-                    Ok(models) => {
-                        log::debug!(
-                            "fetch_remote_models: got {} models from node '{}' ({})",
-                            models.len(),
-                            node_info.hostname,
-                            node_info.node_id
-                        );
-                        for m in models {
-                            all_remote.push(ModelEntry {
-                                id: m.model.clone(),
-                                label: m.model.clone(),
-                                source: "catalog".to_string(),
-                                provider: m.provider,
-                                model: m.model,
-                                node_id: Some(node_info.node_id.to_string()),
-                                node_label: Some(node_info.hostname.clone()),
-                                family: None,
-                                quant: None,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "fetch_remote_models: ListAvailableModels failed for '{}' ({}): {}",
-                            node_info.hostname,
-                            node_info.node_id,
-                            e
-                        );
-                    }
-                }
-            }
-            Err(e) => log::warn!("fetch_remote_models: lookup error: {}", e),
-        }
-    }
-
-    all_remote
 }
 
 #[cfg(test)]

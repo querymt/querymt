@@ -151,6 +151,9 @@ pub struct LocalAgentHandle {
 
     #[cfg(feature = "remote")]
     remote_node_cache: Arc<RemoteNodeMetadataCache>,
+
+    /// Shared model registry for all model enumeration paths (UI, ACP, mesh).
+    pub model_registry: crate::model_registry::ModelRegistry,
 }
 
 impl LocalAgentHandle {
@@ -171,6 +174,7 @@ impl LocalAgentHandle {
             mesh: StdMutex::new(None),
             #[cfg(feature = "remote")]
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
+            model_registry: crate::model_registry::ModelRegistry::new(),
         }
     }
 
@@ -927,6 +931,17 @@ impl LocalAgentHandle {
     }
 }
 
+// ── Model registry convenience ────────────────────────────────────────────
+
+impl LocalAgentHandle {
+    /// Invalidate the model cache, forcing a fresh enumeration on next call.
+    ///
+    /// Delegates to `ModelRegistry::invalidate_all`.
+    pub async fn invalidate_model_cache(&self) {
+        self.model_registry.invalidate_all().await;
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 //  AgentHandle trait implementation for LocalAgentHandle
 // ══════════════════════════════════════════════════════════════════════════
@@ -1154,43 +1169,36 @@ impl SendAgent for LocalAgentHandle {
     async fn ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
         match req.method.as_ref() {
             "querymt/models" => {
-                // Enumerate all configured providers and their models.
-                // For now, return the default provider/model from config.
-                let initial = self.config.provider.initial_config();
-                let provider_name = initial.provider.as_deref().unwrap_or("unknown");
-                let model_name = initial.model.as_deref().unwrap_or("unknown");
-                let model_info = crate::model_info::get_model_info(provider_name, model_name);
+                // Return local + remote models via the shared ModelRegistry.
+                #[cfg(feature = "remote")]
+                let models = self
+                    .model_registry
+                    .get_all_models(&self.config, self.mesh().as_ref())
+                    .await;
+                #[cfg(not(feature = "remote"))]
+                let models = self.model_registry.get_all_models(&self.config).await;
 
-                let max_input: u64 = model_info
-                    .as_ref()
-                    .and_then(|m| m.context_limit())
-                    .unwrap_or(128_000);
-                let max_output: u64 = model_info
-                    .as_ref()
-                    .and_then(|m| m.output_limit())
-                    .unwrap_or(8_192);
-                let supports_attachments = model_info
-                    .as_ref()
-                    .map(|m| m.capabilities.attachment)
-                    .unwrap_or(false);
+                let result = serde_json::json!({ "models": models });
+                let json = serde_json::to_string(&result).map_err(|e| {
+                    Error::from(crate::error::AgentError::Serialization(e.to_string()))
+                })?;
+                let raw = serde_json::value::RawValue::from_string(json).map_err(|e| {
+                    Error::from(crate::error::AgentError::Serialization(e.to_string()))
+                })?;
+                Ok(ExtResponse::new(Arc::from(raw)))
+            }
+            "querymt/refreshModels" => {
+                // Invalidate and refresh all caches, return fresh results.
+                #[cfg(feature = "remote")]
+                let models = self
+                    .model_registry
+                    .refresh_all(&self.config, self.mesh().as_ref())
+                    .await;
+                #[cfg(not(feature = "remote"))]
+                let models = self.model_registry.refresh_all(&self.config).await;
 
-                let model_entry = serde_json::json!({
-                    "models": [{
-                        "id": model_name,
-                        "name": model_name,
-                        "family": provider_name,
-                        "version": "1",
-                        "provider": provider_name,
-                        "maxInputTokens": max_input,
-                        "maxOutputTokens": max_output,
-                        "capabilities": {
-                            "imageInput": supports_attachments,
-                            "toolCalling": true
-                        }
-                    }]
-                });
-
-                let json = serde_json::to_string(&model_entry).map_err(|e| {
+                let result = serde_json::json!({ "models": models });
+                let json = serde_json::to_string(&result).map_err(|e| {
                     Error::from(crate::error::AgentError::Serialization(e.to_string()))
                 })?;
                 let raw = serde_json::value::RawValue::from_string(json).map_err(|e| {

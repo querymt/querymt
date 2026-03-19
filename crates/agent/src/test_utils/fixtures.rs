@@ -143,7 +143,6 @@ impl TestServerState {
             workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
                 crate::index::WorkspaceIndexManagerConfig::default(),
             ),
-            model_cache: moka::future::Cache::new(100),
             oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
         };

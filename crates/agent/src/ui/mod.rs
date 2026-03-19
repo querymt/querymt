@@ -38,18 +38,14 @@ use axum::{
     routing::get,
 };
 use kameo::actor::ActorRef;
-use messages::{ModelEntry, RoutingMode as MsgRoutingMode};
-use moka::future::Cache;
+use messages::RoutingMode as MsgRoutingMode;
 use session::collect_event_sources;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-
-/// TTL for model cache (30 minutes)
-const MODEL_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// UI WebSocket server.
 pub struct UiServer {
@@ -62,7 +58,6 @@ pub struct UiServer {
     session_agents: Arc<Mutex<HashMap<String, String>>>,
     session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
-    model_cache: Cache<(), Vec<ModelEntry>>,
     oauth_flows: Arc<Mutex<HashMap<String, PendingOAuthFlow>>>,
     oauth_callback_listener: Arc<Mutex<Option<ActiveOAuthCallbackListener>>>,
 }
@@ -79,7 +74,6 @@ pub(crate) struct ServerState {
     pub session_agents: Arc<Mutex<HashMap<String, String>>>,
     pub session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     pub workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
-    pub model_cache: Cache<(), Vec<ModelEntry>>,
     pub oauth_flows: Arc<Mutex<HashMap<String, PendingOAuthFlow>>>,
     pub oauth_callback_listener: Arc<Mutex<Option<ActiveOAuthCallbackListener>>>,
 }
@@ -148,7 +142,6 @@ impl UiServer {
         default_cwd: Option<PathBuf>,
     ) -> Self {
         let event_sources = collect_event_sources(&agent);
-        let model_cache = Cache::builder().time_to_live(MODEL_CACHE_TTL).build();
 
         Self {
             agent: agent.clone(),
@@ -160,7 +153,6 @@ impl UiServer {
             session_agents: Arc::new(Mutex::new(HashMap::new())),
             session_cwds: Arc::new(Mutex::new(HashMap::new())),
             workspace_manager: agent.workspace_manager_actor(),
-            model_cache,
             oauth_flows: Arc::new(Mutex::new(HashMap::new())),
             oauth_callback_listener: Arc::new(Mutex::new(None)),
         }
@@ -178,7 +170,6 @@ impl UiServer {
             session_agents: self.session_agents,
             session_cwds: self.session_cwds,
             workspace_manager: self.workspace_manager,
-            model_cache: self.model_cache,
             oauth_flows: self.oauth_flows,
             oauth_callback_listener: self.oauth_callback_listener,
         };
