@@ -322,18 +322,18 @@ mod tests {
         // Each entry line is depth-prefixed: "N name" or "N name/"
         // Depth 0 entries are direct children of root
         assert!(
-            lines.iter().any(|l| *l == "0 subdir/"),
+            lines.contains(&"0 subdir/"),
             "Should have depth-0 directory 'subdir/': got {:?}",
             lines
         );
         assert!(
-            lines.iter().any(|l| *l == "0 file1.txt"),
+            lines.contains(&"0 file1.txt"),
             "Should have depth-0 file 'file1.txt': got {:?}",
             lines
         );
         // file2.txt is inside subdir, so depth 1
         assert!(
-            lines.iter().any(|l| *l == "1 file2.txt"),
+            lines.contains(&"1 file2.txt"),
             "Should have depth-1 file 'file2.txt': got {:?}",
             lines
         );
@@ -364,13 +364,10 @@ mod tests {
         let result = ListTool::format_tree(entries, root, false);
         let lines: Vec<&str> = result.lines().collect();
 
-        assert!(lines.iter().any(|l| *l == "0 a/"), "depth-0 dir a/");
-        assert!(lines.iter().any(|l| *l == "1 b/"), "depth-1 dir b/");
-        assert!(lines.iter().any(|l| *l == "2 c/"), "depth-2 dir c/");
-        assert!(
-            lines.iter().any(|l| *l == "3 deep.txt"),
-            "depth-3 file deep.txt"
-        );
+        assert!(lines.contains(&"0 a/"), "depth-0 dir a/");
+        assert!(lines.contains(&"1 b/"), "depth-1 dir b/");
+        assert!(lines.contains(&"2 c/"), "depth-2 dir c/");
+        assert!(lines.contains(&"3 deep.txt"), "depth-3 file deep.txt");
     }
 
     #[test]

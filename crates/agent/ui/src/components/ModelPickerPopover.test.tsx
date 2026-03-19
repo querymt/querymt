@@ -263,7 +263,7 @@ describe('ModelPickerPopover', () => {
           {...defaultProps}
           currentProvider="llama_cpp"
           currentModel="model.gguf"
-          allModels={[{ provider: 'llama_cpp', model: 'model.gguf', source: 'catalog', id: 'hf:repo:model.gguf' }]}
+          allModels={[{ provider: 'llama_cpp', model: 'model.gguf', source: 'catalog', id: 'llama_cpp/hf:repo:model.gguf' }]}
         />
       );
       expect(screen.getByText(/Add custom model \(llama_cpp\)/i)).toBeInTheDocument();
@@ -280,7 +280,7 @@ describe('ModelPickerPopover', () => {
           {...defaultProps}
           currentProvider="llama_cpp"
           currentModel="model.gguf"
-          allModels={[{ provider: 'llama_cpp', model: 'model.gguf', source: 'custom', id: 'hf:repo:model.gguf' }]}
+          allModels={[{ provider: 'llama_cpp', model: 'model.gguf', source: 'custom', id: 'llama_cpp/hf:repo:model.gguf' }]}
           onAddCustomModelFromHf={onAddCustomModelFromHf}
           onAddCustomModelFromFile={onAddCustomModelFromFile}
           onDeleteCustomModel={onDeleteCustomModel}
@@ -297,7 +297,7 @@ describe('ModelPickerPopover', () => {
       expect(onAddCustomModelFromFile).toHaveBeenCalledWith('llama_cpp', '/tmp/model.gguf', 'model.gguf');
 
       await user.click(screen.getByTitle('Delete selected custom model'));
-      expect(onDeleteCustomModel).toHaveBeenCalledWith('llama_cpp', 'hf:repo:model.gguf');
+      expect(onDeleteCustomModel).toHaveBeenCalledWith('llama_cpp', 'llama_cpp/hf:repo:model.gguf');
     });
 
     it('renders download status text for selected provider', () => {
@@ -306,7 +306,7 @@ describe('ModelPickerPopover', () => {
           {...defaultProps}
           currentProvider="llama_cpp"
           currentModel="model.gguf"
-          allModels={[{ provider: 'llama_cpp', model: 'model.gguf', source: 'catalog', id: 'hf:repo:model.gguf' }]}
+          allModels={[{ provider: 'llama_cpp', model: 'model.gguf', source: 'catalog', id: 'llama_cpp/hf:repo:model.gguf' }]}
           modelDownloads={{
             'llama_cpp:hf:repo:model.gguf': {
               provider: 'llama_cpp',
@@ -337,7 +337,7 @@ describe('ModelPickerPopover', () => {
             {
               provider: 'llama_cpp',
               model: 'Q8_0',
-              id: 'hf:repo:model-Q8_0.gguf',
+              id: 'llama_cpp/hf:repo:model-Q8_0.gguf',
               label: 'model-Q8_0.gguf',
               source: 'custom',
             },
@@ -470,6 +470,105 @@ describe('ModelPickerPopover', () => {
         expect(screen.getByText('remote-host')).toBeInTheDocument();
         expect(screen.queryByText(REMOTE_NODE_ID)).not.toBeInTheDocument();
       });
+    });
+  });
+
+  describe('Model ID pass-through (no double-prefixing)', () => {
+    it('passes provider-prefixed catalog model id directly without double-prefixing', async () => {
+      const user = userEvent.setup();
+      const onSetSessionModel = vi.fn();
+
+      render(
+        <ModelPickerPopover
+          {...defaultProps}
+          currentProvider="anthropic"
+          currentModel="claude-opus-4-6"
+          onSetSessionModel={onSetSessionModel}
+          allModels={[
+            {
+              provider: 'anthropic',
+              model: 'claude-opus-4-6',
+              id: 'anthropic/claude-opus-4-6',
+              label: 'claude-opus-4-6',
+              source: 'catalog',
+            },
+          ]}
+        />
+      );
+
+      await user.click(screen.getByText('claude-opus-4-6'));
+
+      expect(onSetSessionModel).toHaveBeenCalledWith(
+        'session-1',
+        'anthropic/claude-opus-4-6',
+        undefined,
+      );
+    });
+
+    it('passes canonical hf: model id with provider prefix without double-prefixing', async () => {
+      const user = userEvent.setup();
+      const onSetSessionModel = vi.fn();
+
+      render(
+        <ModelPickerPopover
+          {...defaultProps}
+          currentProvider="llama_cpp"
+          currentModel="hf:unsloth/Qwen2.5-Coder:Q8_0.gguf"
+          onSetSessionModel={onSetSessionModel}
+          allModels={[
+            {
+              provider: 'llama_cpp',
+              model: 'hf:unsloth/Qwen2.5-Coder:Q8_0.gguf',
+              id: 'llama_cpp/hf:unsloth/Qwen2.5-Coder:Q8_0.gguf',
+              label: 'Q8_0.gguf',
+              source: 'cached',
+              family: 'Qwen2.5-Coder',
+              quant: 'Q8_0',
+            },
+          ]}
+        />
+      );
+
+      await user.click(screen.getByText('Q8_0.gguf'));
+
+      expect(onSetSessionModel).toHaveBeenCalledWith(
+        'session-1',
+        'llama_cpp/hf:unsloth/Qwen2.5-Coder:Q8_0.gguf',
+        undefined,
+      );
+    });
+
+    it('composes provider/model when id is missing (legacy entries)', async () => {
+      const user = userEvent.setup();
+      const onSetSessionModel = vi.fn();
+
+      render(
+        <ModelPickerPopover
+          {...defaultProps}
+          currentProvider="openai"
+          currentModel="gpt-4"
+          onSetSessionModel={onSetSessionModel}
+          allModels={[
+            {
+              provider: 'openai',
+              model: 'gpt-4',
+              id: 'gpt-4',
+              label: 'gpt-4',
+              source: 'catalog',
+            },
+          ]}
+          recentModelsByWorkspace={{}}
+        />
+      );
+
+      await user.click(screen.getByText('gpt-4'));
+
+      // Legacy id without provider prefix — should compose provider/model
+      expect(onSetSessionModel).toHaveBeenCalledWith(
+        'session-1',
+        'openai/gpt-4',
+        undefined,
+      );
     });
   });
 });

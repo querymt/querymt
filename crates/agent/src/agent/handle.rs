@@ -1206,6 +1206,65 @@ impl SendAgent for LocalAgentHandle {
                 })?;
                 Ok(ExtResponse::new(Arc::from(raw)))
             }
+            "querymt/modelInfo" => {
+                // Batch lookup of model metadata from the providers registry.
+                // Request:  { "models": [{ "provider": "openai", "model": "gpt-4" }, ...] }
+                // Response: { "models": { "openai:gpt-4": <ModelInfo|null>, ... } }
+                #[derive(serde::Deserialize)]
+                struct ModelInfoRequest {
+                    #[serde(default)]
+                    models: Vec<ModelKey>,
+                }
+                #[derive(serde::Deserialize)]
+                struct ModelKey {
+                    provider: String,
+                    model: String,
+                }
+
+                let parsed: ModelInfoRequest =
+                    serde_json::from_str(req.params.get()).map_err(|e| {
+                        Error::from(crate::error::AgentError::Serialization(e.to_string()))
+                    })?;
+
+                let registry = querymt::providers::read_providers_from_cache();
+                let mut info_map = serde_json::Map::new();
+
+                match registry {
+                    Ok(reg) => {
+                        for key in &parsed.models {
+                            let lookup = reg.get_model(&key.provider, &key.model);
+                            let map_key = format!("{}/{}", key.provider, key.model);
+                            match lookup {
+                                Some(model_info) => {
+                                    let val = serde_json::to_value(model_info)
+                                        .unwrap_or(serde_json::Value::Null);
+                                    info_map.insert(map_key, val);
+                                }
+                                None => {
+                                    info_map.insert(map_key, serde_json::Value::Null);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to load providers registry for modelInfo: {}", e);
+                        // Return all nulls
+                        for key in &parsed.models {
+                            let map_key = format!("{}/{}", key.provider, key.model);
+                            info_map.insert(map_key, serde_json::Value::Null);
+                        }
+                    }
+                }
+
+                let result = serde_json::json!({ "models": info_map });
+                let json = serde_json::to_string(&result).map_err(|e| {
+                    Error::from(crate::error::AgentError::Serialization(e.to_string()))
+                })?;
+                let raw = serde_json::value::RawValue::from_string(json).map_err(|e| {
+                    Error::from(crate::error::AgentError::Serialization(e.to_string()))
+                })?;
+                Ok(ExtResponse::new(Arc::from(raw)))
+            }
             "querymt/chat" => {
                 // One-shot chat completion using specified model.
                 // This is a stub — full implementation requires wiring up the

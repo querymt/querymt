@@ -112,7 +112,9 @@ function itemValue(provider: string, model: string, node?: string): string {
 
 function sessionModelId(provider: string, model: string, id?: string): string {
   const canonical = id ?? model;
-  return canonical.includes(':') ? `${provider}/${canonical}` : `${provider}/${canonical}`;
+  // If id already starts with "provider/", pass it through as-is to avoid double-prefixing.
+  if (canonical.startsWith(`${provider}/`)) return canonical;
+  return `${provider}/${canonical}`;
 }
 
 /* ------------------------------------------------------------------ */

@@ -225,7 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(models) if !models.is_empty() => {
                             println!();
                             for model in models {
-                                println!("  - {}:{}", factory.name(), model);
+                                println!("  - {}/{}", factory.name(), model);
                             }
                         }
                         Ok(_) => {

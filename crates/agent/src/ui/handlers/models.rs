@@ -505,15 +505,25 @@ pub async fn handle_add_custom_model_from_file(
     Ok(())
 }
 
+fn normalize_custom_model_id_for_storage<'a>(provider: &str, model_id: &'a str) -> &'a str {
+    model_id
+        .strip_prefix(&format!("{}/", provider))
+        .unwrap_or(model_id)
+}
+
 pub async fn handle_delete_custom_model(
     state: &ServerState,
     provider: &str,
     model_id: &str,
 ) -> Result<(), String> {
     validate_provider_supports_custom_models(state, provider).await?;
+
+    // Accept both canonical transport IDs ("provider/model") and legacy raw model ids.
+    let bare_model_id = normalize_custom_model_id_for_storage(provider, model_id);
+
     state
         .session_store
-        .delete_custom_model(provider, model_id)
+        .delete_custom_model(provider, bare_model_id)
         .await
         .map_err(|e| e.to_string())?;
     state.agent.model_registry.invalidate_all().await;
@@ -735,5 +745,17 @@ mod tests {
         assert_eq!(msg["type"], "auth_providers");
         let providers = msg["data"]["providers"].as_array().unwrap();
         assert!(providers.is_empty());
+    }
+
+    #[test]
+    fn normalize_custom_model_id_for_storage_strips_provider_prefix() {
+        let id = normalize_custom_model_id_for_storage("llama_cpp", "llama_cpp/hf:repo:model.gguf");
+        assert_eq!(id, "hf:repo:model.gguf");
+    }
+
+    #[test]
+    fn normalize_custom_model_id_for_storage_preserves_legacy_raw_id() {
+        let id = normalize_custom_model_id_for_storage("llama_cpp", "hf:repo:model.gguf");
+        assert_eq!(id, "hf:repo:model.gguf");
     }
 }

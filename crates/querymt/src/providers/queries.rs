@@ -45,11 +45,7 @@ impl ProvidersRegistry {
         self.get_model(provider, model).map(|m| &m.pricing)
     }
 
-    pub fn get_limits(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> Option<&super::types::ModelLimits> {
+    pub fn get_limits(&self, provider: &str, model: &str) -> Option<&super::types::ModelLimits> {
         self.get_model(provider, model).map(|m| &m.limits)
     }
 

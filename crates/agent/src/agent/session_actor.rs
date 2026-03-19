@@ -30,6 +30,18 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, instrument};
 use uuid::Uuid;
 
+fn parse_transport_model_id(model_id: &str, fallback_provider: &str) -> (String, String) {
+    if let Some(slash_pos) = model_id.find('/') {
+        (
+            model_id[..slash_pos].to_string(),
+            model_id[slash_pos + 1..].to_string(),
+        )
+    } else {
+        // Backward compatibility for legacy clients that still send a bare model id.
+        (fallback_provider.to_string(), model_id.to_string())
+    }
+}
+
 /// Per-session actor. Each session gets its own actor with isolated state.
 #[derive(Actor)]
 pub struct SessionActor {
@@ -349,24 +361,19 @@ impl Message<SetSessionModel> for SessionActor {
             })?;
 
         let model_id = msg.req.model_id.to_string();
-        let (provider, model) = if let Some(slash_pos) = model_id.find('/') {
-            (
-                model_id[..slash_pos].to_string(),
-                model_id[slash_pos + 1..].to_string(),
-            )
-        } else {
-            let current_config = self
-                .config
-                .provider
-                .history_store()
-                .get_session_llm_config(&session_id)
-                .await
-                .map_err(|e| AgentError::Internal(e.to_string()))?;
-            let provider = current_config
-                .map(|c| c.provider)
-                .unwrap_or_else(|| "anthropic".to_string());
-            (provider, model_id)
-        };
+        let current_config = self
+            .config
+            .provider
+            .history_store()
+            .get_session_llm_config(&session_id)
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
+        let fallback_provider = current_config
+            .as_ref()
+            .map(|c| c.provider.as_str())
+            .unwrap_or("anthropic");
+
+        let (provider, model) = parse_transport_model_id(&model_id, fallback_provider);
 
         let system_prompt = self.get_session_system_prompt().await;
         let mut llm_config_input = querymt::LLMParams::new()
@@ -1825,6 +1832,28 @@ mod tests {
     }
 
     // ── Token state machine tests ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_transport_model_id_splits_on_first_slash() {
+        let (provider, model) = parse_transport_model_id(
+            "llama_cpp/hf:unsloth/Qwen3.5-4B-GGUF:Q5_K_M.gguf",
+            "anthropic",
+        );
+        assert_eq!(provider, "llama_cpp");
+        assert_eq!(model, "hf:unsloth/Qwen3.5-4B-GGUF:Q5_K_M.gguf");
+
+        let (provider, model) =
+            parse_transport_model_id("openrouter/openai/gpt-5.3-codex", "anthropic");
+        assert_eq!(provider, "openrouter");
+        assert_eq!(model, "openai/gpt-5.3-codex");
+    }
+
+    #[test]
+    fn parse_transport_model_id_uses_fallback_for_legacy_bare_ids() {
+        let (provider, model) = parse_transport_model_id("claude-opus-4-6", "anthropic");
+        assert_eq!(provider, "anthropic");
+        assert_eq!(model, "claude-opus-4-6");
+    }
 
     #[test]
     fn stale_prompt_finished_generation_is_ignored() {

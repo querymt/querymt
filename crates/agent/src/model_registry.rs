@@ -313,7 +313,7 @@ async fn fetch_catalog_models(
         Ok(model_list) => model_list
             .into_iter()
             .map(|model| ModelEntry {
-                id: model.clone(),
+                id: format!("{}/{}", provider_name, model),
                 label: model.clone(),
                 source: "catalog".to_string(),
                 provider: provider_name.to_string(),
@@ -368,7 +368,7 @@ async fn fetch_cached_gguf_models(provider: &str) -> Vec<ModelEntry> {
             let id = canonical_id_from_hf(&cached_model.repo, &cached_model.filename);
             let metadata = parse_gguf_metadata(&cached_model.filename);
             ModelEntry {
-                id: id.clone(),
+                id: format!("{}/{}", provider, id),
                 label: cached_model.filename,
                 source: "cached".to_string(),
                 provider: provider.to_string(),
@@ -398,7 +398,7 @@ async fn fetch_custom_models(config: &AgentConfig, provider: &str) -> Vec<ModelE
                 .map(str::to_string)
                 .unwrap_or_else(|| m.model_id.clone());
             ModelEntry {
-                id: m.model_id,
+                id: format!("{}/{}", m.provider.clone(), m.model_id),
                 label: m.display_name,
                 source: "custom".to_string(),
                 provider: m.provider,
@@ -420,7 +420,7 @@ fn dedupe_models(models: Vec<ModelEntry>) -> Vec<ModelEntry> {
     for source in ["custom", "cached", "catalog", "preset"] {
         for model in &models {
             if model.source == source {
-                let key = format!("{}:{}", model.provider, model.id);
+                let key = model.id.clone();
                 if seen.insert(key) {
                     out.push(model.clone());
                 }
@@ -482,7 +482,7 @@ async fn enumerate_remote_models(mesh: &crate::agent::remote::MeshHandle) -> Vec
                         );
                         for m in models {
                             all_remote.push(ModelEntry {
-                                id: m.model.clone(),
+                                id: format!("{}/{}", m.provider, m.model),
                                 label: m.model.clone(),
                                 source: "catalog".to_string(),
                                 provider: m.provider,
@@ -521,7 +521,7 @@ mod tests {
     fn dedupe_models_source_priority() {
         let models = vec![
             ModelEntry {
-                id: "model-a".into(),
+                id: "openai/model-a".into(),
                 label: "Model A (catalog)".into(),
                 source: "catalog".into(),
                 provider: "openai".into(),
@@ -532,7 +532,7 @@ mod tests {
                 quant: None,
             },
             ModelEntry {
-                id: "model-a".into(),
+                id: "openai/model-a".into(),
                 label: "Model A (custom)".into(),
                 source: "custom".into(),
                 provider: "openai".into(),
@@ -543,7 +543,7 @@ mod tests {
                 quant: None,
             },
             ModelEntry {
-                id: "model-b".into(),
+                id: "llama_cpp/model-b".into(),
                 label: "Model B".into(),
                 source: "cached".into(),
                 provider: "llama_cpp".into(),
@@ -560,13 +560,13 @@ mod tests {
         // custom wins over catalog for model-a
         assert_eq!(deduped[0].label, "Model A (custom)");
         assert_eq!(deduped[0].source, "custom");
-        assert_eq!(deduped[1].id, "model-b");
+        assert_eq!(deduped[1].id, "llama_cpp/model-b");
     }
 
     #[test]
     fn model_entry_serialization_shape() {
         let entry = ModelEntry {
-            id: "gpt-4".into(),
+            id: "openai/gpt-4".into(),
             label: "GPT-4".into(),
             source: "catalog".into(),
             provider: "openai".into(),
@@ -578,7 +578,7 @@ mod tests {
         };
 
         let json = serde_json::to_value(&entry).expect("serialize");
-        assert_eq!(json["id"], "gpt-4");
+        assert_eq!(json["id"], "openai/gpt-4");
         assert_eq!(json["source"], "catalog");
         // Optional None fields should be absent
         assert!(json.get("node_id").is_none());
@@ -588,7 +588,7 @@ mod tests {
     #[test]
     fn model_entry_with_node_serialization() {
         let entry = ModelEntry {
-            id: "model-x".into(),
+            id: "anthropic/model-x".into(),
             label: "Model X".into(),
             source: "catalog".into(),
             provider: "anthropic".into(),
@@ -611,5 +611,37 @@ mod tests {
         let registry = ModelRegistry::new();
         // Just verify invalidation doesn't panic on empty caches
         registry.invalidate_all().await;
+    }
+
+    /// Verifies that ModelEntry.id can be parsed back into (provider, model) by
+    /// splitting on the first `/`. This is the contract that session_actor relies on.
+    #[test]
+    fn model_entry_id_parses_provider_and_model() {
+        // Catalog model: provider/model
+        let id = "anthropic/claude-opus-4-6";
+        let slash = id.find('/').expect("should contain /");
+        assert_eq!(&id[..slash], "anthropic");
+        assert_eq!(&id[slash + 1..], "claude-opus-4-6");
+
+        // HF cached model: provider/hf:org/repo:file (model part contains slashes)
+        let id = "llama_cpp/hf:unsloth/Qwen2.5-Coder-32B-Instruct-GGUF:Q8_0.gguf";
+        let slash = id.find('/').expect("should contain /");
+        assert_eq!(&id[..slash], "llama_cpp");
+        assert_eq!(
+            &id[slash + 1..],
+            "hf:unsloth/Qwen2.5-Coder-32B-Instruct-GGUF:Q8_0.gguf"
+        );
+
+        // File-path model: provider/file:/absolute/path
+        let id = "llama_cpp/file:/home/user/models/model.gguf";
+        let slash = id.find('/').expect("should contain /");
+        assert_eq!(&id[..slash], "llama_cpp");
+        assert_eq!(&id[slash + 1..], "file:/home/user/models/model.gguf");
+
+        // OpenRouter model with nested slash in model name
+        let id = "openrouter/openai/gpt-5.3-codex";
+        let slash = id.find('/').expect("should contain /");
+        assert_eq!(&id[..slash], "openrouter");
+        assert_eq!(&id[slash + 1..], "openai/gpt-5.3-codex");
     }
 }
