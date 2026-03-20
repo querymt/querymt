@@ -360,7 +360,9 @@ pub(crate) async fn cleanup_revert_on_prompt(
                 .delete_session_events_from(session_id, seq)
                 .await
             {
-                Ok(n) => { span.record("pruned_events", n); }
+                Ok(n) => {
+                    span.record("pruned_events", n);
+                }
                 Err(e) => warn!("Failed to prune event journal: {}", e),
             }
         }

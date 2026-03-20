@@ -6,8 +6,8 @@
 //! - File restoration
 //! - Proper reverted files list
 
-use crate::session::backend::StorageBackend;
 use crate::events::{AgentEventKind, EventOrigin};
+use crate::session::backend::StorageBackend;
 use crate::session::projection::{EventJournal, NewDurableEvent};
 use crate::test_utils::UndoTestFixture;
 use anyhow::Result;
@@ -547,20 +547,22 @@ async fn test_cleanup_revert_prunes_event_journal() -> Result<()> {
     let journal = fixture.storage.event_journal();
 
     // Turn 1: prompt + some events
-    let msg1_id = fixture.add_user_message(&session_id, "first prompt").await?;
+    let msg1_id = fixture
+        .add_user_message(&session_id, "first prompt")
+        .await?;
     let seq_prompt1 = append_prompt_event(&*journal, &session_id, &msg1_id).await;
     let _seq_after1 = append_generic_event(&*journal, &session_id).await;
 
     // Turn 2 (this will be undone): prompt + some events that should be pruned
-    let msg2_id = fixture.add_user_message(&session_id, "second prompt").await?;
+    let msg2_id = fixture
+        .add_user_message(&session_id, "second prompt")
+        .await?;
     let seq_prompt2 = append_prompt_event(&*journal, &session_id, &msg2_id).await;
     let seq_after2a = append_generic_event(&*journal, &session_id).await;
     let seq_after2b = append_generic_event(&*journal, &session_id).await;
 
     // Verify all 5 events are present before undo
-    let before = journal
-        .load_session_stream(&session_id, None, None)
-        .await?;
+    let before = journal.load_session_stream(&session_id, None, None).await?;
     assert_eq!(before.len(), 5, "expected 5 events before undo");
 
     // Undo turn 2 — this pushes a revert state with msg2_id as the frontier
@@ -579,9 +581,7 @@ async fn test_cleanup_revert_prunes_event_journal() -> Result<()> {
     // After cleanup: the frontier prompt_received event AND everything after
     // it must be gone — the undone turn's prompt and its follow-up events are
     // all pruned so they don't reappear on page reload.
-    let after = journal
-        .load_session_stream(&session_id, None, None)
-        .await?;
+    let after = journal.load_session_stream(&session_id, None, None).await?;
 
     // Turn-2 events (frontier prompt + two generic events) must all be pruned.
     assert!(
