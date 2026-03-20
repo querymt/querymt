@@ -750,4 +750,128 @@ mod provider_host_tests {
         assert_eq!(returned.len(), 1);
         assert_eq!(returned[0].function.name, "my_tool");
     }
+
+    // ── A.18 — ProviderTranscribeRequest serde round-trip ─────────────────────
+
+    #[test]
+    fn test_provider_transcribe_request_serde_roundtrip() {
+        use crate::agent::remote::provider_host::ProviderTranscribeRequest;
+
+        let req = ProviderTranscribeRequest {
+            provider: "openai".to_string(),
+            model: "whisper-1".to_string(),
+            request: querymt::stt::SttRequest::new()
+                .audio(vec![1, 2, 3, 4])
+                .filename("test.wav")
+                .language("en"),
+            params: Some(serde_json::json!({"temperature": 0.0})),
+        };
+
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: ProviderTranscribeRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.provider, "openai");
+        assert_eq!(back.model, "whisper-1");
+        assert_eq!(back.request.audio, vec![1, 2, 3, 4]);
+        assert_eq!(back.request.filename.as_deref(), Some("test.wav"));
+        assert_eq!(back.request.language.as_deref(), Some("en"));
+        assert!(back.params.is_some());
+    }
+
+    // ── A.19 — ProviderSpeechRequest serde round-trip ─────────────────────────
+
+    #[test]
+    fn test_provider_speech_request_serde_roundtrip() {
+        use crate::agent::remote::provider_host::ProviderSpeechRequest;
+
+        let req = ProviderSpeechRequest {
+            provider: "openai".to_string(),
+            model: "tts-1".to_string(),
+            request: querymt::tts::TtsRequest::new()
+                .text("hello world")
+                .format("mp3")
+                .speed(1.5),
+            params: None,
+        };
+
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: ProviderSpeechRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.provider, "openai");
+        assert_eq!(back.model, "tts-1");
+        assert_eq!(back.request.text, "hello world");
+        assert_eq!(back.request.format.as_deref(), Some("mp3"));
+        assert_eq!(back.request.speed, Some(1.5));
+        assert!(back.params.is_none());
+    }
+
+    // ── A.20 — ProviderTranscribeRequest params backward compat ───────────────
+
+    #[test]
+    fn test_provider_transcribe_request_params_none_backward_compat() {
+        use crate::agent::remote::provider_host::ProviderTranscribeRequest;
+
+        // JSON without "params" field should deserialize with params = None
+        let json = r#"{"provider":"openai","model":"whisper-1","request":{"audio":[]}}"#;
+        let req: ProviderTranscribeRequest = serde_json::from_str(json).expect("deserialize");
+        assert!(req.params.is_none());
+    }
+
+    // ── A.21 — ProviderHostActor transcribe handler error path ────────────────
+
+    #[tokio::test]
+    async fn test_provider_host_actor_transcribe_unknown_provider() {
+        use crate::agent::remote::provider_host::ProviderTranscribeRequest;
+
+        let f = ProviderHostFixture::new().await;
+        let req = ProviderTranscribeRequest {
+            provider: "nonexistent_stt_provider".to_string(),
+            model: "no-model".to_string(),
+            request: querymt::stt::SttRequest::new().audio(vec![0u8; 16]),
+            params: None,
+        };
+
+        let result = f.actor_ref.ask(req).await;
+        use kameo::error::SendError;
+        match result {
+            Err(SendError::HandlerError(e)) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("nonexistent_stt_provider") || msg.contains("provider"),
+                    "error should mention the provider: {}",
+                    msg
+                );
+            }
+            Ok(_) => panic!("expected an error for unknown provider"),
+            Err(e) => panic!("unexpected error variant: {:?}", e),
+        }
+    }
+
+    // ── A.22 — ProviderHostActor speech handler error path ────────────────────
+
+    #[tokio::test]
+    async fn test_provider_host_actor_speech_unknown_provider() {
+        use crate::agent::remote::provider_host::ProviderSpeechRequest;
+
+        let f = ProviderHostFixture::new().await;
+        let req = ProviderSpeechRequest {
+            provider: "nonexistent_tts_provider".to_string(),
+            model: "no-model".to_string(),
+            request: querymt::tts::TtsRequest::new().text("hello"),
+            params: None,
+        };
+
+        let result = f.actor_ref.ask(req).await;
+        use kameo::error::SendError;
+        match result {
+            Err(SendError::HandlerError(e)) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("nonexistent_tts_provider") || msg.contains("provider"),
+                    "error should mention the provider: {}",
+                    msg
+                );
+            }
+            Ok(_) => panic!("expected an error for unknown provider"),
+            Err(e) => panic!("unexpected error variant: {:?}", e),
+        }
+    }
 }

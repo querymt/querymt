@@ -46,6 +46,26 @@ pub trait ChatRunner: Send + Sync {
     fn dashboard(&self) -> AgentServer;
 }
 
+/// Unified interface for audio operations (STT/TTS).
+///
+/// Separate from `ChatRunner` because audio operations are fundamentally
+/// different from chat — they are stateless, session-independent, and deal
+/// with binary audio data rather than text conversations.
+#[async_trait]
+pub trait AudioRunner: Send + Sync {
+    /// Transcribe audio to text (speech-to-text).
+    async fn transcribe(
+        &self,
+        request: querymt::stt::SttRequest,
+    ) -> Result<querymt::stt::SttResponse>;
+
+    /// Synthesize speech from text (text-to-speech).
+    async fn speech(
+        &self,
+        request: querymt::tts::TtsRequest,
+    ) -> Result<querymt::tts::TtsResponse>;
+}
+
 /// Extension trait for convenient callback registration  
 pub trait ChatRunnerExt: ChatRunner {
     fn on_tool_call(&self, callback: impl Fn(String, Value) + Send + Sync + 'static) {
@@ -227,6 +247,22 @@ impl AgentRunner {
     /// Returns true if this is a multi-agent (quorum) runner.
     pub fn is_multi(&self) -> bool {
         self.0.is_multi()
+    }
+
+    /// Transcribe audio to text (speech-to-text).
+    pub async fn transcribe(
+        &self,
+        request: querymt::stt::SttRequest,
+    ) -> Result<querymt::stt::SttResponse> {
+        self.0.transcribe(request).await
+    }
+
+    /// Synthesize speech from text (text-to-speech).
+    pub async fn speech(
+        &self,
+        request: querymt::tts::TtsRequest,
+    ) -> Result<querymt::tts::TtsResponse> {
+        self.0.speech(request).await
     }
 }
 

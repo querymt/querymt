@@ -350,7 +350,74 @@ impl EmbeddingProvider for MeshChatProvider {
 
 // ── LLMProvider ───────────────────────────────────────────────────────────────
 
-impl LLMProvider for MeshChatProvider {}
+#[async_trait::async_trait]
+impl LLMProvider for MeshChatProvider {
+    #[tracing::instrument(
+        name = "remote.mesh_provider.transcribe",
+        skip(self, req),
+        fields(
+            provider = %self.provider_name,
+            model = %self.model,
+            target_node = %self.target_dht_name,
+            audio_bytes = req.audio.len(),
+        )
+    )]
+    async fn transcribe(
+        &self,
+        req: &querymt::stt::SttRequest,
+    ) -> Result<querymt::stt::SttResponse, LLMError> {
+        use crate::agent::remote::provider_host::ProviderTranscribeRequest;
+
+        let host_ref = self.lookup_provider_host().await?;
+
+        let request = ProviderTranscribeRequest {
+            provider: self.provider_name.clone(),
+            model: self.model.clone(),
+            request: req.clone(),
+            params: self.params.clone(),
+        };
+
+        host_ref.ask(&request).await.map_err(|e| {
+            LLMError::ProviderError(format!(
+                "MeshChatProvider: remote transcribe to '{}' failed: {}",
+                self.target_dht_name, e
+            ))
+        })
+    }
+
+    #[tracing::instrument(
+        name = "remote.mesh_provider.speech",
+        skip(self, req),
+        fields(
+            provider = %self.provider_name,
+            model = %self.model,
+            target_node = %self.target_dht_name,
+            text_len = req.text.len(),
+        )
+    )]
+    async fn speech(
+        &self,
+        req: &querymt::tts::TtsRequest,
+    ) -> Result<querymt::tts::TtsResponse, LLMError> {
+        use crate::agent::remote::provider_host::ProviderSpeechRequest;
+
+        let host_ref = self.lookup_provider_host().await?;
+
+        let request = ProviderSpeechRequest {
+            provider: self.provider_name.clone(),
+            model: self.model.clone(),
+            request: req.clone(),
+            params: self.params.clone(),
+        };
+
+        host_ref.ask(&request).await.map_err(|e| {
+            LLMError::ProviderError(format!(
+                "MeshChatProvider: remote speech to '{}' failed: {}",
+                self.target_dht_name, e
+            ))
+        })
+    }
+}
 
 // ── find_provider_on_mesh ─────────────────────────────────────────────────────
 

@@ -207,4 +207,94 @@ mod mesh_provider_tests {
             result
         );
     }
+
+    // ── B.9 — MeshChatProvider transcribe no host ────────────────────────────
+
+    #[tokio::test]
+    async fn test_mesh_chat_provider_transcribe_no_host() {
+        use querymt::LLMProvider;
+
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+        let unregistered = format!("unregistered-node-b9-{}", test_id);
+        let provider = MeshChatProvider::new(mesh, &unregistered, "openai", "whisper-1");
+
+        let req = querymt::stt::SttRequest::new().audio(vec![0u8; 16]);
+        let result = provider.transcribe(&req).await;
+        assert!(
+            matches!(result, Err(LLMError::ProviderError(_))),
+            "should return ProviderError when DHT name is not registered, got {:?}",
+            result
+        );
+    }
+
+    // ── B.10 — MeshChatProvider speech no host ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_mesh_chat_provider_speech_no_host() {
+        use querymt::LLMProvider;
+
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+        let unregistered = format!("unregistered-node-b10-{}", test_id);
+        let provider = MeshChatProvider::new(mesh, &unregistered, "openai", "tts-1");
+
+        let req = querymt::tts::TtsRequest::new().text("hello");
+        let result = provider.speech(&req).await;
+        assert!(
+            matches!(result, Err(LLMError::ProviderError(_))),
+            "should return ProviderError when DHT name is not registered, got {:?}",
+            result
+        );
+    }
+
+    // ── B.11 — MeshChatProvider transcribe with local host (provider not buildable) ─
+
+    #[tokio::test]
+    async fn test_mesh_chat_provider_transcribe_local_host() {
+        use querymt::LLMProvider;
+
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+
+        let f = ProviderHostFixture::new().await;
+        let node_id = format!("test-node-b11-{}", test_id);
+        let dht_name = crate::agent::remote::dht_name::provider_host(&node_id);
+        mesh.register_actor(f.actor_ref, dht_name.clone()).await;
+
+        let provider = MeshChatProvider::new(mesh, &node_id, "nonexistent", "no-model");
+
+        let req = querymt::stt::SttRequest::new().audio(vec![0u8; 16]);
+        let result = provider.transcribe(&req).await;
+        assert!(
+            matches!(result, Err(LLMError::ProviderError(_))),
+            "should return ProviderError (provider not buildable), got {:?}",
+            result
+        );
+    }
+
+    // ── B.12 — MeshChatProvider speech with local host (provider not buildable) ─
+
+    #[tokio::test]
+    async fn test_mesh_chat_provider_speech_local_host() {
+        use querymt::LLMProvider;
+
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+
+        let f = ProviderHostFixture::new().await;
+        let node_id = format!("test-node-b12-{}", test_id);
+        let dht_name = crate::agent::remote::dht_name::provider_host(&node_id);
+        mesh.register_actor(f.actor_ref, dht_name.clone()).await;
+
+        let provider = MeshChatProvider::new(mesh, &node_id, "nonexistent", "no-model");
+
+        let req = querymt::tts::TtsRequest::new().text("hello");
+        let result = provider.speech(&req).await;
+        assert!(
+            matches!(result, Err(LLMError::ProviderError(_))),
+            "should return ProviderError (provider not buildable), got {:?}",
+            result
+        );
+    }
 }

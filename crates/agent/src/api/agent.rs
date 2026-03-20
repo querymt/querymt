@@ -20,7 +20,9 @@ use crate::send_agent::SendAgent;
 use crate::server::AgentServer;
 use crate::session::backend::{StorageBackend, default_agent_db_path};
 use crate::session::sqlite_storage::SqliteStorage;
-use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
+use agent_client_protocol::{
+    ContentBlock, NewSessionRequest, PromptRequest, SetSessionModelRequest, TextContent,
+};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use querymt::LLMParams;
@@ -552,6 +554,125 @@ impl Agent {
         Ok(())
     }
 
+    /// Set model for the default session and optionally pin provider execution
+    /// to a specific mesh node.
+    pub async fn set_model_with_node(
+        &self,
+        model_id: &str,
+        provider_node_id: Option<&str>,
+    ) -> Result<()> {
+        let session_id = self.ensure_default_session().await?;
+
+        let req = SetSessionModelRequest::new(session_id.clone(), model_id.to_string());
+
+        #[cfg(feature = "remote")]
+        let provider_node_id = match provider_node_id {
+            Some(raw) => Some(
+                crate::agent::remote::NodeId::parse(raw)
+                    .map_err(|e| anyhow!(format!("invalid provider_node_id '{}': {}", raw, e)))?,
+            ),
+            None => None,
+        };
+
+        #[cfg(not(feature = "remote"))]
+        let provider_node_id: Option<crate::agent::remote::NodeId> = provider_node_id
+            .map(|raw| crate::agent::remote::NodeId::parse(raw))
+            .transpose()
+            .map_err(|e| anyhow!(format!("invalid provider_node_id: {}", e)))?;
+
+        let msg = crate::agent::messages::SetSessionModel {
+            req,
+            provider_node_id,
+        };
+
+        let session_ref = {
+            let registry = self.inner.registry.lock().await;
+            registry
+                .get(&session_id)
+                .cloned()
+                .ok_or_else(|| anyhow!(format!("Session not found: {}", session_id)))?
+        };
+
+        session_ref
+            .set_session_model_with_node(msg)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Transcribe audio to text (speech-to-text).
+    ///
+    /// This is a session-independent operation — no conversation history or
+    /// session state is needed. The provider is resolved from the agent's
+    /// initial config.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use querymt_agent::prelude::*;
+    /// use querymt::stt::SttRequest;
+    ///
+    /// # async fn example(agent: Agent, audio: Vec<u8>) -> anyhow::Result<()> {
+    /// let req = SttRequest::new().audio(audio);
+    /// let resp = agent.transcribe(req).await?;
+    /// println!("Transcript: {}", resp.text);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn transcribe(
+        &self,
+        request: querymt::stt::SttRequest,
+    ) -> Result<querymt::stt::SttResponse> {
+        let provider = self
+            .inner
+            .config
+            .provider
+            .build_default_provider()
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+        provider
+            .transcribe(&request)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    /// Synthesize speech from text (text-to-speech).
+    ///
+    /// This is a session-independent operation — no conversation history or
+    /// session state is needed. The provider is resolved from the agent's
+    /// initial config.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use querymt_agent::prelude::*;
+    /// use querymt::tts::TtsRequest;
+    ///
+    /// # async fn example(agent: Agent, text: String) -> anyhow::Result<()> {
+    /// let req = TtsRequest::new().text(text);
+    /// let resp = agent.speech(req).await?;
+    /// std::fs::write("output.mp3", &resp.audio)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn speech(
+        &self,
+        request: querymt::tts::TtsRequest,
+    ) -> Result<querymt::tts::TtsResponse> {
+        let provider = self
+            .inner
+            .config
+            .provider
+            .build_default_provider()
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+        provider
+            .speech(&request)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::events::EventEnvelope> {
         if let Some(quorum) = &self.quorum {
             quorum.subscribe_events()
@@ -892,5 +1013,22 @@ impl ChatRunner for Agent {
     #[cfg(feature = "dashboard")]
     fn dashboard(&self) -> AgentServer {
         Agent::dashboard(self)
+    }
+}
+
+#[async_trait]
+impl crate::runner::AudioRunner for Agent {
+    async fn transcribe(
+        &self,
+        request: querymt::stt::SttRequest,
+    ) -> Result<querymt::stt::SttResponse> {
+        Agent::transcribe(self, request).await
+    }
+
+    async fn speech(
+        &self,
+        request: querymt::tts::TtsRequest,
+    ) -> Result<querymt::tts::TtsResponse> {
+        Agent::speech(self, request).await
     }
 }

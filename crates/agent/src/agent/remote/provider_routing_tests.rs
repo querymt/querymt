@@ -29,6 +29,8 @@ mod provider_routing_integration_tests {
     use crate::session::provider::{ProviderRouting, build_provider_from_config};
     use querymt::chat::{ChatProvider, FinishReason};
     use querymt::error::LLMError;
+    use querymt::stt::SttRequest;
+    use querymt::tts::TtsRequest;
     use tokio::sync::mpsc;
     use uuid::Uuid;
 
@@ -164,6 +166,206 @@ mod provider_routing_integration_tests {
                 assert!(
                     msg.contains("provider_host::"),
                     "error should name the DHT key (mesh routing confirmed), got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ProviderError from mesh routing, got {:?}", other),
+        }
+    }
+
+    // ── H.3a — provider_node_id routes STT through mesh provider path ─────────
+
+    #[tokio::test]
+    async fn test_build_provider_from_config_with_provider_node_id_routes_transcribe() {
+        let f = AgentConfigFixture::new().await;
+        let mesh = get_test_mesh().await;
+
+        let provider_node_id = random_node_id();
+        let registry = f.config.provider.plugin_registry();
+
+        let provider = build_provider_from_config(
+            &registry,
+            "anthropic",
+            "claude-3",
+            None,
+            None,
+            ProviderRouting {
+                provider_node_id: Some(&provider_node_id),
+                mesh_handle: Some(mesh),
+                allow_mesh_fallback: false,
+            },
+        )
+        .await
+        .expect("build_provider_from_config with provider_node_id should succeed");
+
+        let result = provider.transcribe(&SttRequest::new().audio(vec![0u8; 8])).await;
+        match result {
+            Err(LLMError::ProviderError(msg)) => {
+                assert!(
+                    msg.contains("provider_host::"),
+                    "STT should route through mesh provider host lookup, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ProviderError from mesh routing, got {:?}", other),
+        }
+    }
+
+    // ── H.3b — provider_node_id routes TTS through mesh provider path ─────────
+
+    #[tokio::test]
+    async fn test_build_provider_from_config_with_provider_node_id_routes_speech() {
+        let f = AgentConfigFixture::new().await;
+        let mesh = get_test_mesh().await;
+
+        let provider_node_id = random_node_id();
+        let registry = f.config.provider.plugin_registry();
+
+        let provider = build_provider_from_config(
+            &registry,
+            "anthropic",
+            "claude-3",
+            None,
+            None,
+            ProviderRouting {
+                provider_node_id: Some(&provider_node_id),
+                mesh_handle: Some(mesh),
+                allow_mesh_fallback: false,
+            },
+        )
+        .await
+        .expect("build_provider_from_config with provider_node_id should succeed");
+
+        let result = provider.speech(&TtsRequest::new().text("hello")).await;
+        match result {
+            Err(LLMError::ProviderError(msg)) => {
+                assert!(
+                    msg.contains("provider_host::"),
+                    "TTS should route through mesh provider host lookup, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ProviderError from mesh routing, got {:?}", other),
+        }
+    }
+
+    // ── H.3c — build_provider_for_session uses provider_node_id for STT ──────
+
+    #[tokio::test]
+    async fn test_build_provider_for_session_with_provider_node_id_routes_transcribe() {
+        let f = AgentConfigFixture::new().await;
+        let mesh = get_test_mesh().await;
+        f.config.provider.set_mesh(Some(mesh.clone()));
+
+        let session = f
+            .config
+            .provider
+            .history_store()
+            .create_session(None, None, None, None)
+            .await
+            .expect("create session");
+
+        let llm = querymt::LLMParams::new()
+            .provider("anthropic")
+            .model("claude-3");
+        let cfg = f
+            .config
+            .provider
+            .history_store()
+            .create_or_get_llm_config(&llm)
+            .await
+            .expect("create llm config");
+
+        f.config
+            .provider
+            .history_store()
+            .set_session_llm_config(&session.public_id, cfg.id)
+            .await
+            .expect("set llm config for session");
+
+        let provider_node_id = random_node_id();
+        f.config
+            .provider
+            .history_store()
+            .set_session_provider_node_id(&session.public_id, Some(&provider_node_id))
+            .await
+            .expect("set provider node id");
+
+        let provider = f
+            .config
+            .provider
+            .build_provider_for_session(&session.public_id)
+            .await
+            .expect("build provider for session");
+
+        let result = provider.transcribe(&SttRequest::new().audio(vec![0u8; 8])).await;
+        match result {
+            Err(LLMError::ProviderError(msg)) => {
+                assert!(
+                    msg.contains("provider_host::"),
+                    "session provider STT should route via mesh provider host lookup, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ProviderError from mesh routing, got {:?}", other),
+        }
+    }
+
+    // ── H.3d — build_provider_for_session uses provider_node_id for TTS ──────
+
+    #[tokio::test]
+    async fn test_build_provider_for_session_with_provider_node_id_routes_speech() {
+        let f = AgentConfigFixture::new().await;
+        let mesh = get_test_mesh().await;
+        f.config.provider.set_mesh(Some(mesh.clone()));
+
+        let session = f
+            .config
+            .provider
+            .history_store()
+            .create_session(None, None, None, None)
+            .await
+            .expect("create session");
+
+        let llm = querymt::LLMParams::new()
+            .provider("anthropic")
+            .model("claude-3");
+        let cfg = f
+            .config
+            .provider
+            .history_store()
+            .create_or_get_llm_config(&llm)
+            .await
+            .expect("create llm config");
+
+        f.config
+            .provider
+            .history_store()
+            .set_session_llm_config(&session.public_id, cfg.id)
+            .await
+            .expect("set llm config for session");
+
+        let provider_node_id = random_node_id();
+        f.config
+            .provider
+            .history_store()
+            .set_session_provider_node_id(&session.public_id, Some(&provider_node_id))
+            .await
+            .expect("set provider node id");
+
+        let provider = f
+            .config
+            .provider
+            .build_provider_for_session(&session.public_id)
+            .await
+            .expect("build provider for session");
+
+        let result = provider.speech(&TtsRequest::new().text("hello")).await;
+        match result {
+            Err(LLMError::ProviderError(msg)) => {
+                assert!(
+                    msg.contains("provider_host::"),
+                    "session provider TTS should route via mesh provider host lookup, got: {}",
                     msg
                 );
             }

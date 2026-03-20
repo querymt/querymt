@@ -35,8 +35,12 @@ pub use crate::config::{
     QuorumConfig, QuorumSettings, SingleAgentConfig,
 };
 pub use crate::runner::{
-    AgentRunner, ChatRunner, ChatRunnerExt, ChatSession, ChatSessionExt, from_config,
+    AgentRunner, AudioRunner, ChatRunner, ChatRunnerExt, ChatSession, ChatSessionExt, from_config,
 };
+
+// Audio types (STT / TTS)
+pub use querymt::stt::{SttRequest, SttResponse};
+pub use querymt::tts::{TtsRequest, TtsResponse, VoiceConfig};
 
 // Core agent types
 pub use crate::agent::{AgentHandle, LocalAgentHandle, SnapshotPolicy, ToolPolicy};

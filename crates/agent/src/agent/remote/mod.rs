@@ -96,8 +96,8 @@ pub use node_manager::{
 };
 #[cfg(feature = "remote")]
 pub use provider_host::{
-    ProviderChatRequest, ProviderChatResponse, ProviderHostActor, ProviderStreamRequest,
-    StreamChunkRelay, StreamReceiverActor,
+    ProviderChatRequest, ProviderChatResponse, ProviderHostActor, ProviderSpeechRequest,
+    ProviderStreamRequest, ProviderTranscribeRequest, StreamChunkRelay, StreamReceiverActor,
 };
 #[cfg(feature = "remote")]
 pub use registry_exchange::{

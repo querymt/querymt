@@ -27,6 +27,42 @@ use tracing::Instrument;
 
 // ── Wire types ────────────────────────────────────────────────────────────────
 
+/// Envelope for a transcribe (STT) call routed through the mesh.
+///
+/// The `request` field is the standard `querymt::stt::SttRequest` — no mirror
+/// type needed since it is already `Serialize + Deserialize`. The envelope adds
+/// routing context (`provider`, `model`, `params`) so `ProviderHostActor` can
+/// build the correct provider on the owning node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderTranscribeRequest {
+    /// Provider name (e.g. `"openai"`, `"izwi"`).
+    pub provider: String,
+    /// Model name (e.g. `"whisper-1"`, `"Qwen3-ASR-0.6B"`).
+    pub model: String,
+    /// The STT request payload (audio bytes, optional filename/mime/language).
+    pub request: querymt::stt::SttRequest,
+    /// Per-session LLM parameters forwarded from the requesting node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+/// Envelope for a speech (TTS) call routed through the mesh.
+///
+/// Same lean design as `ProviderTranscribeRequest`: the `request` field is the
+/// standard `querymt::tts::TtsRequest`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSpeechRequest {
+    /// Provider name (e.g. `"openai"`, `"izwi"`).
+    pub provider: String,
+    /// Model name (e.g. `"tts-1"`, `"Kokoro-82M"`).
+    pub model: String,
+    /// The TTS request payload (text, voice config, format, speed, language).
+    pub request: querymt::tts::TtsRequest,
+    /// Per-session LLM parameters forwarded from the requesting node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
 /// The concrete, serializable representation of an LLM response.
 ///
 /// `Box<dyn ChatResponse>` cannot be sent across the mesh — this type maps
@@ -587,6 +623,72 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
     }
 }
 
+// ── Transcribe (STT) handler ──────────────────────────────────────────────────
+
+impl Message<ProviderTranscribeRequest> for ProviderHostActor {
+    type Reply = Result<querymt::stt::SttResponse, AgentError>;
+
+    #[tracing::instrument(
+        name = "remote.provider_host.transcribe",
+        skip_all,
+        fields(
+            provider = %msg.provider,
+            model = %msg.model,
+            audio_bytes = msg.request.audio.len(),
+            has_params = msg.params.is_some(),
+        )
+    )]
+    async fn handle(
+        &mut self,
+        msg: ProviderTranscribeRequest,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let provider = self
+            .build_provider_for_request(&msg.provider, &msg.model, msg.params.as_ref())
+            .await?;
+
+        provider.transcribe(&msg.request).await.map_err(|e| {
+            AgentError::ProviderChat {
+                operation: "transcribe".to_string(),
+                reason: e.to_string(),
+            }
+        })
+    }
+}
+
+// ── Speech (TTS) handler ──────────────────────────────────────────────────────
+
+impl Message<ProviderSpeechRequest> for ProviderHostActor {
+    type Reply = Result<querymt::tts::TtsResponse, AgentError>;
+
+    #[tracing::instrument(
+        name = "remote.provider_host.speech",
+        skip_all,
+        fields(
+            provider = %msg.provider,
+            model = %msg.model,
+            text_len = msg.request.text.len(),
+            has_params = msg.params.is_some(),
+        )
+    )]
+    async fn handle(
+        &mut self,
+        msg: ProviderSpeechRequest,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let provider = self
+            .build_provider_for_request(&msg.provider, &msg.model, msg.params.as_ref())
+            .await?;
+
+        provider.speech(&msg.request).await.map_err(|e| {
+            AgentError::ProviderChat {
+                operation: "speech".to_string(),
+                reason: e.to_string(),
+            }
+        })
+    }
+}
+
 // ── RemoteActor + RemoteMessage registrations ─────────────────────────────────
 
 impl kameo::remote::RemoteActor for ProviderHostActor {
@@ -708,6 +810,19 @@ remote_provider_msg_impl!(
     ProviderStreamRequest,
     "querymt::ProviderStreamRequest",
     REG_PROVIDER_STREAM_REQUEST
+);
+
+remote_provider_msg_impl!(
+    ProviderHostActor,
+    ProviderTranscribeRequest,
+    "querymt::ProviderTranscribeRequest",
+    REG_PROVIDER_TRANSCRIBE_REQUEST
+);
+remote_provider_msg_impl!(
+    ProviderHostActor,
+    ProviderSpeechRequest,
+    "querymt::ProviderSpeechRequest",
+    REG_PROVIDER_SPEECH_REQUEST
 );
 
 // StreamReceiverActor message

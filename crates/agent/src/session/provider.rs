@@ -396,6 +396,71 @@ impl SessionProvider {
         Ok(provider)
     }
 
+    /// Build a provider from the agent's initial config without requiring a session.
+    ///
+    /// This is used for stateless operations (STT, TTS) that don't need
+    /// conversation history or per-session config overrides. The provider is
+    /// resolved using the same `build_provider_from_config` path as session
+    /// providers, including mesh routing when the `remote` feature is enabled.
+    pub async fn build_default_provider(&self) -> SessionResult<Arc<dyn LLMProvider>> {
+        let provider_name = self
+            .initial_config
+            .provider
+            .as_deref()
+            .ok_or_else(|| SessionError::InvalidOperation("No provider configured".to_string()))?;
+        let model = self
+            .initial_config
+            .model
+            .as_deref()
+            .ok_or_else(|| SessionError::InvalidOperation("No model configured".to_string()))?;
+
+        // Serialize initial params for the provider factory, excluding
+        // provider/model/name/api_key (same filtering as remote param forwarding).
+        let params = serde_json::to_value(&self.initial_config)
+            .ok()
+            .and_then(|v| match v {
+                serde_json::Value::Object(mut obj) => {
+                    obj.remove("provider");
+                    obj.remove("model");
+                    obj.remove("name");
+                    if obj.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::Value::Object(obj))
+                    }
+                }
+                _ => None,
+            });
+
+        #[cfg(feature = "remote")]
+        let mesh_handle: Option<crate::agent::remote::MeshHandle> =
+            self.mesh.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+        #[cfg(feature = "remote")]
+        let allow_mesh_fallback = *self
+            .allow_mesh_fallback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        #[cfg(feature = "remote")]
+        let routing = ProviderRouting {
+            provider_node_id: None,
+            mesh_handle: mesh_handle.as_ref(),
+            allow_mesh_fallback,
+        };
+
+        build_provider_from_config(
+            &self.plugin_registry,
+            provider_name,
+            model,
+            params.as_ref(),
+            None,
+            #[cfg(feature = "remote")]
+            routing,
+        )
+        .await
+    }
+
     /// Clear the global provider cache.
     ///
     /// This forces the next provider resolution to rebuild from current config/credentials.

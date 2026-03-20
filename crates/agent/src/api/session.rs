@@ -5,7 +5,7 @@ use super::utils::latest_assistant_message;
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::runner::ChatSession;
 use crate::send_agent::SendAgent;
-use agent_client_protocol::{ContentBlock, PromptRequest, TextContent};
+use agent_client_protocol::{ContentBlock, PromptRequest, SetSessionModelRequest, TextContent};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use querymt::LLMParams;
@@ -116,6 +116,97 @@ impl AgentSession {
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
         Ok(())
+    }
+
+    /// Set the session model and optionally pin provider execution to a mesh node.
+    ///
+    /// `model_id` accepts either transport IDs (`"provider/model"`) or legacy
+    /// bare model IDs. When `provider_node_id` is `Some(peer_id)`, chat/STT/TTS
+    /// for this session route to that node via `MeshChatProvider`.
+    pub async fn set_model_with_node(
+        &self,
+        model_id: &str,
+        provider_node_id: Option<&str>,
+    ) -> Result<()> {
+        let req = SetSessionModelRequest::new(self.session_id.clone(), model_id.to_string());
+
+        #[cfg(feature = "remote")]
+        let provider_node_id = match provider_node_id {
+            Some(raw) => Some(
+                crate::agent::remote::NodeId::parse(raw)
+                    .map_err(|e| anyhow!(format!("invalid provider_node_id '{}': {}", raw, e)))?,
+            ),
+            None => None,
+        };
+
+        #[cfg(not(feature = "remote"))]
+        let provider_node_id: Option<crate::agent::remote::NodeId> = provider_node_id
+            .map(|raw| crate::agent::remote::NodeId::parse(raw))
+            .transpose()
+            .map_err(|e| anyhow!(format!("invalid provider_node_id: {}", e)))?;
+
+        let msg = crate::agent::messages::SetSessionModel {
+            req,
+            provider_node_id,
+        };
+
+        let session_ref = {
+            let registry = self.agent.registry.lock().await;
+            registry
+                .get(&self.session_id)
+                .cloned()
+                .ok_or_else(|| anyhow!(format!("Session not found: {}", self.session_id)))?
+        };
+
+        session_ref
+            .set_session_model_with_node(msg)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn resolve_session_provider(&self) -> Result<std::sync::Arc<dyn querymt::LLMProvider>> {
+        let session_handle = self
+            .agent
+            .config
+            .provider
+            .with_session(&self.session_id)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+        session_handle
+            .provider()
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    /// Transcribe audio to text using the session's provider.
+    ///
+    /// This path is session-aware and therefore respects `provider_node_id`
+    /// pinning set via `set_model_with_node`.
+    pub async fn transcribe(
+        &self,
+        request: querymt::stt::SttRequest,
+    ) -> Result<querymt::stt::SttResponse> {
+        let provider = self.resolve_session_provider().await?;
+        provider
+            .transcribe(&request)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    /// Synthesize speech from text using the session's provider.
+    ///
+    /// This path is session-aware and therefore respects `provider_node_id`
+    /// pinning set via `set_model_with_node`.
+    pub async fn speech(
+        &self,
+        request: querymt::tts::TtsRequest,
+    ) -> Result<querymt::tts::TtsResponse> {
+        let provider = self.resolve_session_provider().await?;
+        provider
+            .speech(&request)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
     }
 }
 
