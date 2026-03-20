@@ -61,6 +61,15 @@ pub struct ModelRegistry {
     remote_cache: Cache<(), Vec<ModelEntry>>,
 }
 
+impl Clone for ModelRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            local_cache: self.local_cache.clone(),
+            remote_cache: self.remote_cache.clone(),
+        }
+    }
+}
+
 impl std::fmt::Debug for ModelRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModelRegistry")

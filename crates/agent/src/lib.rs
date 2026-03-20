@@ -10,7 +10,6 @@ pub mod config;
 pub mod runner;
 pub mod template;
 
-#[cfg(feature = "oauth")]
 pub mod auth;
 
 // Re-export SecretStore at crate root so it is available without the `oauth`
