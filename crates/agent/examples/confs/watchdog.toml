@@ -1,0 +1,94 @@
+# Watchdog — Scheduled Codebase Health Monitor
+#
+# An autonomous agent that runs periodic health checks on a codebase:
+# TODO accumulation, test count drift, dependency audit, dead code detection,
+# and documentation coverage. Every cycle ingests findings into the knowledge
+# store, compares against previous cycles for trend analysis, and periodically
+# consolidates multi-cycle data into trend summaries.
+#
+# ## Features Demonstrated
+#
+# - **Interval scheduling**: Runs every 30 minutes (1800s) by default
+# - **Knowledge as audit trail**: Each cycle ingests structured findings
+# - **Trend analysis via knowledge_query**: Compare current vs. past metrics
+# - **Periodic consolidation**: Synthesize daily health checks into weekly trends
+# - **Execution limits**: max_steps + max_cost_usd keep scheduled runs cheap
+#
+# ## Usage
+#
+#   cargo run --example qmtcode --features dashboard -- confs/watchdog.toml --dashboard
+#
+#   # Create a schedule via the dashboard UI:
+#   #   Session → Schedules → Create Schedule
+#   #   Prompt: "Run a health check cycle: audit TODOs, test count, dependencies, dead code, and documentation. Ingest findings and compare against previous cycles."
+#   #   Trigger: Interval, 1800 seconds (30 min)
+#   #   Max runs: 48 (24 hours of monitoring)
+#   #   Max steps: 25
+#   #   Max cost: $0.10
+#
+#   # For a quick demo, use a shorter interval:
+#   #   Trigger: Interval, 180 seconds (3 minutes)
+#   #   Max runs: 5
+
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+assume_mutating = false
+
+# Shell is mutating because git pull --ff-only updates the working tree.
+# All other shell usage (git log, cargo commands) is read-only.
+mutating_tools = ["shell"]
+
+tools = [
+  # Codebase analysis (read-only)
+  "read_tool", "glob", "search_text", "ls", "shell",
+
+  # Knowledge lifecycle — the audit trail
+  "knowledge_ingest",
+  "knowledge_query",
+  "knowledge_consolidate",
+  "knowledge_list_unconsolidated",
+  "knowledge_stats",
+
+  # Task tracking
+  "create_task", "todowrite", "todoread",
+]
+
+system = [
+  { file = "../prompts/watchdog.txt" },
+  { file = "../prompts/code_meta.jinja2" }
+]
+
+# Snapshot: git-based (read-only agent, so snapshots are just bookkeeping)
+[agent.execution.snapshot]
+backend = "git"
+
+# Compaction: keep tool output small — health checks produce tabular data
+[agent.execution.tool_output]
+max_lines = 500
+max_bytes = 16384
+
+# Compaction: pruning — aggressive to keep scheduled cycles lightweight
+[agent.execution.pruning]
+protect_tokens = 15000
+
+# Compaction: AI summary on overflow
+[agent.execution.compaction]
+auto = true
+
+# =============================================================================
+# Middleware Stack
+# =============================================================================
+
+# Tight execution limits — each health check cycle should be fast and cheap
+[[middleware]]
+type = "limits"
+max_steps = 30
+max_turns = 12
+
+# Context management — compact early to avoid blowing context on large searches
+[[middleware]]
+type = "context"
+warn_at_percent = 70
+compact_at_percent = 85
+fallback_max_tokens = 128000
