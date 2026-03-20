@@ -347,10 +347,9 @@ pub(crate) async fn cleanup_revert_on_prompt(
                 message_id: Some(ref mid),
                 ..
             } = e.kind
+                && mid == &frontier_message_id
             {
-                if mid == &frontier_message_id {
-                    return Some(e.stream_seq);
-                }
+                return Some(e.stream_seq);
             }
             None
         });
