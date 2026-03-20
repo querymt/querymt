@@ -1,0 +1,136 @@
+# Learning Pair — Multi-Agent System with Knowledge-Sharing Planner
+#
+# A planner agent with persistent knowledge that remembers patterns, decisions,
+# and lessons learned across coding sessions. A delegate coder does implementation.
+# The planner ingests every significant decision, and a scheduled consolidation
+# job periodically synthesizes learnings into project-level insights.
+#
+# ## Features Demonstrated
+#
+# - **Knowledge tools on the planner** (not the coder) — separation of concerns
+# - **Quorum delegation** with knowledge-informed context passing
+# - **Interval-scheduled consolidation**: periodic synthesis of accumulated knowledge
+# - **Knowledge query before planning**: the planner gets smarter over time
+# - **Multi-agent + knowledge + scheduling** working together
+#
+# ## Usage
+#
+#   cargo run --example qmtcode --features dashboard -- confs/learning_pair.toml --dashboard
+#
+#   # The planner will automatically query knowledge before planning tasks.
+#   # Try across multiple sessions — knowledge persists.
+#
+#   # Create a consolidation schedule via the dashboard UI:
+#   #   Session → Schedules → Create Schedule
+#   #   Prompt: "Run a knowledge consolidation cycle: list unconsolidated entries, group by topic, and consolidate related entries into project-level insights about architecture, patterns, and lessons learned."
+#   #   Trigger: Interval, 3600 seconds (hourly)
+#   #   Max steps: 15
+#   #   Max runs: 24 (one day of consolidation cycles)
+
+[quorum]
+cwd = "."
+db = "/tmp/learning_pair.db"
+delegation = true
+verification = false
+snapshot_policy = "diff"
+delegation_wait_policy = "all"
+delegation_wait_timeout_secs = 300
+delegation_cancel_grace_secs = 5
+max_parallel_delegations = 1
+
+# Planner — the knowledge-bearing orchestrator
+[planner]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+tools = [
+  # Orchestration
+  "delegate",
+
+  # Knowledge lifecycle — planner's unique capability
+  "knowledge_ingest",
+  "knowledge_query",
+  "knowledge_consolidate",
+  "knowledge_list_unconsolidated",
+  "knowledge_stats",
+
+  # Planning & exploration (read-only)
+  "read_tool", "search_text", "glob", "ls",
+
+  # Task management
+  "create_task", "todowrite", "todoread",
+
+  # User interaction
+  "question",
+]
+system = [
+  { file = "../prompts/learning_pair.txt" },
+  { file = "../prompts/code_meta.jinja2" }
+]
+
+# Planner middleware
+[[planner.middleware]]
+type = "context"
+warn_at_percent = 80
+compact_at_percent = 90
+fallback_max_tokens = 128000
+
+[[planner.middleware]]
+type = "agent_mode"
+default = "plan"
+reminder = """<system-reminder>
+# Plan Mode — Knowledge-Driven Orchestrator
+
+You are the **planner**. You must NOT edit files or run mutating commands.
+Your job is to:
+
+1. **Query knowledge** before planning — always check what you already know
+2. **Plan** — break work into concrete tasks informed by past decisions
+3. **Delegate** implementation to the `coder` agent
+4. **Ingest** decisions, tradeoffs, and lessons into the knowledge store
+5. **Verify** delegation results and ingest follow-up lessons
+
+Knowledge query → Plan → Delegate → Review → Ingest lessons. Every cycle.
+
+Do NOT skip the knowledge query step. Do NOT forget to ingest decisions.
+Do NOT implement code yourself — that is the coder's job.
+</system-reminder>"""
+
+# Delegation summary model (cheap model for summarizing delegation results)
+[quorum.delegation_summary]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+# Coder delegate — pure implementation, no knowledge tools
+[[delegates]]
+id = "coder"
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+description = "Implementation specialist for code writing, editing, and execution. Has full read/write access to the codebase."
+capabilities = ["rust", "python", "typescript", "shell"]
+tools = [
+  "edit", "write_file", "read_tool",
+  "glob", "search_text", "ls",
+  "shell",
+  "todowrite", "todoread",
+]
+system = [
+  { file = "../prompts/coder.md" }
+]
+
+# Coder middleware
+[[delegates.middleware]]
+type = "limits"
+max_steps = 80
+max_turns = 25
+
+[[delegates.middleware]]
+type = "context"
+warn_at_percent = 80
+compact_at_percent = 90
+fallback_max_tokens = 128000
+
+# Detect duplicate code in coder output
+[[delegates.middleware]]
+type = "dedup_check"
+threshold = 0.85
+min_lines = 10

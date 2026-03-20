@@ -1,0 +1,92 @@
+# Research Journal — Interactive Research Agent with Persistent Memory
+#
+# An interactive research assistant that accumulates knowledge across sessions.
+# You ask it questions, it fetches information, ingests findings into the
+# knowledge store, and over time consolidates scattered facts into structured
+# insights. An event-driven schedule auto-triggers consolidation after every
+# 10 ingestions.
+#
+# ## Features Demonstrated
+#
+# - **All 5 knowledge tools**: ingest, query, consolidate, list, stats
+# - **Event-driven scheduling**: auto-consolidate on KnowledgeIngested events
+# - **Global scope**: cross-session memory via scope = "global"
+# - **Interactive + autonomous**: user-driven research with scheduled consolidation
+#
+# ## Usage
+#
+#   cargo run --example qmtcode --features dashboard -- confs/research_journal.toml --dashboard
+#
+#   # Then in a session, try:
+#   #   "Research how Rust async runtimes compare"
+#   #   "What do you already know about tokio?"
+#   #   "Consolidate your findings on async runtimes"
+#
+#   # Create an event-driven consolidation schedule via the dashboard UI:
+#   #   Session → Schedules → Create Schedule
+#   #   Prompt: "Run a consolidation cycle: list unconsolidated entries, group by topic, and consolidate related entries into insights."
+#   #   Trigger: Event-driven
+#   #     event_kinds: ["knowledge_ingested"]
+#   #     threshold: 10
+#   #     debounce_seconds: 30
+#   #   Max steps: 15
+
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+assume_mutating = false
+mutating_tools = []
+
+tools = [
+  # Research tools
+  "web_fetch",
+  "read_tool", "glob", "search_text", "ls",
+
+  # Knowledge lifecycle — the core of this demo
+  "knowledge_ingest",
+  "knowledge_query",
+  "knowledge_consolidate",
+  "knowledge_list_unconsolidated",
+  "knowledge_stats",
+
+  # Task management
+  "create_task", "todowrite", "todoread",
+
+  # User interaction
+  "question",
+]
+
+system = [
+  { file = "../prompts/research_journal.txt" },
+  { file = "../prompts/code_meta.jinja2" }
+]
+
+# Compaction: tool output truncation (Layer 1)
+[agent.execution.tool_output]
+max_lines = 2000
+max_bytes = 51200
+
+# Compaction: pruning after every turn (Layer 2)
+[agent.execution.pruning]
+protect_tokens = 40000
+
+# Compaction: AI summary on context overflow (Layer 3)
+[agent.execution.compaction]
+auto = true
+
+# =============================================================================
+# Middleware Stack
+# =============================================================================
+
+# Execution limits — generous for interactive research
+[[middleware]]
+type = "limits"
+max_steps = 100
+max_turns = 40
+
+# Context management with auto-compaction
+[[middleware]]
+type = "context"
+warn_at_percent = 80
+compact_at_percent = 90
+fallback_max_tokens = 128000
