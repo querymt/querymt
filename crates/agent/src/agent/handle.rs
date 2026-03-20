@@ -1297,7 +1297,7 @@ impl SendAgent for LocalAgentHandle {
             }
 
             // ── _querymt/auth extensions ──────────────────────────────────
-            "_querymt/auth/status" => {
+            "querymt/auth/status" => {
                 #[derive(serde::Deserialize, Default)]
                 struct StatusReq {
                     #[serde(default)]
@@ -1310,7 +1310,7 @@ impl SendAgent for LocalAgentHandle {
                     .await;
                 ext_json_response(&serde_json::json!({ "providers": statuses }))
             }
-            "_querymt/auth/start" => {
+            "querymt/auth/start" => {
                 #[derive(serde::Deserialize)]
                 struct StartReq {
                     provider: String,
@@ -1325,7 +1325,7 @@ impl SendAgent for LocalAgentHandle {
                     .map_err(|e| Error::internal_error().data(serde_json::json!({"error": e})))?;
                 ext_json_response(&result)
             }
-            "_querymt/auth/complete" => {
+            "querymt/auth/complete" => {
                 #[derive(serde::Deserialize)]
                 struct CompleteReq {
                     flow_id: String,
@@ -1340,7 +1340,7 @@ impl SendAgent for LocalAgentHandle {
                     .await;
                 ext_json_response(&result)
             }
-            "_querymt/auth/logout" => {
+            "querymt/auth/logout" => {
                 #[derive(serde::Deserialize)]
                 struct LogoutReq {
                     provider: String,
