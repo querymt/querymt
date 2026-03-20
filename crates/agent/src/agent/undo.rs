@@ -6,9 +6,10 @@
 
 use crate::events::AgentEventKind;
 use crate::model::MessagePart;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use std::path::PathBuf;
 use time::OffsetDateTime;
+use tracing::instrument;
 use uuid::Uuid;
 
 /// Errors that can occur during undo/redo operations.
@@ -79,6 +80,14 @@ pub struct RedoResult {
 /// Free function: undo filesystem changes for a session.
 ///
 /// Used by `SessionActor` which owns the runtime directly.
+#[instrument(
+    name = "undo",
+    skip(backend, provider, worktree),
+    fields(
+        patches = tracing::field::Empty,
+        reverted_files = tracing::field::Empty,
+    )
+)]
 pub(crate) async fn undo_impl(
     backend: &dyn crate::snapshot::SnapshotBackend,
     provider: &crate::session::provider::SessionProvider,
@@ -188,6 +197,8 @@ pub(crate) async fn undo_impl(
         }
     }
 
+    tracing::Span::current().record("patches", all_patches.len());
+
     // Undo patches in reverse order
     for (turn_id, pre_snapshot, changed_paths) in all_patches.iter().rev() {
         let paths: Vec<PathBuf> = changed_paths.iter().map(PathBuf::from).collect();
@@ -234,11 +245,7 @@ pub(crate) async fn undo_impl(
         .await
         .map_err(|e| UndoError::Store(format!("Failed to store revert state: {}", e)))?;
 
-    info!(
-        "Undo: reverted {} files for session {}",
-        all_reverted_files.len(),
-        session_id
-    );
+    tracing::Span::current().record("reverted_files", all_reverted_files.len());
 
     Ok(UndoResult {
         reverted_files: all_reverted_files,
@@ -247,6 +254,11 @@ pub(crate) async fn undo_impl(
 }
 
 /// Free function: redo for a session.
+#[instrument(
+    name = "redo",
+    skip(backend, provider, worktree),
+    fields(restored_files = tracing::field::Empty)
+)]
 pub(crate) async fn redo_impl(
     backend: &dyn crate::snapshot::SnapshotBackend,
     provider: &crate::session::provider::SessionProvider,
@@ -277,6 +289,7 @@ pub(crate) async fn redo_impl(
         .await
         .map_err(|e| UndoError::Store(format!("Failed to update revert state: {}", e)))?;
 
+    tracing::Span::current().record("restored_files", changed.len());
     Ok(RedoResult { restored: true })
 }
 
@@ -286,6 +299,15 @@ pub(crate) async fn redo_impl(
 /// so they do not reappear after a page reload.  The frontier message itself
 /// AND everything after it are removed — the frontier is the user prompt that
 /// started the undone turn, so it must also be purged from history.
+#[instrument(
+    name = "undo.cleanup",
+    skip(provider, event_journal),
+    fields(
+        frontier_message = tracing::field::Empty,
+        deleted_messages = tracing::field::Empty,
+        pruned_events = tracing::field::Empty,
+    )
+)]
 pub(crate) async fn cleanup_revert_on_prompt(
     provider: &crate::session::provider::SessionProvider,
     event_journal: &dyn crate::session::projection::EventJournal,
@@ -297,66 +319,58 @@ pub(crate) async fn cleanup_revert_on_prompt(
         .await
         .map_err(|e| UndoError::Store(format!("Failed to get revert state: {}", e)))?;
 
-    if let Some(revert_state) = revert_state {
-        info!(
-            "Cleaning up revert state for session {}: deleting messages and events after {}",
-            session_id, revert_state.message_id
-        );
+    let Some(revert_state) = revert_state else {
+        return Ok(());
+    };
 
-        let deleted = provider
-            .history_store()
-            .delete_messages_after(session_id, &revert_state.message_id)
-            .await
-            .map_err(|e| UndoError::Store(format!("Failed to delete messages: {}", e)))?;
+    let span = tracing::Span::current();
+    span.record("frontier_message", &revert_state.message_id);
 
-        debug!("Deleted {} messages after revert point", deleted);
+    let deleted = provider
+        .history_store()
+        .delete_messages_after(session_id, &revert_state.message_id)
+        .await
+        .map_err(|e| UndoError::Store(format!("Failed to delete messages: {}", e)))?;
 
-        // Prune the event journal: find the prompt_received event that
-        // corresponds to the frontier message, then delete it and everything
-        // after it so undone turns don't reappear on page reload.
-        let frontier_message_id = revert_state.message_id.clone();
-        match event_journal
-            .load_session_stream(session_id, None, None)
-            .await
-        {
-            Ok(events) => {
-                let frontier_seq = events.iter().find_map(|e| {
-                    if let AgentEventKind::PromptReceived {
-                        message_id: Some(ref mid),
-                        ..
-                    } = e.kind
-                    {
-                        if mid == &frontier_message_id {
-                            return Some(e.stream_seq);
-                        }
-                    }
-                    None
-                });
+    span.record("deleted_messages", deleted);
 
-                if let Some(seq) = frontier_seq {
-                    match event_journal
-                        .delete_session_events_from(session_id, seq)
-                        .await
-                    {
-                        Ok(n) => debug!("Pruned {} event journal entries from seq {}", n, seq),
-                        Err(e) => warn!("Failed to prune event journal after undo cleanup: {}", e),
-                    }
-                } else {
-                    debug!(
-                        "No prompt_received event found for frontier message {}, skipping journal prune",
-                        frontier_message_id
-                    );
+    // Prune the event journal: find the prompt_received event that
+    // corresponds to the frontier message, then delete it and everything
+    // after it so undone turns don't reappear on page reload.
+    let frontier_message_id = revert_state.message_id.clone();
+    if let Ok(events) = event_journal
+        .load_session_stream(session_id, None, None)
+        .await
+    {
+        let frontier_seq = events.iter().find_map(|e| {
+            if let AgentEventKind::PromptReceived {
+                message_id: Some(ref mid),
+                ..
+            } = e.kind
+            {
+                if mid == &frontier_message_id {
+                    return Some(e.stream_seq);
                 }
             }
-            Err(e) => warn!("Failed to load event stream for journal prune: {}", e),
-        }
+            None
+        });
 
-        provider
-            .history_store()
-            .clear_revert_states(session_id)
-            .await
-            .map_err(|e| UndoError::Store(format!("Failed to clear revert state: {}", e)))?;
+        if let Some(seq) = frontier_seq {
+            match event_journal
+                .delete_session_events_from(session_id, seq)
+                .await
+            {
+                Ok(n) => { span.record("pruned_events", n); }
+                Err(e) => warn!("Failed to prune event journal: {}", e),
+            }
+        }
     }
+
+    provider
+        .history_store()
+        .clear_revert_states(session_id)
+        .await
+        .map_err(|e| UndoError::Store(format!("Failed to clear revert state: {}", e)))?;
 
     Ok(())
 }
