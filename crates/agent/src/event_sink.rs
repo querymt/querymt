@@ -405,6 +405,14 @@ mod tests {
             ) -> SessionResult<Vec<DurableEvent>> {
                 Ok(vec![])
             }
+
+            async fn delete_session_events_from(
+                &self,
+                _session_id: &str,
+                _from_seq: u64,
+            ) -> SessionResult<usize> {
+                Ok(0)
+            }
         }
 
         let fanout = Arc::new(EventFanout::new());

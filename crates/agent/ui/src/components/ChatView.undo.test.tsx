@@ -124,11 +124,115 @@ describe('ChatView undo/redo logic', () => {
 
     sendUndo(userMessage.messageId, targetTurn.id);
 
-    // Should log error and not crash
-    expect(consoleSpy).toHaveBeenCalled();
+    expect(consoleSpy).toHaveBeenCalledWith('[Test] Cannot undo: no message ID found');
     expect(sendUndo).not.toHaveBeenCalled();
 
     consoleSpy.mockRestore();
+  });
+
+  it('handleUndo should restore undone user text into the prompt when input is empty', () => {
+    const turn = {
+      id: 'turn-1',
+      userMessage: {
+        id: 'evt-1',
+        type: 'user' as const,
+        content: 'Refactor the parser',
+        timestamp: 1000,
+        messageId: 'msg-xyz',
+      },
+      agentMessages: [],
+      toolCalls: [],
+      delegations: [],
+      startTime: 1000,
+      isActive: false,
+    };
+
+    const sendUndo = vi.fn();
+    const setPrompt = vi.fn();
+    const promptRef = { current: '' };
+
+    const userMessage = turn.userMessage;
+    if (!userMessage?.messageId) {
+      throw new Error('expected messageId');
+    }
+
+    if (userMessage.content && !promptRef.current.trim()) {
+      setPrompt(userMessage.content);
+    }
+    sendUndo(userMessage.messageId, turn.id);
+
+    expect(setPrompt).toHaveBeenCalledWith('Refactor the parser');
+    expect(sendUndo).toHaveBeenCalledWith('msg-xyz', 'turn-1');
+  });
+
+  it('handleUndo should not overwrite prompt when user already typed text', () => {
+    const turn = {
+      id: 'turn-1',
+      userMessage: {
+        id: 'evt-1',
+        type: 'user' as const,
+        content: 'Refactor the parser',
+        timestamp: 1000,
+        messageId: 'msg-xyz',
+      },
+      agentMessages: [],
+      toolCalls: [],
+      delegations: [],
+      startTime: 1000,
+      isActive: false,
+    };
+
+    const sendUndo = vi.fn();
+    const setPrompt = vi.fn();
+    const promptRef = { current: 'keep my draft' };
+
+    const userMessage = turn.userMessage;
+    if (!userMessage?.messageId) {
+      throw new Error('expected messageId');
+    }
+
+    if (userMessage.content && !promptRef.current.trim()) {
+      setPrompt(userMessage.content);
+    }
+    sendUndo(userMessage.messageId, turn.id);
+
+    expect(setPrompt).not.toHaveBeenCalled();
+    expect(sendUndo).toHaveBeenCalledWith('msg-xyz', 'turn-1');
+  });
+
+  it('handleUndo should not restore empty user text into the prompt', () => {
+    const turn = {
+      id: 'turn-1',
+      userMessage: {
+        id: 'evt-1',
+        type: 'user' as const,
+        content: '',
+        timestamp: 1000,
+        messageId: 'msg-xyz',
+      },
+      agentMessages: [],
+      toolCalls: [],
+      delegations: [],
+      startTime: 1000,
+      isActive: false,
+    };
+
+    const sendUndo = vi.fn();
+    const setPrompt = vi.fn();
+    const promptRef = { current: '' };
+
+    const userMessage = turn.userMessage;
+    if (!userMessage?.messageId) {
+      throw new Error('expected messageId');
+    }
+
+    if (userMessage.content && !promptRef.current.trim()) {
+      setPrompt(userMessage.content);
+    }
+    sendUndo(userMessage.messageId, turn.id);
+
+    expect(setPrompt).not.toHaveBeenCalled();
+    expect(sendUndo).toHaveBeenCalledWith('msg-xyz', 'turn-1');
   });
 
   it('handleRedo should call sendRedo with no parameters', () => {
@@ -215,7 +319,7 @@ describe('ChatView undo button visibility logic', () => {
       }
 
       for (let i = startIndex; i >= 0; i--) {
-        if (turns[i].toolCalls.length > 0 && turns[i].userMessage?.messageId) {
+        if (!!turns[i].userMessage?.messageId) {
           return i;
         }
       }
@@ -384,7 +488,7 @@ describe('ChatView undo button visibility logic', () => {
       }
 
       for (let i = startIndex; i >= 0; i--) {
-        if (turns[i].toolCalls.length > 0 && turns[i].userMessage?.messageId) {
+        if (!!turns[i].userMessage?.messageId) {
           return i;
         }
       }
@@ -392,5 +496,86 @@ describe('ChatView undo button visibility logic', () => {
     };
 
     expect(computeUndoTurnIndex()).toBe(2);
+  });
+});
+
+describe('event pruning on prompt_received after undo', () => {
+  // Mirrors the pruning logic that must run in useUiClient when prompt_received
+  // fires while undoState has a frontierMessageId.  The frontier message itself
+  // is also removed (the undone user prompt should not appear in the UI);
+  // every event from the frontier onward is discarded.
+
+  const pruneEventsAfterFrontier = (
+    events: Array<{ id: string; messageId?: string }>,
+    frontierMessageId: string
+  ) => {
+    const idx = events.findIndex(e => e.messageId === frontierMessageId);
+    if (idx < 0) return events; // frontier not found — leave untouched
+    return events.slice(0, idx); // drop frontier and everything after it
+  };
+
+  it('removes the frontier message and all events after it', () => {
+    const events = [
+      { id: 'e1', messageId: 'msg-1' },
+      { id: 'e2' },
+      { id: 'e3', messageId: 'msg-2' },
+      { id: 'e4' },
+      { id: 'e5', messageId: 'msg-3' },
+      { id: 'e6' },
+    ];
+
+    const pruned = pruneEventsAfterFrontier(events, 'msg-2');
+
+    expect(pruned.map(e => e.id)).toEqual(['e1', 'e2']);
+  });
+
+  it('removes the frontier message when it is the last event', () => {
+    const events = [
+      { id: 'e1', messageId: 'msg-1' },
+      { id: 'e2', messageId: 'msg-2' },
+    ];
+
+    const pruned = pruneEventsAfterFrontier(events, 'msg-2');
+
+    expect(pruned.map(e => e.id)).toEqual(['e1']);
+    expect(pruned.find(e => e.messageId === 'msg-2')).toBeUndefined();
+  });
+
+  it('returns events unchanged when the frontier messageId is not present', () => {
+    const events = [
+      { id: 'e1', messageId: 'msg-1' },
+      { id: 'e2', messageId: 'msg-2' },
+    ];
+
+    const pruned = pruneEventsAfterFrontier(events, 'msg-unknown');
+
+    expect(pruned).toEqual(events);
+  });
+
+  it('returns empty array when frontier is the very first event', () => {
+    const events = [
+      { id: 'e1', messageId: 'msg-1' },
+      { id: 'e2', messageId: 'msg-2' },
+      { id: 'e3' },
+    ];
+
+    const pruned = pruneEventsAfterFrontier(events, 'msg-1');
+
+    expect(pruned).toEqual([]);
+  });
+
+  it('does not prune when undoState has no frontierMessageId', () => {
+    const events = [
+      { id: 'e1', messageId: 'msg-1' },
+      { id: 'e2', messageId: 'msg-2' },
+    ];
+
+    // Simulate the guard: only prune when frontier exists
+    const frontierMessageId: string | undefined = undefined;
+    const pruned = frontierMessageId
+      ? pruneEventsAfterFrontier(events, frontierMessageId)
+      : events;
+
+    expect(pruned).toEqual(events);
   });
 });

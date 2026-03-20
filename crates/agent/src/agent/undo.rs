@@ -4,6 +4,7 @@
 //! the git-based snapshot backend. When undoing, it reverts all filesystem changes
 //! made after a specific message. Redo restores the pre-undo state.
 
+use crate::events::AgentEventKind;
 use crate::model::MessagePart;
 use log::{debug, info, warn};
 use std::path::PathBuf;
@@ -280,8 +281,14 @@ pub(crate) async fn redo_impl(
 }
 
 /// Free function: cleanup revert state on new prompt.
+///
+/// Deletes messages and event journal entries that belong to the undone turns
+/// so they do not reappear after a page reload.  The frontier message itself
+/// AND everything after it are removed — the frontier is the user prompt that
+/// started the undone turn, so it must also be purged from history.
 pub(crate) async fn cleanup_revert_on_prompt(
     provider: &crate::session::provider::SessionProvider,
+    event_journal: &dyn crate::session::projection::EventJournal,
     session_id: &str,
 ) -> Result<(), UndoError> {
     let revert_state = provider
@@ -292,7 +299,7 @@ pub(crate) async fn cleanup_revert_on_prompt(
 
     if let Some(revert_state) = revert_state {
         info!(
-            "Cleaning up revert state for session {}: deleting messages after {}",
+            "Cleaning up revert state for session {}: deleting messages and events after {}",
             session_id, revert_state.message_id
         );
 
@@ -303,6 +310,46 @@ pub(crate) async fn cleanup_revert_on_prompt(
             .map_err(|e| UndoError::Store(format!("Failed to delete messages: {}", e)))?;
 
         debug!("Deleted {} messages after revert point", deleted);
+
+        // Prune the event journal: find the prompt_received event that
+        // corresponds to the frontier message, then delete it and everything
+        // after it so undone turns don't reappear on page reload.
+        let frontier_message_id = revert_state.message_id.clone();
+        match event_journal
+            .load_session_stream(session_id, None, None)
+            .await
+        {
+            Ok(events) => {
+                let frontier_seq = events.iter().find_map(|e| {
+                    if let AgentEventKind::PromptReceived {
+                        message_id: Some(ref mid),
+                        ..
+                    } = e.kind
+                    {
+                        if mid == &frontier_message_id {
+                            return Some(e.stream_seq);
+                        }
+                    }
+                    None
+                });
+
+                if let Some(seq) = frontier_seq {
+                    match event_journal
+                        .delete_session_events_from(session_id, seq)
+                        .await
+                    {
+                        Ok(n) => debug!("Pruned {} event journal entries from seq {}", n, seq),
+                        Err(e) => warn!("Failed to prune event journal after undo cleanup: {}", e),
+                    }
+                } else {
+                    debug!(
+                        "No prompt_received event found for frontier message {}, skipping journal prune",
+                        frontier_message_id
+                    );
+                }
+            }
+            Err(e) => warn!("Failed to load event stream for journal prune: {}", e),
+        }
 
         provider
             .history_store()

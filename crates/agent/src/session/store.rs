@@ -408,8 +408,8 @@ pub trait SessionStore: Send + Sync {
     /// Clear all revert state frames for a session
     async fn clear_revert_states(&self, session_id: &str) -> SessionResult<()>;
 
-    /// Delete all messages after a given message ID in a session
-    /// Returns the number of deleted messages
+    /// Delete the message with the given ID and all messages after it.
+    /// Returns the number of deleted messages.
     async fn delete_messages_after(
         &self,
         session_id: &str,

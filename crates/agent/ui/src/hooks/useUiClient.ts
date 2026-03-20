@@ -438,6 +438,25 @@ export function useUiClient() {
             d.session_id === mainSessionId || d.session_id === sessionId;
           if (isCurrentMainOrActiveSession) {
             setIsConversationComplete(false);
+            // Prune in-memory events that were undone before committing the new timeline branch.
+            // The backend deletes the frontier message AND everything after it so the
+            // undone turn (user prompt + assistant response) doesn't appear in the LLM
+            // context or the UI.  We mirror that here: drop the frontier event itself
+            // and everything after it.
+            const frontierMessageId = undoStateRef.current?.frontierMessageId;
+            if (frontierMessageId) {
+              setEventsBySession(prev => {
+                const next = new Map(prev);
+                const sessionEvents = next.get(d.session_id);
+                if (sessionEvents) {
+                  const frontierIdx = sessionEvents.findIndex(e => e.messageId === frontierMessageId);
+                  if (frontierIdx >= 0) {
+                    next.set(d.session_id, sessionEvents.slice(0, frontierIdx));
+                  }
+                }
+                return next;
+              });
+            }
             // A new prompt commits the current timeline branch; stacked redo history is no longer valid.
             setUndoState(null);
             undoStateRef.current = null;

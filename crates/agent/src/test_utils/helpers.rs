@@ -279,6 +279,56 @@ impl UndoTestFixture {
         Ok(msg_id)
     }
 
+    /// Simulate a user message with explicit timestamp and return its ID
+    pub async fn add_user_message_at(
+        &self,
+        session_id: &str,
+        content: &str,
+        created_at: i64,
+    ) -> Result<String> {
+        let msg_id = Uuid::new_v4().to_string();
+        let msg = AgentMessage {
+            id: msg_id.clone(),
+            session_id: session_id.to_string(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::Text {
+                content: content.to_string(),
+            }],
+            created_at,
+            parent_message_id: None,
+        };
+        self.storage
+            .session_store()
+            .add_message(session_id, msg)
+            .await?;
+        Ok(msg_id)
+    }
+
+    /// Simulate an assistant message with explicit timestamp and return its ID
+    pub async fn add_assistant_message_at(
+        &self,
+        session_id: &str,
+        content: &str,
+        created_at: i64,
+    ) -> Result<String> {
+        let msg_id = Uuid::new_v4().to_string();
+        let msg = AgentMessage {
+            id: msg_id.clone(),
+            session_id: session_id.to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::Text {
+                content: content.to_string(),
+            }],
+            created_at,
+            parent_message_id: None,
+        };
+        self.storage
+            .session_store()
+            .add_message(session_id, msg)
+            .await?;
+        Ok(msg_id)
+    }
+
     /// Take a snapshot and record TurnSnapshotStart
     pub async fn take_pre_snapshot(&self, session_id: &str) -> Result<(String, String)> {
         let snapshot_id = self.backend.track(self.worktree.path()).await?;

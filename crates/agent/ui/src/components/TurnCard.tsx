@@ -175,6 +175,37 @@ export const TurnCard = memo(function TurnCard({
   // Copy to clipboard hook
   const { copiedValue: copiedSection, copy: copyToClipboard } = useCopyToClipboard();
 
+  // Collapsed indicator for confirmed undo — replaces the entire turn
+  if (isUndone) {
+    const fileCount = revertedFiles.length;
+    const fileSummary = fileCount > 0
+      ? `${fileCount} file${fileCount !== 1 ? 's' : ''} reverted`
+      : 'no file changes';
+
+    return (
+      <div className="turn-card max-w-6xl mx-auto px-2 md:px-4 py-3 group">
+        <div className="flex items-center gap-3 rounded-lg border border-status-warning/25 bg-surface-elevated/30 px-4 py-2.5">
+          <Undo2 className="w-4 h-4 text-status-warning flex-shrink-0" />
+          <div className="flex items-center gap-2 min-w-0 flex-1">
+            <span className="text-sm text-ui-secondary">Turn undone</span>
+            <span className="text-[10px] text-ui-muted px-1.5 py-px rounded-full bg-surface-elevated/60 border border-surface-border/40 whitespace-nowrap">
+              {fileSummary}
+            </span>
+          </div>
+          {onRedo && (
+            <button
+              onClick={onRedo}
+              className="flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium text-accent-primary bg-accent-primary/10 border border-accent-primary/30 hover:bg-accent-primary/20 hover:border-accent-primary/50 transition-colors flex-shrink-0"
+            >
+              <Redo2 className="w-3.5 h-3.5" />
+              <span>Redo</span>
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       className={`turn-card max-w-6xl mx-auto px-2 md:px-4 py-3 group transition-opacity overflow-hidden ${
@@ -283,60 +314,15 @@ export const TurnCard = memo(function TurnCard({
           }}
         >
           {/* Pending undo state (top stack frame awaiting confirmation) */}
-          {isUndoPending && !isUndone && (
+          {isUndoPending && (
             <div className="mb-3 rounded-lg border border-status-warning/35 bg-status-warning/10 px-4 py-3 text-center">
               <h3 className="text-lg font-semibold text-status-warning mb-1">Undoing Changes...</h3>
               <p className="text-sm text-ui-secondary">Waiting for filesystem snapshot restore to finish.</p>
             </div>
           )}
 
-          {/* Undone state (top stack frame) */}
-          {isUndone && (
-            <div className="mb-3 rounded-lg border border-status-warning/35 bg-surface-canvas/75 p-4">
-              <div className="max-w-md w-full mx-auto space-y-4">
-                <div className="text-center">
-                  <h3 className="text-lg font-semibold text-status-warning mb-2">Changes Undone</h3>
-                  <p className="text-sm text-ui-secondary">
-                    {revertedFiles.length > 0
-                      ? `${revertedFiles.length} file${revertedFiles.length !== 1 ? 's' : ''} reverted`
-                      : 'No filesystem changes were made in this turn'}
-                  </p>
-                </div>
-
-                {/* File list - only show if there are files */}
-                {revertedFiles.length > 0 && (
-                  <div className="bg-surface-elevated/60 border border-surface-border/40 rounded-lg p-3 max-h-40 overflow-y-auto">
-                    <div className="space-y-1">
-                      {revertedFiles.slice(0, 5).map((file, idx) => (
-                        <div key={idx} className="text-xs text-ui-secondary font-mono truncate" title={file}>
-                          {file}
-                        </div>
-                      ))}
-                      {revertedFiles.length > 5 && (
-                        <div className="text-xs text-ui-muted italic">
-                          +{revertedFiles.length - 5} more file{revertedFiles.length - 5 !== 1 ? 's' : ''}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {/* Redo button */}
-                {onRedo && (
-                  <button
-                    onClick={onRedo}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-accent-primary/10 border border-accent-primary/40 text-accent-primary hover:bg-accent-primary/20 hover:border-accent-primary transition-colors"
-                  >
-                    <Redo2 className="w-4 h-4" />
-                    <span className="text-sm font-medium">Redo Changes</span>
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
           {/* Stacked undo placeholder (older undone frames) */}
-          {isStackedUndone && !isUndone && (
+          {isStackedUndone && (
             <div className="mb-3 px-3 py-2 rounded-md bg-status-warning/10 border border-status-warning/30 text-xs text-status-warning text-center">
               Undone in stack. Redo newer undo first.
             </div>

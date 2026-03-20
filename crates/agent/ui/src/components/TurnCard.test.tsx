@@ -240,7 +240,7 @@ describe('TurnCard', () => {
     expect(screen.queryByText('Undo')).not.toBeInTheDocument();
   });
 
-  it('shows "Changes Undone" overlay when isUndone is true', () => {
+  it('shows collapsed "Turn undone" indicator when isUndone is true', () => {
     const turn = makeTurn();
 
     render(
@@ -253,12 +253,12 @@ describe('TurnCard', () => {
       />
     );
 
-    expect(screen.getByText('Changes Undone')).toBeInTheDocument();
+    expect(screen.getByText('Turn undone')).toBeInTheDocument();
     expect(screen.getByText('2 files reverted')).toBeInTheDocument();
-    expect(screen.getByText('Redo Changes')).toBeInTheDocument();
+    expect(screen.getByText('Redo')).toBeInTheDocument();
   });
 
-  it('shows file count in undone overlay', () => {
+  it('shows file count in collapsed undone indicator', () => {
     const turn = makeTurn();
     const revertedFiles = [
       'src/a.ts',
@@ -279,7 +279,6 @@ describe('TurnCard', () => {
     );
 
     expect(screen.getByText('6 files reverted')).toBeInTheDocument();
-    expect(screen.getByText('+1 more file')).toBeInTheDocument();
   });
 
   it('calls onUndoTurn when undo button clicked', async () => {
@@ -301,7 +300,7 @@ describe('TurnCard', () => {
     expect(onUndoTurn).toHaveBeenCalledWith(3);
   });
 
-  it('calls onRedo when redo button clicked in undone overlay', async () => {
+  it('calls onRedo when redo button clicked in collapsed undone indicator', async () => {
     const user = userEvent.setup();
     const onRedo = vi.fn();
     const turn = makeTurn();
@@ -316,7 +315,7 @@ describe('TurnCard', () => {
       />
     );
 
-    const redoButton = screen.getByText('Redo Changes').closest('button');
+    const redoButton = screen.getByText('Redo').closest('button');
     expect(redoButton).toBeTruthy();
     await user.click(redoButton!);
 
@@ -379,7 +378,7 @@ describe('TurnCard', () => {
     expect(screen.queryByText('Undo')).not.toBeInTheDocument();
   });
 
-  it('undo overlay does not show redo when onRedo not provided', () => {
+  it('collapsed undone indicator does not show redo when onRedo not provided', () => {
     const turn = makeTurn();
 
     render(
@@ -392,11 +391,11 @@ describe('TurnCard', () => {
       />
     );
 
-    expect(screen.getByText('Changes Undone')).toBeInTheDocument();
-    expect(screen.queryByText('Redo Changes')).not.toBeInTheDocument();
+    expect(screen.getByText('Turn undone')).toBeInTheDocument();
+    expect(screen.queryByText('Redo')).not.toBeInTheDocument();
   });
 
-  it('undone overlay with 0 reverted files does not crash', () => {
+  it('collapsed undone indicator with 0 reverted files does not crash', () => {
     const turn = makeTurn();
 
     render(
@@ -408,8 +407,8 @@ describe('TurnCard', () => {
       />
     );
 
-    expect(screen.getByText('Changes Undone')).toBeInTheDocument();
-    expect(screen.getByText('No filesystem changes were made in this turn')).toBeInTheDocument();
+    expect(screen.getByText('Turn undone')).toBeInTheDocument();
+    expect(screen.getByText('no file changes')).toBeInTheDocument();
   });
 
   it('undo button hidden when isUndone is true', () => {
