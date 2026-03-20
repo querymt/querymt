@@ -45,8 +45,7 @@ fn test_server_state(
         workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
             crate::index::WorkspaceIndexManagerConfig::default(),
         ),
-        oauth_flows: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        oauth_callback_listener: Arc::new(tokio::sync::Mutex::new(None)),
+        oauth_service: handle.oauth_service.clone(),
     }
 }
 

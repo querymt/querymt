@@ -17,7 +17,6 @@ use querymt_provider_common::{
     DownloadProgress, DownloadStatus, HfModelRef, canonical_id_from_file, canonical_id_from_hf,
     download_hf_gguf_with_progress, parse_gguf_metadata,
 };
-use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 
@@ -25,101 +24,36 @@ use tokio::sync::mpsc;
 
 /// Handle provider listing for dashboard auth UI.
 ///
-/// Lists ALL registered providers with their full auth status:
-/// - OAuth connection status (if the provider supports OAuth)
-/// - Whether a manually-stored API key exists in the keyring
-/// - Whether the environment variable is set
-/// - The user's preferred auth method
+/// Delegates to the shared [`crate::auth::service::auth_status`] and maps
+/// the result into the UI wire format.
 pub async fn handle_list_auth_providers(state: &ServerState, tx: &mpsc::Sender<String>) {
-    let registry = state.agent.config.provider.plugin_registry();
+    let statuses = state.oauth_service.auth_status(None).await;
 
-    let mut seen = HashSet::new();
-    let mut providers = Vec::new();
-
-    let store = crate::SecretStore::new().ok();
-
-    for cfg in &registry.config.providers {
-        if !seen.insert(cfg.name.clone()) {
-            continue;
-        }
-
-        let provider_name = cfg.name.clone();
-
-        // Resolve factory to get api_key_name and display name
-        let factory = registry.get(&provider_name).await;
-        let env_var_name = factory
-            .as_ref()
-            .and_then(|f| f.as_http())
-            .and_then(|h| h.api_key_name());
-
-        // Check OAuth support
-        #[cfg(feature = "oauth")]
-        let (supports_oauth, oauth_status, display_name_from_oauth) = {
-            match crate::auth::get_oauth_provider(&provider_name, None) {
-                Ok(oauth_provider) => {
-                    let status = match store
-                        .as_ref()
-                        .and_then(|s| s.get_oauth_tokens(&provider_name))
-                    {
-                        Some(tokens) if tokens.is_expired() => Some(OAuthStatus::Expired),
-                        Some(_) => Some(OAuthStatus::Connected),
-                        None => Some(OAuthStatus::NotAuthenticated),
-                    };
-                    (
-                        true,
-                        status,
-                        Some(oauth_provider.display_name().to_string()),
-                    )
+    let providers: Vec<AuthProviderEntry> = statuses
+        .into_iter()
+        .map(|s| {
+            let oauth_status = s.oauth_status.map(|os| match os {
+                crate::auth::service::OAuthStatus::NotAuthenticated => {
+                    OAuthStatus::NotAuthenticated
                 }
-                Err(_) => (false, None, None),
+                crate::auth::service::OAuthStatus::Expired => OAuthStatus::Expired,
+                crate::auth::service::OAuthStatus::Connected => OAuthStatus::Connected,
+            });
+            let preferred_method = s
+                .preferred_method
+                .and_then(|v| v.parse::<AuthMethod>().ok());
+            AuthProviderEntry {
+                provider: s.provider,
+                display_name: s.display_name,
+                oauth_status,
+                has_stored_api_key: s.has_stored_api_key,
+                has_env_api_key: s.has_env_api_key,
+                env_var_name: s.env_var_name,
+                supports_oauth: s.supports_oauth,
+                preferred_method,
             }
-        };
-        #[cfg(not(feature = "oauth"))]
-        let (supports_oauth, oauth_status, display_name_from_oauth): (
-            bool,
-            Option<OAuthStatus>,
-            Option<String>,
-        ) = (false, None, None);
-
-        // Check for stored API key in keyring
-        let has_stored_api_key = env_var_name
-            .as_ref()
-            .and_then(|name| store.as_ref().and_then(|s| s.get(name)))
-            .is_some();
-
-        // Check for env var
-        let has_env_api_key = env_var_name
-            .as_ref()
-            .is_some_and(|name| std::env::var(name).is_ok());
-
-        // Get preferred auth method from store
-        let preferred_method = store
-            .as_ref()
-            .and_then(|s| s.get(&format!("auth_method_{}", provider_name)))
-            .and_then(|v| v.parse::<AuthMethod>().ok());
-
-        // Use OAuth display name if available, otherwise capitalize the provider name
-        let display_name = display_name_from_oauth.unwrap_or_else(|| {
-            let mut chars = provider_name.chars();
-            match chars.next() {
-                None => provider_name.clone(),
-                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
-            }
-        });
-
-        providers.push(AuthProviderEntry {
-            provider: provider_name,
-            display_name,
-            oauth_status,
-            has_stored_api_key,
-            has_env_api_key,
-            env_var_name: env_var_name.map(|s| s.to_string()),
-            supports_oauth,
-            preferred_method,
-        });
-    }
-
-    providers.sort_by(|a, b| a.provider.cmp(&b.provider));
+        })
+        .collect();
 
     let _ = send_message(tx, UiServerMessage::AuthProviders { providers }).await;
 }

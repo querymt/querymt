@@ -26,6 +26,7 @@ mod session_stream_tests;
 #[cfg(test)]
 mod undo_handler_tests;
 
+use crate::auth::service::OAuthService;
 use crate::event_fanout::EventFanout;
 use crate::index::WorkspaceIndexManagerActor;
 use crate::session::projection::ViewStore;
@@ -43,7 +44,6 @@ use session::collect_event_sources;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -58,8 +58,7 @@ pub struct UiServer {
     session_agents: Arc<Mutex<HashMap<String, String>>>,
     session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
-    oauth_flows: Arc<Mutex<HashMap<String, PendingOAuthFlow>>>,
-    oauth_callback_listener: Arc<Mutex<Option<ActiveOAuthCallbackListener>>>,
+    oauth_service: OAuthService,
 }
 
 /// Shared server state for request handlers.
@@ -74,25 +73,7 @@ pub(crate) struct ServerState {
     pub session_agents: Arc<Mutex<HashMap<String, String>>>,
     pub session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     pub workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
-    pub oauth_flows: Arc<Mutex<HashMap<String, PendingOAuthFlow>>>,
-    pub oauth_callback_listener: Arc<Mutex<Option<ActiveOAuthCallbackListener>>>,
-}
-
-pub(crate) struct ActiveOAuthCallbackListener {
-    pub flow_id: String,
-    pub conn_id: String,
-    pub provider: String,
-    pub stop_tx: tokio::sync::oneshot::Sender<()>,
-    pub task: JoinHandle<()>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PendingOAuthFlow {
-    pub conn_id: String,
-    pub provider: String,
-    pub state: String,
-    pub verifier: String,
-    pub created_at: Instant,
+    pub oauth_service: OAuthService,
 }
 
 /// State for a single WebSocket connection.
@@ -153,8 +134,7 @@ impl UiServer {
             session_agents: Arc::new(Mutex::new(HashMap::new())),
             session_cwds: Arc::new(Mutex::new(HashMap::new())),
             workspace_manager: agent.workspace_manager_actor(),
-            oauth_flows: Arc::new(Mutex::new(HashMap::new())),
-            oauth_callback_listener: Arc::new(Mutex::new(None)),
+            oauth_service: agent.oauth_service.clone(),
         }
     }
 
@@ -170,8 +150,7 @@ impl UiServer {
             session_agents: self.session_agents,
             session_cwds: self.session_cwds,
             workspace_manager: self.workspace_manager,
-            oauth_flows: self.oauth_flows,
-            oauth_callback_listener: self.oauth_callback_listener,
+            oauth_service: self.oauth_service,
         };
 
         Router::new()

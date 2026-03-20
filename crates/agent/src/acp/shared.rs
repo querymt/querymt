@@ -595,6 +595,22 @@ pub async fn handle_rpc_message<S: SendAgent>(
             }
         }
 
+        // Forward _querymt/* extension methods to the agent's ext_method handler.
+        m if m.starts_with("_querymt/") || m.starts_with("querymt/") => {
+            let raw_params = serde_json::value::RawValue::from_string(
+                serde_json::to_string(&req.params).unwrap_or_else(|_| "null".to_string()),
+            )
+            .unwrap_or_else(|_| {
+                serde_json::value::RawValue::from_string("null".to_string()).unwrap()
+            });
+            let ext_req =
+                agent_client_protocol::ExtRequest::new(m, std::sync::Arc::from(raw_params));
+            agent
+                .ext_method(ext_req)
+                .await
+                .map(|r| serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null))
+        }
+
         _ => Err(Error::method_not_found()),
     };
 

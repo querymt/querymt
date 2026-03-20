@@ -154,6 +154,9 @@ pub struct LocalAgentHandle {
 
     /// Shared model registry for all model enumeration paths (UI, ACP, mesh).
     pub model_registry: crate::model_registry::ModelRegistry,
+
+    /// Shared OAuth service for all auth operations across UI and ACP transports.
+    pub oauth_service: crate::auth::service::OAuthService,
 }
 
 impl LocalAgentHandle {
@@ -163,6 +166,13 @@ impl LocalAgentHandle {
     /// an `AgentConfig` via `AgentConfigBuilder::build()`.
     pub fn from_config(config: Arc<AgentConfig>) -> Self {
         let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
+        let model_registry = crate::model_registry::ModelRegistry::new();
+        let oauth_service = crate::auth::service::OAuthService::new(
+            config.clone(),
+            model_registry.clone(),
+            std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            std::sync::Arc::new(Mutex::new(None)),
+        );
         Self {
             config,
             registry,
@@ -174,7 +184,8 @@ impl LocalAgentHandle {
             mesh: StdMutex::new(None),
             #[cfg(feature = "remote")]
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
-            model_registry: crate::model_registry::ModelRegistry::new(),
+            model_registry,
+            oauth_service,
         }
     }
 
@@ -1284,6 +1295,63 @@ impl SendAgent for LocalAgentHandle {
                     },
                 ))
             }
+
+            // ── _querymt/auth extensions ──────────────────────────────────
+            "_querymt/auth/status" => {
+                #[derive(serde::Deserialize, Default)]
+                struct StatusReq {
+                    #[serde(default)]
+                    provider: Option<String>,
+                }
+                let parsed: StatusReq = serde_json::from_str(req.params.get()).unwrap_or_default();
+                let statuses = self
+                    .oauth_service
+                    .auth_status(parsed.provider.as_deref())
+                    .await;
+                ext_json_response(&serde_json::json!({ "providers": statuses }))
+            }
+            "_querymt/auth/start" => {
+                #[derive(serde::Deserialize)]
+                struct StartReq {
+                    provider: String,
+                }
+                let parsed: StartReq = serde_json::from_str(req.params.get()).map_err(|e| {
+                    Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+                })?;
+                let result = self
+                    .oauth_service
+                    .start_flow("acp", &parsed.provider, None)
+                    .await
+                    .map_err(|e| Error::internal_error().data(serde_json::json!({"error": e})))?;
+                ext_json_response(&result)
+            }
+            "_querymt/auth/complete" => {
+                #[derive(serde::Deserialize)]
+                struct CompleteReq {
+                    flow_id: String,
+                    response: String,
+                }
+                let parsed: CompleteReq = serde_json::from_str(req.params.get()).map_err(|e| {
+                    Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+                })?;
+                let result = self
+                    .oauth_service
+                    .complete_flow("acp", &parsed.flow_id, &parsed.response)
+                    .await;
+                ext_json_response(&result)
+            }
+            "_querymt/auth/logout" => {
+                #[derive(serde::Deserialize)]
+                struct LogoutReq {
+                    provider: String,
+                }
+                let parsed: LogoutReq = serde_json::from_str(req.params.get()).map_err(|e| {
+                    Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+                })?;
+                let result = self.oauth_service.logout("acp", &parsed.provider).await;
+                ext_json_response(&result)
+            }
+
             _ => {
                 // Unknown extension method — return null
                 let raw_value = serde_json::value::RawValue::from_string("null".to_string())
@@ -1303,6 +1371,19 @@ impl SendAgent for LocalAgentHandle {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Helper to build an `ExtResponse` from a serializable value.
+fn ext_json_response<T: serde::Serialize>(
+    value: &T,
+) -> Result<ExtResponse, agent_client_protocol::Error> {
+    let json = serde_json::to_string(value).map_err(|e| {
+        agent_client_protocol::Error::from(crate::error::AgentError::Serialization(e.to_string()))
+    })?;
+    let raw = serde_json::value::RawValue::from_string(json).map_err(|e| {
+        agent_client_protocol::Error::from(crate::error::AgentError::Serialization(e.to_string()))
+    })?;
+    Ok(ExtResponse::new(Arc::from(raw)))
 }
 
 // ══════════════════════════════════════════════════════════════════════════
