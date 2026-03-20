@@ -6,7 +6,9 @@
 //! - File restoration
 //! - Proper reverted files list
 
+use crate::events::{AgentEventKind, EventOrigin};
 use crate::session::backend::StorageBackend;
+use crate::session::projection::{EventJournal, NewDurableEvent};
 use crate::test_utils::UndoTestFixture;
 use anyhow::Result;
 
@@ -494,6 +496,242 @@ async fn test_undo_nested_directory_file_changes() -> Result<()> {
             .all(|p| std::path::Path::new(p).extension().is_some() || p.contains('.')),
         "reverted_files should not contain bare directory paths, got: {:?}",
         result.reverted_files
+    );
+
+    Ok(())
+}
+
+// ==================== Test Suite: cleanup_revert_on_prompt event journal pruning ====================
+
+/// Helper: append a PromptReceived event to the journal and return its stream_seq.
+async fn append_prompt_event(
+    journal: &dyn EventJournal,
+    session_id: &str,
+    message_id: &str,
+) -> u64 {
+    journal
+        .append_durable(&NewDurableEvent {
+            session_id: session_id.to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::PromptReceived {
+                content: "test prompt".to_string(),
+                message_id: Some(message_id.to_string()),
+            },
+        })
+        .await
+        .expect("append prompt event")
+        .stream_seq
+}
+
+/// Helper: append a generic non-prompt event and return its stream_seq.
+async fn append_generic_event(journal: &dyn EventJournal, session_id: &str) -> u64 {
+    journal
+        .append_durable(&NewDurableEvent {
+            session_id: session_id.to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::Cancelled,
+        })
+        .await
+        .expect("append generic event")
+        .stream_seq
+}
+
+/// After undo + new prompt, cleanup_revert_on_prompt must delete event journal
+/// entries that belong to the undone turn so they do not reappear on page reload.
+#[tokio::test]
+async fn test_cleanup_revert_prunes_event_journal() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    let session_id = fixture.create_session().await?;
+    let journal = fixture.storage.event_journal();
+
+    // Turn 1: prompt + some events
+    let msg1_id = fixture
+        .add_user_message(&session_id, "first prompt")
+        .await?;
+    let seq_prompt1 = append_prompt_event(&*journal, &session_id, &msg1_id).await;
+    let _seq_after1 = append_generic_event(&*journal, &session_id).await;
+
+    // Turn 2 (this will be undone): prompt + some events that should be pruned
+    let msg2_id = fixture
+        .add_user_message(&session_id, "second prompt")
+        .await?;
+    let seq_prompt2 = append_prompt_event(&*journal, &session_id, &msg2_id).await;
+    let seq_after2a = append_generic_event(&*journal, &session_id).await;
+    let seq_after2b = append_generic_event(&*journal, &session_id).await;
+
+    // Verify all 5 events are present before undo
+    let before = journal.load_session_stream(&session_id, None, None).await?;
+    assert_eq!(before.len(), 5, "expected 5 events before undo");
+
+    // Undo turn 2 — this pushes a revert state with msg2_id as the frontier
+    fixture.undo(&session_id, &msg2_id).await?;
+
+    // Now simulate a new prompt being sent: cleanup_revert_on_prompt should
+    // delete messages AND prune the event journal after the frontier seq.
+    crate::agent::undo::cleanup_revert_on_prompt(
+        &fixture.handle.config.provider,
+        &*fixture.storage.event_journal(),
+        &session_id,
+    )
+    .await
+    .expect("cleanup should succeed");
+
+    // After cleanup: the frontier prompt_received event AND everything after
+    // it must be gone — the undone turn's prompt and its follow-up events are
+    // all pruned so they don't reappear on page reload.
+    let after = journal.load_session_stream(&session_id, None, None).await?;
+
+    // Turn-2 events (frontier prompt + two generic events) must all be pruned.
+    assert!(
+        !after.iter().any(|e| e.stream_seq == seq_prompt2),
+        "frontier (turn-2) prompt event must be pruned (seq {})",
+        seq_prompt2
+    );
+    assert!(
+        !after.iter().any(|e| e.stream_seq == seq_after2a),
+        "first event after turn-2 prompt must be pruned (seq {})",
+        seq_after2a
+    );
+    assert!(
+        !after.iter().any(|e| e.stream_seq == seq_after2b),
+        "second event after turn-2 prompt must be pruned (seq {})",
+        seq_after2b
+    );
+
+    // Turn-1 events must all be retained.
+    assert!(
+        after.iter().any(|e| e.stream_seq == seq_prompt1),
+        "turn-1 prompt event must be retained (seq {})",
+        seq_prompt1
+    );
+
+    // Exactly 2 events remain: turn-1 prompt and turn-1 generic.
+    assert_eq!(
+        after.len(),
+        2,
+        "expected 2 events after pruning, got {}",
+        after.len()
+    );
+
+    Ok(())
+}
+
+// ==================== Test Suite: cleanup must remove undone messages before history reload ====================
+
+/// Regression test: after undo + cleanup_revert_on_prompt the message history
+/// returned by `get_history` must NOT contain the undone turn's messages.
+///
+/// This is the exact bug that caused the LLM to still "see" undone user
+/// messages — `cleanup_revert_on_prompt` was called AFTER the runtime context
+/// had already loaded history, so the deleted messages were still in memory.
+/// Additionally, `delete_messages_after` used `created_at > target` which
+/// kept the frontier message itself (the undone user prompt) in the history.
+///
+/// The fix:
+///   1. cleanup must run BEFORE `get_history` / `load_working_context`
+///   2. `delete_messages_after` must delete the frontier message AND everything
+///      after it (>= on internal id, not > on created_at)
+#[tokio::test]
+async fn test_cleanup_revert_removes_undone_messages_from_history() -> Result<()> {
+    let fixture = UndoTestFixture::new().await?;
+    let session_id = fixture.create_session().await?;
+    let journal = fixture.storage.event_journal();
+
+    // Turn 1: user message "hello"
+    let msg1_id = fixture
+        .add_user_message_at(&session_id, "hello", 1000)
+        .await?;
+    append_prompt_event(&*journal, &session_id, &msg1_id).await;
+    // Simulate assistant response for turn 1
+    fixture
+        .add_assistant_message_at(&session_id, "Hi there!", 1001)
+        .await?;
+    append_generic_event(&*journal, &session_id).await;
+
+    // Turn 2: user message "hallo" (will be undone)
+    let msg2_id = fixture
+        .add_user_message_at(&session_id, "hallo", 1002)
+        .await?;
+    append_prompt_event(&*journal, &session_id, &msg2_id).await;
+    // Simulate assistant response for turn 2
+    fixture
+        .add_assistant_message_at(&session_id, "Hello again!", 1003)
+        .await?;
+    append_generic_event(&*journal, &session_id).await;
+
+    // Verify both turns are in history before undo
+    let history_before = fixture
+        .storage
+        .session_store()
+        .get_history(&session_id)
+        .await?;
+    assert_eq!(
+        history_before.len(),
+        4,
+        "expected 4 messages (2 user + 2 assistant) before undo"
+    );
+
+    // Undo turn 2
+    fixture.undo(&session_id, &msg2_id).await?;
+
+    // Simulate what execute_prompt_detached should do:
+    // cleanup MUST run BEFORE loading history
+    crate::agent::undo::cleanup_revert_on_prompt(
+        &fixture.handle.config.provider,
+        &*journal,
+        &session_id,
+    )
+    .await
+    .expect("cleanup should succeed");
+
+    // Now get_history — the undone turn's messages must be gone
+    let history_after = fixture
+        .storage
+        .session_store()
+        .get_history(&session_id)
+        .await?;
+
+    // Only turn 1 messages should remain (user "hello" + assistant "Hi there!").
+    // The frontier message (msg2_id = "hallo") AND its assistant response must
+    // both be deleted — the user undid that turn, so neither the prompt nor the
+    // response should appear in the LLM context on the next turn.
+    assert_eq!(
+        history_after.len(),
+        2,
+        "expected 2 messages after cleanup (turn 1 only), got {} — undone messages leaked into history",
+        history_after.len()
+    );
+
+    // Verify the surviving messages are from turn 1
+    let user_msgs: Vec<&str> = history_after
+        .iter()
+        .filter_map(|m| {
+            m.parts.iter().find_map(|p| {
+                if let crate::model::MessagePart::Text { content } = p {
+                    Some(content.as_str())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    assert!(
+        user_msgs.contains(&"hello"),
+        "turn-1 user message 'hello' must survive"
+    );
+    assert!(
+        user_msgs.contains(&"Hi there!"),
+        "turn-1 assistant message must survive"
+    );
+    assert!(
+        !user_msgs.contains(&"hallo"),
+        "undone user message 'hallo' must NOT survive"
+    );
+    assert!(
+        !user_msgs.contains(&"Hello again!"),
+        "undone assistant message must NOT survive"
     );
 
     Ok(())

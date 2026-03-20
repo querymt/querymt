@@ -127,6 +127,18 @@ pub trait EventJournal: Send + Sync {
         after_seq: Option<u64>,
         limit: Option<usize>,
     ) -> SessionResult<Vec<DurableEvent>>;
+
+    /// Delete the event at `from_seq` and all subsequent events for a session.
+    /// Used by undo cleanup to prune the event journal when the user commits
+    /// a new prompt after an undo so that the reverted turns do not reappear
+    /// on page reload.
+    ///
+    /// Returns the number of deleted rows.
+    async fn delete_session_events_from(
+        &self,
+        session_id: &str,
+        from_seq: u64,
+    ) -> SessionResult<usize>;
 }
 
 /// View generation (read-only projections)

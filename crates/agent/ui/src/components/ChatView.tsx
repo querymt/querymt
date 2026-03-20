@@ -157,8 +157,10 @@ export function ChatView() {
   const trailingFollowTimeoutRef = useRef<number | null>(null);
   const previousThinkingAgentIdRef = useRef<string | null>(null);
   const mentionInputRef = useRef<HTMLTextAreaElement>(null);
+  const promptRef = useRef(prompt);
   const activeIndexStatus = sessionId ? workspaceIndexStatus[sessionId]?.status : undefined;
 
+  promptRef.current = prompt;
 
   // File mention hook
   const fileMention = useFileMention(requestFileIndex);
@@ -444,7 +446,7 @@ export function ChatView() {
     for (let i = startIndex; i >= 0; i--) {
       const turn = filteredTurns[i];
       // Only user-initiated turns are undo-eligible.
-      if (turn.toolCalls.length > 0 && !!turn.userMessage?.messageId) {
+      if (!!turn.userMessage?.messageId) {
         return i;
       }
     }
@@ -493,9 +495,17 @@ export function ChatView() {
       console.error('[ChatView] Cannot undo: no message ID found for turn', turn.id);
       return;
     }
+
+    // Restore the undone user text into the composer only when the user has
+    // not already started typing a new draft.  We can only restore the stored
+    // prompt text representation here; file mentions come back as plain text.
+    if (userMessage.content && !promptRef.current.trim()) {
+      setPrompt(userMessage.content);
+    }
+
     console.log('[ChatView] Undoing turn', turn.id, 'with message ID', userMessage.messageId);
     sendUndo(userMessage.messageId, turn.id);
-  }, [filteredTurns, sendUndo]);
+  }, [filteredTurns, sendUndo, setPrompt]);
 
   // Handle redo
   const handleRedo = useCallback(() => {

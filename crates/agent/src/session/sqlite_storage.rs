@@ -1292,25 +1292,20 @@ impl SessionStore for SqliteStorage {
         self.run_blocking(move |conn| {
             let tx = conn.transaction()?;
 
-            // Get the created_at timestamp of the target message
-            let target_created_at: i64 = tx.query_row(
-                "SELECT created_at FROM messages WHERE id = ?",
-                params![message_internal_id],
-                |row| row.get(0),
-            )?;
-
-            // Delete message_parts for messages after the target
+            // Delete message_parts for the target message and everything after it.
+            // We use the internal auto-increment id (>= target) rather than
+            // created_at timestamps which can collide at second resolution.
             tx.execute(
                 "DELETE FROM message_parts WHERE message_id IN (
-                    SELECT id FROM messages WHERE session_id = ? AND created_at > ?
+                    SELECT id FROM messages WHERE session_id = ? AND id >= ?
                 )",
-                params![session_internal_id, target_created_at],
+                params![session_internal_id, message_internal_id],
             )?;
 
-            // Delete messages after the target
+            // Delete the target message and all messages after it
             let deleted: usize = tx.execute(
-                "DELETE FROM messages WHERE session_id = ? AND created_at > ?",
-                params![session_internal_id, target_created_at],
+                "DELETE FROM messages WHERE session_id = ? AND id >= ?",
+                params![session_internal_id, message_internal_id],
             )?;
 
             tx.commit()?;
@@ -2116,6 +2111,27 @@ impl EventJournal for SqliteStorage {
                 .collect::<Result<Vec<_>, _>>()?;
 
             Ok(events)
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    async fn delete_session_events_from(
+        &self,
+        session_id: &str,
+        from_seq: u64,
+    ) -> SessionResult<usize> {
+        let session_id = session_id.to_string();
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            let deleted = conn.execute(
+                "DELETE FROM event_journal WHERE session_id = ? AND stream_seq >= ?",
+                params![session_id, from_seq],
+            )?;
+            Ok(deleted)
         })
         .await
         .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?

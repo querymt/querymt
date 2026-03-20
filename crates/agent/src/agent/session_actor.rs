@@ -1128,6 +1128,20 @@ async fn execute_prompt_detached(
         }
     };
 
+    // Clean up revert state if a new prompt is sent while in reverted state.
+    // Also prunes the event journal so undone turns don't reappear on reload.
+    // IMPORTANT: this must run BEFORE loading RuntimeContext so that
+    // `get_history` / `load_working_context` only sees the surviving messages.
+    if let Err(e) = crate::agent::undo::cleanup_revert_on_prompt(
+        &config.provider,
+        &**config.event_sink.journal(),
+        &session_id,
+    )
+    .await
+    {
+        warn!("Failed to clean up revert state: {}", e);
+    }
+
     // Get Session Context (turn-pinned)
     let session_handle = config
         .provider
@@ -1144,13 +1158,6 @@ async fn execute_prompt_detached(
         .load_working_context()
         .await
         .map_err(|e| AgentError::Internal(e.to_string()))?;
-
-    // Clean up revert state if a new prompt is sent while in reverted state
-    if let Err(e) =
-        crate::agent::undo::cleanup_revert_on_prompt(&config.provider, &session_id).await
-    {
-        warn!("Failed to clean up revert state: {}", e);
-    }
 
     // Create execution context — attach the cancellation token so it propagates
     // into individual tool calls for cooperative cancellation.
