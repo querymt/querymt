@@ -2,7 +2,7 @@
  * Turn card component - groups user prompt, agent responses, and tool activity
  */
 
-import { useState, memo } from 'react';
+import { useState, useEffect, memo } from 'react';
 import { Turn, UiAgentInfo, EventRow, DelegationGroupInfo, LlmConfigDetails, TurnCompaction } from '../types';
 import { MessageContent } from './MessageContent';
 import { ActivitySection } from './ActivitySection';
@@ -12,7 +12,7 @@ import { CompactionCard, CompactingIndicator } from './CompactionCard';
 import { getAgentShortName } from '../utils/agentNames';
 import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
-import { Undo2, Redo2, Copy, Check, GitBranchPlus } from 'lucide-react';
+import { Undo2, Redo2, Copy, Check, GitBranchPlus, Loader } from 'lucide-react';
 
 export interface TurnCardProps {
   turn: Turn;
@@ -176,6 +176,10 @@ export const TurnCard = memo(function TurnCard({
   const { copiedValue: copiedSection, copy: copyToClipboard } = useCopyToClipboard();
 
   // Collapsed indicator for confirmed undo — replaces the entire turn
+  const [redoPending, setRedoPending] = useState(false);
+  // Reset pending state when a fresh undo lands (undo → redo → undo cycle)
+  useEffect(() => { if (isUndone) setRedoPending(false); }, [isUndone]);
+
   if (isUndone) {
     const fileCount = revertedFiles.length;
     const fileSummary = fileCount > 0
@@ -187,18 +191,23 @@ export const TurnCard = memo(function TurnCard({
         <div className="flex items-center gap-3 rounded-lg border border-status-warning/25 bg-surface-elevated/30 px-4 py-2.5">
           <Undo2 className="w-4 h-4 text-status-warning flex-shrink-0" />
           <div className="flex items-center gap-2 min-w-0 flex-1">
-            <span className="text-sm text-ui-secondary">Turn undone</span>
-            <span className="text-[10px] text-ui-muted px-1.5 py-px rounded-full bg-surface-elevated/60 border border-surface-border/40 whitespace-nowrap">
-              {fileSummary}
-            </span>
+            <span className="text-sm text-ui-secondary">{redoPending ? 'Redoing…' : 'Turn undone'}</span>
+            {!redoPending && (
+              <span className="text-[10px] text-ui-muted px-1.5 py-px rounded-full bg-surface-elevated/60 border border-surface-border/40 whitespace-nowrap">
+                {fileSummary}
+              </span>
+            )}
           </div>
           {onRedo && (
             <button
-              onClick={onRedo}
-              className="flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium text-accent-primary bg-accent-primary/10 border border-accent-primary/30 hover:bg-accent-primary/20 hover:border-accent-primary/50 transition-colors flex-shrink-0"
+              onClick={() => { setRedoPending(true); onRedo(); }}
+              disabled={redoPending}
+              className="flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium text-accent-primary bg-accent-primary/10 border border-accent-primary/30 hover:bg-accent-primary/20 hover:border-accent-primary/50 transition-colors flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              <Redo2 className="w-3.5 h-3.5" />
-              <span>Redo</span>
+              {redoPending
+                ? <Loader className="w-3.5 h-3.5 animate-spin" />
+                : <Redo2 className="w-3.5 h-3.5" />}
+              <span>{redoPending ? 'Redoing' : 'Redo'}</span>
             </button>
           )}
         </div>

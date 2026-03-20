@@ -322,6 +322,80 @@ describe('TurnCard', () => {
     expect(onRedo).toHaveBeenCalledTimes(1);
   });
 
+  it('disables redo button and shows spinner after click', async () => {
+    const user = userEvent.setup();
+    const onRedo = vi.fn();
+    const turn = makeTurn();
+
+    render(
+      <TurnCard
+        {...defaultProps}
+        turn={turn}
+        isUndone={true}
+        revertedFiles={['src/foo.ts']}
+        onRedo={onRedo}
+      />
+    );
+
+    await user.click(screen.getByText('Redo').closest('button')!);
+
+    // After click: button shows "Redoing" and is disabled
+    expect(screen.getByText('Redoing')).toBeInTheDocument();
+    expect(screen.getByText('Redoing…')).toBeInTheDocument();
+    const disabledButton = screen.getByText('Redoing').closest('button');
+    expect(disabledButton).toBeDisabled();
+
+    // Second click should not fire
+    await user.click(disabledButton!);
+    expect(onRedo).toHaveBeenCalledTimes(1);
+  });
+
+  it('resets redo pending state on undo-redo-undo cycle', async () => {
+    const user = userEvent.setup();
+    const onRedo = vi.fn();
+    const turn = makeTurn();
+
+    const { rerender } = render(
+      <TurnCard
+        {...defaultProps}
+        turn={turn}
+        isUndone={true}
+        revertedFiles={['src/foo.ts']}
+        onRedo={onRedo}
+      />
+    );
+
+    // Click redo — enters pending state
+    await user.click(screen.getByText('Redo').closest('button')!);
+    expect(screen.getByText('Redoing')).toBeInTheDocument();
+
+    // Redo completes — turn is no longer undone
+    rerender(
+      <TurnCard
+        {...defaultProps}
+        turn={turn}
+        isUndone={false}
+        revertedFiles={[]}
+        onRedo={onRedo}
+      />
+    );
+
+    // User undoes again — isUndone flips back to true
+    rerender(
+      <TurnCard
+        {...defaultProps}
+        turn={turn}
+        isUndone={true}
+        revertedFiles={['src/foo.ts']}
+        onRedo={onRedo}
+      />
+    );
+
+    // Should show "Redo" (not stuck on "Redoing")
+    expect(screen.getByText('Redo')).toBeInTheDocument();
+    expect(screen.queryByText('Redoing')).not.toBeInTheDocument();
+  });
+
   it('shows fork button when turn has a user message id and is eligible', () => {
     const turn = makeTurn({
       isActive: false,
