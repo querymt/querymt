@@ -26,6 +26,8 @@ pub(crate) struct HostState {
         u64,
         Pin<Box<dyn Stream<Item = Result<Vec<u8>, reqwest::Error>> + Send>>,
     >,
+    #[cfg(feature = "http-client")]
+    pub http_client: reqwest::Client,
     pub next_stream_id: u64,
     pub yield_tx:
         Option<tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, crate::error::LLMError>>>,
@@ -47,6 +49,8 @@ impl HostState {
             cancel_watch_rx,
             #[cfg(feature = "http-client")]
             http_streams: std::collections::HashMap::new(),
+            #[cfg(feature = "http-client")]
+            http_client: reqwest::Client::new(),
             next_stream_id: 1,
             yield_tx: None,
             tokio_handle,
@@ -94,7 +98,7 @@ pub(crate) fn reqwest_http(
 
     let http_req = ser_req.req;
     let state = user_data.get()?;
-    let (handle_tokio, cancel_rx) = {
+    let (handle_tokio, cancel_rx, client) = {
         let state_guard = state.lock().unwrap();
         if let Some(host) = http_req.uri().host()
             && !state_guard.allowed_hosts.is_empty()
@@ -116,6 +120,7 @@ pub(crate) fn reqwest_http(
         (
             state_guard.tokio_handle.clone(),
             state_guard.cancel_watch_rx.clone(),
+            state_guard.http_client.clone(),
         )
     };
 
@@ -131,7 +136,6 @@ pub(crate) fn reqwest_http(
                     .body(b"cancelled".to_vec())
                     .map_err(|e| format!("{}", e))
             };
-            let client = reqwest::Client::new();
             let method = reqwest::Method::from_bytes(http_req.method().as_str().as_bytes())
                 .map_err(|e| format!("Invalid HTTP method: {}", e))?;
             let url = http_req.uri().to_string();
@@ -235,7 +239,7 @@ pub(crate) fn qmt_http_stream_open(
         })?;
         let http_req = ser_req.req;
         let state = user_data.get()?;
-        let (handle_tokio, cancel_rx) = {
+        let (handle_tokio, cancel_rx, client) = {
             let state_guard = state.lock().unwrap();
             if let Some(host) = http_req.uri().host()
                 && !state_guard.allowed_hosts.is_empty()
@@ -249,11 +253,11 @@ pub(crate) fn qmt_http_stream_open(
             (
                 state_guard.tokio_handle.clone(),
                 state_guard.cancel_watch_rx.clone(),
+                state_guard.http_client.clone(),
             )
         };
 
         let stream_res = handle_tokio.block_on(async move {
-            let client = reqwest::Client::new();
             let method =
                 reqwest::Method::from_bytes(http_req.method().as_str().as_bytes()).unwrap();
             let url = http_req.uri().to_string();
@@ -406,33 +410,31 @@ pub(crate) fn qmt_http_stream_next(
         }
 
         let state = user_data.get()?;
-        let (handle_tokio, stream_exists, cancel_rx) = {
-            let state_guard = state.lock().unwrap();
+
+        // Single lock: extract handle, cancel_rx, and remove the stream in one acquisition.
+        let (handle_tokio, cancel_rx, mut stream) = {
+            let mut state_guard = state.lock().unwrap();
+            let stream = match state_guard.http_streams.remove(&stream_id) {
+                Some(s) => s,
+                None => {
+                    return Err(extism::Error::msg(format!(
+                        "Stream {} not found",
+                        stream_id
+                    )));
+                }
+            };
             (
                 state_guard.tokio_handle.clone(),
-                state_guard.http_streams.contains_key(&stream_id),
                 state_guard.cancel_watch_rx.clone(),
+                stream,
             )
         };
-        if !stream_exists {
-            return Err(extism::Error::msg(format!(
-                "Stream {} not found",
-                stream_id
-            )));
-        }
 
         let next_chunk = handle_tokio.block_on(async {
             // Fast path: already cancelled.
             if *cancel_rx.borrow() {
-                let mut state_guard = state.lock().unwrap();
-                state_guard.http_streams.remove(&stream_id);
                 return None;
             }
-
-            let mut stream = {
-                let mut state_guard = state.lock().unwrap();
-                state_guard.http_streams.remove(&stream_id).unwrap()
-            };
 
             let mut cancel_rx = cancel_rx;
 
