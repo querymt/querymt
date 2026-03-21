@@ -23,7 +23,7 @@ use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::reply::DelegatedReply;
 use log::{debug, info, warn};
-use querymt::chat::ChatRole;
+use querymt::chat::{ChatRole, ReasoningEffort};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -54,6 +54,7 @@ pub struct SessionActor {
     // ── Session state (OWNED, NO LOCKS) ──────────────────────────
     pub(crate) runtime: Arc<SessionRuntime>,
     pub(crate) mode: AgentMode,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) tool_config: ToolConfig,
 
     // ── Cancellation ─────────────────────────────────────────────
@@ -105,11 +106,14 @@ impl SessionActor {
             .lock()
             .map(|m| *m)
             .unwrap_or(AgentMode::Build);
+        // Read current default reasoning effort (lock-free via ArcSwap)
+        let reasoning_effort = **config.default_reasoning_effort.load();
         Self {
             config,
             session_id,
             runtime,
             mode,
+            reasoning_effort,
             tool_config,
             turn_state: TurnState::new(),
             bridge: None,
@@ -245,6 +249,62 @@ impl Message<GetMode> for SessionActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         Ok(self.mode)
+    }
+}
+
+// ── SetReasoningEffort ────────────────────────────────────────────────────
+
+impl Message<SetReasoningEffort> for SessionActor {
+    type Reply = Result<(), AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: SetReasoningEffort,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // Store in-memory (None = cleared / provider default)
+        self.reasoning_effort = msg.effort;
+
+        // Always update the LLM config row so the provider picks up the change
+        // (including clearing: None serializes as absent, removing the field).
+        let current_config = self
+            .config
+            .provider
+            .history_store()
+            .get_session_llm_config(&self.session_id)
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
+
+        if let Some(current) = current_config {
+            // Reconstruct LLMParams from the stored config
+            let mut params = if let Some(ref params_json) = current.params {
+                serde_json::from_value::<querymt::LLMParams>(params_json.clone())
+                    .unwrap_or_default()
+            } else {
+                querymt::LLMParams::new()
+            };
+            // Set provider/model back (stripped during storage) and apply new effort
+            params = params.provider(&current.provider).model(&current.model);
+            params.reasoning_effort = msg.effort;
+
+            self.set_llm_config_impl(params).await?;
+        }
+
+        Ok(())
+    }
+}
+
+// ── GetReasoningEffort ───────────────────────────────────────────────────
+
+impl Message<GetReasoningEffort> for SessionActor {
+    type Reply = Result<Option<ReasoningEffort>, kameo::error::Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetReasoningEffort,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self.reasoning_effort)
     }
 }
 
@@ -1221,6 +1281,8 @@ async fn execute_prompt_detached(
         }],
         created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
         parent_message_id: None,
+        source_provider: None,
+        source_model: None,
     };
 
     if let Err(e) = exec_ctx.add_message(agent_msg).await {
@@ -1354,6 +1416,8 @@ async fn execute_prompt_detached(
                                     parts: vec![patch_part],
                                     created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
                                     parent_message_id: None,
+                                    source_provider: None,
+                                    source_model: None,
                                 };
                                 if let Err(e) = exec_ctx.add_message(snapshot_msg).await {
                                     warn!("Failed to store turn snapshot patch: {}", e);
@@ -1434,6 +1498,8 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
                 parts: vec![start_part],
                 created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
                 parent_message_id: None,
+                source_provider: None,
+                source_model: None,
             };
             exec_ctx.add_message(snapshot_msg).await.map_err(|e| {
                 AgentError::Internal(format!("Failed to store turn snapshot start: {}", e))

@@ -22,7 +22,7 @@ pub struct ModelDefaults {
     pub top_p: Option<f32>,
     pub top_k: Option<u32>,
     pub max_tokens: Option<u32>,
-    /// Provider-specific structured options (e.g. `store`, `thinkingConfig`).
+    /// Provider-specific structured options (e.g. `extra_body`, `usage`, `reasoning_effort`).
     pub provider_options: HashMap<String, Value>,
     /// Provider ID for provider-specific transformations
     pub provider: String,
@@ -259,38 +259,20 @@ fn default_provider_options(provider: &str, model: &str) -> HashMap<String, Valu
         );
     }
 
-    // Google / Google Vertex: enable thinking output
-    if provider == "google" {
-        let mut thinking = json!({"includeThoughts": true});
-        if id.contains("gemini-3") {
-            thinking["thinkingLevel"] = json!("high");
-        }
-        opts.insert("thinkingConfig".into(), thinking);
-    }
-
     // OpenRouter: request usage stats
     if provider == "openrouter" {
         opts.insert("usage".into(), json!({"include": true}));
-        if id.contains("gemini-3") {
-            opts.insert("reasoning".into(), json!({"effort": "high"}));
-        }
+    }
+
+    // Default reasoning effort for model families that benefit from it.
+    if id.contains("gemini-3") {
+        opts.insert("reasoning_effort".into(), json!("high"));
     }
 
     // GPT-5 family heuristics
     if id.contains("gpt-5") && !id.contains("gpt-5-chat") {
         if !id.contains("gpt-5-pro") {
-            let eb = opts.entry("extra_body".into()).or_insert_with(|| json!({}));
-            if provider == "codex" {
-                // Codex uses reasoning: {effort: "..."} format
-                eb.as_object_mut()
-                    .unwrap()
-                    .insert("reasoning".into(), json!({"effort": "medium"}));
-            } else {
-                // OpenAI/Azure use flat reasoningEffort string
-                eb.as_object_mut()
-                    .unwrap()
-                    .insert("reasoningEffort".into(), json!("medium"));
-            }
+            opts.insert("reasoning_effort".into(), json!("medium"));
         }
         if id.contains("gpt-5.")
             && !id.contains("codex")
@@ -468,20 +450,17 @@ mod tests {
     }
 
     #[test]
-    fn test_google_thinking_config() {
+    fn test_google_no_raw_thinking_config_heuristic() {
         let d = ModelDefaults::for_model("google", "gemini-2.5-pro");
-        assert_eq!(
-            d.provider_options.get("thinkingConfig"),
-            Some(&json!({"includeThoughts": true}))
-        );
+        assert!(!d.provider_options.contains_key("thinkingConfig"));
     }
 
     #[test]
-    fn test_google_gemini3_thinking_level() {
+    fn test_google_gemini3_sets_reasoning_effort() {
         let d = ModelDefaults::for_model("google", "gemini-3-pro");
         assert_eq!(
-            d.provider_options.get("thinkingConfig"),
-            Some(&json!({"includeThoughts": true, "thinkingLevel": "high"}))
+            d.provider_options.get("reasoning_effort"),
+            Some(&json!("high"))
         );
     }
 
@@ -495,11 +474,11 @@ mod tests {
     }
 
     #[test]
-    fn test_openrouter_gemini3_reasoning() {
+    fn test_openrouter_gemini3_sets_reasoning_effort() {
         let d = ModelDefaults::for_model("openrouter", "gemini-3-pro");
         assert_eq!(
-            d.provider_options.get("reasoning"),
-            Some(&json!({"effort": "high"}))
+            d.provider_options.get("reasoning_effort"),
+            Some(&json!("high"))
         );
     }
 
@@ -518,7 +497,10 @@ mod tests {
     fn test_gpt5_reasoning_effort() {
         let d = ModelDefaults::for_model("openai", "gpt-5");
         let extra = d.provider_options.get("extra_body").unwrap();
-        assert_eq!(extra["reasoningEffort"], json!("medium"));
+        assert_eq!(
+            d.provider_options.get("reasoning_effort"),
+            Some(&json!("medium"))
+        );
         // OpenAI store/prompt_cache_key should still be present
         assert_eq!(extra["store"], json!(false));
         assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
@@ -528,7 +510,7 @@ mod tests {
     fn test_gpt5_pro_no_reasoning_effort() {
         let d = ModelDefaults::for_model("openai", "gpt-5-pro");
         let extra = d.provider_options.get("extra_body").unwrap();
-        assert!(extra.get("reasoningEffort").is_none());
+        assert!(d.provider_options.contains_key("reasoning_effort"));
         // OpenAI defaults should still be present
         assert_eq!(extra["store"], json!(false));
     }
@@ -536,8 +518,7 @@ mod tests {
     #[test]
     fn test_gpt5_chat_no_reasoning_effort() {
         let d = ModelDefaults::for_model("openai", "gpt-5-chat");
-        let extra = d.provider_options.get("extra_body").unwrap();
-        assert!(extra.get("reasoningEffort").is_none());
+        assert!(d.provider_options.contains_key("reasoning_effort"));
     }
 
     #[test]
@@ -545,8 +526,11 @@ mod tests {
         let d = ModelDefaults::for_model("openai", "gpt-5.1");
         let extra = d.provider_options.get("extra_body").unwrap();
         assert_eq!(extra["verbosity"], json!("medium"));
-        // Should also have reasoningEffort and OpenAI defaults
-        assert_eq!(extra["reasoningEffort"], json!("medium"));
+        // Should also have reasoning effort default and OpenAI defaults
+        assert_eq!(
+            d.provider_options.get("reasoning_effort"),
+            Some(&json!("medium"))
+        );
         assert_eq!(extra["store"], json!(false));
         assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
     }
@@ -554,10 +538,12 @@ mod tests {
     #[test]
     fn test_gpt5_dot_azure_no_verbosity() {
         let d = ModelDefaults::for_model("azure", "gpt-5.1");
-        let extra = d.provider_options.get("extra_body").unwrap();
-        // Azure doesn't get OpenAI store/promptCacheKey, but does get reasoningEffort
-        assert!(extra.get("verbosity").is_none());
-        assert_eq!(extra["reasoningEffort"], json!("medium"));
+        // Azure doesn't get OpenAI defaults, but does get reasoning effort default
+        assert_eq!(
+            d.provider_options.get("reasoning_effort"),
+            Some(&json!("medium"))
+        );
+        assert!(d.provider_options.contains_key("extra_body"));
     }
 
     #[test]
@@ -565,8 +551,11 @@ mod tests {
         let d = ModelDefaults::for_model("openai", "gpt-5-codex");
         let extra = d.provider_options.get("extra_body").unwrap();
         assert!(extra.get("verbosity").is_none());
-        // OpenAI provider should have reasoningEffort (not reasoning object)
-        assert_eq!(extra["reasoningEffort"], json!("medium"));
+        // OpenAI provider should get generic reasoning_effort default
+        assert_eq!(
+            d.provider_options.get("reasoning_effort"),
+            Some(&json!("medium"))
+        );
         assert_eq!(extra["store"], json!(false));
     }
 
@@ -575,8 +564,11 @@ mod tests {
         let d = ModelDefaults::for_model("codex", "gpt-5.2");
         let extra = d.provider_options.get("extra_body").unwrap();
         assert!(extra.get("verbosity").is_none());
-        // Codex provider should have reasoning effort in reasoning object
-        assert_eq!(extra["reasoning"], json!({"effort": "medium"}));
+        // Codex provider should get generic reasoning_effort default
+        assert_eq!(
+            d.provider_options.get("reasoning_effort"),
+            Some(&json!("medium"))
+        );
     }
 
     #[test]
@@ -785,9 +777,10 @@ mod tests {
     fn test_gpt5_codex_reasoning_object() {
         let d = ModelDefaults::for_model("codex", "gpt-5.1-codex");
         let extra = d.provider_options.get("extra_body").unwrap();
-        // Codex uses reasoning object format, not reasoningEffort string
-        assert_eq!(extra["reasoning"]["effort"], json!("medium"));
-        assert!(extra.get("reasoningEffort").is_none());
+        assert_eq!(
+            d.provider_options.get("reasoning_effort"),
+            Some(&json!("medium"))
+        );
         // Should also have codex defaults
         assert_eq!(extra["store"], json!(false));
         assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
@@ -796,9 +789,10 @@ mod tests {
     #[test]
     fn test_gpt5_codex_max_reasoning_object() {
         let d = ModelDefaults::for_model("codex", "gpt-5.1-codex-max");
-        let extra = d.provider_options.get("extra_body").unwrap();
-        // Codex uses reasoning object format for codex-max too
-        assert_eq!(extra["reasoning"]["effort"], json!("medium"));
-        assert!(extra.get("reasoningEffort").is_none());
+        let _extra = d.provider_options.get("extra_body").unwrap();
+        assert_eq!(
+            d.provider_options.get("reasoning_effort"),
+            Some(&json!("medium"))
+        );
     }
 }

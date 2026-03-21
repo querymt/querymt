@@ -62,6 +62,8 @@ export function AppShell() {
     addCustomModelFromFile,
     deleteCustomModel,
     cycleAgentMode,
+    cycleReasoningEffort,
+    setReasoningEffort,
     submitWorkspacePathDialog,
     cancelWorkspacePathDialog,
     dismissConnectionError,
@@ -84,6 +86,7 @@ export function AppShell() {
     sessionGroups,
     thinkingBySession,
     agentMode,
+    reasoningEffort,
     remoteNodes,
   } = useUiClientSession();
 
@@ -254,7 +257,14 @@ export function AppShell() {
         cycleAgentMode();
         return;
       }
-      
+
+      // Ctrl+; / Cmd+; - Cycle reasoning effort
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key === ';') {
+        e.preventDefault();
+        cycleReasoningEffort();
+        return;
+      }
+
       // Cmd+Shift+M / Ctrl+Shift+M - Toggle model picker
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && normalizedKey === 'm') {
         e.preventDefault();
@@ -279,6 +289,7 @@ export function AppShell() {
     sessionSwitcherOpen,
     setSessionSwitcherOpen,
     cycleAgentMode,
+    cycleReasoningEffort,
     modelPickerOpen,
     setModelPickerOpen,
     setShortcutGatewayOpen,
@@ -620,8 +631,11 @@ export function AppShell() {
                 currentWorkspace={currentWorkspace}
                 recentModelsByWorkspace={recentModelsByWorkspace}
                 agentMode={agentMode}
+                reasoningEffort={reasoningEffort}
                 onRefresh={refreshAllModels}
                 onSetSessionModel={setSessionModel}
+                onSetReasoningEffort={setReasoningEffort}
+                onCycleReasoningEffort={cycleReasoningEffort}
                 providerCapabilities={providerCapabilities}
                 modelDownloads={modelDownloads}
                 onAddCustomModelFromHf={addCustomModelFromHf}
@@ -699,8 +713,11 @@ export function AppShell() {
             currentWorkspace={currentWorkspace}
             recentModelsByWorkspace={recentModelsByWorkspace}
             agentMode={agentMode}
+            reasoningEffort={reasoningEffort}
             onRefresh={refreshAllModels}
             onSetSessionModel={setSessionModel}
+            onSetReasoningEffort={setReasoningEffort}
+            onCycleReasoningEffort={cycleReasoningEffort}
             providerCapabilities={providerCapabilities}
             modelDownloads={modelDownloads}
             onAddCustomModelFromHf={addCustomModelFromHf}

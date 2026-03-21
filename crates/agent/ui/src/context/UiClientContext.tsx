@@ -63,6 +63,8 @@ export interface UiClientActionsContextValue {
   sendElicitationResponse: (elicitationId: string, action: 'accept' | 'decline' | 'cancel', content?: Record<string, unknown>) => void;
   setAgentMode: (mode: string) => void;
   cycleAgentMode: () => void;
+  setReasoningEffort: (effort: string | null) => void;
+  cycleReasoningEffort: () => void;
   submitWorkspacePathDialog: (cwd: string, node: string | null) => void;
   cancelWorkspacePathDialog: () => void;
   listRemoteNodes: () => void;
@@ -110,6 +112,7 @@ export interface UiClientSessionContextValue {
   undoState: { stack: Array<{ turnId: string; messageId: string; status: 'pending' | 'confirmed'; revertedFiles: string[] }>; frontierMessageId?: string } | null;
   agentMode: string;
   availableModes: string[];
+  reasoningEffort: string | null;
   remoteNodes: RemoteNodeInfo[];
   /** Session ID of the last session that failed to load. Used to navigate away and stop retry loops. */
   lastLoadErrorSessionId: string | null;
@@ -201,6 +204,8 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     sendElicitationResponse: uiClient.sendElicitationResponse,
     setAgentMode: uiClient.setAgentMode,
     cycleAgentMode: uiClient.cycleAgentMode,
+    setReasoningEffort: uiClient.setReasoningEffort,
+    cycleReasoningEffort: uiClient.cycleReasoningEffort,
     submitWorkspacePathDialog: uiClient.submitWorkspacePathDialog,
     cancelWorkspacePathDialog: uiClient.cancelWorkspacePathDialog,
     listRemoteNodes: uiClient.listRemoteNodes,
@@ -240,6 +245,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     undoState: uiClient.undoState,
     agentMode: uiClient.agentMode,
     availableModes: uiClient.availableModes,
+    reasoningEffort: uiClient.reasoningEffort,
     remoteNodes: uiClient.remoteNodes,
     lastLoadErrorSessionId: uiClient.lastLoadErrorSessionId,
   }), [
@@ -262,6 +268,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.undoState,
     uiClient.agentMode,
     uiClient.availableModes,
+    uiClient.reasoningEffort,
     uiClient.remoteNodes,
     uiClient.lastLoadErrorSessionId,
   ]);

@@ -29,7 +29,13 @@ fn mode_state(mode: AgentMode) -> SessionModeState {
     SessionModeState::new(mode.as_str(), all_session_modes())
 }
 
-fn config_options(mode: AgentMode) -> Vec<SessionConfigOption> {
+fn config_options(
+    mode: AgentMode,
+    reasoning_effort: Option<querymt::chat::ReasoningEffort>,
+) -> Vec<SessionConfigOption> {
+    let effort_value = reasoning_effort
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "auto".to_string());
     vec![
         SessionConfigOption::select(
             "mode",
@@ -46,6 +52,23 @@ fn config_options(mode: AgentMode) -> Vec<SessionConfigOption> {
         )
         .description("Controls how the agent operates for this session")
         .category(SessionConfigOptionCategory::Mode),
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            effort_value,
+            vec![
+                SessionConfigSelectOption::new("auto", "Auto")
+                    .description("Use model-specific defaults"),
+                SessionConfigSelectOption::new("low", "Low")
+                    .description("Minimal thinking, fastest responses"),
+                SessionConfigSelectOption::new("medium", "Medium").description("Balanced thinking"),
+                SessionConfigSelectOption::new("high", "High").description("Thorough thinking"),
+                SessionConfigSelectOption::new("max", "Max")
+                    .description("Deepest thinking, highest budget"),
+            ],
+        )
+        .description("Controls reasoning depth for this session")
+        .category(SessionConfigOptionCategory::ThoughtLevel),
     ]
 }
 
@@ -467,7 +490,10 @@ impl SessionRegistry {
 
         Ok(NewSessionResponse::new(session_id)
             .modes(mode_state(current_mode))
-            .config_options(config_options(current_mode)))
+            .config_options(config_options(
+                current_mode,
+                **self.config.default_reasoning_effort.load(),
+            )))
     }
 
     /// Load an existing session: validate it exists, build runtime, spawn SessionActor.
@@ -560,7 +586,10 @@ impl SessionRegistry {
 
         Ok(agent_client_protocol::LoadSessionResponse::new()
             .modes(mode_state(current_mode))
-            .config_options(config_options(current_mode)))
+            .config_options(config_options(
+                current_mode,
+                **self.config.default_reasoning_effort.load(),
+            )))
     }
 
     /// Fork an existing session at the latest message.
@@ -678,7 +707,10 @@ impl SessionRegistry {
 
         Ok(agent_client_protocol::ResumeSessionResponse::new()
             .modes(mode_state(current_mode))
-            .config_options(config_options(current_mode)))
+            .config_options(config_options(
+                current_mode,
+                **self.config.default_reasoning_effort.load(),
+            )))
     }
 
     /// List all sessions (queries the store, not the actors).
@@ -854,8 +886,8 @@ mod tests {
 
     #[test]
     fn test_config_options_include_mode_selector() {
-        let options = config_options(AgentMode::Review);
-        assert_eq!(options.len(), 1);
+        let options = config_options(AgentMode::Review, None);
+        assert_eq!(options.len(), 2);
         assert_eq!(options[0].id.0.as_ref(), "mode");
 
         let select = match &options[0].kind {
@@ -863,6 +895,13 @@ mod tests {
             _ => panic!("expected select mode option"),
         };
         assert_eq!(select.current_value.0.as_ref(), "review");
+
+        // Verify reasoning effort option is present
+        assert_eq!(options[1].id.0.as_ref(), "reasoning_effort");
+        assert_eq!(
+            options[1].category,
+            Some(SessionConfigOptionCategory::ThoughtLevel)
+        );
     }
 
     #[tokio::test]

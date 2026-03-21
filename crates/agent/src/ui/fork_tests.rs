@@ -64,6 +64,8 @@ async fn fork_session_from_selected_message_succeeds() -> Result<()> {
                 }],
                 created_at: same_second,
                 parent_message_id: None,
+                source_provider: None,
+                source_model: None,
             },
         )
         .await?;
@@ -83,6 +85,8 @@ async fn fork_session_from_selected_message_succeeds() -> Result<()> {
                 }],
                 created_at: same_second,
                 parent_message_id: Some(user_message_id.clone()),
+                source_provider: None,
+                source_model: None,
             },
         )
         .await?;

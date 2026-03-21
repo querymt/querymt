@@ -105,12 +105,9 @@ pub struct LLMBuilder {
     /// Enable parallel tool use
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_parallel_tool_use: Option<bool>,
-    /// Enable reasoning
+    /// Reasoning effort level
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<bool>,
-    /// Enable reasoning effort
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
     /// reasoning_budget_tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_budget_tokens: Option<u32>,
@@ -171,15 +168,10 @@ impl LLMBuilder {
         self
     }
 
-    /// Sets the reasoning flag.
+    /// Sets the reasoning effort level.
+    /// Providers that support reasoning will map this to their own API format.
     pub fn reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
-        self.reasoning_effort = Some(reasoning_effort.to_string());
-        self
-    }
-
-    /// Sets the reasoning flag.
-    pub fn reasoning(mut self, reasoning: bool) -> Self {
-        self.reasoning = Some(reasoning);
+        self.reasoning_effort = Some(reasoning_effort);
         self
     }
 

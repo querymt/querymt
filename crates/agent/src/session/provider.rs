@@ -10,7 +10,7 @@ use querymt::plugin::host::PluginRegistry;
 use querymt::providers::ModelPricing;
 use querymt::{
     LLMProvider,
-    chat::{ChatMessage, ChatResponse, Content},
+    chat::{ChatMessage, ChatResponse, ChatRole, Content},
     error::LLMError,
 };
 use serde_json::{Map, Value};
@@ -559,7 +559,9 @@ impl SessionHandle {
             Ok(agent_msgs) => agent_msgs
                 .iter()
                 .map(|m| {
-                    m.to_chat_message_with_max_prompt_bytes(
+                    m.to_chat_message_with_target(
+                        self.llm_config.as_ref().map(|cfg| cfg.provider.as_str()),
+                        self.llm_config.as_ref().map(|cfg| cfg.model.as_str()),
                         self.execution_config
                             .as_ref()
                             .and_then(|cfg| cfg.max_prompt_bytes),
@@ -653,9 +655,10 @@ impl SessionHandle {
                         content: text.clone(),
                     });
                 }
-                Content::Thinking { text } => {
+                Content::Thinking { text, signature } => {
                     parts.push(MessagePart::Reasoning {
                         content: text.clone(),
+                        signature: signature.clone(),
                         time_ms: None,
                     });
                 }
@@ -698,6 +701,17 @@ impl SessionHandle {
             }
         }
 
+        let source_provider = if msg.role == ChatRole::Assistant {
+            self.llm_config.as_ref().map(|cfg| cfg.provider.clone())
+        } else {
+            None
+        };
+        let source_model = if msg.role == ChatRole::Assistant {
+            self.llm_config.as_ref().map(|cfg| cfg.model.clone())
+        } else {
+            None
+        };
+
         AgentMessage {
             id: uuid::Uuid::now_v7().to_string(),
             session_id: self.session.public_id.clone(),
@@ -705,6 +719,8 @@ impl SessionHandle {
             parts,
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
+            source_provider,
+            source_model,
         }
     }
 }

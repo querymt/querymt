@@ -18,6 +18,8 @@ pub enum MessagePart {
     },
     Reasoning {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
         time_ms: Option<u64>,
     },
     StepStart {
@@ -116,6 +118,12 @@ pub struct AgentMessage {
     pub parts: Vec<MessagePart>,
     pub created_at: i64,
     pub parent_message_id: Option<String>,
+    /// Provider that generated this assistant message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_provider: Option<String>,
+    /// Model that generated this assistant message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_model: Option<String>,
 }
 
 impl AgentMessage {
@@ -127,18 +135,39 @@ impl AgentMessage {
             parts: Vec::new(),
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         }
     }
 
     pub fn to_chat_message(&self) -> ChatMessage {
-        self.to_chat_message_with_max_prompt_bytes(None)
+        self.to_chat_message_with_target(None, None, None)
     }
 
     pub fn to_chat_message_with_max_prompt_bytes(
         &self,
         max_prompt_bytes: Option<usize>,
     ) -> ChatMessage {
+        self.to_chat_message_with_target(None, None, max_prompt_bytes)
+    }
+
+    pub fn to_chat_message_with_target(
+        &self,
+        target_provider: Option<&str>,
+        target_model: Option<&str>,
+        max_prompt_bytes: Option<usize>,
+    ) -> ChatMessage {
         let mut blocks = Vec::new();
+
+        let preserve_provider_metadata = match (
+            target_provider,
+            target_model,
+            self.source_provider.as_deref(),
+            self.source_model.as_deref(),
+        ) {
+            (Some(tp), Some(tm), Some(sp), Some(sm)) => tp == sp && tm == sm,
+            _ => true,
+        };
 
         for part in &self.parts {
             match part {
@@ -153,8 +182,17 @@ impl AgentMessage {
                         max_prompt_bytes,
                     )));
                 }
-                MessagePart::Reasoning { content, .. } => {
-                    blocks.push(Content::thinking(content));
+                MessagePart::Reasoning {
+                    content, signature, ..
+                } => {
+                    blocks.push(Content::Thinking {
+                        text: content.clone(),
+                        signature: if preserve_provider_metadata {
+                            signature.clone()
+                        } else {
+                            None
+                        },
+                    });
                 }
                 MessagePart::ToolUse(tc) => {
                     blocks.push(Content::tool_use(
@@ -227,6 +265,8 @@ mod tests {
             }],
             created_at: 0,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
 
         let chat = msg.to_chat_message();
@@ -245,6 +285,8 @@ mod tests {
             }],
             created_at: 0,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
 
         let chat = msg.to_chat_message();
@@ -263,6 +305,8 @@ mod tests {
             }],
             created_at: 0,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
 
         let chat = msg.to_chat_message();
@@ -281,6 +325,8 @@ mod tests {
             }],
             created_at: 0,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
         let sum = AgentMessage {
             id: "m2".to_string(),
@@ -292,6 +338,8 @@ mod tests {
             }],
             created_at: 0,
             parent_message_id: Some("m1".to_string()),
+            source_provider: None,
+            source_model: None,
         };
 
         let req_chat = req.to_chat_message();
@@ -322,6 +370,8 @@ mod tests {
             }],
             created_at: 0,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
 
         let chat = msg.to_chat_message();
@@ -360,6 +410,8 @@ mod tests {
             }],
             created_at: 0,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
 
         let chat = msg.to_chat_message();
@@ -372,6 +424,63 @@ mod tests {
                 );
             }
             _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn to_chat_message_with_target_keeps_signature_for_same_model() {
+        let msg = AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::Reasoning {
+                content: "reasoning".to_string(),
+                signature: Some("sig-123".to_string()),
+                time_ms: None,
+            }],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: Some("anthropic".to_string()),
+            source_model: Some("claude-sonnet-4-5".to_string()),
+        };
+
+        let chat =
+            msg.to_chat_message_with_target(Some("anthropic"), Some("claude-sonnet-4-5"), None);
+
+        match &chat.content[0] {
+            Content::Thinking {
+                signature: Some(sig),
+                ..
+            } => assert_eq!(sig, "sig-123"),
+            _ => panic!("expected signed thinking block"),
+        }
+    }
+
+    #[test]
+    fn to_chat_message_with_target_drops_signature_on_model_switch() {
+        let msg = AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::Reasoning {
+                content: "reasoning".to_string(),
+                signature: Some("sig-123".to_string()),
+                time_ms: None,
+            }],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: Some("anthropic".to_string()),
+            source_model: Some("claude-sonnet-4-5".to_string()),
+        };
+
+        let chat =
+            msg.to_chat_message_with_target(Some("anthropic"), Some("claude-opus-4-1"), None);
+
+        match &chat.content[0] {
+            Content::Thinking {
+                signature: None, ..
+            } => {}
+            _ => panic!("expected thinking block without signature"),
         }
     }
 }

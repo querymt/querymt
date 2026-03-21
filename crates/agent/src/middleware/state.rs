@@ -176,6 +176,8 @@ pub struct LlmResponse {
     pub content: String,
     /// Accumulated thinking/reasoning content from streaming, if any.
     pub thinking: Option<String>,
+    /// Signature for the accumulated thinking block, if provided by the model.
+    pub thinking_signature: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<querymt::Usage>,
     pub finish_reason: Option<FinishReason>,
@@ -195,6 +197,7 @@ impl LlmResponse {
         Self {
             content,
             thinking: None,
+            thinking_signature: None,
             tool_calls,
             usage,
             finish_reason,
@@ -211,6 +214,12 @@ impl LlmResponse {
     /// Set the accumulated thinking content (builder-style).
     pub fn with_thinking(mut self, thinking: Option<String>) -> Self {
         self.thinking = thinking;
+        self
+    }
+
+    /// Set the thinking signature (builder-style).
+    pub fn with_thinking_signature(mut self, signature: Option<String>) -> Self {
+        self.thinking_signature = signature;
         self
     }
 

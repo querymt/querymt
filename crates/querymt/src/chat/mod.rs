@@ -36,7 +36,11 @@ pub enum Content {
     /// Audio data
     Audio { mime_type: String, data: Vec<u8> },
     /// Model reasoning / chain-of-thought
-    Thinking { text: String },
+    Thinking {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
     /// Tool invocation requested by the model
     ToolUse {
         id: String,
@@ -98,7 +102,10 @@ impl Content {
 
     /// Create a thinking content block.
     pub fn thinking(s: impl Into<String>) -> Self {
-        Content::Thinking { text: s.into() }
+        Content::Thinking {
+            text: s.into(),
+            signature: None,
+        }
     }
 
     /// Create a tool use content block.
@@ -189,7 +196,16 @@ impl PartialEq for Content {
                     data: db,
                 },
             ) => ma == mb && da == db,
-            (Content::Thinking { text: a }, Content::Thinking { text: b }) => a == b,
+            (
+                Content::Thinking {
+                    text: a,
+                    signature: sa,
+                },
+                Content::Thinking {
+                    text: b,
+                    signature: sb,
+                },
+            ) => a == b && sa == sb,
             (
                 Content::ToolUse {
                     id: ia,
@@ -249,7 +265,7 @@ impl fmt::Display for Content {
             Content::Audio { mime_type, data } => {
                 write!(f, "[Audio: {}, {} bytes]", mime_type, data.len())
             }
-            Content::Thinking { text } => write!(f, "[Thinking: {}]", text),
+            Content::Thinking { text, .. } => write!(f, "[Thinking: {}]", text),
             Content::ToolUse { id, name, .. } => write!(f, "[ToolUse: {} ({})]", name, id),
             Content::ToolResult {
                 id,
@@ -375,14 +391,25 @@ pub enum CacheHint {
     },
 }
 
-/// The type of reasoning effort for a message in a chat conversation.
+/// The type of reasoning effort for a model's reasoning/thinking feature.
+///
+/// Providers that support reasoning map these levels to their own API format:
+/// - **OpenAI-compatible**: passed as `reasoning_effort` string in the request body
+/// - **Anthropic**: mapped to `thinking.budget_tokens` (or adaptive mode for newer models)
+/// - **Google**: mapped to `thinkingConfig.thinkingBudget` or `thinkingConfig.thinkingLevel`
+/// - **Ollama**: any effort level enables `think: true`
+/// - **Providers without support**: warned and ignored
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
-    /// Low reasoning effort
+    /// Low reasoning effort — minimal thinking, fastest responses
     Low,
-    /// Medium reasoning effort
+    /// Medium reasoning effort — balanced thinking
     Medium,
-    /// High reasoning effort
+    /// High reasoning effort — thorough thinking
     High,
+    /// Maximum reasoning effort — deepest thinking, highest budget
+    Max,
 }
 
 /// A single message in a chat conversation.
@@ -777,6 +804,10 @@ pub enum StreamChunk {
     /// store reasoning content differently (e.g., dimmed text, separate field).
     Thinking(String),
 
+    /// Signature for the current thinking block (providers that require
+    /// signed thinking replay emit this once the block is complete).
+    ThinkingSignature(String),
+
     /// Tool use block started (contains tool id and name)
     ToolUseStart {
         /// The index of this content block in the response
@@ -907,6 +938,24 @@ impl fmt::Display for ReasoningEffort {
             ReasoningEffort::Low => write!(f, "low"),
             ReasoningEffort::Medium => write!(f, "medium"),
             ReasoningEffort::High => write!(f, "high"),
+            ReasoningEffort::Max => write!(f, "max"),
+        }
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "low" => Ok(ReasoningEffort::Low),
+            "medium" => Ok(ReasoningEffort::Medium),
+            "high" => Ok(ReasoningEffort::High),
+            "max" => Ok(ReasoningEffort::Max),
+            other => Err(format!(
+                "unknown reasoning effort '{}', expected one of: low, medium, high, max",
+                other
+            )),
         }
     }
 }
@@ -967,7 +1016,7 @@ impl ChatMessage {
     /// Extract the first thinking block text, if any.
     pub fn thinking(&self) -> Option<&str> {
         self.content.iter().find_map(|b| match b {
-            Content::Thinking { text } => Some(text.as_str()),
+            Content::Thinking { text, .. } => Some(text.as_str()),
             _ => None,
         })
     }

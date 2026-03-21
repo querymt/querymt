@@ -136,6 +136,9 @@ export function useUiClient() {
   const [agentMode, setAgentModeState] = useState<string>('build');
   const agentModeRef = useRef(agentMode);
   agentModeRef.current = agentMode;
+  const [reasoningEffort, setReasoningEffortState] = useState<string | null>(null);
+  const reasoningEffortRef = useRef(reasoningEffort);
+  reasoningEffortRef.current = reasoningEffort;
   // @ts-expect-error - setAvailableModes reserved for future backend integration
   const [availableModes, setAvailableModes] = useState<string[]>(['build', 'plan']);
   const [sessionGroups, setSessionGroups] = useState<SessionGroup[]>([]);
@@ -280,6 +283,8 @@ export function useUiClient() {
         if (d.agent_mode) {
           setAgentModeState(d.agent_mode);
         }
+        // reasoning_effort may be null/undefined (= "auto")
+        setReasoningEffortState(d.reasoning_effort ?? null);
         break;
       }
       case 'session_created': {
@@ -960,6 +965,11 @@ export function useUiClient() {
         setAgentModeState(d.mode);
         break;
       }
+      case 'reasoning_effort': {
+        const d = msg.data;
+        setReasoningEffortState(d.reasoning_effort ?? null);
+        break;
+      }
       case 'remote_nodes': {
         const d = msg.data;
         setRemoteNodes(d.nodes);
@@ -1362,6 +1372,18 @@ export function useUiClient() {
     setAgentMode(nextMode);
 }, [setAgentMode, availableModes]);
 
+  const setReasoningEffort = useCallback((effort: string | null) => {
+    setReasoningEffortState(effort);  // Optimistic update
+    sendMessage({ type: 'set_reasoning_effort', data: { reasoning_effort: effort ?? 'auto' } });
+  }, []);
+
+  const cycleReasoningEffort = useCallback(() => {
+    const levels: (string | null)[] = [null, 'low', 'medium', 'high', 'max'];
+    const currentIndex = levels.indexOf(reasoningEffortRef.current);
+    const next = levels[(currentIndex + 1) % levels.length];
+    setReasoningEffort(next);
+  }, [setReasoningEffort]);
+
   const updatePlugins = useCallback(() => {
     setIsUpdatingPlugins(true);
     setPluginUpdateStatus({});
@@ -1441,6 +1463,9 @@ export function useUiClient() {
     availableModes,
     setAgentMode,
     cycleAgentMode,
+    reasoningEffort,
+    setReasoningEffort,
+    cycleReasoningEffort,
     remoteNodes,
     listRemoteNodes,
     connectionErrors,

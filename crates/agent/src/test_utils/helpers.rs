@@ -271,6 +271,8 @@ impl UndoTestFixture {
             }],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
         self.storage
             .session_store()
@@ -296,6 +298,8 @@ impl UndoTestFixture {
             }],
             created_at,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
         self.storage
             .session_store()
@@ -321,6 +325,8 @@ impl UndoTestFixture {
             }],
             created_at,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
         self.storage
             .session_store()
@@ -344,6 +350,8 @@ impl UndoTestFixture {
             }],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
         self.storage
             .session_store()
@@ -383,6 +391,8 @@ impl UndoTestFixture {
             }],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
         self.storage
             .session_store()

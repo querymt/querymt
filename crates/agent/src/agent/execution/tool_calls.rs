@@ -694,6 +694,8 @@ pub(super) async fn store_all_tool_results(
             parts,
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
 
         exec_ctx
