@@ -258,6 +258,12 @@ pub enum UiClientMessage {
     },
     /// Get the current agent mode
     GetAgentMode,
+    /// Set the reasoning effort level for the current session
+    SetReasoningEffort {
+        reasoning_effort: String,
+    },
+    /// Get the current reasoning effort level
+    GetReasoningEffort,
     /// List remote nodes discovered in the kameo mesh
     ListRemoteNodes,
     /// List sessions on a specific remote node
@@ -508,6 +514,8 @@ pub enum UiServerMessage {
         agents: Vec<UiAgentInfo>,
         sessions_by_agent: HashMap<String, String>,
         agent_mode: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
     },
     SessionCreated {
         agent_id: String,
@@ -595,6 +603,11 @@ pub enum UiServerMessage {
     /// Current agent mode notification
     AgentMode {
         mode: String,
+    },
+    /// Current reasoning effort notification
+    ReasoningEffort {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
     },
     /// OAuth-capable providers and current authentication status
     AuthProviders {
@@ -688,6 +701,7 @@ impl UiServerMessage {
             Self::RedoResult { .. } => "redo_result",
             Self::ForkResult { .. } => "fork_result",
             Self::AgentMode { .. } => "agent_mode",
+            Self::ReasoningEffort { .. } => "reasoning_effort",
             Self::AuthProviders { .. } => "auth_providers",
             Self::OAuthFlowStarted { .. } => "oauth_flow_started",
             Self::OAuthResult { .. } => "oauth_result",

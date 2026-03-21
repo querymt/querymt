@@ -5,6 +5,7 @@
 
 use crate::events::{AgentEvent, AgentEventKind};
 use crate::session::projection::AuditView;
+use querymt::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -72,7 +73,7 @@ pub struct AtifStep {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,

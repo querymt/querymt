@@ -93,6 +93,8 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             role TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             parent_message_id INTEGER,
+            source_provider TEXT,
+            source_model TEXT,
             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
             FOREIGN KEY(parent_message_id) REFERENCES messages(id) ON DELETE SET NULL
         );

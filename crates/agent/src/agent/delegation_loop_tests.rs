@@ -760,6 +760,8 @@ async fn test_delegation_guard_blocks_duplicate() {
         ))],
         created_at: OffsetDateTime::now_utc().unix_timestamp(),
         parent_message_id: None,
+        source_provider: None,
+        source_model: None,
     }];
 
     let delegation = Delegation {
@@ -835,6 +837,8 @@ async fn test_delegation_guard_blocks_max_retries() {
         ))],
         created_at: OffsetDateTime::now_utc().unix_timestamp(),
         parent_message_id: None,
+        source_provider: None,
+        source_model: None,
     }];
 
     let delegation = Delegation {

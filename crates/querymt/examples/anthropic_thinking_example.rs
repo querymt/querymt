@@ -9,7 +9,7 @@
 
 use querymt::{
     builder::LLMBuilder,
-    chat::ChatMessage,
+    chat::{ChatMessage, ReasoningEffort},
     plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
 };
 
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .model("claude-sonnet-4-6") // Use Claude Sonnet model
         .max_tokens(1500) // Limit response length
         .temperature(1.0) // Control response randomness (0.0-1.0)
-        .reasoning(true)
+        .reasoning_effort(ReasoningEffort::High)
         .reasoning_budget_tokens(1024)
         .build(&registry)
         .await?;

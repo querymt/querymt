@@ -19,7 +19,9 @@ use crate::session::provider::SessionProvider;
 use crate::session::store::SessionExecutionConfig;
 use crate::tools::ToolRegistry;
 use agent_client_protocol::AuthMethod;
+use arc_swap::ArcSwap;
 use kameo::actor::ActorRef;
+use querymt::chat::ReasoningEffort;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -42,6 +44,9 @@ pub struct AgentConfig {
     /// Shared live reference to the default agent mode.
     /// Session actors read this at spawn time to get the current mode.
     pub default_mode: Arc<StdMutex<AgentMode>>,
+    /// Shared live reference to the default reasoning effort.
+    /// Lock-free reads via `ArcSwap`. `None` = use model heuristic defaults.
+    pub default_reasoning_effort: Arc<ArcSwap<Option<ReasoningEffort>>>,
     pub tool_config: ToolConfig,
     pub tool_registry: ToolRegistry,
     pub middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,

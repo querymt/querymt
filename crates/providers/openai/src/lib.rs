@@ -87,7 +87,7 @@ pub struct OpenAI {
     /// Embedding parameters
     pub embedding_encoding_format: Option<String>,
     pub embedding_dimensions: Option<u32>,
-    pub reasoning_effort: Option<String>,
+    pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
     /// JSON schema for structured output
     pub json_schema: Option<StructuredOutputFormat>,
     /// Extra body fields to include in the API request (e.g. `store`, `promptCacheKey`).
@@ -174,8 +174,8 @@ impl api::OpenAIProviderConfig for OpenAI {
         self.embedding_dimensions.as_ref()
     }
 
-    fn reasoning_effort(&self) -> Option<&String> {
-        self.reasoning_effort.as_ref()
+    fn reasoning_effort(&self) -> Option<querymt::chat::ReasoningEffort> {
+        self.reasoning_effort
     }
 
     fn json_schema(&self) -> Option<&StructuredOutputFormat> {

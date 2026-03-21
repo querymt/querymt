@@ -6,7 +6,7 @@ use http::{
 use querymt::{
     FunctionCall, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StreamChunk,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, StreamChunk,
         StructuredOutputFormat, Tool, ToolChoice,
     },
     error::LLMError,
@@ -396,7 +396,7 @@ pub trait OpenAIProviderConfig {
     fn tool_choice(&self) -> Option<&ToolChoice>;
     fn embedding_encoding_format(&self) -> Option<&str>;
     fn embedding_dimensions(&self) -> Option<&u32>;
-    fn reasoning_effort(&self) -> Option<&String> {
+    fn reasoning_effort(&self) -> Option<ReasoningEffort> {
         None
     }
     fn json_schema(&self) -> Option<&StructuredOutputFormat>;
@@ -838,7 +838,9 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
         top_k: cfg.top_k().copied(),
         tools: request_tools,
         tool_choice: request_tool_choice,
-        reasoning_effort: cfg.reasoning_effort().cloned(),
+        reasoning_effort: cfg
+            .reasoning_effort()
+            .map(|e| openai_effort_str(e).to_owned()),
         response_format,
         extra_body,
     };
@@ -1318,6 +1320,19 @@ pub fn parse_openai_sse_chunk(
     Ok(results)
 }
 
+/// Map unified `ReasoningEffort` to the OpenAI API string.
+///
+/// OpenAI/Codex APIs use `"xhigh"` where the unified enum uses `Max`.
+/// `None` is handled by the caller (omit field = provider/model default).
+pub(crate) fn openai_effort_str(e: ReasoningEffort) -> &'static str {
+    match e {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Max => "xhigh",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use http::Response;
@@ -1452,5 +1467,15 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
             StreamChunk::Thinking(text) => assert_eq!(text, "continued"),
             other => panic!("expected thinking chunk, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn openai_effort_str_maps_correctly() {
+        use super::{ReasoningEffort, openai_effort_str};
+        assert_eq!(openai_effort_str(ReasoningEffort::Low), "low");
+        assert_eq!(openai_effort_str(ReasoningEffort::Medium), "medium");
+        assert_eq!(openai_effort_str(ReasoningEffort::High), "high");
+        // Max must map to "xhigh" — OpenAI API does not accept "max"
+        assert_eq!(openai_effort_str(ReasoningEffort::Max), "xhigh");
     }
 }

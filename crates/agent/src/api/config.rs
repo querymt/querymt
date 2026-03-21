@@ -3,7 +3,7 @@
 use super::utils::infer_required_capabilities;
 use crate::config::{ExecutionPolicy, MiddlewareEntry};
 use crate::tools::CapabilityRequirement;
-use querymt::LLMParams;
+use querymt::{LLMParams, chat::ReasoningEffort};
 use serde_json::Value;
 
 /// Internal configuration for building agents
@@ -84,11 +84,7 @@ impl PlannerConfigBuilder {
         self.with_llm(|c| c.top_k(value))
     }
 
-    pub fn reasoning(self, value: bool) -> Self {
-        self.with_llm(|c| c.reasoning(value))
-    }
-
-    pub fn reasoning_effort(self, value: impl Into<String>) -> Self {
+    pub fn reasoning_effort(self, value: ReasoningEffort) -> Self {
         self.with_llm(|c| c.reasoning_effort(value))
     }
 
@@ -168,11 +164,7 @@ impl DelegateConfigBuilder {
         self.with_llm(|c| c.top_k(value))
     }
 
-    pub fn reasoning(self, value: bool) -> Self {
-        self.with_llm(|c| c.reasoning(value))
-    }
-
-    pub fn reasoning_effort(self, value: impl Into<String>) -> Self {
+    pub fn reasoning_effort(self, value: ReasoningEffort) -> Self {
         self.with_llm(|c| c.reasoning_effort(value))
     }
 
@@ -227,8 +219,6 @@ mod tests {
 
     #[test]
     fn test_delegate_system_prompt_stored() {
-        use querymt::LLMParams;
-
         let mut config = AgentConfig::new("test-delegate");
         config.llm_config = Some(
             LLMParams::new()

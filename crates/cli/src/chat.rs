@@ -134,6 +134,9 @@ pub async fn handle_any_response(
                                     io::stdout().flush().ok();
                                     thinking_text.push_str(&t);
                                 }
+                                StreamChunk::ThinkingSignature(_sig) => {
+                                    // Signature is used for signed thinking replay, not terminal display.
+                                }
                                 StreamChunk::ToolUseStart { index, id, name } => {
                                     log::debug!("Received tool use start: {} (idx {})", name, index);
                                     tool_calls_map.insert(index, (id, name, String::new()));

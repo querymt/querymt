@@ -15,6 +15,7 @@ use crate::index::resolve_workspace_root;
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
 use agent_client_protocol::{CancelNotification, LoadSessionRequest, SessionId};
+use querymt::chat::ReasoningEffort;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -996,6 +997,117 @@ pub async fn handle_get_agent_mode(state: &ServerState, conn_id: &str, tx: &mpsc
         tx,
         UiServerMessage::AgentMode {
             mode: mode.as_str().to_string(),
+        },
+    )
+    .await;
+}
+
+// ── Reasoning effort ──────────────────────────────────────────────────────────
+
+/// Handle reasoning effort change request.
+///
+/// Sets the reasoning effort on the active session actor (per-session) and
+/// updates the default for new sessions.
+pub async fn handle_set_reasoning_effort(
+    state: &ServerState,
+    conn_id: &str,
+    effort_str: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    let effort: Option<ReasoningEffort> = if effort_str.is_empty() || effort_str == "auto" {
+        None
+    } else {
+        match serde_json::from_value::<ReasoningEffort>(serde_json::json!(effort_str)) {
+            Ok(e) => Some(e),
+            Err(e) => {
+                let _ = send_error(
+                    tx,
+                    format!("Invalid reasoning effort '{}': {}", effort_str, e),
+                )
+                .await;
+                return;
+            }
+        }
+    };
+
+    // Update default for new sessions (lock-free store via ArcSwap)
+    state.agent.default_reasoning_effort.store(Arc::new(effort));
+
+    let session_id = {
+        let connections = state.connections.lock().await;
+        connections
+            .get(conn_id)
+            .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
+    };
+
+    if let Some(ref session_id) = session_id {
+        let session_ref = {
+            let registry = state.agent.registry.lock().await;
+            registry.get(session_id).cloned()
+        };
+        // Always send to the actor — including None (auto) so the LLM config
+        // row is updated and the next turn uses provider/model defaults.
+        if let Some(session_ref) = session_ref {
+            match session_ref.set_reasoning_effort(effort).await {
+                Ok(_) => {
+                    log::info!(
+                        "Reasoning effort changed on session {}: {:?}",
+                        session_id,
+                        effort
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to set reasoning effort on session {}: {}. Will apply to next session.",
+                        session_id,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    let _ = send_message(
+        tx,
+        UiServerMessage::ReasoningEffort {
+            reasoning_effort: effort.map(|e| e.to_string()),
+        },
+    )
+    .await;
+}
+
+/// Handle get reasoning effort request.
+pub async fn handle_get_reasoning_effort(
+    state: &ServerState,
+    conn_id: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    let session_id = {
+        let connections = state.connections.lock().await;
+        connections
+            .get(conn_id)
+            .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
+    };
+
+    let effort = if let Some(session_id) = session_id {
+        let session_ref = {
+            let registry = state.agent.registry.lock().await;
+            registry.get(&session_id).cloned()
+        };
+
+        if let Some(session_ref) = session_ref {
+            session_ref.get_reasoning_effort().await.ok().flatten()
+        } else {
+            **state.agent.default_reasoning_effort.load()
+        }
+    } else {
+        **state.agent.default_reasoning_effort.load()
+    };
+
+    let _ = send_message(
+        tx,
+        UiServerMessage::ReasoningEffort {
+            reasoning_effort: effort.map(|e| e.to_string()),
         },
     )
     .await;
