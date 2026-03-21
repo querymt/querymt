@@ -372,6 +372,70 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             processed_at TEXT NOT NULL,
             UNIQUE(scope, source_key)
         );
+
+        -- ========================================================================
+        -- FTS5 INDEXES — BM25-ranked full-text search for knowledge layer
+        -- ========================================================================
+
+        -- FTS5 index for knowledge entries (summary + raw_text + source).
+        -- External-content table: data lives in knowledge_entries, FTS only
+        -- maintains the inverted index. The porter tokenizer adds English
+        -- stemming (e.g. "configured" matches "configuration").
+        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_entries_fts USING fts5(
+            summary, raw_text, source,
+            content='knowledge_entries',
+            content_rowid='id',
+            tokenize='porter unicode61'
+        );
+
+        -- FTS5 index for knowledge consolidations (summary + insight).
+        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_consolidations_fts USING fts5(
+            summary, insight,
+            content='knowledge_consolidations',
+            content_rowid='id',
+            tokenize='porter unicode61'
+        );
+
+        -- Sync triggers: keep FTS indexes in sync with base tables.
+        -- INSERT trigger for knowledge_entries
+        CREATE TRIGGER IF NOT EXISTS knowledge_entries_ai AFTER INSERT ON knowledge_entries BEGIN
+            INSERT INTO knowledge_entries_fts(rowid, summary, raw_text, source)
+            VALUES (new.id, new.summary, COALESCE(new.raw_text, ''), new.source);
+        END;
+
+        -- UPDATE trigger for knowledge_entries
+        CREATE TRIGGER IF NOT EXISTS knowledge_entries_au AFTER UPDATE ON knowledge_entries BEGIN
+            INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, summary, raw_text, source)
+            VALUES ('delete', old.id, old.summary, COALESCE(old.raw_text, ''), old.source);
+            INSERT INTO knowledge_entries_fts(rowid, summary, raw_text, source)
+            VALUES (new.id, new.summary, COALESCE(new.raw_text, ''), new.source);
+        END;
+
+        -- DELETE trigger for knowledge_entries
+        CREATE TRIGGER IF NOT EXISTS knowledge_entries_ad AFTER DELETE ON knowledge_entries BEGIN
+            INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, summary, raw_text, source)
+            VALUES ('delete', old.id, old.summary, COALESCE(old.raw_text, ''), old.source);
+        END;
+
+        -- INSERT trigger for knowledge_consolidations
+        CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_ai AFTER INSERT ON knowledge_consolidations BEGIN
+            INSERT INTO knowledge_consolidations_fts(rowid, summary, insight)
+            VALUES (new.id, new.summary, new.insight);
+        END;
+
+        -- UPDATE trigger for knowledge_consolidations
+        CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_au AFTER UPDATE ON knowledge_consolidations BEGIN
+            INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, summary, insight)
+            VALUES ('delete', old.id, old.summary, old.insight);
+            INSERT INTO knowledge_consolidations_fts(rowid, summary, insight)
+            VALUES (new.id, new.summary, new.insight);
+        END;
+
+        -- DELETE trigger for knowledge_consolidations
+        CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_ad AFTER DELETE ON knowledge_consolidations BEGIN
+            INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, summary, insight)
+            VALUES ('delete', old.id, old.summary, old.insight);
+        END;
         "#,
     )?;
 

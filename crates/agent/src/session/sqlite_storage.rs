@@ -2315,6 +2315,10 @@ const MIGRATIONS: &[Migration] = &[
         version: "0004_add_scheduler_and_knowledge_tables",
         apply: migration_0004_add_scheduler_and_knowledge_tables,
     },
+    Migration {
+        version: "0005_add_knowledge_fts5",
+        apply: migration_0005_add_knowledge_fts5,
+    },
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -2523,6 +2527,78 @@ fn migration_0004_add_scheduler_and_knowledge_tables(
             );
         "#,
     )?;
+    Ok(())
+}
+
+fn migration_0005_add_knowledge_fts5(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    // Add FTS5 full-text search indexes for the knowledge layer.
+    // Uses external-content tables backed by the base knowledge tables,
+    // with porter-stemming unicode61 tokenizer for English stemming.
+    conn.execute_batch(
+        r#"
+            -- FTS5 virtual tables (external content, porter stemming)
+            CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_entries_fts USING fts5(
+                summary, raw_text, source,
+                content='knowledge_entries',
+                content_rowid='id',
+                tokenize='porter unicode61'
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_consolidations_fts USING fts5(
+                summary, insight,
+                content='knowledge_consolidations',
+                content_rowid='id',
+                tokenize='porter unicode61'
+            );
+
+            -- Sync triggers for knowledge_entries
+            CREATE TRIGGER IF NOT EXISTS knowledge_entries_ai AFTER INSERT ON knowledge_entries BEGIN
+                INSERT INTO knowledge_entries_fts(rowid, summary, raw_text, source)
+                VALUES (new.id, new.summary, COALESCE(new.raw_text, ''), new.source);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS knowledge_entries_au AFTER UPDATE ON knowledge_entries BEGIN
+                INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, summary, raw_text, source)
+                VALUES ('delete', old.id, old.summary, COALESCE(old.raw_text, ''), old.source);
+                INSERT INTO knowledge_entries_fts(rowid, summary, raw_text, source)
+                VALUES (new.id, new.summary, COALESCE(new.raw_text, ''), new.source);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS knowledge_entries_ad AFTER DELETE ON knowledge_entries BEGIN
+                INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, summary, raw_text, source)
+                VALUES ('delete', old.id, old.summary, COALESCE(old.raw_text, ''), old.source);
+            END;
+
+            -- Sync triggers for knowledge_consolidations
+            CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_ai AFTER INSERT ON knowledge_consolidations BEGIN
+                INSERT INTO knowledge_consolidations_fts(rowid, summary, insight)
+                VALUES (new.id, new.summary, new.insight);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_au AFTER UPDATE ON knowledge_consolidations BEGIN
+                INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, summary, insight)
+                VALUES ('delete', old.id, old.summary, old.insight);
+                INSERT INTO knowledge_consolidations_fts(rowid, summary, insight)
+                VALUES (new.id, new.summary, new.insight);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_ad AFTER DELETE ON knowledge_consolidations BEGIN
+                INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, summary, insight)
+                VALUES ('delete', old.id, old.summary, old.insight);
+            END;
+        "#,
+    )?;
+
+    // Rebuild FTS indexes from any existing data in the base tables.
+    // This is a no-op on fresh installs but populates the index for
+    // databases that already had knowledge entries before this migration.
+    conn.execute_batch(
+        r#"
+            INSERT INTO knowledge_entries_fts(knowledge_entries_fts) VALUES('rebuild');
+            INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts) VALUES('rebuild');
+        "#,
+    )?;
+
     Ok(())
 }
 

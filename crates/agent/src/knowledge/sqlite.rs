@@ -135,8 +135,17 @@ const ENTRY_COLS: &str = "id, public_id, scope, source, raw_text, summary, \
     entities_json, topics_json, connections_json, importance, \
     consolidated_at, created_at";
 
+/// Table-qualified column list for use in JOIN queries (FTS5).
+const ENTRY_COLS_QUALIFIED: &str = "e.id, e.public_id, e.scope, e.source, e.raw_text, e.summary, \
+    e.entities_json, e.topics_json, e.connections_json, e.importance, \
+    e.consolidated_at, e.created_at";
+
 const CONSOLIDATION_COLS: &str = "id, public_id, scope, source_entry_public_ids_json, \
     summary, insight, connections_json, created_at";
+
+/// Table-qualified column list for use in JOIN queries (FTS5).
+const CONSOLIDATION_COLS_QUALIFIED: &str = "e.id, e.public_id, e.scope, e.source_entry_public_ids_json, \
+    e.summary, e.insight, e.connections_json, e.created_at";
 
 // ─── KnowledgeStore implementation ───────────────────────────────────────────
 
@@ -398,12 +407,13 @@ impl KnowledgeStore for SqliteKnowledgeStore {
         let question = question.to_string();
 
         self.run_blocking(move |conn| {
-            // Extract keywords from the question for matching
+            // Build FTS5 query and extract keywords for hybrid entity/topic boosts
+            let fts_query = build_fts5_query(&question);
             let keywords = extract_keywords(&question);
 
-            let entries = query_entries(conn, &scope, &keywords, &opts)?;
+            let entries = query_entries(conn, &scope, fts_query.as_deref(), &keywords, &opts)?;
             let consolidations = if opts.include_consolidations {
-                query_consolidations(conn, &scope, &keywords, opts.limit)?
+                query_consolidations(conn, &scope, fts_query.as_deref(), opts.limit)?
             } else {
                 vec![]
             };
@@ -611,6 +621,9 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
 /// Extract keywords from a question string for keyword-based search.
 /// Strips common stop words and returns lowercase tokens.
+///
+/// Used for LIKE-based entity/topic matching in hybrid mode and as input
+/// to `build_fts5_query` for full-text search.
 fn extract_keywords(question: &str) -> Vec<String> {
     const STOP_WORDS: &[&str] = &[
         "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
@@ -633,200 +646,235 @@ fn extract_keywords(question: &str) -> Vec<String> {
         .collect()
 }
 
-/// Query entries using keyword matching with optional hybrid scoring.
+/// Build a safe FTS5 query string from extracted keywords.
 ///
-/// Uses `?N` positional params (1-indexed) with `raw_bind_parameter` so the
-/// same keyword pattern can be referenced in both the WHERE clause and the
-/// CASE WHEN score expression without duplicating values.
+/// Produces an OR-joined query of quoted tokens, e.g. `"rust" OR "memory"`.
+/// Each token is double-quote-escaped to prevent FTS5 syntax injection
+/// (e.g. a user typing `NOT` or `NEAR` in a question). Tokens with the
+/// porter stemmer applied at index time will be matched via stemmed forms
+/// automatically by FTS5.
+///
+/// Returns `None` if no valid keywords remain after stop-word filtering.
+fn build_fts5_query(question: &str) -> Option<String> {
+    let keywords = extract_keywords(question);
+    if keywords.is_empty() {
+        return None;
+    }
+
+    // Quote each token to prevent FTS5 operator injection.
+    // Escape any internal double-quotes by doubling them.
+    let terms: Vec<String> = keywords
+        .iter()
+        .map(|kw| format!("\"{}\"", kw.replace('"', "\"\"")))
+        .collect();
+
+    Some(terms.join(" OR "))
+}
+
+/// Query entries using FTS5 BM25 ranking with optional hybrid scoring.
+///
+/// Uses FTS5 `MATCH` for candidate selection and `bm25()` for relevance
+/// ranking. The bm25 weights are: summary=10.0, raw_text=1.0, source=0.5.
+///
+/// In `Hybrid` mode, the BM25 score is combined with structured boosts
+/// from entity/topic LIKE matches and the importance field.
 fn query_entries(
     conn: &Connection,
     scope: &str,
+    fts_query: Option<&str>,
     keywords: &[String],
     opts: &QueryOpts,
 ) -> Result<Vec<KnowledgeEntry>, KnowledgeError> {
-    if keywords.is_empty() {
-        // No keywords: return most recent entries
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {ENTRY_COLS} FROM knowledge_entries \
-                 WHERE scope = ?1 ORDER BY created_at DESC LIMIT ?2"
-            ))
+    let fts_query = match fts_query {
+        Some(q) => q,
+        None => {
+            // No keywords: return most recent entries
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {ENTRY_COLS} FROM knowledge_entries \
+                     WHERE scope = ?1 ORDER BY created_at DESC LIMIT ?2"
+                ))
+                .map_err(KnowledgeError::from)?;
+            stmt.raw_bind_parameter(1, scope)
+                .map_err(KnowledgeError::from)?;
+            stmt.raw_bind_parameter(2, opts.limit as i64)
+                .map_err(KnowledgeError::from)?;
+            let mut rows = stmt.raw_query();
+            let mut results = Vec::new();
+            while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
+                results.push(row_to_entry(row).map_err(KnowledgeError::from)?);
+            }
+            return Ok(results);
+        }
+    };
+
+    // BM25 weights: summary=10.0, raw_text=1.0, source=0.5
+    // bm25() returns negative values (lower = better), so we negate for
+    // combination with positive boost terms in hybrid mode.
+    //
+    // Hybrid mode uses a UNION to pull candidates from both FTS text matches
+    // AND entity/topic LIKE matches, then ranks everything together with
+    // BM25 + structured boosts + importance. This ensures entries that match
+    // only via entities/topics (not in summary/raw_text/source) are still
+    // discovered and ranked.
+    if opts.retrieval_mode == RetrievalMode::Hybrid {
+        // Build LIKE conditions for entity/topic candidate selection + boosting.
+        // The FTS query param is ?1, scope is ?2.
+        let mut like_conditions = Vec::new();
+        let mut like_boosts = Vec::new();
+        let mut bindings: Vec<(usize, Value)> = vec![
+            (1, Value::Text(fts_query.to_string())),
+            (2, Value::Text(scope.to_string())),
+        ];
+        let mut param_idx = 3usize;
+
+        for keyword in keywords {
+            let pattern = format!("%{}%", keyword);
+            let kw_idx = param_idx;
+            bindings.push((kw_idx, Value::Text(pattern)));
+            param_idx += 1;
+
+            like_conditions.push(format!(
+                "entities_json LIKE ?{kw_idx} OR topics_json LIKE ?{kw_idx}"
+            ));
+            like_boosts.push(format!(
+                "CASE WHEN entities_json LIKE ?{kw_idx} THEN 2.0 ELSE 0.0 END + \
+                 CASE WHEN topics_json LIKE ?{kw_idx} THEN 2.0 ELSE 0.0 END"
+            ));
+        }
+
+        let like_where = if like_conditions.is_empty() {
+            "0".to_string() // never true — no entity/topic candidates
+        } else {
+            format!("({})", like_conditions.join(" OR "))
+        };
+
+        let boost_expr = if like_boosts.is_empty() {
+            "0.0".to_string()
+        } else {
+            like_boosts.join(" + ")
+        };
+
+        let limit_idx = param_idx;
+        bindings.push((limit_idx, Value::Integer(opts.limit as i64)));
+
+        // UNION strategy:
+        // 1. FTS candidates: entries matching the text query (have BM25 score)
+        // 2. Entity/topic candidates: entries matching via structured metadata
+        //    (assigned BM25 score of 0.0 since they didn't match text)
+        //
+        // Both sets are scored with: bm25_score + entity/topic boosts + importance
+        // Note: FTS5 requires the real table name, not an alias.
+        let sql = format!(
+            "SELECT {ENTRY_COLS}, _rank FROM ( \
+                SELECT {ENTRY_COLS_QUALIFIED}, \
+                    (-bm25(knowledge_entries_fts, 10.0, 1.0, 0.5) + ({boost_expr}) + (e.importance * 5.0)) AS _rank \
+                FROM knowledge_entries_fts \
+                JOIN knowledge_entries e ON e.id = knowledge_entries_fts.rowid \
+                WHERE knowledge_entries_fts MATCH ?1 AND e.scope = ?2 \
+              UNION \
+                SELECT {ENTRY_COLS}, \
+                    (0.0 + ({boost_expr}) + (importance * 5.0)) AS _rank \
+                FROM knowledge_entries \
+                WHERE scope = ?2 AND {like_where} \
+             ) \
+             ORDER BY _rank DESC, created_at DESC, id DESC \
+             LIMIT ?{limit_idx}"
+        );
+
+        let mut stmt = conn.prepare(&sql).map_err(KnowledgeError::from)?;
+        for (idx, val) in &bindings {
+            stmt.raw_bind_parameter(*idx, val)
+                .map_err(KnowledgeError::from)?;
+        }
+        let mut rows = stmt.raw_query();
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
+            results.push(row_to_entry(row).map_err(KnowledgeError::from)?);
+        }
+        Ok(results)
+    } else {
+        // Keyword mode: pure BM25 ranking, no structured boosts.
+        // Note: FTS5 requires the real table name, not an alias.
+        let sql = format!(
+            "SELECT {ENTRY_COLS_QUALIFIED} FROM knowledge_entries_fts \
+             JOIN knowledge_entries e ON e.id = knowledge_entries_fts.rowid \
+             WHERE knowledge_entries_fts MATCH ?1 AND e.scope = ?2 \
+             ORDER BY bm25(knowledge_entries_fts, 10.0, 1.0, 0.5), e.created_at DESC, e.id DESC \
+             LIMIT ?3"
+        );
+
+        let mut stmt = conn.prepare(&sql).map_err(KnowledgeError::from)?;
+        stmt.raw_bind_parameter(1, fts_query)
             .map_err(KnowledgeError::from)?;
-        stmt.raw_bind_parameter(1, scope)
+        stmt.raw_bind_parameter(2, scope)
             .map_err(KnowledgeError::from)?;
-        stmt.raw_bind_parameter(2, opts.limit as i64)
+        stmt.raw_bind_parameter(3, opts.limit as i64)
             .map_err(KnowledgeError::from)?;
         let mut rows = stmt.raw_query();
         let mut results = Vec::new();
         while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
             results.push(row_to_entry(row).map_err(KnowledgeError::from)?);
         }
-        return Ok(results);
+        Ok(results)
     }
-
-    // Build LIKE conditions for each keyword across summary, raw_text, source
-    // and optionally entities/topics for hybrid mode.
-    //
-    // Uses `?N` params so the same pattern param can be reused in both WHERE
-    // and CASE WHEN score expression.
-    let mut like_parts = Vec::new();
-    let mut bindings: Vec<(usize, Value)> = vec![(1, Value::Text(scope.to_string()))];
-    let mut param_idx = 2usize;
-
-    // Build a score expression for ranking
-    let mut score_parts = Vec::new();
-
-    for keyword in keywords {
-        let pattern = format!("%{}%", keyword);
-
-        // One param for the keyword pattern, reused across WHERE + score
-        let kw_idx = param_idx;
-        bindings.push((kw_idx, Value::Text(pattern.clone())));
-        param_idx += 1;
-
-        // WHERE: summary OR raw_text OR source
-        like_parts.push(format!(
-            "(summary LIKE ?{kw_idx} OR raw_text LIKE ?{kw_idx} OR source LIKE ?{kw_idx})"
-        ));
-        // Score: same columns with weights
-        score_parts.push(format!(
-            "(CASE WHEN summary LIKE ?{kw_idx} THEN 3 ELSE 0 END + \
-             CASE WHEN raw_text LIKE ?{kw_idx} THEN 1 ELSE 0 END + \
-             CASE WHEN source LIKE ?{kw_idx} THEN 1 ELSE 0 END)"
-        ));
-
-        if opts.retrieval_mode == RetrievalMode::Hybrid {
-            // Separate param for entity/topic matching (same pattern)
-            let ht_idx = param_idx;
-            bindings.push((ht_idx, Value::Text(pattern)));
-            param_idx += 1;
-
-            like_parts.push(format!(
-                "(entities_json LIKE ?{ht_idx} OR topics_json LIKE ?{ht_idx})"
-            ));
-            score_parts.push(format!(
-                "(CASE WHEN entities_json LIKE ?{ht_idx} THEN 2 ELSE 0 END + \
-                 CASE WHEN topics_json LIKE ?{ht_idx} THEN 2 ELSE 0 END)"
-            ));
-        }
-    }
-
-    let where_clause = format!("scope = ?1 AND ({})", like_parts.join(" OR "));
-
-    let score_expr = if score_parts.is_empty() {
-        "0".to_string()
-    } else {
-        let base_score = score_parts.join(" + ");
-        if opts.retrieval_mode == RetrievalMode::Hybrid {
-            // In hybrid mode, boost by importance
-            format!("({base_score}) + (importance * 5)")
-        } else {
-            base_score
-        }
-    };
-
-    // Limit param
-    let limit_idx = param_idx;
-    bindings.push((limit_idx, Value::Integer(opts.limit as i64)));
-
-    let sql = format!(
-        "SELECT {ENTRY_COLS}, ({score_expr}) as _score \
-         FROM knowledge_entries \
-         WHERE {where_clause} \
-         ORDER BY _score DESC, created_at DESC, id DESC \
-         LIMIT ?{limit_idx}"
-    );
-
-    let mut stmt = conn.prepare(&sql).map_err(KnowledgeError::from)?;
-    for (idx, val) in &bindings {
-        stmt.raw_bind_parameter(*idx, val)
-            .map_err(KnowledgeError::from)?;
-    }
-    let mut rows = stmt.raw_query();
-    let mut results = Vec::new();
-    while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
-        results.push(row_to_entry(row).map_err(KnowledgeError::from)?);
-    }
-    Ok(results)
 }
 
-/// Query consolidations using keyword matching.
+/// Query consolidations using FTS5 BM25 ranking.
+///
+/// Uses FTS5 `MATCH` for candidate selection and `bm25()` for relevance
+/// ranking. The bm25 weights are: summary=10.0, insight=5.0.
 fn query_consolidations(
     conn: &Connection,
     scope: &str,
-    keywords: &[String],
+    fts_query: Option<&str>,
     limit: usize,
 ) -> Result<Vec<Consolidation>, KnowledgeError> {
-    if keywords.is_empty() {
-        // No keywords: return most recent consolidations
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {CONSOLIDATION_COLS} FROM knowledge_consolidations \
-                 WHERE scope = ?1 ORDER BY created_at DESC LIMIT ?2"
-            ))
-            .map_err(KnowledgeError::from)?;
-        stmt.raw_bind_parameter(1, scope)
-            .map_err(KnowledgeError::from)?;
-        stmt.raw_bind_parameter(2, limit as i64)
-            .map_err(KnowledgeError::from)?;
-        let mut rows = stmt.raw_query();
-        let mut results = Vec::new();
-        while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
-            results.push(row_to_consolidation(row).map_err(KnowledgeError::from)?);
+    match fts_query {
+        None => {
+            // No keywords: return most recent consolidations
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {CONSOLIDATION_COLS} FROM knowledge_consolidations \
+                     WHERE scope = ?1 ORDER BY created_at DESC LIMIT ?2"
+                ))
+                .map_err(KnowledgeError::from)?;
+            stmt.raw_bind_parameter(1, scope)
+                .map_err(KnowledgeError::from)?;
+            stmt.raw_bind_parameter(2, limit as i64)
+                .map_err(KnowledgeError::from)?;
+            let mut rows = stmt.raw_query();
+            let mut results = Vec::new();
+            while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
+                results.push(row_to_consolidation(row).map_err(KnowledgeError::from)?);
+            }
+            Ok(results)
         }
-        return Ok(results);
+        Some(fts_q) => {
+            // BM25 weights: summary=10.0, insight=5.0
+            let sql = format!(
+                "SELECT {CONSOLIDATION_COLS_QUALIFIED} FROM knowledge_consolidations_fts \
+                 JOIN knowledge_consolidations e ON e.id = knowledge_consolidations_fts.rowid \
+                 WHERE knowledge_consolidations_fts MATCH ?1 AND e.scope = ?2 \
+                 ORDER BY bm25(knowledge_consolidations_fts, 10.0, 5.0), e.created_at DESC, e.id DESC \
+                 LIMIT ?3"
+            );
+
+            let mut stmt = conn.prepare(&sql).map_err(KnowledgeError::from)?;
+            stmt.raw_bind_parameter(1, fts_q)
+                .map_err(KnowledgeError::from)?;
+            stmt.raw_bind_parameter(2, scope)
+                .map_err(KnowledgeError::from)?;
+            stmt.raw_bind_parameter(3, limit as i64)
+                .map_err(KnowledgeError::from)?;
+            let mut rows = stmt.raw_query();
+            let mut results = Vec::new();
+            while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
+                results.push(row_to_consolidation(row).map_err(KnowledgeError::from)?);
+            }
+            Ok(results)
+        }
     }
-
-    // Build LIKE conditions for each keyword
-    let mut like_parts = Vec::new();
-    let mut bindings: Vec<(usize, Value)> = vec![(1, Value::Text(scope.to_string()))];
-    let mut param_idx = 2usize;
-    let mut score_parts = Vec::new();
-
-    for keyword in keywords {
-        let pattern = format!("%{}%", keyword);
-
-        let kw_idx = param_idx;
-        bindings.push((kw_idx, Value::Text(pattern)));
-        param_idx += 1;
-
-        // WHERE: summary OR insight (reuse same param)
-        like_parts.push(format!(
-            "(summary LIKE ?{kw_idx} OR insight LIKE ?{kw_idx})"
-        ));
-        // Score: same columns with weights
-        score_parts.push(format!(
-            "(CASE WHEN summary LIKE ?{kw_idx} THEN 3 ELSE 0 END + \
-             CASE WHEN insight LIKE ?{kw_idx} THEN 2 ELSE 0 END)"
-        ));
-    }
-
-    let where_clause = format!("scope = ?1 AND ({})", like_parts.join(" OR "));
-
-    let score_expr = score_parts.join(" + ");
-
-    let limit_idx = param_idx;
-    bindings.push((limit_idx, Value::Integer(limit as i64)));
-
-    let sql = format!(
-        "SELECT {CONSOLIDATION_COLS}, ({score_expr}) as _score \
-         FROM knowledge_consolidations \
-         WHERE {where_clause} \
-         ORDER BY _score DESC, created_at DESC, id DESC \
-         LIMIT ?{limit_idx}"
-    );
-
-    let mut stmt = conn.prepare(&sql).map_err(KnowledgeError::from)?;
-    for (idx, val) in &bindings {
-        stmt.raw_bind_parameter(*idx, val)
-            .map_err(KnowledgeError::from)?;
-    }
-    let mut rows = stmt.raw_query();
-    let mut results = Vec::new();
-    while let Some(row) = rows.next().map_err(KnowledgeError::from)? {
-        results.push(row_to_consolidation(row).map_err(KnowledgeError::from)?);
-    }
-    Ok(results)
 }
 
 #[cfg(test)]
