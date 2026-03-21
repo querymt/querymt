@@ -20,8 +20,8 @@ use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, Tool, ToolChoice,
-        http::HTTPChatProvider,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, Tool,
+        ToolChoice, http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -117,7 +117,7 @@ pub struct Anthropic {
     pub top_k: Option<u32>,
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<ToolChoice>,
-    pub reasoning: Option<bool>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub reasoning_budget_tokens: Option<u32>,
     /// Optional resolver for dynamic credential refresh (e.g., OAuth tokens).
     #[serde(skip)]
@@ -131,6 +131,14 @@ pub struct Anthropic {
     #[serde(skip, default = "Anthropic::default_tool_state_buffer")]
     #[schemars(skip)]
     pub(crate) tool_state_buffer: Arc<StdMutex<HashMap<usize, AnthropicToolUseState>>>,
+    /// Per-request accumulator for streaming thinking signatures.
+    ///
+    /// Keyed by the SSE `index` field. Entries are inserted on
+    /// `content_block_start` (type `thinking`) and removed on
+    /// `content_block_stop` once a signature is available.
+    #[serde(skip, default = "Anthropic::default_thinking_state_buffer")]
+    #[schemars(skip)]
+    pub(crate) thinking_state_buffer: Arc<StdMutex<HashMap<usize, AnthropicThinkingState>>>,
 }
 
 /// Per-block accumulator used while streaming tool-use content.
@@ -144,6 +152,12 @@ struct AnthropicToolUseState {
     id: String,
     name: String,
     arguments_buffer: String,
+}
+
+/// Per-block accumulator for Anthropic thinking signature deltas.
+#[derive(Debug, Default)]
+struct AnthropicThinkingState {
+    signature: String,
 }
 
 /// Anthropic-specific tool format that matches their API structure
@@ -160,7 +174,8 @@ struct AnthropicTool<'a> {
 struct ThinkingConfig {
     #[serde(rename = "type")]
     thinking_type: String,
-    budget_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_tokens: Option<u32>,
 }
 
 /// Request payload for Anthropic's messages API endpoint.
@@ -234,6 +249,7 @@ enum MessageContent {
         #[serde(rename = "type")]
         content_type: &'static str, // "thinking"
         thinking: String,
+        signature: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControlEphemeral>,
     },
@@ -523,6 +539,8 @@ struct AnthropicDelta {
     partial_json: Option<String>,
     /// Thinking content (for thinking_delta)
     thinking: Option<String>,
+    /// Thinking signature (for signature_delta)
+    signature: Option<String>,
     /// Stop reason (for message_delta)
     stop_reason: Option<String>,
 }
@@ -644,6 +662,10 @@ impl Anthropic {
         Arc::new(StdMutex::new(HashMap::new()))
     }
 
+    fn default_thinking_state_buffer() -> Arc<StdMutex<HashMap<usize, AnthropicThinkingState>>> {
+        Arc::new(StdMutex::new(HashMap::new()))
+    }
+
     /// Returns the current API key, using the resolver if available.
     fn resolved_key(&self) -> String {
         if let Some(ref resolver) = self.key_resolver {
@@ -714,6 +736,23 @@ impl Anthropic {
         }
     }
 
+    /// Returns true for models that support Anthropic adaptive thinking mode.
+    fn is_adaptive_reasoning_model(&self) -> bool {
+        ["opus-4-6", "opus-4.6", "sonnet-4-6", "sonnet-4.6"]
+            .iter()
+            .any(|needle| self.model.contains(needle))
+    }
+
+    /// Maps generic reasoning effort to Anthropic default budget tokens.
+    fn effort_budget_tokens(effort: ReasoningEffort) -> u32 {
+        match effort {
+            ReasoningEffort::Low => 1_024,
+            ReasoningEffort::Medium => 8_000,
+            ReasoningEffort::High => 16_000,
+            ReasoningEffort::Max => 31_999,
+        }
+    }
+
     /// Strips the TOOL_PREFIX from a tool name if present (used for responses)
     fn strip_tool_prefix(name: &str) -> String {
         name.strip_prefix(TOOL_PREFIX).unwrap_or(name).to_string()
@@ -764,12 +803,17 @@ impl HTTPChatProvider for Anthropic {
                                 });
                             }
                         }
-                        Content::Thinking { text } => {
-                            content.push(MessageContent::Thinking {
-                                content_type: "thinking",
-                                thinking: text.clone(),
-                                cache_control: None,
-                            });
+                        Content::Thinking { text, signature } => {
+                            // Anthropic requires signed thinking blocks when replaying
+                            // assistant history. Skip unsigned legacy blocks.
+                            if let Some(signature) = signature {
+                                content.push(MessageContent::Thinking {
+                                    content_type: "thinking",
+                                    thinking: text.clone(),
+                                    signature: signature.clone(),
+                                    cache_control: None,
+                                });
+                            }
                         }
                         Content::Image { mime_type, data } => {
                             content.push(MessageContent::Image {
@@ -922,14 +966,23 @@ impl HTTPChatProvider for Anthropic {
             None
         };
 
-        let thinking = if self.reasoning.unwrap_or(false) {
-            Some(ThinkingConfig {
-                thinking_type: "enabled".to_string(),
-                budget_tokens: self.reasoning_budget_tokens.unwrap_or(16000),
-            })
-        } else {
-            None
-        };
+        let thinking = self.reasoning_effort.map(|effort| {
+            if self.is_adaptive_reasoning_model() {
+                // Newer Anthropic models support adaptive reasoning and ignore explicit budgets.
+                ThinkingConfig {
+                    thinking_type: "adaptive".to_string(),
+                    budget_tokens: None,
+                }
+            } else {
+                let budget_tokens = self
+                    .reasoning_budget_tokens
+                    .unwrap_or_else(|| Self::effort_budget_tokens(effort));
+                ThinkingConfig {
+                    thinking_type: "enabled".to_string(),
+                    budget_tokens: Some(budget_tokens),
+                }
+            }
+        });
 
         // Use sanitized system prompt for OAuth requests
         let sanitized_system = self.sanitize_system_prompt();
@@ -938,9 +991,8 @@ impl HTTPChatProvider for Anthropic {
             messages: anthropic_messages,
             model: &self.model,
             max_tokens: Some(self.max_tokens),
-            temperature: if self.reasoning.unwrap_or(false) {
-                // NOTE: Ignoring temperature when reasoning is enabled. Temperature in this cases
-                // should always be set to `1.0`.
+            temperature: if self.reasoning_effort.is_some() {
+                // NOTE: Anthropic reasoning mode expects fixed temperature = 1.0.
                 Some(1.0)
             } else {
                 self.temperature
@@ -1023,34 +1075,39 @@ impl HTTPChatProvider for Anthropic {
                     "content_block_start" => {
                         if let (Some(index), Some(block)) =
                             (stream_resp.index, stream_resp.content_block)
-                            && block.block_type == "tool_use"
                         {
-                            // Strip tool prefix from name for OAuth responses
-                            let name = block.name.unwrap_or_default();
-                            let name = if self.is_oauth() {
-                                Self::strip_tool_prefix(&name)
-                            } else {
-                                name
-                            };
-                            let id = block.id.unwrap_or_default();
+                            if block.block_type == "tool_use" {
+                                // Strip tool prefix from name for OAuth responses
+                                let name = block.name.unwrap_or_default();
+                                let name = if self.is_oauth() {
+                                    Self::strip_tool_prefix(&name)
+                                } else {
+                                    name
+                                };
+                                let id = block.id.unwrap_or_default();
 
-                            // Insert accumulator entry for this block index
-                            if let Ok(mut buf) = self.tool_state_buffer.lock() {
-                                buf.insert(
+                                // Insert accumulator entry for this block index
+                                if let Ok(mut buf) = self.tool_state_buffer.lock() {
+                                    buf.insert(
+                                        index,
+                                        AnthropicToolUseState {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                            arguments_buffer: String::new(),
+                                        },
+                                    );
+                                }
+
+                                chunks.push(querymt::chat::StreamChunk::ToolUseStart {
                                     index,
-                                    AnthropicToolUseState {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        arguments_buffer: String::new(),
-                                    },
-                                );
+                                    id,
+                                    name,
+                                });
+                            } else if block.block_type == "thinking"
+                                && let Ok(mut buf) = self.thinking_state_buffer.lock()
+                            {
+                                buf.insert(index, AnthropicThinkingState::default());
                             }
-
-                            chunks.push(querymt::chat::StreamChunk::ToolUseStart {
-                                index,
-                                id,
-                                name,
-                            });
                         }
                     }
                     "content_block_delta" => {
@@ -1059,6 +1116,12 @@ impl HTTPChatProvider for Anthropic {
                                 chunks.push(querymt::chat::StreamChunk::Text(text));
                             } else if let Some(thinking) = delta.thinking {
                                 chunks.push(querymt::chat::StreamChunk::Thinking(thinking));
+                            } else if let Some(signature) = delta.signature {
+                                if let Ok(mut buf) = self.thinking_state_buffer.lock()
+                                    && let Some(state) = buf.get_mut(&index)
+                                {
+                                    state.signature.push_str(&signature);
+                                }
                             } else if let Some(partial_json) = delta.partial_json {
                                 // Accumulate into the state buffer
                                 if let Ok(mut buf) = self.tool_state_buffer.lock()
@@ -1075,27 +1138,38 @@ impl HTTPChatProvider for Anthropic {
                         }
                     }
                     "content_block_stop" => {
-                        // If this block was a tool-use block, emit ToolUseComplete with
-                        // the fully assembled arguments.
-                        if let Some(index) = stream_resp.index
-                            && let Ok(mut buf) = self.tool_state_buffer.lock()
-                            && let Some(state) = buf.remove(&index)
-                        {
-                            chunks.push(querymt::chat::StreamChunk::ToolUseComplete {
-                                index,
-                                tool_call: querymt::ToolCall {
-                                    id: state.id,
-                                    call_type: "function".to_string(),
-                                    function: querymt::FunctionCall {
-                                        name: state.name,
-                                        arguments: if state.arguments_buffer.is_empty() {
-                                            "{}".to_string()
-                                        } else {
-                                            state.arguments_buffer
+                        if let Some(index) = stream_resp.index {
+                            // If this block was a tool-use block, emit ToolUseComplete with
+                            // the fully assembled arguments.
+                            if let Ok(mut buf) = self.tool_state_buffer.lock()
+                                && let Some(state) = buf.remove(&index)
+                            {
+                                chunks.push(querymt::chat::StreamChunk::ToolUseComplete {
+                                    index,
+                                    tool_call: querymt::ToolCall {
+                                        id: state.id,
+                                        call_type: "function".to_string(),
+                                        function: querymt::FunctionCall {
+                                            name: state.name,
+                                            arguments: if state.arguments_buffer.is_empty() {
+                                                "{}".to_string()
+                                            } else {
+                                                state.arguments_buffer
+                                            },
                                         },
                                     },
-                                },
-                            });
+                                });
+                            }
+
+                            // Emit thinking signature once the thinking block closes.
+                            if let Ok(mut buf) = self.thinking_state_buffer.lock()
+                                && let Some(state) = buf.remove(&index)
+                                && !state.signature.is_empty()
+                            {
+                                chunks.push(querymt::chat::StreamChunk::ThinkingSignature(
+                                    state.signature,
+                                ));
+                            }
                         }
                     }
                     "message_delta" => {
@@ -1177,10 +1251,11 @@ mod tests {
             top_k: None,
             tools: None,
             tool_choice: None,
-            reasoning: None,
+            reasoning_effort: None,
             reasoning_budget_tokens: None,
             key_resolver: None,
             tool_state_buffer: Anthropic::default_tool_state_buffer(),
+            thinking_state_buffer: Anthropic::default_thinking_state_buffer(),
         }
     }
 
@@ -1229,7 +1304,7 @@ mod tests {
             "api_key": "sk-ant-api03-test",
             "model": "claude-3-7-sonnet-20250219",
             "max_tokens": 2500,
-            "reasoning": true,
+            "reasoning_effort": "high",
             "reasoning_budget_tokens": 1024
         });
 

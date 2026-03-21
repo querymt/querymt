@@ -11,7 +11,7 @@
 
 use crate::agent::agent_config::AgentConfig;
 use crate::error::AgentError;
-use crate::session::provider::{ProviderRouting, build_provider_from_config};
+use crate::session::provider::ProviderRequest;
 use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::remote::_internal;
@@ -289,27 +289,16 @@ impl ProviderHostActor {
         // Request params override host defaults
         let merged = merge_params(request_params, host_defaults.as_ref());
 
-        let plugin_registry = self.config.provider.plugin_registry();
-
-        build_provider_from_config(
-            &plugin_registry,
-            provider_name,
-            model,
-            merged.as_ref(),
-            None, // no API key override — use local keys
-            ProviderRouting {
-                provider_node_id: None,     // always local on the owning node
-                mesh_handle: None,          // not needed — owning node builds directly
-                allow_mesh_fallback: false, // host should stay local-only
-            },
-        )
-        .await
-        .map_err(|e| {
-            AgentError::Internal(format!(
-                "ProviderHostActor: failed to build provider '{}' model '{}': {}",
-                provider_name, model, e
-            ))
-        })
+        self.config
+            .provider
+            .build_provider(ProviderRequest::new(provider_name, model).with_params(merged.as_ref()))
+            .await
+            .map_err(|e| {
+                AgentError::Internal(format!(
+                    "ProviderHostActor: failed to build provider '{}' model '{}': {}",
+                    provider_name, model, e
+                ))
+            })
     }
 }
 
@@ -317,7 +306,7 @@ impl ProviderHostActor {
 
 /// Serialize [`LLMParams`] for forwarding to a remote provider, excluding
 /// fields that are passed as separate arguments to
-/// [`build_provider_from_config`] (`provider`, `model`, `name`) and
+/// [`SessionProvider::build_provider`] (`provider`, `model`, `name`) and
 /// sensitive credentials (`api_key`) that must never leave the owning node.
 ///
 /// This ensures *all* configuration — system prompt, temperature, top_p,

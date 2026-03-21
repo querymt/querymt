@@ -50,7 +50,7 @@ pub(crate) fn messages_to_json(
             .content
             .iter()
             .filter_map(|b| match b {
-                Content::Thinking { text } => Some(text.as_str()),
+                Content::Thinking { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()

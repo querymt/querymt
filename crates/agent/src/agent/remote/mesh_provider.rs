@@ -1,7 +1,7 @@
 //! `MeshChatProvider` — client-side proxy that executes LLM calls on a remote mesh node.
 //!
 //! When a session's `LLMConfig` targets a provider owned by a different node,
-//! `build_provider_from_config` wraps the request in a `MeshChatProvider` instead
+//! `SessionProvider::build_provider` wraps the request in a `MeshChatProvider` instead
 //! of constructing a local provider. API keys and OAuth tokens never leave the
 //! owning node — only `ChatMessage`s flow out and `StreamChunk`s / `ProviderChatResponse`s
 //! flow back.
@@ -42,7 +42,7 @@ use uuid::Uuid;
 /// A `ChatProvider` (and `LLMProvider`) implementation that proxies all LLM calls
 /// to a `ProviderHostActor` running on `target_node` in the kameo mesh.
 ///
-/// Constructed by `build_provider_from_config` when:
+/// Constructed by `SessionProvider::build_provider` when:
 /// 1. The session's `LLMConfig.provider_node_id` names a specific remote node, or
 /// 2. The provider is not available locally but is found on a mesh peer.
 ///
@@ -359,7 +359,7 @@ impl LLMProvider for MeshChatProvider {}
 /// Returns the stable node id of the first node that has valid credentials for
 /// the provider, or `None` if no peer is advertising it.
 ///
-/// This is used by `build_provider_from_config` as a mesh-fallback (Case 3) when
+/// This is used by `SessionProvider::build_provider` as a mesh-fallback (Case 3) when
 /// the provider is unavailable locally.
 ///
 /// # Implementation note

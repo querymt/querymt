@@ -8,7 +8,8 @@ use log::debug;
 use querymt::{
     FunctionCall, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StreamChunk, Tool, ToolChoice,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, StreamChunk,
+        Tool, ToolChoice,
     },
     error::LLMError,
     handle_http_error,
@@ -82,6 +83,9 @@ pub trait CodexProviderConfig {
     fn tools(&self) -> Option<&[Tool]>;
     fn tool_choice(&self) -> Option<&ToolChoice>;
     fn client_version(&self) -> Option<&str>;
+    fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        None
+    }
     fn extra_body(&self) -> Option<Map<String, Value>> {
         None
     }
@@ -433,13 +437,24 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
         None
     };
 
-    let extra_body = cfg.extra_body().map(|m| {
-        if should_snakecase_extra_body(cfg.base_url()) {
-            normalize_extra_body_map(m)
-        } else {
-            m
+    let extra_body = {
+        let mut merged = cfg.extra_body().unwrap_or_default();
+
+        if let Some(effort) = cfg.reasoning_effort() {
+            merged.insert(
+                "reasoning".into(),
+                serde_json::json!({ "effort": codex_effort_str(effort) }),
+            );
         }
-    });
+
+        if merged.is_empty() {
+            None
+        } else if should_snakecase_extra_body(cfg.base_url()) {
+            Some(normalize_extra_body_map(merged))
+        } else {
+            Some(merged)
+        }
+    };
 
     let body = CodexChatRequest {
         model: cfg.model(),
@@ -982,6 +997,19 @@ fn resolve_instructions<'a>(
     Ok(instructions)
 }
 
+/// Map unified `ReasoningEffort` to the Codex API string.
+///
+/// Codex uses `"xhigh"` where the unified enum uses `Max`.
+/// `None` is handled by the caller (omit field = provider/model default).
+fn codex_effort_str(e: ReasoningEffort) -> &'static str {
+    match e {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Max => "xhigh",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CodexChatResponse, CodexToolUseState, codex_parse_stream_chunk_with_state};
@@ -1033,5 +1061,15 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
             StreamChunk::Thinking(text) => assert_eq!(text, "continued"),
             other => panic!("expected thinking chunk, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn codex_effort_str_maps_correctly() {
+        use super::{ReasoningEffort, codex_effort_str};
+        assert_eq!(codex_effort_str(ReasoningEffort::Low), "low");
+        assert_eq!(codex_effort_str(ReasoningEffort::Medium), "medium");
+        assert_eq!(codex_effort_str(ReasoningEffort::High), "high");
+        // Max must map to "xhigh" — Codex API does not accept "max"
+        assert_eq!(codex_effort_str(ReasoningEffort::Max), "xhigh");
     }
 }

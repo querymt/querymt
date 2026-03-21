@@ -1,4 +1,5 @@
 #[cfg(feature = "remote")]
+#[cfg(feature = "remote")]
 use crate::agent::remote::NodeId;
 use crate::model::{AgentMessage, MessagePart};
 use crate::model_heuristics::ModelDefaults;
@@ -10,7 +11,7 @@ use querymt::plugin::host::PluginRegistry;
 use querymt::providers::ModelPricing;
 use querymt::{
     LLMProvider,
-    chat::{ChatMessage, ChatResponse, Content},
+    chat::{ChatMessage, ChatResponse, ChatRole, Content},
     error::LLMError,
 };
 use serde_json::{Map, Value};
@@ -97,7 +98,7 @@ pub struct SessionProvider {
     /// resolve per-agent template variables.
     pub(crate) agent_id: Option<String>,
     /// Optional mesh handle — present when this node participates in a kameo mesh.
-    /// Passed through to `build_provider_from_config` to enable `MeshChatProvider`
+    /// Passed through to `build_provider` to enable `MeshChatProvider`
     /// routing and mesh-fallback discovery.
     ///
     /// Wrapped in `Arc<StdMutex<...>>` so the mesh can be injected *after* the
@@ -303,8 +304,8 @@ impl SessionProvider {
 
         // `parse_llm_config_row` always returns `provider_node_id: None` because
         // provider_node_id lives in the `sessions` table, not `llm_configs`.
-        // Read it separately so mesh routing (Case 1 in build_provider_from_config)
-        // is actually triggered for remote sessions.
+        // Read it separately so mesh routing (Case 1) is actually triggered
+        // for remote sessions.
         #[cfg(feature = "remote")]
         let provider_node_id: Option<String> = self
             .history_store
@@ -357,29 +358,13 @@ impl SessionProvider {
             allow_mesh_fallback,
         );
 
-        // Read the mesh handle outside of any async context — StdMutex must not
-        // be held across await points.
+        let req = ProviderRequest::new(&config.provider, &config.model)
+            .with_params(config.params.as_ref())
+            .with_session_id(session_id);
         #[cfg(feature = "remote")]
-        let mesh_handle: Option<crate::agent::remote::MeshHandle> =
-            self.mesh.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let req = req.with_provider_node_id(provider_node_id.as_deref());
 
-        #[cfg(feature = "remote")]
-        let routing = ProviderRouting {
-            provider_node_id: provider_node_id.as_deref(),
-            mesh_handle: mesh_handle.as_ref(),
-            allow_mesh_fallback,
-        };
-
-        let provider = build_provider_from_config(
-            &self.plugin_registry,
-            &config.provider,
-            &config.model,
-            config.params.as_ref(),
-            None,
-            #[cfg(feature = "remote")]
-            routing,
-        )
-        .await?;
+        let provider = self.build_provider(req).await?;
 
         // Update cache - this will drop the old provider if config changed.
         // For GPU models (llama_cpp), this frees VRAM before loading the new model.
@@ -431,6 +416,317 @@ impl SessionProvider {
     /// Get LLM config by ID
     pub async fn get_llm_config(&self, config_id: i64) -> SessionResult<Option<LLMConfig>> {
         self.history_store.get_llm_config(config_id).await
+    }
+
+    /// Build an LLM provider from a [`ProviderRequest`].
+    ///
+    /// Infrastructure (plugin registry, mesh handle, mesh-fallback policy) is
+    /// read from `&self`. The [`ProviderRequest`] carries per-call values:
+    /// provider name, model, params, optional API-key override, session ID
+    /// (for prompt-cache key substitution), and optional mesh node routing.
+    ///
+    /// Provider construction includes:
+    /// - Routing to a remote `MeshChatProvider` when `provider_node_id` names a mesh peer
+    /// - Looking up the factory from the plugin registry
+    /// - Merging model and params into a builder config
+    /// - Resolving API keys (respecting user's preferred auth method from dashboard)
+    /// - Applying model-specific heuristic defaults
+    /// - Falling back to the mesh when the provider is unavailable locally (requires `remote` feature)
+    pub async fn build_provider(
+        &self,
+        req: ProviderRequest<'_>,
+    ) -> SessionResult<Arc<dyn LLMProvider>> {
+        let provider_name = req.provider_name;
+        let model = req.model;
+        let params = req.params;
+        let api_key_override = req.api_key_override;
+        let session_id = req.session_id;
+
+        // ── Case 1: Explicit remote node requested ─────────────────────────────
+        #[cfg(feature = "remote")]
+        if let Some(node_id) = req.provider_node_id
+            && node_id != "local"
+        {
+            let mesh_handle = self.mesh.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mesh = mesh_handle.as_ref().ok_or_else(|| {
+                SessionError::InvalidOperation(format!(
+                    "provider_node_id='{}' specified but no mesh handle available",
+                    node_id
+                ))
+            })?;
+            let node_id = NodeId::parse(node_id).map_err(SessionError::InvalidOperation)?;
+            log::debug!(
+                "build_provider: routing {}/{} to mesh node '{}'",
+                provider_name,
+                model,
+                node_id
+            );
+            return Ok(Arc::new(
+                crate::agent::remote::mesh_provider::MeshChatProvider::from_node_id(
+                    mesh,
+                    &node_id,
+                    provider_name,
+                    model,
+                )
+                .with_params(params.cloned()),
+            ));
+        }
+
+        // ── Case 2: Try local provider ─────────────────────────────────────────
+        let plugin_registry = &self.plugin_registry;
+        let factory = plugin_registry.get(provider_name).await;
+
+        #[cfg(not(feature = "remote"))]
+        let factory = factory.ok_or_else(|| {
+            SessionError::InvalidOperation(format!("Unknown provider: {}", provider_name))
+        })?;
+
+        // With the remote feature enabled we may optionally fall back to the mesh
+        // (Case 3 below), so we don't error-out immediately.
+        #[cfg(feature = "remote")]
+        let factory = match factory {
+            Some(f) => f,
+            None => {
+                // ── Case 3: Not available locally → optional mesh fallback ─────
+                let allow_mesh_fallback = *self
+                    .allow_mesh_fallback
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mesh_handle = self.mesh.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+                if allow_mesh_fallback && let Some(ref mesh) = mesh_handle {
+                    log::debug!(
+                        "build_provider: provider '{}' not found locally, searching mesh",
+                        provider_name
+                    );
+                    if let Some(node_id) =
+                        crate::agent::remote::mesh_provider::find_provider_on_mesh(
+                            mesh,
+                            provider_name,
+                        )
+                        .await
+                    {
+                        log::info!(
+                            "build_provider: found '{}' on mesh peer '{}', using MeshChatProvider",
+                            provider_name,
+                            node_id
+                        );
+                        return Ok(Arc::new(
+                            crate::agent::remote::mesh_provider::MeshChatProvider::from_node_id(
+                                mesh,
+                                &node_id,
+                                provider_name,
+                                model,
+                            )
+                            .with_params(params.cloned()),
+                        ));
+                    }
+                }
+                return Err(SessionError::InvalidOperation(format!(
+                    "Unknown provider: {}",
+                    provider_name
+                )));
+            }
+        };
+
+        // Build config JSON, starting with model
+        let mut builder_config = serde_json::json!({ "model": model });
+
+        // Merge params if provided
+        if let Some(params_value) = params
+            && let Some(obj) = params_value.as_object()
+        {
+            for (key, value) in obj {
+                builder_config[key] = value.clone();
+            }
+        }
+
+        // Merge static provider config from providers.toml [providers.config] as
+        // lowest-priority defaults. This allows provider-level settings such as
+        // `fast_download` to reach the provider's from_config() without requiring
+        // the caller to pass them as params every time.
+        // Params (above) and model always take precedence over these defaults.
+        if let Some(provider_cfg) = plugin_registry
+            .config
+            .providers
+            .iter()
+            .find(|p| p.name == provider_name)
+            && let Some(ref static_config) = provider_cfg.config
+        {
+            for (key, value) in static_config {
+                if builder_config.get(key).is_none_or(|v| v.is_null())
+                    && let Ok(json_val) = serde_json::to_value(value)
+                {
+                    builder_config[key] = json_val;
+                }
+            }
+        }
+
+        // Apply model/provider heuristic defaults (only fills keys not already present)
+        let defaults = ModelDefaults::for_model(provider_name, model);
+        defaults.apply_to(&mut builder_config, session_id);
+
+        // Track whether we should attach an OAuth key resolver after construction.
+        // The resolver enables transparent token refresh without rebuilding the provider.
+        let mut _use_oauth_resolver = false;
+
+        // Get API key — respects user's preferred auth method if set.
+        //
+        // Resolution order (when no preference):
+        //   1. api_key_override (explicit caller param — always wins)
+        //   2. OAuth token (if oauth feature enabled)
+        //   3. Stored API key from keyring (set via dashboard UI)
+        //   4. Environment variable
+        //
+        // When the user has set a preferred_method via the dashboard:
+        //   - "oauth":   OAuth → stored key → env
+        //   - "api_key": stored key → env → OAuth
+        //   - "env_var": env → stored key → OAuth
+        //
+        // Note: `api_key_name()` may return `None` for OAuth-only providers
+        // (e.g. Codex). The OAuth path does not depend on an env var name,
+        // so it runs regardless.
+        if let Some(http_factory) = factory.as_http() {
+            let env_var_name = http_factory.api_key_name();
+
+            let api_key = if let Some(key) = api_key_override {
+                Some(key.to_string())
+            } else {
+                let preferred_method = preferred_auth_method(provider_name);
+
+                log::debug!(
+                    "Resolving API key for provider '{}' (preferred: {:?}, env_var: {:?})",
+                    provider_name,
+                    preferred_method,
+                    env_var_name
+                );
+
+                resolve_api_key_with_preference(
+                    provider_name,
+                    env_var_name.as_deref(),
+                    preferred_method.as_ref(),
+                    &mut _use_oauth_resolver,
+                )
+                .await
+            };
+
+            if let Some(key) = api_key {
+                builder_config["api_key"] = key.into();
+            } else {
+                // All credential sources failed — return a descriptive error
+                // instead of letting `from_config` fail with a cryptic serde
+                // "missing field `api_key`" message.
+                let msg = if let Some(ref env_name) = env_var_name {
+                    format!(
+                        "No API key found for provider '{}'. Set {} or run 'qmt auth login {}'",
+                        provider_name, env_name, provider_name
+                    )
+                } else {
+                    format!(
+                        "No credentials found for provider '{}'. Run 'qmt auth login {}'",
+                        provider_name, provider_name
+                    )
+                };
+                return Err(SessionError::ProviderError(LLMError::AuthError(msg)));
+            }
+        }
+
+        // Prune config by provider schema to avoid providers with
+        // `deny_unknown_fields` rejecting unrelated parameters.
+        let schema: Value = serde_json::from_str(&factory.config_schema())?;
+        let pruned_config = prune_config_by_schema(&builder_config, &schema);
+
+        let pruned_keys = pruned_top_level_keys(&builder_config, &pruned_config);
+        if !pruned_keys.is_empty() {
+            const MAX_KEYS_TO_LOG: usize = 50;
+            let shown = pruned_keys.len().min(MAX_KEYS_TO_LOG);
+            let suffix = if pruned_keys.len() > shown {
+                format!(" (+{} more)", pruned_keys.len() - shown)
+            } else {
+                String::new()
+            };
+
+            log::warn!(
+                "Pruned unsupported config keys for provider '{}': {}{}",
+                provider_name,
+                pruned_keys[..shown].join(", "),
+                suffix
+            );
+        }
+
+        let pruned_config_str = serde_json::to_string(&pruned_config)?;
+
+        // If OAuth was used, attach a resolver so expired tokens are refreshed
+        // transparently on each request.
+        //
+        // We try the generic LLMProviderFactory path first: Extism providers
+        // handle HTTP internally and accept set_key_resolver directly on the
+        // LLMProvider. For native HTTP providers the generic path wraps the
+        // inner HTTP provider in Arc before we can set the resolver, so we
+        // fall back to the HTTPLLMProviderFactory path to set it on the inner
+        // provider before wrapping.
+        #[cfg(feature = "oauth")]
+        if _use_oauth_resolver {
+            let initial_key = builder_config
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let resolver = std::sync::Arc::new(crate::auth::OAuthKeyResolver::new(
+                provider_name,
+                &initial_key,
+            ));
+
+            // Generic path — works for Extism providers that implement set_key_resolver.
+            let mut provider = factory.from_config(&pruned_config_str).map_err(|e| {
+                LLMError::PluginError(format!("provider '{}': {}", provider_name, e))
+            })?;
+            provider.set_key_resolver(resolver.clone());
+
+            if provider.key_resolver().is_some() {
+                log::debug!(
+                    "Attached OAuthKeyResolver via LLMProvider for '{}' (model: {})",
+                    provider_name,
+                    model
+                );
+                return Ok(Arc::from(provider));
+            }
+
+            // Fallback for native HTTP providers: set the resolver on the inner
+            // HTTPLLMProvider before it gets wrapped in Arc by the adapter.
+            if let Some(http_factory) = factory.as_http() {
+                let mut http_provider =
+                    http_factory.from_config(&pruned_config_str).map_err(|e| {
+                        LLMError::PluginError(format!("provider '{}': {}", provider_name, e))
+                    })?;
+                http_provider.set_key_resolver(resolver);
+
+                log::debug!(
+                    "Attached OAuthKeyResolver via HTTPLLMProvider for '{}' (model: {})",
+                    provider_name,
+                    model
+                );
+
+                let arc_provider: std::sync::Arc<dyn querymt::HTTPLLMProvider> =
+                    std::sync::Arc::from(http_provider);
+                let adapter = querymt::adapters::LLMProviderFromHTTP::new(arc_provider);
+                return Ok(Arc::from(Box::new(adapter) as Box<dyn LLMProvider>));
+            }
+
+            // Neither path attached a resolver — return the provider as-is.
+            log::warn!(
+                "OAuthKeyResolver could not be attached for provider '{}' (model: {})",
+                provider_name,
+                model
+            );
+            return Ok(Arc::from(provider));
+        }
+
+        let provider = factory
+            .from_config(&pruned_config_str)
+            .map_err(|e| LLMError::PluginError(format!("provider '{}': {}", provider_name, e)))?;
+        Ok(Arc::from(provider))
     }
 }
 
@@ -559,7 +855,9 @@ impl SessionHandle {
             Ok(agent_msgs) => agent_msgs
                 .iter()
                 .map(|m| {
-                    m.to_chat_message_with_max_prompt_bytes(
+                    m.to_chat_message_with_target(
+                        self.llm_config.as_ref().map(|cfg| cfg.provider.as_str()),
+                        self.llm_config.as_ref().map(|cfg| cfg.model.as_str()),
                         self.execution_config
                             .as_ref()
                             .and_then(|cfg| cfg.max_prompt_bytes),
@@ -653,9 +951,10 @@ impl SessionHandle {
                         content: text.clone(),
                     });
                 }
-                Content::Thinking { text } => {
+                Content::Thinking { text, signature } => {
                     parts.push(MessagePart::Reasoning {
                         content: text.clone(),
+                        signature: signature.clone(),
                         time_ms: None,
                     });
                 }
@@ -698,6 +997,17 @@ impl SessionHandle {
             }
         }
 
+        let source_provider = if msg.role == ChatRole::Assistant {
+            self.llm_config.as_ref().map(|cfg| cfg.provider.clone())
+        } else {
+            None
+        };
+        let source_model = if msg.role == ChatRole::Assistant {
+            self.llm_config.as_ref().map(|cfg| cfg.model.clone())
+        } else {
+            None
+        };
+
         AgentMessage {
             id: uuid::Uuid::now_v7().to_string(),
             session_id: self.session.public_id.clone(),
@@ -705,6 +1015,8 @@ impl SessionHandle {
             parts,
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
+            source_provider,
+            source_model,
         }
     }
 }
@@ -836,320 +1148,68 @@ pub(crate) async fn resolve_api_key_with_preference(
     None
 }
 
-/// Build an LLM provider from configuration parameters (reusable helper)
+/// Per-call parameters for building an LLM provider via
+/// [`SessionProvider::build_provider`].
 ///
-/// This function encapsulates the provider construction logic, including:
-/// - Routing to a remote `MeshChatProvider` when `provider_node_id` names a mesh peer
-/// - Looking up the factory from the plugin registry
-/// - Merging model and params into a builder config
-/// - Resolving API keys (respecting user's preferred auth method from dashboard)
-/// - Applying model-specific heuristic defaults
-/// - Falling back to the mesh when the provider is unavailable locally (requires `remote` feature)
+/// Infrastructure concerns (plugin registry, mesh handle, mesh-fallback policy)
+/// live on [`SessionProvider`] and are accessed through `&self`. This struct
+/// carries only the values that vary per request.
 ///
-/// Used by both session-based provider construction and standalone providers
-/// (e.g., for delegation summarization).
-///
-/// # Arguments
-/// * `plugin_registry`  — local plugin registry.
-/// * `provider_name`    — provider name (e.g. `"anthropic"`).
-/// * `model`            — model name (e.g. `"claude-sonnet-4-20250514"`).
-/// * `params`           — optional extra params JSON blob.
-/// * `api_key_override` — override the API key resolved from env/OAuth.
-#[cfg(feature = "remote")]
-pub struct ProviderRouting<'a> {
-    /// When `Some`, route the call to this mesh node's `ProviderHostActor`.
-    /// `None` or `"local"` means local provider resolution.
+/// Use [`ProviderRequest::new`] for the common case — optional fields default
+/// to sensible values (`params: None`, `api_key_override: None`,
+/// `session_id: "standalone"`, `provider_node_id: None`).
+pub struct ProviderRequest<'a> {
+    /// Provider name (e.g. `"anthropic"`, `"openai"`).
+    pub provider_name: &'a str,
+    /// Model name (e.g. `"claude-sonnet-4-20250514"`, `"gpt-5"`).
+    pub model: &'a str,
+    /// Optional extra params JSON blob merged into the provider config.
+    pub params: Option<&'a serde_json::Value>,
+    /// Override the API key resolved from env/OAuth/keyring.
+    pub api_key_override: Option<&'a str>,
+    /// Session identifier for prompt-cache key substitution.
+    /// Defaults to `"standalone"` for session-less contexts.
+    pub session_id: &'a str,
+    /// Route the call to a specific mesh node's `ProviderHostActor`.
+    /// `None` (default) or `"local"` means local provider resolution.
+    #[cfg(feature = "remote")]
     pub provider_node_id: Option<&'a str>,
-    /// Required when `provider_node_id` is `Some` (except `"local"`) or when fallback is enabled.
-    pub mesh_handle: Option<&'a crate::agent::remote::MeshHandle>,
-    /// When true and `provider_node_id` is `None`, unresolved local providers may be discovered on mesh peers.
-    pub allow_mesh_fallback: bool,
 }
 
-/// * `routing`          — remote routing/fallback policy (remote feature only).
-pub async fn build_provider_from_config(
-    plugin_registry: &PluginRegistry,
-    provider_name: &str,
-    model: &str,
-    params: Option<&serde_json::Value>,
-    api_key_override: Option<&str>,
-    #[cfg(feature = "remote")] routing: ProviderRouting<'_>,
-) -> SessionResult<Arc<dyn LLMProvider>> {
-    // ── Case 1: Explicit remote node requested ─────────────────────────────────
-    #[cfg(feature = "remote")]
-    if let Some(node_id) = routing.provider_node_id
-        && node_id != "local"
-    {
-        let mesh = routing.mesh_handle.ok_or_else(|| {
-            SessionError::InvalidOperation(format!(
-                "provider_node_id='{}' specified but no mesh handle available",
-                node_id
-            ))
-        })?;
-        let node_id = NodeId::parse(node_id).map_err(SessionError::InvalidOperation)?;
-        log::debug!(
-            "build_provider_from_config: routing {}/{} to mesh node '{}'",
+impl<'a> ProviderRequest<'a> {
+    /// Create a request with only the required fields; optional fields use defaults.
+    pub fn new(provider_name: &'a str, model: &'a str) -> Self {
+        Self {
             provider_name,
             model,
-            node_id
-        );
-        return Ok(Arc::new(
-            crate::agent::remote::mesh_provider::MeshChatProvider::from_node_id(
-                mesh,
-                &node_id,
-                provider_name,
-                model,
-            )
-            .with_params(params.cloned()),
-        ));
+            params: None,
+            api_key_override: None,
+            session_id: "standalone",
+            #[cfg(feature = "remote")]
+            provider_node_id: None,
+        }
     }
 
-    // ── Case 2: Try local provider (existing logic) ────────────────────────────
-    let factory = plugin_registry.get(provider_name).await;
+    pub fn with_params(mut self, params: Option<&'a serde_json::Value>) -> Self {
+        self.params = params;
+        self
+    }
 
-    #[cfg(not(feature = "remote"))]
-    let factory = factory.ok_or_else(|| {
-        SessionError::InvalidOperation(format!("Unknown provider: {}", provider_name))
-    })?;
+    pub fn with_api_key_override(mut self, api_key_override: Option<&'a str>) -> Self {
+        self.api_key_override = api_key_override;
+        self
+    }
 
-    // With the remote feature enabled we may optionally fall back to the mesh
-    // (Case 3 below), so we don't error-out immediately.
+    pub fn with_session_id(mut self, session_id: &'a str) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
     #[cfg(feature = "remote")]
-    let factory = match factory {
-        Some(f) => f,
-        None => {
-            // ── Case 3: Not available locally → optional mesh fallback ─────────
-            if routing.allow_mesh_fallback
-                && let Some(mesh) = routing.mesh_handle
-            {
-                log::debug!(
-                    "build_provider_from_config: provider '{}' not found locally, searching mesh",
-                    provider_name
-                );
-                if let Some(node_id) =
-                    crate::agent::remote::mesh_provider::find_provider_on_mesh(mesh, provider_name)
-                        .await
-                {
-                    log::info!(
-                        "build_provider_from_config: found '{}' on mesh peer '{}', using MeshChatProvider",
-                        provider_name,
-                        node_id
-                    );
-                    return Ok(Arc::new(
-                        crate::agent::remote::mesh_provider::MeshChatProvider::from_node_id(
-                            mesh,
-                            &node_id,
-                            provider_name,
-                            model,
-                        )
-                        .with_params(params.cloned()),
-                    ));
-                }
-            }
-            return Err(SessionError::InvalidOperation(format!(
-                "Unknown provider: {}",
-                provider_name
-            )));
-        }
-    };
-
-    // Build config JSON, starting with model
-    let mut builder_config = serde_json::json!({ "model": model });
-
-    // Merge params if provided
-    if let Some(params_value) = params
-        && let Some(obj) = params_value.as_object()
-    {
-        for (key, value) in obj {
-            builder_config[key] = value.clone();
-        }
+    pub fn with_provider_node_id(mut self, provider_node_id: Option<&'a str>) -> Self {
+        self.provider_node_id = provider_node_id;
+        self
     }
-
-    // Merge static provider config from providers.toml [providers.config] as
-    // lowest-priority defaults. This allows provider-level settings such as
-    // `fast_download` to reach the provider's from_config() without requiring
-    // the caller to pass them as params every time.
-    // Params (above) and model always take precedence over these defaults.
-    if let Some(provider_cfg) = plugin_registry
-        .config
-        .providers
-        .iter()
-        .find(|p| p.name == provider_name)
-        && let Some(ref static_config) = provider_cfg.config
-    {
-        for (key, value) in static_config {
-            if builder_config.get(key).is_none_or(|v| v.is_null())
-                && let Ok(json_val) = serde_json::to_value(value)
-            {
-                builder_config[key] = json_val;
-            }
-        }
-    }
-
-    // Apply model/provider heuristic defaults (only fills keys not already present)
-    let defaults = ModelDefaults::for_model(provider_name, model);
-    defaults.apply_to(&mut builder_config, "standalone");
-
-    // Track whether we should attach an OAuth key resolver after construction.
-    // The resolver enables transparent token refresh without rebuilding the provider.
-    let mut _use_oauth_resolver = false;
-
-    // Get API key — respects user's preferred auth method if set.
-    //
-    // Resolution order (when no preference):
-    //   1. api_key_override (explicit caller param — always wins)
-    //   2. OAuth token (if oauth feature enabled)
-    //   3. Stored API key from keyring (set via dashboard UI)
-    //   4. Environment variable
-    //
-    // When the user has set a preferred_method via the dashboard:
-    //   - "oauth":   OAuth → stored key → env
-    //   - "api_key": stored key → env → OAuth
-    //   - "env_var": env → stored key → OAuth
-    //
-    // Note: `api_key_name()` may return `None` for OAuth-only providers
-    // (e.g. Codex). The OAuth path does not depend on an env var name,
-    // so it runs regardless.
-    if let Some(http_factory) = factory.as_http() {
-        let env_var_name = http_factory.api_key_name();
-
-        let api_key = if let Some(key) = api_key_override {
-            Some(key.to_string())
-        } else {
-            let preferred_method = preferred_auth_method(provider_name);
-
-            log::debug!(
-                "Resolving API key for provider '{}' (preferred: {:?}, env_var: {:?})",
-                provider_name,
-                preferred_method,
-                env_var_name
-            );
-
-            resolve_api_key_with_preference(
-                provider_name,
-                env_var_name.as_deref(),
-                preferred_method.as_ref(),
-                &mut _use_oauth_resolver,
-            )
-            .await
-        };
-
-        if let Some(key) = api_key {
-            builder_config["api_key"] = key.into();
-        } else {
-            // All credential sources failed — return a descriptive error
-            // instead of letting `from_config` fail with a cryptic serde
-            // "missing field `api_key`" message.
-            let msg = if let Some(ref env_name) = env_var_name {
-                format!(
-                    "No API key found for provider '{}'. Set {} or run 'qmt auth login {}'",
-                    provider_name, env_name, provider_name
-                )
-            } else {
-                format!(
-                    "No credentials found for provider '{}'. Run 'qmt auth login {}'",
-                    provider_name, provider_name
-                )
-            };
-            return Err(SessionError::ProviderError(LLMError::AuthError(msg)));
-        }
-    }
-
-    // Prune config by provider schema to avoid providers with
-    // `deny_unknown_fields` rejecting unrelated parameters.
-    let schema: Value = serde_json::from_str(&factory.config_schema())?;
-    let pruned_config = prune_config_by_schema(&builder_config, &schema);
-
-    let pruned_keys = pruned_top_level_keys(&builder_config, &pruned_config);
-    if !pruned_keys.is_empty() {
-        const MAX_KEYS_TO_LOG: usize = 50;
-        let shown = pruned_keys.len().min(MAX_KEYS_TO_LOG);
-        let suffix = if pruned_keys.len() > shown {
-            format!(" (+{} more)", pruned_keys.len() - shown)
-        } else {
-            String::new()
-        };
-
-        log::warn!(
-            "Pruned unsupported config keys for provider '{}': {}{}",
-            provider_name,
-            pruned_keys[..shown].join(", "),
-            suffix
-        );
-    }
-
-    let pruned_config_str = serde_json::to_string(&pruned_config)?;
-
-    // If OAuth was used, attach a resolver so expired tokens are refreshed
-    // transparently on each request.
-    //
-    // We try the generic LLMProviderFactory path first: Extism providers
-    // handle HTTP internally and accept set_key_resolver directly on the
-    // LLMProvider. For native HTTP providers the generic path wraps the
-    // inner HTTP provider in Arc before we can set the resolver, so we
-    // fall back to the HTTPLLMProviderFactory path to set it on the inner
-    // provider before wrapping.
-    #[cfg(feature = "oauth")]
-    if _use_oauth_resolver {
-        let initial_key = builder_config
-            .get("api_key")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let resolver = std::sync::Arc::new(crate::auth::OAuthKeyResolver::new(
-            provider_name,
-            &initial_key,
-        ));
-
-        // Generic path — works for Extism providers that implement set_key_resolver.
-        let mut provider = factory
-            .from_config(&pruned_config_str)
-            .map_err(|e| LLMError::PluginError(format!("provider '{}': {}", provider_name, e)))?;
-        provider.set_key_resolver(resolver.clone());
-
-        if provider.key_resolver().is_some() {
-            log::debug!(
-                "Attached OAuthKeyResolver via LLMProvider for '{}' (model: {})",
-                provider_name,
-                model
-            );
-            return Ok(Arc::from(provider));
-        }
-
-        // Fallback for native HTTP providers: set the resolver on the inner
-        // HTTPLLMProvider before it gets wrapped in Arc by the adapter.
-        if let Some(http_factory) = factory.as_http() {
-            let mut http_provider = http_factory.from_config(&pruned_config_str).map_err(|e| {
-                LLMError::PluginError(format!("provider '{}': {}", provider_name, e))
-            })?;
-            http_provider.set_key_resolver(resolver);
-
-            log::debug!(
-                "Attached OAuthKeyResolver via HTTPLLMProvider for '{}' (model: {})",
-                provider_name,
-                model
-            );
-
-            let arc_provider: std::sync::Arc<dyn querymt::HTTPLLMProvider> =
-                std::sync::Arc::from(http_provider);
-            let adapter = querymt::adapters::LLMProviderFromHTTP::new(arc_provider);
-            return Ok(Arc::from(Box::new(adapter) as Box<dyn LLMProvider>));
-        }
-
-        // Neither path attached a resolver — return the provider as-is.
-        log::warn!(
-            "OAuthKeyResolver could not be attached for provider '{}' (model: {})",
-            provider_name,
-            model
-        );
-        return Ok(Arc::from(provider));
-    }
-
-    let provider = factory
-        .from_config(&pruned_config_str)
-        .map_err(|e| LLMError::PluginError(format!("provider '{}': {}", provider_name, e)))?;
-    Ok(Arc::from(provider))
 }
 
 #[cfg(test)]

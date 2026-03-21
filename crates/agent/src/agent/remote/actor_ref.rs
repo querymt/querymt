@@ -18,6 +18,7 @@ use agent_client_protocol::{
     Error as AcpError, PromptRequest, PromptResponse, SetSessionModelResponse,
 };
 use kameo::actor::ActorRef;
+use querymt::chat::ReasoningEffort;
 
 /// Location-transparent reference to a `SessionActor`.
 ///
@@ -179,6 +180,43 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::GetMode)
+                .await
+                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+        }
+    }
+
+    /// Set the reasoning effort for this session.
+    /// Pass `None` to clear the override and restore model/provider defaults.
+    pub async fn set_reasoning_effort(
+        &self,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<(), AgentError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(messages::SetReasoningEffort { effort })
+                .await
+                .map_err(|e| AgentError::RemoteActor(e.to_string()))?,
+
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&messages::SetReasoningEffort { effort })
+                .await
+                .map_err(|e| AgentError::RemoteActor(e.to_string()))?,
+        }
+        Ok(())
+    }
+
+    /// Get the current reasoning effort.
+    pub async fn get_reasoning_effort(&self) -> Result<Option<ReasoningEffort>, AgentError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(messages::GetReasoningEffort)
+                .await
+                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&messages::GetReasoningEffort)
                 .await
                 .map_err(|e| AgentError::RemoteActor(e.to_string())),
         }

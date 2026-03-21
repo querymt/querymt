@@ -195,6 +195,16 @@ remote_msg_impl!(
     "querymt::ReadRemoteFile",
     REG_READ_REMOTE_FILE
 );
+remote_msg_impl!(
+    messages::SetReasoningEffort,
+    "querymt::SetReasoningEffort",
+    REG_SET_REASONING_EFFORT
+);
+remote_msg_impl!(
+    messages::GetReasoningEffort,
+    "querymt::GetReasoningEffort",
+    REG_GET_REASONING_EFFORT
+);
 
 // ── EventRelayActor RemoteActor ──────────────────────────────────────────
 

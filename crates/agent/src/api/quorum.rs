@@ -18,6 +18,7 @@ use crate::agent::handle::AgentHandle as AgentHandleTrait;
 use crate::middleware::MIDDLEWARE_REGISTRY;
 use crate::runner::ChatSession;
 use crate::session::backend::default_agent_db_path;
+use crate::session::provider::SessionProvider;
 use crate::session::store::SessionStore;
 use crate::session::{SqliteStorage, StorageBackend};
 use crate::snapshot::GitSnapshotBackend;
@@ -431,9 +432,14 @@ impl QuorumBuilder {
         // Build delegation summarizer if configured
         if let Some(ref summary_config) = self.delegation_summary_config {
             if summary_config.enabled {
+                let summarizer_provider = SessionProvider::new(
+                    registry.clone(),
+                    backend.session_store(),
+                    querymt::LLMParams::default(),
+                );
                 match crate::delegation::DelegationSummarizer::from_config(
                     summary_config,
-                    registry.clone(),
+                    &summarizer_provider,
                 )
                 .await
                 {

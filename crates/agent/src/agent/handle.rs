@@ -27,9 +27,11 @@ use agent_client_protocol::{
     ResumeSessionRequest, ResumeSessionResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use kameo::actor::ActorRef;
 use querymt::LLMParams;
+use querymt::chat::ReasoningEffort;
 use std::any::Any;
 #[cfg(feature = "remote")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -143,6 +145,10 @@ pub struct LocalAgentHandle {
     // Mutable default mode (UI "set agent mode" → affects new sessions)
     pub default_mode: StdMutex<AgentMode>,
 
+    /// Default reasoning effort for new sessions. Lock-free via `ArcSwap`.
+    /// `None` = use model heuristic defaults.
+    pub default_reasoning_effort: ArcSwap<Option<ReasoningEffort>>,
+
     /// Handle to the kameo mesh swarm, set after `bootstrap_mesh()` succeeds.
     /// `None` in local-only mode. Wrapped in a `Mutex` for interior mutability
     /// so startup code can set it on the shared `Arc<LocalAgentHandle>`.
@@ -180,6 +186,7 @@ impl LocalAgentHandle {
             client: Arc::new(StdMutex::new(None)),
             bridge: Arc::new(StdMutex::new(None)),
             default_mode: StdMutex::new(crate::agent::core::AgentMode::Build),
+            default_reasoning_effort: ArcSwap::from_pointee(None),
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),
             #[cfg(feature = "remote")]

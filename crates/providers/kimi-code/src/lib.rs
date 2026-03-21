@@ -118,7 +118,7 @@ impl OpenAIProviderConfig for KimiCode {
         None
     }
 
-    fn reasoning_effort(&self) -> Option<&String> {
+    fn reasoning_effort(&self) -> Option<querymt::chat::ReasoningEffort> {
         None
     }
 

@@ -198,48 +198,79 @@ impl SessionStore for SqliteStorage {
         self.run_blocking(move |conn| {
             // 1. Fetch Messages with public_id and internal parent_message_id
             let mut stmt = conn.prepare(
-                "SELECT id, public_id, role, created_at, parent_message_id FROM messages WHERE session_id = ? ORDER BY created_at ASC"
+                "SELECT id, public_id, role, created_at, parent_message_id, source_provider, source_model FROM messages WHERE session_id = ? ORDER BY created_at ASC"
             )?;
 
             // Build a map: internal_id → public_id for parent resolution
             let mut id_map: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
-            let messages_data: Vec<(i64, String, String, i64, Option<i64>)> = stmt
+            let messages_data: Vec<(
+                i64,
+                String,
+                String,
+                i64,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+            )> = stmt
                 .query_map(params![session_internal_id], |row| {
                     let internal_id: i64 = row.get(0)?;
                     let public_id: String = row.get(1)?;
                     let role_str: String = row.get(2)?;
                     let created_at: i64 = row.get(3)?;
                     let parent_internal_id: Option<i64> = row.get(4)?;
-                    Ok((internal_id, public_id, role_str, created_at, parent_internal_id))
+                    let source_provider: Option<String> = row.get(5)?;
+                    let source_model: Option<String> = row.get(6)?;
+                    Ok((
+                        internal_id,
+                        public_id,
+                        role_str,
+                        created_at,
+                        parent_internal_id,
+                        source_provider,
+                        source_model,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Build id_map
-            for (internal_id, public_id, _, _, _) in &messages_data {
+            for (internal_id, public_id, _, _, _, _, _) in &messages_data {
                 id_map.insert(*internal_id, public_id.clone());
             }
 
             // Convert to AgentMessage, resolving parent_message_id
             let mut messages: Vec<AgentMessage> = messages_data
                 .into_iter()
-                .map(|(_internal_id, public_id, role_str, created_at, parent_internal_id)| {
-                    let role = match role_str.as_str() {
-                        "User" => ChatRole::User,
-                        "Assistant" => ChatRole::Assistant,
-                        _ => ChatRole::User, // Default fallback
-                    };
-
-                    let parent_message_id = parent_internal_id.and_then(|pid| id_map.get(&pid).cloned());
-
-                    AgentMessage {
-                        id: public_id.clone(),
-                        session_id: session_id_str.clone(),
-                        role,
-                        parts: Vec::new(), // Will populate next
+                .map(
+                    |(
+                        _internal_id,
+                        public_id,
+                        role_str,
                         created_at,
-                        parent_message_id,
-                    }
-                })
+                        parent_internal_id,
+                        source_provider,
+                        source_model,
+                    )| {
+                        let role = match role_str.as_str() {
+                            "User" => ChatRole::User,
+                            "Assistant" => ChatRole::Assistant,
+                            _ => ChatRole::User, // Default fallback
+                        };
+
+                        let parent_message_id =
+                            parent_internal_id.and_then(|pid| id_map.get(&pid).cloned());
+
+                        AgentMessage {
+                            id: public_id.clone(),
+                            session_id: session_id_str.clone(),
+                            role,
+                            parts: Vec::new(), // Will populate next
+                            created_at,
+                            parent_message_id,
+                            source_provider,
+                            source_model,
+                        }
+                    },
+                )
                 .collect();
 
             // 2. Fetch Parts for all messages in this session (by internal message_id)
@@ -300,8 +331,16 @@ impl SessionStore for SqliteStorage {
 
             // Insert message with public_id and internal session_id/parent_message_id
             tx.execute(
-                "INSERT INTO messages (public_id, session_id, role, created_at, parent_message_id) VALUES (?, ?, ?, ?, ?)",
-                params![msg.id, session_internal_id, role_str, msg.created_at, parent_internal_id],
+                "INSERT INTO messages (public_id, session_id, role, created_at, parent_message_id, source_provider, source_model) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    msg.id,
+                    session_internal_id,
+                    role_str,
+                    msg.created_at,
+                    parent_internal_id,
+                    msg.source_provider,
+                    msg.source_model
+                ],
             )?;
 
             // Get the internal message_id that was just inserted
@@ -387,15 +426,17 @@ impl SessionStore for SqliteStorage {
             // assistant turns unpredictably.
             let messages_to_copy = {
                 let mut stmt = tx.prepare(
-                    "SELECT id, public_id, role, created_at FROM messages WHERE session_id = ? ORDER BY id ASC"
+                    "SELECT id, public_id, role, created_at, source_provider, source_model FROM messages WHERE session_id = ? ORDER BY id ASC"
                 )?;
 
-                let messages: Vec<(i64, String, String, i64)> = stmt.query_map(params![source_session_internal_id], |row| {
+                let messages: Vec<(i64, String, String, i64, Option<String>, Option<String>)> = stmt.query_map(params![source_session_internal_id], |row| {
                     Ok((
                         row.get(0)?, // internal id
                         row.get(1)?, // public_id
                         row.get(2)?, // role
-                        row.get(3)?  // created_at
+                        row.get(3)?, // created_at
+                        row.get(4)?, // source_provider
+                        row.get(5)?  // source_model
                     ))
                 })?.collect::<Result<Vec<_>, _>>()?;
 
@@ -412,7 +453,7 @@ impl SessionStore for SqliteStorage {
 
             let copied_message_ids: std::collections::HashSet<String> = messages_to_copy
                 .iter()
-                .map(|(_, public_id, _, _)| public_id.clone())
+                .map(|(_, public_id, _, _, _, _)| public_id.clone())
                 .collect();
 
             let conversational_events_to_copy: Vec<(String, i64, String, Option<String>, String, String)> = {
@@ -474,13 +515,29 @@ impl SessionStore for SqliteStorage {
             };
 
             // 3. Copy messages and their parts with new UUID v7 public_ids
-            for (old_internal_id, _old_public_id, role, created_at) in messages_to_copy {
+            for (
+                old_internal_id,
+                _old_public_id,
+                role,
+                created_at,
+                source_provider,
+                source_model,
+            ) in messages_to_copy
+            {
                 let new_msg_public_id = Uuid::now_v7().to_string();
 
                 // Insert Message with new public_id and internal session_id
                 tx.execute(
-                    "INSERT INTO messages (public_id, session_id, role, created_at, parent_message_id) VALUES (?, ?, ?, ?, ?)",
-                    params![new_msg_public_id, new_session_internal_id, role, created_at, Option::<i64>::None],
+                    "INSERT INTO messages (public_id, session_id, role, created_at, parent_message_id, source_provider, source_model) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        new_msg_public_id,
+                        new_session_internal_id,
+                        role,
+                        created_at,
+                        Option::<i64>::None,
+                        source_provider,
+                        source_model
+                    ],
                 )?;
 
                 // Get new message internal ID
@@ -2220,6 +2277,10 @@ const MIGRATIONS: &[Migration] = &[
         version: "0002_drop_legacy_events",
         apply: migration_0002_drop_legacy_events,
     },
+    Migration {
+        version: "0003_message_source_model",
+        apply: migration_0003_message_source_model,
+    },
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -2299,6 +2360,23 @@ fn migration_0002_drop_legacy_events(conn: &mut Connection) -> Result<(), rusqli
     Ok(())
 }
 
+fn migration_0003_message_source_model(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    // Preserve assistant-origin provider/model metadata for cross-model replay logic.
+    let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<HashSet<_>, _>>()?;
+
+    if !columns.contains("source_provider") {
+        conn.execute("ALTER TABLE messages ADD COLUMN source_provider TEXT", [])?;
+    }
+    if !columns.contains("source_model") {
+        conn.execute("ALTER TABLE messages ADD COLUMN source_model TEXT", [])?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2344,6 +2422,33 @@ mod tests {
             )
             .expect("check event_journal table");
         assert_eq!(journal_table_count, 1, "event_journal table should exist");
+    }
+
+    #[test]
+    fn migration_0003_adds_message_source_columns() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        apply_migrations(&mut conn).expect("apply migrations");
+
+        let source_provider_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'source_provider'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check source_provider column");
+        assert_eq!(
+            source_provider_count, 1,
+            "source_provider column should exist"
+        );
+
+        let source_model_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'source_model'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check source_model column");
+        assert_eq!(source_model_count, 1, "source_model column should exist");
     }
 
     #[test]

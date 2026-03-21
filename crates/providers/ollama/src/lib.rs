@@ -7,8 +7,8 @@ use http::{Method, Request, Response, header::AUTHORIZATION, header::CONTENT_TYP
 use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StructuredOutputFormat, Tool,
-        http::HTTPChatProvider,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort,
+        StructuredOutputFormat, Tool, http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -43,7 +43,7 @@ pub struct Ollama {
     pub model: String,
     pub timeout_seconds: Option<u64>,
     pub stream: Option<bool>,
-    pub reasoning: Option<bool>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(
         default,
         deserialize_with = "querymt::params::deserialize_system_string"
@@ -556,7 +556,7 @@ impl HTTPChatProvider for Ollama {
             model: self.model.clone(),
             messages: chat_messages,
             stream: self.stream.unwrap_or(false),
-            think: self.reasoning.unwrap_or(false),
+            think: self.reasoning_effort.is_some(),
             options: Some(self.build_options()),
             format,
             tools: tools.map(|t| t.to_vec()),
@@ -754,7 +754,7 @@ mod tests {
             model: "llama3".to_string(),
             timeout_seconds: None,
             stream: Some(false),
-            reasoning: None,
+            reasoning_effort: None,
             system: None,
             json_schema: None,
             tools: None,

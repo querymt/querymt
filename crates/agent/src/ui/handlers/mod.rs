@@ -37,10 +37,12 @@ pub use session_ops::handle_fork_session;
 pub use session_ops::handle_get_agent_mode;
 pub use session_ops::handle_get_file_index;
 pub use session_ops::handle_get_llm_config;
+pub use session_ops::handle_get_reasoning_effort;
 pub use session_ops::handle_list_sessions;
 pub use session_ops::handle_load_session;
 pub use session_ops::handle_redo;
 pub use session_ops::handle_set_agent_mode;
+pub use session_ops::handle_set_reasoning_effort;
 pub use session_ops::handle_subscribe_session;
 pub use session_ops::handle_undo;
 pub use session_ops::handle_unsubscribe_session;
@@ -227,6 +229,12 @@ pub async fn handle_ui_message(
         }
         UiClientMessage::GetAgentMode => {
             handle_get_agent_mode(state, conn_id, tx).await;
+        }
+        UiClientMessage::SetReasoningEffort { reasoning_effort } => {
+            handle_set_reasoning_effort(state, conn_id, &reasoning_effort, tx).await;
+        }
+        UiClientMessage::GetReasoningEffort => {
+            handle_get_reasoning_effort(state, conn_id, tx).await;
         }
         UiClientMessage::ListRemoteNodes => {
             handle_list_remote_nodes(state, tx).await;
