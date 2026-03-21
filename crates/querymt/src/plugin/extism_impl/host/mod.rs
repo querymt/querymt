@@ -571,7 +571,7 @@ impl ChatProvider for ExtismProvider {
             tools: tools.map(|v| v.to_vec()),
         };
 
-        std::thread::spawn(move || {
+        tokio::task::spawn_blocking(move || {
             log::debug!("Extism plugin chat_stream thread started");
             let mut plug = plugin.lock().unwrap();
             let res: Result<(), (extism::Error, i32)> =
