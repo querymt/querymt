@@ -84,7 +84,7 @@ use std::pin::Pin;
 #[cfg(feature = "oauth")]
 pub struct OAuthKeyResolver {
     provider_name: String,
-    cached_key: std::sync::RwLock<String>,
+    cached_key: parking_lot::RwLock<String>,
 }
 
 #[cfg(feature = "oauth")]
@@ -97,7 +97,7 @@ impl OAuthKeyResolver {
     pub fn new(provider_name: impl Into<String>, initial_key: impl Into<String>) -> Self {
         Self {
             provider_name: provider_name.into(),
-            cached_key: std::sync::RwLock::new(initial_key.into()),
+            cached_key: parking_lot::RwLock::new(initial_key.into()),
         }
     }
 }
@@ -119,12 +119,12 @@ impl ApiKeyResolver for OAuthKeyResolver {
             let token = get_or_refresh_token(&self.provider_name)
                 .await
                 .map_err(|e| LLMError::AuthError(format!("OAuth refresh failed: {}", e)))?;
-            *self.cached_key.write().unwrap() = token;
+            *self.cached_key.write() = token;
             Ok(())
         })
     }
 
     fn current(&self) -> String {
-        self.cached_key.read().unwrap().clone()
+        self.cached_key.read().clone()
     }
 }

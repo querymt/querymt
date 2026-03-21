@@ -732,19 +732,11 @@ impl MiddlewareDriver for DedupCheckMiddleware {
         };
 
         // Get and clear turn_diffs
-        let turn_diffs = runtime.turn_diffs.lock().ok().map(|mut diffs| {
+        let turn_diffs = {
+            let mut diffs = runtime.turn_diffs.lock();
             let accumulated = diffs.clone();
             *diffs = DiffPaths::default();
             accumulated
-        });
-
-        let Some(turn_diffs) = turn_diffs else {
-            log::debug!("DedupCheckMiddleware: skipping — turn_diffs mutex poisoned");
-            tracing::Span::current().record("files_checked", 0usize);
-            tracing::Span::current().record("duplicates_found", 0usize);
-            tracing::Span::current().record("review_injected", false);
-            tracing::Span::current().record("output_state", "Complete");
-            return Ok(state);
         };
 
         if turn_diffs.is_empty() {

@@ -226,17 +226,16 @@ impl ClientHandler for McpClientHandler {
                 let mut new_tools = std::collections::HashMap::new();
                 let mut new_defs = Vec::new();
 
-                // Retain tools belonging to other servers.
+                // Retain tools belonging to other servers from the current snapshot.
                 {
-                    let current_tools = self.tool_state.tools.read().unwrap();
-                    let current_defs = self.tool_state.tool_defs.read().unwrap();
-                    for (name, adapter) in current_tools.iter() {
+                    let current = self.tool_state.load();
+                    for (name, adapter) in current.tools.iter() {
                         if adapter.server_name() != self.server_name {
                             new_tools.insert(name.clone(), adapter.clone());
                         }
                     }
-                    for def in current_defs.iter() {
-                        if let Some(adapter) = current_tools.get(&def.function.name)
+                    for def in current.tool_defs.iter() {
+                        if let Some(adapter) = current.tools.get(&def.function.name)
                             && adapter.server_name() != self.server_name
                         {
                             new_defs.push(def.clone());
@@ -270,11 +269,12 @@ impl ClientHandler for McpClientHandler {
                     }
                 }
 
-                // Swap atomically (two separate locks — see module-level note on ordering).
-                *self.tool_state.tools.write().unwrap() = new_tools;
-                *self.tool_state.tool_defs.write().unwrap() = new_defs;
-                // Clear hash so the next turn unconditionally re-emits ToolsAvailable.
-                *self.tool_state.tools_hash.lock().unwrap() = None;
+                // Atomically swap the entire snapshot (tools + defs + cleared hash).
+                self.tool_state.store(crate::agent::core::McpToolSnapshot {
+                    tools: new_tools,
+                    tool_defs: new_defs,
+                    tools_hash: None,
+                });
 
                 log::info!(
                     "session={} server='{}': MCP tool list refreshed",

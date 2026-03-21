@@ -34,9 +34,9 @@ use std::any::Any;
 #[cfg(feature = "remote")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{Mutex, broadcast};
 #[cfg(feature = "remote")]
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, broadcast};
 
 // ══════════════════════════════════════════════════════════════════════════
 //  AgentHandle trait — the unified interface for local and remote agents
@@ -117,7 +117,7 @@ struct CachedNodeEntry {
 #[cfg(feature = "remote")]
 #[derive(Debug)]
 struct RemoteNodeMetadataCache {
-    by_label: RwLock<std::collections::HashMap<String, CachedNodeEntry>>,
+    by_label: parking_lot::RwLock<std::collections::HashMap<String, CachedNodeEntry>>,
     invalidation_task_started: AtomicBool,
 }
 
@@ -125,7 +125,7 @@ struct RemoteNodeMetadataCache {
 impl RemoteNodeMetadataCache {
     fn new() -> Self {
         Self {
-            by_label: RwLock::new(std::collections::HashMap::new()),
+            by_label: parking_lot::RwLock::new(std::collections::HashMap::new()),
             invalidation_task_started: AtomicBool::new(false),
         }
     }
@@ -506,16 +506,12 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    async fn get_cached_remote_node(
-        &self,
-        cache_key: &str,
-    ) -> Option<crate::agent::remote::NodeInfo> {
+    fn get_cached_remote_node(&self, cache_key: &str) -> Option<crate::agent::remote::NodeInfo> {
         let now = std::time::Instant::now();
         if let Some(entry) = self
             .remote_node_cache
             .by_label
             .read()
-            .await
             .get(cache_key)
             .cloned()
             && entry.expires_at > now
@@ -523,7 +519,7 @@ impl LocalAgentHandle {
             return Some(entry.info);
         }
 
-        let mut guard = self.remote_node_cache.by_label.write().await;
+        let mut guard = self.remote_node_cache.by_label.write();
         if let Some(entry) = guard.get(cache_key)
             && entry.expires_at <= now
         {
@@ -533,13 +529,9 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    async fn insert_cached_remote_node(
-        &self,
-        cache_key: String,
-        info: crate::agent::remote::NodeInfo,
-    ) {
+    fn insert_cached_remote_node(&self, cache_key: String, info: crate::agent::remote::NodeInfo) {
         let ttl = Self::remote_node_cache_ttl();
-        self.remote_node_cache.by_label.write().await.insert(
+        self.remote_node_cache.by_label.write().insert(
             cache_key,
             CachedNodeEntry {
                 info,
@@ -567,7 +559,7 @@ impl LocalAgentHandle {
                     Ok(crate::agent::remote::mesh::PeerEvent::Discovered(peer_id))
                     | Ok(crate::agent::remote::mesh::PeerEvent::Expired(peer_id)) => {
                         let key = format!("peer:{peer_id}");
-                        cache.by_label.write().await.remove(&key);
+                        cache.by_label.write().remove(&key);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -616,14 +608,14 @@ impl LocalAgentHandle {
                         && !mesh.is_peer_alive(&pid)
                     {
                         let key = format!("peer:{pid}");
-                        self.remote_node_cache.by_label.write().await.remove(&key);
+                        self.remote_node_cache.by_label.write().remove(&key);
                         log::debug!("list_remote_nodes: skipping stale DHT record for peer {pid}");
                         continue;
                     }
 
                     let cache_key =
                         Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
-                    if let Some(info) = self.get_cached_remote_node(&cache_key).await {
+                    if let Some(info) = self.get_cached_remote_node(&cache_key) {
                         cached_nodes.push(info);
                         continue;
                     }
@@ -648,8 +640,7 @@ impl LocalAgentHandle {
         while let Some((cache_key, peer_id, result)) = lookups.next().await {
             match result {
                 Ok(Ok(info)) => {
-                    self.insert_cached_remote_node(cache_key, info.clone())
-                        .await;
+                    self.insert_cached_remote_node(cache_key, info.clone());
                     fetched_nodes.push(info);
                 }
                 Ok(Err(e)) => {
@@ -766,7 +757,7 @@ impl LocalAgentHandle {
 
                     let cache_key =
                         Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
-                    if let Some(info) = self.get_cached_remote_node(&cache_key).await {
+                    if let Some(info) = self.get_cached_remote_node(&cache_key) {
                         if info.node_id.to_string() == node_id {
                             return Ok(node_manager_ref);
                         }
@@ -794,8 +785,7 @@ impl LocalAgentHandle {
         while let Some((node_manager_ref, cache_key, peer_id, result)) = lookups.next().await {
             match result {
                 Ok(Ok(info)) => {
-                    self.insert_cached_remote_node(cache_key, info.clone())
-                        .await;
+                    self.insert_cached_remote_node(cache_key, info.clone());
                     if info.node_id.to_string() == node_id {
                         return Ok(node_manager_ref);
                     }
@@ -1668,7 +1658,7 @@ mod tests {
         let f = HandleFixture::new().await;
         let cache_key = "peer:test-peer".to_string();
 
-        f.handle.remote_node_cache.by_label.write().await.insert(
+        f.handle.remote_node_cache.by_label.write().insert(
             cache_key.clone(),
             CachedNodeEntry {
                 info: crate::agent::remote::NodeInfo {
@@ -1685,14 +1675,13 @@ mod tests {
             },
         );
 
-        let expired = f.handle.get_cached_remote_node(&cache_key).await;
+        let expired = f.handle.get_cached_remote_node(&cache_key);
         assert!(expired.is_none());
         assert!(
             !f.handle
                 .remote_node_cache
                 .by_label
                 .read()
-                .await
                 .contains_key(&cache_key)
         );
     }

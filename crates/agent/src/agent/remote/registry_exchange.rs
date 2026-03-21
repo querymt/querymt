@@ -15,8 +15,9 @@
 use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::remote::_internal;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 // ── Wire types ────────────────────────────────────────────────────────────────
 
@@ -78,10 +79,7 @@ impl Message<GetRegistrations> for RegistryExchangeActor {
         _msg: GetRegistrations,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.registrations
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.registrations.read().clone()
     }
 }
 
@@ -93,11 +91,10 @@ impl Message<NotifyRegistration> for RegistryExchangeActor {
         msg: NotifyRegistration,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Ok(mut reg) = self.registrations.write() {
-            // Avoid duplicates (idempotent re-registration).
-            if !reg.iter().any(|e| e.dht_name == msg.entry.dht_name) {
-                reg.push(msg.entry);
-            }
+        let mut reg = self.registrations.write();
+        // Avoid duplicates (idempotent re-registration).
+        if !reg.iter().any(|e| e.dht_name == msg.entry.dht_name) {
+            reg.push(msg.entry);
         }
     }
 }

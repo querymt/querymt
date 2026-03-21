@@ -1283,13 +1283,13 @@ async fn execute_prompt_detached(
             )),
         );
 
-        *runtime.pre_turn_snapshot_task.lock().unwrap() = Some(task);
+        *runtime.pre_turn_snapshot_task.lock() = Some(task);
     } else {
         debug!(
             "Session {}: no snapshot backend, skipping pre-turn snapshot",
             session_id
         );
-        *runtime.pre_turn_snapshot_task.lock().unwrap() = None;
+        *runtime.pre_turn_snapshot_task.lock() = None;
     }
 
     debug!(
@@ -1329,7 +1329,7 @@ async fn execute_prompt_detached(
             );
         }
 
-        let turn_snapshot_data = runtime.turn_snapshot.lock().unwrap().take();
+        let turn_snapshot_data = runtime.turn_snapshot.lock().take();
         if let Some((turn_id, pre_snapshot_id)) = turn_snapshot_data {
             match backend.track(worktree).await {
                 Ok(post_snapshot_id) => {
@@ -1402,12 +1402,7 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
     exec_ctx: &mut ExecutionContext,
     reason: &'static str,
 ) -> Result<(), AgentError> {
-    let pending_task = exec_ctx
-        .runtime
-        .pre_turn_snapshot_task
-        .lock()
-        .unwrap()
-        .take();
+    let pending_task = exec_ctx.runtime.pre_turn_snapshot_task.lock().take();
     let Some(task) = pending_task else {
         return Ok(());
     };
@@ -1420,8 +1415,7 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
 
     match task.instrument(span).await {
         Ok((turn_id, Ok(snapshot_id))) => {
-            *exec_ctx.runtime.turn_snapshot.lock().unwrap() =
-                Some((turn_id.clone(), snapshot_id.clone()));
+            *exec_ctx.runtime.turn_snapshot.lock() = Some((turn_id.clone(), snapshot_id.clone()));
 
             let start_part = MessagePart::TurnSnapshotStart {
                 turn_id,

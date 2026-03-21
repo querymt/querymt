@@ -2,11 +2,12 @@
 
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use querymt::chat::{FunctionTool, Tool as ChatTool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::tools::{Tool, ToolContext, ToolError};
 
@@ -118,9 +119,7 @@ impl Tool for TodoWriteTool {
         let session_id = context.session_id().to_string();
 
         // Store todos for this session
-        let mut storage = TODO_STORAGE
-            .lock()
-            .map_err(|e| ToolError::SessionError(format!("Failed to lock todo storage: {}", e)))?;
+        let mut storage = TODO_STORAGE.lock();
         storage.insert(session_id, todos.clone());
 
         let result = json!({
@@ -177,10 +176,7 @@ impl Tool for TodoReadTool {
     async fn call(&self, _args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
         let session_id = context.session_id().to_string();
 
-        let storage = TODO_STORAGE
-            .lock()
-            .map_err(|e| ToolError::SessionError(format!("Failed to lock todo storage: {}", e)))?;
-
+        let storage = TODO_STORAGE.lock();
         let todos = storage.get(&session_id).cloned().unwrap_or_default();
 
         let result = json!({
