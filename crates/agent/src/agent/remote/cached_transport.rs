@@ -34,9 +34,10 @@
 //! `MeshConfig::directory == DirectoryMode::Cached` it wraps the result in a
 //! `CachedMeshTransport` first.
 
+use parking_lot::RwLock;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use kameo::actor::{ActorRef, RemoteActorRef, Spawn};
@@ -129,9 +130,11 @@ impl CachedMeshTransport {
             ref_any: Arc::new(r) as Arc<dyn Any + Send + Sync>,
             cached_at: Instant::now(),
         };
-        if let Ok(mut cache) = self.cache.write() {
-            cache.entry(name.to_string()).or_default().push(entry);
-        }
+        self.cache
+            .write()
+            .entry(name.to_string())
+            .or_default()
+            .push(entry);
     }
 
     /// Try to retrieve a typed `RemoteActorRef<A>` from the cache.
@@ -142,7 +145,7 @@ impl CachedMeshTransport {
         &self,
         name: &str,
     ) -> Option<RemoteActorRef<A>> {
-        let cache = self.cache.read().ok()?;
+        let cache = self.cache.read();
         let entries = cache.get(name)?;
         // Return the first entry that downcasts to the right type.
         for e in entries {
@@ -156,13 +159,12 @@ impl CachedMeshTransport {
     /// Evict all cache entries belonging to `peer_id`.
     #[allow(dead_code)]
     fn evict_peer(&self, peer_id: &PeerId) {
-        if let Ok(mut cache) = self.cache.write() {
-            for entries in cache.values_mut() {
-                entries.retain(|e| e.peer_id.as_ref() != Some(peer_id));
-            }
-            // Remove empty buckets.
-            cache.retain(|_, v| !v.is_empty());
+        let mut cache = self.cache.write();
+        for entries in cache.values_mut() {
+            entries.retain(|e| e.peer_id.as_ref() != Some(peer_id));
         }
+        // Remove empty buckets.
+        cache.retain(|_, v| !v.is_empty());
     }
 
     // ── Generic lookup with caching ───────────────────────────────────────────
@@ -211,7 +213,8 @@ impl CachedMeshTransport {
                     }
                     Ok(PeerEvent::Expired(peer_id)) => {
                         // Evict all cache entries for this peer.
-                        if let Ok(mut c) = cache.write() {
+                        {
+                            let mut c = cache.write();
                             for entries in c.values_mut() {
                                 entries.retain(|e| e.peer_id.as_ref() != Some(&peer_id));
                             }
@@ -362,9 +365,11 @@ fn insert_into_cache<A: kameo::Actor + kameo::remote::RemoteActor + 'static + Se
         ref_any: Arc::new(r) as Arc<dyn Any + Send + Sync>,
         cached_at: Instant::now(),
     };
-    if let Ok(mut c) = cache.write() {
-        c.entry(name.to_string()).or_default().push(entry);
-    }
+    cache
+        .write()
+        .entry(name.to_string())
+        .or_default()
+        .push(entry);
 }
 
 // ── CachedDynMeshTransport — public façade ────────────────────────────────────
@@ -415,10 +420,11 @@ impl CachedDynMeshTransport {
             dht_name: name.clone(),
             actor_sequence_id: actor_seq_id,
         };
-        if let Ok(mut reg) = self.cached.local_registrations.write()
-            && !reg.iter().any(|e| e.dht_name == name)
         {
-            reg.push(entry);
+            let mut reg = self.cached.local_registrations.write();
+            if !reg.iter().any(|e| e.dht_name == name) {
+                reg.push(entry);
+            }
         }
         self.cached.inner.register_actor(actor_ref, name).await
     }

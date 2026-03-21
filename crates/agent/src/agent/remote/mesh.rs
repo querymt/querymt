@@ -30,10 +30,11 @@
 //! deployments where mDNS multicast is not available.
 
 use libp2p::{Multiaddr, PeerId};
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// A peer lifecycle event emitted by the swarm event loop.
@@ -206,10 +207,7 @@ impl std::fmt::Debug for MeshHandle {
         f.debug_struct("MeshHandle")
             .field("peer_id", &self.peer_id)
             .field("local_hostname", &self.local_hostname)
-            .field(
-                "re_register_fns_count",
-                &self.re_register_fns.read().map(|g| g.len()).unwrap_or(0),
-            )
+            .field("re_register_fns_count", &self.re_register_fns.read().len())
             .finish_non_exhaustive()
     }
 }
@@ -243,10 +241,7 @@ impl MeshHandle {
 
     /// Check whether a peer is currently known to be alive (discovered and not expired).
     pub fn is_peer_alive(&self, peer_id: &PeerId) -> bool {
-        self.known_peers
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(peer_id)
+        self.known_peers.read().contains_key(peer_id)
     }
 
     /// Inject a peer directly into the `known_peers` map, bypassing mDNS.
@@ -258,11 +253,7 @@ impl MeshHandle {
     /// for the actual mDNS timer.
     #[cfg(test)]
     pub fn inject_known_peer_for_test(&self, peer_id: PeerId) {
-        self.known_peers
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(peer_id)
-            .or_default();
+        self.known_peers.write().entry(peer_id).or_default();
     }
 
     /// Subscribe to peer lifecycle events (discovered / expired).
@@ -326,9 +317,9 @@ impl MeshHandle {
                 }
             })
         });
-        if let Ok(mut fns) = self.re_register_fns.write() {
-            fns.insert(name.clone(), re_register);
-        }
+        self.re_register_fns
+            .write()
+            .insert(name.clone(), re_register);
     }
 
     /// Look up a remote actor by its DHT name.
@@ -405,13 +396,7 @@ impl MeshHandle {
     ) -> Option<crate::agent::remote::NodeId> {
         use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
 
-        let peers: Vec<PeerId> = self
-            .known_peers
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .copied()
-            .collect();
+        let peers: Vec<PeerId> = self.known_peers.read().keys().copied().collect();
 
         for peer_id in peers {
             let per_peer_name =
@@ -460,10 +445,7 @@ impl MeshHandle {
         log::debug!(
             "resolve_peer_node_id: no peer with hostname '{}' found in {} known peers",
             peer_name,
-            self.known_peers
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .len()
+            self.known_peers.read().len()
         );
         None
     }
@@ -476,9 +458,7 @@ impl MeshHandle {
     ///
     /// No-op if `name` is not present.
     pub fn deregister_actor(&self, name: &str) {
-        if let Ok(mut fns) = self.re_register_fns.write() {
-            fns.remove(name);
-        }
+        self.re_register_fns.write().remove(name);
     }
 
     /// Return the number of currently registered re-registration closures.
@@ -486,7 +466,7 @@ impl MeshHandle {
     /// Useful for tests and debug logging to verify that dead actors are
     /// cleaned up properly.
     pub fn re_register_fns_count(&self) -> usize {
-        self.re_register_fns.read().map(|g| g.len()).unwrap_or(0)
+        self.re_register_fns.read().len()
     }
 
     /// Check whether a re-registration closure exists for the given name.
@@ -494,20 +474,12 @@ impl MeshHandle {
     /// Useful in tests to verify register/deregister without relying on
     /// absolute counts (the test mesh is shared across concurrent tests).
     pub fn has_re_register_fn(&self, name: &str) -> bool {
-        self.re_register_fns
-            .read()
-            .map(|g| g.contains_key(name))
-            .unwrap_or(false)
+        self.re_register_fns.read().contains_key(name)
     }
 
     /// Return all currently-known peer IDs (alive, not expired).
     pub fn known_peer_ids(&self) -> Vec<PeerId> {
-        self.known_peers
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .copied()
-            .collect()
+        self.known_peers.read().keys().copied().collect()
     }
 }
 
@@ -685,7 +657,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                     for (peer_id, new_addrs) in addrs_by_peer {
                         // Determine whether this is a new peer or an address change.
                         let (is_new, has_new_addr) = {
-                            let peers = known_peers_loop.read().unwrap_or_else(|e| e.into_inner());
+                            let peers = known_peers_loop.read();
                             match peers.get(&peer_id) {
                                 None => (true, false),
                                 Some(known_addrs) => {
@@ -697,7 +669,8 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                         };
 
                         // Always update the stored address set.
-                        if let Ok(mut peers) = known_peers_loop.write() {
+                        {
+                            let mut peers = known_peers_loop.write();
                             let entry = peers.entry(peer_id).or_default();
                             for addr in &new_addrs {
                                 entry.insert(addr.clone());
@@ -727,10 +700,8 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                         // the new/updated peer's Kademlia routing table so that
                         // lookups from the peer succeed immediately rather than
                         // waiting for the next Kademlia republish cycle.
-                        let fns: Vec<ReRegisterFn> = re_register_fns_loop
-                            .read()
-                            .map(|g| g.values().cloned().collect())
-                            .unwrap_or_default();
+                        let fns: Vec<ReRegisterFn> =
+                            re_register_fns_loop.read().values().cloned().collect();
                         if !fns.is_empty() {
                             tokio::spawn(async move {
                                 for f in &fns {
@@ -755,8 +726,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
 
                     for (peer_id, expired_addrs) in addrs_by_peer {
                         let peer_fully_gone = {
-                            let mut peers =
-                                known_peers_loop.write().unwrap_or_else(|e| e.into_inner());
+                            let mut peers = known_peers_loop.write();
                             if let Some(known_addrs) = peers.get_mut(&peer_id) {
                                 for addr in &expired_addrs {
                                     known_addrs.remove(addr);
@@ -807,7 +777,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                     // peers") fail even though we have a live TCP connection.
                     swarm.add_peer_address(peer_id, remote_addr.clone());
                     let is_new = {
-                        let mut peers = known_peers_loop.write().unwrap_or_else(|e| e.into_inner());
+                        let mut peers = known_peers_loop.write();
                         let entry = peers.entry(peer_id).or_default();
                         let was_empty = entry.is_empty();
                         entry.insert(remote_addr.clone());
@@ -821,10 +791,8 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                         // Re-registration cascade: publish all local actors into
                         // the new peer's Kademlia routing table immediately so
                         // DHT lookups from that peer succeed right away.
-                        let fns: Vec<ReRegisterFn> = re_register_fns_loop
-                            .read()
-                            .map(|g| g.values().cloned().collect())
-                            .unwrap_or_default();
+                        let fns: Vec<ReRegisterFn> =
+                            re_register_fns_loop.read().values().cloned().collect();
                         if !fns.is_empty() {
                             tokio::spawn(async move {
                                 for f in &fns {
@@ -848,8 +816,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                     // inbound + outbound) are normal; we must not evict early.
                     if num_established == 0 {
                         let was_known = {
-                            let mut peers =
-                                known_peers_loop.write().unwrap_or_else(|e| e.into_inner());
+                            let mut peers = known_peers_loop.write();
                             peers.remove(&peer_id).is_some()
                         };
                         if was_known {

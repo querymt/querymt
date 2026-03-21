@@ -721,10 +721,10 @@ mod build_provider_for_session_tests {
 //  `provider_node_id` was set, producing:
 //    "provider_node_id='nostromo' specified but no mesh handle available"
 //
-//  Fix: `SessionProvider.mesh` is now `Arc<StdMutex<Option<MeshHandle>>>` so all
-//  clones share the same cell.  `AgentHandle::set_mesh` writes into that cell via
-//  `config.provider.set_mesh(Some(mesh))`, making the handle visible to every
-//  existing clone — including the one stored inside `RemoteNodeManager.config`.
+//  Fix: `SessionProvider.mesh` is now `Arc<ArcSwapOption<MeshHandle>>` so all
+//  clones share the same atomic slot.  `AgentHandle::set_mesh` stores into that
+//  slot via `config.provider.set_mesh(Some(mesh))`, making the handle visible to
+//  every existing clone — including the one stored inside `RemoteNodeManager.config`.
 
 #[cfg(all(test, feature = "remote"))]
 mod set_mesh_after_build_tests {

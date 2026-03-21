@@ -1,8 +1,9 @@
 //! Event callback system for the simple API
 
 use crate::events::{AgentEventKind, EventEnvelope};
+use parking_lot::Mutex;
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 pub type ToolCallCallback = Box<dyn Fn(String, Value) + Send + Sync>;
@@ -39,49 +40,39 @@ impl EventCallbacksState {
     where
         F: Fn(String, Value) + Send + Sync + 'static,
     {
-        if let Ok(mut callbacks) = self.callbacks.lock() {
-            callbacks.on_tool_call = Some(Box::new(callback));
-        }
+        self.callbacks.lock().on_tool_call = Some(Box::new(callback));
     }
 
     pub fn on_tool_complete<F>(&self, callback: F)
     where
         F: Fn(String, String) + Send + Sync + 'static,
     {
-        if let Ok(mut callbacks) = self.callbacks.lock() {
-            callbacks.on_tool_complete = Some(Box::new(callback));
-        }
+        self.callbacks.lock().on_tool_complete = Some(Box::new(callback));
     }
 
     pub fn on_message<F>(&self, callback: F)
     where
         F: Fn(String, String) + Send + Sync + 'static,
     {
-        if let Ok(mut callbacks) = self.callbacks.lock() {
-            callbacks.on_message = Some(Box::new(callback));
-        }
+        self.callbacks.lock().on_message = Some(Box::new(callback));
     }
 
     pub fn on_delegation<F>(&self, callback: F)
     where
         F: Fn(String, String) + Send + Sync + 'static,
     {
-        if let Ok(mut callbacks) = self.callbacks.lock() {
-            callbacks.on_delegation = Some(Box::new(callback));
-        }
+        self.callbacks.lock().on_delegation = Some(Box::new(callback));
     }
 
     pub fn on_error<F>(&self, callback: F)
     where
         F: Fn(String) + Send + Sync + 'static,
     {
-        if let Ok(mut callbacks) = self.callbacks.lock() {
-            callbacks.on_error = Some(Box::new(callback));
-        }
+        self.callbacks.lock().on_error = Some(Box::new(callback));
     }
 
     pub fn ensure_listener(&self, receiver: tokio::sync::broadcast::Receiver<EventEnvelope>) {
-        let mut task = self.task.lock().unwrap();
+        let mut task = self.task.lock();
         if task.is_some() {
             return;
         }
@@ -97,9 +88,8 @@ impl EventCallbacksState {
                         {
                             continue;
                         }
-                        if let Ok(callbacks) = callbacks.lock() {
-                            dispatch_event(&callbacks, &envelope);
-                        }
+                        let callbacks = callbacks.lock();
+                        dispatch_event(&callbacks, &envelope);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -112,9 +102,8 @@ impl EventCallbacksState {
 
 impl Drop for EventCallbacksState {
     fn drop(&mut self) {
-        if let Ok(mut task) = self.task.lock()
-            && let Some(handle) = task.take()
-        {
+        let mut task = self.task.lock();
+        if let Some(handle) = task.take() {
             handle.abort();
         }
     }
