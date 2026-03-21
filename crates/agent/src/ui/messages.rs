@@ -114,6 +114,8 @@ pub struct SessionSummary {
     pub parent_session_id: Option<String>,
     /// Fork origin: "user" or "delegation"
     pub fork_origin: Option<String>,
+    /// Session kind for specialized workflows (e.g. "recurring")
+    pub session_kind: Option<String>,
     /// Whether this session has child sessions
     pub has_children: bool,
     /// Node label where this session lives. "local" for local sessions,
@@ -321,6 +323,73 @@ pub enum UiClientMessage {
     },
     /// Trigger an update of all OCI provider plugins.
     UpdatePlugins,
+    /// Create a new schedule (recurring task + schedule trigger)
+    #[serde(rename = "create_schedule")]
+    CreateSchedule {
+        session_id: String,
+        /// Prompt text for each cycle (becomes the task's expected_deliverable)
+        prompt: String,
+        /// Trigger configuration as JSON (ScheduleTrigger)
+        #[typeshare(serialized_as = "any")]
+        trigger: serde_json::Value,
+        /// Optional execution limits
+        #[serde(default)]
+        max_steps: Option<u32>,
+        #[serde(default)]
+        max_cost_usd: Option<f64>,
+        /// Optional max runs before exhaustion
+        #[serde(default)]
+        max_runs: Option<u32>,
+    },
+    /// List schedules for a session (or all if session_id is None)
+    #[serde(rename = "list_schedules")]
+    ListSchedules {
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    /// Pause a schedule
+    #[serde(rename = "pause_schedule")]
+    PauseSchedule {
+        schedule_public_id: String,
+    },
+    /// Resume a paused schedule
+    #[serde(rename = "resume_schedule")]
+    ResumeSchedule {
+        schedule_public_id: String,
+    },
+    /// Trigger a schedule to fire immediately
+    #[serde(rename = "trigger_schedule")]
+    TriggerSchedule {
+        schedule_public_id: String,
+    },
+    /// Delete a schedule
+    #[serde(rename = "delete_schedule")]
+    DeleteSchedule {
+        schedule_public_id: String,
+    },
+    /// Query the knowledge store
+    #[serde(rename = "query_knowledge")]
+    QueryKnowledge {
+        scope: String,
+        question: String,
+        #[serde(default)]
+        #[typeshare(serialized_as = "Option<number>")]
+        limit: Option<u32>,
+    },
+    /// List knowledge entries for a scope
+    #[serde(rename = "list_knowledge")]
+    ListKnowledge {
+        scope: String,
+        /// Optional filter as JSON (topics, entities, since, consolidated, limit)
+        #[serde(default)]
+        #[typeshare(serialized_as = "any")]
+        filter: Option<serde_json::Value>,
+    },
+    /// Get knowledge stats for a scope
+    #[serde(rename = "knowledge_stats")]
+    KnowledgeStats {
+        scope: String,
+    },
 }
 
 #[typeshare]
@@ -336,6 +405,57 @@ pub struct PluginUpdateResult {
     pub plugin_name: String,
     pub success: bool,
     pub message: Option<String>,
+}
+
+/// Schedule information DTO for the UI.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleInfo {
+    pub public_id: String,
+    pub task_public_id: String,
+    pub session_public_id: String,
+    /// Serialized trigger config
+    #[typeshare(serialized_as = "any")]
+    pub trigger: serde_json::Value,
+    /// Current state: armed, running, paused, exhausted, failed
+    pub state: String,
+    pub last_run_at: Option<String>,
+    pub next_run_at: Option<String>,
+    pub run_count: u32,
+    pub consecutive_failures: u32,
+    pub max_runs: Option<u32>,
+    #[typeshare(serialized_as = "number")]
+    pub max_runtime_seconds: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Knowledge entry DTO for the UI (read-only).
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeEntryInfo {
+    pub public_id: String,
+    pub scope: String,
+    pub source: String,
+    pub summary: String,
+    pub entities: Vec<String>,
+    pub topics: Vec<String>,
+    pub importance: f64,
+    pub consolidated_at: Option<String>,
+    pub created_at: String,
+}
+
+/// Knowledge consolidation DTO for the UI (read-only).
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationInfo {
+    pub public_id: String,
+    pub scope: String,
+    pub summary: String,
+    pub insight: String,
+    #[typeshare(serialized_as = "number")]
+    pub source_count: u32,
+    pub created_at: String,
 }
 
 #[typeshare]
@@ -665,6 +785,49 @@ pub enum UiServerMessage {
         success: bool,
         message: String,
     },
+    /// Schedule list response
+    #[serde(rename = "schedule_list")]
+    ScheduleList {
+        schedules: Vec<ScheduleInfo>,
+    },
+    /// Schedule created successfully
+    #[serde(rename = "schedule_created_result")]
+    ScheduleCreatedResult {
+        success: bool,
+        schedule_public_id: Option<String>,
+        message: Option<String>,
+    },
+    /// Schedule action result (pause/resume/trigger/delete)
+    #[serde(rename = "schedule_action_result")]
+    ScheduleActionResult {
+        success: bool,
+        schedule_public_id: String,
+        action: String,
+        message: Option<String>,
+    },
+    /// Knowledge query result (entries + consolidations)
+    #[serde(rename = "knowledge_query_result")]
+    KnowledgeQueryResult {
+        entries: Vec<KnowledgeEntryInfo>,
+        consolidations: Vec<ConsolidationInfo>,
+    },
+    /// Knowledge list result
+    #[serde(rename = "knowledge_list_result")]
+    KnowledgeListResult {
+        entries: Vec<KnowledgeEntryInfo>,
+    },
+    /// Knowledge stats result
+    #[serde(rename = "knowledge_stats_result")]
+    KnowledgeStatsResult {
+        #[typeshare(serialized_as = "number")]
+        total_entries: u64,
+        #[typeshare(serialized_as = "number")]
+        unconsolidated_entries: u64,
+        #[typeshare(serialized_as = "number")]
+        total_consolidations: u64,
+        latest_entry_at: Option<String>,
+        latest_consolidation_at: Option<String>,
+    },
 }
 
 impl UiServerMessage {
@@ -697,6 +860,12 @@ impl UiServerMessage {
             Self::PluginUpdateStatus { .. } => "plugin_update_status",
             Self::PluginUpdateComplete { .. } => "plugin_update_complete",
             Self::ApiTokenResult { .. } => "api_token_result",
+            Self::ScheduleList { .. } => "schedule_list",
+            Self::ScheduleCreatedResult { .. } => "schedule_created_result",
+            Self::ScheduleActionResult { .. } => "schedule_action_result",
+            Self::KnowledgeQueryResult { .. } => "knowledge_query_result",
+            Self::KnowledgeListResult { .. } => "knowledge_list_result",
+            Self::KnowledgeStatsResult { .. } => "knowledge_stats_result",
         }
     }
 }
@@ -1197,5 +1366,98 @@ mod tests {
         assert!(p["env_var_name"].is_null());
         assert_eq!(p["has_stored_api_key"], false);
         assert_eq!(p["has_env_api_key"], false);
+    }
+
+    // ── Knowledge message tests ────────────────────────────────────────────
+
+    #[test]
+    fn deserializes_query_knowledge_tag() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "query_knowledge",
+            "data": { "scope": "global", "question": "What do we know about Rust?" }
+        }))
+        .expect("query_knowledge should deserialize");
+
+        match msg {
+            UiClientMessage::QueryKnowledge {
+                scope, question, ..
+            } => {
+                assert_eq!(scope, "global");
+                assert_eq!(question, "What do we know about Rust?");
+            }
+            _ => panic!("expected QueryKnowledge variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_list_knowledge_tag() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "list_knowledge",
+            "data": { "scope": "session:abc" }
+        }))
+        .expect("list_knowledge should deserialize");
+
+        match msg {
+            UiClientMessage::ListKnowledge { scope, .. } => {
+                assert_eq!(scope, "session:abc");
+            }
+            _ => panic!("expected ListKnowledge variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_knowledge_stats_tag() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "knowledge_stats",
+            "data": { "scope": "global" }
+        }))
+        .expect("knowledge_stats should deserialize");
+
+        match msg {
+            UiClientMessage::KnowledgeStats { scope } => {
+                assert_eq!(scope, "global");
+            }
+            _ => panic!("expected KnowledgeStats variant"),
+        }
+    }
+
+    #[test]
+    fn knowledge_query_result_server_msg_serializes() {
+        let msg = UiServerMessage::KnowledgeQueryResult {
+            entries: vec![super::KnowledgeEntryInfo {
+                public_id: "entry-1".to_string(),
+                scope: "global".to_string(),
+                source: "user_message".to_string(),
+                summary: "Rust is great".to_string(),
+                entities: vec!["Rust".to_string()],
+                topics: vec!["programming".to_string()],
+                importance: 0.8,
+                consolidated_at: None,
+                created_at: "2026-03-18T00:00:00Z".to_string(),
+            }],
+            consolidations: vec![],
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        assert_eq!(json["type"], "knowledge_query_result");
+        let entries = json["data"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["public_id"], "entry-1");
+        assert_eq!(entries[0]["summary"], "Rust is great");
+    }
+
+    #[test]
+    fn knowledge_stats_result_server_msg_serializes() {
+        let msg = UiServerMessage::KnowledgeStatsResult {
+            total_entries: 42,
+            unconsolidated_entries: 10,
+            total_consolidations: 5,
+            latest_entry_at: Some("2026-03-18T00:00:00Z".to_string()),
+            latest_consolidation_at: None,
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        assert_eq!(json["type"], "knowledge_stats_result");
+        assert_eq!(json["data"]["total_entries"], 42);
+        assert_eq!(json["data"]["unconsolidated_entries"], 10);
+        assert_eq!(json["data"]["total_consolidations"], 5);
     }
 }

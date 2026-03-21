@@ -313,6 +313,8 @@ pub struct SessionListItem {
     pub parent_session_id: Option<String>,
     /// Fork origin: "user" or "delegation"
     pub fork_origin: Option<String>,
+    /// Session kind (e.g. "recurring") for specialized UI badges.
+    pub session_kind: Option<String>,
     /// Whether this session has child sessions
     pub has_children: bool,
 }
@@ -502,6 +504,7 @@ mod tests {
             updated_at: None,
             parent_session_id: None,
             fork_origin: None,
+            session_kind: None,
             has_children: false,
         };
         assert_eq!(item.session_id, "sess-x");

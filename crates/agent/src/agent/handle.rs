@@ -157,6 +157,10 @@ pub struct LocalAgentHandle {
 
     /// Shared OAuth service for all auth operations across UI and ACP transports.
     pub oauth_service: crate::auth::service::OAuthService,
+
+    /// Handle to the scheduler actor, set after `start_scheduler()` succeeds.
+    /// `None` if scheduling is not enabled or lease was not acquired.
+    scheduler_handle: StdMutex<Option<crate::scheduler::SchedulerHandle>>,
 }
 
 impl LocalAgentHandle {
@@ -186,6 +190,7 @@ impl LocalAgentHandle {
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
             model_registry,
             oauth_service,
+            scheduler_handle: StdMutex::new(None),
         }
     }
 
@@ -236,9 +241,89 @@ impl LocalAgentHandle {
         self.config.emit_event(session_id, kind);
     }
 
+    /// Start the scheduler actor if a schedule repository is configured.
+    ///
+    /// This should be called after construction, during agent startup.
+    /// Returns `true` if the scheduler was started (lease acquired).
+    /// Returns `false` if no schedule repository is configured or the lease
+    /// was not acquired (another scheduler is active).
+    pub async fn start_scheduler(&self) -> bool {
+        let schedule_repo = match &self.config.schedule_repository {
+            Some(repo) => repo.clone(),
+            None => {
+                log::debug!(
+                    "LocalAgentHandle: no schedule repository configured, skipping scheduler"
+                );
+                return false;
+            }
+        };
+
+        let handle = crate::scheduler::SchedulerActor::spawn(
+            schedule_repo,
+            self.config.provider.history_store(),
+            self.registry.clone(),
+            self.config.clone(),
+            crate::scheduler::SchedulerConfig::default(),
+        )
+        .await;
+
+        match handle {
+            Some(h) => {
+                if let Ok(mut guard) = self.scheduler_handle.lock() {
+                    *guard = Some(h);
+                }
+                log::info!("LocalAgentHandle: scheduler started");
+                true
+            }
+            None => {
+                log::info!("LocalAgentHandle: scheduler not started (lease not acquired)");
+                false
+            }
+        }
+    }
+
+    /// Get a reference to the scheduler handle, if the scheduler is running.
+    pub fn scheduler(&self) -> Option<crate::scheduler::SchedulerHandle> {
+        self.scheduler_handle
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn clear_scheduler_handle(&self) {
+        if let Ok(mut guard) = self.scheduler_handle.lock() {
+            *guard = None;
+        }
+    }
+
+    fn scheduler_unavailable_error() -> agent_client_protocol::Error {
+        agent_client_protocol::Error::internal_error().data("Scheduler unavailable".to_string())
+    }
+
+    fn is_actor_not_running_error(error_message: &str) -> bool {
+        error_message.contains("actor not running")
+    }
+
+    async fn get_or_start_scheduler(&self) -> Option<crate::scheduler::SchedulerHandle> {
+        if let Some(scheduler) = self.scheduler() {
+            return Some(scheduler);
+        }
+
+        if self.start_scheduler().await {
+            return self.scheduler();
+        }
+
+        None
+    }
+
     /// Gracefully shutdown the agent and all background tasks.
     pub async fn shutdown(&self) {
         log::info!("LocalAgentHandle: Starting graceful shutdown");
+
+        // Shutdown the scheduler first
+        if let Some(scheduler) = self.scheduler() {
+            scheduler.shutdown().await;
+        }
 
         self.config.shutdown().await;
 
@@ -246,6 +331,329 @@ impl LocalAgentHandle {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         log::info!("LocalAgentHandle: Shutdown complete");
+    }
+
+    // ── Schedule management API (Phase 7) ─────────────────────────────────
+
+    /// Create a recurring task and schedule for a session.
+    ///
+    /// Creates the underlying `Task` row first (so FK constraints are satisfied),
+    /// then creates the `Schedule` referencing it and registers it with the scheduler.
+    ///
+    /// Returns the schedule public ID, or an error if the scheduler is not running
+    /// or the session cannot be found.
+    pub async fn create_scheduled_task(
+        &self,
+        session_public_id: &str,
+        prompt: &str,
+        trigger: crate::session::domain_schedule::ScheduleTrigger,
+        max_steps: Option<u32>,
+        max_cost_usd: Option<f64>,
+        max_runs: Option<u32>,
+    ) -> Result<String, agent_client_protocol::Error> {
+        use crate::session::domain::{Task, TaskKind, TaskStatus};
+        use crate::session::domain_schedule::ScheduleExecutionLimits;
+
+        // Look up session to get the internal row ID required by FK constraints.
+        let store = self.config.provider.history_store();
+        let session = store
+            .get_session(session_public_id)
+            .await
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))?
+            .ok_or_else(|| {
+                agent_client_protocol::Error::invalid_params()
+                    .data(format!("Session not found: {session_public_id}"))
+            })?;
+
+        // Create the task row so the schedule FK is satisfied.
+        let now = time::OffsetDateTime::now_utc();
+        let task = Task {
+            id: 0,                    // populated by create_task
+            public_id: String::new(), // generated by create_task
+            session_id: session.id,
+            kind: TaskKind::Recurring,
+            status: TaskStatus::Active,
+            expected_deliverable: Some(prompt.to_string()),
+            acceptance_criteria: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let task = store
+            .create_task(task)
+            .await
+            .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))?;
+
+        // Build the schedule with valid internal IDs.
+        let mut schedule = crate::session::domain_schedule::Schedule::new(
+            task.public_id.clone(),
+            session_public_id.to_string(),
+            trigger,
+        );
+        schedule.task_id = task.id;
+        schedule.session_id = session.id;
+
+        // Apply user-provided limits.
+        if max_runs.is_some() {
+            schedule.config.max_runs = max_runs;
+        }
+        if max_steps.is_some() || max_cost_usd.is_some() {
+            schedule.config.execution_limits = Some(ScheduleExecutionLimits {
+                max_steps,
+                max_cost_usd,
+            });
+        }
+
+        let schedule_public_id = schedule.public_id.clone();
+
+        let scheduler = self
+            .get_or_start_scheduler()
+            .await
+            .ok_or_else(Self::scheduler_unavailable_error)?;
+
+        match scheduler.add_schedule(schedule.clone()).await {
+            Ok(()) => Ok(schedule_public_id),
+            Err(e) => {
+                let msg = e.to_string();
+                if !Self::is_actor_not_running_error(&msg) {
+                    return Err(agent_client_protocol::Error::internal_error().data(msg));
+                }
+
+                self.clear_scheduler_handle();
+                let scheduler = self
+                    .get_or_start_scheduler()
+                    .await
+                    .ok_or_else(Self::scheduler_unavailable_error)?;
+                scheduler.add_schedule(schedule).await.map_err(|err| {
+                    agent_client_protocol::Error::internal_error().data(err.to_string())
+                })?;
+                Ok(schedule_public_id)
+            }
+        }
+    }
+
+    /// Trigger a schedule to fire immediately.
+    pub async fn trigger_schedule_now(
+        &self,
+        schedule_public_id: &str,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let scheduler = self
+            .get_or_start_scheduler()
+            .await
+            .ok_or_else(Self::scheduler_unavailable_error)?;
+
+        match scheduler.trigger_now(schedule_public_id).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if !Self::is_actor_not_running_error(&msg) {
+                    return Err(agent_client_protocol::Error::internal_error().data(msg));
+                }
+
+                self.clear_scheduler_handle();
+                let scheduler = self
+                    .get_or_start_scheduler()
+                    .await
+                    .ok_or_else(Self::scheduler_unavailable_error)?;
+                scheduler
+                    .trigger_now(schedule_public_id)
+                    .await
+                    .map_err(|err| {
+                        agent_client_protocol::Error::internal_error().data(err.to_string())
+                    })
+            }
+        }
+    }
+
+    /// Pause a schedule.
+    pub async fn pause_schedule(
+        &self,
+        schedule_public_id: &str,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let scheduler = self
+            .get_or_start_scheduler()
+            .await
+            .ok_or_else(Self::scheduler_unavailable_error)?;
+
+        match scheduler.pause_schedule(schedule_public_id).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if !Self::is_actor_not_running_error(&msg) {
+                    return Err(agent_client_protocol::Error::internal_error().data(msg));
+                }
+
+                self.clear_scheduler_handle();
+                let scheduler = self
+                    .get_or_start_scheduler()
+                    .await
+                    .ok_or_else(Self::scheduler_unavailable_error)?;
+                scheduler
+                    .pause_schedule(schedule_public_id)
+                    .await
+                    .map_err(|err| {
+                        agent_client_protocol::Error::internal_error().data(err.to_string())
+                    })
+            }
+        }
+    }
+
+    /// Resume a paused schedule.
+    pub async fn resume_schedule(
+        &self,
+        schedule_public_id: &str,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let scheduler = self
+            .get_or_start_scheduler()
+            .await
+            .ok_or_else(Self::scheduler_unavailable_error)?;
+
+        match scheduler.resume_schedule(schedule_public_id).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if !Self::is_actor_not_running_error(&msg) {
+                    return Err(agent_client_protocol::Error::internal_error().data(msg));
+                }
+
+                self.clear_scheduler_handle();
+                let scheduler = self
+                    .get_or_start_scheduler()
+                    .await
+                    .ok_or_else(Self::scheduler_unavailable_error)?;
+                scheduler
+                    .resume_schedule(schedule_public_id)
+                    .await
+                    .map_err(|err| {
+                        agent_client_protocol::Error::internal_error().data(err.to_string())
+                    })
+            }
+        }
+    }
+
+    /// Delete a schedule.
+    pub async fn delete_schedule(
+        &self,
+        schedule_public_id: &str,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let scheduler = self
+            .get_or_start_scheduler()
+            .await
+            .ok_or_else(Self::scheduler_unavailable_error)?;
+
+        match scheduler.remove_schedule(schedule_public_id).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if !Self::is_actor_not_running_error(&msg) {
+                    return Err(agent_client_protocol::Error::internal_error().data(msg));
+                }
+
+                self.clear_scheduler_handle();
+                let scheduler = self
+                    .get_or_start_scheduler()
+                    .await
+                    .ok_or_else(Self::scheduler_unavailable_error)?;
+                scheduler
+                    .remove_schedule(schedule_public_id)
+                    .await
+                    .map_err(|err| {
+                        agent_client_protocol::Error::internal_error().data(err.to_string())
+                    })
+            }
+        }
+    }
+
+    /// List schedules, optionally filtered by session.
+    ///
+    /// Returns an empty list if the scheduler is not running (rather than an
+    /// error), since the frontend polls this on every session load and an
+    /// absent scheduler simply means no schedules exist yet.
+    pub async fn list_schedules(
+        &self,
+        session_public_id: Option<&str>,
+    ) -> Result<Vec<crate::session::domain_schedule::Schedule>, agent_client_protocol::Error> {
+        let scheduler = match self.get_or_start_scheduler().await {
+            Some(s) => s,
+            None => return Ok(vec![]),
+        };
+
+        match scheduler.list_schedules(session_public_id).await {
+            Ok(schedules) => Ok(schedules),
+            Err(e) => {
+                let msg = e.to_string();
+                if !Self::is_actor_not_running_error(&msg) {
+                    return Err(agent_client_protocol::Error::internal_error().data(msg));
+                }
+
+                self.clear_scheduler_handle();
+                let scheduler = match self.get_or_start_scheduler().await {
+                    Some(s) => s,
+                    None => return Ok(vec![]),
+                };
+                scheduler
+                    .list_schedules(session_public_id)
+                    .await
+                    .or_else(|retry_err| {
+                        if Self::is_actor_not_running_error(&retry_err.to_string()) {
+                            Ok(vec![])
+                        } else {
+                            Err(retry_err)
+                        }
+                    })
+                    .map_err(|retry_err| {
+                        agent_client_protocol::Error::internal_error().data(retry_err.to_string())
+                    })
+            }
+        }
+    }
+
+    /// Get a single schedule by public ID.
+    ///
+    /// Returns `None` if the scheduler is not running or the schedule does not exist.
+    pub async fn get_schedule(
+        &self,
+        schedule_public_id: &str,
+    ) -> Result<Option<crate::session::domain_schedule::Schedule>, agent_client_protocol::Error>
+    {
+        let scheduler = match self.get_or_start_scheduler().await {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        match scheduler.get_schedule(schedule_public_id).await {
+            Ok(schedule) => Ok(schedule),
+            Err(e) => {
+                let msg = e.to_string();
+                if !Self::is_actor_not_running_error(&msg) {
+                    return Err(agent_client_protocol::Error::internal_error().data(msg));
+                }
+
+                self.clear_scheduler_handle();
+                let scheduler = match self.get_or_start_scheduler().await {
+                    Some(s) => s,
+                    None => return Ok(None),
+                };
+                scheduler
+                    .get_schedule(schedule_public_id)
+                    .await
+                    .or_else(|retry_err| {
+                        if Self::is_actor_not_running_error(&retry_err.to_string()) {
+                            Ok(None)
+                        } else {
+                            Err(retry_err)
+                        }
+                    })
+                    .map_err(|retry_err| {
+                        agent_client_protocol::Error::internal_error().data(retry_err.to_string())
+                    })
+            }
+        }
+    }
+
+    /// Get scheduler metrics snapshot.
+    pub async fn scheduler_metrics(&self) -> Option<crate::scheduler::SchedulerMetrics> {
+        let scheduler = self.scheduler()?;
+        Some(scheduler.metrics().await)
     }
 
     /// Switch provider and model for a session (simple form)
@@ -1464,16 +1872,19 @@ mod tests {
                     .expect("create event store"),
             );
 
-            let config = Arc::new(
-                AgentConfigBuilder::new(
-                    Arc::new(plugin_registry),
-                    store.clone(),
-                    storage.event_journal(),
-                    LLMParams::new().provider("mock").model("mock-model"),
-                )
-                .with_tool_policy(ToolPolicy::ProviderOnly)
-                .build(),
-            );
+            let mut builder = AgentConfigBuilder::new(
+                Arc::new(plugin_registry),
+                store.clone(),
+                storage.event_journal(),
+                LLMParams::new().provider("mock").model("mock-model"),
+            )
+            .with_tool_policy(ToolPolicy::ProviderOnly);
+
+            if let Some(repo) = storage.schedule_repository() {
+                builder = builder.with_schedule_repository(repo);
+            }
+
+            let config = Arc::new(builder.build());
 
             Self {
                 handle: LocalAgentHandle::from_config(config),
@@ -1625,6 +2036,51 @@ mod tests {
         let registry = f.handle.agent_registry();
         // DefaultAgentRegistry starts empty
         assert!(registry.list_agents().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_schedules_returns_empty_when_scheduler_actor_stops() {
+        let f = HandleFixture::new().await;
+        assert!(f.handle.start_scheduler().await);
+
+        if let Some(scheduler) = f.handle.scheduler() {
+            scheduler.shutdown().await;
+        }
+
+        let schedules = f.handle.list_schedules(None).await.expect("list_schedules");
+        assert!(schedules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_schedule_returns_none_when_scheduler_actor_stops() {
+        let f = HandleFixture::new().await;
+        assert!(f.handle.start_scheduler().await);
+
+        if let Some(scheduler) = f.handle.scheduler() {
+            scheduler.shutdown().await;
+        }
+
+        let schedule = f
+            .handle
+            .get_schedule("missing-schedule")
+            .await
+            .expect("get_schedule");
+        assert!(schedule.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_trigger_schedule_now_recovers_from_stopped_scheduler_actor() {
+        let f = HandleFixture::new().await;
+        assert!(f.handle.start_scheduler().await);
+
+        if let Some(scheduler) = f.handle.scheduler() {
+            scheduler.shutdown().await;
+        }
+
+        // Triggering a missing schedule should still succeed at the transport level
+        // once the scheduler is recovered.
+        let result = f.handle.trigger_schedule_now("missing-schedule").await;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test]

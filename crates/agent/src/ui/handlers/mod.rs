@@ -8,10 +8,12 @@
 //! - [`session_ops`] — session list/load/cancel/subscribe/undo/redo/elicitation/mode
 //! - [`remote`]      — remote node and session management
 
+mod knowledge;
 mod models;
 mod oauth;
 mod plugins;
 mod remote;
+mod schedules;
 mod session_ops;
 
 // ── Re-exports consumed by sibling modules ────────────────────────────────────
@@ -30,6 +32,12 @@ pub use remote::handle_attach_remote_session;
 pub use remote::handle_create_remote_session;
 pub use remote::handle_list_remote_nodes;
 pub use remote::handle_list_remote_sessions;
+pub use schedules::handle_create_schedule;
+pub use schedules::handle_delete_schedule;
+pub use schedules::handle_list_schedules;
+pub use schedules::handle_pause_schedule;
+pub use schedules::handle_resume_schedule;
+pub use schedules::handle_trigger_schedule;
 pub use session_ops::handle_cancel_session;
 pub use session_ops::handle_delete_session;
 pub use session_ops::handle_elicitation_response;
@@ -301,6 +309,52 @@ pub async fn handle_ui_message(
         }
         UiClientMessage::UpdatePlugins => {
             handle_update_plugins(state, tx).await;
+        }
+        UiClientMessage::CreateSchedule {
+            session_id,
+            prompt,
+            trigger,
+            max_steps,
+            max_cost_usd,
+            max_runs,
+        } => {
+            let params = schedules::CreateScheduleParams {
+                session_id: &session_id,
+                prompt: &prompt,
+                trigger_json: &trigger,
+                max_steps,
+                max_cost_usd,
+                max_runs,
+            };
+            handle_create_schedule(state, &params, tx).await;
+        }
+        UiClientMessage::ListSchedules { session_id } => {
+            handle_list_schedules(state, session_id.as_deref(), tx).await;
+        }
+        UiClientMessage::PauseSchedule { schedule_public_id } => {
+            handle_pause_schedule(state, &schedule_public_id, tx).await;
+        }
+        UiClientMessage::ResumeSchedule { schedule_public_id } => {
+            handle_resume_schedule(state, &schedule_public_id, tx).await;
+        }
+        UiClientMessage::TriggerSchedule { schedule_public_id } => {
+            handle_trigger_schedule(state, &schedule_public_id, tx).await;
+        }
+        UiClientMessage::DeleteSchedule { schedule_public_id } => {
+            handle_delete_schedule(state, &schedule_public_id, tx).await;
+        }
+        UiClientMessage::QueryKnowledge {
+            scope,
+            question,
+            limit,
+        } => {
+            knowledge::handle_query_knowledge(state, &scope, &question, limit, tx).await;
+        }
+        UiClientMessage::ListKnowledge { scope, filter } => {
+            knowledge::handle_list_knowledge(state, &scope, filter.as_ref(), tx).await;
+        }
+        UiClientMessage::KnowledgeStats { scope } => {
+            knowledge::handle_knowledge_stats(state, &scope, tx).await;
         }
     }
 }

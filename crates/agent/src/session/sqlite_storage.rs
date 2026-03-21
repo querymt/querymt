@@ -71,6 +71,13 @@ pub struct SqliteStorage {
 }
 
 impl SqliteStorage {
+    /// Expose the raw connection for sharing with other SQLite-backed components
+    /// (e.g. `SqliteScheduleRepository`, `SqliteKnowledgeStore`) that operate
+    /// on the same database.
+    pub fn conn(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
+    }
+
     /// Expose the raw connection for test assertions (e.g. querying legacy tables).
     #[cfg(test)]
     pub fn conn_for_test(&self) -> Arc<Mutex<Connection>> {
@@ -1627,6 +1634,17 @@ impl ViewStore for SqliteStorage {
 
         let total_count = sessions.len();
 
+        // Derive recurring sessions from task data so recurring task sessions are
+        // visible in the normal session list without extra plumbing.
+        let recurring_session_ids: HashSet<i64> = self
+            .run_blocking(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT DISTINCT session_id FROM tasks WHERE kind = 'recurring'")?;
+                let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+                rows.collect::<Result<HashSet<_>, _>>()
+            })
+            .await?;
+
         // Build a map of internal ID -> public ID for parent resolution
         let mut id_to_public_id: HashMap<i64, String> = HashMap::new();
         for session in &sessions {
@@ -1672,6 +1690,13 @@ impl ViewStore for SqliteStorage {
             // Check if this session has children
             let has_children = sessions_with_children.contains(&session.public_id);
 
+            // Mark session kind for recurring task workflows.
+            let session_kind = if recurring_session_ids.contains(&session.id) {
+                Some("recurring".to_string())
+            } else {
+                session.session_kind.clone()
+            };
+
             // Convert fork_origin to string
             let fork_origin = session.fork_origin.map(|fo| fo.to_string());
 
@@ -1684,6 +1709,7 @@ impl ViewStore for SqliteStorage {
                 updated_at: session.updated_at,
                 parent_session_id,
                 fork_origin,
+                session_kind,
                 has_children,
             });
         }
@@ -2220,6 +2246,14 @@ const MIGRATIONS: &[Migration] = &[
         version: "0002_drop_legacy_events",
         apply: migration_0002_drop_legacy_events,
     },
+    Migration {
+        version: "0003_add_session_kind",
+        apply: migration_0003_add_session_kind,
+    },
+    Migration {
+        version: "0004_add_scheduler_and_knowledge_tables",
+        apply: migration_0004_add_scheduler_and_knowledge_tables,
+    },
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -2299,6 +2333,121 @@ fn migration_0002_drop_legacy_events(conn: &mut Connection) -> Result<(), rusqli
     Ok(())
 }
 
+fn migration_0003_add_session_kind(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    // Add optional session kind metadata (e.g. "recurring") for UI labeling.
+    let has_session_kind = {
+        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|name| name == "session_kind")
+    };
+
+    if !has_session_kind {
+        conn.execute("ALTER TABLE sessions ADD COLUMN session_kind TEXT", [])?;
+    }
+
+    Ok(())
+}
+
+fn migration_0004_add_scheduler_and_knowledge_tables(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    // Add tables introduced after the 0001 baseline that existing databases may
+    // be missing. All statements use IF NOT EXISTS / IF NOT EXISTS so this is
+    // safe to run against fresh installs where init_schema already created them.
+    conn.execute_batch(
+        r#"
+            CREATE TABLE IF NOT EXISTS schedules (
+                id INTEGER PRIMARY KEY,
+                public_id TEXT UNIQUE NOT NULL,
+                task_id INTEGER NOT NULL,
+                task_public_id TEXT NOT NULL,
+                session_id INTEGER NOT NULL,
+                session_public_id TEXT NOT NULL,
+                trigger_json TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'armed',
+                last_run_at TEXT,
+                next_run_at TEXT,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                config_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_schedules_state_next_run
+                ON schedules(state, next_run_at) WHERE state = 'armed';
+            CREATE INDEX IF NOT EXISTS idx_schedules_running_last_run
+                ON schedules(last_run_at) WHERE state = 'running';
+            CREATE INDEX IF NOT EXISTS idx_schedules_terminal_updated
+                ON schedules(state, updated_at) WHERE state IN ('failed', 'exhausted');
+            CREATE INDEX IF NOT EXISTS idx_schedules_session_public
+                ON schedules(session_public_id);
+            CREATE INDEX IF NOT EXISTS idx_schedules_task_public
+                ON schedules(task_public_id);
+
+            CREATE TABLE IF NOT EXISTS scheduler_lease (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                owner_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge_entries (
+                id INTEGER PRIMARY KEY,
+                public_id TEXT UNIQUE NOT NULL,
+                scope TEXT NOT NULL,
+                source TEXT NOT NULL,
+                raw_text TEXT,
+                summary TEXT NOT NULL,
+                entities_json TEXT NOT NULL DEFAULT '[]',
+                topics_json TEXT NOT NULL DEFAULT '[]',
+                connections_json TEXT NOT NULL DEFAULT '[]',
+                importance REAL NOT NULL DEFAULT 0.5,
+                consolidated_at TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_knowledge_entries_scope
+                ON knowledge_entries(scope);
+            CREATE INDEX IF NOT EXISTS idx_knowledge_entries_unconsolidated
+                ON knowledge_entries(scope, consolidated_at)
+                WHERE consolidated_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_knowledge_entries_created
+                ON knowledge_entries(scope, created_at);
+
+            CREATE TABLE IF NOT EXISTS knowledge_consolidations (
+                id INTEGER PRIMARY KEY,
+                public_id TEXT UNIQUE NOT NULL,
+                scope TEXT NOT NULL,
+                source_entry_public_ids_json TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                insight TEXT NOT NULL,
+                connections_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_knowledge_consolidations_scope
+                ON knowledge_consolidations(scope);
+            CREATE INDEX IF NOT EXISTS idx_knowledge_consolidations_created
+                ON knowledge_consolidations(scope, created_at);
+
+            CREATE TABLE IF NOT EXISTS knowledge_ingestion_log (
+                id INTEGER PRIMARY KEY,
+                scope TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                processed_at TEXT NOT NULL,
+                UNIQUE(scope, source_key)
+            );
+        "#,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2344,6 +2493,23 @@ mod tests {
             )
             .expect("check event_journal table");
         assert_eq!(journal_table_count, 1, "event_journal table should exist");
+    }
+
+    #[test]
+    fn migration_0003_adds_session_kind_column() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        apply_migrations(&mut conn).expect("apply migrations");
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .expect("table info query");
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("load column names")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect columns");
+
+        assert!(columns.into_iter().any(|name| name == "session_kind"));
     }
 
     #[test]

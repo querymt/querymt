@@ -6,6 +6,11 @@ pub mod delete_file;
 pub mod edit;
 pub mod glob;
 pub mod helpers;
+pub mod knowledge_consolidate;
+pub mod knowledge_ingest;
+pub mod knowledge_list;
+pub mod knowledge_query;
+pub mod knowledge_stats;
 pub mod language_query;
 pub mod ls;
 pub mod mdq;
@@ -35,6 +40,11 @@ pub use delegate::DelegateTool;
 pub use delete_file::DeleteFileTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
+pub use knowledge_consolidate::KnowledgeConsolidateTool;
+pub use knowledge_ingest::KnowledgeIngestTool;
+pub use knowledge_list::KnowledgeListTool;
+pub use knowledge_query::KnowledgeQueryTool;
+pub use knowledge_stats::KnowledgeStatsTool;
 pub use language_query::LanguageQueryTool;
 pub use ls::ListTool;
 pub use mdq::MdqTool;
@@ -66,6 +76,11 @@ pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(EditTool::new()),
         Arc::new(GlobTool::new()),
         Arc::new(LanguageQueryTool::new()),
+        Arc::new(KnowledgeConsolidateTool::new()),
+        Arc::new(KnowledgeIngestTool::new()),
+        Arc::new(KnowledgeListTool::new()),
+        Arc::new(KnowledgeQueryTool::new()),
+        Arc::new(KnowledgeStatsTool::new()),
         Arc::new(ListTool::new()),
         Arc::new(MdqTool::new()),
         Arc::new(MultiEditTool::new()),

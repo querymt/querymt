@@ -9,6 +9,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::elicitation::{ElicitationAction, ElicitationResponse};
+use crate::event_sink::EventSink;
+use crate::knowledge::{KnowledgeStore, ScopePolicy};
 use crate::tools::context::{ToolContext, ToolError};
 
 /// A request to elicit information from the user, sent from tool context to the agent
@@ -28,6 +30,9 @@ pub struct AgentToolContext {
     elicitation_tx: Option<mpsc::Sender<ElicitationRequest>>,
     cancellation_token: CancellationToken,
     workspace_query_bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
+    knowledge_store: Option<Arc<dyn KnowledgeStore>>,
+    scope_policy: Arc<dyn ScopePolicy>,
+    event_sink: Option<Arc<EventSink>>,
 }
 
 impl AgentToolContext {
@@ -44,6 +49,9 @@ impl AgentToolContext {
             elicitation_tx,
             cancellation_token: CancellationToken::new(),
             workspace_query_bridge: None,
+            knowledge_store: None,
+            scope_policy: Arc::new(crate::knowledge::PermissiveScopePolicy),
+            event_sink: None,
         }
     }
 
@@ -65,6 +73,21 @@ impl AgentToolContext {
         self
     }
 
+    /// Attach a knowledge store to this context.
+    pub fn with_knowledge_store(&mut self, knowledge_store: Arc<dyn KnowledgeStore>) {
+        self.knowledge_store = Some(knowledge_store);
+    }
+
+    /// Set the scope policy for knowledge tools.
+    pub fn with_scope_policy(&mut self, policy: Arc<dyn ScopePolicy>) {
+        self.scope_policy = policy;
+    }
+
+    /// Attach an event sink so tools can emit agent events.
+    pub fn with_event_sink(&mut self, sink: Arc<EventSink>) {
+        self.event_sink = Some(sink);
+    }
+
     /// Create a basic context for testing or simple operations
     pub fn basic(session_id: String, cwd: Option<PathBuf>) -> Self {
         Self::new(session_id, cwd, None, None)
@@ -83,6 +106,41 @@ impl ToolContext for AgentToolContext {
 
     fn agent_registry(&self) -> Option<Arc<dyn crate::delegation::AgentRegistry>> {
         self.agent_registry.clone()
+    }
+
+    fn session_public_id(&self) -> Option<String> {
+        Some(self.session_id.clone())
+    }
+
+    fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
+        self.knowledge_store.clone()
+    }
+
+    fn scope_policy(&self) -> Arc<dyn ScopePolicy> {
+        self.scope_policy.clone()
+    }
+
+    fn emit_event(&self, kind: crate::events::AgentEventKind) {
+        if let Some(ref sink) = self.event_sink {
+            use crate::events::{Durability, classify_durability};
+
+            let session_id = self.session_id.clone();
+
+            if classify_durability(&kind) == Durability::Ephemeral {
+                sink.emit_ephemeral(&session_id, kind);
+            } else {
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = sink.emit_durable(&session_id, kind).await {
+                        log::warn!(
+                            "failed to emit durable event for session {}: {}",
+                            session_id,
+                            err
+                        );
+                    }
+                });
+            }
+        }
     }
 
     async fn record_progress(
