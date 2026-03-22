@@ -197,7 +197,29 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     ],
                 )
                 .map_err(KnowledgeError::from)?;
-                Ok(conn.last_insert_rowid())
+                let row_id = conn.last_insert_rowid();
+
+                // Populate junction tables with normalized forms for indexed matching
+                for entity in &entry.entities {
+                    let normalized = crate::knowledge::text_processing::normalize_term(entity);
+                    conn.execute(
+                        "INSERT INTO knowledge_entry_entities (entry_id, entity, entity_normalized) \
+                         VALUES (?, ?, ?)",
+                        params![row_id, entity, normalized],
+                    )
+                    .map_err(KnowledgeError::from)?;
+                }
+                for topic in &entry.topics {
+                    let normalized = crate::knowledge::text_processing::normalize_term(topic);
+                    conn.execute(
+                        "INSERT INTO knowledge_entry_topics (entry_id, topic, topic_normalized) \
+                         VALUES (?, ?, ?)",
+                        params![row_id, topic, normalized],
+                    )
+                    .map_err(KnowledgeError::from)?;
+                }
+
+                Ok(row_id)
             })
             .await?;
 
@@ -266,16 +288,20 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 None => {}
             }
 
-            // Topic/entity filtering uses JSON LIKE matching
+            // Topic/entity filtering uses normalized junction tables.
+            // Filter values are normalized (lowercased + stemmed) to match
+            // the stored normalized forms, enabling index-backed exact matching.
             if let Some(ref topics) = filter.topics {
                 let topic_conditions: Vec<String> = topics
                     .iter()
                     .map(|t| {
-                        let cond = format!("topics_json LIKE ?{}", param_idx);
-                        bindings.push((
-                            param_idx,
-                            Value::Text(format!("%\"{}\"%", t.replace('"', ""))),
-                        ));
+                        let normalized = crate::knowledge::text_processing::normalize_term(t);
+                        let cond = format!(
+                            "EXISTS (SELECT 1 FROM knowledge_entry_topics \
+                             WHERE entry_id = knowledge_entries.id AND topic_normalized = ?{})",
+                            param_idx
+                        );
+                        bindings.push((param_idx, Value::Text(normalized)));
                         param_idx += 1;
                         cond
                     })
@@ -289,11 +315,13 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 let entity_conditions: Vec<String> = entities
                     .iter()
                     .map(|e| {
-                        let cond = format!("entities_json LIKE ?{}", param_idx);
-                        bindings.push((
-                            param_idx,
-                            Value::Text(format!("%\"{}\"%", e.replace('"', ""))),
-                        ));
+                        let normalized = crate::knowledge::text_processing::normalize_term(e);
+                        let cond = format!(
+                            "EXISTS (SELECT 1 FROM knowledge_entry_entities \
+                             WHERE entry_id = knowledge_entries.id AND entity_normalized = ?{})",
+                            param_idx
+                        );
+                        bindings.push((param_idx, Value::Text(normalized)));
                         param_idx += 1;
                         cond
                     })
@@ -407,11 +435,13 @@ impl KnowledgeStore for SqliteKnowledgeStore {
         let question = question.to_string();
 
         self.run_blocking(move |conn| {
-            // Build FTS5 query and extract keywords for hybrid entity/topic boosts
-            let fts_query = build_fts5_query(&question);
-            let keywords = extract_keywords(&question);
+            // Extract keywords with multilingual stopword filtering and stemming.
+            // Raw keywords go to FTS5 (which applies its own Porter stemming).
+            // Stemmed keywords go to LIKE-based entity/topic matching for consistency.
+            let (keywords, stemmed_keywords) = extract_keywords(&question);
+            let fts_query = build_fts5_query(&keywords);
 
-            let entries = query_entries(conn, &scope, fts_query.as_deref(), &keywords, &opts)?;
+            let entries = query_entries(conn, &scope, fts_query.as_deref(), &stemmed_keywords, &opts)?;
             let consolidations = if opts.include_consolidations {
                 query_consolidations(conn, &scope, fts_query.as_deref(), opts.limit)?
             } else {
@@ -620,30 +650,15 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 // ─── Query Helpers ───────────────────────────────────────────────────────────
 
 /// Extract keywords from a question string for keyword-based search.
-/// Strips common stop words and returns lowercase tokens.
 ///
-/// Used for LIKE-based entity/topic matching in hybrid mode and as input
-/// to `build_fts5_query` for full-text search.
-fn extract_keywords(question: &str) -> Vec<String> {
-    const STOP_WORDS: &[&str] = &[
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
-        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
-        "need", "dare", "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
-        "as", "into", "through", "during", "before", "after", "above", "below", "between", "out",
-        "off", "over", "under", "again", "further", "then", "once", "here", "there", "when",
-        "where", "why", "how", "all", "both", "each", "few", "more", "most", "other", "some",
-        "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "just",
-        "don", "now", "and", "but", "or", "if", "it", "its", "i", "me", "my", "we", "our", "you",
-        "your", "he", "she", "they", "them", "his", "her", "what", "which", "who", "whom", "this",
-        "that", "these", "those", "am", "about", "up",
-    ];
-
-    question
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-        .filter(|w| w.len() >= 2 && !STOP_WORDS.contains(w))
-        .map(String::from)
-        .collect()
+/// Uses the `text_processing` module for multilingual stopword filtering.
+/// Returns `(keywords, stemmed_keywords)` — raw keywords for FTS5 (which
+/// does its own Porter stemming) and stemmed keywords for LIKE-based
+/// entity/topic matching where we need consistent normalization.
+fn extract_keywords(question: &str) -> (Vec<String>, Vec<String>) {
+    let (keywords, lang) = crate::knowledge::text_processing::extract_keywords(question);
+    let stemmed = crate::knowledge::text_processing::stem_keywords(&keywords, &lang);
+    (keywords, stemmed)
 }
 
 /// Build a safe FTS5 query string from extracted keywords.
@@ -655,8 +670,19 @@ fn extract_keywords(question: &str) -> Vec<String> {
 /// automatically by FTS5.
 ///
 /// Returns `None` if no valid keywords remain after stop-word filtering.
-fn build_fts5_query(question: &str) -> Option<String> {
-    let keywords = extract_keywords(question);
+/// Build a safe FTS5 query string from pre-extracted keywords.
+///
+/// Produces an OR-joined query of quoted tokens, e.g. `"rust" OR "memory"`.
+/// Each token is double-quote-escaped to prevent FTS5 syntax injection
+/// (e.g. a user typing `NOT` or `NEAR` in a question). Tokens with the
+/// porter stemmer applied at index time will be matched via stemmed forms
+/// automatically by FTS5.
+///
+/// Takes raw (unstemmed) keywords since FTS5 applies Porter stemming
+/// internally at both index and query time.
+///
+/// Returns `None` if no keywords are provided.
+fn build_fts5_query(keywords: &[String]) -> Option<String> {
     if keywords.is_empty() {
         return None;
     }
@@ -677,7 +703,9 @@ fn build_fts5_query(question: &str) -> Option<String> {
 /// ranking. The bm25 weights are: summary=10.0, raw_text=1.0, source=0.5.
 ///
 /// In `Hybrid` mode, the BM25 score is combined with structured boosts
-/// from entity/topic LIKE matches and the importance field.
+/// from entity/topic LIKE matches and the importance field. The `keywords`
+/// parameter should contain **stemmed** keywords for consistent matching
+/// against stored entity/topic values.
 fn query_entries(
     conn: &Connection,
     scope: &str,
@@ -718,10 +746,13 @@ fn query_entries(
     // only via entities/topics (not in summary/raw_text/source) are still
     // discovered and ranked.
     if opts.retrieval_mode == RetrievalMode::Hybrid {
-        // Build LIKE conditions for entity/topic candidate selection + boosting.
+        // Build junction-table conditions for entity/topic candidate selection + boosting.
+        // Uses normalized (stemmed) keywords matched against the indexed
+        // `entity_normalized` / `topic_normalized` columns for exact matching.
+        //
         // The FTS query param is ?1, scope is ?2.
-        let mut like_conditions = Vec::new();
-        let mut like_boosts = Vec::new();
+        let mut junction_conditions = Vec::new();
+        let mut junction_boosts = Vec::new();
         let mut bindings: Vec<(usize, Value)> = vec![
             (1, Value::Text(fts_query.to_string())),
             (2, Value::Text(scope.to_string())),
@@ -729,30 +760,30 @@ fn query_entries(
         let mut param_idx = 3usize;
 
         for keyword in keywords {
-            let pattern = format!("%{}%", keyword);
             let kw_idx = param_idx;
-            bindings.push((kw_idx, Value::Text(pattern)));
+            bindings.push((kw_idx, Value::Text(keyword.clone())));
             param_idx += 1;
 
-            like_conditions.push(format!(
-                "entities_json LIKE ?{kw_idx} OR topics_json LIKE ?{kw_idx}"
+            junction_conditions.push(format!(
+                "EXISTS (SELECT 1 FROM knowledge_entry_entities WHERE entry_id = knowledge_entries.id AND entity_normalized = ?{kw_idx}) OR \
+                 EXISTS (SELECT 1 FROM knowledge_entry_topics WHERE entry_id = knowledge_entries.id AND topic_normalized = ?{kw_idx})"
             ));
-            like_boosts.push(format!(
-                "CASE WHEN entities_json LIKE ?{kw_idx} THEN 2.0 ELSE 0.0 END + \
-                 CASE WHEN topics_json LIKE ?{kw_idx} THEN 2.0 ELSE 0.0 END"
+            junction_boosts.push(format!(
+                "CASE WHEN EXISTS (SELECT 1 FROM knowledge_entry_entities kee WHERE kee.entry_id = e.id AND kee.entity_normalized = ?{kw_idx}) THEN 2.0 ELSE 0.0 END + \
+                 CASE WHEN EXISTS (SELECT 1 FROM knowledge_entry_topics ket WHERE ket.entry_id = e.id AND ket.topic_normalized = ?{kw_idx}) THEN 2.0 ELSE 0.0 END"
             ));
         }
 
-        let like_where = if like_conditions.is_empty() {
+        let junction_where = if junction_conditions.is_empty() {
             "0".to_string() // never true — no entity/topic candidates
         } else {
-            format!("({})", like_conditions.join(" OR "))
+            format!("({})", junction_conditions.join(" OR "))
         };
 
-        let boost_expr = if like_boosts.is_empty() {
+        let boost_expr = if junction_boosts.is_empty() {
             "0.0".to_string()
         } else {
-            like_boosts.join(" + ")
+            junction_boosts.join(" + ")
         };
 
         let limit_idx = param_idx;
@@ -760,7 +791,7 @@ fn query_entries(
 
         // UNION strategy:
         // 1. FTS candidates: entries matching the text query (have BM25 score)
-        // 2. Entity/topic candidates: entries matching via structured metadata
+        // 2. Entity/topic candidates: entries matching via junction tables
         //    (assigned BM25 score of 0.0 since they didn't match text)
         //
         // Both sets are scored with: bm25_score + entity/topic boosts + importance
@@ -774,12 +805,14 @@ fn query_entries(
                 WHERE knowledge_entries_fts MATCH ?1 AND e.scope = ?2 \
               UNION \
                 SELECT {ENTRY_COLS}, \
-                    (0.0 + ({boost_expr}) + (importance * 5.0)) AS _rank \
+                    (0.0 + ({boost_expr_unaliased}) + (importance * 5.0)) AS _rank \
                 FROM knowledge_entries \
-                WHERE scope = ?2 AND {like_where} \
+                WHERE scope = ?2 AND {junction_where} \
              ) \
              ORDER BY _rank DESC, created_at DESC, id DESC \
-             LIMIT ?{limit_idx}"
+             LIMIT ?{limit_idx}",
+            boost_expr = boost_expr,
+            boost_expr_unaliased = boost_expr.replace("e.id", "knowledge_entries.id"),
         );
 
         let mut stmt = conn.prepare(&sql).map_err(KnowledgeError::from)?;
@@ -1418,26 +1451,37 @@ mod tests {
 
     #[test]
     fn extract_keywords_filters_stop_words() {
-        let kw = extract_keywords("what are the patterns I have been working on?");
+        let (kw, _stemmed) = extract_keywords("what are the patterns and refactoring tasks?");
         assert!(kw.contains(&"patterns".to_string()));
-        assert!(kw.contains(&"working".to_string()));
+        assert!(kw.contains(&"refactoring".to_string()));
+        assert!(kw.contains(&"tasks".to_string()));
         assert!(!kw.contains(&"the".to_string()));
         assert!(!kw.contains(&"are".to_string()));
-        assert!(!kw.contains(&"i".to_string()));
+        assert!(!kw.contains(&"what".to_string()));
     }
 
     #[test]
     fn extract_keywords_returns_empty_for_only_stop_words() {
-        let kw = extract_keywords("is it a the");
+        let (kw, _stemmed) = extract_keywords("is it a the");
         assert!(kw.is_empty());
     }
 
     #[test]
     fn extract_keywords_handles_punctuation() {
-        let kw = extract_keywords("rust's memory-safe, concurrent!");
+        let (kw, _stemmed) = extract_keywords("rust's memory-safe, concurrent!");
         assert!(kw.contains(&"rust".to_string()));
         assert!(kw.contains(&"memory-safe".to_string()));
         assert!(kw.contains(&"concurrent".to_string()));
+    }
+
+    #[test]
+    fn extract_keywords_returns_stemmed_forms() {
+        let (kw, stemmed) = extract_keywords("the configurations are running smoothly today");
+        assert!(kw.contains(&"configurations".to_string()));
+        assert!(kw.contains(&"running".to_string()));
+        // Stemmed forms should reduce to root
+        assert!(stemmed.contains(&"configur".to_string()));
+        assert!(stemmed.contains(&"run".to_string()));
     }
 
     // ── Citation contract ───────────────────────────────────────────────

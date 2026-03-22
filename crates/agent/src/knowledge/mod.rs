@@ -16,6 +16,7 @@
 //! implementation — no embedded AI logic.
 
 pub mod sqlite;
+pub mod text_processing;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

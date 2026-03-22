@@ -78,6 +78,11 @@ tokio-util = { version = "0.7", features = ["compat"] }
 base64.workspace = true
 infer = "0.19"
 rayon = "1.11"
+
+# NLP: multilingual stopwords, stemming, language detection
+stop-words = "0.10"
+rust-stemmers = "1.2"
+whatlang = "0.18"
 indexmap = { version = "2", features = ["serde"] }
 gray_matter = "0.3"
 fast_html2md = { package = "fast_html2md", version = "0.0.58", features = ["scraper"] }

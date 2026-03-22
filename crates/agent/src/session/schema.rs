@@ -365,6 +365,29 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_knowledge_consolidations_created
             ON knowledge_consolidations(scope, created_at);
 
+        -- Junction tables for normalized entity/topic matching.
+        -- Stores both original and normalized (lowercased + stemmed) forms
+        -- so queries can match via indexed exact lookups instead of LIKE scans.
+        CREATE TABLE IF NOT EXISTS knowledge_entry_entities (
+            entry_id INTEGER NOT NULL REFERENCES knowledge_entries(id) ON DELETE CASCADE,
+            entity TEXT NOT NULL,
+            entity_normalized TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_kee_entry
+            ON knowledge_entry_entities(entry_id);
+        CREATE INDEX IF NOT EXISTS idx_kee_normalized
+            ON knowledge_entry_entities(entity_normalized);
+
+        CREATE TABLE IF NOT EXISTS knowledge_entry_topics (
+            entry_id INTEGER NOT NULL REFERENCES knowledge_entries(id) ON DELETE CASCADE,
+            topic TEXT NOT NULL,
+            topic_normalized TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ket_entry
+            ON knowledge_entry_topics(entry_id);
+        CREATE INDEX IF NOT EXISTS idx_ket_normalized
+            ON knowledge_entry_topics(topic_normalized);
+
         CREATE TABLE IF NOT EXISTS knowledge_ingestion_log (
             id INTEGER PRIMARY KEY,
             scope TEXT NOT NULL,

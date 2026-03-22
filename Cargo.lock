@@ -986,7 +986,7 @@ dependencies = [
  "deunicode",
  "fxhash",
  "rust-stemmers",
- "stop-words",
+ "stop-words 0.9.0",
  "unicode-segmentation",
 ]
 
@@ -10078,6 +10078,7 @@ dependencies = [
  "rmcp",
  "rusqlite",
  "rust-embed",
+ "rust-stemmers",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -10086,6 +10087,7 @@ dependencies = [
  "similarity-py",
  "similarity-rs",
  "srgn",
+ "stop-words 0.10.0",
  "strsim 0.11.1",
  "syn 2.0.117",
  "tempfile",
@@ -10101,6 +10103,7 @@ dependencies = [
  "tracing-subscriber",
  "typeshare",
  "uuid 1.22.0",
+ "whatlang",
 ]
 
 [[package]]
@@ -12296,6 +12299,15 @@ name = "stop-words"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "645a3d441ccf4bf47f2e4b7681461986681a6eeea9937d4c3bc9febd61d17c71"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "stop-words"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68df56303396bcfb639455b3c166804aeb7994005010aab5e9e8a1277b8871d"
 dependencies = [
  "serde_json",
 ]
@@ -14846,6 +14858,15 @@ name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
+
+[[package]]
+name = "whatlang"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5e8f38b596e2a359b755342473520a99421e43658548c79489ee221b728c107"
+dependencies = [
+ "hashbrown 0.15.5",
+]
 
 [[package]]
 name = "which"
