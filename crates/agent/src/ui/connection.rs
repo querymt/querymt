@@ -164,6 +164,22 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
             .unwrap_or(AgentMode::Build)
     };
 
+    // Try to get reasoning effort from active session actor, fall back to default
+    let reasoning_effort = if let Some(ref session_id) = active_session_id {
+        let session_ref = {
+            let registry = state.agent.registry.lock().await;
+            registry.get(session_id).cloned()
+        };
+
+        if let Some(session_ref) = session_ref {
+            session_ref.get_reasoning_effort().await.ok().flatten()
+        } else {
+            **state.agent.default_reasoning_effort.load()
+        }
+    } else {
+        **state.agent.default_reasoning_effort.load()
+    };
+
     let _ = send_message(
         tx,
         UiServerMessage::State {
@@ -174,6 +190,7 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
             agents,
             sessions_by_agent,
             agent_mode: agent_mode.as_str().to_string(),
+            reasoning_effort: reasoning_effort.map(|e| e.to_string()),
         },
     )
     .await;

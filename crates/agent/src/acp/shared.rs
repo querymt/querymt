@@ -297,7 +297,13 @@ pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<EventFanout>> 
     sources
 }
 
-fn session_config_options(mode: AgentMode) -> Vec<SessionConfigOption> {
+fn session_config_options(
+    mode: AgentMode,
+    reasoning_effort: Option<querymt::chat::ReasoningEffort>,
+) -> Vec<SessionConfigOption> {
+    let effort_value = reasoning_effort
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "auto".to_string());
     vec![
         SessionConfigOption::select(
             "mode",
@@ -314,6 +320,23 @@ fn session_config_options(mode: AgentMode) -> Vec<SessionConfigOption> {
         )
         .description("Controls how the agent operates for this session")
         .category(SessionConfigOptionCategory::Mode),
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning Effort",
+            effort_value,
+            vec![
+                SessionConfigSelectOption::new("auto", "Auto")
+                    .description("Use model-specific defaults"),
+                SessionConfigSelectOption::new("low", "Low")
+                    .description("Minimal thinking, fastest responses"),
+                SessionConfigSelectOption::new("medium", "Medium").description("Balanced thinking"),
+                SessionConfigSelectOption::new("high", "High").description("Thorough thinking"),
+                SessionConfigSelectOption::new("max", "Max")
+                    .description("Deepest thinking, highest budget"),
+            ],
+        )
+        .description("Controls reasoning depth for this session")
+        .category(SessionConfigOptionCategory::ThoughtLevel),
     ]
 }
 
@@ -353,35 +376,127 @@ async fn handle_set_session_mode<S: SendAgent>(
     Ok(serde_json::to_value(SetSessionModeResponse::new()).unwrap())
 }
 
+async fn set_reasoning_effort_for_session<S: SendAgent>(
+    agent: &S,
+    session_id: &str,
+    effort: Option<querymt::chat::ReasoningEffort>,
+) -> Result<(), Error> {
+    let Some(handle) = agent.as_any().downcast_ref::<AgentHandle>() else {
+        return Err(Error::internal_error().data("set_reasoning_effort requires AgentHandle"));
+    };
+
+    let session_ref = {
+        let registry = handle.registry.lock().await;
+        registry.get(session_id).cloned().ok_or_else(|| {
+            Error::invalid_params().data(serde_json::json!({
+                "message": "unknown session",
+                "sessionId": session_id,
+            }))
+        })?
+    };
+
+    session_ref
+        .set_reasoning_effort(effort)
+        .await
+        .map_err(Error::from)
+}
+
+/// Get the current reasoning effort from the session actor (or default).
+async fn get_reasoning_effort_for_session<S: SendAgent>(
+    agent: &S,
+    session_id: &str,
+) -> Option<querymt::chat::ReasoningEffort> {
+    let handle = agent.as_any().downcast_ref::<AgentHandle>()?;
+
+    let session_ref = {
+        let registry = handle.registry.lock().await;
+        registry.get(session_id).cloned()
+    };
+
+    if let Some(session_ref) = session_ref {
+        session_ref.get_reasoning_effort().await.ok().flatten()
+    } else {
+        **handle.default_reasoning_effort.load()
+    }
+}
+
 async fn handle_set_session_config_option<S: SendAgent>(
     agent: &S,
     params: SetSessionConfigOptionRequest,
 ) -> Result<serde_json::Value, Error> {
-    if params.config_id.0.as_ref() != "mode" {
-        return Err(Error::invalid_params().data(serde_json::json!({
-            "error": format!("Unsupported configId: {}", params.config_id.0),
-        })));
-    }
+    let config_id = params.config_id.0.as_ref();
 
     let SessionConfigOptionValue::ValueId { value: value_id } = params.value else {
         return Err(Error::invalid_params().data(serde_json::json!({
-            "error": "mode config option requires a value id",
+            "error": "config option requires a value id",
         })));
     };
-    let mode = value_id.0.parse::<AgentMode>().map_err(|e| {
-        Error::invalid_params().data(serde_json::json!({
-            "error": e,
-        }))
-    })?;
 
-    set_mode_for_session(agent, &params.session_id.0, mode).await?;
+    let session_id = &params.session_id.0;
 
-    Ok(
-        serde_json::to_value(SetSessionConfigOptionResponse::new(session_config_options(
-            mode,
-        )))
-        .unwrap(),
-    )
+    match config_id {
+        "mode" => {
+            let mode = value_id
+                .0
+                .parse::<AgentMode>()
+                .map_err(|e| Error::invalid_params().data(serde_json::json!({ "error": e })))?;
+            set_mode_for_session(agent, session_id, mode).await?;
+
+            let effort = get_reasoning_effort_for_session(agent, session_id).await;
+            Ok(
+                serde_json::to_value(SetSessionConfigOptionResponse::new(session_config_options(
+                    mode, effort,
+                )))
+                .unwrap(),
+            )
+        }
+        "reasoning_effort" => {
+            let effort_str = value_id.0.as_ref();
+            let effort = if effort_str == "auto" {
+                None
+            } else {
+                Some(
+                    serde_json::from_value::<querymt::chat::ReasoningEffort>(serde_json::json!(
+                        effort_str
+                    ))
+                    .map_err(|e| {
+                        Error::invalid_params().data(serde_json::json!({
+                            "error": format!("Invalid reasoning effort '{}': {}", effort_str, e),
+                        }))
+                    })?,
+                )
+            };
+
+            // Always call through — including None (auto) so the LLM config row
+            // is updated and the next turn uses provider/model defaults.
+            set_reasoning_effort_for_session(agent, session_id, effort).await?;
+
+            // Read the current mode to build a complete config options response
+            let mode = if let Some(handle) = agent.as_any().downcast_ref::<AgentHandle>() {
+                let session_ref = {
+                    let registry = handle.registry.lock().await;
+                    registry.get(session_id).cloned()
+                };
+                if let Some(session_ref) = session_ref {
+                    session_ref.get_mode().await.unwrap_or(AgentMode::Build)
+                } else {
+                    AgentMode::Build
+                }
+            } else {
+                AgentMode::Build
+            };
+
+            Ok(
+                serde_json::to_value(SetSessionConfigOptionResponse::new(session_config_options(
+                    mode, effort,
+                )))
+                .unwrap(),
+            )
+        }
+        _ => Err(Error::invalid_params().data(serde_json::json!({
+            "error": format!("Unsupported configId: {}", config_id),
+        }))),
+    }
 }
 
 /// Handle an RPC request and return a response.
@@ -762,8 +877,8 @@ mod tests {
 
     #[test]
     fn mode_config_option_contains_expected_shape() {
-        let options = session_config_options(AgentMode::Plan);
-        assert_eq!(options.len(), 1);
+        let options = session_config_options(AgentMode::Plan, None);
+        assert_eq!(options.len(), 2);
         assert_eq!(options[0].id.0.as_ref(), "mode");
         assert_eq!(options[0].category, Some(SessionConfigOptionCategory::Mode));
 
@@ -772,6 +887,34 @@ mod tests {
             _ => panic!("expected select config option"),
         };
         assert_eq!(select.current_value.0.as_ref(), "plan");
+    }
+
+    #[test]
+    fn reasoning_effort_config_option_contains_expected_shape() {
+        let options =
+            session_config_options(AgentMode::Build, Some(querymt::chat::ReasoningEffort::High));
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[1].id.0.as_ref(), "reasoning_effort");
+        assert_eq!(
+            options[1].category,
+            Some(SessionConfigOptionCategory::ThoughtLevel)
+        );
+
+        let select = match &options[1].kind {
+            agent_client_protocol::SessionConfigKind::Select(select) => select,
+            _ => panic!("expected select config option"),
+        };
+        assert_eq!(select.current_value.0.as_ref(), "high");
+    }
+
+    #[test]
+    fn reasoning_effort_config_option_auto_when_none() {
+        let options = session_config_options(AgentMode::Build, None);
+        let select = match &options[1].kind {
+            agent_client_protocol::SessionConfigKind::Select(select) => select,
+            _ => panic!("expected select config option"),
+        };
+        assert_eq!(select.current_value.0.as_ref(), "auto");
     }
 
     #[test]

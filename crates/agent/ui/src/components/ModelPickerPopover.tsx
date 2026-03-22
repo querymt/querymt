@@ -38,8 +38,11 @@ interface ModelPickerPopoverProps {
   currentWorkspace: string | null;
   recentModelsByWorkspace: Record<string, RecentModelEntry[]>;
   agentMode: string;
+  reasoningEffort: string | null;
   onRefresh: () => void;
   onSetSessionModel: (sessionId: string, modelId: string, node?: string) => void;
+  onSetReasoningEffort: (effort: string | null) => void;
+  onCycleReasoningEffort: () => void;
   providerCapabilities: Record<string, ProviderCapabilityEntry>;
   modelDownloads: Record<string, ModelDownloadStatus>;
   onAddCustomModelFromHf: (provider: string, repo: string, filename: string, displayName?: string) => void;
@@ -137,6 +140,17 @@ function makeTriggerTitle(currentProvider?: string, currentModel?: string, curre
     : `Select model (${shortcutHint})`;
 }
 
+/** Short label for the reasoning effort badge on the trigger button. */
+function effortBadgeLabel(effort: string | null): string {
+  switch (effort) {
+    case 'low': return 'Lo';
+    case 'medium': return 'Med';
+    case 'high': return 'Hi';
+    case 'max': return 'Max';
+    default: return 'Auto';
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /*  ModelPickerPanel — heavy panel, only mounted when open            */
 /* ------------------------------------------------------------------ */
@@ -154,8 +168,10 @@ interface ModelPickerPanelProps {
   currentWorkspace: string | null;
   recentModelsByWorkspace: Record<string, RecentModelEntry[]>;
   agentMode: string;
+  reasoningEffort: string | null;
   onRefresh: () => void;
   onSetSessionModel: (sessionId: string, modelId: string, node?: string) => void;
+  onSetReasoningEffort: (effort: string | null) => void;
   providerCapabilities: Record<string, ProviderCapabilityEntry>;
   modelDownloads: Record<string, ModelDownloadStatus>;
   onAddCustomModelFromHf: (provider: string, repo: string, filename: string, displayName?: string) => void;
@@ -180,8 +196,10 @@ const ModelPickerPanel = memo(function ModelPickerPanel({
   currentWorkspace,
   recentModelsByWorkspace,
   agentMode,
+  reasoningEffort,
   onRefresh,
   onSetSessionModel,
+  onSetReasoningEffort,
   providerCapabilities,
   modelDownloads,
   onAddCustomModelFromHf,
@@ -473,6 +491,38 @@ const ModelPickerPanel = memo(function ModelPickerPanel({
         )}
       </div>
 
+      {/* Reasoning effort selector */}
+      <div className="px-3 py-2 border-b border-surface-border/40">
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-[10px] uppercase tracking-widest text-ui-muted">Thinking</span>
+          <div className="flex-1 flex items-center gap-1">
+            {([
+              { value: null, label: 'Auto' },
+              { value: 'low', label: 'Low' },
+              { value: 'medium', label: 'Med' },
+              { value: 'high', label: 'High' },
+              { value: 'max', label: 'Max' },
+            ] as const).map((opt) => {
+              const isActive = reasoningEffort === opt.value;
+              return (
+                <button
+                  key={opt.label}
+                  type="button"
+                  onClick={() => onSetReasoningEffort(opt.value)}
+                  className={`flex-1 px-1.5 py-1 rounded text-[10px] font-medium transition-colors ${
+                    isActive
+                      ? 'bg-accent-primary/20 text-accent-primary border border-accent-primary/40'
+                      : 'text-ui-muted hover:text-ui-secondary hover:bg-surface-elevated/60 border border-transparent'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
       {/* Command palette (filter + list) */}
       <Command
         label="Model picker"
@@ -649,8 +699,11 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
   currentWorkspace,
   recentModelsByWorkspace,
   agentMode,
+  reasoningEffort,
   onRefresh,
   onSetSessionModel,
+  onSetReasoningEffort,
+  onCycleReasoningEffort,
   providerCapabilities,
   modelDownloads,
   onAddCustomModelFromHf,
@@ -686,8 +739,10 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
     currentWorkspace,
     recentModelsByWorkspace,
     agentMode,
+    reasoningEffort,
     onRefresh,
     onSetSessionModel,
+    onSetReasoningEffort,
     providerCapabilities,
     modelDownloads,
     onAddCustomModelFromHf,
@@ -714,6 +769,9 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
                 {currentNodeLabel}
               </span>
             )}
+            <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-purple-500/10 text-purple-400 border border-purple-500/20">
+              {effortBadgeLabel(reasoningEffort)}
+            </span>
             <ChevronDown className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
           </button>
         </Dialog.Trigger>
@@ -751,6 +809,14 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
               {currentNodeLabel}
             </span>
           )}
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onCycleReasoningEffort(); }}
+            className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider bg-purple-500/10 text-purple-400 border border-purple-500/20 hover:bg-purple-500/20 transition-colors"
+            title={`Reasoning: ${reasoningEffort ?? 'auto'} (${isMacPlatform ? '⌘;' : 'Ctrl+;'} to cycle)`}
+          >
+            {effortBadgeLabel(reasoningEffort)}
+          </button>
           <ChevronDown className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
         </button>
       </Popover.Trigger>

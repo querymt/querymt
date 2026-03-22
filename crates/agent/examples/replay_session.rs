@@ -44,12 +44,11 @@ use querymt::plugin::host::native::NativeLoader;
 use querymt_agent::events::AgentEvent;
 use querymt_agent::model::MessagePart;
 use querymt_agent::session::projection::EventJournal;
-#[cfg(feature = "remote")]
-use querymt_agent::session::provider::ProviderRouting;
-use querymt_agent::session::provider::build_provider_from_config;
+use querymt_agent::session::provider::{ProviderRequest, SessionProvider};
 use querymt_agent::session::sqlite_storage::SqliteStorage;
 use querymt_agent::session::store::SessionStore;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct ReplayArgs {
@@ -152,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // Open database read-only (skip migrations to preserve data)
-    let store = SqliteStorage::connect_with_options(args.db_path.clone(), false).await?;
+    let store = Arc::new(SqliteStorage::connect_with_options(args.db_path.clone(), false).await?);
 
     // Load session
     let session = store
@@ -294,20 +293,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         registry.register_loader(Box::new(NativeLoader));
 
         // Build provider from config
-        let provider = build_provider_from_config(
-            &registry,
-            &llm_config.provider,
-            &llm_config.model,
-            Some(&params),
-            None, // No API key override
-            #[cfg(feature = "remote")]
-            ProviderRouting {
-                provider_node_id: None, // local
-                mesh_handle: None,      // not available in example
-                allow_mesh_fallback: false,
-            },
-        )
-        .await?;
+        let session_provider = SessionProvider::new(
+            Arc::new(registry),
+            store.clone(),
+            querymt::LLMParams::default(),
+        );
+        let provider = session_provider
+            .build_provider(
+                ProviderRequest::new(&llm_config.provider, &llm_config.model)
+                    .with_params(Some(&params)),
+            )
+            .await?;
 
         // Tools are already in querymt::chat::Tool format from the events
 

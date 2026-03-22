@@ -17,6 +17,7 @@ use agent_client_protocol::{
     ExtNotification as AcpExtNotification, ExtRequest, PromptRequest, SetSessionModelRequest,
 };
 use querymt::LLMParams;
+use querymt::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -59,6 +60,17 @@ pub struct SetMode {
 /// Get the current agent mode for this session.
 #[derive(Serialize, Deserialize)]
 pub struct GetMode;
+
+/// Set the reasoning effort level for this session.
+/// `None` clears the explicit override and restores model/provider defaults.
+#[derive(Serialize, Deserialize)]
+pub struct SetReasoningEffort {
+    pub effort: Option<ReasoningEffort>,
+}
+
+/// Get the current reasoning effort for this session.
+#[derive(Serialize, Deserialize)]
+pub struct GetReasoningEffort;
 
 /// Switch provider and model for this session (simple form).
 #[derive(Serialize, Deserialize)]
@@ -288,6 +300,31 @@ mod tests {
         let msg = GetMode;
         let json = serde_json::to_string(&msg).unwrap();
         let _rt: GetMode = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn set_reasoning_effort_message_serializes() {
+        let msg = SetReasoningEffort {
+            effort: Some(ReasoningEffort::High),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let rt: SetReasoningEffort = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn set_reasoning_effort_none_serializes() {
+        let msg = SetReasoningEffort { effort: None };
+        let json = serde_json::to_string(&msg).unwrap();
+        let rt: SetReasoningEffort = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.effort, None);
+    }
+
+    #[test]
+    fn get_reasoning_effort_message_serializes() {
+        let msg = GetReasoningEffort;
+        let json = serde_json::to_string(&msg).unwrap();
+        let _rt: GetReasoningEffort = serde_json::from_str(&json).unwrap();
     }
 
     #[test]

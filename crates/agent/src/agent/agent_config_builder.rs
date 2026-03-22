@@ -27,6 +27,7 @@ use crate::session::provider::SessionProvider;
 use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
 use agent_client_protocol::AuthMethod;
+use arc_swap::ArcSwap;
 use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;
 use std::collections::HashSet;
@@ -178,6 +179,7 @@ impl AgentConfigBuilder {
             agent_registry: self.agent_registry,
             workspace_manager_actor: self.workspace_manager_actor,
             default_mode: self.default_mode,
+            default_reasoning_effort: Arc::new(ArcSwap::from_pointee(None)),
             tool_config: self.tool_config,
             tool_registry: self.tool_registry,
             middleware_drivers: self.middleware_drivers,

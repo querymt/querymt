@@ -877,6 +877,12 @@ export type UiClientMessage =
 }}
 	/** Get the current agent mode */
 	| { type: "get_agent_mode", data?: undefined }
+	/** Set the reasoning effort level for the current session */
+	| { type: "set_reasoning_effort", data: {
+	reasoning_effort: string;
+}}
+	/** Get the current reasoning effort level */
+	| { type: "get_reasoning_effort", data?: undefined }
 	/** List remote nodes discovered in the kameo mesh */
 	| { type: "list_remote_nodes", data?: undefined }
 	/** List sessions on a specific remote node */
@@ -959,6 +965,7 @@ export type UiServerMessage =
 	agents: UiAgentInfo[];
 	sessions_by_agent: Record<string, string>;
 	agent_mode: string;
+	reasoning_effort?: string;
 }}
 	| { type: "session_created", data: {
 	agent_id: string;
@@ -1040,6 +1047,10 @@ export type UiServerMessage =
 	/** Current agent mode notification */
 	| { type: "agent_mode", data: {
 	mode: string;
+}}
+	/** Current reasoning effort notification */
+	| { type: "reasoning_effort", data: {
+	reasoning_effort?: string;
 }}
 	/** OAuth-capable providers and current authentication status */
 	| { type: "auth_providers", data: {

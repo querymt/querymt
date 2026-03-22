@@ -3,6 +3,7 @@
 //! This module provides a serializable configuration struct that contains
 //! only LLM parameters without operational concerns like validators or tool registries.
 
+use crate::chat::ReasoningEffort;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -103,13 +104,11 @@ pub struct LLMParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
 
-    /// Enable reasoning mode (for providers that support it)
+    /// Reasoning effort level (low, medium, high, max).
+    /// When set, providers that support reasoning will use their own API format
+    /// to configure the appropriate thinking level or budget.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<bool>,
-
-    /// Reasoning effort level (e.g., "low", "medium", "high")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 
     /// Reasoning budget in tokens
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,15 +191,10 @@ impl LLMParams {
         self
     }
 
-    /// Sets reasoning mode
-    pub fn reasoning(mut self, reasoning: bool) -> Self {
-        self.reasoning = Some(reasoning);
-        self
-    }
-
-    /// Sets reasoning effort
-    pub fn reasoning_effort(mut self, effort: impl Into<String>) -> Self {
-        self.reasoning_effort = Some(effort.into());
+    /// Sets reasoning effort level.
+    /// Providers that support reasoning will map this to their own API format.
+    pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
         self
     }
 

@@ -2,7 +2,7 @@
 //!
 //! Module H: The primary broken path — using Alpha's LLM model to run prompts
 //! on Beta's session. Tests `ProviderHostActor`, `MeshChatProvider`, and
-//! `build_provider_from_config` with `provider_node_id`.
+//! `SessionProvider::build_provider` with `provider_node_id`.
 //!
 //! Module I: `setup_mesh_from_config` TOML-config translation layer.
 //!
@@ -26,7 +26,7 @@ mod provider_routing_integration_tests {
     use crate::agent::remote::test_helpers::fixtures::{
         AgentConfigFixture, ProviderHostFixture, ProviderRoutingFixture, get_test_mesh,
     };
-    use crate::session::provider::{ProviderRouting, build_provider_from_config};
+    use crate::session::provider::ProviderRequest;
     use querymt::chat::{ChatProvider, FinishReason};
     use querymt::error::LLMError;
     use tokio::sync::mpsc;
@@ -47,21 +47,12 @@ mod provider_routing_integration_tests {
     async fn test_session_with_no_provider_node_id_uses_local_provider() {
         let f = AgentConfigFixture::new().await;
 
-        // build_provider_from_config with provider_node_id = None uses local registry.
-        let registry = f.config.provider.plugin_registry();
-        let result = build_provider_from_config(
-            &registry,
-            "nonexistent",
-            "model",
-            None,
-            None,
-            ProviderRouting {
-                provider_node_id: None, // provider_node_id = None → local path
-                mesh_handle: None,      // mesh_handle = None
-                allow_mesh_fallback: false,
-            },
-        )
-        .await;
+        // build_provider with provider_node_id = None uses local registry.
+        let result = f
+            .config
+            .provider
+            .build_provider(ProviderRequest::new("nonexistent", "model"))
+            .await;
 
         // Fails because "nonexistent" isn't registered, not because of mesh routing.
         assert!(
@@ -126,7 +117,7 @@ mod provider_routing_integration_tests {
         );
     }
 
-    // ── H.3 — build_provider_from_config with provider_node_id → MeshChatProvider ─
+    // ── H.3 — build_provider with provider_node_id → MeshChatProvider ────────────
 
     /// Tests **Bug #1 root cause**: when `provider_node_id` is set, the session
     /// should use `MeshChatProvider`. This test verifies the builder path.
@@ -136,24 +127,19 @@ mod provider_routing_integration_tests {
         let mesh = get_test_mesh().await;
 
         let provider_node_id = random_node_id();
-        let registry = f.config.provider.plugin_registry();
+        f.config.provider.set_mesh(Some(mesh.clone()));
 
-        let provider = build_provider_from_config(
-            &registry,
-            "anthropic",
-            "claude-3",
-            None,
-            None,
-            ProviderRouting {
-                provider_node_id: Some(&provider_node_id), // explicit remote node
-                mesh_handle: Some(mesh),
-                allow_mesh_fallback: false,
-            },
-        )
-        .await
-        .expect("build_provider_from_config with provider_node_id should succeed");
+        let provider = f
+            .config
+            .provider
+            .build_provider(
+                ProviderRequest::new("anthropic", "claude-3")
+                    .with_provider_node_id(Some(&provider_node_id)),
+            )
+            .await
+            .expect("build_provider with provider_node_id should succeed");
 
-        // `build_provider_from_config` returns `Arc<dyn LLMProvider>`.
+        // `build_provider` returns `Arc<dyn LLMProvider>`.
         // `type_name_of_val` only sees the trait object type, not the concrete
         // type behind it.  Verify mesh routing via observable behaviour instead:
         // a MeshChatProvider tries a DHT lookup for "provider_host::{node}" and
@@ -254,22 +240,17 @@ mod provider_routing_integration_tests {
         let mesh = get_test_mesh().await;
 
         let provider_node_id = random_node_id();
-        let registry = f.config.provider.plugin_registry();
+        f.config.provider.set_mesh(Some(mesh.clone()));
 
-        let provider = build_provider_from_config(
-            &registry,
-            "mock",
-            "mock-model",
-            None,
-            None,
-            ProviderRouting {
-                provider_node_id: Some(&provider_node_id),
-                mesh_handle: Some(mesh),
-                allow_mesh_fallback: false,
-            },
-        )
-        .await
-        .expect("should succeed (creates MeshChatProvider, no local plugin needed)");
+        let provider = f
+            .config
+            .provider
+            .build_provider(
+                ProviderRequest::new("mock", "mock-model")
+                    .with_provider_node_id(Some(&provider_node_id)),
+            )
+            .await
+            .expect("should succeed (creates MeshChatProvider, no local plugin needed)");
 
         // Verify mesh routing via observable behaviour: a MeshChatProvider
         // performs a DHT lookup for "provider_host::{node}" and returns a
@@ -299,21 +280,16 @@ mod provider_routing_integration_tests {
     async fn test_provider_node_id_local_uses_local_provider() {
         let f = AgentConfigFixture::new().await;
         let mesh = get_test_mesh().await;
+        f.config.provider.set_mesh(Some(mesh.clone()));
 
-        let registry = f.config.provider.plugin_registry();
-        let result = build_provider_from_config(
-            &registry,
-            "nonexistent-local",
-            "model",
-            None,
-            None,
-            ProviderRouting {
-                provider_node_id: Some("local"), // "local" → bypass mesh
-                mesh_handle: Some(mesh),
-                allow_mesh_fallback: false,
-            },
-        )
-        .await;
+        let result = f
+            .config
+            .provider
+            .build_provider(
+                ProviderRequest::new("nonexistent-local", "model")
+                    .with_provider_node_id(Some("local")), // "local" → bypass mesh
+            )
+            .await;
 
         assert!(
             result.is_err(),
@@ -488,10 +464,10 @@ mod provider_routing_integration_tests {
 //  session DB (sessions.provider_node_id)
 //    → `build_provider_for_session`
 //    → `get_session_provider_node_id`
-//    → `build_provider_from_config` with provider_node_id = Some(...)
+//    → `SessionProvider::build_provider` with provider_node_id = Some(...)
 //    → `MeshChatProvider`
 //
-//  Previously only `build_provider_from_config` was called directly in tests,
+//  Previously only `build_provider` was called directly in tests,
 //  bypassing the DB read-back.  Bug: `parse_llm_config_row` always returned
 //  `provider_node_id: None`, so the mesh routing path was never triggered.
 
@@ -526,7 +502,7 @@ mod build_provider_for_session_tests {
     /// (observable via the DHT lookup error for the named DHT key).
     ///
     /// This test was previously impossible because `parse_llm_config_row` always
-    /// returned `provider_node_id: None`, causing `build_provider_from_config` to
+    /// returned `provider_node_id: None`, causing `build_provider` to
     /// fall through to the local provider (Case 2), which would fail with
     /// "Unknown provider: anthropic" instead of routing through the mesh.
     #[tokio::test]

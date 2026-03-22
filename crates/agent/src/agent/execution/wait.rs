@@ -333,6 +333,8 @@ async fn inject_wait_message(
         }],
         created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
         parent_message_id: None,
+        source_provider: None,
+        source_model: None,
     };
 
     exec_ctx

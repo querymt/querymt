@@ -161,9 +161,14 @@ pub(super) async fn transition_call_llm(
 
     // Determine response via streaming or non-streaming path.
     // Each arm produces the same tuple so the rest of the function is uniform.
-    let (response_content, response_thinking, tool_calls, usage, finish_reason) = if tools
-        .is_empty()
-    {
+    let (
+        response_content,
+        response_thinking,
+        response_thinking_signature,
+        tool_calls,
+        usage,
+        finish_reason,
+    ) = if tools.is_empty() {
         // No tools — always use the non-streaming simple submit path.
         let cancel = exec_ctx.cancellation_token.clone();
         let resp = super::llm_retry::call_llm_with_retry(
@@ -190,6 +195,7 @@ pub(super) async fn transition_call_llm(
         (
             resp.text().unwrap_or_default(),
             resp.thinking(),
+            None,
             resp.tool_calls().unwrap_or_default(),
             resp.usage(),
             resp.finish_reason(),
@@ -224,6 +230,7 @@ pub(super) async fn transition_call_llm(
 
             let mut text = String::new();
             let mut thinking = String::new();
+            let mut thinking_signature: Option<String> = None;
             let mut stream_tool_calls: Vec<ToolCall> = Vec::new();
             let mut tool_call_ids = std::collections::HashSet::new();
             let mut usage: Option<querymt::Usage> = None;
@@ -304,6 +311,15 @@ pub(super) async fn transition_call_llm(
                         );
                         thinking.push_str(&delta);
                         thinking_buffer.push_str(&delta);
+                    }
+                    StreamChunk::ThinkingSignature(signature) => {
+                        trace!(
+                            "stream chunk: session={} message_id={} type=thinking_signature len={}",
+                            session_id,
+                            message_id,
+                            signature.len()
+                        );
+                        thinking_signature = Some(signature);
                     }
                     StreamChunk::ToolUseComplete { tool_call, .. } => {
                         // Flush before tool use so UI sees final text before tool starts
@@ -390,6 +406,7 @@ pub(super) async fn transition_call_llm(
                 } else {
                     Some(thinking)
                 },
+                thinking_signature,
                 stream_tool_calls,
                 usage,
                 finish_reason,
@@ -423,6 +440,7 @@ pub(super) async fn transition_call_llm(
             (
                 resp.text().unwrap_or_default(),
                 resp.thinking(),
+                None,
                 resp.tool_calls().unwrap_or_default(),
                 resp.usage(),
                 resp.finish_reason(),
@@ -492,7 +510,8 @@ pub(super) async fn transition_call_llm(
         .collect();
 
     let mut llm_response = LlmResponse::new(response_content, llm_tool_calls, usage, finish_reason)
-        .with_thinking(response_thinking);
+        .with_thinking(response_thinking)
+        .with_thinking_signature(response_thinking_signature);
     if let Some(mid) = streaming_message_id {
         llm_response = llm_response.with_message_id(mid);
     }
@@ -568,6 +587,7 @@ pub(super) async fn transition_after_llm(
     {
         parts.push(MessagePart::Reasoning {
             content: thinking.clone(),
+            signature: response.thinking_signature.clone(),
             time_ms: None,
         });
     }
@@ -612,6 +632,8 @@ pub(super) async fn transition_after_llm(
         parts,
         created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
         parent_message_id: None,
+        source_provider: Some(context.provider.to_string()),
+        source_model: Some(context.model.to_string()),
     };
 
     exec_ctx

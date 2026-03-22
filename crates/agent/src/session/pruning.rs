@@ -218,6 +218,8 @@ mod tests {
             }],
             created_at: 0,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         }
     }
 
@@ -242,6 +244,8 @@ mod tests {
             }],
             created_at: 0,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         }
     }
 
@@ -256,6 +260,8 @@ mod tests {
             }],
             created_at: 0,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         }
     }
 

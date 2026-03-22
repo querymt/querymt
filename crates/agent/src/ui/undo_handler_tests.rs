@@ -118,6 +118,8 @@ async fn test_undo_handler_single_agent() -> Result<()> {
         }],
         created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
         parent_message_id: None,
+        source_provider: None,
+        source_model: None,
     };
     storage
         .session_store()
@@ -141,6 +143,8 @@ async fn test_undo_handler_single_agent() -> Result<()> {
                 }],
                 created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
                 parent_message_id: None,
+                source_provider: None,
+                source_model: None,
             },
         )
         .await?;
@@ -171,6 +175,8 @@ async fn test_undo_handler_single_agent() -> Result<()> {
                 }],
                 created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
                 parent_message_id: None,
+                source_provider: None,
+                source_model: None,
             },
         )
         .await?;
@@ -361,6 +367,8 @@ async fn test_undo_handler_cross_session() -> Result<()> {
                 }],
                 created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
                 parent_message_id: None,
+                source_provider: None,
+                source_model: None,
             },
         )
         .await?;
@@ -382,6 +390,8 @@ async fn test_undo_handler_cross_session() -> Result<()> {
                 }],
                 created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
                 parent_message_id: None,
+                source_provider: None,
+                source_model: None,
             },
         )
         .await?;
@@ -412,6 +422,8 @@ async fn test_undo_handler_cross_session() -> Result<()> {
                 }],
                 created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
                 parent_message_id: None,
+                source_provider: None,
+                source_model: None,
             },
         )
         .await?;

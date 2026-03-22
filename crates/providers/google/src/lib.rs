@@ -45,8 +45,8 @@ use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StructuredOutputFormat, Tool,
-        ToolChoice, http::HTTPChatProvider,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort,
+        StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -94,6 +94,7 @@ pub struct Google {
     /// Available tools for function calling
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<ToolChoice>, // FIXME: currently not being used
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub thinking_budget: Option<u32>,
     pub cached_content: Option<String>,
     /// Buffer for accumulating incomplete streaming JSON chunks
@@ -127,6 +128,7 @@ impl Clone for Google {
             json_schema: self.json_schema.clone(),
             tools: self.tools.clone(),
             tool_choice: self.tool_choice.clone(),
+            reasoning_effort: self.reasoning_effort,
             thinking_budget: self.thinking_budget,
             cached_content: self.cached_content.clone(),
             // Create a new empty buffer for the cloned instance
@@ -288,6 +290,8 @@ struct GoogleThinkingConfig {
     include_thoughts: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingBudget")]
     thinking_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingLevel")]
+    thinking_level: Option<String>,
 }
 
 /// Response from the chat completion API
@@ -694,6 +698,53 @@ impl Google {
             self.api_key.clone()
         }
     }
+
+    fn is_gemini_2_5(&self) -> bool {
+        self.model.contains("2.5")
+    }
+
+    fn effort_to_budget(effort: ReasoningEffort) -> u32 {
+        match effort {
+            ReasoningEffort::Low => 1_024,
+            ReasoningEffort::Medium => 8_000,
+            ReasoningEffort::High => 16_000,
+            ReasoningEffort::Max => 24_576,
+        }
+    }
+
+    fn effort_to_level(effort: ReasoningEffort) -> String {
+        match effort {
+            ReasoningEffort::Low => "low".to_string(),
+            ReasoningEffort::Medium | ReasoningEffort::High | ReasoningEffort::Max => {
+                "high".to_string()
+            }
+        }
+    }
+
+    fn resolve_thinking_config(&self) -> Option<GoogleThinkingConfig> {
+        if let Some(thinking_budget) = self.thinking_budget {
+            return Some(GoogleThinkingConfig {
+                include_thoughts: Some(true),
+                thinking_budget: Some(thinking_budget),
+                thinking_level: None,
+            });
+        }
+
+        let effort = self.reasoning_effort?;
+        if self.is_gemini_2_5() {
+            Some(GoogleThinkingConfig {
+                include_thoughts: Some(true),
+                thinking_budget: Some(Self::effort_to_budget(effort)),
+                thinking_level: None,
+            })
+        } else {
+            Some(GoogleThinkingConfig {
+                include_thoughts: Some(true),
+                thinking_budget: None,
+                thinking_level: Some(Self::effort_to_level(effort)),
+            })
+        }
+    }
 }
 
 impl HTTPChatProvider for Google {
@@ -735,7 +786,7 @@ impl HTTPChatProvider for Google {
                             parts.push(GoogleContentPart::text(text));
                         }
                     }
-                    Content::Thinking { text } => {
+                    Content::Thinking { text, .. } => {
                         if !text.is_empty() {
                             parts.push(GoogleContentPart::thought(text));
                         }
@@ -835,12 +886,7 @@ impl HTTPChatProvider for Google {
                 (None, None)
             };
 
-            let thinking_config =
-                self.thinking_budget
-                    .map(|thinking_budget| GoogleThinkingConfig {
-                        include_thoughts: None, // TODO
-                        thinking_budget: Some(thinking_budget),
-                    });
+            let thinking_config = self.resolve_thinking_config();
 
             Some(GoogleGenerationConfig {
                 max_output_tokens: self.max_tokens,

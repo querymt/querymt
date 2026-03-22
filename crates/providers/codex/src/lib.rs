@@ -45,6 +45,7 @@ pub struct Codex {
     pub client_version: Option<String>,
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<ToolChoice>,
+    pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
     /// Extra body fields to include in the API request (e.g. `store`, `promptCacheKey`).
     /// These are passed through as-is via `#[serde(flatten)]` in the request body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,6 +131,10 @@ impl api::CodexProviderConfig for Codex {
 
     fn client_version(&self) -> Option<&str> {
         self.client_version.as_deref()
+    }
+
+    fn reasoning_effort(&self) -> Option<querymt::chat::ReasoningEffort> {
+        self.reasoning_effort
     }
 
     fn extra_body(&self) -> Option<serde_json::Map<String, Value>> {
@@ -229,6 +234,7 @@ impl HTTPLLMProviderFactory for CodexFactory {
             "gpt-5.3-codex".to_string(),
             "gpt-5.3-codex-spark".to_string(),
             "gpt-5.4".to_string(),
+            "gpt-5.4-mini".to_string(),
             "gpt-5.2".to_string(),
             "gpt-5.1".to_string(),
             "gpt-5-codex".to_string(),

@@ -292,6 +292,8 @@ impl SessionCompaction {
             }],
             created_at: now,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         };
 
         let summary_msg = AgentMessage {
@@ -304,6 +306,8 @@ impl SessionCompaction {
             }],
             created_at: now,
             parent_message_id: Some(request_id),
+            source_provider: None,
+            source_model: None,
         };
 
         (request_msg, summary_msg)
@@ -418,6 +422,8 @@ mod tests {
                 }],
                 created_at: 0,
                 parent_message_id: None,
+                source_provider: None,
+                source_model: None,
             }
         }
 
@@ -449,6 +455,8 @@ mod tests {
                 }],
                 created_at: 0,
                 parent_message_id: None,
+                source_provider: None,
+                source_model: None,
             }
         }
 
@@ -462,6 +470,8 @@ mod tests {
                 }],
                 created_at: 0,
                 parent_message_id: None,
+                source_provider: None,
+                source_model: None,
             }
         }
 
@@ -476,6 +486,8 @@ mod tests {
                 }],
                 created_at: 0,
                 parent_message_id: None,
+                source_provider: None,
+                source_model: None,
             }
         }
 
@@ -486,10 +498,13 @@ mod tests {
                 role: ChatRole::Assistant,
                 parts: vec![MessagePart::Reasoning {
                     content: reasoning.to_string(),
+                    signature: None,
                     time_ms: Some(100),
                 }],
                 created_at: 0,
                 parent_message_id: None,
+                source_provider: None,
+                source_model: None,
             }
         }
 

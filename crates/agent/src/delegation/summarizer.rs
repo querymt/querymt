@@ -9,13 +9,10 @@ use crate::agent::utils::{render_prompt_for_display, render_prompt_for_llm};
 use crate::config::DelegationSummaryConfig;
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::error::{SessionError, SessionResult};
-#[cfg(feature = "remote")]
-use crate::session::provider::ProviderRouting;
-use crate::session::provider::build_provider_from_config;
+use crate::session::provider::{ProviderRequest, SessionProvider};
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use querymt::LLMProvider;
 use querymt::chat::{ChatMessage, ChatRole};
-use querymt::plugin::host::PluginRegistry;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,7 +42,7 @@ impl DelegationSummarizer {
     /// Build a summarizer from configuration
     pub async fn from_config(
         config: &DelegationSummaryConfig,
-        plugin_registry: Arc<PluginRegistry>,
+        session_provider: &SessionProvider,
     ) -> SessionResult<Self> {
         // Build params JSON including system prompt and max_tokens
         let mut params = serde_json::json!({
@@ -56,20 +53,13 @@ impl DelegationSummarizer {
             params["max_tokens"] = max_tokens.into();
         }
 
-        let provider = build_provider_from_config(
-            &plugin_registry,
-            &config.provider,
-            &config.model,
-            Some(&params),
-            config.api_key.as_deref(),
-            #[cfg(feature = "remote")]
-            ProviderRouting {
-                provider_node_id: None,     // summarizer always uses local provider
-                mesh_handle: None,          // not needed for summarizer
-                allow_mesh_fallback: false, // should not hop across peers
-            },
-        )
-        .await?;
+        let provider = session_provider
+            .build_provider(
+                ProviderRequest::new(&config.provider, &config.model)
+                    .with_params(Some(&params))
+                    .with_api_key_override(config.api_key.as_deref()),
+            )
+            .await?;
 
         Ok(Self {
             provider,
@@ -444,6 +434,8 @@ mod tests {
             }],
             created_at: 0,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         }
     }
 
@@ -457,6 +449,8 @@ mod tests {
             }],
             created_at: 0,
             parent_message_id: None,
+            source_provider: None,
+            source_model: None,
         }
     }
 
