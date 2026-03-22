@@ -1,9 +1,11 @@
 //! Core agent structures and basic implementations
 
 use agent_client_protocol::{ClientCapabilities, Implementation, ProtocolVersion};
+use arc_swap::ArcSwap;
+use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 /// Runtime operating mode for the agent.
@@ -97,23 +99,29 @@ pub struct ClientState {
     pub authenticated: bool,
 }
 
+/// Immutable snapshot of MCP tool state.
+///
+/// Contains the tool adapter map, tool definitions, and a change-detection hash.
+/// Published atomically via [`McpToolState`]'s `ArcSwap` so readers get a
+/// consistent, lock-free view while writers (rare `tools/list_changed`
+/// notifications) simply swap in a new snapshot.
+#[derive(Clone)]
+pub struct McpToolSnapshot {
+    pub tools: HashMap<String, Arc<querymt::mcp::adapter::McpToolAdapter>>,
+    pub tool_defs: Vec<querymt::chat::Tool>,
+    /// Hash of the currently available tool set used for change detection.
+    /// `None` signals that the next turn should unconditionally re-emit a
+    /// `ToolsAvailable` event.
+    pub tools_hash: Option<crate::hash::RapidHash>,
+}
+
 /// Shared, live MCP tool state for a session.
 ///
-/// Holds the tool maps and change-detection hash behind interior-mutability
-/// locks so that `McpClientHandler::on_tool_list_changed` can refresh them
-/// at any time without requiring exclusive ownership of `SessionRuntime`.
-///
-/// `tools` and `tool_defs` use `std::sync::RwLock` because all read paths are
-/// synchronous (no `.await` while the lock is held) and writes only occur on
-/// `tools/list_changed` notifications (rare).  `tools_hash` reuses the
-/// `Mutex` pattern already established by other `SessionRuntime` fields.
+/// Wraps an `ArcSwap<McpToolSnapshot>` so that reads (every LLM turn) are
+/// lock-free and writes (`tools/list_changed` notifications, hash updates)
+/// atomically replace the entire snapshot — no multi-lock consistency issue.
 pub struct McpToolState {
-    pub tools: RwLock<HashMap<String, Arc<querymt::mcp::adapter::McpToolAdapter>>>,
-    pub tool_defs: RwLock<Vec<querymt::chat::Tool>>,
-    /// Hash of the currently available tool set used for change detection.
-    /// Cleared by `McpClientHandler::on_tool_list_changed` so the next turn
-    /// unconditionally re-emits a `ToolsAvailable` event.
-    pub tools_hash: StdMutex<Option<crate::hash::RapidHash>>,
+    snapshot: ArcSwap<McpToolSnapshot>,
 }
 
 impl McpToolState {
@@ -122,20 +130,43 @@ impl McpToolState {
         tool_defs: Vec<querymt::chat::Tool>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            tools: RwLock::new(tools),
-            tool_defs: RwLock::new(tool_defs),
-            tools_hash: StdMutex::new(None),
+            snapshot: ArcSwap::from_pointee(McpToolSnapshot {
+                tools,
+                tool_defs,
+                tools_hash: None,
+            }),
         })
     }
 
     pub fn empty() -> Arc<Self> {
         Self::new(HashMap::new(), Vec::new())
     }
+
+    /// Load a snapshot reference for lock-free reading.
+    pub fn load(&self) -> arc_swap::Guard<Arc<McpToolSnapshot>> {
+        self.snapshot.load()
+    }
+
+    /// Atomically replace the snapshot.
+    pub fn store(&self, snapshot: McpToolSnapshot) {
+        self.snapshot.store(Arc::new(snapshot));
+    }
+
+    /// Read-modify-write the snapshot via a closure.
+    ///
+    /// Uses `ArcSwap::rcu` for safe concurrent updates. The closure may be
+    /// called more than once on contention.
+    pub fn rcu<F>(&self, f: F)
+    where
+        F: Fn(&McpToolSnapshot) -> McpToolSnapshot,
+    {
+        self.snapshot.rcu(|current| Arc::new(f(current)));
+    }
 }
 
 /// Type alias for the in-flight pre-turn snapshot task handle.
 type PreTurnSnapshotTask =
-    StdMutex<Option<tokio::task::JoinHandle<(String, Result<String, String>)>>>;
+    ParkingMutex<Option<tokio::task::JoinHandle<(String, Result<String, String>)>>>;
 
 /// Runtime state for an active session.
 pub struct SessionRuntime {
@@ -147,15 +178,15 @@ pub struct SessionRuntime {
     /// Live MCP tool state — refreshed in-place when a server sends
     /// `tools/list_changed`.
     pub mcp_tool_state: Arc<McpToolState>,
-    pub permission_cache: StdMutex<HashMap<String, bool>>,
+    pub permission_cache: ParkingMutex<HashMap<String, bool>>,
     /// Workspace handle for duplicate code detection (built asynchronously on session start)
     pub workspace_handle: Arc<OnceCell<crate::index::WorkspaceHandle>>,
     /// Turn snapshot: (turn_id, snapshot_id) taken at the start of the turn for undo/redo
-    pub turn_snapshot: StdMutex<Option<(String, String)>>,
+    pub turn_snapshot: ParkingMutex<Option<(String, String)>>,
     /// In-flight pre-turn snapshot task, resolved before first assistant response or post-turn use.
     pub pre_turn_snapshot_task: PreTurnSnapshotTask,
     /// Accumulated changed file paths across the entire turn (for end-of-turn dedup check)
-    pub turn_diffs: StdMutex<crate::index::DiffPaths>,
+    pub turn_diffs: ParkingMutex<crate::index::DiffPaths>,
     /// Execution permit ensuring only one prompt runs at a time for this session.
     /// Uses a semaphore with capacity 1 to guarantee FIFO ordering of concurrent prompts.
     /// This prevents race conditions where user messages are inserted between
@@ -183,11 +214,11 @@ impl SessionRuntime {
             cwd,
             _mcp_services: mcp_services,
             mcp_tool_state,
-            permission_cache: StdMutex::new(HashMap::new()),
+            permission_cache: ParkingMutex::new(HashMap::new()),
             workspace_handle: Arc::new(OnceCell::new()),
-            turn_snapshot: StdMutex::new(None),
-            pre_turn_snapshot_task: StdMutex::new(None),
-            turn_diffs: StdMutex::new(Default::default()),
+            turn_snapshot: ParkingMutex::new(None),
+            pre_turn_snapshot_task: ParkingMutex::new(None),
+            turn_diffs: ParkingMutex::new(Default::default()),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }

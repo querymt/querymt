@@ -314,14 +314,22 @@ impl AgentConfig {
         // Collect MCP tools (always when a runtime is present, regardless of
         // policy, because the policy was already chosen with MCP in mind in
         // builder_from_config).
-        let mcp_tool_defs: Vec<querymt::chat::Tool> =
+        //
+        // Load a single consistent snapshot — tools and defs are guaranteed to
+        // be from the same generation (no multi-lock tearing).
+        let mcp_snapshot =
             if let (Some(runtime), ToolPolicy::ProviderOnly | ToolPolicy::BuiltInAndProvider) =
                 (runtime, config.policy)
             {
-                runtime.mcp_tool_state.tool_defs.read().unwrap().clone()
+                Some(runtime.mcp_tool_state.load())
             } else {
-                vec![]
+                None
             };
+
+        let mcp_tool_defs: Vec<querymt::chat::Tool> = mcp_snapshot
+            .as_ref()
+            .map(|s| s.tool_defs.clone())
+            .unwrap_or_default();
 
         // Filter built-in / provider tools with the basic allowlist check.
         let mut filtered: Vec<querymt::chat::Tool> = tools
@@ -331,10 +339,10 @@ impl AgentConfig {
 
         // Filter MCP tools with the server-name-aware check so that
         // "servername.*" wildcard entries in the allowlist are honoured.
-        if let Some(runtime) = runtime {
-            let mcp_tools = runtime.mcp_tool_state.tools.read().unwrap();
+        if let Some(ref snap) = mcp_snapshot {
             for tool_def in mcp_tool_defs {
-                let server_name = mcp_tools
+                let server_name = snap
+                    .tools
                     .get(&tool_def.function.name)
                     .map(|a| a.server_name());
                 if crate::agent::tools::is_mcp_tool_allowed_with(

@@ -76,8 +76,11 @@ pub(crate) async fn build_mcp_state(
     }
 
     // Populate the shared tool state with the initial tool list.
-    *tool_state.tools.write().unwrap() = tools;
-    *tool_state.tool_defs.write().unwrap() = tool_defs;
+    tool_state.store(crate::agent::core::McpToolSnapshot {
+        tools,
+        tool_defs,
+        tools_hash: None,
+    });
 
     Ok(clients)
 }

@@ -152,14 +152,15 @@ pub(super) async fn execute_tool_call(
     // the MCP server name so that "servername.*" wildcard entries in the
     // allowlist correctly permit MCP tools (e.g. "context7.*" → "resolve-library-id").
     //
-    // Both lookups are in a separate block so the RwLockReadGuard is dropped
-    // before any `.await` — std::sync::RwLockReadGuard is not Send.
+    // Load a lock-free snapshot of the MCP tool state. The `Guard` is
+    // dropped before any `.await` (same discipline as the old RwLock).
     let (mcp_server_name, mcp_tool) = {
-        let tools = exec_ctx.runtime.mcp_tool_state.tools.read().unwrap();
-        let server_name = tools
+        let snap = exec_ctx.runtime.mcp_tool_state.load();
+        let server_name = snap
+            .tools
             .get(&call.function.name)
             .map(|a| a.server_name().to_owned());
-        let tool = tools.get(&call.function.name).cloned();
+        let tool = snap.tools.get(&call.function.name).cloned();
         (server_name, tool)
     };
 
@@ -435,12 +436,13 @@ pub(super) async fn ensure_tool_permission(
         return Ok(false);
     }
 
-    if let Ok(cache) = exec_ctx.runtime.permission_cache.lock()
-        && let Some(cached) = cache.get(tool_name)
     {
-        Span::current().record("cache_hit", true);
-        Span::current().record("granted", *cached);
-        return Ok(*cached);
+        let cache = exec_ctx.runtime.permission_cache.lock();
+        if let Some(cached) = cache.get(tool_name) {
+            Span::current().record("cache_hit", true);
+            Span::current().record("granted", *cached);
+            return Ok(*cached);
+        }
     }
     Span::current().record("cache_hit", false);
 
@@ -520,7 +522,8 @@ pub(super) async fn ensure_tool_permission(
         RequestPermissionOutcome::Selected(selected) => {
             let option_id = selected.option_id.0.as_ref();
             let allow = option_id == "allow_once" || option_id == "allow_always";
-            if let Ok(mut cache) = exec_ctx.runtime.permission_cache.lock() {
+            {
+                let mut cache = exec_ctx.runtime.permission_cache.lock();
                 if option_id == "allow_always" {
                     cache.insert(tool_name.to_string(), true);
                 } else if option_id == "reject_always" {
@@ -740,9 +743,8 @@ pub(super) async fn store_all_tool_results(
     combined.removed.sort();
     combined.removed.dedup();
 
-    if !combined.is_empty()
-        && let Ok(mut diffs) = exec_ctx.runtime.turn_diffs.lock()
-    {
+    if !combined.is_empty() {
+        let mut diffs = exec_ctx.runtime.turn_diffs.lock();
         diffs.added.extend(combined.added);
         diffs.modified.extend(combined.modified);
         diffs.removed.extend(combined.removed);
