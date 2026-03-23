@@ -65,8 +65,14 @@ fn init_logger_provider(
 
 /// Setup telemetry with configurable service name and version
 ///
+/// Uses **per-layer filtering** so that console output and OTLP telemetry
+/// can operate at independent log levels:
+///
+/// - Console (`fmt` layer): defaults to `ERROR`, overridden by `RUST_LOG`
+/// - OTLP layers (traces + logs): defaults to `INFO`, overridden by `QMT_TELEMETRY_LEVEL`
+///
 /// # Behavior
-/// - If `QMT_NO_TELEMETRY` env var is set, only sets up fmt + filter layers (no OTLP export)
+/// - If `QMT_NO_TELEMETRY` env var is set, only sets up fmt layer (no OTLP export)
 /// - If `OTEL_EXPORTER_OTLP_ENDPOINT` is not set, defaults to `http://otel.query.mt:4317`
 /// - If `OTEL_EXPORTER_OTLP_ENDPOINT` is set, uses that endpoint instead
 ///
@@ -77,21 +83,30 @@ fn init_logger_provider(
 /// # Environment Variables
 /// - `QMT_NO_TELEMETRY`: If set (any value), disables OTLP export
 /// - `OTEL_EXPORTER_OTLP_ENDPOINT`: Custom OTLP endpoint (defaults to http://otel.query.mt:4317)
-/// - `RUST_LOG`: Controls log filtering (via EnvFilter)
+/// - `RUST_LOG`: Controls console output filtering (defaults to `error`)
+/// - `QMT_TELEMETRY_LEVEL`: Controls OTLP telemetry filtering (defaults to `info`)
 pub fn setup_telemetry(service_name: &str, service_version: &str) {
     // Always initialize LogTracer for log->tracing bridge
     LogTracer::init().expect("Failed to set LogTracer");
 
-    let fmt_layer = fmt::layer().with_target(true);
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Console filter: default ERROR, overridden by RUST_LOG
+    let console_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error"));
+    let fmt_layer = fmt::layer().with_target(true).with_filter(console_filter);
 
     // Check if telemetry is disabled
     if std::env::var("QMT_NO_TELEMETRY").is_ok() {
-        let subscriber = Registry::default().with(filter).with(fmt_layer);
+        let subscriber = Registry::default().with(fmt_layer);
         tracing::subscriber::set_global_default(subscriber)
             .expect("Failed to set tracing subscriber");
         return;
     }
+
+    // Telemetry filter: default INFO, overridden by QMT_TELEMETRY_LEVEL
+    // Two separate instances needed because EnvFilter doesn't implement Clone
+    let telemetry_level = std::env::var("QMT_TELEMETRY_LEVEL").unwrap_or_else(|_| "info".into());
+    let trace_filter = EnvFilter::new(&telemetry_level);
+    let log_filter = EnvFilter::new(&telemetry_level);
 
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string());
@@ -103,10 +118,9 @@ pub fn setup_telemetry(service_name: &str, service_version: &str) {
     let log_layer = OpenTelemetryTracingBridge::new(&logger_provider);
 
     let subscriber = Registry::default()
-        .with(filter)
         .with(fmt_layer)
-        .with(OpenTelemetryLayer::new(tracer))
-        .with(log_layer);
+        .with(OpenTelemetryLayer::new(tracer).with_filter(trace_filter))
+        .with(log_layer.with_filter(log_filter));
 
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 }
