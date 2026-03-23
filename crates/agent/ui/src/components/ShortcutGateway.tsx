@@ -208,7 +208,7 @@ export function ShortcutGateway({
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="text-sm text-ui-primary">Create Schedule</div>
-                  <div className="text-xs text-ui-muted">Set up a recurring autonomous task for the current session</div>
+                  <div className="text-xs text-ui-muted">Set up a scheduled task for the current session</div>
                 </div>
                 <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
                   S

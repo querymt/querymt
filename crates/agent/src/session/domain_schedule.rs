@@ -18,6 +18,11 @@ pub enum ScheduleTrigger {
         event_filter: EventTriggerFilter,
         debounce_seconds: u64,
     },
+    /// Fire exactly once at the specified instant, then exhaust.
+    OnceAt {
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
 }
 
 /// Filter for event-driven schedule triggers.
@@ -198,12 +203,18 @@ impl Schedule {
         trigger: ScheduleTrigger,
     ) -> Self {
         let now = OffsetDateTime::now_utc();
+        let is_once = matches!(&trigger, ScheduleTrigger::OnceAt { .. });
         let next_run_at = match &trigger {
             ScheduleTrigger::Interval { seconds } => {
                 Some(now + time::Duration::seconds(*seconds as i64))
             }
             ScheduleTrigger::EventDriven { .. } => None,
+            ScheduleTrigger::OnceAt { at } => Some(*at),
         };
+        let mut config = ScheduleConfig::default();
+        if is_once {
+            config.max_runs = Some(1);
+        }
         Self {
             id: 0,
             public_id: uuid::Uuid::now_v7().to_string(),
@@ -217,7 +228,7 @@ impl Schedule {
             next_run_at,
             run_count: 0,
             consecutive_failures: 0,
-            config: ScheduleConfig::default(),
+            config,
             created_at: now,
             updated_at: now,
         }
@@ -300,6 +311,37 @@ mod tests {
         } else {
             panic!("Expected Interval variant");
         }
+    }
+
+    #[test]
+    fn schedule_trigger_once_at_serde_roundtrip() {
+        let at = OffsetDateTime::now_utc() + time::Duration::hours(2);
+        let trigger = ScheduleTrigger::OnceAt { at };
+        let json = serde_json::to_string(&trigger).unwrap();
+        assert!(json.contains("\"once_at\""), "tag should be once_at");
+        let rt: ScheduleTrigger = serde_json::from_str(&json).unwrap();
+        if let ScheduleTrigger::OnceAt { at: rt_at } = rt {
+            // Compare to second precision (rfc3339 may truncate sub-second)
+            assert_eq!(rt_at.unix_timestamp(), at.unix_timestamp());
+        } else {
+            panic!("Expected OnceAt variant");
+        }
+    }
+
+    #[test]
+    fn schedule_new_once_at_forces_max_runs_one() {
+        let at = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let schedule = Schedule::new(
+            "task-1".to_string(),
+            "sess-1".to_string(),
+            ScheduleTrigger::OnceAt { at },
+        );
+        assert_eq!(schedule.config.max_runs, Some(1));
+        assert_eq!(
+            schedule.next_run_at.map(|t| t.unix_timestamp()),
+            Some(at.unix_timestamp())
+        );
+        assert_eq!(schedule.state, ScheduleState::Armed);
     }
 
     #[test]

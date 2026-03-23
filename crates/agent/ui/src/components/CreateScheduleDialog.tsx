@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
-import { Clock, Zap } from 'lucide-react';
+import { Clock, Zap, CalendarClock } from 'lucide-react';
 
-type TriggerType = 'interval' | 'event';
+type TriggerType = 'interval' | 'event' | 'once';
 
 interface CreateScheduleDialogProps {
   open: boolean;
@@ -34,6 +34,9 @@ export function CreateScheduleDialog({
   const [eventThreshold, setEventThreshold] = useState('1');
   const [eventDebounceSeconds, setEventDebounceSeconds] = useState('30');
 
+  // Once-at fields
+  const [onceAtDatetime, setOnceAtDatetime] = useState('');
+
   // Limits
   const [maxRuns, setMaxRuns] = useState('');
   const [showLimits, setShowLimits] = useState(false);
@@ -48,6 +51,13 @@ export function CreateScheduleDialog({
       setEventKind('');
       setEventThreshold('1');
       setEventDebounceSeconds('30');
+      // Default to 1 hour from now, formatted for datetime-local input
+      const defaultAt = new Date(Date.now() + 3600_000);
+      defaultAt.setSeconds(0, 0);
+      const pad = (n: number) => String(n).padStart(2, '0');
+      setOnceAtDatetime(
+        `${defaultAt.getFullYear()}-${pad(defaultAt.getMonth() + 1)}-${pad(defaultAt.getDate())}T${pad(defaultAt.getHours())}:${pad(defaultAt.getMinutes())}`,
+      );
       setMaxRuns('');
       setShowLimits(false);
     }
@@ -64,6 +74,10 @@ export function CreateScheduleDialog({
       if (intervalUnit === 'hours') seconds *= 3600;
       if (seconds <= 0) return;
       trigger = { type: 'interval', seconds };
+    } else if (triggerType === 'once') {
+      const at = new Date(onceAtDatetime);
+      if (isNaN(at.getTime()) || at.getTime() <= Date.now()) return;
+      trigger = { type: 'once_at', at: at.toISOString() };
     } else {
       if (!eventKind.trim()) return;
       trigger = {
@@ -78,6 +92,9 @@ export function CreateScheduleDialog({
     }
 
     const opts: { maxRuns?: number } = {};
+    if (triggerType === 'once') {
+      opts.maxRuns = 1;
+    }
     const maxRunsParsed = parseInt(maxRuns, 10);
     if (maxRunsParsed > 0) opts.maxRuns = maxRunsParsed;
 
@@ -91,6 +108,10 @@ export function CreateScheduleDialog({
       const val = parseInt(intervalValue, 10);
       return val > 0;
     }
+    if (triggerType === 'once') {
+      const at = new Date(onceAtDatetime);
+      return !isNaN(at.getTime()) && at.getTime() > Date.now();
+    }
     return eventKind.trim().length > 0;
   })();
 
@@ -103,7 +124,7 @@ export function CreateScheduleDialog({
             Create Schedule
           </Dialog.Title>
           <Dialog.Description className="mt-1 text-sm text-ui-secondary">
-            Set up an autonomous recurring task for the current session.
+            Set up an autonomous scheduled task for the current session.
           </Dialog.Description>
 
           <form className="mt-4 space-y-4" onSubmit={handleSubmit}>
@@ -122,6 +143,18 @@ export function CreateScheduleDialog({
                 >
                   <Clock className="w-3.5 h-3.5" />
                   Interval
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTriggerType('once')}
+                  className={`flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border text-sm transition-all ${
+                    triggerType === 'once'
+                      ? 'border-accent-tertiary bg-accent-tertiary/15 text-accent-tertiary shadow-[0_0_8px_rgba(var(--accent-tertiary-rgb),0.2)]'
+                      : 'border-surface-border bg-surface-canvas text-ui-secondary hover:border-surface-border/80 hover:bg-surface-elevated'
+                  }`}
+                >
+                  <CalendarClock className="w-3.5 h-3.5" />
+                  Once
                 </button>
                 <button
                   type="button"
@@ -160,6 +193,20 @@ export function CreateScheduleDialog({
                     <option value="hours">hours</option>
                   </select>
                 </div>
+              </div>
+            ) : triggerType === 'once' ? (
+              <div className="space-y-2">
+                <label className="text-xs font-mono text-ui-muted">Run at</label>
+                <input
+                  type="datetime-local"
+                  value={onceAtDatetime}
+                  onChange={(e) => setOnceAtDatetime(e.target.value)}
+                  min={new Date().toISOString().slice(0, 16)}
+                  className="w-full rounded-lg border border-surface-border bg-surface-canvas px-3 py-2 text-sm text-ui-primary focus:border-accent-primary/60 focus:outline-none"
+                />
+                <p className="text-[10px] text-ui-muted">
+                  Task will run exactly once at this time, then complete.
+                </p>
               </div>
             ) : (
               <div className="space-y-3">

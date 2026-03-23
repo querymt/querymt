@@ -856,7 +856,7 @@ impl SchedulerActor {
     /// have changed (interval schedules).
     fn enqueue_schedule(&mut self, schedule: &Schedule) {
         match &schedule.trigger {
-            ScheduleTrigger::Interval { .. } => {
+            ScheduleTrigger::Interval { .. } | ScheduleTrigger::OnceAt { .. } => {
                 if let Some(next) = schedule.next_run_at {
                     self.deadline_queue.insert(next, schedule.public_id.clone());
                     // Queue head may have changed — reschedule wake

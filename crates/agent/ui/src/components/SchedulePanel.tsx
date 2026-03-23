@@ -62,6 +62,14 @@ function describeTrigger(trigger: any): string {
     if (secs < 3600) return `Every ${Math.round(secs / 60)}m`;
     return `Every ${Math.round(secs / 3600)}h`;
   }
+  // Once-at trigger: { type: "once_at", at: "ISO8601" }
+  if (trigger.type === 'once_at') {
+    try {
+      return `Once at ${new Date(trigger.at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`;
+    } catch {
+      return 'Once';
+    }
+  }
   // Event-driven trigger: { type: "event_driven", event_filter: { event_kinds: [...] }, debounce_seconds: N }
   if (trigger.type === 'event_driven') {
     const kinds: string[] = trigger.event_filter?.event_kinds ?? [];

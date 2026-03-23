@@ -204,3 +204,62 @@ async fn event_driven_schedule_storage() {
         panic!("Expected EventDriven trigger");
     }
 }
+
+#[tokio::test]
+async fn once_at_schedule_storage_and_max_runs() {
+    let db = setup_db();
+    let repo = Arc::new(SqliteScheduleRepository::new(db.clone())) as Arc<dyn ScheduleRepository>;
+
+    let (session_id, task_id) = {
+        let c = db.lock().unwrap();
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        c.execute(
+            "INSERT INTO sessions (public_id, created_at, updated_at) VALUES (?, ?, ?)",
+            rusqlite::params!["sess-once", now, now],
+        )
+        .unwrap();
+        let session_id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO tasks (public_id, session_id, kind, status, created_at, updated_at) VALUES (?, ?, 'recurring', 'active', ?, ?)",
+            rusqlite::params!["task-once", session_id, now, now],
+        )
+        .unwrap();
+        let task_id = c.last_insert_rowid();
+        (session_id, task_id)
+    };
+
+    let fire_at = OffsetDateTime::now_utc() + time::Duration::hours(3);
+    let mut schedule = Schedule::new(
+        "task-once".to_string(),
+        "sess-once".to_string(),
+        ScheduleTrigger::OnceAt { at: fire_at },
+    );
+    // Populate internal IDs required by the repository
+    schedule.public_id = "once-sched".to_string();
+    schedule.task_id = task_id;
+    schedule.session_id = session_id;
+
+    // Verify Schedule::new enforced max_runs = 1
+    assert_eq!(schedule.config.max_runs, Some(1));
+    assert_eq!(
+        schedule.next_run_at.map(|t| t.unix_timestamp()),
+        Some(fire_at.unix_timestamp())
+    );
+
+    let created = repo.create_schedule(schedule).await.unwrap();
+    let fetched = repo
+        .get_schedule(&created.public_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    if let ScheduleTrigger::OnceAt { at } = &fetched.trigger {
+        assert_eq!(at.unix_timestamp(), fire_at.unix_timestamp());
+    } else {
+        panic!("Expected OnceAt trigger");
+    }
+    assert_eq!(fetched.config.max_runs, Some(1));
+    assert_eq!(fetched.state, ScheduleState::Armed);
+}

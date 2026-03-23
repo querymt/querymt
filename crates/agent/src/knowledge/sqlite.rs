@@ -441,7 +441,8 @@ impl KnowledgeStore for SqliteKnowledgeStore {
             let (keywords, stemmed_keywords) = extract_keywords(&question);
             let fts_query = build_fts5_query(&keywords);
 
-            let entries = query_entries(conn, &scope, fts_query.as_deref(), &stemmed_keywords, &opts)?;
+            let entries =
+                query_entries(conn, &scope, fts_query.as_deref(), &stemmed_keywords, &opts)?;
             let consolidations = if opts.include_consolidations {
                 query_consolidations(conn, &scope, fts_query.as_deref(), opts.limit)?
             } else {
