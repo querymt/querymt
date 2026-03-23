@@ -1,15 +1,34 @@
 //! Execution context bundling all per-run state for agent execution
 
 use crate::agent::core::{SessionRuntime, ToolConfig};
+use crate::knowledge::KnowledgeStore;
 use crate::model::AgentMessage;
 use crate::session::error::SessionResult;
 use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::{LLMConfig, SessionExecutionConfig};
 use crate::tools::AgentToolContext;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+/// Describes the origin of an execution cycle.
+///
+/// Used to correlate scheduled executions with the `SchedulerActor` so that
+/// terminal events (`ScheduledExecutionCompleted` / `ScheduledExecutionFailed`)
+/// carry the correct `schedule_public_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExecutionOrigin {
+    /// Interactive prompt from a user or delegation.
+    Interactive,
+    /// Prompt fired by the scheduler for a recurring schedule.
+    Scheduled {
+        /// Public ID of the schedule that triggered this execution.
+        schedule_public_id: String,
+    },
+}
 
 /// Bundles all execution state needed for a single agent run.
 ///
@@ -46,6 +65,22 @@ pub(crate) struct ExecutionContext {
     /// `SetDeniedTools`, and `SetToolPolicy` messages are honoured during execution.
     /// Falls back to `AgentConfig.tool_config` when not overridden.
     pub tool_config: ToolConfig,
+
+    /// Origin of this execution cycle — interactive (user/delegation) or scheduled.
+    ///
+    /// When `Scheduled`, the `SessionActor` emits explicit terminal events
+    /// (`ScheduledExecutionCompleted` / `ScheduledExecutionFailed`) so the
+    /// `SchedulerActor` can correlate cycle completion without relying on
+    /// generic task events.
+    pub execution_origin: ExecutionOrigin,
+
+    /// Optional knowledge store, propagated into tool contexts so knowledge
+    /// tools (`knowledge_ingest`, `knowledge_query`, etc.) can access it.
+    pub knowledge_store: Option<Arc<dyn KnowledgeStore>>,
+
+    /// Optional event sink, propagated into tool contexts so tools can emit
+    /// agent events (e.g. `KnowledgeIngested`, `KnowledgeConsolidated`).
+    pub event_sink: Option<Arc<crate::event_sink::EventSink>>,
 }
 
 impl ExecutionContext {
@@ -64,12 +99,33 @@ impl ExecutionContext {
             session_handle,
             cancellation_token: CancellationToken::new(),
             tool_config,
+            execution_origin: ExecutionOrigin::Interactive,
+            knowledge_store: None,
+            event_sink: None,
         }
     }
 
     /// Attach a cancellation token, replacing the default no-op token.
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
+        self
+    }
+
+    /// Set the execution origin for this context.
+    pub fn with_execution_origin(mut self, origin: ExecutionOrigin) -> Self {
+        self.execution_origin = origin;
+        self
+    }
+
+    /// Set the knowledge store for this context.
+    pub fn with_knowledge_store(mut self, store: Option<Arc<dyn KnowledgeStore>>) -> Self {
+        self.knowledge_store = store;
+        self
+    }
+
+    /// Set the event sink for this context.
+    pub fn with_event_sink(mut self, sink: Arc<crate::event_sink::EventSink>) -> Self {
+        self.event_sink = Some(sink);
         self
     }
 
@@ -97,19 +153,29 @@ impl ExecutionContext {
     ///
     /// This centralizes the construction of `AgentToolContext` from the execution state,
     /// extracting the necessary fields (session_id, cwd, agent_registry) in one place.
-    /// The cancellation token is propagated so tools can abort long-running work.
+    /// The cancellation token and knowledge store are propagated so tools can abort
+    /// long-running work and access the knowledge layer.
     pub fn tool_context(
         &self,
         agent_registry: Arc<dyn crate::delegation::AgentRegistry>,
         elicitation_tx: Option<tokio::sync::mpsc::Sender<crate::tools::ElicitationRequest>>,
     ) -> AgentToolContext {
-        AgentToolContext::new(
+        let mut ctx = AgentToolContext::new(
             self.session_id.clone(),
             self.cwd().map(|p| p.to_path_buf()),
             Some(agent_registry),
             elicitation_tx,
         )
-        .with_cancellation_token(self.cancellation_token.clone())
+        .with_cancellation_token(self.cancellation_token.clone());
+
+        if let Some(ref ks) = self.knowledge_store {
+            ctx.with_knowledge_store(ks.clone());
+        }
+        if let Some(ref sink) = self.event_sink {
+            ctx.with_event_sink(sink.clone());
+        }
+
+        ctx
     }
 }
 
@@ -255,5 +321,58 @@ mod tests {
         );
         // Fresh session has no execution config stored
         assert!(ctx.execution_config().is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_context_propagates_knowledge_store() {
+        use crate::knowledge::KnowledgeStore;
+        use crate::knowledge::sqlite::SqliteKnowledgeStore;
+        use crate::test_utils::sqlite_conn_with_schema;
+        use crate::tools::context::ToolContext;
+
+        let db = sqlite_conn_with_schema();
+        let knowledge_store: Arc<dyn KnowledgeStore> = Arc::new(SqliteKnowledgeStore::new(db));
+
+        let (runtime, runtime_ctx, handle) = make_context_parts().await;
+        let ctx = ExecutionContext::new(
+            handle.session().public_id.clone(),
+            runtime,
+            runtime_ctx,
+            handle,
+            ToolConfig::default(),
+        )
+        .with_knowledge_store(Some(knowledge_store.clone()));
+
+        let agent_registry = Arc::new(crate::delegation::DefaultAgentRegistry::new());
+        let tool_ctx = ctx.tool_context(agent_registry, None);
+
+        // The knowledge_store must be propagated to the tool context
+        assert!(
+            tool_ctx.knowledge_store().is_some(),
+            "knowledge_store should be Some when set on ExecutionContext"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_context_no_knowledge_store_when_not_set() {
+        use crate::tools::context::ToolContext;
+
+        let (runtime, runtime_ctx, handle) = make_context_parts().await;
+        let ctx = ExecutionContext::new(
+            handle.session().public_id.clone(),
+            runtime,
+            runtime_ctx,
+            handle,
+            ToolConfig::default(),
+        );
+
+        let agent_registry = Arc::new(crate::delegation::DefaultAgentRegistry::new());
+        let tool_ctx = ctx.tool_context(agent_registry, None);
+
+        // Without knowledge_store, tool context should return None
+        assert!(
+            tool_ctx.knowledge_store().is_none(),
+            "knowledge_store should be None when not set"
+        );
     }
 }

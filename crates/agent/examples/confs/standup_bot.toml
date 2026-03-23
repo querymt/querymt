@@ -1,0 +1,90 @@
+# Standup Bot — Scheduled Daily Standup Reporter
+#
+# An autonomous agent that runs on a recurring schedule to generate daily
+# standup reports from git history. Ingests findings into the knowledge store
+# and periodically consolidates daily entries into weekly summaries.
+#
+# ## Features Demonstrated
+#
+# - **Interval scheduling**: Runs every 24 hours (86400s), configurable
+# - **Knowledge ingest/query/consolidate**: Full knowledge lifecycle
+# - **Autonomous execution**: No user interaction needed per cycle
+# - **Execution limits**: Bounded cost and steps per scheduled cycle
+#
+# ## Usage
+#
+#   # Start the dashboard (schedule is created via UI or API)
+#   cargo run --example qmtcode --features dashboard -- confs/standup_bot.toml --dashboard
+#
+#   # Then create a schedule via the dashboard UI:
+#   #   Session → Schedules → Create Schedule
+#   #   Prompt: "Run a standup cycle: analyze recent git activity, ingest findings, and report."
+#   #   Trigger: Interval, 86400 seconds (daily)
+#   #   Max runs: 30 (one month trial)
+#   #   Max steps: 20
+#
+#   # Or for testing with a short interval:
+#   #   Trigger: Interval, 120 seconds (every 2 minutes)
+#   #   Max runs: 5
+
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+assume_mutating = false
+
+# No mutating tools — this agent is strictly read-only + knowledge writes
+mutating_tools = []
+
+tools = [
+  # Git & codebase analysis (read-only)
+  "read_tool", "glob", "search_text", "ls", "shell",
+
+  # Knowledge lifecycle
+  "knowledge_ingest",
+  "knowledge_query",
+  "knowledge_consolidate",
+  "knowledge_list_unconsolidated",
+  "knowledge_stats",
+
+  # Task tracking
+  "create_task", "todowrite", "todoread",
+]
+
+system = [
+  { file = "../prompts/standup_bot.txt" },
+  { file = "../prompts/code_meta.jinja2" }
+]
+
+# Snapshot: track what the agent reads (no writes expected)
+[agent.execution.snapshot]
+backend = "git"
+
+# Compaction: tool output truncation (Layer 1)
+[agent.execution.tool_output]
+max_lines = 1000
+max_bytes = 25600
+
+# Compaction: pruning after every turn (Layer 2)
+[agent.execution.pruning]
+protect_tokens = 20000
+
+# Compaction: AI summary on context overflow (Layer 3)
+[agent.execution.compaction]
+auto = true
+
+# =============================================================================
+# Middleware Stack
+# =============================================================================
+
+# Execution limits — keep scheduled cycles fast and cheap
+[[middleware]]
+type = "limits"
+max_steps = 30
+max_turns = 15
+
+# Context management
+[[middleware]]
+type = "context"
+warn_at_percent = 80
+compact_at_percent = 90
+fallback_max_tokens = 128000

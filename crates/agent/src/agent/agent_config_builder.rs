@@ -67,6 +67,8 @@ pub struct AgentConfigBuilder {
     snapshot_gc_config: crate::snapshot::GcConfig,
     pending_elicitations: crate::elicitation::PendingElicitationMap,
     mcp_servers: Vec<McpServerConfig>,
+    schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
+    knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
 }
 
 impl AgentConfigBuilder {
@@ -119,6 +121,8 @@ impl AgentConfigBuilder {
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
             pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mcp_servers: Vec::new(),
+            schedule_repository: None,
+            knowledge_store: None,
         }
     }
 
@@ -164,6 +168,8 @@ impl AgentConfigBuilder {
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
             pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mcp_servers: Vec::new(),
+            schedule_repository: None,
+            knowledge_store: None,
         }
     }
 
@@ -200,6 +206,8 @@ impl AgentConfigBuilder {
             delegation_context_config: self.delegation_context_config,
             pending_elicitations: self.pending_elicitations,
             mcp_servers: self.mcp_servers,
+            schedule_repository: self.schedule_repository,
+            knowledge_store: self.knowledge_store,
         }
     }
 
@@ -404,6 +412,26 @@ impl AgentConfigBuilder {
     /// Sets the MCP servers to attach to every new session (from TOML `[[mcp]]` config).
     pub fn with_mcp_servers(mut self, servers: Vec<McpServerConfig>) -> Self {
         self.mcp_servers = servers;
+        self
+    }
+
+    // ── Scheduling & Knowledge ────────────────────────────────────────────
+
+    /// Set the schedule repository (from storage backend).
+    pub fn with_schedule_repository(
+        mut self,
+        repo: Arc<dyn crate::session::repo_schedule::ScheduleRepository>,
+    ) -> Self {
+        self.schedule_repository = Some(repo);
+        self
+    }
+
+    /// Set the knowledge store (from storage backend).
+    pub fn with_knowledge_store(
+        mut self,
+        store: Arc<dyn crate::knowledge::KnowledgeStore>,
+    ) -> Self {
+        self.knowledge_store = Some(store);
         self
     }
 

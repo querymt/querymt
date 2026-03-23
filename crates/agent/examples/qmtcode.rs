@@ -315,6 +315,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Received Ctrl+C, shutting down mesh node...");
     }
 
+    // Graceful shutdown: release scheduler lease, stop background tasks.
+    // Idempotent — safe to call even if the dashboard server already ran shutdown.
+    runner.handle().shutdown().await;
+
     Ok(())
 }
 

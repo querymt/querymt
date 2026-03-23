@@ -40,6 +40,8 @@ pub struct Session {
     pub parent_session_id: Option<i64>,
     /// Fork origin (user or delegation)
     pub fork_origin: Option<ForkOrigin>,
+    /// Session kind for specialized workflows (e.g. "recurring")
+    pub session_kind: Option<String>,
     /// Fork point type (message_index or progress_entry)
     pub fork_point_type: Option<ForkPointType>,
     /// Fork point reference (message ID or progress entry ID)

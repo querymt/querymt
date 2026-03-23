@@ -72,6 +72,9 @@ export type {
   DuplicateWarning,
   FunctionLocation,
   SimilarMatch,
+  ScheduleInfo,
+  KnowledgeEntryInfo,
+  ConsolidationInfo,
 } from './generated/types';
 
 // FileIndexEntry is now generated from Rust via typeshare — re-exported above.

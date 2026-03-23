@@ -244,6 +244,76 @@ export type AgentEventKind =
 	 */
 	| { type: "workspace_index_ready", data: {
 	workspace_root: string;
+}}
+	/** A new schedule was created and armed. */
+	| { type: "schedule_created", data: {
+	schedule_public_id: string;
+	session_public_id: string;
+	task_public_id: string;
+}}
+	/** A schedule cycle was fired (ScheduledPrompt sent to SessionActor). */
+	| { type: "schedule_fired", data: {
+	schedule_public_id: string;
+	session_public_id: string;
+}}
+	/** A scheduled cycle completed successfully. */
+	| { type: "schedule_cycle_completed", data: {
+	schedule_public_id: string;
+	turn_id: string;
+	run_count: number;
+}}
+	/** A scheduled cycle failed. */
+	| { type: "schedule_cycle_failed", data: {
+	schedule_public_id: string;
+	turn_id?: string;
+	error: string;
+}}
+	/** A schedule was paused by user/API. */
+	| { type: "schedule_paused", data: {
+	schedule_public_id: string;
+}}
+	/** A schedule was resumed by user/API. */
+	| { type: "schedule_resumed", data: {
+	schedule_public_id: string;
+}}
+	/** A schedule reached max_runs and is now exhausted. */
+	| { type: "schedule_exhausted", data: {
+	schedule_public_id: string;
+}}
+	/** A schedule exceeded its failure threshold. */
+	| { type: "schedule_failed", data: {
+	schedule_public_id: string;
+	consecutive_failures: number;
+}}
+	/** SessionActor finished a scheduled execution cycle successfully. */
+	| { type: "scheduled_execution_completed", data: {
+	schedule_public_id: string;
+	turn_id: string;
+}}
+	/** SessionActor's scheduled execution cycle failed. */
+	| { type: "scheduled_execution_failed", data: {
+	schedule_public_id: string;
+	turn_id?: string;
+	error: string;
+}}
+	/**
+	 * Debounce window completed for an event-driven schedule.
+	 * Internal event used by the scheduler to trigger after debounce.
+	 */
+	| { type: "schedule_debounce_completed", data: {
+	schedule_public_id: string;
+}}
+	/** A new knowledge entry was ingested. */
+	| { type: "knowledge_ingested", data: {
+	scope: string;
+	entry_public_id: string;
+	source: string;
+}}
+	/** Knowledge entries were consolidated into an insight. */
+	| { type: "knowledge_consolidated", data: {
+	scope: string;
+	consolidation_public_id: string;
+	source_count: number;
 }};
 
 /**
@@ -433,6 +503,16 @@ export interface AuthProviderEntry {
 	preferred_method?: AuthMethod;
 }
 
+/** Knowledge consolidation DTO for the UI (read-only). */
+export interface ConsolidationInfo {
+	public_id: string;
+	scope: string;
+	summary: string;
+	insight: string;
+	source_count: number;
+	created_at: string;
+}
+
 /** Location of a function in source code */
 export interface FunctionLocation {
 	file_path: string;
@@ -517,6 +597,19 @@ export interface FunctionToolInfo {
 	parameters: any;
 }
 
+/** Knowledge entry DTO for the UI (read-only). */
+export interface KnowledgeEntryInfo {
+	public_id: string;
+	scope: string;
+	source: string;
+	summary: string;
+	entities: string[];
+	topics: string[];
+	importance: number;
+	consolidated_at?: string;
+	created_at: string;
+}
+
 /**
  * Mirror of `querymt::mcp::config::McpServerConfig` for typeshare generation.
  * Note: kept for typeshare output; may be unused in Rust code paths.
@@ -599,6 +692,25 @@ export interface RemoteSessionInfo {
 	peer_label: string;
 }
 
+/** Schedule information DTO for the UI. */
+export interface ScheduleInfo {
+	public_id: string;
+	task_public_id: string;
+	session_public_id: string;
+	/** Serialized trigger config */
+	trigger: any;
+	/** Current state: armed, running, paused, exhausted, failed */
+	state: string;
+	last_run_at?: string;
+	next_run_at?: string;
+	run_count: number;
+	consecutive_failures: number;
+	max_runs?: number;
+	max_runtime_seconds: number;
+	created_at: string;
+	updated_at: string;
+}
+
 /** Summary of a session for listing. */
 export interface SessionSummary {
 	session_id: string;
@@ -611,6 +723,8 @@ export interface SessionSummary {
 	parent_session_id?: string;
 	/** Fork origin: "user" or "delegation" */
 	fork_origin?: string;
+	/** Session kind for specialized workflows (e.g. "recurring") */
+	session_kind?: string;
 	/** Whether this session has child sessions */
 	has_children: boolean;
 	/**
@@ -936,7 +1050,56 @@ export type UiClientMessage =
 	method: AuthMethod;
 }}
 	/** Trigger an update of all OCI provider plugins. */
-	| { type: "update_plugins", data?: undefined };
+	| { type: "update_plugins", data?: undefined }
+	/** Create a new schedule (recurring task + schedule trigger) */
+	| { type: "create_schedule", data: {
+	session_id: string;
+	/** Prompt text for each cycle (becomes the task's expected_deliverable) */
+	prompt: string;
+	/** Trigger configuration as JSON (ScheduleTrigger) */
+	trigger: any;
+	/** Optional execution limits */
+	max_steps?: number;
+	max_cost_usd?: number;
+	/** Optional max runs before exhaustion */
+	max_runs?: number;
+}}
+	/** List schedules for a session (or all if session_id is None) */
+	| { type: "list_schedules", data: {
+	session_id?: string;
+}}
+	/** Pause a schedule */
+	| { type: "pause_schedule", data: {
+	schedule_public_id: string;
+}}
+	/** Resume a paused schedule */
+	| { type: "resume_schedule", data: {
+	schedule_public_id: string;
+}}
+	/** Trigger a schedule to fire immediately */
+	| { type: "trigger_schedule", data: {
+	schedule_public_id: string;
+}}
+	/** Delete a schedule */
+	| { type: "delete_schedule", data: {
+	schedule_public_id: string;
+}}
+	/** Query the knowledge store */
+	| { type: "query_knowledge", data: {
+	scope: string;
+	question: string;
+	limit?: number;
+}}
+	/** List knowledge entries for a scope */
+	| { type: "list_knowledge", data: {
+	scope: string;
+	/** Optional filter as JSON (topics, entities, since, consolidated, limit) */
+	filter?: any;
+}}
+	/** Get knowledge stats for a scope */
+	| { type: "knowledge_stats", data: {
+	scope: string;
+}};
 
 /**
  * A block of content in a UI prompt (text or resource reference).
@@ -1110,5 +1273,39 @@ export type UiServerMessage =
 	provider: string;
 	success: boolean;
 	message: string;
+}}
+	/** Schedule list response */
+	| { type: "schedule_list", data: {
+	schedules: ScheduleInfo[];
+}}
+	/** Schedule created successfully */
+	| { type: "schedule_created_result", data: {
+	success: boolean;
+	schedule_public_id?: string;
+	message?: string;
+}}
+	/** Schedule action result (pause/resume/trigger/delete) */
+	| { type: "schedule_action_result", data: {
+	success: boolean;
+	schedule_public_id: string;
+	action: string;
+	message?: string;
+}}
+	/** Knowledge query result (entries + consolidations) */
+	| { type: "knowledge_query_result", data: {
+	entries: KnowledgeEntryInfo[];
+	consolidations: ConsolidationInfo[];
+}}
+	/** Knowledge list result */
+	| { type: "knowledge_list_result", data: {
+	entries: KnowledgeEntryInfo[];
+}}
+	/** Knowledge stats result */
+	| { type: "knowledge_stats_result", data: {
+	total_entries: number;
+	unconsolidated_entries: number;
+	total_consolidations: number;
+	latest_entry_at?: string;
+	latest_consolidation_at?: string;
 }};
 

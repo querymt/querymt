@@ -28,6 +28,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             llm_config_id INTEGER,
             parent_session_id INTEGER,
             fork_origin TEXT,
+            session_kind TEXT,
             fork_point_type TEXT,
             fork_point_ref TEXT,
             fork_instructions TEXT,
@@ -277,6 +278,187 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 
         CREATE INDEX IF NOT EXISTS idx_custom_models_provider
             ON custom_models(provider);
+
+        -- ========================================================================
+        -- TIER 1: SCHEDULES (with public_id) — Autonomous scheduled work
+        -- ========================================================================
+
+        CREATE TABLE IF NOT EXISTS schedules (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            task_id INTEGER NOT NULL,
+            task_public_id TEXT NOT NULL,
+            session_id INTEGER NOT NULL,
+            session_public_id TEXT NOT NULL,
+            trigger_json TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'armed',
+            last_run_at TEXT,
+            next_run_at TEXT,
+            run_count INTEGER NOT NULL DEFAULT 0,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            config_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_schedules_state_next_run
+            ON schedules(state, next_run_at) WHERE state = 'armed';
+        CREATE INDEX IF NOT EXISTS idx_schedules_running_last_run
+            ON schedules(last_run_at) WHERE state = 'running';
+        CREATE INDEX IF NOT EXISTS idx_schedules_terminal_updated
+            ON schedules(state, updated_at) WHERE state IN ('failed', 'exhausted');
+        CREATE INDEX IF NOT EXISTS idx_schedules_session_public
+            ON schedules(session_public_id);
+        CREATE INDEX IF NOT EXISTS idx_schedules_task_public
+            ON schedules(task_public_id);
+
+        -- Scheduler lease table (single-row, DB-backed leadership)
+        CREATE TABLE IF NOT EXISTS scheduler_lease (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            owner_id TEXT NOT NULL,
+            acquired_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+
+        -- ========================================================================
+        -- TIER 1: KNOWLEDGE LAYER (with public_id) — Pluggable structured memory
+        -- ========================================================================
+
+        CREATE TABLE IF NOT EXISTS knowledge_entries (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            scope TEXT NOT NULL,
+            source TEXT NOT NULL,
+            raw_text TEXT,
+            summary TEXT NOT NULL,
+            entities_json TEXT NOT NULL DEFAULT '[]',
+            topics_json TEXT NOT NULL DEFAULT '[]',
+            connections_json TEXT NOT NULL DEFAULT '[]',
+            importance REAL NOT NULL DEFAULT 0.5,
+            consolidated_at TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_knowledge_entries_scope
+            ON knowledge_entries(scope);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_entries_unconsolidated
+            ON knowledge_entries(scope, consolidated_at)
+            WHERE consolidated_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_knowledge_entries_created
+            ON knowledge_entries(scope, created_at);
+
+        CREATE TABLE IF NOT EXISTS knowledge_consolidations (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT UNIQUE NOT NULL,
+            scope TEXT NOT NULL,
+            source_entry_public_ids_json TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            insight TEXT NOT NULL,
+            connections_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_knowledge_consolidations_scope
+            ON knowledge_consolidations(scope);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_consolidations_created
+            ON knowledge_consolidations(scope, created_at);
+
+        -- Junction tables for normalized entity/topic matching.
+        -- Stores both original and normalized (lowercased + stemmed) forms
+        -- so queries can match via indexed exact lookups instead of LIKE scans.
+        CREATE TABLE IF NOT EXISTS knowledge_entry_entities (
+            entry_id INTEGER NOT NULL REFERENCES knowledge_entries(id) ON DELETE CASCADE,
+            entity TEXT NOT NULL,
+            entity_normalized TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_kee_entry
+            ON knowledge_entry_entities(entry_id);
+        CREATE INDEX IF NOT EXISTS idx_kee_normalized
+            ON knowledge_entry_entities(entity_normalized);
+
+        CREATE TABLE IF NOT EXISTS knowledge_entry_topics (
+            entry_id INTEGER NOT NULL REFERENCES knowledge_entries(id) ON DELETE CASCADE,
+            topic TEXT NOT NULL,
+            topic_normalized TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ket_entry
+            ON knowledge_entry_topics(entry_id);
+        CREATE INDEX IF NOT EXISTS idx_ket_normalized
+            ON knowledge_entry_topics(topic_normalized);
+
+        CREATE TABLE IF NOT EXISTS knowledge_ingestion_log (
+            id INTEGER PRIMARY KEY,
+            scope TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            processed_at TEXT NOT NULL,
+            UNIQUE(scope, source_key)
+        );
+
+        -- ========================================================================
+        -- FTS5 INDEXES — BM25-ranked full-text search for knowledge layer
+        -- ========================================================================
+
+        -- FTS5 index for knowledge entries (summary + raw_text + source).
+        -- External-content table: data lives in knowledge_entries, FTS only
+        -- maintains the inverted index. The porter tokenizer adds English
+        -- stemming (e.g. "configured" matches "configuration").
+        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_entries_fts USING fts5(
+            summary, raw_text, source,
+            content='knowledge_entries',
+            content_rowid='id',
+            tokenize='porter unicode61'
+        );
+
+        -- FTS5 index for knowledge consolidations (summary + insight).
+        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_consolidations_fts USING fts5(
+            summary, insight,
+            content='knowledge_consolidations',
+            content_rowid='id',
+            tokenize='porter unicode61'
+        );
+
+        -- Sync triggers: keep FTS indexes in sync with base tables.
+        -- INSERT trigger for knowledge_entries
+        CREATE TRIGGER IF NOT EXISTS knowledge_entries_ai AFTER INSERT ON knowledge_entries BEGIN
+            INSERT INTO knowledge_entries_fts(rowid, summary, raw_text, source)
+            VALUES (new.id, new.summary, COALESCE(new.raw_text, ''), new.source);
+        END;
+
+        -- UPDATE trigger for knowledge_entries
+        CREATE TRIGGER IF NOT EXISTS knowledge_entries_au AFTER UPDATE ON knowledge_entries BEGIN
+            INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, summary, raw_text, source)
+            VALUES ('delete', old.id, old.summary, COALESCE(old.raw_text, ''), old.source);
+            INSERT INTO knowledge_entries_fts(rowid, summary, raw_text, source)
+            VALUES (new.id, new.summary, COALESCE(new.raw_text, ''), new.source);
+        END;
+
+        -- DELETE trigger for knowledge_entries
+        CREATE TRIGGER IF NOT EXISTS knowledge_entries_ad AFTER DELETE ON knowledge_entries BEGIN
+            INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, summary, raw_text, source)
+            VALUES ('delete', old.id, old.summary, COALESCE(old.raw_text, ''), old.source);
+        END;
+
+        -- INSERT trigger for knowledge_consolidations
+        CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_ai AFTER INSERT ON knowledge_consolidations BEGIN
+            INSERT INTO knowledge_consolidations_fts(rowid, summary, insight)
+            VALUES (new.id, new.summary, new.insight);
+        END;
+
+        -- UPDATE trigger for knowledge_consolidations
+        CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_au AFTER UPDATE ON knowledge_consolidations BEGIN
+            INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, summary, insight)
+            VALUES ('delete', old.id, old.summary, old.insight);
+            INSERT INTO knowledge_consolidations_fts(rowid, summary, insight)
+            VALUES (new.id, new.summary, new.insight);
+        END;
+
+        -- DELETE trigger for knowledge_consolidations
+        CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_ad AFTER DELETE ON knowledge_consolidations BEGIN
+            INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, summary, insight)
+            VALUES ('delete', old.id, old.summary, old.insight);
+        END;
         "#,
     )?;
 

@@ -1,5 +1,5 @@
 use crate::middleware::{ExecutionState, MiddlewareDriver, Result};
-use crate::session::domain::{DelegationStatus, TaskStatus};
+use crate::session::domain::{DelegationStatus, TaskKind, TaskStatus};
 use crate::session::store::SessionStore;
 use async_trait::async_trait;
 use log::{debug, trace};
@@ -95,6 +95,16 @@ impl MiddlewareDriver for TaskAutoCompletionMiddleware {
                     trace!(
                         "TaskAutoCompletionMiddleware: task status is {:?}, not Active",
                         task.status
+                    );
+                    return Ok(state);
+                }
+
+                // Recurring tasks are never auto-completed to Done.
+                // The SchedulerActor handles cycle completion and re-arming.
+                if task.kind == TaskKind::Recurring {
+                    debug!(
+                        "TaskAutoCompletionMiddleware: skipping auto-completion for recurring task: {}",
+                        task_public_id
                     );
                     return Ok(state);
                 }

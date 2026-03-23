@@ -55,7 +55,16 @@ impl AgentServer {
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         log::info!("UI dashboard listening on http://{}", addr);
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+                log::info!("Received shutdown signal, stopping dashboard server...");
+            })
+            .await?;
+
+        // Run graceful agent shutdown (releases scheduler lease, stops background tasks)
+        agent.shutdown().await;
+
         Ok(())
     }
 }

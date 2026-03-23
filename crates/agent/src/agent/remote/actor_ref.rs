@@ -545,4 +545,30 @@ impl SessionActorRef {
                 .map_err(|e| FileProxyError::ActorSend(e.to_string())),
         }
     }
+
+    /// Send a scheduled prompt to this session (local only).
+    ///
+    /// Scheduled execution is always local to the scheduler leader node.
+    /// Remote sessions cannot receive `ScheduledPrompt` messages.
+    pub async fn tell_scheduled_prompt(
+        &self,
+        msg: messages::ScheduledPrompt,
+    ) -> Result<(), AgentError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .tell(msg)
+                .await
+                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+
+            #[cfg(feature = "remote")]
+            Self::Remote { .. } => {
+                log::warn!(
+                    "tell_scheduled_prompt called on remote SessionActorRef — not supported"
+                );
+                Err(AgentError::Internal(
+                    "ScheduledPrompt cannot be sent to remote sessions".to_string(),
+                ))
+            }
+        }
+    }
 }

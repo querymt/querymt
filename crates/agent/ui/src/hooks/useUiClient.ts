@@ -18,13 +18,16 @@ import {
   AuthMethod,
   ModelDownloadStatus,
   OAuthFlowState,
-  ProviderCapabilityEntry,
   OAuthResultState,
+  ProviderCapabilityEntry,
   OAuthFlowKind,
   UndoStackFrame,
   RemoteNodeInfo,
   PluginUpdateStatus,
   PluginUpdateResult,
+  ScheduleInfo,
+  KnowledgeEntryInfo,
+  ConsolidationInfo,
 } from '../types';
 import { debugLog, debugTrace } from '../utils/debugLog';
 
@@ -178,6 +181,16 @@ export function useUiClient() {
   const [pluginUpdateStatus, setPluginUpdateStatus] = useState<Record<string, PluginUpdateStatus>>({});
   const [pluginUpdateResults, setPluginUpdateResults] = useState<PluginUpdateResult[] | null>(null);
   const [isUpdatingPlugins, setIsUpdatingPlugins] = useState(false);
+  const [schedules, setSchedules] = useState<ScheduleInfo[]>([]);
+  const [knowledgeEntries, setKnowledgeEntries] = useState<KnowledgeEntryInfo[]>([]);
+  const [knowledgeConsolidations, setKnowledgeConsolidations] = useState<ConsolidationInfo[]>([]);
+  const [knowledgeStats, setKnowledgeStats] = useState<{
+    totalEntries: number;
+    unconsolidatedEntries: number;
+    totalConsolidations: number;
+    latestEntryAt: string | null;
+    latestConsolidationAt: string | null;
+  } | null>(null);
   const [defaultCwd, setDefaultCwd] = useState<string | null>(null);
   const [workspacePathDialogOpen, setWorkspacePathDialogOpen] = useState(false);
   const [workspacePathDialogDefaultValue, setWorkspacePathDialogDefaultValue] = useState('');
@@ -1031,6 +1044,47 @@ export function useUiClient() {
         setTimeout(() => setPluginUpdateResults(null), 8000);
         break;
       }
+      case 'schedule_list': {
+        const d = msg.data;
+        setSchedules(d.schedules);
+        break;
+      }
+      case 'schedule_created_result': {
+        const d = msg.data;
+        if (!d.success) {
+          pushSessionActionNotice('error', d.message ?? 'Failed to create schedule');
+        }
+        break;
+      }
+      case 'schedule_action_result': {
+        const d = msg.data;
+        if (!d.success) {
+          pushSessionActionNotice('error', d.message ?? `Failed to ${d.action} schedule`);
+        }
+        break;
+      }
+      case 'knowledge_query_result': {
+        const d = msg.data;
+        setKnowledgeEntries(d.entries);
+        setKnowledgeConsolidations(d.consolidations);
+        break;
+      }
+      case 'knowledge_list_result': {
+        const d = msg.data;
+        setKnowledgeEntries(d.entries);
+        break;
+      }
+      case 'knowledge_stats_result': {
+        const d = msg.data;
+        setKnowledgeStats({
+          totalEntries: d.total_entries,
+          unconsolidatedEntries: d.unconsolidated_entries,
+          totalConsolidations: d.total_consolidations,
+          latestEntryAt: d.latest_entry_at ?? null,
+          latestConsolidationAt: d.latest_consolidation_at ?? null,
+        });
+        break;
+      }
       default:
         break;
     }
@@ -1391,6 +1445,59 @@ export function useUiClient() {
     sendMessage({ type: 'update_plugins' });
   }, []);
 
+  // ── Schedule management ──────────────────────────────────────────────────
+
+  const listSchedules = useCallback((sessionId?: string) => {
+    sendMessage({ type: 'list_schedules', data: { session_id: sessionId } });
+  }, []);
+
+  const createSchedule = useCallback((
+    sessionId: string,
+    prompt: string,
+    trigger: any,
+    opts?: { maxSteps?: number; maxCostUsd?: number; maxRuns?: number },
+  ) => {
+    sendMessage({
+      type: 'create_schedule',
+      data: {
+        session_id: sessionId,
+        prompt,
+        trigger,
+        max_steps: opts?.maxSteps,
+        max_cost_usd: opts?.maxCostUsd,
+        max_runs: opts?.maxRuns,
+      },
+    });
+  }, []);
+
+  const pauseSchedule = useCallback((schedulePublicId: string) => {
+    sendMessage({ type: 'pause_schedule', data: { schedule_public_id: schedulePublicId } });
+  }, []);
+
+  const resumeSchedule = useCallback((schedulePublicId: string) => {
+    sendMessage({ type: 'resume_schedule', data: { schedule_public_id: schedulePublicId } });
+  }, []);
+
+  const triggerScheduleNow = useCallback((schedulePublicId: string) => {
+    sendMessage({ type: 'trigger_schedule', data: { schedule_public_id: schedulePublicId } });
+  }, []);
+
+  const deleteSchedule = useCallback((schedulePublicId: string) => {
+    sendMessage({ type: 'delete_schedule', data: { schedule_public_id: schedulePublicId } });
+  }, []);
+
+  const queryKnowledge = useCallback((scope: string, question: string, limit?: number) => {
+    sendMessage({ type: 'query_knowledge', data: { scope, question, limit } });
+  }, []);
+
+  const listKnowledge = useCallback((scope: string, filter?: Record<string, unknown>) => {
+    sendMessage({ type: 'list_knowledge', data: { scope, filter } });
+  }, []);
+
+  const getKnowledgeStats = useCallback((scope: string) => {
+    sendMessage({ type: 'knowledge_stats', data: { scope } });
+  }, []);
+
   return {
     events,
     eventsBySession,
@@ -1477,6 +1584,19 @@ export function useUiClient() {
     pluginUpdateResults,
     isUpdatingPlugins,
     updatePlugins,
+    schedules,
+    listSchedules,
+    createSchedule,
+    pauseSchedule,
+    resumeSchedule,
+    triggerScheduleNow,
+    deleteSchedule,
+    knowledgeEntries,
+    knowledgeConsolidations,
+    knowledgeStats,
+    queryKnowledge,
+    listKnowledge,
+    getKnowledgeStats,
   };
 }
 

@@ -1087,6 +1087,7 @@ impl Message<Prompt> for SessionActor {
                 bridge,
                 mode,
                 tool_config,
+                execution_origin: crate::agent::execution_context::ExecutionOrigin::Interactive,
             })
             .await;
 
@@ -1112,6 +1113,124 @@ impl Message<Prompt> for SessionActor {
     }
 }
 
+// ── ScheduledPrompt ──────────────────────────────────────────────────────
+//
+// Fired by SchedulerActor. Similar to Prompt but:
+// 1. Builds a PromptRequest from the schedule's prompt_text.
+// 2. Sets ExecutionOrigin::Scheduled on the execution context.
+// 3. Emits ScheduledExecutionCompleted / ScheduledExecutionFailed terminal
+//    events so the SchedulerActor can correlate cycle outcomes.
+
+impl Message<ScheduledPrompt> for SessionActor {
+    type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
+
+    async fn handle(
+        &mut self,
+        msg: ScheduledPrompt,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        debug!(
+            "Session {}: ScheduledPrompt received (schedule={})",
+            self.session_id, msg.schedule_public_id
+        );
+
+        if self.prompt_running {
+            if self.turn_state.token.is_cancelled() {
+                debug!(
+                    "Session {}: scheduled prompt: prompt_running=true, cancelled=true → allowing through",
+                    self.session_id
+                );
+            } else {
+                debug!(
+                    "Session {}: scheduled prompt: prompt_running=true → queueing behind running prompt",
+                    self.session_id
+                );
+            }
+        }
+
+        self.prompt_running = true;
+        self.turn_state.generation = self.turn_state.generation.saturating_add(1);
+        let prompt_generation = self.turn_state.generation;
+
+        if self.turn_state.token.is_cancelled() {
+            self.turn_state.token = CancellationToken::new();
+        }
+
+        // Build a PromptRequest from the schedule's prompt text
+        let prompt_request = agent_client_protocol::PromptRequest::new(
+            agent_client_protocol::SessionId::from(self.session_id.clone()),
+            vec![agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent::new(msg.prompt_text),
+            )],
+        );
+
+        let config = self.config.clone();
+        let session_id = self.session_id.clone();
+        let runtime = self.runtime.clone();
+        let cancel_token = self.turn_state.token.clone();
+        let bridge = self.bridge.clone();
+        let mode = self.mode;
+        let tool_config = self.tool_config.clone();
+        let schedule_public_id = msg.schedule_public_id.clone();
+        let actor_ref = ctx.actor_ref().clone();
+
+        ctx.spawn(async move {
+            let result = execute_prompt_detached(DetachedPromptExecution {
+                req: prompt_request,
+                session_id: session_id.clone(),
+                runtime,
+                config: config.clone(),
+                cancel_token,
+                bridge,
+                mode,
+                tool_config,
+                execution_origin: crate::agent::execution_context::ExecutionOrigin::Scheduled {
+                    schedule_public_id: schedule_public_id.clone(),
+                },
+            })
+            .await;
+
+            // Emit explicit scheduled terminal events for SchedulerActor correlation
+            let turn_id = Uuid::new_v4().to_string();
+            match &result {
+                Ok(_) => {
+                    config.emit_event(
+                        &session_id,
+                        AgentEventKind::ScheduledExecutionCompleted {
+                            schedule_public_id,
+                            turn_id,
+                        },
+                    );
+                }
+                Err(e) => {
+                    config.emit_event(
+                        &session_id,
+                        AgentEventKind::ScheduledExecutionFailed {
+                            schedule_public_id,
+                            turn_id: None,
+                            error: e.to_string(),
+                        },
+                    );
+                }
+            }
+
+            if let Err(e) = actor_ref
+                .tell(PromptFinished {
+                    generation: prompt_generation,
+                })
+                .await
+            {
+                warn!(
+                    "Failed to send PromptFinished after scheduled execution: {:?}",
+                    e
+                );
+            }
+
+            result
+        })
+    }
+}
+
 /// Execute a prompt in a detached task (called from `ctx.spawn()`).
 ///
 /// This function gathers all needed state upfront and runs the full execution cycle.
@@ -1125,6 +1244,8 @@ struct DetachedPromptExecution {
     bridge: Option<ClientBridgeSender>,
     mode: AgentMode,
     tool_config: ToolConfig,
+    /// Origin of this execution — interactive or scheduled.
+    execution_origin: crate::agent::execution_context::ExecutionOrigin,
 }
 
 #[instrument(
@@ -1144,6 +1265,7 @@ async fn execute_prompt_detached(
         bridge,
         mode,
         tool_config,
+        execution_origin,
     } = exec;
     debug!(
         "Prompt request for session {} with {} block(s)",
@@ -1221,6 +1343,7 @@ async fn execute_prompt_detached(
 
     // Create execution context — attach the cancellation token so it propagates
     // into individual tool calls for cooperative cancellation.
+    // The knowledge store is propagated so knowledge tools can access it.
     let mut exec_ctx = ExecutionContext::new(
         session_id.clone(),
         runtime.clone(),
@@ -1228,7 +1351,10 @@ async fn execute_prompt_detached(
         session_handle,
         tool_config,
     )
-    .with_cancellation_token(cancel_token.clone());
+    .with_cancellation_token(cancel_token.clone())
+    .with_execution_origin(execution_origin)
+    .with_knowledge_store(config.knowledge_store())
+    .with_event_sink(config.event_sink.clone());
 
     // 4. Store User Messages
     // Keep separate projections for user-visible events vs LLM replay context.
