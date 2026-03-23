@@ -33,7 +33,6 @@ use kameo::actor::ActorRef;
 use querymt::LLMParams;
 use querymt::chat::ReasoningEffort;
 use std::any::Any;
-#[cfg(feature = "remote")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(feature = "remote")]
@@ -167,6 +166,9 @@ pub struct LocalAgentHandle {
     /// Handle to the scheduler actor, set after `start_scheduler()` succeeds.
     /// `None` if scheduling is not enabled or lease was not acquired.
     scheduler_handle: StdMutex<Option<crate::scheduler::SchedulerHandle>>,
+
+    /// Guard to ensure `shutdown()` only runs its body once.
+    shutdown_done: AtomicBool,
 }
 
 impl LocalAgentHandle {
@@ -198,6 +200,7 @@ impl LocalAgentHandle {
             model_registry,
             oauth_service,
             scheduler_handle: StdMutex::new(None),
+            shutdown_done: AtomicBool::new(false),
         }
     }
 
@@ -325,6 +328,9 @@ impl LocalAgentHandle {
 
     /// Gracefully shutdown the agent and all background tasks.
     pub async fn shutdown(&self) {
+        if self.shutdown_done.swap(true, Ordering::SeqCst) {
+            return;
+        }
         log::info!("LocalAgentHandle: Starting graceful shutdown");
 
         // Shutdown the scheduler first
@@ -1864,6 +1870,13 @@ impl SendAgent for LocalAgentHandle {
                 })?;
                 let result = self.oauth_service.logout("acp", &parsed.provider).await;
                 ext_json_response(&result)
+            }
+
+            // ── _querymt/updatePlugins ─────────────────────────────────
+            "querymt/updatePlugins" => {
+                let registry = self.config.provider.plugin_registry();
+                let results = crate::plugin_update::update_all_plugins(&registry, None).await;
+                ext_json_response(&serde_json::json!({ "results": results }))
             }
 
             _ => {

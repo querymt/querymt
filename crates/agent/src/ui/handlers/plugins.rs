@@ -1,36 +1,34 @@
 //! Handler for OCI plugin update requests.
+//!
+//! The core update loop lives in [`crate::plugin_update::update_all_plugins`]
+//! (always compiled, no feature gate). This module provides the WebSocket-
+//! specific wrapper that streams progress messages to the UI client.
 
 use super::super::ServerState;
 use super::super::connection::send_message;
-use super::super::messages::{PluginUpdateResult, UiServerMessage};
+use super::super::messages::UiServerMessage;
+use crate::plugin_update::update_all_plugins;
 use querymt::plugin::host::{OciDownloadPhase, OciDownloadProgress, OciProgressCallback};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Handle an `UpdatePlugins` WebSocket message.
 ///
-/// Force-updates every OCI-based provider plugin in the registry, streaming
-/// `PluginUpdateStatus` messages for each download phase and finishing with a
-/// single `PluginUpdateComplete` message.
+/// Builds a progress callback factory that streams `PluginUpdateStatus`
+/// messages for each download phase, delegates to [`update_all_plugins`],
+/// then sends a single `PluginUpdateComplete` message with the results.
 pub async fn handle_update_plugins(state: &ServerState, tx: &mpsc::Sender<String>) {
     let registry = state.agent.config.provider.plugin_registry();
-    let mut results: Vec<PluginUpdateResult> = Vec::new();
 
-    for provider_cfg in &registry.config.providers {
-        let Some(image_ref) = provider_cfg.path.strip_prefix("oci://") else {
-            continue;
-        };
-
-        let name = provider_cfg.name.clone();
-        let image_ref_owned = image_ref.to_string();
-        let tx_clone = tx.clone();
-        let name_for_cb = name.clone();
-        let image_ref_for_cb = image_ref_owned.clone();
-
-        let progress: OciProgressCallback = Arc::new(move |p: OciDownloadProgress| {
-            let tx = tx_clone.clone();
-            let plugin_name = name_for_cb.clone();
-            let image_reference = image_ref_for_cb.clone();
+    let tx_outer = tx.clone();
+    let progress_factory = move |plugin_name: &str, image_reference: &str| -> OciProgressCallback {
+        let tx = tx_outer.clone();
+        let plugin_name = plugin_name.to_owned();
+        let image_reference = image_reference.to_owned();
+        Arc::new(move |p: OciDownloadProgress| {
+            let tx = tx.clone();
+            let plugin_name = plugin_name.clone();
+            let image_reference = image_reference.clone();
             let phase = match &p.phase {
                 OciDownloadPhase::Resolving => "resolving",
                 OciDownloadPhase::VerifyingSignature => "verifying_signature",
@@ -60,25 +58,26 @@ pub async fn handle_update_plugins(state: &ServerState, tx: &mpsc::Sender<String
                 )
                 .await;
             });
-        });
+        })
+    };
 
-        let result = registry
-            .oci_downloader
-            .pull_and_extract(
-                &image_ref_owned,
-                None,
-                &registry.cache_path,
-                true,
-                Some(progress),
-            )
-            .await;
+    let results = update_all_plugins(&registry, Some(&progress_factory)).await;
 
-        results.push(PluginUpdateResult {
-            plugin_name: name,
-            success: result.is_ok(),
-            message: result.err().map(|e| e.to_string()),
-        });
-    }
+    // Convert shared PluginUpdateResult → UI PluginUpdateResult for the WS message.
+    let ui_results = results
+        .into_iter()
+        .map(|r| super::super::messages::PluginUpdateResult {
+            plugin_name: r.plugin_name,
+            success: r.success,
+            message: r.message,
+        })
+        .collect();
 
-    let _ = send_message(tx, UiServerMessage::PluginUpdateComplete { results }).await;
+    let _ = send_message(
+        tx,
+        UiServerMessage::PluginUpdateComplete {
+            results: ui_results,
+        },
+    )
+    .await;
 }

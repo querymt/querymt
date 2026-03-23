@@ -32,6 +32,7 @@ pub mod model;
 pub mod model_heuristics;
 pub mod model_info;
 pub mod model_registry;
+pub mod plugin_update;
 pub mod quorum;
 pub mod scheduler;
 pub mod send_agent;
