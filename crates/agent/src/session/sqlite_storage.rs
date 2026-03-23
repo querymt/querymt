@@ -2312,12 +2312,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0004_add_session_kind,
     },
     Migration {
-        version: "0004_add_scheduler_and_knowledge_tables",
-        apply: migration_0004_add_scheduler_and_knowledge_tables,
+        version: "0005_add_scheduler_and_knowledge_tables",
+        apply: migration_0005_add_scheduler_and_knowledge_tables,
     },
     Migration {
-        version: "0005_add_knowledge_fts5",
-        apply: migration_0005_add_knowledge_fts5,
+        version: "0006_add_knowledge_fts5",
+        apply: migration_0006_add_knowledge_fts5,
     },
 ];
 
@@ -2433,7 +2433,7 @@ fn migration_0004_add_session_kind(conn: &mut Connection) -> Result<(), rusqlite
     Ok(())
 }
 
-fn migration_0004_add_scheduler_and_knowledge_tables(
+fn migration_0005_add_scheduler_and_knowledge_tables(
     conn: &mut Connection,
 ) -> Result<(), rusqlite::Error> {
     // Add tables introduced after the 0001 baseline that existing databases may
@@ -2530,7 +2530,7 @@ fn migration_0004_add_scheduler_and_knowledge_tables(
     Ok(())
 }
 
-fn migration_0005_add_knowledge_fts5(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+fn migration_0006_add_knowledge_fts5(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     // Add FTS5 full-text search indexes for the knowledge layer.
     // Uses external-content tables backed by the base knowledge tables,
     // with porter-stemming unicode61 tokenizer for English stemming.
