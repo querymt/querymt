@@ -11,7 +11,6 @@ permissions:
   pull-requests: write
 
 jobs:
-  # Job to build and deploy the preview for opened/updated PRs
   deploy_preview:
     name: Deploy Preview
     if: github.event.action != 'closed'
@@ -19,9 +18,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-        with:
-          # Fetch all history for all branches and tags
-          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v6
@@ -33,44 +29,60 @@ jobs:
         run: pip install -r requirements.txt
         working-directory: ./docs
 
-      - name: Configure Git User
+      - name: Build documentation
+        run: zensical build
+        working-directory: ./docs
+
+      - name: Deploy preview to gh-pages
         run: |
+          PR_DIR="pr-${{ github.event.number }}"
+
+          # Save built site to a temporary location
+          cp -r docs/site /tmp/site-output
+
+          # Configure git
           git config user.name "GitHub Actions Bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Deploy preview documentation
-        run: mike deploy --push pr-${{ github.event.number }}
-        working-directory: ./docs
-      
+          # Switch to gh-pages branch
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          # Replace the preview directory with the new build
+          rm -rf "$PR_DIR"
+          cp -r /tmp/site-output "$PR_DIR"
+
+          # Commit and push
+          git add -A
+          git diff --cached --quiet || git commit -m "Deploy docs preview for PR #${{ github.event.number }}"
+          git push origin gh-pages
+
       - name: Post preview link comment
         uses: actions/github-script@v8
         with:
           script: |
             const docsUrl = 'https://docs.query.mt';
-            
-            // Find a previous comment to update
+
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-            const botComment = comments.find(comment => 
-              comment.user.type === 'Bot' && comment.body.includes('📚 Documentation Preview')
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' && comment.body.includes('Documentation Preview')
             );
 
-            // Construct the new comment body
             const previewUrl = `${docsUrl}/pr-${context.issue.number}`;
-            const commentBody = `
-              ### 📚 Documentation Preview
-              
-              A preview for this pull request has been built and is available at:
-              
-              **[${previewUrl}](${previewUrl})**
-              
-              *This preview will be automatically deleted when the pull request is closed.*
-            `;
+            const commentBody = [
+              '### Documentation Preview',
+              '',
+              'A preview for this pull request has been built and is available at:',
+              '',
+              `**[${previewUrl}](${previewUrl})**`,
+              '',
+              '*This preview will be automatically deleted when the pull request is closed.*'
+            ].join('\n');
 
-            // Update an existing comment or create a new one
             if (botComment) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
@@ -87,7 +99,6 @@ jobs:
               });
             }
 
-  # Job to delete the preview when the PR is closed
   cleanup_preview:
     name: Cleanup Preview
     if: github.event.action == 'closed'
@@ -96,22 +107,17 @@ jobs:
       - name: Checkout gh-pages branch
         uses: actions/checkout@v6
         with:
-          # Fetch all history for all branches and tags
-          fetch-depth: 0
-      
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
+          ref: gh-pages
 
-      - name: Install MkDocs and Mike
-        run: pip install mkdocs-material mike
-
-      - name: Configure Git User
+      - name: Remove preview directory
         run: |
+          PR_DIR="pr-${{ github.event.number }}"
+
           git config user.name "GitHub Actions Bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
-      - name: Delete preview directory
-        run: mike delete --push pr-${{ github.event.number }}
-        working-directory: ./docs
+
+          if [ -d "$PR_DIR" ]; then
+            git rm -rf "$PR_DIR"
+            git commit -m "Remove docs preview for PR #${{ github.event.number }}"
+            git push origin gh-pages
+          fi
