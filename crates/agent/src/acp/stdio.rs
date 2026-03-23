@@ -46,7 +46,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use tracing::{info_span, instrument};
+use tracing::info_span;
 
 /// Run the client bridge task inside LocalSet.
 ///
@@ -57,7 +57,6 @@ use tracing::{info_span, instrument};
 ///
 /// - **Notification**: Fire-and-forget, just call `connection.session_notification()`
 /// - **RequestPermission**: Request-response, send result back via oneshot channel
-#[instrument(name = "acp.bridge_task", skip(rx, _connection))]
 async fn run_bridge_task(
     mut rx: mpsc::Receiver<ClientBridgeMessage>,
     _connection: Rc<AgentSideConnection>,
@@ -203,7 +202,6 @@ async fn run_bridge_task(
 /// The forwarder automatically stops when:
 /// - The EventFanout is shut down (recv returns error)
 /// - The bridge channel closes (notify returns error)
-#[instrument(name = "acp.event_forwarder", skip(event_fanout, bridge, shutdown_tx))]
 fn spawn_event_bridge_forwarder(
     event_fanout: Arc<EventFanout>,
     bridge: ClientBridgeSender,
@@ -297,7 +295,6 @@ fn spawn_event_bridge_forwarder(
 ///
 /// The server handles SIGTERM and SIGINT (Ctrl+C) for graceful shutdown.
 /// Current operations are allowed to complete before exit.
-#[instrument(name = "acp.serve_stdio", skip(agent))]
 pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::Result<()> {
     let local = tokio::task::LocalSet::new();
 
