@@ -85,25 +85,6 @@ struct Cli {
     mesh: Option<String>,
 }
 
-/// Setup logging for stdio mode - writes to stderr only to avoid corrupting stdout JSON-RPC.
-fn setup_stdio_logging() {
-    use tracing_log::LogTracer;
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::{EnvFilter, Registry, fmt};
-
-    // Initialize log->tracing bridge so log:: macros from providers work.
-    LogTracer::init().expect("Failed to set LogTracer");
-
-    // Create fmt layer that writes to STDERR only (stdout is reserved for JSON-RPC).
-    let fmt_layer = fmt::layer().with_writer(std::io::stderr).with_target(true);
-
-    let filter = EnvFilter::from_default_env();
-
-    let subscriber = Registry::default().with(filter).with(fmt_layer);
-
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
-}
-
 fn embedded_single_coder_config() -> anyhow::Result<String> {
     use anyhow::{Context, anyhow};
 
@@ -190,14 +171,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("No mode selected. Use --acp, --dashboard, or --mesh.".into());
     }
 
-    // Setup logging based on mode:
-    // - ACP mode: logs to stderr (stdout reserved for JSON-RPC)
-    // - Dashboard/mesh modes: full telemetry with stdout
-    if is_acp {
-        setup_stdio_logging();
-    } else {
-        querymt_utils::telemetry::setup_telemetry("qmtcode", env!("QMT_BUILD_VERSION"));
-    }
+    // Setup telemetry: ACP mode writes console logs to stderr (stdout is
+    // reserved for JSON-RPC); dashboard/mesh modes use stdout.
+    // OTLP export (traces + logs over gRPC) is active in all modes.
+    querymt_utils::telemetry::setup_telemetry("qmtcode", env!("QMT_BUILD_VERSION"), is_acp);
 
     let runner = if let Some(config_path) = &cli.config_file {
         eprintln!("Loading agent from: {}", config_path.display());

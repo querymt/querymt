@@ -9,6 +9,7 @@ use opentelemetry_sdk::{
 use opentelemetry_semantic_conventions::{SCHEMA_URL, resource::SERVICE_VERSION};
 use tracing_log::LogTracer;
 use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Registry, fmt};
 
@@ -79,20 +80,30 @@ fn init_logger_provider(
 /// # Arguments
 /// - `service_name`: The name of the service (e.g., "querymt-cli")
 /// - `service_version`: The version of the service (e.g., "0.2.0")
+/// - `use_stderr`: If `true`, the console `fmt` layer writes to stderr instead of stdout.
+///   Useful for ACP/stdio mode where stdout is reserved for JSON-RPC.
 ///
 /// # Environment Variables
 /// - `QMT_NO_TELEMETRY`: If set (any value), disables OTLP export
 /// - `OTEL_EXPORTER_OTLP_ENDPOINT`: Custom OTLP endpoint (defaults to http://otel.query.mt:4317)
 /// - `RUST_LOG`: Controls console output filtering (defaults to `error`)
 /// - `QMT_TELEMETRY_LEVEL`: Controls OTLP telemetry filtering (defaults to `info`)
-pub fn setup_telemetry(service_name: &str, service_version: &str) {
+pub fn setup_telemetry(service_name: &str, service_version: &str, use_stderr: bool) {
     // Always initialize LogTracer for log->tracing bridge
     LogTracer::init().expect("Failed to set LogTracer");
 
     // Console filter: default ERROR, overridden by RUST_LOG
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error"));
-    let fmt_layer = fmt::layer().with_target(true).with_filter(console_filter);
+    let writer: BoxMakeWriter = if use_stderr {
+        BoxMakeWriter::new(std::io::stderr)
+    } else {
+        BoxMakeWriter::new(std::io::stdout)
+    };
+    let fmt_layer = fmt::layer()
+        .with_writer(writer)
+        .with_target(true)
+        .with_filter(console_filter);
 
     // Check if telemetry is disabled
     if std::env::var("QMT_NO_TELEMETRY").is_ok() {
