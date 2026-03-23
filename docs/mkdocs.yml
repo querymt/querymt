@@ -38,6 +38,7 @@ theme:
 markdown_extensions:
   - pymdownx.highlight:
       anchor_linenums: true
+      linenums: true
   - pymdownx.inlinehilite
   - pymdownx.snippets
   - admonition
@@ -101,8 +102,6 @@ extra:
       as to measure the effectiveness of our documentation and whether users
       find what they're searching for. With your consent, you're helping us to
       make our documentation better.
-
-extra:
   version:
     provider: mike
     default: stable
