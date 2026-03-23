@@ -427,6 +427,7 @@ pub async fn handle_any_response(
 }
 
 /// Handle piped input or single-shot chat
+#[tracing::instrument(name = "cli.chat.pipe", skip_all)]
 pub async fn chat_pipe(
     provider: &Box<dyn LLMProvider>,
     prompt: Option<&String>,
@@ -448,6 +449,7 @@ pub async fn chat_pipe(
 }
 
 /// Interactive REPL loop
+#[tracing::instrument(name = "cli.chat.interactive", skip_all)]
 pub async fn interactive_loop(
     provider: &Box<dyn LLMProvider>,
     provider_name: &str,

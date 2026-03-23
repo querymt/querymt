@@ -194,6 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             Commands::Providers => {
+                let _span = ::tracing::info_span!("cli.providers").entered();
                 // Load all plugins since we need to list all providers
                 registry.load_all_plugins().await;
                 for factory in registry.list() {
@@ -202,6 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Commands::Models => {
+                let _span = ::tracing::info_span!("cli.models").entered();
                 // Load all plugins since we need to list models from all providers
                 registry.load_all_plugins().await;
                 for factory in registry.list() {
@@ -265,6 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 separator,
                 text,
             } => {
+                let _span = ::tracing::info_span!("cli.embed").entered();
                 let (prov_name, opt_model) =
                     resolve_provider_and_model(&args, sc_provider.as_ref(), sc_model.as_ref())?;
                 let mut builder = LLMBuilder::new().provider(prov_name.clone());
@@ -293,6 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Commands::Update => {
+                let _span = ::tracing::info_span!("cli.update").entered();
                 println!("{}", "Updating providers config...".bright_blue());
                 match querymt_utils::providers::fetch_providers_repository(None).await {
                     Ok(content) => {

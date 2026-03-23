@@ -1433,6 +1433,7 @@ impl AgentHandle for LocalAgentHandle {
 /// This replaces the `impl SendAgent for QueryMTAgent` from protocol.rs.
 #[async_trait]
 impl SendAgent for LocalAgentHandle {
+    #[tracing::instrument(name = "acp.initialize", skip_all)]
     async fn initialize(&self, req: InitializeRequest) -> Result<InitializeResponse, Error> {
         use agent_client_protocol::{
             AgentCapabilities, Implementation, McpCapabilities, PromptCapabilities, ProtocolVersion,
@@ -1474,6 +1475,7 @@ impl SendAgent for LocalAgentHandle {
             ))
     }
 
+    #[tracing::instrument(name = "acp.authenticate", skip_all)]
     async fn authenticate(&self, req: AuthenticateRequest) -> Result<AuthenticateResponse, Error> {
         let auth_methods = &self.config.auth_methods;
 
@@ -1492,6 +1494,7 @@ impl SendAgent for LocalAgentHandle {
         Ok(AuthenticateResponse::new())
     }
 
+    #[tracing::instrument(name = "acp.new_session", skip_all)]
     async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse, Error> {
         // Auth check stays on LocalAgentHandle (connection-level concern)
         if let Ok(state) = self.client_state.lock()
@@ -1509,6 +1512,7 @@ impl SendAgent for LocalAgentHandle {
         registry.new_session(req).await
     }
 
+    #[tracing::instrument(name = "acp.prompt", skip_all, fields(session_id = %req.session_id))]
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
         let session_id = req.session_id.to_string();
         let session_ref = {
@@ -1524,6 +1528,7 @@ impl SendAgent for LocalAgentHandle {
         session_ref.prompt(req).await
     }
 
+    #[tracing::instrument(name = "acp.cancel", skip_all, fields(session_id = %notif.session_id))]
     async fn cancel(&self, notif: CancelNotification) -> Result<(), Error> {
         let session_id = notif.session_id.to_string();
 
@@ -1543,24 +1548,28 @@ impl SendAgent for LocalAgentHandle {
         Ok(())
     }
 
+    #[tracing::instrument(name = "acp.load_session", skip_all, fields(session_id = %req.session_id))]
     async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
         // Delegate to kameo SessionRegistry
         let mut registry = self.registry.lock().await;
         registry.load_session(req).await
     }
 
+    #[tracing::instrument(name = "acp.list_sessions", skip_all)]
     async fn list_sessions(&self, req: ListSessionsRequest) -> Result<ListSessionsResponse, Error> {
         // Delegate to kameo SessionRegistry
         let registry = self.registry.lock().await;
         registry.list_sessions(req).await
     }
 
+    #[tracing::instrument(name = "acp.fork_session", skip_all, fields(session_id = %req.session_id))]
     async fn fork_session(&self, req: ForkSessionRequest) -> Result<ForkSessionResponse, Error> {
         // Delegate to kameo SessionRegistry
         let registry = self.registry.lock().await;
         registry.fork_session(req).await
     }
 
+    #[tracing::instrument(name = "acp.resume_session", skip_all, fields(session_id = %req.session_id))]
     async fn resume_session(
         &self,
         req: ResumeSessionRequest,
@@ -1570,6 +1579,7 @@ impl SendAgent for LocalAgentHandle {
         registry.resume_session(req).await
     }
 
+    #[tracing::instrument(name = "acp.set_session_model", skip_all, fields(session_id = %req.session_id))]
     async fn set_session_model(
         &self,
         req: SetSessionModelRequest,
@@ -1588,6 +1598,7 @@ impl SendAgent for LocalAgentHandle {
         session_ref.set_session_model(req).await
     }
 
+    #[tracing::instrument(name = "acp.set_session_mode", skip_all, fields(session_id = %req.session_id))]
     async fn set_session_mode(
         &self,
         req: agent_client_protocol::SetSessionModeRequest,
@@ -1613,6 +1624,7 @@ impl SendAgent for LocalAgentHandle {
         Ok(agent_client_protocol::SetSessionModeResponse::new())
     }
 
+    #[tracing::instrument(name = "acp.set_session_config_option", skip_all, fields(session_id = %req.session_id))]
     async fn set_session_config_option(
         &self,
         req: agent_client_protocol::SetSessionConfigOptionRequest,
@@ -1697,6 +1709,7 @@ impl SendAgent for LocalAgentHandle {
         }
     }
 
+    #[tracing::instrument(name = "acp.ext_method", skip_all, fields(method = %req.method))]
     async fn ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
         match req.method.as_ref() {
             "querymt/models" => {
@@ -1890,6 +1903,7 @@ impl SendAgent for LocalAgentHandle {
         }
     }
 
+    #[tracing::instrument(name = "acp.ext_notification", skip_all)]
     async fn ext_notification(&self, _notif: ExtNotification) -> Result<(), Error> {
         // OK - extensions not yet implemented
         Ok(())

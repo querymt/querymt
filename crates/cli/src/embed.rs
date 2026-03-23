@@ -2,6 +2,7 @@ use querymt::LLMProvider;
 use std::io::{self, Read};
 
 /// Read either the provided `text` or stdin, then call your provider's embedding method
+#[tracing::instrument(name = "cli.embed", skip_all)]
 pub async fn embed_pipe(
     provider: &Box<dyn LLMProvider>,
     input: Option<&String>,
