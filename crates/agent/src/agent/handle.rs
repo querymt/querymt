@@ -1582,6 +1582,115 @@ impl SendAgent for LocalAgentHandle {
         session_ref.set_session_model(req).await
     }
 
+    async fn set_session_mode(
+        &self,
+        req: agent_client_protocol::SetSessionModeRequest,
+    ) -> Result<agent_client_protocol::SetSessionModeResponse, Error> {
+        let mode = req
+            .mode_id
+            .0
+            .parse::<AgentMode>()
+            .map_err(|e| Error::invalid_params().data(serde_json::json!({ "error": e })))?;
+        let session_id = req.session_id.to_string();
+
+        let session_ref = {
+            let registry = self.registry.lock().await;
+            registry.get(&session_id).cloned().ok_or_else(|| {
+                Error::invalid_params().data(serde_json::json!({
+                    "message": "unknown session",
+                    "sessionId": session_id,
+                }))
+            })?
+        };
+
+        session_ref.set_mode(mode).await.map_err(Error::from)?;
+        Ok(agent_client_protocol::SetSessionModeResponse::new())
+    }
+
+    async fn set_session_config_option(
+        &self,
+        req: agent_client_protocol::SetSessionConfigOptionRequest,
+    ) -> Result<agent_client_protocol::SetSessionConfigOptionResponse, Error> {
+        use crate::agent::session_registry::config_options;
+        use agent_client_protocol::SessionConfigOptionValue;
+
+        let config_id = req.config_id.0.as_ref();
+
+        let SessionConfigOptionValue::ValueId { value: value_id } = req.value else {
+            return Err(Error::invalid_params().data(serde_json::json!({
+                "error": "config option requires a value id",
+            })));
+        };
+
+        let session_id = req.session_id.0.to_string();
+
+        match config_id {
+            "mode" => {
+                let mode = value_id
+                    .0
+                    .parse::<AgentMode>()
+                    .map_err(|e| Error::invalid_params().data(serde_json::json!({ "error": e })))?;
+
+                let session_ref = {
+                    let registry = self.registry.lock().await;
+                    registry.get(&session_id).cloned().ok_or_else(|| {
+                        Error::invalid_params().data(serde_json::json!({
+                            "message": "unknown session",
+                            "sessionId": session_id,
+                        }))
+                    })?
+                };
+                session_ref.set_mode(mode).await.map_err(Error::from)?;
+
+                let effort = session_ref.get_reasoning_effort().await.ok().flatten();
+                Ok(agent_client_protocol::SetSessionConfigOptionResponse::new(
+                    config_options(mode, effort),
+                ))
+            }
+            "reasoning_effort" => {
+                let effort_str = value_id.0.as_ref();
+                let effort = if effort_str == "auto" {
+                    None
+                } else {
+                    Some(
+                        serde_json::from_value::<querymt::chat::ReasoningEffort>(
+                            serde_json::json!(effort_str),
+                        )
+                        .map_err(|e| {
+                            Error::invalid_params().data(serde_json::json!({
+                                "error": format!("Invalid reasoning effort '{}': {}", effort_str, e),
+                            }))
+                        })?,
+                    )
+                };
+
+                let session_ref = {
+                    let registry = self.registry.lock().await;
+                    registry.get(&session_id).cloned().ok_or_else(|| {
+                        Error::invalid_params().data(serde_json::json!({
+                            "message": "unknown session",
+                            "sessionId": session_id,
+                        }))
+                    })?
+                };
+
+                session_ref
+                    .set_reasoning_effort(effort)
+                    .await
+                    .map_err(Error::from)?;
+
+                let mode = session_ref.get_mode().await.unwrap_or(AgentMode::Build);
+
+                Ok(agent_client_protocol::SetSessionConfigOptionResponse::new(
+                    config_options(mode, effort),
+                ))
+            }
+            _ => Err(Error::invalid_params().data(serde_json::json!({
+                "error": format!("Unsupported configId: {}", config_id),
+            }))),
+        }
+    }
+
     async fn ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
         match req.method.as_ref() {
             "querymt/models" => {

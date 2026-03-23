@@ -29,7 +29,11 @@ fn mode_state(mode: AgentMode) -> SessionModeState {
     SessionModeState::new(mode.as_str(), all_session_modes())
 }
 
-fn config_options(
+/// Build the full set of session configuration options for the given mode and reasoning effort.
+///
+/// This is the single source of truth for config option shape — used by session creation,
+/// set_session_config_option responses, and config_option_update notifications.
+pub(crate) fn config_options(
     mode: AgentMode,
     reasoning_effort: Option<querymt::chat::ReasoningEffort>,
 ) -> Vec<SessionConfigOption> {

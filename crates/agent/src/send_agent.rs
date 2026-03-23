@@ -23,7 +23,9 @@ use agent_client_protocol::{
     ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SetSessionModelRequest, SetSessionModelResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionModelRequest, SetSessionModelResponse,
 };
 use async_trait::async_trait;
 use std::any::Any;
@@ -101,6 +103,30 @@ pub trait SendAgent: Send + Sync + Any {
         &self,
         req: SetSessionModelRequest,
     ) -> Result<SetSessionModelResponse, Error>;
+
+    /// Set the current mode for a session.
+    ///
+    /// Allows switching between different agent modes (e.g., "build", "plan", "review")
+    /// that affect system prompts, tool availability, and permission behaviors.
+    async fn set_session_mode(
+        &self,
+        _req: SetSessionModeRequest,
+    ) -> Result<SetSessionModeResponse, Error> {
+        Err(Error::method_not_found())
+    }
+
+    /// Set a configuration option for a session.
+    ///
+    /// Configuration options allow agents to expose arbitrary selectors (like mode,
+    /// reasoning effort, etc.) that clients can display and modify. The response
+    /// returns the full list of configuration options with their current values,
+    /// as changing one option may affect others.
+    async fn set_session_config_option(
+        &self,
+        _req: SetSessionConfigOptionRequest,
+    ) -> Result<SetSessionConfigOptionResponse, Error> {
+        Err(Error::method_not_found())
+    }
 
     /// Handle extension method calls.
     ///
@@ -220,6 +246,20 @@ impl<T: SendAgent> agent_client_protocol::Agent for ApcAgentAdapter<T> {
         req: SetSessionModelRequest,
     ) -> Result<SetSessionModelResponse, Error> {
         self.inner.set_session_model(req).await
+    }
+
+    async fn set_session_mode(
+        &self,
+        req: SetSessionModeRequest,
+    ) -> Result<SetSessionModeResponse, Error> {
+        self.inner.set_session_mode(req).await
+    }
+
+    async fn set_session_config_option(
+        &self,
+        req: SetSessionConfigOptionRequest,
+    ) -> Result<SetSessionConfigOptionResponse, Error> {
+        self.inner.set_session_config_option(req).await
     }
 
     async fn ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
