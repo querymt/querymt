@@ -32,6 +32,7 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use wake::{ActiveCycle, DeadlineQueue, EventAccumulator};
 
 // ── Metrics ──────────────────────────────────────────────────────────────────
@@ -259,6 +260,10 @@ pub struct SchedulerActor {
     self_ref: Option<ActorRef<Self>>,
     /// Handle to the current deadline wake task (aborted when the queue head changes).
     wake_handle: Option<JoinHandle<()>>,
+
+    /// Token cancelled during shutdown to immediately stop all background loops
+    /// (lease renewal, event subscription, reconciliation).
+    shutdown_token: CancellationToken,
 
     /// Operational metrics for observability (Phase 6).
     metrics: SchedulerMetrics,
@@ -550,6 +555,7 @@ impl SchedulerActor {
             processed_terminals: HashSet::new(),
             self_ref: None,
             wake_handle: None,
+            shutdown_token: CancellationToken::new(),
             metrics: SchedulerMetrics::default(),
         }
     }
@@ -586,6 +592,7 @@ impl SchedulerActor {
         let sched_store = actor.schedule_store.clone();
         let sched_config = actor.scheduler_config.clone();
         let owner_id = actor.owner_id.clone();
+        let shutdown_token = actor.shutdown_token.clone();
 
         // Spawn as a kameo actor
         let actor_ref = kameo::actor::Spawn::spawn(actor);
@@ -605,6 +612,7 @@ impl SchedulerActor {
             &sched_store,
             &sched_config,
             &owner_id,
+            &shutdown_token,
         );
 
         info!("SchedulerActor: started successfully");
@@ -655,10 +663,17 @@ impl SchedulerActor {
         schedule_store: &Arc<dyn ScheduleRepository>,
         scheduler_config: &SchedulerConfig,
         owner_id: &str,
+        shutdown_token: &CancellationToken,
     ) {
-        Self::start_lease_renewal_loop(actor_ref, schedule_store, scheduler_config, owner_id);
-        Self::start_event_subscription_loop(actor_ref, agent_config);
-        Self::start_reconciliation_loop(actor_ref, scheduler_config);
+        Self::start_lease_renewal_loop(
+            actor_ref,
+            schedule_store,
+            scheduler_config,
+            owner_id,
+            shutdown_token,
+        );
+        Self::start_event_subscription_loop(actor_ref, agent_config, shutdown_token);
+        Self::start_reconciliation_loop(actor_ref, scheduler_config, shutdown_token);
         // Deadline wakes are handled by `reschedule_wake()` inside the actor
         // (triggered via the SetSelfRef message after spawn).
     }
@@ -673,12 +688,14 @@ impl SchedulerActor {
         schedule_store: &Arc<dyn ScheduleRepository>,
         scheduler_config: &SchedulerConfig,
         owner_id: &str,
+        shutdown_token: &CancellationToken,
     ) {
         let store = schedule_store.clone();
         let owner = owner_id.to_string();
         let ttl_secs = scheduler_config.lease_ttl_secs;
         let renew_interval = ttl_secs / 2;
         let actor = actor_ref.clone();
+        let token = shutdown_token.clone();
 
         tokio::spawn(async move {
             let mut interval =
@@ -686,7 +703,13 @@ impl SchedulerActor {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = token.cancelled() => {
+                        debug!("SchedulerActor: lease renewal loop cancelled by shutdown token");
+                        break;
+                    }
+                }
 
                 match store.renew_scheduler_lease(&owner, ttl_secs).await {
                     Ok(true) => {
@@ -713,26 +736,40 @@ impl SchedulerActor {
     ///
     /// Subscribes to the `AgentConfig` event broadcast and forwards each
     /// envelope as a `ProcessEvent` message to the actor.
-    fn start_event_subscription_loop(actor_ref: &ActorRef<Self>, agent_config: &Arc<AgentConfig>) {
+    fn start_event_subscription_loop(
+        actor_ref: &ActorRef<Self>,
+        agent_config: &Arc<AgentConfig>,
+        shutdown_token: &CancellationToken,
+    ) {
         let mut event_rx = agent_config.subscribe_events();
         let actor = actor_ref.clone();
+        let token = shutdown_token.clone();
 
         tokio::spawn(async move {
             loop {
-                match event_rx.recv().await {
-                    Ok(envelope) => {
-                        if let Err(e) = actor.tell(ProcessEvent { envelope }).await {
-                            warn!("SchedulerActor: failed to send ProcessEvent: {}", e);
-                            break;
+                let envelope = tokio::select! {
+                    result = event_rx.recv() => {
+                        match result {
+                            Ok(envelope) => envelope,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                info!("SchedulerActor: event fanout closed, exiting subscription loop");
+                                break;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("SchedulerActor: event subscription lagged by {} events", n);
+                                continue;
+                            }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        info!("SchedulerActor: event fanout closed, exiting subscription loop");
+                    _ = token.cancelled() => {
+                        debug!("SchedulerActor: event subscription loop cancelled by shutdown token");
                         break;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("SchedulerActor: event subscription lagged by {} events", n);
-                    }
+                };
+
+                if let Err(e) = actor.tell(ProcessEvent { envelope }).await {
+                    warn!("SchedulerActor: failed to send ProcessEvent: {}", e);
+                    break;
                 }
             }
         });
@@ -741,16 +778,27 @@ impl SchedulerActor {
     /// Start the reconciliation background task.
     ///
     /// Periodically sends a `Reconcile` message to the actor.
-    fn start_reconciliation_loop(actor_ref: &ActorRef<Self>, scheduler_config: &SchedulerConfig) {
+    fn start_reconciliation_loop(
+        actor_ref: &ActorRef<Self>,
+        scheduler_config: &SchedulerConfig,
+        shutdown_token: &CancellationToken,
+    ) {
         let interval_secs = scheduler_config.reconcile_interval_secs;
         let actor = actor_ref.clone();
+        let token = shutdown_token.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = token.cancelled() => {
+                        debug!("SchedulerActor: reconciliation loop cancelled by shutdown token");
+                        break;
+                    }
+                }
 
                 if let Err(e) = actor.tell(Reconcile).await {
                     warn!("SchedulerActor: failed to send Reconcile: {}", e);
@@ -762,6 +810,11 @@ impl SchedulerActor {
 
     /// Abort the current deadline wake task (if any).
     fn abort_background_tasks(&mut self) {
+        // Cancel all background loops (lease renewal, event subscription, reconciliation).
+        // Each loop selects on this token and exits immediately when cancelled.
+        self.shutdown_token.cancel();
+
+        // Abort the one-shot deadline wake timer (not a long-running loop).
         if let Some(handle) = self.wake_handle.take() {
             handle.abort();
         }
@@ -1752,6 +1805,130 @@ mod unit_tests {
             session_public_id: "sess-1".to_string(),
         };
         assert_eq!(event_kind_name(&kind), "schedule_fired");
+    }
+
+    /// Verify that `abort_background_tasks()` cancels the shutdown token.
+    ///
+    /// This is the mechanism that makes all background loops (lease renewal,
+    /// event subscription, reconciliation) exit immediately on shutdown instead
+    /// of lingering until their next failed `tell()` attempt.
+    #[tokio::test]
+    async fn shutdown_token_is_cancelled_on_abort() {
+        use crate::session::backend::StorageBackend;
+        use crate::session::repo_schedule::SqliteScheduleRepository;
+        use crate::session::schema;
+        use crate::test_utils::{
+            MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_plugin_registry,
+        };
+        use querymt::LLMParams;
+
+        // Build a minimal SchedulerActor (not spawned — direct field access)
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        schema::init_schema(&mut conn).unwrap();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        let schedule_store = Arc::new(SqliteScheduleRepository::new(db))
+            as Arc<dyn crate::session::repo_schedule::ScheduleRepository>;
+
+        let mut store = MockSessionStore::new();
+        store
+            .expect_list_sessions()
+            .returning(|| Ok(vec![]))
+            .times(0..);
+        let session_store: Arc<dyn crate::session::store::SessionStore> = Arc::new(store);
+
+        let provider = Arc::new(tokio::sync::Mutex::new(
+            crate::test_utils::MockLlmProvider::new(),
+        ));
+        let shared = SharedLlmProvider {
+            inner: provider,
+            tools: vec![].into_boxed_slice(),
+        };
+        let factory = Arc::new(TestProviderFactory { provider: shared });
+        let (plugin_registry, _temp_dir) = mock_plugin_registry(factory).unwrap();
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("create storage"),
+        );
+        let config = Arc::new(
+            crate::agent::agent_config_builder::AgentConfigBuilder::new(
+                Arc::new(plugin_registry),
+                session_store.clone(),
+                storage.event_journal(),
+                LLMParams::new().provider("mock").model("mock-model"),
+            )
+            .build(),
+        );
+
+        let registry = Arc::new(tokio::sync::Mutex::new(
+            crate::agent::session_registry::SessionRegistry::new(config.clone()),
+        ));
+
+        let mut actor = SchedulerActor::new(
+            schedule_store,
+            session_store,
+            registry,
+            config,
+            SchedulerConfig::default(),
+        );
+
+        // Token should start uncancelled
+        let token_clone = actor.shutdown_token.clone();
+        assert!(
+            !token_clone.is_cancelled(),
+            "shutdown token should not be cancelled before abort"
+        );
+
+        // Abort should cancel the token
+        actor.abort_background_tasks();
+        assert!(
+            token_clone.is_cancelled(),
+            "shutdown token must be cancelled after abort_background_tasks()"
+        );
+    }
+
+    /// Verify that a background loop using the same `select!` pattern as the
+    /// scheduler loops exits immediately when the token is cancelled, rather
+    /// than waiting for the next interval tick (which could be 60+ seconds).
+    #[tokio::test]
+    async fn background_loop_exits_on_token_cancellation() {
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+
+        // Spawn a task that mimics the reconciliation loop pattern:
+        // `select!` on a long interval vs token cancellation.
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // 1 hour
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            // Consume the first immediate tick
+            interval.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Would normally send a message here
+                    }
+                    _ = token_clone.cancelled() => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Cancel the token
+        token.cancel();
+
+        // The task must complete almost instantly (not wait for the 1h interval)
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), handle).await;
+        assert!(
+            result.is_ok(),
+            "background loop must exit within 100ms of token cancellation, not wait for interval"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "background loop task should complete without panic"
+        );
     }
 }
 
