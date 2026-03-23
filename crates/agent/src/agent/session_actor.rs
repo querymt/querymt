@@ -1452,7 +1452,7 @@ async fn execute_prompt_detached(
                 let snapshot_result = backend.track(&worktree).await.map_err(|e| e.to_string());
                 let elapsed = started.elapsed();
                 match &snapshot_result {
-                    Ok(snapshot_id) => info!(
+                    Ok(snapshot_id) => debug!(
                         "Session {}: pre-turn snapshot ready in {:?} (turn_id={}, snapshot_id={})",
                         session_id_for_task, elapsed, turn_id_for_task, snapshot_id
                     ),

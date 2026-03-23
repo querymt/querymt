@@ -69,21 +69,31 @@ pub(crate) async fn execute_cycle_state_machine(
 
     let driver = config.create_driver();
 
-    info!(
+    debug!(
         "Session {}: state machine loading history, cancelled={}",
         exec_ctx.session_id,
         exec_ctx.cancellation_token.is_cancelled()
     );
 
-    let messages: Arc<[querymt::chat::ChatMessage]> =
-        async { Arc::from(exec_ctx.session_handle.history().await.into_boxed_slice()) }
-            .instrument(info_span!(
-                "agent.execution.history_load",
-                session_id = %exec_ctx.session_id
-            ))
-            .await;
+    let messages: Arc<[querymt::chat::ChatMessage]> = async {
+        let started = std::time::Instant::now();
+        let messages: Arc<[querymt::chat::ChatMessage]> =
+            Arc::from(exec_ctx.session_handle.history().await.into_boxed_slice());
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let span = tracing::Span::current();
+        span.record("history_ms", elapsed_ms);
+        span.record("message_count", messages.len() as u64);
+        messages
+    }
+    .instrument(info_span!(
+        "agent.execution.history_load",
+        session_id = %exec_ctx.session_id,
+        history_ms = tracing::field::Empty,
+        message_count = tracing::field::Empty
+    ))
+    .await;
 
-    info!(
+    debug!(
         "Session {}: history loaded, {} messages",
         exec_ctx.session_id,
         messages.len()
@@ -103,7 +113,7 @@ pub(crate) async fn execute_cycle_state_machine(
         .llm_config()
         .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
 
-    info!(
+    debug!(
         "Session {}: llm_config provider={} model={}",
         exec_ctx.session_id, llm_config.provider, llm_config.model
     );
@@ -133,7 +143,7 @@ pub(crate) async fn execute_cycle_state_machine(
         .await
         .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
 
-    info!(
+    debug!(
         "Session {}: run_turn_start done, state={}, cancelled={}",
         exec_ctx.session_id,
         state.name(),

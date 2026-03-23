@@ -22,7 +22,7 @@ use agent_client_protocol::{ContentBlock, ContentChunk, SessionUpdate, TextConte
 use anyhow::Context as _;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
-use log::{debug, info, trace, warn};
+use log::{debug, trace, warn};
 use querymt::ToolCall;
 use querymt::chat::{CacheHint, ChatMessage, ChatRole, FinishReason, StreamChunk};
 use std::sync::Arc;
@@ -471,7 +471,7 @@ pub(super) async fn transition_call_llm(
         (None, None)
     };
 
-    info!(
+    debug!(
         "Session {} received provider response ({} chars, {} tool call(s), finish: {:?}, cost: ${:.4?})",
         session_id,
         response_content.len(),

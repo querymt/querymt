@@ -83,7 +83,7 @@ pub fn setup_telemetry(service_name: &str, service_version: &str) {
     LogTracer::init().expect("Failed to set LogTracer");
 
     let fmt_layer = fmt::layer().with_target(true);
-    let filter = EnvFilter::from_default_env();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Check if telemetry is disabled
     if std::env::var("QMT_NO_TELEMETRY").is_ok() {

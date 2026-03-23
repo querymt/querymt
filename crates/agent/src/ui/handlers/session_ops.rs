@@ -900,7 +900,7 @@ pub async fn handle_set_agent_mode(
                 if let Some(session_ref) = session_ref {
                     match session_ref.set_mode(new_mode).await {
                         Ok(_) => {
-                            log::info!(
+                            log::debug!(
                                 "Agent mode changed on session {}: {} -> {}",
                                 session_id,
                                 previous_mode,
@@ -1053,7 +1053,7 @@ pub async fn handle_set_reasoning_effort(
         if let Some(session_ref) = session_ref {
             match session_ref.set_reasoning_effort(effort).await {
                 Ok(_) => {
-                    log::info!(
+                    log::debug!(
                         "Reasoning effort changed on session {}: {:?}",
                         session_id,
                         effort

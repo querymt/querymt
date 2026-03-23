@@ -633,7 +633,7 @@ impl ChatProvider for ExtismProvider {
                         state_guard.cancel_state = functions::CancelState::CancelledByConsumerDrop;
                         let _ = state_guard.cancel_watch_tx.send(true);
                         state_guard.yield_tx = None;
-                        log::info!("Extism stream cancelled: consumer dropped stream");
+                        log::debug!("Extism stream cancelled: consumer dropped stream");
                     } else {
                         log::debug!(
                             "Extism stream dropped after completion/error (not a user cancel)"
