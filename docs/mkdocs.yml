@@ -58,6 +58,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Architecture: architecture.md
+  - Telemetry: telemetry.md
   - Core Concepts:
     - Overview: core/index.md
     - LLM Providers: core/providers.md
