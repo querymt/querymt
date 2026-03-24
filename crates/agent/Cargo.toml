@@ -25,6 +25,11 @@ dbus-secret-service = ["querymt-utils/dbus-secret-service"]
 # for distributed actor registry. SessionActorRef gains a Remote variant.
 remote = ["kameo/remote", "dep:libp2p"]
 
+# Extends `remote` with iroh-backed QUIC transport for NAT traversal and
+# relay-based connectivity across the internet.  Adds invite-token support
+# for dynamic mesh joining.
+remote-internet = ["remote", "dep:libp2p-iroh"]
+
 [dependencies]
 typeshare = "1.0"
 querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
@@ -34,6 +39,7 @@ agent-client-protocol = { version = "0.10", features = ["unstable"] }
 agent-client-protocol-schema = { version = "0.11", features = ["unstable"]}
 kameo = "0.19"
 libp2p = { version = "0.56", optional = true, default-features = false }
+libp2p-iroh = { git = "https://github.com/querymt/libp2p-iroh.git", branch = "kademlia", optional = true }
 async-trait.workspace = true
 anyhow = "1.0"
 thiserror = "2.0"
@@ -78,6 +84,7 @@ regex.workspace = true
 srgn = "0.14"
 tokio-util = { version = "0.7", features = ["compat"] }
 base64.workspace = true
+hex = "0.4"
 infer = "0.19"
 rayon = "1.11"
 

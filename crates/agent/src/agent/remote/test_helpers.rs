@@ -81,13 +81,27 @@ pub(crate) mod fixtures {
                 // event-loop task is owned by a runtime that never shuts down.
                 mesh_runtime()
                     .spawn(async {
+                        // Use a temp directory for the identity file so tests
+                        // don't pollute ~/.qmt/mesh_identity.key and each test
+                        // suite run gets a fresh PeerId (no stale Kademlia state).
+                        let identity_dir = tempfile::tempdir()
+                            .expect("failed to create temp dir for test identity");
+                        let identity_path = identity_dir.path().join("test_identity.key");
+
                         let cfg = MeshConfig {
                             listen: Some("/ip4/127.0.0.1/tcp/0".to_string()),
                             discovery: MeshDiscovery::None,
                             bootstrap_peers: vec![],
                             directory: crate::agent::remote::mesh::DirectoryMode::default(),
                             request_timeout: std::time::Duration::from_secs(300),
+                            transport: Default::default(),
+                            identity_file: Some(identity_path),
+                            mesh_secret: None,
+                            invite: None,
                         };
+                        // Leak the tempdir so it lives for the entire process
+                        // (the test mesh is a process-global singleton).
+                        std::mem::forget(identity_dir);
                         bootstrap_mesh(&cfg)
                             .await
                             .expect("test mesh bootstrap failed")
