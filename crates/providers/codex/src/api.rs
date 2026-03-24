@@ -356,11 +356,11 @@ impl std::fmt::Display for CodexChatResponse {
     }
 }
 
-pub fn codex_chat_request<C: CodexProviderConfig>(
+fn codex_chat_body_json<C: CodexProviderConfig>(
     cfg: &C,
     messages: &[ChatMessage],
     tools: Option<&[Tool]>,
-) -> Result<Request<Vec<u8>>, LLMError> {
+) -> Result<Vec<u8>, LLMError> {
     let instructions = resolve_instructions(cfg.model(), cfg.instructions())?;
     let mut inputs = Vec::with_capacity(messages.len() + 1);
     if let Some(system) = cfg.system().filter(|text| !text.trim().is_empty()) {
@@ -530,7 +530,15 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
         extra_body,
     };
 
-    let json_body = serde_json::to_vec(&body)?;
+    Ok(serde_json::to_vec(&body)?)
+}
+
+pub fn codex_chat_request<C: CodexProviderConfig>(
+    cfg: &C,
+    messages: &[ChatMessage],
+    tools: Option<&[Tool]>,
+) -> Result<Request<Vec<u8>>, LLMError> {
+    let json_body = codex_chat_body_json(cfg, messages, tools)?;
     let url = cfg
         .base_url()
         .join("responses")
@@ -1071,90 +1079,79 @@ fn codex_effort_str(e: ReasoningEffort) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexChatResponse, CodexProviderConfig, CodexToolUseState, codex_chat_request,
-        codex_parse_stream_chunk_with_state,
+        CodexChatResponse, CodexToolUseState, chatgpt_account_id, codex_chat_body_json,
+        codex_chat_request, codex_parse_stream_chunk_with_state,
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use querymt::chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, ReasoningEffort, StreamChunk, Tool,
-        ToolChoice,
-    };
+    use http::header::AUTHORIZATION;
+    use querymt::chat::{ChatMessage, ChatResponse, ChatRole, Content, StreamChunk};
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use url::Url;
 
-    // ── Minimal config stub for unit tests ───────────────────────────────────
-
-    struct TestConfig {
-        api_key: String,
-        base_url: Url,
+    /// Build a minimal config for unit tests.
+    fn test_codex(api_key: &str) -> crate::Codex {
+        crate::Codex {
+            api_key: api_key.to_string(),
+            base_url: Url::parse("https://chatgpt.com/backend-api/codex/").unwrap(),
+            model: "codex-mini-latest".to_string(),
+            max_tokens: None,
+            temperature: None,
+            instructions: None,
+            system: None,
+            timeout_seconds: None,
+            stream: None,
+            top_p: None,
+            top_k: None,
+            client_version: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            extra_body: None,
+            tool_state_buffer: crate::Codex::default_tool_state_buffer(),
+            key_resolver: None,
+        }
     }
 
-    impl TestConfig {
-        fn new() -> Self {
-            // Build a minimal fake JWT: header.payload.signature
-            // payload must contain `https://api.openai.com/auth.chatgpt_account_id`
-            let payload_json =
-                r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"test-account-id"}}"#;
-            let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
-            let api_key = format!("eyJ.{}.sig", payload_b64);
-            Self {
-                api_key,
-                base_url: Url::parse("https://chatgpt.com/backend-api/codex/").unwrap(),
+    fn test_oauth_token(account_id: &str) -> String {
+        let payload_json = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
             }
-        }
+        });
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.to_string().as_bytes());
+        format!("eyJ.{}.sig", payload_b64)
     }
 
-    impl CodexProviderConfig for TestConfig {
-        fn api_key(&self) -> String {
-            self.api_key.clone()
-        }
-        fn base_url(&self) -> &Url {
-            &self.base_url
-        }
-        fn model(&self) -> &str {
-            "codex-mini-latest"
-        }
-        fn max_tokens(&self) -> Option<&u32> {
-            None
-        }
-        fn temperature(&self) -> Option<&f32> {
-            None
-        }
-        fn instructions(&self) -> Option<&str> {
-            None
-        }
-        fn system(&self) -> Option<&str> {
-            None
-        }
-        fn timeout_seconds(&self) -> Option<&u64> {
-            None
-        }
-        fn stream(&self) -> Option<&bool> {
-            None
-        }
-        fn top_p(&self) -> Option<&f32> {
-            None
-        }
-        fn top_k(&self) -> Option<&u32> {
-            None
-        }
-        fn tools(&self) -> Option<&[Tool]> {
-            None
-        }
-        fn tool_choice(&self) -> Option<&ToolChoice> {
-            None
-        }
-        fn client_version(&self) -> Option<&str> {
-            None
-        }
-        fn reasoning_effort(&self) -> Option<ReasoningEffort> {
-            None
-        }
-        fn extra_body(&self) -> Option<serde_json::Map<String, Value>> {
-            None
-        }
+    #[test]
+    fn codex_chat_request_adds_auth_headers() {
+        let token = test_oauth_token("test-account-id");
+        let codex = test_codex(&token);
+        let messages = vec![ChatMessage::user().text("hello").build()];
+
+        let req = codex_chat_request(&codex, &messages, None).expect("chat request should build");
+
+        let expected_auth = format!("Bearer {}", token);
+        assert_eq!(
+            req.headers().get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+            Some(expected_auth.as_str())
+        );
+        assert_eq!(
+            req.headers()
+                .get("ChatGPT-Account-ID")
+                .and_then(|v| v.to_str().ok()),
+            Some("test-account-id")
+        );
+    }
+
+    #[test]
+    fn chatgpt_account_id_requires_oauth_payload_claim() {
+        let err = chatgpt_account_id("not-a-jwt").expect_err("invalid token should fail");
+        assert!(
+            err.to_string().contains("Invalid OAuth access token"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Build a user `ChatMessage` whose content is a single `Content::ToolResult`
@@ -1197,7 +1194,7 @@ mod tests {
     /// must carry the image as an `input_image` content block.
     #[test]
     fn codex_tool_result_with_image_injects_follow_up_message() {
-        let cfg = TestConfig::new();
+        let cfg = test_codex("test-token");
         let png_bytes: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x00];
 
         let messages = vec![tool_result_msg(
@@ -1209,9 +1206,8 @@ mod tests {
         )];
 
         let body: Value = serde_json::from_slice(
-            codex_chat_request(&cfg, &messages, None)
-                .expect("must not error on image tool result")
-                .body(),
+            &codex_chat_body_json(&cfg, &messages, None)
+                .expect("must not error on image tool result"),
         )
         .unwrap();
 
@@ -1253,7 +1249,7 @@ mod tests {
     /// function_call_output and the image appears in the follow-up message.
     #[test]
     fn codex_tool_result_with_text_and_image_preserves_text_and_injects_image() {
-        let cfg = TestConfig::new();
+        let cfg = test_codex("test-token");
 
         let messages = vec![tool_result_msg(
             "call-3",
@@ -1267,9 +1263,8 @@ mod tests {
         )];
 
         let body: Value = serde_json::from_slice(
-            codex_chat_request(&cfg, &messages, None)
-                .expect("must not error on mixed text+image tool result")
-                .body(),
+            &codex_chat_body_json(&cfg, &messages, None)
+                .expect("must not error on mixed text+image tool result"),
         )
         .unwrap();
 
@@ -1300,7 +1295,7 @@ mod tests {
     /// `input_image` content block — not skipped, not errored.
     #[test]
     fn codex_top_level_image_serialized_as_input_image() {
-        let cfg = TestConfig::new();
+        let cfg = test_codex("test-token");
 
         let messages = vec![ChatMessage {
             role: ChatRole::User,
@@ -1315,9 +1310,8 @@ mod tests {
         }];
 
         let body: Value = serde_json::from_slice(
-            codex_chat_request(&cfg, &messages, None)
-                .expect("must not error on top-level image")
-                .body(),
+            &codex_chat_body_json(&cfg, &messages, None)
+                .expect("must not error on top-level image"),
         )
         .unwrap();
 
@@ -1342,7 +1336,7 @@ mod tests {
     /// with the URL passed through directly (no base64 encoding).
     #[test]
     fn codex_top_level_image_url_serialized_as_input_image() {
-        let cfg = TestConfig::new();
+        let cfg = test_codex("test-token");
 
         let messages = vec![ChatMessage {
             role: ChatRole::User,
@@ -1353,9 +1347,8 @@ mod tests {
         }];
 
         let body: Value = serde_json::from_slice(
-            codex_chat_request(&cfg, &messages, None)
-                .expect("must not error on top-level ImageUrl")
-                .body(),
+            &codex_chat_body_json(&cfg, &messages, None)
+                .expect("must not error on top-level ImageUrl"),
         )
         .unwrap();
 
