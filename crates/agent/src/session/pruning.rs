@@ -4,7 +4,7 @@
 //! which marks old tool outputs as compacted (soft delete) to keep context size manageable.
 
 use crate::model::{AgentMessage, MessagePart};
-use querymt::chat::ChatRole;
+use querymt::chat::{ChatRole, Content};
 
 /// Default number of tokens to protect from pruning (most recent tool outputs)
 pub const PRUNE_PROTECT_TOKENS: usize = 40_000;
@@ -42,6 +42,44 @@ impl Default for PruneConfig {
 /// Trait for estimating token counts from text
 pub trait TokenEstimator: Send + Sync {
     fn estimate(&self, text: &str) -> usize;
+}
+
+fn estimate_content_tokens(content: &[Content], estimator: &dyn TokenEstimator) -> usize {
+    content
+        .iter()
+        .map(|block| estimate_block_tokens(block, estimator))
+        .sum()
+}
+
+fn estimate_block_tokens(block: &Content, estimator: &dyn TokenEstimator) -> usize {
+    match block {
+        Content::Text { text } => estimator.estimate(text),
+        Content::Image { data, .. } | Content::Pdf { data } => data.len().saturating_div(4),
+        Content::Audio { data, .. } => data.len().saturating_div(4),
+        Content::ImageUrl { url } => estimator.estimate(url),
+        Content::Thinking { text, .. } => estimator.estimate(text),
+        Content::ToolUse {
+            name, arguments, ..
+        } => estimator.estimate(name) + estimator.estimate(&arguments.to_string()),
+        Content::ToolResult { content, .. } => estimate_content_tokens(content, estimator),
+        Content::ResourceLink {
+            uri,
+            name,
+            description,
+            mime_type,
+        } => {
+            estimator.estimate(uri)
+                + name.as_deref().map(|s| estimator.estimate(s)).unwrap_or(0)
+                + description
+                    .as_deref()
+                    .map(|s| estimator.estimate(s))
+                    .unwrap_or(0)
+                + mime_type
+                    .as_deref()
+                    .map(|s| estimator.estimate(s))
+                    .unwrap_or(0)
+        }
+    }
 }
 
 /// Simple token estimator using character count heuristic (~4 chars per token)
@@ -155,12 +193,7 @@ pub fn compute_prune_candidates(
                     continue;
                 }
 
-                let text: String = content
-                    .iter()
-                    .filter_map(|b| b.as_text())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let tokens = estimator.estimate(&text);
+                let tokens = estimate_content_tokens(content, estimator);
 
                 // Step 5: Protect the most recent PRUNE_PROTECT tokens
                 if protected_tokens < config.protect_tokens {
@@ -265,6 +298,31 @@ mod tests {
         }
     }
 
+    fn make_assistant_message_with_binary_tool_result(
+        id: &str,
+        session_id: &str,
+        call_id: &str,
+        content: Vec<Content>,
+    ) -> AgentMessage {
+        AgentMessage {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::ToolResult {
+                call_id: call_id.to_string(),
+                content,
+                is_error: false,
+                tool_name: Some("read".to_string()),
+                tool_arguments: None,
+                compacted_at: None,
+            }],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        }
+    }
+
     #[test]
     fn test_simple_token_estimator() {
         let estimator = SimpleTokenEstimator;
@@ -272,6 +330,20 @@ mod tests {
         assert_eq!(estimator.estimate("test"), 1);
         assert_eq!(estimator.estimate("12345678"), 2);
         assert_eq!(estimator.estimate(&"a".repeat(100)), 25);
+    }
+
+    #[test]
+    fn test_estimate_content_tokens_counts_binary_payloads() {
+        let estimator = SimpleTokenEstimator;
+        let content = vec![
+            Content::image("image/png", vec![0u8; 400]),
+            Content::pdf(vec![1u8; 800]),
+            Content::text("tiny"),
+        ];
+
+        let tokens = estimate_content_tokens(&content, &estimator);
+
+        assert_eq!(tokens, 100 + 200 + 1);
     }
 
     #[test]
@@ -397,6 +469,34 @@ mod tests {
         // Not enough tokens to justify pruning
         assert!(!analysis.should_prune);
         assert!(analysis.candidates.is_empty());
+    }
+
+    #[test]
+    fn test_prune_can_select_binary_heavy_tool_results() {
+        let estimator = SimpleTokenEstimator;
+        let config = PruneConfig {
+            protect_tokens: 0,
+            minimum_tokens: 1,
+            protected_tools: vec![],
+        };
+
+        let messages = vec![
+            make_user_message("1", "s1"),
+            make_assistant_message_with_binary_tool_result(
+                "2",
+                "s1",
+                "c1",
+                vec![Content::image("image/png", vec![0u8; 400])],
+            ),
+            make_user_message("3", "s1"),
+            make_user_message("4", "s1"),
+        ];
+
+        let analysis = compute_prune_candidates(&messages, &config, &estimator);
+
+        assert!(analysis.should_prune);
+        assert!(analysis.prunable_tokens >= 100);
+        assert!(analysis.candidates.iter().any(|c| c.call_id == "c1"));
     }
 
     #[test]

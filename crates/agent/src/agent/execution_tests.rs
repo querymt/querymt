@@ -15,7 +15,7 @@ use crate::test_utils::{
 use agent_client_protocol::StopReason;
 use mockall::Sequence;
 use querymt::LLMParams;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use querymt::error::LLMError;
 use serde_json::json;
 use std::collections::HashMap;
@@ -464,6 +464,87 @@ async fn test_tool_error_continues() {
     let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
+}
+
+#[tokio::test]
+async fn test_tool_binary_output_survives_follow_up_turn_until_compaction() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let tool_call = mock_querymt_tool_call("call-1", "remote_tool", "{}");
+    let seen_history = Arc::new(StdMutex::new(None::<Vec<querymt::chat::ChatMessage>>));
+    let seen_history_clone = seen_history.clone();
+    let mut seq = Sequence::new();
+
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_| {
+            Ok(Box::new(MockChatResponse::with_tools(
+                "",
+                vec![tool_call.clone()],
+            )))
+        });
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |messages| {
+            *seen_history_clone.lock().unwrap() = Some(messages.to_vec());
+            Ok(Box::new(MockChatResponse::text_only("done")))
+        });
+    harness
+        .provider_mut()
+        .await
+        .expect_call_tool()
+        .returning(|_, _| {
+            Ok(vec![
+                Content::image("image/png", vec![0u8; 32]),
+                Content::pdf(vec![1u8; 64]),
+                Content::text("small text"),
+            ])
+        })
+        .times(1);
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+
+    let history = seen_history
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("second chat should capture history");
+    let tool_result_message = history
+        .iter()
+        .find(|msg| {
+            msg.content
+                .iter()
+                .any(|block| matches!(block, Content::ToolResult { .. }))
+        })
+        .expect("history should contain tool result message");
+
+    let tool_result_content = tool_result_message
+        .content
+        .iter()
+        .find_map(|block| match block {
+            Content::ToolResult { content, .. } => Some(content),
+            _ => None,
+        })
+        .expect("tool result block should exist");
+
+    assert!(matches!(&tool_result_content[0], Content::Image { .. }));
+    assert!(matches!(&tool_result_content[1], Content::Pdf { .. }));
+    assert!(matches!(&tool_result_content[2], Content::Text { text } if text == "small text"));
 }
 
 #[tokio::test]
