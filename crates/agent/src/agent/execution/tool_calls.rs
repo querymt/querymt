@@ -189,7 +189,7 @@ pub(super) async fn execute_tool_call(
                 ))
                 .await
             {
-                Ok(res) => (vec![Content::text(res)], false, "builtin"),
+                Ok(res) => (res, false, "builtin"),
                 Err(e) => (
                     vec![Content::text(format!("Error: {}", e))],
                     true,

@@ -182,8 +182,17 @@ impl VerificationService {
             }
         })?;
 
-        // Parse result if it's JSON
-        let result_value: Value = serde_json::from_str(&result).unwrap_or(Value::String(result));
+        // Extract text from content blocks and parse as JSON if possible
+        let result_text: String = result
+            .into_iter()
+            .filter_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result_value: Value =
+            serde_json::from_str(&result_text).unwrap_or(Value::String(result_text));
 
         // Check expectation
         self.check_expectation(&result_value, expectation, tool_name)

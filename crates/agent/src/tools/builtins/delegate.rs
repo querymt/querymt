@@ -6,7 +6,7 @@
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde_json::{Value, json};
 
 pub struct DelegateTool;
@@ -71,7 +71,11 @@ impl ToolTrait for DelegateTool {
         &[]
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         // Extract and validate arguments
         let target_id = args["target_agent_id"]
             .as_str()
@@ -105,12 +109,12 @@ impl ToolTrait for DelegateTool {
         // Return immediately - the actual delegation will be handled asynchronously
         // by the DelegationOrchestrator when it receives the DelegationRequested event
         // (emitted by the agent after this tool call completes)
-        Ok(format!(
+        Ok(vec![Content::text(format!(
             "Delegation to agent '{}' has been queued.\n\
              Objective: {}\n\n\
              The task will be executed asynchronously. \
              You will receive results when the delegation completes.",
             target_id, objective
-        ))
+        ))])
     }
 }

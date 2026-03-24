@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use querymt::chat::{FunctionTool, Tool as ChatTool};
+use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -104,7 +104,11 @@ impl Tool for TodoWriteTool {
         }
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         let todos_val = args
             .get("todos")
             .and_then(Value::as_array)
@@ -132,6 +136,7 @@ impl Tool for TodoWriteTool {
         });
 
         serde_json::to_string_pretty(&result)
+            .map(|s| vec![Content::text(s)])
             .map_err(|e| ToolError::ProviderError(format!("Failed to serialize result: {}", e)))
     }
 }
@@ -173,7 +178,11 @@ impl Tool for TodoReadTool {
         }
     }
 
-    async fn call(&self, _args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        _args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         let session_id = context.session_id().to_string();
 
         let storage = TODO_STORAGE.lock();
@@ -185,6 +194,7 @@ impl Tool for TodoReadTool {
         });
 
         serde_json::to_string_pretty(&result)
+            .map(|s| vec![Content::text(s)])
             .map_err(|e| ToolError::ProviderError(format!("Failed to serialize result: {}", e)))
     }
 }
@@ -192,6 +202,16 @@ impl Tool for TodoReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
 
@@ -224,12 +244,12 @@ mod tests {
             ]
         });
 
-        let write_result = write_tool.call(write_args, &context).await.unwrap();
+        let write_result = first_text_block(write_tool.call(write_args, &context).await.unwrap());
         assert!(write_result.contains("\"total_todos\": 2"));
 
         // Read todos
         let read_args = json!({});
-        let read_result = read_tool.call(read_args, &context).await.unwrap();
+        let read_result = first_text_block(read_tool.call(read_args, &context).await.unwrap());
         assert!(read_result.contains("Task 1"));
         assert!(read_result.contains("Task 2"));
     }

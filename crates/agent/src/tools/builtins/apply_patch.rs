@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use patchkit::ContentPatch;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde_json::{Value, json};
 use std::fs;
 
@@ -68,7 +68,11 @@ impl ToolTrait for ApplyPatchTool {
         &[CapabilityRequirement::Filesystem]
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         let patch = args
             .get("patch")
             .and_then(Value::as_str)
@@ -105,11 +109,12 @@ impl ToolTrait for ApplyPatchTool {
                 files_modified.push(file_path);
             }
 
-            Ok(json!({
+            let s = json!({
                 "success": true,
                 "files": files_modified,
             })
-            .to_string())
+            .to_string();
+            Ok(vec![Content::text(s)])
         })
         .await
         .map_err(|e| ToolError::ProviderError(format!("patch task failed: {}", e)))?
@@ -148,6 +153,16 @@ impl ApplyPatchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::tools::AgentToolContext;
     use std::fs;
     use std::io::Write;
@@ -257,7 +272,7 @@ mod tests {
         let result = tool.call(args, &context).await;
         assert!(result.is_ok(), "Patch application failed: {:?}", result);
 
-        let output = result.unwrap();
+        let output = first_text_block(result.unwrap());
         let parsed: Value = serde_json::from_str(&output).unwrap();
 
         // Check response format
@@ -347,7 +362,7 @@ mod tests {
         let result = tool.call(args, &context).await;
         assert!(result.is_ok(), "Multi-file patch failed: {:?}", result);
 
-        let output = result.unwrap();
+        let output = first_text_block(result.unwrap());
         let parsed: Value = serde_json::from_str(&output).unwrap();
 
         // Should have modified 2 files

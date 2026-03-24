@@ -2,7 +2,7 @@
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde_json::{Value, json};
 
 pub struct KnowledgeListTool;
@@ -55,7 +55,11 @@ impl ToolTrait for KnowledgeListTool {
         &[]
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         // Extract optional fields
         let limit = args["limit"].as_u64().unwrap_or(20) as usize;
         if !(1..=100).contains(&limit) {
@@ -93,10 +97,10 @@ impl ToolTrait for KnowledgeListTool {
 
         // Format response
         if entries.is_empty() {
-            return Ok(format!(
+            return Ok(vec![Content::text(format!(
                 "No unconsolidated knowledge entries found for scope '{}'",
                 scope
-            ));
+            ))]);
         }
 
         let mut response = format!(
@@ -132,13 +136,23 @@ impl ToolTrait for KnowledgeListTool {
         response
             .push_str("\nUse knowledge_consolidate with the public IDs to create consolidations.");
 
-        Ok(response)
+        Ok(vec![Content::text(response)])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::knowledge::sqlite::SqliteKnowledgeStore;
     use crate::knowledge::{IngestRequest, KnowledgeStore};
     use crate::test_utils::sqlite_conn_with_schema;
@@ -199,7 +213,7 @@ mod tests {
 
         let result = tool.call(args, &context).await;
         assert!(result.is_ok(), "Failed: {:?}", result);
-        let output = result.unwrap();
+        let output = first_text_block(result.unwrap());
         assert!(output.contains("Found 2 unconsolidated"));
         assert!(output.contains("Dark mode preference"));
         assert!(output.contains("Late night work"));
@@ -223,6 +237,6 @@ mod tests {
 
         let result = tool.call(args, &context).await;
         assert!(result.is_ok());
-        assert!(result.unwrap().contains("No unconsolidated"));
+        assert!(first_text_block(result.unwrap()).contains("No unconsolidated"));
     }
 }

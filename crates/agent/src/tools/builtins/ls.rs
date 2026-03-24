@@ -1,7 +1,7 @@
 //! List directory contents tool
 
 use async_trait::async_trait;
-use querymt::chat::{FunctionTool, Tool as ChatTool};
+use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -246,7 +246,11 @@ impl Tool for ListTool {
         )
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         let root = if let Some(path_str) = args.get("path").and_then(Value::as_str) {
             context.resolve_path(path_str)?
         } else {
@@ -283,13 +287,27 @@ impl Tool for ListTool {
         .await
         .map_err(|e| ToolError::ProviderError(format!("list task failed: {}", e)))??;
 
-        Ok(Self::format_tree(entries, &root_for_format, truncated))
+        Ok(vec![Content::text(Self::format_tree(
+            entries,
+            &root_for_format,
+            truncated,
+        ))])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::tools::AgentToolContext;
     use std::fs;
     use tempfile::TempDir;
@@ -508,7 +526,7 @@ mod tests {
         let tool = ListTool::new();
 
         let args = json!({});
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
 
         // Check depth-prefix format output
         assert!(result.contains("0 file1.txt"), "depth-0 file1.txt");
@@ -531,7 +549,7 @@ mod tests {
         let args = json!({
             "ignore": ["*.log"]
         });
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
 
         assert!(result.contains("keep.txt"));
         assert!(!result.contains("ignore.log"));

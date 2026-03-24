@@ -1,7 +1,7 @@
 //! Multiedit tool for applying multiple edits to a single file
 
 use async_trait::async_trait;
-use querymt::chat::{FunctionTool, Tool as ChatTool};
+use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -95,7 +95,11 @@ impl Tool for MultiEditTool {
         &[CapabilityRequirement::Filesystem]
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         let file_path_str = args
             .get("filePath")
             .and_then(Value::as_str)
@@ -164,6 +168,7 @@ impl Tool for MultiEditTool {
         });
 
         serde_json::to_string_pretty(&result)
+            .map(|s| vec![Content::text(s)])
             .map_err(|e| ToolError::ProviderError(format!("Failed to serialize result: {}", e)))
     }
 }
@@ -171,6 +176,16 @@ impl Tool for MultiEditTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::tools::AgentToolContext;
     use std::fs;
     use tempfile::TempDir;
@@ -200,7 +215,7 @@ mod tests {
             ]
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         assert!(result.contains("\"successful_edits\": 2"));
 
         let new_content = fs::read_to_string(&file_path).unwrap();

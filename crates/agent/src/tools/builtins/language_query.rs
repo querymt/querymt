@@ -8,7 +8,7 @@
 //! (currently the VS Code extension). In CLI mode, returns an error message.
 
 use async_trait::async_trait;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde_json::{Value, json};
 
 use crate::tools::{Tool as ToolTrait, ToolContext, ToolError};
@@ -188,15 +188,20 @@ impl ToolTrait for LanguageQueryTool {
         }
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         // Check if workspace query bridge is available
         let bridge = match context.workspace_query_bridge() {
             Some(bridge) => bridge.clone(),
             None => {
-                return Ok("language_query is not available in this mode. \
+                return Ok(vec![Content::text(
+                    "language_query is not available in this mode. \
                      It requires a VS Code client with workspace query support. \
-                     Use file reading and search tools instead."
-                    .to_string());
+                     Use file reading and search tools instead.",
+                )]);
             }
         };
 
@@ -209,7 +214,7 @@ impl ToolTrait for LanguageQueryTool {
         })?;
 
         // Format the response as a string for the LLM
-        Ok(response.to_string())
+        Ok(vec![Content::text(response.to_string())])
     }
 }
 

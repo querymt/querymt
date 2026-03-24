@@ -92,11 +92,21 @@ pub async fn build_prompt_blocks(
         }
 
         if metadata.is_dir() {
-            if let Ok(output) = render_read_output(&resolved_path, 0, DEFAULT_READ_LIMIT).await {
+            if let Ok(content_blocks) =
+                render_read_output(&resolved_path, 0, DEFAULT_READ_LIMIT).await
+            {
+                let text = content_blocks
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        querymt::chat::Content::Text { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 blocks.push(ContentBlock::Text(TextContent::new(format!(
                     "[dir: {}]\n{}",
                     resolved_path.display(),
-                    output
+                    text
                 ))));
             }
             continue;
@@ -115,11 +125,21 @@ pub async fn build_prompt_blocks(
         }
 
         if String::from_utf8(bytes).is_ok() {
-            if let Ok(output) = render_read_output(&resolved_path, 0, DEFAULT_READ_LIMIT).await {
+            if let Ok(content_blocks) =
+                render_read_output(&resolved_path, 0, DEFAULT_READ_LIMIT).await
+            {
+                let text = content_blocks
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        querymt::chat::Content::Text { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 blocks.push(ContentBlock::Text(TextContent::new(format!(
                     "[file: {}]\n{}",
                     resolved_path.display(),
-                    output
+                    text
                 ))));
             }
         } else {

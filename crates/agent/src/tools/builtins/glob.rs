@@ -1,7 +1,7 @@
 //! Glob tool for fast file pattern matching
 
 use async_trait::async_trait;
-use querymt::chat::{FunctionTool, Tool as ChatTool};
+use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -129,7 +129,11 @@ impl Tool for GlobTool {
         )
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         // Extract pattern (required)
         let pattern = args
             .get("pattern")
@@ -176,13 +180,23 @@ impl Tool for GlobTool {
             output.push_str(&format!("({} matches)", count));
         }
 
-        Ok(output)
+        Ok(vec![Content::text(output)])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::tools::AgentToolContext;
     use std::fs;
     use tempfile::TempDir;
@@ -205,7 +219,7 @@ mod tests {
             "pattern": "**/*.rs"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
 
         // Check simple list format
         assert!(result.contains("test.rs"));
@@ -232,7 +246,7 @@ mod tests {
             "limit": 5
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
 
         // Check truncation message
         assert!(result.contains("(5 matches, truncated)"));

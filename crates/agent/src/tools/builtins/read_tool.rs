@@ -1,7 +1,7 @@
 //! Read tool implementation using ToolContext
 
 use async_trait::async_trait;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde_json::{Value, json};
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
@@ -33,7 +33,7 @@ impl ToolTrait for ReadTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Read a file or directory under the workspace. Returns XML-like output with <path>, <type>, and <content> or <entries>. Supports non-recursive pagination via offset/limit for both files and directories."
+                description: "Read a file or directory under the workspace. For text files, returns XML-like output with <path>, <type>, and <content> including line numbers. For image files (PNG, JPEG, GIF, WebP), returns the image content directly. For PDF files, returns the PDF content directly. For other binary files, returns a descriptive error. Supports non-recursive pagination via offset/limit for text files and directories."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -76,7 +76,11 @@ impl ToolTrait for ReadTool {
         )
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
@@ -117,11 +121,14 @@ impl ToolTrait for ReadTool {
 mod tests {
     use super::*;
     use crate::tools::AgentToolContext;
+    use querymt::chat::Content;
     use serde_json::json;
     use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    // ── helpers ──────────────────────────────────────────────────────────────
 
     async fn create_test_file(dir: &TempDir, name: &str, content: &str) -> PathBuf {
         let file_path = dir.path().join(name);
@@ -129,6 +136,18 @@ mod tests {
         file.write_all(content.as_bytes()).unwrap();
         file_path
     }
+
+    /// Extract the text from the first Content::Text block, panicking if absent.
+    fn first_text(blocks: &[Content]) -> &str {
+        for b in blocks {
+            if let Content::Text { text } = b {
+                return text.as_str();
+            }
+        }
+        panic!("no Content::Text block found in result: {:?}", blocks);
+    }
+
+    // ── existing text / directory tests (updated for Vec<Content>) ───────────
 
     #[tokio::test]
     async fn test_read_file_full() {
@@ -141,12 +160,13 @@ mod tests {
         let args = json!({ "path": file_path.to_str().unwrap() });
 
         let result = tool.call(args, &context).await.unwrap();
+        let text = first_text(&result);
 
-        assert!(result.contains("<type>file</type>"));
-        assert!(result.contains("<content>"));
-        assert!(result.contains("00001| line 1"));
-        assert!(result.contains("00003| line 3"));
-        assert!(result.contains("(End of file - total 3 lines)"));
+        assert!(text.contains("<type>file</type>"));
+        assert!(text.contains("<content>"));
+        assert!(text.contains("00001| line 1"));
+        assert!(text.contains("00003| line 3"));
+        assert!(text.contains("(End of file - total 3 lines)"));
     }
 
     #[tokio::test]
@@ -165,11 +185,12 @@ mod tests {
         });
 
         let result = tool.call(args, &context).await.unwrap();
+        let text = first_text(&result);
 
-        assert!(result.contains("00002| line 2"));
-        assert!(result.contains("00003| line 3"));
-        assert!(!result.contains("00001| line 1"));
-        assert!(result.contains("Use 'offset' parameter to read beyond line 3"));
+        assert!(text.contains("00002| line 2"));
+        assert!(text.contains("00003| line 3"));
+        assert!(!text.contains("00001| line 1"));
+        assert!(text.contains("Use 'offset' parameter to read beyond line 3"));
     }
 
     #[tokio::test]
@@ -191,11 +212,12 @@ mod tests {
         });
 
         let result = tool.call(args, &context).await.unwrap();
+        let text = first_text(&result);
 
-        assert!(result.contains("<type>directory</type>"));
-        assert!(result.contains("<entries>"));
-        assert!(!result.contains("nested.txt"));
-        assert!(result.contains("(2 entries)"));
+        assert!(text.contains("<type>directory</type>"));
+        assert!(text.contains("<entries>"));
+        assert!(!text.contains("nested.txt"));
+        assert!(text.contains("(2 entries)"));
     }
 
     #[tokio::test]
@@ -216,8 +238,124 @@ mod tests {
         });
 
         let result = tool.call(args, &context).await.unwrap();
+        let text = first_text(&result);
 
-        assert!(result.contains("(2 entries)"));
-        assert!(result.contains("(More entries available. Use a higher offset.)"));
+        assert!(text.contains("(2 entries)"));
+        assert!(text.contains("(More entries available. Use a higher offset.)"));
+    }
+
+    // ── RED: new image / PDF / unsupported-binary tests ──────────────────────
+
+    /// Minimal valid 1×1 red PNG (67 bytes).
+    const MINIMAL_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR length + type
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1×1
+        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, // 8-bit RGB, CRC
+        0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, // IDAT length + type
+        0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, // IDAT data
+        0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC, // IDAT CRC
+        0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, // IEND length + type
+        0x44, 0xAE, 0x42, 0x60, 0x82, // IEND CRC
+    ];
+
+    /// Minimal valid PDF (just enough bytes to pass the `%PDF` magic header check).
+    const MINIMAL_PDF: &[u8] = b"%PDF-1.0\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
+
+    #[tokio::test]
+    async fn test_read_png_returns_image_content() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let file_path = temp_dir.path().join("image.png");
+        fs::write(&file_path, MINIMAL_PNG).unwrap();
+
+        let tool = ReadTool::new();
+        let args = json!({ "path": file_path.to_str().unwrap() });
+
+        let result = tool.call(args, &context).await.unwrap();
+
+        assert_eq!(result.len(), 1, "expected exactly one content block");
+        match &result[0] {
+            Content::Image { mime_type, data } => {
+                assert_eq!(mime_type, "image/png");
+                assert_eq!(data, MINIMAL_PNG);
+            }
+            other => panic!("expected Content::Image, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_jpeg_returns_image_content() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        // Minimal JPEG: SOI marker + EOI marker
+        let jpeg_bytes: &[u8] = &[
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+        ];
+        let file_path = temp_dir.path().join("image.jpg");
+        fs::write(&file_path, jpeg_bytes).unwrap();
+
+        let tool = ReadTool::new();
+        let args = json!({ "path": file_path.to_str().unwrap() });
+
+        let result = tool.call(args, &context).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Content::Image { mime_type, .. } => assert_eq!(mime_type, "image/jpeg"),
+            other => panic!("expected Content::Image, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_pdf_returns_pdf_content() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let file_path = temp_dir.path().join("doc.pdf");
+        fs::write(&file_path, MINIMAL_PDF).unwrap();
+
+        let tool = ReadTool::new();
+        let args = json!({ "path": file_path.to_str().unwrap() });
+
+        let result = tool.call(args, &context).await.unwrap();
+
+        assert_eq!(result.len(), 1, "expected exactly one content block");
+        match &result[0] {
+            Content::Pdf { data } => {
+                assert_eq!(data.as_slice(), MINIMAL_PDF);
+            }
+            other => panic!("expected Content::Pdf, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_unsupported_binary_returns_error_text() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        // Random binary bytes that are not a valid image or PDF.
+        let binary: &[u8] = &[0x00, 0x01, 0x02, 0x03, 0xFF, 0xFE, 0xFD, 0xFC];
+        let file_path = temp_dir.path().join("random.bin");
+        fs::write(&file_path, binary).unwrap();
+
+        let tool = ReadTool::new();
+        let args = json!({ "path": file_path.to_str().unwrap() });
+
+        let result = tool.call(args, &context).await.unwrap();
+        let text = first_text(&result);
+
+        assert!(
+            text.contains("Binary file"),
+            "expected a 'Binary file' message, got: {}",
+            text
+        );
     }
 }

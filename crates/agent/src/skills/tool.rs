@@ -2,6 +2,7 @@ use crate::skills::permissions::{PermissionLevel, SkillPermissions};
 use crate::skills::registry::SkillRegistry;
 use crate::tools::{Tool, ToolContext, ToolError};
 use async_trait::async_trait;
+use querymt::chat::Content;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
@@ -100,7 +101,7 @@ impl Tool for SkillTool {
         }
     }
 
-    async fn call(&self, args: Value, ctx: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(&self, args: Value, ctx: &dyn ToolContext) -> Result<Vec<Content>, ToolError> {
         let name = args["name"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidRequest("'name' parameter required".into()))?;
@@ -170,13 +171,23 @@ impl Tool for SkillTool {
             // TODO: Apply to session's active tool filter (Phase 5)
         }
 
-        Ok(output)
+        Ok(vec![Content::text(output)])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::skills::types::{Skill, SkillMetadata, SkillSource};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -247,7 +258,7 @@ mod tests {
         let result = tool.call(args, &ctx).await;
 
         assert!(result.is_ok());
-        let output = result.unwrap();
+        let output = first_text_block(result.unwrap());
         assert!(output.contains("test-skill"));
         assert!(output.contains("A test skill"));
         assert!(output.contains("Test content for test-skill"));

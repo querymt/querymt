@@ -988,10 +988,18 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
             std::fs::metadata(&resolved).map_err(|e| FileProxyError::ReadError(e.to_string()))?;
 
         if metadata.is_dir() {
-            let output = render_read_output(&resolved, msg.offset, msg.limit)
+            let content_blocks = render_read_output(&resolved, msg.offset, msg.limit)
                 .await
                 .map_err(FileProxyError::ReadError)?;
-            return Ok(ReadRemoteFileResponse::Text(output));
+            let text = content_blocks
+                .into_iter()
+                .filter_map(|b| match b {
+                    querymt::chat::Content::Text { text } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(ReadRemoteFileResponse::Text(text));
         }
 
         let bytes =
@@ -1006,10 +1014,18 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
         }
 
         if String::from_utf8(bytes).is_ok() {
-            let output = render_read_output(&resolved, msg.offset, msg.limit)
+            let content_blocks = render_read_output(&resolved, msg.offset, msg.limit)
                 .await
                 .map_err(FileProxyError::ReadError)?;
-            Ok(ReadRemoteFileResponse::Text(output))
+            let text = content_blocks
+                .into_iter()
+                .filter_map(|b| match b {
+                    querymt::chat::Content::Text { text } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(ReadRemoteFileResponse::Text(text))
         } else {
             Ok(ReadRemoteFileResponse::Binary)
         }

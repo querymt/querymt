@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use regex::Regex;
 use reqwest::Url;
 use serde_json::{Value, json};
@@ -192,7 +192,11 @@ impl ToolTrait for BrowseTool {
         )
     }
 
-    async fn call(&self, args: Value, _context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        _context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         let url = args
             .get("url")
             .and_then(Value::as_str)
@@ -226,9 +230,11 @@ impl ToolTrait for BrowseTool {
 
         if is_html_content_type(&content_type) {
             let cleaned = strip_styles_and_scripts(&body);
-            Ok(fast_html2md::parse_html(&cleaned, true))
+            Ok(vec![Content::text(fast_html2md::parse_html(
+                &cleaned, true,
+            ))])
         } else {
-            Ok(body)
+            Ok(vec![Content::text(body)])
         }
     }
 }
