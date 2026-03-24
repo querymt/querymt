@@ -157,6 +157,8 @@ enum CodexInputContent<'a> {
     #[serde(rename = "output_text")]
     OutputText { text: Cow<'a, str> },
     /// Inline image: `{ "type": "input_image", "image_url": "data:...;base64,..." }`
+    // TODO: Add `detail` support once image detail is modeled in shared content/config.
+    // TODO: Support file IDs here so Codex can accept images, PDFs, and other uploaded files.
     #[serde(rename = "input_image")]
     InputImage { image_url: Cow<'a, str> },
 }

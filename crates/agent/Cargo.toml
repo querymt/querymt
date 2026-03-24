@@ -78,6 +78,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 base64.workspace = true
 infer = "0.19"
 rayon = "1.11"
+imagesize = "0.14"
 
 # NLP: multilingual stopwords, stemming, language detection
 stop-words = "0.10"

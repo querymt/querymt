@@ -34,9 +34,13 @@ pub(super) async fn run_pruning(
         protected_tools: config.execution_policy.pruning.protected_tools.clone(),
     };
 
-    let estimator = crate::session::pruning::SimpleTokenEstimator;
-    let analysis =
-        crate::session::pruning::compute_prune_candidates(&messages, &prune_config, &estimator);
+    let estimator =
+        crate::session::pruning::content_cost_estimator_for_llm_config(exec_ctx.llm_config());
+    let analysis = crate::session::pruning::compute_prune_candidates(
+        &messages,
+        &prune_config,
+        estimator.as_ref(),
+    );
 
     if analysis.should_prune && !analysis.candidates.is_empty() {
         let call_ids = crate::session::pruning::extract_call_ids(&analysis.candidates);
