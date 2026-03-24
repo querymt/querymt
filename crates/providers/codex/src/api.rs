@@ -1134,7 +1134,9 @@ mod tests {
 
         let expected_auth = format!("Bearer {}", token);
         assert_eq!(
-            req.headers().get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+            req.headers()
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
             Some(expected_auth.as_str())
         );
         assert_eq!(
