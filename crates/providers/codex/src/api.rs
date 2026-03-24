@@ -143,7 +143,27 @@ enum CodexInputItem<'a> {
     #[serde(rename = "function_call_output")]
     FunctionCallOutput {
         call_id: Cow<'a, str>,
-        output: Cow<'a, str>,
+        output: CodexFunctionCallOutput<'a>,
+    },
+}
+
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+enum CodexFunctionCallOutput<'a> {
+    Text(Cow<'a, str>),
+    Parts(Vec<CodexToolOutputPart<'a>>),
+}
+
+#[derive(Serialize, Debug)]
+#[serde(tag = "type")]
+enum CodexToolOutputPart<'a> {
+    #[serde(rename = "output_text")]
+    OutputText { text: Cow<'a, str> },
+    #[serde(rename = "input_image")]
+    InputImage {
+        image_url: Cow<'a, str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<&'a str>,
     },
 }
 
@@ -225,6 +245,7 @@ struct CodexOutputContent {
     content_type: String,
     #[serde(default, alias = "reasoning", alias = "reasoning_content")]
     text: Option<String>,
+    #[allow(dead_code)]
     tool_calls: Vec<ToolCall>,
 }
 
@@ -262,14 +283,13 @@ impl CodexRawUsage {
             .map(|d| d.reasoning_tokens)
             .unwrap_or(0);
 
-        let usage = Usage {
+        Usage {
             input_tokens: self.input_tokens.saturating_sub(cache_read),
             output_tokens: self.output_tokens.saturating_sub(reasoning),
             reasoning_tokens: reasoning,
             cache_read,
             cache_write: 0,
-        };
-        usage
+        }
     }
 }
 
@@ -436,28 +456,52 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
                     });
                 }
                 Content::ToolResult { id, content, .. } => {
-                    // function_call_output only accepts a plain string; collect text and
-                    // describe media blocks, then inject media as a follow-up user message
-                    // so the model can actually see it.
-                    let mut text_parts: Vec<String> = Vec::new();
-                    let mut media_blocks: Vec<CodexInputContent> = Vec::new();
+                    let mut output_parts: Vec<CodexToolOutputPart> = Vec::new();
+                    let mut text_only_parts: Vec<String> = Vec::new();
+                    let mut has_non_text = false;
 
                     for c in content {
                         match c {
                             Content::Text { text } => {
-                                text_parts.push(text.clone());
+                                output_parts.push(CodexToolOutputPart::OutputText {
+                                    text: Cow::Borrowed(text.as_str()),
+                                });
+                                text_only_parts.push(text.clone());
                             }
                             Content::Image { mime_type, data } => {
-                                text_parts.push(format!(
-                                    "[Image: {} ({} bytes) — content follows in next message]",
-                                    mime_type,
-                                    data.len()
-                                ));
-                                media_blocks.push(CodexInputContent::InputImage {
+                                has_non_text = true;
+                                output_parts.push(CodexToolOutputPart::InputImage {
                                     image_url: Cow::Owned(format!(
                                         "data:{};base64,{}",
                                         mime_type,
                                         STANDARD.encode(data)
+                                    )),
+                                    detail: None,
+                                });
+                            }
+                            Content::ImageUrl { url } => {
+                                has_non_text = true;
+                                output_parts.push(CodexToolOutputPart::InputImage {
+                                    image_url: Cow::Borrowed(url.as_str()),
+                                    detail: None,
+                                });
+                            }
+                            Content::Pdf { data } => {
+                                has_non_text = true;
+                                output_parts.push(CodexToolOutputPart::OutputText {
+                                    text: Cow::Owned(format!(
+                                        "[PDF tool output not yet serialized natively ({} bytes)]",
+                                        data.len()
+                                    )),
+                                });
+                            }
+                            Content::Audio { mime_type, data } => {
+                                has_non_text = true;
+                                output_parts.push(CodexToolOutputPart::OutputText {
+                                    text: Cow::Owned(format!(
+                                        "[Audio tool output not yet serialized natively ({}: {} bytes)]",
+                                        mime_type,
+                                        data.len()
                                     )),
                                 });
                             }
@@ -465,22 +509,16 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
                         }
                     }
 
+                    let output = if has_non_text {
+                        CodexFunctionCallOutput::Parts(output_parts)
+                    } else {
+                        CodexFunctionCallOutput::Text(Cow::Owned(text_only_parts.join("\n")))
+                    };
+
                     inputs.push(CodexInputItem::FunctionCallOutput {
                         call_id: Cow::Borrowed(id.as_str()),
-                        output: Cow::Owned(text_parts.join("\n")),
+                        output,
                     });
-
-                    // Inject media as a follow-up user message so the model can see it.
-                    if !media_blocks.is_empty() {
-                        let mut follow_up = vec![CodexInputContent::InputText {
-                            text: Cow::Owned(format!("[Content from tool call {}]", id)),
-                        }];
-                        follow_up.extend(media_blocks);
-                        inputs.push(CodexInputItem::Message {
-                            role: Cow::Borrowed("user"),
-                            content: follow_up,
-                        });
-                    }
                 }
                 // Audio, ResourceLink, Thinking — not supported; skip.
                 _ => {}
@@ -1183,21 +1221,13 @@ mod tests {
             .find(|item| item["type"] == item_type)
     }
 
-    /// Collect ALL input items of the given type.
-    fn all_input_items<'a>(body: &'a Value, item_type: &str) -> Vec<&'a Value> {
-        body["input"]
-            .as_array()
-            .map(|arr| arr.iter().filter(|i| i["type"] == item_type).collect())
-            .unwrap_or_default()
-    }
-
     // ── tool-result image tests ───────────────────────────────────────────────
 
-    /// When a tool result contains an image, the function_call_output must have a
-    /// descriptive text referencing the follow-up, AND a follow-up user message
-    /// must carry the image as an `input_image` content block.
+    /// When a tool result contains an image, the function_call_output should carry
+    /// the image directly as rich output parts rather than injecting a synthetic
+    /// follow-up message.
     #[test]
-    fn codex_tool_result_with_image_injects_follow_up_message() {
+    fn codex_tool_result_with_image_uses_rich_function_call_output() {
         let cfg = test_codex("test-token");
         let png_bytes: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x00];
 
@@ -1215,32 +1245,15 @@ mod tests {
         )
         .unwrap();
 
-        // function_call_output must be present and non-empty
-        let fco_output = find_input_item(&body, "function_call_output")
-            .and_then(|i| i["output"].as_str())
-            .expect("function_call_output with output field");
-        assert!(!fco_output.is_empty(), "output must not be empty");
-
-        // A follow-up message item must exist after function_call_output
-        let msgs = all_input_items(&body, "message");
-        let follow_up = msgs
-            .iter()
-            .find(|m| {
-                m["content"]
-                    .as_array()
-                    .map(|c| c.iter().any(|b| b["type"] == "input_image"))
-                    .unwrap_or(false)
-            })
-            .expect("a follow-up user message with an input_image block");
-
-        // The input_image block must carry a data URL
-        let image_url = follow_up["content"]
-            .as_array()
-            .unwrap()
+        // function_call_output must carry rich output parts with an inline image.
+        let fco = find_input_item(&body, "function_call_output")
+            .expect("function_call_output item must be present");
+        let output_parts = fco["output"].as_array().expect("rich output parts array");
+        let image_url = output_parts
             .iter()
             .find(|b| b["type"] == "input_image")
             .and_then(|b| b["image_url"].as_str())
-            .expect("input_image block with image_url");
+            .expect("input_image part with image_url");
 
         assert!(
             image_url.starts_with("data:image/png;base64,"),
@@ -1249,10 +1262,10 @@ mod tests {
         );
     }
 
-    /// When a tool result contains both text and an image, text appears in
-    /// function_call_output and the image appears in the follow-up message.
+    /// When a tool result contains both text and an image, the rich
+    /// function_call_output must preserve both parts in order.
     #[test]
-    fn codex_tool_result_with_text_and_image_preserves_text_and_injects_image() {
+    fn codex_tool_result_with_text_and_image_preserves_rich_output_order() {
         let cfg = test_codex("test-token");
 
         let messages = vec![tool_result_msg(
@@ -1272,25 +1285,13 @@ mod tests {
         )
         .unwrap();
 
-        let fco_output = find_input_item(&body, "function_call_output")
-            .and_then(|i| i["output"].as_str())
-            .unwrap();
+        let output_parts = find_input_item(&body, "function_call_output")
+            .and_then(|i| i["output"].as_array())
+            .expect("rich function_call_output parts");
 
-        assert!(
-            fco_output.contains("some text output"),
-            "original text must be in function_call_output, got: {}",
-            fco_output
-        );
-
-        // Follow-up message with input_image must exist
-        let msgs = all_input_items(&body, "message");
-        assert!(
-            msgs.iter().any(|m| m["content"]
-                .as_array()
-                .map(|c| c.iter().any(|b| b["type"] == "input_image"))
-                .unwrap_or(false)),
-            "follow-up message with input_image must be injected"
-        );
+        assert_eq!(output_parts[0]["type"].as_str(), Some("output_text"));
+        assert_eq!(output_parts[0]["text"].as_str(), Some("some text output"));
+        assert_eq!(output_parts[1]["type"].as_str(), Some("input_image"));
     }
 
     // ── top-level image tests ────────────────────────────────────────────────
