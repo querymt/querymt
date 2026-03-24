@@ -9,9 +9,7 @@ use crate::agent::file_proxy::ReadRemoteFileResponse;
 use crate::index::{
     FileIndex, FileIndexEntry, GetOrCreate, WorkspaceIndexManagerActor, resolve_workspace_root,
 };
-use crate::tools::builtins::read_shared::{
-    DEFAULT_READ_LIMIT, detect_image_mime, render_read_output,
-};
+use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_read_output};
 use agent_client_protocol::{ContentBlock, ImageContent, TextContent};
 use base64::Engine;
 use kameo::actor::ActorRef;
@@ -91,62 +89,29 @@ pub async fn build_prompt_blocks(
             }
         }
 
-        if metadata.is_dir() {
-            if let Ok(content_blocks) =
-                render_read_output(&resolved_path, 0, DEFAULT_READ_LIMIT).await
-            {
-                let text = content_blocks
-                    .into_iter()
-                    .filter_map(|b| match b {
-                        querymt::chat::Content::Text { text } => Some(text),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                blocks.push(ContentBlock::Text(TextContent::new(format!(
-                    "[dir: {}]\n{}",
-                    resolved_path.display(),
-                    text
-                ))));
-            }
+        let is_dir = metadata.is_dir();
+        let Ok(content_blocks) = render_read_output(&resolved_path, 0, DEFAULT_READ_LIMIT).await
+        else {
             continue;
-        }
-
-        let bytes = match std::fs::read(&resolved_path) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
         };
 
-        if let Some(mime_type) = detect_image_mime(&bytes) {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-            let image = ImageContent::new(encoded, mime_type).uri(raw_path.to_string());
-            blocks.push(ContentBlock::Image(image));
-            continue;
-        }
-
-        if String::from_utf8(bytes).is_ok() {
-            if let Ok(content_blocks) =
-                render_read_output(&resolved_path, 0, DEFAULT_READ_LIMIT).await
-            {
-                let text = content_blocks
-                    .into_iter()
-                    .filter_map(|b| match b {
-                        querymt::chat::Content::Text { text } => Some(text),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                blocks.push(ContentBlock::Text(TextContent::new(format!(
-                    "[file: {}]\n{}",
-                    resolved_path.display(),
-                    text
-                ))));
+        for block in content_blocks {
+            match block {
+                querymt::chat::Content::Image { mime_type, data } => {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+                    let image = ImageContent::new(encoded, mime_type).uri(raw_path.to_string());
+                    blocks.push(ContentBlock::Image(image));
+                }
+                querymt::chat::Content::Text { text } => {
+                    let label = if is_dir { "dir" } else { "file" };
+                    blocks.push(ContentBlock::Text(TextContent::new(format!(
+                        "[{label}: {}]\n{}",
+                        resolved_path.display(),
+                        text
+                    ))));
+                }
+                _ => {}
             }
-        } else {
-            blocks.push(ContentBlock::Text(TextContent::new(format!(
-                "[file: {}]\n(binary file; not inlined)",
-                raw_path
-            ))));
         }
     }
 

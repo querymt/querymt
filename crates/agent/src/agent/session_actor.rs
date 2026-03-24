@@ -957,7 +957,7 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         use crate::agent::file_proxy::{FileProxyError, ReadRemoteFileResponse};
-        use crate::tools::builtins::read_shared::{detect_image_mime, render_read_output};
+        use crate::tools::builtins::read_shared::render_read_output;
         use base64::Engine as _;
 
         let cwd = self
@@ -984,51 +984,28 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
             ));
         }
 
-        let metadata =
-            std::fs::metadata(&resolved).map_err(|e| FileProxyError::ReadError(e.to_string()))?;
+        let blocks = render_read_output(&resolved, msg.offset, msg.limit)
+            .await
+            .map_err(FileProxyError::ReadError)?;
 
-        if metadata.is_dir() {
-            let content_blocks = render_read_output(&resolved, msg.offset, msg.limit)
-                .await
-                .map_err(FileProxyError::ReadError)?;
-            let text = content_blocks
-                .into_iter()
-                .filter_map(|b| match b {
-                    querymt::chat::Content::Text { text } => Some(text),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Ok(ReadRemoteFileResponse::Text(text));
+        // Map the single Content block returned by render_read_output to the
+        // appropriate ReadRemoteFileResponse variant.
+        for block in blocks {
+            match block {
+                querymt::chat::Content::Image { mime_type, data } => {
+                    return Ok(ReadRemoteFileResponse::Image {
+                        mime_type,
+                        base64_data: base64::engine::general_purpose::STANDARD.encode(&data),
+                    });
+                }
+                querymt::chat::Content::Text { text } => {
+                    return Ok(ReadRemoteFileResponse::Text(text));
+                }
+                _ => {}
+            }
         }
 
-        let bytes =
-            std::fs::read(&resolved).map_err(|e| FileProxyError::ReadError(e.to_string()))?;
-
-        if let Some(mime_type) = detect_image_mime(&bytes) {
-            let base64_data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            return Ok(ReadRemoteFileResponse::Image {
-                mime_type: (*mime_type).to_string(),
-                base64_data,
-            });
-        }
-
-        if String::from_utf8(bytes).is_ok() {
-            let content_blocks = render_read_output(&resolved, msg.offset, msg.limit)
-                .await
-                .map_err(FileProxyError::ReadError)?;
-            let text = content_blocks
-                .into_iter()
-                .filter_map(|b| match b {
-                    querymt::chat::Content::Text { text } => Some(text),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(ReadRemoteFileResponse::Text(text))
-        } else {
-            Ok(ReadRemoteFileResponse::Binary)
-        }
+        Ok(ReadRemoteFileResponse::Binary)
     }
 }
 
