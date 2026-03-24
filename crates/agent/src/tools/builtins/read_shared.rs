@@ -3,33 +3,15 @@ use std::path::Path;
 
 pub const DEFAULT_READ_LIMIT: usize = 2000;
 
-/// Maximum file size (bytes) we will read into memory for image/PDF content.
+/// Maximum file size (bytes) we will read into memory for binary content.
 /// Files larger than this get a descriptive error instead.
 const MAX_BINARY_READ_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
 
-/// The kind of media detected in a binary file.
-pub(crate) enum MediaKind {
-    Image { mime_type: &'static str },
-    Pdf,
-}
-
-/// Detect if bytes represent a supported media format (image or PDF).
-pub(crate) fn detect_media_kind(bytes: &[u8]) -> Option<MediaKind> {
+/// Detect if bytes represent a supported image format.
+pub(crate) fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
     let kind = infer::get(bytes)?;
     match kind.mime_type() {
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp" => Some(MediaKind::Image {
-            mime_type: kind.mime_type(),
-        }),
-        "application/pdf" => Some(MediaKind::Pdf),
-        _ => None,
-    }
-}
-
-/// Detect if bytes represent a supported image format.
-/// Kept for compatibility with existing callers (session_actor, mentions).
-pub(crate) fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    match detect_media_kind(bytes)? {
-        MediaKind::Image { mime_type } => Some(mime_type),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" => Some(kind.mime_type()),
         _ => None,
     }
 }
@@ -38,7 +20,6 @@ pub(crate) fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
 ///
 /// - Text files   → `[Content::Text]` with line-numbered XML-like format
 /// - Image files  → `[Content::Image { mime_type, data }]`
-/// - PDF files    → `[Content::Pdf { data }]`
 /// - Other binary → `[Content::Text]` with a descriptive error message
 /// - Directories  → `[Content::Text]` with entry listing
 pub async fn render_read_output(
@@ -65,15 +46,9 @@ pub async fn render_read_output(
             .await
             .map_err(|e| format!("read failed: {}", e))?;
 
-        // Binary detection: image or PDF get returned as rich content blocks.
-        match detect_media_kind(&bytes) {
-            Some(MediaKind::Image { mime_type }) => {
-                return Ok(vec![Content::image(mime_type, bytes)]);
-            }
-            Some(MediaKind::Pdf) => {
-                return Ok(vec![Content::pdf(bytes)]);
-            }
-            None => {}
+        // Binary detection: images get returned as rich content blocks.
+        if let Some(mime_type) = detect_image_mime(&bytes) {
+            return Ok(vec![Content::image(mime_type, bytes)]);
         }
 
         // Not a recognised binary format — try to interpret as UTF-8 text.
@@ -107,7 +82,7 @@ pub async fn render_read_output(
             }
             Err(_) => {
                 return Ok(vec![Content::text(format!(
-                    "Binary file '{}'; not a supported format (image/PDF/text). \
+                    "Binary file '{}'; not a supported format (image/text). \
                      Use an external tool to process this file.",
                     target.display(),
                 ))]);

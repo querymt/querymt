@@ -33,7 +33,7 @@ impl ToolTrait for ReadTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Read a file or directory under the workspace. For text files, returns XML-like output with <path>, <type>, and <content> including line numbers. For image files (PNG, JPEG, GIF, WebP), returns the image content directly. For PDF files, returns the PDF content directly. For other binary files, returns a descriptive error. Supports non-recursive pagination via offset/limit for text files and directories."
+                description: "Read a file or directory under the workspace. For text files, returns XML-like output with <path>, <type>, and <content> including line numbers. For image files (PNG, JPEG, GIF, WebP), returns the image content directly. For other binary files, returns a descriptive error. Supports non-recursive pagination via offset/limit for text files and directories."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -244,7 +244,7 @@ mod tests {
         assert!(text.contains("(More entries available. Use a higher offset.)"));
     }
 
-    // ── RED: new image / PDF / unsupported-binary tests ──────────────────────
+    // ── new image / unsupported-binary tests ─────────────────────────────────
 
     /// Minimal valid 1×1 red PNG (67 bytes).
     const MINIMAL_PNG: &[u8] = &[
@@ -258,9 +258,6 @@ mod tests {
         0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, // IEND length + type
         0x44, 0xAE, 0x42, 0x60, 0x82, // IEND CRC
     ];
-
-    /// Minimal valid PDF (just enough bytes to pass the `%PDF` magic header check).
-    const MINIMAL_PDF: &[u8] = b"%PDF-1.0\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
 
     #[tokio::test]
     async fn test_read_png_returns_image_content() {
@@ -313,35 +310,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_pdf_returns_pdf_content() {
-        let temp_dir = TempDir::new().unwrap();
-        let context =
-            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
-
-        let file_path = temp_dir.path().join("doc.pdf");
-        fs::write(&file_path, MINIMAL_PDF).unwrap();
-
-        let tool = ReadTool::new();
-        let args = json!({ "path": file_path.to_str().unwrap() });
-
-        let result = tool.call(args, &context).await.unwrap();
-
-        assert_eq!(result.len(), 1, "expected exactly one content block");
-        match &result[0] {
-            Content::Pdf { data } => {
-                assert_eq!(data.as_slice(), MINIMAL_PDF);
-            }
-            other => panic!("expected Content::Pdf, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
     async fn test_read_unsupported_binary_returns_error_text() {
         let temp_dir = TempDir::new().unwrap();
         let context =
             AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
 
-        // Random binary bytes that are not a valid image or PDF.
+        // Random binary bytes that are not a valid image.
         let binary: &[u8] = &[0x00, 0x01, 0x02, 0x03, 0xFF, 0xFE, 0xFD, 0xFC];
         let file_path = temp_dir.path().join("random.bin");
         fs::write(&file_path, binary).unwrap();
