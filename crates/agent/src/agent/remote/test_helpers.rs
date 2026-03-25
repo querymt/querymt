@@ -96,7 +96,6 @@ pub(crate) mod fixtures {
                             request_timeout: std::time::Duration::from_secs(300),
                             transport: Default::default(),
                             identity_file: Some(identity_path),
-                            mesh_secret: None,
                             invite: None,
                         };
                         // Leak the tempdir so it lives for the entire process

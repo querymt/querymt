@@ -28,7 +28,7 @@ remote = ["kameo/remote", "dep:libp2p"]
 # Extends `remote` with iroh-backed QUIC transport for NAT traversal and
 # relay-based connectivity across the internet.  Adds invite-token support
 # for dynamic mesh joining.
-remote-internet = ["remote", "dep:libp2p-iroh"]
+remote-internet = ["remote", "dep:libp2p-iroh", "dep:qrcode"]
 
 [dependencies]
 typeshare = "1.0"
@@ -40,6 +40,7 @@ agent-client-protocol-schema = { version = "0.11", features = ["unstable"]}
 kameo = "0.19"
 libp2p = { version = "0.56", optional = true, default-features = false }
 libp2p-iroh = { git = "https://github.com/querymt/libp2p-iroh.git", branch = "kademlia", optional = true }
+qrcode = { version = "0.14", optional = true }
 async-trait.workspace = true
 anyhow = "1.0"
 thiserror = "2.0"

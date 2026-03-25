@@ -373,6 +373,28 @@ pub enum UiClientMessage {
     DeleteSchedule {
         schedule_public_id: String,
     },
+    /// Create a new mesh invite token
+    #[serde(rename = "create_mesh_invite")]
+    CreateMeshInvite {
+        /// Optional human-readable mesh name
+        #[serde(default)]
+        mesh_name: Option<String>,
+        /// TTL as human string: "24h", "7d", "none". Default: "24h".
+        #[serde(default)]
+        ttl: Option<String>,
+        /// Max uses (0 = unlimited, default 1)
+        #[serde(default)]
+        #[typeshare(serialized_as = "Option<number>")]
+        max_uses: Option<u32>,
+    },
+    /// List active (pending) mesh invites
+    #[serde(rename = "list_mesh_invites")]
+    ListMeshInvites,
+    /// Revoke a mesh invite by ID
+    #[serde(rename = "revoke_mesh_invite")]
+    RevokeMeshInvite {
+        invite_id: String,
+    },
     /// Query the knowledge store
     #[serde(rename = "query_knowledge")]
     QueryKnowledge {
@@ -473,6 +495,25 @@ pub struct StreamCursor {
     #[serde(default)]
     #[typeshare(serialized_as = "Record<string, number>")]
     pub remote_seq_by_source: HashMap<String, u64>,
+}
+
+/// Mesh invite DTO for the UI.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshInviteInfo {
+    pub invite_id: String,
+    pub mesh_name: Option<String>,
+    #[typeshare(serialized_as = "number")]
+    pub expires_at: u64,
+    #[typeshare(serialized_as = "number")]
+    pub max_uses: u32,
+    #[typeshare(serialized_as = "number")]
+    pub uses_remaining: u32,
+    /// pending | consumed | revoked
+    pub status: String,
+    pub used_by: Vec<String>,
+    #[typeshare(serialized_as = "number")]
+    pub created_at: u64,
 }
 
 // ============================================================================
@@ -760,6 +801,28 @@ pub enum UiServerMessage {
         /// Sessions on that node
         sessions: Vec<crate::agent::remote::RemoteSessionInfo>,
     },
+    /// Newly created mesh invite
+    MeshInviteCreated {
+        invite_id: String,
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        qr_code: Option<String>,
+        #[typeshare(serialized_as = "number")]
+        expires_at: u64,
+        #[typeshare(serialized_as = "number")]
+        max_uses: u32,
+        mesh_name: Option<String>,
+    },
+    /// List of mesh invites
+    MeshInviteList {
+        invites: Vec<MeshInviteInfo>,
+    },
+    /// Invite revocation result
+    MeshInviteRevoked {
+        invite_id: String,
+        success: bool,
+        message: Option<String>,
+    },
     ModelDownloadStatus {
         provider: String,
         model_id: String,
@@ -870,6 +933,9 @@ impl UiServerMessage {
             Self::OAuthResult { .. } => "oauth_result",
             Self::RemoteNodes { .. } => "remote_nodes",
             Self::RemoteSessions { .. } => "remote_sessions",
+            Self::MeshInviteCreated { .. } => "mesh_invite_created",
+            Self::MeshInviteList { .. } => "mesh_invite_list",
+            Self::MeshInviteRevoked { .. } => "mesh_invite_revoked",
             Self::ModelDownloadStatus { .. } => "model_download_status",
             Self::PluginUpdateStatus { .. } => "plugin_update_status",
             Self::PluginUpdateComplete { .. } => "plugin_update_complete",

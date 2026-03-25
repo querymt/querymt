@@ -11,7 +11,7 @@
 
 use super::super::ServerState;
 use super::super::connection::{send_error, send_message};
-use super::super::messages::UiServerMessage;
+use super::super::messages::{MeshInviteInfo, UiServerMessage};
 #[cfg(feature = "remote")]
 use super::session_ops::handle_list_sessions;
 #[cfg(feature = "remote")]
@@ -331,6 +331,197 @@ pub async fn handle_attach_remote_session(
                 "attach_remote_session '{}' on node_id '{}' requires the 'remote' feature",
                 session_id, node_id
             ),
+        )
+        .await;
+    }
+}
+
+/// Create a mesh invite token on the local node.
+pub async fn handle_create_mesh_invite(
+    state: &ServerState,
+    mesh_name: Option<String>,
+    ttl: Option<String>,
+    max_uses: Option<u32>,
+    tx: &mpsc::Sender<String>,
+) {
+    #[cfg(feature = "remote")]
+    {
+        let Some(mesh) = state.agent.mesh() else {
+            let _ = send_error(tx, "mesh not bootstrapped — start with --mesh".to_string()).await;
+            return;
+        };
+
+        if !mesh.is_iroh_transport() {
+            let _ = send_error(
+                tx,
+                "Mesh invites require iroh transport. Restart host with --mesh --mesh-invite (or set transport=iroh).".to_string(),
+            )
+            .await;
+            return;
+        }
+
+        let ttl_secs = ttl
+            .as_deref()
+            .and_then(crate::agent::remote::invite::parse_duration_secs)
+            .or(Some(24 * 3600));
+
+        match mesh.create_invite(mesh_name.clone(), ttl_secs, max_uses, false) {
+            Ok(invite) => {
+                let url = invite.to_url();
+                #[cfg(feature = "remote-internet")]
+                let qr_code = crate::agent::remote::qr::render_to_terminal(&url);
+                #[cfg(not(feature = "remote-internet"))]
+                let qr_code: Option<String> = None;
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::MeshInviteCreated {
+                        invite_id: invite.grant.invite_id,
+                        url,
+                        qr_code,
+                        expires_at: invite.grant.expires_at,
+                        max_uses: invite.grant.max_uses,
+                        mesh_name,
+                    },
+                )
+                .await;
+            }
+            Err(e) => {
+                let _ = send_error(tx, format!("Failed to create mesh invite: {e}")).await;
+            }
+        }
+    }
+    #[cfg(not(feature = "remote"))]
+    {
+        let _ = send_error(
+            tx,
+            "create_mesh_invite requires the 'remote' feature".to_string(),
+        )
+        .await;
+    }
+}
+
+/// List mesh invites from the local invite store.
+pub async fn handle_list_mesh_invites(state: &ServerState, tx: &mpsc::Sender<String>) {
+    #[cfg(feature = "remote")]
+    {
+        let Some(mesh) = state.agent.mesh() else {
+            let _ = send_message(
+                tx,
+                UiServerMessage::MeshInviteList {
+                    invites: Vec::new(),
+                },
+            )
+            .await;
+            return;
+        };
+
+        let invites = if let Some(store) = mesh.invite_store() {
+            let store = store.read();
+            store
+                .list_pending()
+                .into_iter()
+                .map(|r| MeshInviteInfo {
+                    invite_id: r.invite_id.clone(),
+                    mesh_name: r.grant.mesh_name.clone(),
+                    expires_at: r.grant.expires_at,
+                    max_uses: r.grant.max_uses,
+                    uses_remaining: r.uses_remaining,
+                    status: match r.status {
+                        crate::agent::remote::invite::InviteStatus::Pending => {
+                            "pending".to_string()
+                        }
+                        crate::agent::remote::invite::InviteStatus::Consumed => {
+                            "consumed".to_string()
+                        }
+                        crate::agent::remote::invite::InviteStatus::Revoked => {
+                            "revoked".to_string()
+                        }
+                    },
+                    used_by: r.used_by.clone(),
+                    created_at: r.created_at,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let _ = send_message(tx, UiServerMessage::MeshInviteList { invites }).await;
+    }
+    #[cfg(not(feature = "remote"))]
+    {
+        let _ = send_message(
+            tx,
+            UiServerMessage::MeshInviteList {
+                invites: Vec::new(),
+            },
+        )
+        .await;
+    }
+}
+
+/// Revoke a mesh invite by ID.
+pub async fn handle_revoke_mesh_invite(
+    state: &ServerState,
+    invite_id: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    #[cfg(feature = "remote")]
+    {
+        let Some(mesh) = state.agent.mesh() else {
+            let _ = send_message(
+                tx,
+                UiServerMessage::MeshInviteRevoked {
+                    invite_id: invite_id.to_string(),
+                    success: false,
+                    message: Some("mesh not bootstrapped — start with --mesh".to_string()),
+                },
+            )
+            .await;
+            return;
+        };
+
+        let result = if let Some(store) = mesh.invite_store() {
+            store.write().revoke(invite_id)
+        } else {
+            Err(crate::agent::remote::invite::InviteError::StoreError(
+                "invite store not available".to_string(),
+            ))
+        };
+
+        match result {
+            Ok(()) => {
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::MeshInviteRevoked {
+                        invite_id: invite_id.to_string(),
+                        success: true,
+                        message: None,
+                    },
+                )
+                .await;
+            }
+            Err(e) => {
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::MeshInviteRevoked {
+                        invite_id: invite_id.to_string(),
+                        success: false,
+                        message: Some(e.to_string()),
+                    },
+                )
+                .await;
+            }
+        }
+    }
+    #[cfg(not(feature = "remote"))]
+    {
+        let _ = send_message(
+            tx,
+            UiServerMessage::MeshInviteRevoked {
+                invite_id: invite_id.to_string(),
+                success: false,
+                message: Some("revoke_mesh_invite requires the 'remote' feature".to_string()),
+            },
         )
         .await;
     }

@@ -24,6 +24,8 @@ import type {
   ScheduleInfo,
   KnowledgeEntryInfo,
   ConsolidationInfo,
+  MeshInviteInfo,
+  MeshInviteCreated,
 } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -71,6 +73,9 @@ export interface UiClientActionsContextValue {
   submitWorkspacePathDialog: (cwd: string, node: string | null) => void;
   cancelWorkspacePathDialog: () => void;
   listRemoteNodes: () => void;
+  createMeshInvite: (opts?: { meshName?: string; ttl?: string; maxUses?: number }) => void;
+  listMeshInvites: () => void;
+  revokeMeshInvite: (inviteId: string) => void;
   dismissConnectionError: (errorId: number) => void;
   dismissSessionActionNotice: (noticeId: number) => void;
   updatePlugins: () => void;
@@ -126,6 +131,8 @@ export interface UiClientSessionContextValue {
   availableModes: string[];
   reasoningEffort: string | null;
   remoteNodes: RemoteNodeInfo[];
+  meshInvites: MeshInviteInfo[];
+  lastCreatedMeshInvite: MeshInviteCreated | null;
   /** Session ID of the last session that failed to load. Used to navigate away and stop retry loops. */
   lastLoadErrorSessionId: string | null;
   schedules: ScheduleInfo[];
@@ -231,6 +238,9 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     submitWorkspacePathDialog: uiClient.submitWorkspacePathDialog,
     cancelWorkspacePathDialog: uiClient.cancelWorkspacePathDialog,
     listRemoteNodes: uiClient.listRemoteNodes,
+    createMeshInvite: uiClient.createMeshInvite,
+    listMeshInvites: uiClient.listMeshInvites,
+    revokeMeshInvite: uiClient.revokeMeshInvite,
     dismissConnectionError: uiClient.dismissConnectionError,
     dismissSessionActionNotice: uiClient.dismissSessionActionNotice,
     updatePlugins: uiClient.updatePlugins,
@@ -278,6 +288,8 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     availableModes: uiClient.availableModes,
     reasoningEffort: uiClient.reasoningEffort,
     remoteNodes: uiClient.remoteNodes,
+    meshInvites: uiClient.meshInvites,
+    lastCreatedMeshInvite: uiClient.lastCreatedMeshInvite,
     lastLoadErrorSessionId: uiClient.lastLoadErrorSessionId,
     schedules: uiClient.schedules,
     knowledgeEntries: uiClient.knowledgeEntries,
@@ -305,6 +317,8 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.availableModes,
     uiClient.reasoningEffort,
     uiClient.remoteNodes,
+    uiClient.meshInvites,
+    uiClient.lastCreatedMeshInvite,
     uiClient.lastLoadErrorSessionId,
     uiClient.schedules,
     uiClient.knowledgeEntries,

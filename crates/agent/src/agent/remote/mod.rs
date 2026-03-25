@@ -21,6 +21,8 @@ pub mod identity;
 pub mod invite;
 pub mod node_id;
 pub mod node_manager;
+#[cfg(feature = "remote-internet")]
+pub mod qr;
 pub mod routing;
 
 #[cfg(feature = "remote")]

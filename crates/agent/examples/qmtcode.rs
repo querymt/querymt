@@ -108,10 +108,11 @@ struct Cli {
     #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_MESH_ADDR)]
     mesh: Option<String>,
 
-    /// Create and print a mesh invite token, then start as an iroh mesh host.
+    /// Create and print a signed mesh invite token, then start as an iroh mesh host.
     ///
-    /// Requires --mesh. The mesh secret is loaded from ~/.qmt/mesh_secret
-    /// (created on first use). Optionally specify a human-readable mesh name.
+    /// Requires --mesh. The invite is signed with the node's ed25519 identity
+    /// keypair (~/.qmt/mesh_identity.key). Optionally specify a human-readable
+    /// mesh name.
     ///
     /// Examples:
     ///   --mesh --mesh-invite                    → generate invite, print, start
@@ -119,6 +120,20 @@ struct Cli {
     #[cfg(feature = "remote-internet")]
     #[arg(long, value_name = "name", num_args = 0..=1, default_missing_value = "")]
     mesh_invite: Option<String>,
+
+    /// Time-to-live for invite tokens. Default: 24h.
+    ///
+    /// Examples: 1h, 7d, 30m, none (no expiry)
+    #[cfg(feature = "remote-internet")]
+    #[arg(long, value_name = "duration", default_value = "24h")]
+    invite_ttl: Option<String>,
+
+    /// Maximum number of uses for invite tokens. Default: 1 (single-use).
+    ///
+    /// Set to 0 for unlimited uses.
+    #[cfg(feature = "remote-internet")]
+    #[arg(long, value_name = "n", default_value = "1")]
+    invite_uses: Option<u32>,
 
     /// Join an existing mesh using an invite token.
     ///
@@ -265,10 +280,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "remote-internet"))]
     let has_mesh_join = false;
 
+    // --mesh-invite implies --mesh (iroh host mode).
+    #[cfg(feature = "remote-internet")]
+    let has_mesh_invite = cli.mesh_invite.is_some();
+    #[cfg(not(feature = "remote-internet"))]
+    let has_mesh_invite = false;
+
     #[cfg(feature = "remote")]
-    let has_mesh = cli.mesh.is_some() || has_mesh_join;
+    let has_mesh = cli.mesh.is_some() || has_mesh_join || has_mesh_invite;
     #[cfg(not(feature = "remote"))]
-    let has_mesh = has_mesh_join;
+    let has_mesh = has_mesh_join || has_mesh_invite;
 
     if !is_acp && !is_api && !is_dashboard && !has_mesh {
         return Err(
@@ -304,22 +325,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Mode 3: Join via invite token ─────────────────────────────────────────
     #[cfg(feature = "remote-internet")]
     if let Some(ref token) = cli.mesh_join {
-        use querymt_agent::agent::remote::invite::MeshInvite;
+        use querymt_agent::agent::remote::invite::SignedInviteGrant;
         use querymt_agent::agent::remote::mesh::join_mesh_via_invite;
 
-        let invite = MeshInvite::decode(token).map_err(|e| format!("Invalid invite token: {e}"))?;
+        let invite =
+            SignedInviteGrant::decode(token).map_err(|e| format!("Invalid invite token: {e}"))?;
         invite
-            .validate()
-            .map_err(|e| format!("Invite validation failed: {e}"))?;
+            .verify()
+            .map_err(|e| format!("Invite verification failed: {e}"))?;
 
         eprintln!(
             "Joining mesh{} via inviter {}...",
             invite
+                .grant
                 .mesh_name
                 .as_ref()
                 .map(|n| format!(" \"{}\"", n))
                 .unwrap_or_default(),
-            invite.inviter_peer_id
+            invite.grant.inviter_peer_id
         );
 
         match join_mesh_via_invite(&invite, None).await {
@@ -342,7 +365,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mesh_invite_handled = false;
 
     #[cfg(feature = "remote")]
-    if let Some(ref mesh_addr) = cli.mesh
+    let effective_mesh = cli.mesh.clone().or_else(|| {
+        if has_mesh_invite { Some(DEFAULT_MESH_ADDR.to_string()) } else { None }
+    });
+
+    #[cfg(feature = "remote")]
+    if let Some(ref mesh_addr) = effective_mesh
         && !mesh_invite_handled
     {
         use querymt_agent::agent::remote::mesh::{
@@ -355,18 +383,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "remote-internet"))]
         let is_iroh_host = false;
 
-        let (transport, mesh_secret) = if is_iroh_host {
-            // Load or generate the mesh secret for invite creation.
-            let secret_path = dirs::home_dir()
-                .expect("cannot determine home directory")
-                .join(".qmt")
-                .join("mesh_secret");
-            let secret =
-                querymt_agent::agent::remote::invite::load_or_generate_mesh_secret(&secret_path)
-                    .map_err(|e| format!("Mesh secret error: {e}"))?;
-            (MeshTransportMode::Iroh, Some(secret))
+        let transport = if is_iroh_host {
+            MeshTransportMode::Iroh
         } else {
-            (MeshTransportMode::Lan, None)
+            MeshTransportMode::Lan
         };
 
         let mesh_config = MeshConfig {
@@ -385,7 +405,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             request_timeout: std::time::Duration::from_secs(300),
             transport,
             identity_file: None,
-            mesh_secret,
             invite: None,
         };
 
@@ -398,24 +417,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Mesh listening on: {}", mesh_addr);
                 }
 
-                // If hosting with iroh, generate and print the invite token.
+                // If hosting with iroh, generate and print the signed invite token.
                 #[cfg(feature = "remote-internet")]
-                if let (Some(name), Some(secret)) = (&cli.mesh_invite, &mesh_config.mesh_secret) {
+                if let Some(name) = &cli.mesh_invite {
                     let mesh_name = if name.is_empty() {
                         None
                     } else {
                         Some(name.clone())
                     };
-                    let invite = mesh.create_invite(secret, mesh_name, None);
-                    eprintln!();
-                    eprintln!("────────────────────────────────────────────");
-                    eprintln!("Mesh invite token:");
-                    eprintln!("  {}", invite.encode());
-                    eprintln!();
-                    eprintln!("Mesh invite URL:");
-                    eprintln!("  {}", invite.to_url());
-                    eprintln!("────────────────────────────────────────────");
-                    eprintln!();
+
+                    // Parse TTL from CLI flag.
+                    let ttl_secs = cli
+                        .invite_ttl
+                        .as_deref()
+                        .and_then(querymt_agent::agent::remote::invite::parse_duration_secs);
+
+                    let max_uses = cli.invite_uses;
+
+                    match mesh.create_invite(mesh_name, ttl_secs, max_uses, false) {
+                        Ok(invite) => {
+                            let ttl_label = match ttl_secs {
+                                Some(s) => {
+                                    querymt_agent::agent::remote::invite::format_duration_human(s)
+                                }
+                                None => "no expiry".to_string(),
+                            };
+                            let uses_label = match max_uses {
+                                Some(0) | None if max_uses == Some(0) => "unlimited".to_string(),
+                                Some(1) => "single-use".to_string(),
+                                Some(n) => format!("{n} uses"),
+                                None => "single-use".to_string(),
+                            };
+
+                            let url = invite.to_url();
+
+                            eprintln!();
+                            eprintln!("────────────────────────────────────────────");
+                            eprintln!("Mesh invite ({uses_label}, expires in {ttl_label}):");
+                            eprintln!();
+                            eprintln!("  {url}");
+                            eprintln!();
+
+                            // Render QR code if the terminal supports it.
+                            if let Some(qr) =
+                                querymt_agent::agent::remote::qr::render_to_terminal(&url)
+                            {
+                                for line in qr.lines() {
+                                    eprintln!("  {line}");
+                                }
+                                eprintln!();
+                            }
+
+                            eprintln!("────────────────────────────────────────────");
+                            eprintln!();
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: failed to create invite: {e}");
+                        }
+                    }
                 }
 
                 register_mesh_actors(&runner, &mesh).await;

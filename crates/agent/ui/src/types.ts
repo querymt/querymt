@@ -318,6 +318,27 @@ export interface OAuthResultState {
   message: string;
 }
 
+// Mesh invite view models (UI-only; backend-generated union support may lag).
+export interface MeshInviteInfo {
+  invite_id: string;
+  mesh_name?: string | null;
+  expires_at: number;
+  max_uses: number;
+  uses_remaining: number;
+  status: 'pending' | 'consumed' | 'revoked' | string;
+  used_by: string[];
+  created_at: number;
+}
+
+export interface MeshInviteCreated {
+  invite_id: string;
+  url: string;
+  qr_code?: string | null;
+  expires_at: number;
+  max_uses: number;
+  mesh_name?: string | null;
+}
+
 // Cached LLM config details for model config popover
 export interface LlmConfigDetails {
   configId: number;

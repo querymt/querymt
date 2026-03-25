@@ -659,14 +659,6 @@ pub struct MeshTomlConfig {
     #[serde(default)]
     pub identity_file: Option<String>,
 
-    /// Path to the mesh secret file (32 raw bytes).
-    ///
-    /// When set, only peers that share this secret can join the mesh.
-    /// The file is created on first use if it doesn't exist.
-    /// Supports `${VAR}` interpolation, e.g. `"${QMT_MESH_SECRET_FILE}"`.
-    #[serde(default)]
-    pub mesh_secret_file: Option<String>,
-
     /// Invite token to join an existing mesh.
     ///
     /// When set, the node bootstraps in "join" mode: it dials the inviter
@@ -696,7 +688,6 @@ impl Default for MeshTomlConfig {
             peers: Vec::new(),
             request_timeout_secs: default_mesh_request_timeout_secs(),
             identity_file: None,
-            mesh_secret_file: None,
             invite: None,
         }
     }

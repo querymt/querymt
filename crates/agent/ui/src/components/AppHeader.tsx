@@ -13,6 +13,7 @@ import { ModelPickerPopover } from './ModelPickerPopover';
 import { HeaderStatsBar } from './HeaderStatsBar';
 import { RemoteNodeIndicator } from './RemoteNodeIndicator';
 import { getModeDisplayName } from '../utils/modeColors';
+import type { ReactNode } from 'react';
 import type { UiAgentInfo, SessionLimits, RoutingMode } from '../types';
 
 interface AppHeaderProps {
@@ -58,6 +59,9 @@ interface AppHeaderProps {
   // Mobile menu
   mobileMenuOpen: boolean;
   setMobileMenuOpen: (open: boolean) => void;
+
+  // Render slots
+  desktopActions?: ReactNode;
 }
 
 export function AppHeader(props: AppHeaderProps) {
@@ -189,6 +193,7 @@ export function AppHeader(props: AppHeaderProps) {
             />
 
             <RemoteNodeIndicator remoteNodes={remoteNodes} />
+            {props.desktopActions}
           </div>
         )}
 

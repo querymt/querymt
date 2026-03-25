@@ -84,15 +84,12 @@ pub async fn setup_mesh_from_config(
 
     // ── 1b. Parse invite token (if provided) ─────────────────────────────────
     let invite = if let Some(ref invite_str) = mesh_cfg.invite {
-        let parsed = crate::agent::remote::invite::MeshInvite::decode(invite_str)
+        let parsed = crate::agent::remote::invite::SignedInviteGrant::decode(invite_str)
             .map_err(|e| anyhow::anyhow!("invalid mesh invite token: {e}"))?;
-        parsed
-            .validate()
-            .map_err(|e| anyhow::anyhow!("mesh invite validation failed: {e}"))?;
         log::info!(
             "Parsed mesh invite: inviter={}, name={:?}",
-            parsed.inviter_peer_id,
-            parsed.mesh_name
+            parsed.grant.inviter_peer_id,
+            parsed.grant.mesh_name
         );
         Some(parsed)
     } else {
@@ -108,22 +105,6 @@ pub async fn setup_mesh_from_config(
             MeshTransportConfig::Lan => MeshTransportMode::Lan,
             MeshTransportConfig::Iroh => MeshTransportMode::Iroh,
         }
-    };
-
-    // ── 1c. Load mesh secret (if configured) ───────────────────────────────────
-    let mesh_secret = if let Some(ref invite) = invite {
-        // When joining via invite, extract the secret from the token.
-        let secret = invite
-            .secret_bytes()
-            .map_err(|e| anyhow::anyhow!("invalid mesh secret in invite: {e}"))?;
-        Some(secret)
-    } else if let Some(ref secret_path) = mesh_cfg.mesh_secret_file {
-        let path = std::path::PathBuf::from(secret_path);
-        let secret = crate::agent::remote::invite::load_or_generate_mesh_secret(&path)
-            .map_err(|e| anyhow::anyhow!("mesh secret error: {e}"))?;
-        Some(secret)
-    } else {
-        None
     };
 
     let config = MeshConfig {
@@ -142,7 +123,6 @@ pub async fn setup_mesh_from_config(
             .identity_file
             .as_ref()
             .map(std::path::PathBuf::from),
-        mesh_secret,
         invite,
     };
     let listen_addr_str = config.listen.as_deref().unwrap_or("<auto>").to_string();

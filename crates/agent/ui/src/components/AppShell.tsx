@@ -13,6 +13,7 @@ import { AppHeader } from './AppHeader';
 import { MobileDropdownMenu } from './MobileDropdownMenu';
 import { GlobalOverlays } from './GlobalOverlays';
 import { ToastStack } from './ToastStack';
+import { MeshInvitePanel } from './MeshInvitePanel';
 
 /**
  * AppShell - Main layout wrapper for all routes.
@@ -44,6 +45,9 @@ export function AppShell() {
     setReasoningEffort,
     submitWorkspacePathDialog,
     cancelWorkspacePathDialog,
+    createMeshInvite,
+    listMeshInvites,
+    revokeMeshInvite,
     dismissConnectionError,
     dismissSessionActionNotice,
     updatePlugins,
@@ -67,6 +71,8 @@ export function AppShell() {
     agentMode,
     reasoningEffort,
     remoteNodes,
+    meshInvites,
+    lastCreatedMeshInvite,
   } = useUiClientSession();
 
   const {
@@ -233,6 +239,17 @@ export function AppShell() {
 
   // --- Render ---
 
+  const meshInvitePanel = (
+    <MeshInvitePanel
+      connected={connected}
+      meshInvites={meshInvites}
+      lastCreatedMeshInvite={lastCreatedMeshInvite}
+      createMeshInvite={createMeshInvite}
+      listMeshInvites={listMeshInvites}
+      revokeMeshInvite={revokeMeshInvite}
+    />
+  );
+
   return (
     <SessionTimerProvider>
     <div className="flex flex-col h-screen bg-surface-canvas text-ui-primary">
@@ -273,6 +290,7 @@ export function AppShell() {
         addCustomModelFromHf={addCustomModelFromHf}
         addCustomModelFromFile={addCustomModelFromFile}
         deleteCustomModel={deleteCustomModel}
+        desktopActions={meshInvitePanel}
       />
 
       {/* Mobile dropdown menu */}
@@ -304,6 +322,7 @@ export function AppShell() {
           addCustomModelFromHf={addCustomModelFromHf}
           addCustomModelFromFile={addCustomModelFromFile}
           deleteCustomModel={deleteCustomModel}
+          mobileExtras={meshInvitePanel}
         />
       )}
 

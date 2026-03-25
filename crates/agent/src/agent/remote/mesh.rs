@@ -148,21 +148,12 @@ pub struct MeshConfig {
     /// so the node's `PeerId` is stable across restarts.
     pub identity_file: Option<std::path::PathBuf>,
 
-    /// Optional 32-byte mesh secret for membership gating.
-    ///
-    /// When set, only peers that are already known members (connected and
-    /// verified via the join protocol) are accepted.  New peers must present
-    /// this secret after connecting to be admitted.
-    ///
-    /// When `None`, the mesh is open (any peer can connect).
-    pub mesh_secret: Option<[u8; 32]>,
-
-    /// Pre-parsed invite token.
+    /// Pre-parsed signed invite grant (v2.5).
     ///
     /// When set, the mesh bootstraps in "join" mode: it dials the inviter
-    /// (from the token) instead of waiting for mDNS or explicit peers.
+    /// (from the grant) instead of waiting for mDNS or explicit peers.
     /// Takes priority over `bootstrap_peers`.
-    pub invite: Option<super::invite::MeshInvite>,
+    pub invite: Option<super::invite::SignedInviteGrant>,
 }
 
 impl Default for MeshConfig {
@@ -176,7 +167,6 @@ impl Default for MeshConfig {
             request_timeout: std::time::Duration::from_secs(300),
             transport: MeshTransportMode::default(),
             identity_file: None,
-            mesh_secret: None,
             invite: None,
         }
     }
@@ -244,6 +234,19 @@ pub struct MeshHandle {
     /// discovers a new peer so the new peer's Kademlia routing table is
     /// populated immediately rather than waiting for the next republish cycle.
     re_register_fns: Arc<RwLock<HashMap<String, ReRegisterFn>>>,
+    /// The node's ed25519 identity keypair, cloned from bootstrap context.
+    ///
+    /// Used to sign invite grants.  The keypair is the same one used by
+    /// the libp2p swarm — its public key derives this node's `PeerId`.
+    keypair: Arc<libp2p::identity::Keypair>,
+    /// Host-side invite store for tracking issued invites.
+    ///
+    /// `None` when the node is a joiner (not a host).  Wrapped in
+    /// `Arc<RwLock<..>>` for shared access from the mesh handle and
+    /// (future) the connection handler.
+    invite_store: Option<Arc<RwLock<super::invite::InviteStore>>>,
+    /// Active transport mode used by this mesh handle.
+    transport_mode: MeshTransportMode,
 }
 
 impl std::fmt::Debug for MeshHandle {
@@ -252,17 +255,23 @@ impl std::fmt::Debug for MeshHandle {
             .field("peer_id", &self.peer_id)
             .field("local_hostname", &self.local_hostname)
             .field("re_register_fns_count", &self.re_register_fns.read().len())
+            .field("has_invite_store", &self.invite_store.is_some())
+            .field("transport_mode", &self.transport_mode)
             .finish_non_exhaustive()
     }
 }
 
 impl MeshHandle {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         peer_id: PeerId,
         peer_events_tx: broadcast::Sender<PeerEvent>,
         known_peers: Arc<RwLock<HashMap<PeerId, HashSet<Multiaddr>>>>,
         local_hostname: String,
         re_register_fns: Arc<RwLock<HashMap<String, ReRegisterFn>>>,
+        keypair: libp2p::identity::Keypair,
+        invite_store: Option<Arc<RwLock<super::invite::InviteStore>>>,
+        transport_mode: MeshTransportMode,
     ) -> Self {
         Self {
             peer_id,
@@ -270,6 +279,9 @@ impl MeshHandle {
             known_peers,
             local_hostname: Arc::new(local_hostname),
             re_register_fns,
+            keypair: Arc::new(keypair),
+            invite_store,
+            transport_mode,
         }
     }
 
@@ -526,24 +538,83 @@ impl MeshHandle {
         self.known_peers.read().keys().copied().collect()
     }
 
-    /// Create an invite token for this mesh.
+    /// Create a signed invite grant for this mesh (v2.5).
     ///
-    /// The invite contains this node's `PeerId` (as the entry point) and the
-    /// shared mesh secret.  Share the resulting token (via QR code, URL, or
-    /// clipboard) with the joining node, which can decode it and call
-    /// `join_mesh_via_invite()` to connect.
+    /// The invite contains this node's `PeerId` (as the entry point) and is
+    /// signed with this node's ed25519 identity keypair.  Share the resulting
+    /// token (via QR code, URL, or clipboard) with the joining node.
+    ///
+    /// If an `InviteStore` is attached, the invite is recorded for tracking.
     ///
     /// # Arguments
-    /// - `mesh_secret` — the 32-byte shared secret for this mesh
     /// - `mesh_name` — optional human-readable label (e.g. "Dev Mesh")
     /// - `ttl_secs` — optional time-to-live in seconds; `None` = no expiry
+    /// - `max_uses` — max number of times this invite can be used; `None` = 1
+    /// - `can_invite` — whether the joiner can create their own invites
     pub fn create_invite(
         &self,
-        mesh_secret: &[u8; 32],
         mesh_name: Option<String>,
         ttl_secs: Option<u64>,
-    ) -> super::invite::MeshInvite {
-        super::invite::MeshInvite::new(&self.peer_id.to_string(), mesh_secret, mesh_name, ttl_secs)
+        max_uses: Option<u32>,
+        can_invite: bool,
+    ) -> Result<super::invite::SignedInviteGrant, super::invite::InviteError> {
+        let max_uses = max_uses.unwrap_or(1);
+        let permissions = super::invite::InvitePermissions {
+            can_invite,
+            role: "member".to_string(),
+        };
+
+        if let Some(ref store) = self.invite_store {
+            store.write().create_invite(
+                &self.keypair,
+                &self.peer_id.to_string(),
+                mesh_name,
+                ttl_secs,
+                max_uses,
+                permissions,
+            )
+        } else {
+            // No store — just sign and return without tracking.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let expires_at = ttl_secs.map(|ttl| now + ttl).unwrap_or(0);
+
+            let grant = super::invite::InviteGrant {
+                version: 3,
+                invite_id: uuid::Uuid::now_v7().to_string(),
+                inviter_peer_id: self.peer_id.to_string(),
+                mesh_name,
+                expires_at,
+                max_uses,
+                permissions,
+            };
+            grant.sign(&self.keypair)
+        }
+    }
+
+    /// Return a reference to the node's identity keypair.
+    ///
+    /// Useful for callers that need to sign additional data (e.g. custom
+    /// auth handshakes in future versions).
+    pub fn keypair(&self) -> &libp2p::identity::Keypair {
+        &self.keypair
+    }
+
+    /// Return a reference to the invite store (if any).
+    pub fn invite_store(&self) -> Option<&Arc<RwLock<super::invite::InviteStore>>> {
+        self.invite_store.as_ref()
+    }
+
+    /// Return the active transport mode for this mesh handle.
+    pub fn transport_mode(&self) -> MeshTransportMode {
+        self.transport_mode.clone()
+    }
+
+    /// Return true when the mesh is internet-capable iroh transport.
+    pub fn is_iroh_transport(&self) -> bool {
+        matches!(self.transport_mode, MeshTransportMode::Iroh)
     }
 }
 
@@ -685,18 +756,38 @@ fn finalize_bootstrap(
     local_peer_id: PeerId,
     ctx: MeshBootstrapContext,
     listen_label: &str,
+    transport_mode: MeshTransportMode,
 ) -> MeshHandle {
     log::info!(
         "Kameo mesh bootstrapped: peer_id={}, listen={}",
         local_peer_id,
         listen_label,
     );
+
+    // Try to load or create the invite store at the default path.
+    let invite_store = match super::invite::default_invite_store_path() {
+        Ok(path) => match super::invite::InviteStore::load_or_create(&path) {
+            Ok(store) => Some(Arc::new(RwLock::new(store))),
+            Err(e) => {
+                log::warn!("Failed to load invite store: {e}; invites will not be persisted");
+                None
+            }
+        },
+        Err(e) => {
+            log::warn!("Cannot determine invite store path: {e}; invites will not be persisted");
+            None
+        }
+    };
+
     MeshHandle::new(
         local_peer_id,
         ctx.peer_events_tx,
         ctx.known_peers,
         ctx.local_hostname,
         ctx.re_register_fns,
+        ctx.keypair,
+        invite_store,
+        transport_mode,
     )
 }
 
@@ -974,7 +1065,12 @@ async fn bootstrap_lan_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         }
     }
 
-    Ok(finalize_bootstrap(local_peer_id, ctx, listen_addr))
+    Ok(finalize_bootstrap(
+        local_peer_id,
+        ctx,
+        listen_addr,
+        MeshTransportMode::Lan,
+    ))
 }
 
 // ── Iroh mesh (QUIC + relay, NAT traversal) ────────────────────────────────────
@@ -993,15 +1089,15 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
 
     // ── Build the iroh-backed libp2p transport ─────────────────────────────────
 
-    // v1: no transport-level peer_filter.
+    // v2.5: no transport-level peer_filter.
     //
-    // The mesh_secret controls who receives an invite token (and therefore
-    // knows which PeerId to dial), not who can connect at the transport
-    // layer.  iroh already provides TLS-authenticated, encrypted connections
-    // — each peer's identity is verified via its ed25519 key.
+    // Signed invite grants (v2.5) verify the inviter's identity client-side
+    // via ed25519 signature.  iroh already provides TLS-authenticated,
+    // encrypted connections — each peer's identity is verified via its
+    // ed25519 key.
     //
-    // Post-connect secret verification (challenge-response handshake) and
-    // dynamic allowlists are a v2 concern.
+    // Post-connect grant verification (challenge-response handshake) is a
+    // future v3 enhancement.
     let iroh_config = libp2p_iroh::TransportConfig {
         timeout: config.request_timeout,
         ..Default::default()
@@ -1058,19 +1154,19 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
     // If we have an invite, dial the inviter first — this is the entry point
     // into the mesh.  The inviter's PeerId is resolved by iroh's relay.
     if let Some(ref invite) = config.invite {
-        let inviter_addr: Multiaddr = format!("/p2p/{}", invite.inviter_peer_id).parse().map_err(
-            |e: libp2p::multiaddr::Error| {
+        let inviter_addr: Multiaddr = format!("/p2p/{}", invite.grant.inviter_peer_id)
+            .parse()
+            .map_err(|e: libp2p::multiaddr::Error| {
                 MeshError::SwarmError(format!(
                     "invalid inviter PeerId '{}': {}",
-                    invite.inviter_peer_id, e
+                    invite.grant.inviter_peer_id, e
                 ))
-            },
-        )?;
+            })?;
         match swarm.dial(inviter_addr.clone()) {
             Ok(_) => log::info!(
                 "Dialing inviter via iroh relay: {} (mesh: {:?})",
                 inviter_addr,
-                invite.mesh_name
+                invite.grant.mesh_name
             ),
             Err(e) => log::warn!("Failed to dial inviter {}: {}", inviter_addr, e),
         }
@@ -1129,7 +1225,12 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
         }
     });
 
-    Ok(finalize_bootstrap(local_peer_id, ctx, "iroh-relay"))
+    Ok(finalize_bootstrap(
+        local_peer_id,
+        ctx,
+        "iroh-relay",
+        MeshTransportMode::Iroh,
+    ))
 }
 
 /// Bootstrap the mesh with default settings (mDNS, port 9000).
@@ -1139,10 +1240,10 @@ pub async fn bootstrap_mesh_default() -> Result<MeshHandle, MeshError> {
     bootstrap_mesh(&MeshConfig::default()).await
 }
 
-/// Join an existing mesh using an invite token.
+/// Join an existing mesh using a signed invite grant (v2.5).
 ///
 /// This is a convenience function that:
-/// 1. Validates the invite token (checks expiry and secret format)
+/// 1. Verifies the invite grant signature and checks expiry
 /// 2. Constructs a `MeshConfig` with `transport = Iroh` and the inviter as
 ///    a bootstrap peer
 /// 3. Bootstraps the mesh and connects to the inviter
@@ -1151,23 +1252,19 @@ pub async fn bootstrap_mesh_default() -> Result<MeshHandle, MeshError> {
 /// other members via Kademlia.
 ///
 /// # Arguments
-/// - `invite` — a decoded `MeshInvite` token
+/// - `invite` — a decoded and verified `SignedInviteGrant` token
 /// - `identity_file` — optional path to the persistent identity file
 ///
 /// # Errors
 /// Returns an error if the invite is expired/invalid or if bootstrap fails.
 #[cfg(feature = "remote-internet")]
 pub async fn join_mesh_via_invite(
-    invite: &super::invite::MeshInvite,
+    invite: &super::invite::SignedInviteGrant,
     identity_file: Option<std::path::PathBuf>,
 ) -> Result<MeshHandle, MeshError> {
-    // Validate the invite.
+    // Verify the signed grant (checks signature, expiry, version).
     invite
-        .validate()
-        .map_err(|e| MeshError::SwarmError(e.to_string()))?;
-
-    let mesh_secret = invite
-        .secret_bytes()
+        .verify()
         .map_err(|e| MeshError::SwarmError(e.to_string()))?;
 
     let config = MeshConfig {
@@ -1178,14 +1275,13 @@ pub async fn join_mesh_via_invite(
         request_timeout: std::time::Duration::from_secs(300),
         transport: MeshTransportMode::Iroh,
         identity_file,
-        mesh_secret: Some(mesh_secret),
         invite: Some(invite.clone()),
     };
 
     log::info!(
         "Joining mesh via invite (inviter={}, name={:?})",
-        invite.inviter_peer_id,
-        invite.mesh_name
+        invite.grant.inviter_peer_id,
+        invite.grant.mesh_name
     );
 
     bootstrap_mesh(&config).await
