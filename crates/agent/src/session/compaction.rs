@@ -403,7 +403,7 @@ pub fn merge_consecutive_tool_result_messages(messages: Vec<AgentMessage>) -> Ve
     for msg in messages {
         let dominated_by_tool_result = is_user_tool_result(&msg);
         let should_merge =
-            dominated_by_tool_result && result.last().is_some_and(|prev| is_user_tool_result(prev));
+            dominated_by_tool_result && result.last().is_some_and(is_user_tool_result);
 
         if should_merge {
             // Safe: we just checked last() is Some.
