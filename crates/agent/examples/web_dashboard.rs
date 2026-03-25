@@ -14,7 +14,6 @@
 //! Then open http://127.0.0.1:3030 in your browser.
 
 use querymt_agent::prelude::*;
-#[cfg(feature = "dashboard")]
 use querymt_agent::server::ServerMode;
 
 #[tokio::main]

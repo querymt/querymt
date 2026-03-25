@@ -27,7 +27,7 @@ pub struct AgentServer {
 pub enum ServerMode {
     #[cfg(feature = "dashboard")]
     Dashboard,
-    ApiOnly,
+    Api,
 }
 
 impl AgentServer {
@@ -51,7 +51,7 @@ impl AgentServer {
         match mode {
             #[cfg(feature = "dashboard")]
             ServerMode::Dashboard => log::info!("UI dashboard listening on http://{}", addr),
-            ServerMode::ApiOnly => log::info!("API-only server listening on http://{}", addr),
+            ServerMode::Api => log::info!("API server listening on http://{}", addr),
         }
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
@@ -86,7 +86,7 @@ impl AgentServer {
         Ok(match mode {
             #[cfg(feature = "dashboard")]
             ServerMode::Dashboard => app.route("/", get(index_handler)).fallback(static_handler),
-            ServerMode::ApiOnly => app,
+            ServerMode::Api => app,
         })
     }
 }

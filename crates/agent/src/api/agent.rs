@@ -16,7 +16,7 @@ use crate::config::{
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
 use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
-#[cfg(feature = "api-only")]
+#[cfg(feature = "api")]
 use crate::server::AgentServer;
 use crate::session::backend::{StorageBackend, default_agent_db_path};
 use crate::session::sqlite_storage::SqliteStorage;
@@ -508,7 +508,7 @@ impl AgentBuilder {
 
 pub struct Agent {
     pub(super) inner: Arc<AgentHandle>,
-    #[cfg_attr(not(feature = "api-only"), allow(dead_code))]
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(super) storage: Arc<dyn StorageBackend>,
     pub(super) default_session_id: Arc<Mutex<Option<String>>>,
     pub(super) cwd: Option<PathBuf>,
@@ -617,7 +617,7 @@ impl Agent {
         self
     }
 
-    #[cfg(feature = "api-only")]
+    #[cfg(feature = "api")]
     pub fn server(&self) -> AgentServer {
         AgentServer::new(self.inner.clone(), self.storage.clone(), self.cwd.clone())
     }
@@ -901,7 +901,7 @@ impl ChatRunner for Agent {
         self.callbacks.ensure_listener(Agent::subscribe(self));
     }
 
-    #[cfg(feature = "api-only")]
+    #[cfg(feature = "api")]
     fn server(&self) -> AgentServer {
         AgentServer::new(self.inner.clone(), self.storage.clone(), self.cwd.clone())
     }

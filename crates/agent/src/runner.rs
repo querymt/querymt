@@ -5,7 +5,7 @@
 use crate::api::Agent;
 use crate::config::{Config, ConfigSource, load_config};
 use crate::events::EventEnvelope;
-#[cfg(feature = "api-only")]
+#[cfg(feature = "api")]
 use crate::server::AgentServer;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -42,7 +42,7 @@ pub trait ChatRunner: Send + Sync {
     fn on_error_boxed(&self, callback: Box<dyn Fn(String) + Send + Sync>);
 
     /// Get the UI server
-    #[cfg(feature = "api-only")]
+    #[cfg(feature = "api")]
     fn server(&self) -> AgentServer;
 }
 
@@ -163,7 +163,7 @@ impl AgentRunner {
     }
 
     /// Get the UI server
-    #[cfg(feature = "api-only")]
+    #[cfg(feature = "api")]
     pub fn server(&self) -> AgentServer {
         self.0.server()
     }
