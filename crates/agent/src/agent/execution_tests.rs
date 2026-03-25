@@ -259,7 +259,7 @@ async fn test_provider_tools_passed_to_llm() {
             assert_eq!(tools.len(), 1);
             assert_eq!(tools[0].function.name, tool.function.name);
             Ok(Box::new(MockChatResponse::text_only("done")))
-    });
+        });
 
     let outcome = harness.run().await;
 

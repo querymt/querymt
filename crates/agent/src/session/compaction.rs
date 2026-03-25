@@ -386,9 +386,7 @@ pub fn filter_to_effective_history(messages: Vec<AgentMessage>) -> Vec<AgentMess
 ///
 /// This repairs data written by older versions of `store_all_tool_results`
 /// which created one message per tool result instead of batching them.
-pub fn merge_consecutive_tool_result_messages(
-    messages: Vec<AgentMessage>,
-) -> Vec<AgentMessage> {
+pub fn merge_consecutive_tool_result_messages(messages: Vec<AgentMessage>) -> Vec<AgentMessage> {
     if messages.len() < 2 {
         return messages;
     }
@@ -403,12 +401,9 @@ pub fn merge_consecutive_tool_result_messages(
     let mut result: Vec<AgentMessage> = Vec::with_capacity(messages.len());
 
     for msg in messages {
-        let dominated_by_tool_result =
-            is_user_tool_result(&msg);
-        let should_merge = dominated_by_tool_result
-            && result
-                .last()
-                .is_some_and(|prev| is_user_tool_result(prev));
+        let dominated_by_tool_result = is_user_tool_result(&msg);
+        let should_merge =
+            dominated_by_tool_result && result.last().is_some_and(|prev| is_user_tool_result(prev));
 
         if should_merge {
             // Safe: we just checked last() is Some.

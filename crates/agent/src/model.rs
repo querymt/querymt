@@ -560,10 +560,7 @@ mod tests {
             .content
             .iter()
             .position(|b| matches!(b, Content::Text { .. }));
-        let last_tool_result_idx = chat
-            .content
-            .iter()
-            .rposition(|b| b.is_tool_result());
+        let last_tool_result_idx = chat.content.iter().rposition(|b| b.is_tool_result());
 
         if let (Some(first_text), Some(last_tr)) = (first_text_idx, last_tool_result_idx) {
             assert!(
