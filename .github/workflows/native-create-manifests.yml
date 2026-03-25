@@ -11,6 +11,7 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 jobs:
   create-multi-platform-manifests:
@@ -364,6 +365,74 @@ jobs:
             fi
           done
           echo "Created $total_manifests manifest indexes across ${#provider_versions[@]} provider(s)"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign multi-platform index manifests with Cosign (keyless)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Signing multi-platform index manifests ==="
+
+          # Collect unique (provider, feature_tag) pairs and versions
+          declare -A provider_versions
+          declare -A groups
+
+          for data_file in manifests/*/data.txt; do
+            [[ -f "$data_file" ]] || continue
+            unset PROVIDER VERSION FEATURE_TAG
+            source "$data_file"
+            [[ "$PROVIDER" == "noop" ]] && continue
+            provider_versions[$PROVIDER]="$VERSION"
+            groups["${PROVIDER}|${FEATURE_TAG}"]=1
+          done
+
+          if [[ ${#groups[@]} -eq 0 ]]; then
+            echo "No manifests to sign, skipping"
+            exit 0
+          fi
+
+          sign_tag() {
+            local tag="$1"
+            echo "  Signing: ${tag}"
+            local digest
+            digest=$(oras resolve "$tag" 2>/dev/null || true)
+            if [[ -n "$digest" ]]; then
+              # Extract the repository portion (everything before the tag)
+              local repo="${tag%:*}"
+              cosign sign --yes "${repo}@${digest}"
+            else
+              echo "  WARNING: Could not resolve digest for ${tag}, skipping"
+            fi
+          }
+
+          for group_key in "${!groups[@]}"; do
+            IFS='|' read -r provider feature_tag <<< "$group_key"
+            base="ghcr.io/${{ github.repository_owner }}/${provider}"
+            version="${provider_versions[$provider]}"
+
+            # Sign version-feature tag (e.g., 0.1.0-metal)
+            sign_tag "${base}:${version}-${feature_tag}"
+
+            # Sign latest-feature tag (e.g., latest-metal)
+            sign_tag "${base}:latest-${feature_tag}"
+
+            # Sign plain version tag for default feature
+            if [[ "$feature_tag" == "default" ]]; then
+              sign_tag "${base}:${version}"
+            fi
+          done
+
+          # Sign plain "latest" tags
+          for provider in "${!provider_versions[@]}"; do
+            if [[ -n "${groups[${provider}|default]:-}" ]]; then
+              sign_tag "ghcr.io/${{ github.repository_owner }}/${provider}:latest"
+            fi
+          done
+
+          echo "=== Signing complete ==="
 
       - name: Validate multi-platform manifests
         shell: bash

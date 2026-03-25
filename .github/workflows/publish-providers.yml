@@ -10,6 +10,7 @@ permissions:
   contents: read
   packages: write
   deployments: write
+  id-token: write
 
 jobs:
   detect-changes:
@@ -255,3 +256,20 @@ jobs:
             --annotation "mt.query.plugin.type=extism" \
             --annotation "org.opencontainers.image.version=${{ env.VERSION }}" \
             plugin.wasm:application/vnd.wasm.v1.layer+wasm
+
+      - name: Install Cosign
+        if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign WASM artifact with Cosign (keyless)
+        if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'
+        run: |
+          IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}"
+
+          # Resolve the digest of the just-pushed image for deterministic signing.
+          # Both the version and latest tags point to the same digest, so one
+          # signature covers both.
+          DIGEST=$(oras resolve "${IMAGE_BASE}:${{ env.VERSION }}")
+          echo "Signing digest: ${DIGEST}"
+
+          cosign sign --yes "${IMAGE_BASE}@${DIGEST}"
