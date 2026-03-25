@@ -68,7 +68,6 @@ struct EmbeddedPromptAssets;
     all(not(feature = "api-only"), feature = "dashboard"),
     command(group(ArgGroup::new("transport").args(["acp", "dashboard"]).multiple(false)))
 )]
-
 struct Cli {
     /// Path to TOML config.
     ///
