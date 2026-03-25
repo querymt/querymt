@@ -1,12 +1,16 @@
 //! QMT Code Agent Example
 //!
-//! Multi-mode agent that can run as ACP stdio server, web dashboard, or mesh node.
+//! Multi-mode agent that can run as ACP stdio server, API server, web dashboard, or mesh node.
 //!
 //! ## Usage
 //!
 //! ```bash
 //! # ACP stdio mode
 //! cargo run --example qmtcode -- --acp
+//!
+//! # API server mode (for alternate UIs like qmtui)
+//! cargo run --example qmtcode --features api -- --api
+//! cargo run --example qmtcode --features api -- --api=0.0.0.0:8080
 //!
 //! # Web dashboard mode
 //! cargo run --example qmtcode --features dashboard -- --dashboard
@@ -24,15 +28,17 @@
 //! ./qmtcode --mesh
 //! ```
 
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "api")]
 use clap::ArgGroup;
 use clap::Parser;
 use querymt_agent::prelude::*;
+#[cfg(feature = "api")]
+use querymt_agent::server::ServerMode;
 use rust_embed::RustEmbed;
 use std::path::{Component, Path, PathBuf};
 
-#[cfg(feature = "dashboard")]
-const DEFAULT_DASHBOARD_ADDR: &str = "127.0.0.1:3000";
+#[cfg(feature = "api")]
+const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:3000";
 #[cfg(feature = "remote")]
 const DEFAULT_MESH_ADDR: &str = "/ip4/0.0.0.0/tcp/9000";
 const EMBEDDED_CONFIG: &str = include_str!("confs/single_coder.toml");
@@ -44,13 +50,19 @@ struct EmbeddedPromptAssets;
 #[derive(Debug, Parser)]
 #[command(name = "qmtcode")]
 #[command(version = env!("QMT_BUILD_VERSION"))]
-#[command(about = "Run QueryMT coder agent in ACP mode, dashboard mode, or as a mesh node")]
 #[command(
-    after_help = "Examples:\n  qmtcode --acp\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --dashboard --mesh\n  qmtcode path/to/config.toml --acp"
+    about = "Run QueryMT coder agent in ACP mode, API mode, dashboard mode, or as a mesh node"
+)]
+#[command(
+    after_help = "Examples:\n  qmtcode --acp\n  qmtcode --api\n  qmtcode --api=0.0.0.0:8080\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --api --mesh\n  qmtcode path/to/config.toml --acp"
 )]
 #[cfg_attr(
     feature = "dashboard",
-    command(group(ArgGroup::new("transport").args(["acp", "dashboard"]).multiple(false)))
+    command(group(ArgGroup::new("transport").args(["acp", "api", "dashboard"]).multiple(false)))
+)]
+#[cfg_attr(
+    all(feature = "api", not(feature = "dashboard")),
+    command(group(ArgGroup::new("transport").args(["acp", "api"]).multiple(false)))
 )]
 struct Cli {
     /// Path to TOML config.
@@ -62,9 +74,14 @@ struct Cli {
     #[arg(long)]
     acp: bool,
 
+    /// Run API server for alternate UIs; optionally set bind address
+    #[cfg(feature = "api")]
+    #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_SERVER_ADDR)]
+    api: Option<String>,
+
     /// Run web dashboard; optionally set bind address
     #[cfg(feature = "dashboard")]
-    #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_DASHBOARD_ADDR)]
+    #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_SERVER_ADDR)]
     dashboard: Option<String>,
 
     /// Enable kameo mesh networking for cross-machine sessions.
@@ -158,6 +175,10 @@ fn embedded_prompt_asset_key(file_ref: &str) -> Option<String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let is_acp = cli.acp;
+    #[cfg(feature = "api")]
+    let is_api = cli.api.is_some();
+    #[cfg(not(feature = "api"))]
+    let is_api = false;
     #[cfg(feature = "dashboard")]
     let is_dashboard = cli.dashboard.is_some();
     #[cfg(not(feature = "dashboard"))]
@@ -167,8 +188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "remote"))]
     let has_mesh = false;
 
-    if !is_acp && !is_dashboard && !has_mesh {
-        return Err("No mode selected. Use --acp, --dashboard, or --mesh.".into());
+    if !is_acp && !is_api && !is_dashboard && !has_mesh {
+        return Err("No mode selected. Use --acp, --api, --dashboard, or --mesh.".into());
     }
 
     // Setup telemetry: ACP mode writes console logs to stderr (stdout is
@@ -275,12 +296,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if is_acp {
         eprintln!("Starting ACP stdio server...");
         runner.acp("stdio").await?;
+    } else if is_api {
+        #[cfg(feature = "api")]
+        {
+            let addr = cli.api.as_deref().unwrap_or(DEFAULT_SERVER_ADDR);
+            eprintln!("Starting API server at http://{}", addr);
+            runner.server().run(addr, ServerMode::Api).await?;
+        }
+        #[cfg(not(feature = "api"))]
+        {
+            return Err("--api requires the `api` feature.".into());
+        }
     } else if is_dashboard {
         #[cfg(feature = "dashboard")]
         {
-            let addr = cli.dashboard.as_deref().unwrap_or(DEFAULT_DASHBOARD_ADDR);
+            let addr = cli.dashboard.as_deref().unwrap_or(DEFAULT_SERVER_ADDR);
             eprintln!("Starting dashboard at http://{}", addr);
-            runner.dashboard().run(addr).await?;
+            runner.server().run(addr, ServerMode::Dashboard).await?;
         }
         #[cfg(not(feature = "dashboard"))]
         {

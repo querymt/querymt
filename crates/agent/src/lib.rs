@@ -36,14 +36,14 @@ pub mod plugin_update;
 pub mod quorum;
 pub mod scheduler;
 pub mod send_agent;
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "api")]
 pub mod server;
 pub mod session;
 pub mod skills;
 pub mod snapshot;
 pub mod tasks;
 pub mod tools;
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "api")]
 pub mod ui;
 pub mod verification;
 pub mod workspace_query;
