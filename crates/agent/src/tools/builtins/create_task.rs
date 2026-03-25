@@ -2,7 +2,7 @@
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde_json::{Value, json};
 
 pub struct CreateTaskTool;
@@ -58,7 +58,11 @@ impl ToolTrait for CreateTaskTool {
         &[]
     }
 
-    async fn call(&self, args: Value, _context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        _context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         // Validate arguments
         let kind_str = args["kind"]
             .as_str()
@@ -77,7 +81,7 @@ impl ToolTrait for CreateTaskTool {
 
         // The actual task creation is handled by the agent loop via events
         // This tool just validates and returns success
-        Ok("Task creation request recorded.".to_string())
+        Ok(vec![Content::text("Task creation request recorded.")])
     }
 }
 

@@ -220,7 +220,7 @@ pub trait Tool: Send + Sync {
         &self,
         args: serde_json::Value,
         context: &dyn ToolContext,
-    ) -> Result<String, ToolError>;
+    ) -> Result<Vec<querymt::chat::Content>, ToolError>;
 
     /// Returns a context-aware hint to show when this tool's output is truncated.
     ///

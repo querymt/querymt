@@ -2,7 +2,7 @@
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde_json::{Value, json};
 
 pub struct KnowledgeStatsTool;
@@ -49,7 +49,11 @@ impl ToolTrait for KnowledgeStatsTool {
         &[]
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         // Determine scope with policy validation
         let session_public_id = context
             .session_public_id()
@@ -117,13 +121,23 @@ impl ToolTrait for KnowledgeStatsTool {
             ));
         }
 
-        Ok(response)
+        Ok(vec![Content::text(response)])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::knowledge::sqlite::SqliteKnowledgeStore;
     use crate::knowledge::{IngestRequest, KnowledgeStore};
     use crate::test_utils::sqlite_conn_with_schema;
@@ -149,7 +163,7 @@ mod tests {
 
         let result = tool.call(args, &context).await;
         assert!(result.is_ok(), "Failed: {:?}", result);
-        let output = result.unwrap();
+        let output = first_text_block(result.unwrap());
         assert!(output.contains("Total entries: 0"));
     }
 
@@ -204,7 +218,7 @@ mod tests {
 
         let result = tool.call(args, &context).await;
         assert!(result.is_ok(), "Failed: {:?}", result);
-        let output = result.unwrap();
+        let output = first_text_block(result.unwrap());
         assert!(output.contains("Total entries: 2"));
         assert!(output.contains("Unconsolidated entries: 2"));
     }

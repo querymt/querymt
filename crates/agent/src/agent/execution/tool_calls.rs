@@ -189,7 +189,7 @@ pub(super) async fn execute_tool_call(
                 ))
                 .await
             {
-                Ok(res) => (vec![Content::text(res)], false, "builtin"),
+                Ok(res) => (res, false, "builtin"),
                 Err(e) => (
                     vec![Content::text(format!("Error: {}", e))],
                     true,
@@ -258,7 +258,7 @@ pub(super) async fn execute_tool_call(
     span.record("tool_source", tool_source);
     span.record("is_error", is_error);
 
-    // Apply Layer 1 truncation to text content blocks
+    // Apply Layer 1 truncation to text content blocks.
     let result_blocks = if !is_error {
         use crate::tools::builtins::helpers::{
             TruncationDirection, format_truncation_message_with_overflow, save_overflow_output,
@@ -266,7 +266,6 @@ pub(super) async fn execute_tool_call(
         };
         let tc = &config.execution_policy.tool_output;
 
-        // Extract text from content blocks for truncation
         let raw_text: String = raw_result_blocks
             .iter()
             .filter_map(|b| b.as_text())
@@ -279,6 +278,7 @@ pub(super) async fn execute_tool_call(
             tc.max_bytes,
             TruncationDirection::Head,
         );
+
         if truncation.was_truncated {
             let overflow = save_overflow_output(
                 &raw_text,
@@ -299,7 +299,7 @@ pub(super) async fn execute_tool_call(
                 Some(&overflow),
                 tool_hint,
             );
-            // Replace text blocks with truncated text; keep non-text blocks as-is
+
             let mut blocks: Vec<Content> = raw_result_blocks
                 .into_iter()
                 .filter(|b| b.as_text().is_none())

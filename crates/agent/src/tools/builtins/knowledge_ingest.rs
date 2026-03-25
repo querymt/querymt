@@ -3,7 +3,7 @@
 use crate::knowledge::IngestRequest;
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde_json::{Value, json};
 
 pub struct KnowledgeIngestTool;
@@ -78,7 +78,11 @@ impl ToolTrait for KnowledgeIngestTool {
         &[]
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         // Extract required fields
         let raw_text = args["text"]
             .as_str()
@@ -171,16 +175,26 @@ impl ToolTrait for KnowledgeIngestTool {
             source: entry.source.clone(),
         });
 
-        Ok(format!(
+        Ok(vec![Content::text(format!(
             "Ingested knowledge entry {} (scope: {}, importance: {:.2})",
             entry.public_id, scope, importance
-        ))
+        ))])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::knowledge::sqlite::SqliteKnowledgeStore;
     use crate::test_utils::sqlite_conn_with_schema;
     use crate::tools::AgentToolContext;
@@ -211,7 +225,7 @@ mod tests {
 
         let result = tool.call(args, &context).await;
         assert!(result.is_ok(), "Failed: {:?}", result);
-        assert!(result.unwrap().contains("Ingested knowledge entry"));
+        assert!(first_text_block(result.unwrap()).contains("Ingested knowledge entry"));
     }
 
     #[tokio::test]

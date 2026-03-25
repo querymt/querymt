@@ -7,7 +7,7 @@ use crate::agent::remote::routing::{RouteTarget, RoutingActor, SetSessionTarget}
 use crate::tools::{Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
 use kameo::actor::ActorRef;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde_json::{Value, json};
 
 /// Planner tool that routes a delegate's session to a named peer (or back to local).
@@ -55,7 +55,11 @@ impl ToolTrait for RouteDelegationToPeerTool {
         }
     }
 
-    async fn call(&self, args: Value, _context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        _context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         let agent_id = args
             .get("agent_id")
             .and_then(Value::as_str)
@@ -93,13 +97,25 @@ impl ToolTrait for RouteDelegationToPeerTool {
             })),
         });
 
-        Ok(serde_json::to_string_pretty(&result).unwrap_or(status))
+        Ok(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap_or(status),
+        )])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::agent::remote::routing::{RoutingActor, new_routing_snapshot_handle};
     use crate::tools::AgentToolContext;
     use kameo::actor::Spawn;
@@ -111,10 +127,11 @@ mod tests {
         let tool = RouteDelegationToPeerTool::new(actor);
         let ctx = AgentToolContext::basic("test-session".to_string(), None);
 
-        let result = tool
-            .call(json!({ "agent_id": "coder", "peer_name": "gpu-box" }), &ctx)
-            .await
-            .expect("call should succeed");
+        let result = first_text_block(
+            tool.call(json!({ "agent_id": "coder", "peer_name": "gpu-box" }), &ctx)
+                .await
+                .expect("call should succeed"),
+        );
 
         assert!(result.contains("gpu-box"), "should mention the peer name");
 
@@ -137,10 +154,11 @@ mod tests {
             .unwrap();
 
         // Then reset to local (peer_name = null)
-        let result = tool
-            .call(json!({ "agent_id": "coder", "peer_name": null }), &ctx)
-            .await
-            .expect("call should succeed");
+        let result = first_text_block(
+            tool.call(json!({ "agent_id": "coder", "peer_name": null }), &ctx)
+                .await
+                .expect("call should succeed"),
+        );
 
         assert!(result.contains("locally"), "should mention local routing");
 

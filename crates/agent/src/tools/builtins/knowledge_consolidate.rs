@@ -3,7 +3,7 @@
 use crate::knowledge::ConsolidateRequest;
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde_json::{Value, json};
 
 pub struct KnowledgeConsolidateTool;
@@ -68,7 +68,11 @@ impl ToolTrait for KnowledgeConsolidateTool {
         &[]
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         // Extract required fields
         let source_ids = args["source_ids"]
             .as_array()
@@ -143,18 +147,28 @@ impl ToolTrait for KnowledgeConsolidateTool {
             source_count,
         });
 
-        Ok(format!(
+        Ok(vec![Content::text(format!(
             "Created consolidation {} from {} entries (scope: {})",
             result.public_id,
             source_ids.len(),
             scope
-        ))
+        ))])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::knowledge::sqlite::SqliteKnowledgeStore;
     use crate::knowledge::{IngestRequest, KnowledgeStore};
     use crate::test_utils::sqlite_conn_with_schema;
@@ -218,7 +232,7 @@ mod tests {
 
         let result = tool.call(args, &context).await;
         assert!(result.is_ok(), "Failed: {:?}", result);
-        assert!(result.unwrap().contains("Created consolidation"));
+        assert!(first_text_block(result.unwrap()).contains("Created consolidation"));
     }
 
     #[tokio::test]

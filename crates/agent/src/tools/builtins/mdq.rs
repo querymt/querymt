@@ -3,7 +3,7 @@
 //! Runs an mdq selector against a markdown file and returns JSON.
 
 use async_trait::async_trait;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde_json::{Value, json};
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
@@ -63,7 +63,11 @@ Text matching: unquoted = case-insensitive; quoted = case-sensitive; `^...$` anc
         &[CapabilityRequirement::Filesystem]
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
@@ -107,6 +111,7 @@ Text matching: unquoted = case-insensitive; quoted = case-sensitive; `^...$` anc
         });
 
         serde_json::to_string(&result)
+            .map(|s| vec![Content::text(s)])
             .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
     }
 }
@@ -114,6 +119,16 @@ Text matching: unquoted = case-insensitive; quoted = case-sensitive; `^...$` anc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::tools::AgentToolContext;
     use serde_json::json;
     use std::fs;
@@ -140,7 +155,7 @@ mod tests {
             "selector": "# second | - *"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: Value = serde_json::from_str(&result).unwrap();
 
         assert!(parsed["found_any"].as_bool().unwrap());

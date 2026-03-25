@@ -8,7 +8,7 @@ use grep_searcher::{
 };
 use ignore::{WalkBuilder, types::TypesBuilder};
 use indexmap::IndexMap;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -455,7 +455,11 @@ impl ToolTrait for SearchTextTool {
         )
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         let pattern = args
             .get("pattern")
             .and_then(Value::as_str)
@@ -542,6 +546,7 @@ impl ToolTrait for SearchTextTool {
             Self::format_compact(&internal_results, &root_for_format, has_context);
 
         serde_json::to_string_pretty(&compact_results)
+            .map(|s| vec![Content::text(s)])
             .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
     }
 }
@@ -549,6 +554,16 @@ impl ToolTrait for SearchTextTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::tools::AgentToolContext;
     use std::fs;
     use tempfile::TempDir;
@@ -571,7 +586,7 @@ rust is great",
             "pattern": "rust"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: CompactResults = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed.results.len(), 1);
@@ -595,7 +610,7 @@ rust is great",
             "include": "*.rs"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: CompactResults = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed.results.len(), 1);
@@ -623,7 +638,7 @@ hello world",
         let args = json!({
             "pattern": "hello"
         });
-        let result = tool.call(args.clone(), &context).await.unwrap();
+        let result = first_text_block(tool.call(args.clone(), &context).await.unwrap());
         let parsed: CompactResults = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.total_matches, 1);
 
@@ -632,7 +647,7 @@ hello world",
             "pattern": "hello",
             "case_insensitive": true
         });
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: CompactResults = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.total_matches, 3);
     }
@@ -656,7 +671,7 @@ foo*bar",
         let args = json!({
             "pattern": "foo.bar"
         });
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: CompactResults = serde_json::from_str(&result).unwrap();
         assert!(parsed.total_matches >= 2); // Matches foo.bar and fooXbar
 
@@ -665,7 +680,7 @@ foo*bar",
             "pattern": "foo.bar",
             "fixed_strings": true
         });
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: CompactResults = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.total_matches, 1);
         let file_content = parsed.results.values().next().unwrap();
@@ -689,7 +704,7 @@ foo*bar",
         let args = json!({
             "pattern": "foo"
         });
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: CompactResults = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.total_matches, 1);
 
@@ -698,7 +713,7 @@ foo*bar",
             "pattern": "foo",
             "word_match": true
         });
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: CompactResults = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.total_matches, 1);
         // The line still contains foobar, etc., but only standalone "foo" triggered the match
@@ -727,7 +742,7 @@ line 5",
         let args = json!({
             "pattern": "MATCH"
         });
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: CompactResults = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.total_matches, 1);
         let file_content = parsed.results.values().next().unwrap();
@@ -739,7 +754,7 @@ line 5",
             "before_context": 1,
             "after_context": 2
         });
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: CompactResults = serde_json::from_str(&result).unwrap();
 
         // Should have only 1 actual match (context lines don't count)
@@ -768,7 +783,7 @@ line 5",
         let args = json!({
             "pattern": "main"
         });
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: CompactResults = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.total_matches, 3);
         assert_eq!(parsed.results.len(), 3);
@@ -778,7 +793,7 @@ line 5",
             "pattern": "main",
             "file_type": "rust"
         });
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: CompactResults = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.total_matches, 1);
         assert_eq!(parsed.results.len(), 1);

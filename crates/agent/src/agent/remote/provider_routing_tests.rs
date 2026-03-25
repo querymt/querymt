@@ -1180,6 +1180,16 @@ mod mesh_setup_config_tests {
 
 #[cfg(all(test, feature = "remote"))]
 mod peer_delegate_routing_tests {
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::handle::{AgentHandle, LocalAgentHandle};
     use crate::agent::remote::RemoteNodeManager;
@@ -1384,10 +1394,11 @@ mod peer_delegate_routing_tests {
         let ctx = AgentToolContext::basic("l4-session".to_string(), None);
 
         // Tool call: route "coder" provider to "gpu-box" peer.
-        let result = tool
-            .call(json!({ "agent_id": "coder", "peer_name": "gpu-box" }), &ctx)
-            .await
-            .expect("tool call should succeed");
+        let result = first_text_block(
+            tool.call(json!({ "agent_id": "coder", "peer_name": "gpu-box" }), &ctx)
+                .await
+                .expect("tool call should succeed"),
+        );
 
         assert!(
             result.contains("gpu-box"),
@@ -1529,23 +1540,27 @@ mod peer_delegate_routing_tests {
         let ctx = AgentToolContext::basic("l6-session".to_string(), None);
 
         // Step 1: Planner routes "coder" session to peer "fast-node".
-        let r1 = session_tool
-            .call(
-                json!({ "agent_id": "coder", "peer_name": "fast-node" }),
-                &ctx,
-            )
-            .await
-            .expect("route session");
+        let r1 = first_text_block(
+            session_tool
+                .call(
+                    json!({ "agent_id": "coder", "peer_name": "fast-node" }),
+                    &ctx,
+                )
+                .await
+                .expect("route session"),
+        );
         assert!(r1.contains("fast-node"));
 
         // Step 2: Planner routes "coder" provider to peer "gpu-node".
-        let r2 = provider_tool
-            .call(
-                json!({ "agent_id": "coder", "peer_name": "gpu-node" }),
-                &ctx,
-            )
-            .await
-            .expect("route provider");
+        let r2 = first_text_block(
+            provider_tool
+                .call(
+                    json!({ "agent_id": "coder", "peer_name": "gpu-node" }),
+                    &ctx,
+                )
+                .await
+                .expect("route provider"),
+        );
         assert!(r2.contains("gpu-node"));
 
         // Step 3: Resolve the provider peer (simulates PeerEvent::Discovered handler).

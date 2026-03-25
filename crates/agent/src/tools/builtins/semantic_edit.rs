@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use glob::glob;
 use ignore::WalkBuilder;
 use indexmap::IndexMap;
-use querymt::chat::{FunctionTool, Tool};
+use querymt::chat::{Content, FunctionTool, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use srgn::RegexPattern;
@@ -946,7 +946,11 @@ Walks directories recursively, respects .gitignore. Set glob to limit which file
         &[CapabilityRequirement::Filesystem]
     }
 
-    async fn call(&self, args: Value, context: &dyn ToolContext) -> Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
         // Extract required parameters
         let language = args
             .get("language")
@@ -1080,6 +1084,7 @@ Walks directories recursively, respects .gitignore. Set glob to limit which file
             };
 
             serde_json::to_string_pretty(&results)
+                .map(|s| vec![Content::text(s)])
                 .map_err(|e| ToolError::ProviderError(format!("Failed to serialize: {}", e)))
         } else {
             // Convert to relative paths
@@ -1102,6 +1107,7 @@ Walks directories recursively, respects .gitignore. Set glob to limit which file
             };
 
             serde_json::to_string_pretty(&results)
+                .map(|s| vec![Content::text(s)])
                 .map_err(|e| ToolError::ProviderError(format!("Failed to serialize: {}", e)))
         }
     }
@@ -1110,6 +1116,16 @@ Walks directories recursively, respects .gitignore. Set glob to limit which file
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::Content::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
 
@@ -1137,7 +1153,7 @@ def foo():
             "pattern": "TODO"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed["mode"], "search");
@@ -1173,7 +1189,7 @@ def foo():
             "pattern": "TODO"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed["mode"], "search");
@@ -1204,7 +1220,7 @@ def foo():
             "action": "delete"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: TransformResults = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed.mode, "transform");
@@ -1239,7 +1255,7 @@ other = 123
             "replacement": "Universe"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: TransformResults = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed.mode, "transform");
@@ -1269,7 +1285,7 @@ other = 123
             "pattern": "TODO"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed["files_searched"], 1);
@@ -1293,7 +1309,7 @@ other = 123
             "pattern": "TODO"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed["files_searched"], 1);
@@ -1318,7 +1334,7 @@ other = 123
             "action": "delete"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: TransformResults = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed.total_files_modified, 0);
@@ -1358,7 +1374,7 @@ other = 123
             "glob": "src/**/*.py"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed["files_searched"], 1);
@@ -1391,7 +1407,7 @@ z = "a.b.c"
             "literal_string": true
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         // Should match "a.b" inside the two strings that contain it, not "axb"
@@ -1431,7 +1447,7 @@ pub struct Musician {
             "pattern": "Subgenre"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         // Should only find Subgenre inside the pub enum, not in the const or struct
@@ -1467,7 +1483,7 @@ pub struct Handler {
             "scope": "struct~Config"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed["mode"], "search");
@@ -1498,7 +1514,7 @@ pub struct Handler {
             "action": "symbols"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: TransformResults = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.mode, "transform");
 
@@ -1527,7 +1543,7 @@ pub struct Handler {
             "action": "symbols-invert"
         });
 
-        let result = tool.call(args, &context).await.unwrap();
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
         let parsed: TransformResults = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.mode, "transform");
 

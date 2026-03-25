@@ -1,4 +1,6 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _, engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD,
+};
 use heck::ToSnakeCase;
 use http::{
     Method, Request, Response,
@@ -141,15 +143,44 @@ enum CodexInputItem<'a> {
     #[serde(rename = "function_call_output")]
     FunctionCallOutput {
         call_id: Cow<'a, str>,
-        output: Cow<'a, str>,
+        output: CodexFunctionCallOutput<'a>,
     },
 }
 
 #[derive(Serialize, Debug)]
-struct CodexInputContent<'a> {
-    #[serde(rename = "type")]
-    content_type: Cow<'a, str>,
-    text: Cow<'a, str>,
+#[serde(untagged)]
+enum CodexFunctionCallOutput<'a> {
+    Text(Cow<'a, str>),
+    Parts(Vec<CodexToolOutputPart<'a>>),
+}
+
+#[derive(Serialize, Debug)]
+#[serde(tag = "type")]
+enum CodexToolOutputPart<'a> {
+    #[serde(rename = "output_text")]
+    OutputText { text: Cow<'a, str> },
+    #[serde(rename = "input_image")]
+    InputImage {
+        image_url: Cow<'a, str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<&'a str>,
+    },
+}
+
+#[derive(Serialize, Debug)]
+#[serde(tag = "type")]
+enum CodexInputContent<'a> {
+    /// User-turn text: `{ "type": "input_text", "text": "..." }`
+    #[serde(rename = "input_text")]
+    InputText { text: Cow<'a, str> },
+    /// Assistant-turn text: `{ "type": "output_text", "text": "..." }`
+    #[serde(rename = "output_text")]
+    OutputText { text: Cow<'a, str> },
+    /// Inline image: `{ "type": "input_image", "image_url": "data:...;base64,..." }`
+    // TODO: Add `detail` support once image detail is modeled in shared content/config.
+    // TODO: Support file IDs here so Codex can accept images, PDFs, and other uploaded files.
+    #[serde(rename = "input_image")]
+    InputImage { image_url: Cow<'a, str> },
 }
 
 #[derive(Serialize, Debug)]
@@ -214,6 +245,7 @@ struct CodexOutputContent {
     content_type: String,
     #[serde(default, alias = "reasoning", alias = "reasoning_content")]
     text: Option<String>,
+    #[allow(dead_code)]
     tool_calls: Vec<ToolCall>,
 }
 
@@ -251,14 +283,13 @@ impl CodexRawUsage {
             .map(|d| d.reasoning_tokens)
             .unwrap_or(0);
 
-        let usage = Usage {
+        Usage {
             input_tokens: self.input_tokens.saturating_sub(cache_read),
             output_tokens: self.output_tokens.saturating_sub(reasoning),
             reasoning_tokens: reasoning,
             cache_read,
             cache_write: 0,
-        };
-        usage
+        }
     }
 }
 
@@ -347,11 +378,11 @@ impl std::fmt::Display for CodexChatResponse {
     }
 }
 
-pub fn codex_chat_request<C: CodexProviderConfig>(
+fn codex_chat_body_json<C: CodexProviderConfig>(
     cfg: &C,
     messages: &[ChatMessage],
     tools: Option<&[Tool]>,
-) -> Result<Request<Vec<u8>>, LLMError> {
+) -> Result<Vec<u8>, LLMError> {
     let instructions = resolve_instructions(cfg.model(), cfg.instructions())?;
     let mut inputs = Vec::with_capacity(messages.len() + 1);
     if let Some(system) = cfg.system().filter(|text| !text.trim().is_empty()) {
@@ -361,35 +392,56 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
         );
         inputs.push(CodexInputItem::Message {
             role: Cow::Borrowed("user"),
-            content: vec![CodexInputContent {
-                content_type: Cow::Borrowed("input_text"),
+            content: vec![CodexInputContent::InputText {
                 text: Cow::Owned(text),
             }],
         });
     }
     for msg in messages {
-        let (role, content_type) = match msg.role {
-            ChatRole::User => ("user", "input_text"),
-            ChatRole::Assistant => ("assistant", "output_text"),
-        };
+        let is_user = matches!(msg.role, ChatRole::User);
 
-        let text = msg
-            .content
-            .iter()
-            .filter_map(|c| c.as_text())
-            .collect::<Vec<_>>()
-            .join("\n");
+        // ── Pass 1: collect regular content blocks into a single message item ──
+        // ToolUse and ToolResult are emitted as separate API items in pass 2.
+        let mut content_blocks: Vec<CodexInputContent> = Vec::new();
 
-        if !text.trim().is_empty() {
+        for block in &msg.content {
+            match block {
+                Content::Text { text } if !text.is_empty() => {
+                    content_blocks.push(if is_user {
+                        CodexInputContent::InputText {
+                            text: Cow::Borrowed(text.as_str()),
+                        }
+                    } else {
+                        CodexInputContent::OutputText {
+                            text: Cow::Borrowed(text.as_str()),
+                        }
+                    });
+                }
+                Content::Image { mime_type, data } => {
+                    let data_url = format!("data:{};base64,{}", mime_type, STANDARD.encode(data));
+                    content_blocks.push(CodexInputContent::InputImage {
+                        image_url: Cow::Owned(data_url),
+                    });
+                }
+                Content::ImageUrl { url } => {
+                    content_blocks.push(CodexInputContent::InputImage {
+                        image_url: Cow::Borrowed(url.as_str()),
+                    });
+                }
+                // ToolUse, ToolResult, Thinking — handled in pass 2 or skipped.
+                _ => {}
+            }
+        }
+
+        if !content_blocks.is_empty() {
+            let role = if is_user { "user" } else { "assistant" };
             inputs.push(CodexInputItem::Message {
                 role: Cow::Borrowed(role),
-                content: vec![CodexInputContent {
-                    content_type: Cow::Borrowed(content_type),
-                    text: Cow::Owned(text),
-                }],
+                content: content_blocks,
             });
         }
 
+        // ── Pass 2: emit function_call / function_call_output items ──────────
         for block in &msg.content {
             match block {
                 Content::ToolUse {
@@ -404,25 +456,71 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
                     });
                 }
                 Content::ToolResult { id, content, .. } => {
-                    let output = content
-                        .iter()
-                        .filter_map(|c| c.as_text())
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let mut output_parts: Vec<CodexToolOutputPart> = Vec::new();
+                    let mut text_only_parts: Vec<String> = Vec::new();
+                    let mut has_non_text = false;
+
+                    for c in content {
+                        match c {
+                            Content::Text { text } => {
+                                output_parts.push(CodexToolOutputPart::OutputText {
+                                    text: Cow::Borrowed(text.as_str()),
+                                });
+                                text_only_parts.push(text.clone());
+                            }
+                            Content::Image { mime_type, data } => {
+                                has_non_text = true;
+                                output_parts.push(CodexToolOutputPart::InputImage {
+                                    image_url: Cow::Owned(format!(
+                                        "data:{};base64,{}",
+                                        mime_type,
+                                        STANDARD.encode(data)
+                                    )),
+                                    detail: None,
+                                });
+                            }
+                            Content::ImageUrl { url } => {
+                                has_non_text = true;
+                                output_parts.push(CodexToolOutputPart::InputImage {
+                                    image_url: Cow::Borrowed(url.as_str()),
+                                    detail: None,
+                                });
+                            }
+                            Content::Pdf { data } => {
+                                has_non_text = true;
+                                output_parts.push(CodexToolOutputPart::OutputText {
+                                    text: Cow::Owned(format!(
+                                        "[PDF tool output not yet serialized natively ({} bytes)]",
+                                        data.len()
+                                    )),
+                                });
+                            }
+                            Content::Audio { mime_type, data } => {
+                                has_non_text = true;
+                                output_parts.push(CodexToolOutputPart::OutputText {
+                                    text: Cow::Owned(format!(
+                                        "[Audio tool output not yet serialized natively ({}: {} bytes)]",
+                                        mime_type,
+                                        data.len()
+                                    )),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let output = if has_non_text {
+                        CodexFunctionCallOutput::Parts(output_parts)
+                    } else {
+                        CodexFunctionCallOutput::Text(Cow::Owned(text_only_parts.join("\n")))
+                    };
+
                     inputs.push(CodexInputItem::FunctionCallOutput {
                         call_id: Cow::Borrowed(id.as_str()),
-                        output: Cow::Owned(output),
+                        output,
                     });
                 }
-                Content::Image { .. }
-                | Content::ImageUrl { .. }
-                | Content::Pdf { .. }
-                | Content::Audio { .. }
-                | Content::ResourceLink { .. } => {
-                    return Err(LLMError::ProviderError(
-                        "Codex backend only supports text/tool messages".to_string(),
-                    ));
-                }
+                // Audio, ResourceLink, Thinking — not supported; skip.
                 _ => {}
             }
         }
@@ -472,7 +570,15 @@ pub fn codex_chat_request<C: CodexProviderConfig>(
         extra_body,
     };
 
-    let json_body = serde_json::to_vec(&body)?;
+    Ok(serde_json::to_vec(&body)?)
+}
+
+pub fn codex_chat_request<C: CodexProviderConfig>(
+    cfg: &C,
+    messages: &[ChatMessage],
+    tools: Option<&[Tool]>,
+) -> Result<Request<Vec<u8>>, LLMError> {
+    let json_body = codex_chat_body_json(cfg, messages, tools)?;
     let url = cfg
         .base_url()
         .join("responses")
@@ -1012,10 +1118,258 @@ fn codex_effort_str(e: ReasoningEffort) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodexChatResponse, CodexToolUseState, codex_parse_stream_chunk_with_state};
-    use querymt::chat::{ChatResponse, StreamChunk};
+    use super::{
+        CodexChatResponse, CodexToolUseState, chatgpt_account_id, codex_chat_body_json,
+        codex_chat_request, codex_parse_stream_chunk_with_state,
+    };
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use http::header::AUTHORIZATION;
+    use querymt::chat::{ChatMessage, ChatResponse, ChatRole, Content, StreamChunk};
+    use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    use url::Url;
+
+    /// Build a minimal config for unit tests.
+    fn test_codex(api_key: &str) -> crate::Codex {
+        crate::Codex {
+            api_key: api_key.to_string(),
+            base_url: Url::parse("https://chatgpt.com/backend-api/codex/").unwrap(),
+            model: "codex-mini-latest".to_string(),
+            max_tokens: None,
+            temperature: None,
+            instructions: None,
+            system: None,
+            timeout_seconds: None,
+            stream: None,
+            top_p: None,
+            top_k: None,
+            client_version: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            extra_body: None,
+            tool_state_buffer: crate::Codex::default_tool_state_buffer(),
+            key_resolver: None,
+        }
+    }
+
+    fn test_oauth_token(account_id: &str) -> String {
+        let payload_json = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+            }
+        });
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.to_string().as_bytes());
+        format!("eyJ.{}.sig", payload_b64)
+    }
+
+    #[test]
+    fn codex_chat_request_adds_auth_headers() {
+        let token = test_oauth_token("test-account-id");
+        let codex = test_codex(&token);
+        let messages = vec![ChatMessage::user().text("hello").build()];
+
+        let req = codex_chat_request(&codex, &messages, None).expect("chat request should build");
+
+        let expected_auth = format!("Bearer {}", token);
+        assert_eq!(
+            req.headers()
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_auth.as_str())
+        );
+        assert_eq!(
+            req.headers()
+                .get("ChatGPT-Account-ID")
+                .and_then(|v| v.to_str().ok()),
+            Some("test-account-id")
+        );
+    }
+
+    #[test]
+    fn chatgpt_account_id_requires_oauth_payload_claim() {
+        let err = chatgpt_account_id("not-a-jwt").expect_err("invalid token should fail");
+        assert!(
+            err.to_string().contains("Invalid OAuth access token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Build a user `ChatMessage` whose content is a single `Content::ToolResult`
+    /// wrapping the given inner blocks.
+    fn tool_result_msg(call_id: &str, inner: Vec<Content>) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::ToolResult {
+                id: call_id.to_string(),
+                name: Some("read_tool".to_string()),
+                is_error: false,
+                content: inner,
+            }],
+            cache: None,
+        }
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Find the first input item of the given type in the serialised request body.
+    fn find_input_item<'a>(body: &'a Value, item_type: &str) -> Option<&'a Value> {
+        body["input"]
+            .as_array()?
+            .iter()
+            .find(|item| item["type"] == item_type)
+    }
+
+    // ── tool-result image tests ───────────────────────────────────────────────
+
+    /// When a tool result contains an image, the function_call_output should carry
+    /// the image directly as rich output parts rather than injecting a synthetic
+    /// follow-up message.
+    #[test]
+    fn codex_tool_result_with_image_uses_rich_function_call_output() {
+        let cfg = test_codex("test-token");
+        let png_bytes: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x00];
+
+        let messages = vec![tool_result_msg(
+            "call-1",
+            vec![Content::Image {
+                mime_type: "image/png".to_string(),
+                data: png_bytes.clone(),
+            }],
+        )];
+
+        let body: Value = serde_json::from_slice(
+            &codex_chat_body_json(&cfg, &messages, None)
+                .expect("must not error on image tool result"),
+        )
+        .unwrap();
+
+        // function_call_output must carry rich output parts with an inline image.
+        let fco = find_input_item(&body, "function_call_output")
+            .expect("function_call_output item must be present");
+        let output_parts = fco["output"].as_array().expect("rich output parts array");
+        let image_url = output_parts
+            .iter()
+            .find(|b| b["type"] == "input_image")
+            .and_then(|b| b["image_url"].as_str())
+            .expect("input_image part with image_url");
+
+        assert!(
+            image_url.starts_with("data:image/png;base64,"),
+            "image_url must be a base64 data URL, got: {}",
+            &image_url[..50.min(image_url.len())]
+        );
+    }
+
+    /// When a tool result contains both text and an image, the rich
+    /// function_call_output must preserve both parts in order.
+    #[test]
+    fn codex_tool_result_with_text_and_image_preserves_rich_output_order() {
+        let cfg = test_codex("test-token");
+
+        let messages = vec![tool_result_msg(
+            "call-3",
+            vec![
+                Content::text("some text output"),
+                Content::Image {
+                    mime_type: "image/jpeg".to_string(),
+                    data: vec![0xFF, 0xD8, 0xFF],
+                },
+            ],
+        )];
+
+        let body: Value = serde_json::from_slice(
+            &codex_chat_body_json(&cfg, &messages, None)
+                .expect("must not error on mixed text+image tool result"),
+        )
+        .unwrap();
+
+        let output_parts = find_input_item(&body, "function_call_output")
+            .and_then(|i| i["output"].as_array())
+            .expect("rich function_call_output parts");
+
+        assert_eq!(output_parts[0]["type"].as_str(), Some("output_text"));
+        assert_eq!(output_parts[0]["text"].as_str(), Some("some text output"));
+        assert_eq!(output_parts[1]["type"].as_str(), Some("input_image"));
+    }
+
+    // ── top-level image tests ────────────────────────────────────────────────
+
+    /// A top-level Content::Image in a user message must be serialized as an
+    /// `input_image` content block — not skipped, not errored.
+    #[test]
+    fn codex_top_level_image_serialized_as_input_image() {
+        let cfg = test_codex("test-token");
+
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: vec![
+                Content::text("describe this"),
+                Content::Image {
+                    mime_type: "image/png".to_string(),
+                    data: vec![0x89, 0x50, 0x4E, 0x47],
+                },
+            ],
+            cache: None,
+        }];
+
+        let body: Value = serde_json::from_slice(
+            &codex_chat_body_json(&cfg, &messages, None)
+                .expect("must not error on top-level image"),
+        )
+        .unwrap();
+
+        let msg = find_input_item(&body, "message").expect("message item");
+        let content = msg["content"].as_array().expect("content array");
+
+        let has_text = content.iter().any(|b| b["type"] == "input_text");
+        let image_block = content.iter().find(|b| b["type"] == "input_image");
+
+        assert!(has_text, "input_text block must be present");
+        assert!(image_block.is_some(), "input_image block must be present");
+        assert!(
+            image_block.unwrap()["image_url"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("data:image/png;base64,"),
+            "image_url must be a base64 data URL"
+        );
+    }
+
+    /// A top-level Content::ImageUrl must be serialized as an `input_image` block
+    /// with the URL passed through directly (no base64 encoding).
+    #[test]
+    fn codex_top_level_image_url_serialized_as_input_image() {
+        let cfg = test_codex("test-token");
+
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::ImageUrl {
+                url: "https://example.com/img.png".to_string(),
+            }],
+            cache: None,
+        }];
+
+        let body: Value = serde_json::from_slice(
+            &codex_chat_body_json(&cfg, &messages, None)
+                .expect("must not error on top-level ImageUrl"),
+        )
+        .unwrap();
+
+        let msg = find_input_item(&body, "message").expect("message item");
+        let image_block = msg["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "input_image")
+            .expect("input_image block");
+
+        assert_eq!(
+            image_block["image_url"].as_str(),
+            Some("https://example.com/img.png")
+        );
+    }
 
     #[test]
     fn codex_chat_response_exposes_reasoning_as_thinking() {
