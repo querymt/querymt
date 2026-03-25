@@ -11,9 +11,11 @@ use oci_client::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sigstore::cosign::signature_layers::SignatureLayer;
 use sigstore::cosign::verification_constraint::cert_subject_email_verifier::StringVerifier;
 use sigstore::cosign::verification_constraint::{
-    CertSubjectEmailVerifier, CertSubjectUrlVerifier, VerificationConstraintVec,
+    CertSubjectEmailVerifier, CertSubjectUrlVerifier, VerificationConstraint,
+    VerificationConstraintVec,
 };
 use sigstore::cosign::{ClientBuilder, CosignCapabilities, verify_constraints};
 use sigstore::errors::SigstoreVerifyConstraintsError;
@@ -129,6 +131,36 @@ fn build_auth(reference: &Reference) -> RegistryAuth {
     }
 }
 
+/// Verifies that a signature was produced by a GitHub Actions workflow
+/// in a specific repository, with a specific OIDC issuer.
+///
+/// This checks the `github_workflow_repository` OID field embedded in the
+/// Fulcio certificate (e.g., `"querymt/querymt"`), rather than doing string
+/// matching on the subject URL. This naturally covers all workflows in the
+/// repository regardless of workflow filename or git ref.
+#[derive(Debug)]
+struct CertGitHubWorkflowVerifier {
+    /// Expected GitHub repository (e.g., `"querymt/querymt"`).
+    repository: String,
+    /// Expected OIDC issuer (e.g., `"https://token.actions.githubusercontent.com"`).
+    issuer: String,
+}
+
+impl VerificationConstraint for CertGitHubWorkflowVerifier {
+    fn verify(&self, signature_layer: &SignatureLayer) -> sigstore::errors::Result<bool> {
+        let verified = match &signature_layer.certificate_signature {
+            Some(signature) => {
+                let issuer_matches = signature.issuer.as_deref() == Some(self.issuer.as_str());
+                let repo_matches = signature.github_workflow_repository.as_deref()
+                    == Some(self.repository.as_str());
+                issuer_matches && repo_matches
+            }
+            None => false,
+        };
+        Ok(verified)
+    }
+}
+
 async fn setup_trust_repository(
     config: &OciDownloaderConfig,
 ) -> Result<Box<dyn TrustRoot + Send + Sync>, anyhow::Error> {
@@ -197,29 +229,23 @@ async fn setup_trust_repository(
 
 #[cfg_attr(feature = "tracing", instrument(name = "oci.verify_image_signature", skip_all, fields(image = %image_reference)))]
 async fn verify_image_signature(
+    trust_root: &(dyn TrustRoot + Send + Sync),
     config: &OciDownloaderConfig,
     image_reference: &str,
 ) -> Result<bool, anyhow::Error> {
     log::info!("Verifying signature for {}", image_reference);
 
-    // Set up the trust repository based on CLI arguments
-    let repo = setup_trust_repository(config).await?;
     let auth = &Auth::Anonymous;
 
-    // Create a client builder
-    let client_builder = ClientBuilder::default();
+    // Build a cosign client using the pre-cached trust root.
+    // This is cheap — it just parses keys/certs from already-loaded data.
+    let client_builder = ClientBuilder::default()
+        .with_trust_repository(trust_root)
+        .map_err(|e| anyhow!("Failed to set up trust repository: {}", e))?;
 
-    // Create client with trust repository
-    let client_builder = match client_builder.with_trust_repository(repo.as_ref()) {
-        Ok(builder) => builder,
-        Err(e) => return Err(anyhow!("Failed to set up trust repository: {}", e)),
-    };
-
-    // Build the client
-    let mut client = match client_builder.build() {
-        Ok(client) => client,
-        Err(e) => return Err(anyhow!("Failed to build Sigstore client: {}", e)),
-    };
+    let mut client = client_builder
+        .build()
+        .map_err(|e| anyhow!("Failed to build Sigstore client: {}", e))?;
 
     // Parse the reference
     let image_ref = match OciReference::from_str(image_reference) {
@@ -281,6 +307,17 @@ async fn verify_image_signature(
                 log::warn!("'cert-issuer' is required when 'cert-url' is specified");
             }
         }
+    }
+
+    if let Some(repo) = &config.github_workflow_repository {
+        let issuer = config
+            .cert_issuer
+            .clone()
+            .unwrap_or_else(|| "https://token.actions.githubusercontent.com".to_string());
+        verification_constraints.push(Box::new(CertGitHubWorkflowVerifier {
+            repository: repo.clone(),
+            issuer,
+        }));
     }
 
     // Verify the constraints
@@ -555,26 +592,77 @@ fn determine_plugin_type(image_manifest: &OciImageManifest) -> Result<PluginType
     ))
 }
 
-#[derive(Default, Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct OciDownloaderConfig {
+    #[serde(default)]
     insecure_skip_signature: bool,
     cert_email: Option<String>,
+    #[serde(default = "default_cert_issuer")]
     cert_issuer: Option<String>,
     cert_url: Option<String>,
+    #[serde(default = "default_use_sigstore_tuf")]
     use_sigstore_tuf_data: bool,
     rekor_pub_keys: Option<PathBuf>,
     fulcio_certs: Option<PathBuf>,
+    /// GitHub repository to verify signatures against (e.g., `"querymt/querymt"`).
+    /// When set, verifies the signing certificate's `github_workflow_repository` OID
+    /// field matches this value, ensuring the image was signed by a CI workflow in
+    /// the expected repository.
+    #[serde(default = "default_github_workflow_repository")]
+    github_workflow_repository: Option<String>,
+}
+
+fn default_cert_issuer() -> Option<String> {
+    Some("https://token.actions.githubusercontent.com".to_string())
+}
+
+fn default_use_sigstore_tuf() -> bool {
+    true
+}
+
+fn default_github_workflow_repository() -> Option<String> {
+    Some("querymt/querymt".to_string())
+}
+
+impl Default for OciDownloaderConfig {
+    fn default() -> Self {
+        Self {
+            insecure_skip_signature: false,
+            cert_email: None,
+            cert_issuer: default_cert_issuer(),
+            cert_url: None,
+            use_sigstore_tuf_data: true,
+            rekor_pub_keys: None,
+            fulcio_certs: None,
+            github_workflow_repository: default_github_workflow_repository(),
+        }
+    }
 }
 
 pub struct OciDownloader {
     config: OciDownloaderConfig,
+    /// Lazily initialized trust root, shared across all signature verification
+    /// calls to avoid re-fetching TUF metadata from the Sigstore CDN on every
+    /// `pull_and_extract` invocation.
+    trust_root: tokio::sync::OnceCell<Box<dyn TrustRoot + Send + Sync>>,
 }
 
 impl OciDownloader {
     pub fn new(config: Option<OciDownloaderConfig>) -> Self {
         Self {
             config: config.unwrap_or_default(),
+            trust_root: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Returns a reference to the cached trust root, initializing it on first
+    /// call. The expensive TUF metadata fetch (`SigstoreTrustRoot::new`) only
+    /// happens once; subsequent calls return the cached value immediately.
+    async fn get_trust_root(&self) -> Result<&(dyn TrustRoot + Send + Sync), anyhow::Error> {
+        self.trust_root
+            .get_or_try_init(|| setup_trust_repository(&self.config))
+            .await
+            .map(|b| b.as_ref())
     }
 
     #[cfg_attr(feature = "tracing", instrument(name = "oci.pull_and_extract", skip_all, fields(image = %image_reference)))]
@@ -628,7 +716,7 @@ impl OciDownloader {
         let auth = build_auth(&reference);
 
         // --- Signature verification phase ---
-        if self.config.insecure_skip_signature {
+        if !self.config.insecure_skip_signature {
             progress(OciDownloadProgress {
                 phase: OciDownloadPhase::VerifyingSignature,
                 bytes_downloaded: 0,
@@ -636,7 +724,11 @@ impl OciDownloader {
                 percent: None,
             });
             log::info!("Signature verification enabled for {}", image_reference);
-            match verify_image_signature(&self.config, image_reference).await {
+            let trust_root = self
+                .get_trust_root()
+                .await
+                .map_err(|e| format!("Failed to initialize trust root: {}", e))?;
+            match verify_image_signature(trust_root, &self.config, image_reference).await {
                 Ok(verified) => {
                     if !verified {
                         let msg = format!(
@@ -1308,5 +1400,153 @@ mod tests {
         assert_eq!(recs[2].bytes_downloaded, 11);
         assert_eq!(recs[2].bytes_total, Some(11));
         assert!((recs[2].percent.unwrap() - 100.0).abs() < 0.01);
+    }
+
+    // ── CertGitHubWorkflowVerifier tests ──────────────────────────────────
+
+    /// Helper: build a minimal `SignatureLayer` with the given GitHub workflow
+    /// fields set on its `CertificateSignature`.
+    fn build_signature_layer_with_github_fields(
+        issuer: Option<&str>,
+        repository: Option<&str>,
+    ) -> SignatureLayer {
+        use sigstore::cosign::payload::simple_signing::{Critical, Identity, Image, SimpleSigning};
+        use sigstore::crypto::{CosignVerificationKey, SigningScheme};
+
+        // Minimal EC P-256 public key for constructing CosignVerificationKey.
+        // The key itself is never used for actual signature verification in
+        // these tests — we only inspect the metadata fields.
+        let pem = b"-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8AbamfHxKgo2atFCqWJoA5njNNHE
+B1jWUwVphCeKZF4rxpWioIOV2xqiOQGtE0D26WZ0pJsrCR75mQ8g276Y+A==
+-----END PUBLIC KEY-----";
+        let vk = CosignVerificationKey::from_pem(pem, &SigningScheme::ECDSA_P256_SHA256_ASN1)
+            .expect("test key must parse");
+
+        let cert_sig = sigstore::cosign::signature_layers::CertificateSignature {
+            verification_key: vk,
+            subject: sigstore::cosign::signature_layers::CertificateSubject::Uri(
+                "https://github.com/querymt/querymt/.github/workflows/test.yml@refs/heads/main"
+                    .to_string(),
+            ),
+            issuer: issuer.map(|s| s.to_string()),
+            github_workflow_trigger: None,
+            github_workflow_sha: None,
+            github_workflow_name: None,
+            github_workflow_repository: repository.map(|s| s.to_string()),
+            github_workflow_ref: None,
+        };
+
+        SignatureLayer {
+            simple_signing: SimpleSigning {
+                critical: Critical {
+                    type_name: "cosign container image signature".to_string(),
+                    image: Image {
+                        docker_manifest_digest: "sha256:dummy".to_string(),
+                    },
+                    identity: Identity {
+                        docker_reference: "ghcr.io/test/test:latest".to_string(),
+                    },
+                },
+                optional: None,
+            },
+            oci_digest: "sha256:dummy".to_string(),
+            certificate_signature: Some(cert_sig),
+            bundle: None,
+            signature: None,
+            raw_data: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn github_workflow_verifier_matching_repo_and_issuer() {
+        let sl = build_signature_layer_with_github_fields(
+            Some("https://token.actions.githubusercontent.com"),
+            Some("querymt/querymt"),
+        );
+        let vc = CertGitHubWorkflowVerifier {
+            repository: "querymt/querymt".to_string(),
+            issuer: "https://token.actions.githubusercontent.com".to_string(),
+        };
+        assert!(vc.verify(&sl).unwrap());
+    }
+
+    #[test]
+    fn github_workflow_verifier_wrong_repo() {
+        let sl = build_signature_layer_with_github_fields(
+            Some("https://token.actions.githubusercontent.com"),
+            Some("other-org/other-repo"),
+        );
+        let vc = CertGitHubWorkflowVerifier {
+            repository: "querymt/querymt".to_string(),
+            issuer: "https://token.actions.githubusercontent.com".to_string(),
+        };
+        assert!(!vc.verify(&sl).unwrap());
+    }
+
+    #[test]
+    fn github_workflow_verifier_wrong_issuer() {
+        let sl = build_signature_layer_with_github_fields(
+            Some("https://evil.example.com"),
+            Some("querymt/querymt"),
+        );
+        let vc = CertGitHubWorkflowVerifier {
+            repository: "querymt/querymt".to_string(),
+            issuer: "https://token.actions.githubusercontent.com".to_string(),
+        };
+        assert!(!vc.verify(&sl).unwrap());
+    }
+
+    #[test]
+    fn github_workflow_verifier_missing_repo() {
+        let sl = build_signature_layer_with_github_fields(
+            Some("https://token.actions.githubusercontent.com"),
+            None,
+        );
+        let vc = CertGitHubWorkflowVerifier {
+            repository: "querymt/querymt".to_string(),
+            issuer: "https://token.actions.githubusercontent.com".to_string(),
+        };
+        assert!(!vc.verify(&sl).unwrap());
+    }
+
+    #[test]
+    fn github_workflow_verifier_missing_issuer() {
+        let sl = build_signature_layer_with_github_fields(None, Some("querymt/querymt"));
+        let vc = CertGitHubWorkflowVerifier {
+            repository: "querymt/querymt".to_string(),
+            issuer: "https://token.actions.githubusercontent.com".to_string(),
+        };
+        assert!(!vc.verify(&sl).unwrap());
+    }
+
+    #[test]
+    fn github_workflow_verifier_no_certificate_signature() {
+        use sigstore::cosign::payload::simple_signing::{Critical, Identity, Image, SimpleSigning};
+
+        let sl = SignatureLayer {
+            simple_signing: SimpleSigning {
+                critical: Critical {
+                    type_name: "cosign container image signature".to_string(),
+                    image: Image {
+                        docker_manifest_digest: "sha256:dummy".to_string(),
+                    },
+                    identity: Identity {
+                        docker_reference: "ghcr.io/test/test:latest".to_string(),
+                    },
+                },
+                optional: None,
+            },
+            oci_digest: "sha256:dummy".to_string(),
+            certificate_signature: None,
+            bundle: None,
+            signature: None,
+            raw_data: Vec::new(),
+        };
+        let vc = CertGitHubWorkflowVerifier {
+            repository: "querymt/querymt".to_string(),
+            issuer: "https://token.actions.githubusercontent.com".to_string(),
+        };
+        assert!(!vc.verify(&sl).unwrap());
     }
 }
