@@ -7,10 +7,12 @@ description = "Agent and Session management for querymt"
 
 [features]
 default = []
-# Enables the web dashboard UI with React frontend
+# Enables the API-only UI server for alternate clients over /ui/ws.
+api-only = []
+# Enables the web dashboard UI with React frontend assets.
 # Locally, the build script uses bun (or npm fallback) to build UI assets.
 # Packagers can bypass runtime installs by setting QMT_UI_DIST to a prebuilt dist/.
-dashboard = []
+dashboard = ["api-only"]
 # Enables OAuth token support for authentication (reads tokens from system keyring)
 oauth = ["querymt-utils/oauth"]
 

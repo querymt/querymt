@@ -1,12 +1,16 @@
 //! QMT Code Agent Example
 //!
-//! Multi-mode agent that can run as ACP stdio server, web dashboard, or mesh node.
+//! Multi-mode agent that can run as ACP stdio server, headless UI server, web dashboard, or mesh node.
 //!
 //! ## Usage
 //!
 //! ```bash
 //! # ACP stdio mode
 //! cargo run --example qmtcode -- --acp
+//!
+//! # Headless UI mode (for alternate UIs like qmtui)
+//! cargo run --example qmtcode --features headless-ui -- --headless-ui
+//! cargo run --example qmtcode --features headless-ui -- --headless-ui=0.0.0.0:8080
 //!
 //! # Web dashboard mode
 //! cargo run --example qmtcode --features dashboard -- --dashboard
@@ -24,14 +28,16 @@
 //! ./qmtcode --mesh
 //! ```
 
-#[cfg(feature = "dashboard")]
+#[cfg(any(feature = "api-only", feature = "dashboard"))]
 use clap::ArgGroup;
 use clap::Parser;
 use querymt_agent::prelude::*;
+#[cfg(feature = "api-only")]
+use querymt_agent::server::ServerMode;
 use rust_embed::RustEmbed;
 use std::path::{Component, Path, PathBuf};
 
-#[cfg(feature = "dashboard")]
+#[cfg(any(feature = "api-only", feature = "dashboard"))]
 const DEFAULT_DASHBOARD_ADDR: &str = "127.0.0.1:3000";
 #[cfg(feature = "remote")]
 const DEFAULT_MESH_ADDR: &str = "/ip4/0.0.0.0/tcp/9000";
@@ -44,14 +50,25 @@ struct EmbeddedPromptAssets;
 #[derive(Debug, Parser)]
 #[command(name = "qmtcode")]
 #[command(version = env!("QMT_BUILD_VERSION"))]
-#[command(about = "Run QueryMT coder agent in ACP mode, dashboard mode, or as a mesh node")]
 #[command(
-    after_help = "Examples:\n  qmtcode --acp\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --dashboard --mesh\n  qmtcode path/to/config.toml --acp"
+    about = "Run QueryMT coder agent in ACP mode, API-only mode, dashboard mode, or as a mesh node"
+)]
+#[command(
+    after_help = "Examples:\n  qmtcode --acp\n  qmtcode --api-only\n  qmtcode --api-only=0.0.0.0:8080\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --api-only --mesh\n  qmtcode path/to/config.toml --acp"
 )]
 #[cfg_attr(
-    feature = "dashboard",
+    all(feature = "api-only", feature = "dashboard"),
+    command(group(ArgGroup::new("transport").args(["acp", "api_only", "dashboard"]).multiple(false)))
+)]
+#[cfg_attr(
+    all(feature = "api-only", not(feature = "dashboard")),
+    command(group(ArgGroup::new("transport").args(["acp", "api_only"]).multiple(false)))
+)]
+#[cfg_attr(
+    all(not(feature = "api-only"), feature = "dashboard"),
     command(group(ArgGroup::new("transport").args(["acp", "dashboard"]).multiple(false)))
 )]
+
 struct Cli {
     /// Path to TOML config.
     ///
@@ -62,9 +79,16 @@ struct Cli {
     #[arg(long)]
     acp: bool,
 
+    /// Run API-only server for alternate UIs; optionally set bind address
+    #[cfg(feature = "api-only")]
+    #[cfg_attr(feature = "dashboard", arg(long = "api-only", value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_DASHBOARD_ADDR, conflicts_with = "dashboard"))]
+    #[cfg_attr(not(feature = "dashboard"), arg(long = "api-only", value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_DASHBOARD_ADDR))]
+    api_only: Option<String>,
+
     /// Run web dashboard; optionally set bind address
     #[cfg(feature = "dashboard")]
-    #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_DASHBOARD_ADDR)]
+    #[cfg_attr(feature = "api-only", arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_DASHBOARD_ADDR, conflicts_with = "api_only"))]
+    #[cfg_attr(not(feature = "api-only"), arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_DASHBOARD_ADDR))]
     dashboard: Option<String>,
 
     /// Enable kameo mesh networking for cross-machine sessions.
@@ -158,6 +182,10 @@ fn embedded_prompt_asset_key(file_ref: &str) -> Option<String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let is_acp = cli.acp;
+    #[cfg(feature = "api-only")]
+    let is_api_only = cli.api_only.is_some();
+    #[cfg(not(feature = "api-only"))]
+    let is_api_only = false;
     #[cfg(feature = "dashboard")]
     let is_dashboard = cli.dashboard.is_some();
     #[cfg(not(feature = "dashboard"))]
@@ -167,8 +195,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "remote"))]
     let has_mesh = false;
 
-    if !is_acp && !is_dashboard && !has_mesh {
-        return Err("No mode selected. Use --acp, --dashboard, or --mesh.".into());
+    if !is_acp && !is_api_only && !is_dashboard && !has_mesh {
+        return Err("No mode selected. Use --acp, --api-only, --dashboard, or --mesh.".into());
     }
 
     // Setup telemetry: ACP mode writes console logs to stderr (stdout is
@@ -275,12 +303,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if is_acp {
         eprintln!("Starting ACP stdio server...");
         runner.acp("stdio").await?;
+    } else if is_api_only {
+        #[cfg(feature = "api-only")]
+        {
+            let addr = cli.api_only.as_deref().unwrap_or(DEFAULT_DASHBOARD_ADDR);
+            eprintln!("Starting API-only server at http://{}", addr);
+            runner.server().run(addr, ServerMode::ApiOnly).await?;
+        }
+        #[cfg(not(feature = "api-only"))]
+        {
+            return Err("--api-only requires the `api-only` feature.".into());
+        }
     } else if is_dashboard {
         #[cfg(feature = "dashboard")]
         {
             let addr = cli.dashboard.as_deref().unwrap_or(DEFAULT_DASHBOARD_ADDR);
             eprintln!("Starting dashboard at http://{}", addr);
-            runner.dashboard().run(addr).await?;
+            runner.server().run(addr, ServerMode::Dashboard).await?;
         }
         #[cfg(not(feature = "dashboard"))]
         {

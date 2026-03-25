@@ -14,15 +14,17 @@
 //! Then open http://127.0.0.1:3030 in your browser.
 
 use querymt_agent::prelude::*;
+#[cfg(feature = "dashboard")]
+use querymt_agent::server::ServerMode;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let agent = Agent::single().provider("openai", "gpt-4").build().await?;
 
-    let server = agent.dashboard();
+    let server = agent.server();
     let addr = "127.0.0.1:3030";
 
     println!("Dashboard running at http://{}", addr);
-    server.run(addr).await?;
+    server.run(addr, ServerMode::Dashboard).await?;
     Ok(())
 }

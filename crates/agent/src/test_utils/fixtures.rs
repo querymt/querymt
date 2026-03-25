@@ -120,13 +120,13 @@ impl TestAgent {
 // ── Tier 3 ── agent + ServerState ────────────────────────────────────────────
 
 /// Agent + ServerState for UI/handler tests.
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "api-only")]
 pub struct TestServerState {
     pub agent: TestAgent,
     pub(crate) state: crate::ui::ServerState,
 }
 
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "api-only")]
 impl TestServerState {
     /// Default server state backed by `TestAgent::with_observer()`.
     pub async fn new() -> Self {

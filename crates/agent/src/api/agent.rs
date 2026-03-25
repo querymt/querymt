@@ -16,7 +16,7 @@ use crate::config::{
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
 use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "api-only")]
 use crate::server::AgentServer;
 use crate::session::backend::{StorageBackend, default_agent_db_path};
 use crate::session::sqlite_storage::SqliteStorage;
@@ -508,7 +508,7 @@ impl AgentBuilder {
 
 pub struct Agent {
     pub(super) inner: Arc<AgentHandle>,
-    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
+    #[cfg_attr(not(feature = "api-only"), allow(dead_code))]
     pub(super) storage: Arc<dyn StorageBackend>,
     pub(super) default_session_id: Arc<Mutex<Option<String>>>,
     pub(super) cwd: Option<PathBuf>,
@@ -617,8 +617,8 @@ impl Agent {
         self
     }
 
-    #[cfg(feature = "dashboard")]
-    pub fn dashboard(&self) -> AgentServer {
+    #[cfg(feature = "api-only")]
+    pub fn server(&self) -> AgentServer {
         AgentServer::new(self.inner.clone(), self.storage.clone(), self.cwd.clone())
     }
 
@@ -626,7 +626,7 @@ impl Agent {
     ///
     /// # Transports
     /// - `"stdio"` - Use stdin/stdout for JSON-RPC communication (for subprocess spawning)
-    /// - `"ws://host:port"` - Start a WebSocket server (not yet implemented, use .dashboard() instead)
+    /// - `"ws://host:port"` - Start a WebSocket server (not yet implemented, use .server() instead)
     ///
     /// # Example
     /// ```rust,no_run
@@ -901,8 +901,8 @@ impl ChatRunner for Agent {
         self.callbacks.ensure_listener(Agent::subscribe(self));
     }
 
-    #[cfg(feature = "dashboard")]
-    fn dashboard(&self) -> AgentServer {
-        Agent::dashboard(self)
+    #[cfg(feature = "api-only")]
+    fn server(&self) -> AgentServer {
+        AgentServer::new(self.inner.clone(), self.storage.clone(), self.cwd.clone())
     }
 }

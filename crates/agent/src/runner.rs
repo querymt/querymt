@@ -5,7 +5,7 @@
 use crate::api::Agent;
 use crate::config::{Config, ConfigSource, load_config};
 use crate::events::EventEnvelope;
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "api-only")]
 use crate::server::AgentServer;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -41,9 +41,9 @@ pub trait ChatRunner: Send + Sync {
     /// Register a callback for error events (boxed version)
     fn on_error_boxed(&self, callback: Box<dyn Fn(String) + Send + Sync>);
 
-    /// Get the web dashboard server
-    #[cfg(feature = "dashboard")]
-    fn dashboard(&self) -> AgentServer;
+    /// Get the UI server
+    #[cfg(feature = "api-only")]
+    fn server(&self) -> AgentServer;
 }
 
 /// Extension trait for convenient callback registration  
@@ -162,10 +162,10 @@ impl AgentRunner {
         self.0.acp(transport).await
     }
 
-    /// Get the web dashboard server
-    #[cfg(feature = "dashboard")]
-    pub fn dashboard(&self) -> AgentServer {
-        self.0.dashboard()
+    /// Get the UI server
+    #[cfg(feature = "api-only")]
+    pub fn server(&self) -> AgentServer {
+        self.0.server()
     }
 
     /// Subscribe to agent events (tool calls, messages, etc.)
