@@ -14,6 +14,7 @@ use similarity_py::python_parser::PythonParser;
 use similarity_rs::rust_parser::RustParser;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tracing::instrument;
 
 /// Index of all functions in a codebase for fast similarity lookups
 pub struct FunctionIndex {
@@ -61,9 +62,21 @@ impl FunctionIndex {
     /// - Concurrent parser usage can cause segfaults in `Node::kind()` and similar methods
     ///
     /// See: https://github.com/tree-sitter/tree-sitter/issues/1369
+    #[instrument(
+        name = "function_index.build",
+        skip(root, config),
+        fields(
+            root = %root.display(),
+            files_found = tracing::field::Empty,
+            functions_indexed = tracing::field::Empty,
+            files_indexed = tracing::field::Empty,
+        )
+    )]
     fn build_sync(root: &Path, config: FunctionIndexConfig) -> Result<Self, String> {
         // Collect all supported source files
         let files = collect_source_files(root)?;
+
+        tracing::Span::current().record("files_found", files.len());
 
         log::debug!(
             "FunctionIndex: Building index for {} files in {:?}",
@@ -320,10 +333,14 @@ impl FunctionIndex {
         })?;
 
         let total_functions: usize = functions.values().map(|v| v.len()).sum();
+        let total_files = functions.len();
+        tracing::Span::current().record("functions_indexed", total_functions);
+        tracing::Span::current().record("files_indexed", total_files);
+
         log::info!(
             "FunctionIndex: Indexed {} functions from {} files",
             total_functions,
-            functions.len()
+            total_files
         );
 
         Ok(Self {
@@ -334,11 +351,26 @@ impl FunctionIndex {
     }
 
     /// Find functions similar to the given function entry
+    #[instrument(
+        name = "function_index.find_similar",
+        skip(self, func),
+        fields(
+            function_name = %func.name,
+            language = %func.language,
+            candidates_total = tracing::field::Empty,
+            fingerprint_rejected = tracing::field::Empty,
+            language_rejected = tracing::field::Empty,
+            below_threshold = tracing::field::Empty,
+            matches_found = tracing::field::Empty,
+        )
+    )]
     pub fn find_similar(&self, func: &IndexedFunctionEntry) -> Vec<SimilarFunctionMatch> {
         let mut matches = Vec::new();
         let threshold = self.config.similarity_threshold;
 
         let total_functions: usize = self.functions.values().map(|v| v.len()).sum();
+        tracing::Span::current().record("candidates_total", total_functions);
+
         log::debug!(
             "FunctionIndex::find_similar: '{}' ({:?}) — searching {} candidate(s) across {} file(s)",
             func.name,
@@ -420,6 +452,12 @@ impl FunctionIndex {
             }
         }
 
+        let span = tracing::Span::current();
+        span.record("fingerprint_rejected", fingerprint_rejected);
+        span.record("language_rejected", language_rejected);
+        span.record("below_threshold", below_threshold);
+        span.record("matches_found", matches.len());
+
         log::debug!(
             "FunctionIndex::find_similar: '{}' done — {} match(es), {} fingerprint-rejected, \
             {} language-rejected, {} below-threshold",
@@ -441,6 +479,15 @@ impl FunctionIndex {
     }
 
     /// Find functions similar to newly written/modified code
+    #[instrument(
+        name = "function_index.find_similar_to_code",
+        skip(self, source),
+        fields(
+            file = %file_path.display(),
+            functions_extracted = tracing::field::Empty,
+            functions_with_matches = tracing::field::Empty,
+        )
+    )]
     pub fn find_similar_to_code(
         &self,
         file_path: &Path,
@@ -455,6 +502,7 @@ impl FunctionIndex {
 
         // Extract functions from the new code
         let new_entries = index_file_with_language(file_path, source, language, &self.config);
+        tracing::Span::current().record("functions_extracted", new_entries.len());
 
         // Find similar functions for each new entry
         let mut results = Vec::new();
@@ -465,12 +513,19 @@ impl FunctionIndex {
             }
         }
 
+        tracing::Span::current().record("functions_with_matches", results.len());
+
         results
     }
 
     /// Update the index for a specific file
     ///
     /// Sequential by construction when called through the actor mailbox.
+    #[instrument(
+        name = "function_index.update_file",
+        skip(self, source),
+        fields(file = %file_path.display(), functions_indexed = tracing::field::Empty)
+    )]
     pub fn update_file(&mut self, file_path: &Path, source: &str) {
         let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
@@ -484,6 +539,7 @@ impl FunctionIndex {
         };
 
         let entries = index_file_with_language(file_path, source, language, &self.config);
+        tracing::Span::current().record("functions_indexed", entries.len());
 
         if entries.is_empty() {
             self.functions.remove(file_path);
@@ -493,6 +549,11 @@ impl FunctionIndex {
     }
 
     /// Remove a file from the index
+    #[instrument(
+        name = "function_index.remove_file",
+        skip(self),
+        fields(file = %file_path.display())
+    )]
     pub fn remove_file(&mut self, file_path: &Path) {
         self.functions.remove(file_path);
     }
@@ -512,6 +573,17 @@ impl FunctionIndex {
     /// Dispatches to the appropriate parser based on the language stored in each
     /// `IndexedFunctionEntry`.  `find_similar` already guarantees that both entries
     /// share the same language, so we only need to check one of them.
+    #[instrument(
+        level = "debug",
+        name = "function_index.calculate_similarity",
+        skip(self, func1, func2),
+        fields(
+            func1 = %func1.name,
+            func2 = %func2.name,
+            language = %func1.language,
+            similarity = tracing::field::Empty,
+        )
+    )]
     fn calculate_similarity(
         &self,
         func1: &IndexedFunctionEntry,
@@ -665,6 +737,8 @@ impl FunctionIndex {
             ..TSEDOptions::default()
         };
 
-        calculate_tsed(&tree1, &tree2, &options)
+        let similarity = calculate_tsed(&tree1, &tree2, &options);
+        tracing::Span::current().record("similarity", similarity);
+        similarity
     }
 }

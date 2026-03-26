@@ -10,8 +10,18 @@ use similarity_core::{
 use similarity_py::python_parser::PythonParser;
 use similarity_rs::rust_parser::RustParser;
 use std::path::{Path, PathBuf};
+use tracing::instrument;
 
 /// Index a TypeScript/JavaScript file using the oxc-based parser
+#[instrument(
+    name = "function_index.index_typescript_file",
+    skip(source, config),
+    fields(
+        file = %file_path.display(),
+        functions_found = tracing::field::Empty,
+        functions_indexed = tracing::field::Empty,
+    )
+)]
 pub(super) fn index_typescript_file(
     file_path: &Path,
     source: &str,
@@ -20,7 +30,10 @@ pub(super) fn index_typescript_file(
     let filename = file_path.to_string_lossy().to_string();
     let functions = extract_functions(&filename, source)?;
 
+    tracing::Span::current().record("functions_found", functions.len());
+
     let mut entries = Vec::new();
+    let mut fingerprint_failures = 0usize;
 
     for func in functions {
         let line_count = func.end_line - func.start_line + 1;
@@ -34,7 +47,10 @@ pub(super) fn index_typescript_file(
         // Create fingerprint
         let fingerprint = match AstFingerprint::from_source(&body_text) {
             Ok(fp) => fp,
-            Err(_) => continue,
+            Err(_) => {
+                fingerprint_failures += 1;
+                continue;
+            }
         };
 
         entries.push(IndexedFunctionEntry {
@@ -50,10 +66,30 @@ pub(super) fn index_typescript_file(
         });
     }
 
+    if fingerprint_failures > 0 {
+        log::debug!(
+            "index_typescript_file: {} fingerprint failure(s) in {:?}",
+            fingerprint_failures,
+            file_path
+        );
+    }
+
+    tracing::Span::current().record("functions_indexed", entries.len());
+
     Ok(entries)
 }
 
 /// Index a file using a tree-sitter based parser
+#[instrument(
+    name = "function_index.index_with_parser",
+    skip(parser, source, config),
+    fields(
+        file = %file_path.display(),
+        language = %language,
+        functions_found = tracing::field::Empty,
+        functions_indexed = tracing::field::Empty,
+    )
+)]
 pub(super) fn index_with_parser(
     parser: &mut dyn LanguageParser,
     file_path: &Path,
@@ -65,6 +101,8 @@ pub(super) fn index_with_parser(
     let functions = parser
         .extract_functions(source, &filename)
         .map_err(|e| format!("Failed to extract functions: {}", e))?;
+
+    tracing::Span::current().record("functions_found", functions.len());
 
     let mut entries = Vec::new();
 
@@ -93,7 +131,15 @@ pub(super) fn index_with_parser(
             // Tree-sitter parse of the body for SimHash
             match parser.parse(&body_text, &filename) {
                 Ok(tree) => structural_simhash_from_tree(&tree),
-                Err(_) => 0,
+                Err(e) => {
+                    log::debug!(
+                        "index_with_parser: structural fingerprint parse failed for '{}' in {:?}: {}",
+                        func.name,
+                        file_path,
+                        e
+                    );
+                    0
+                }
             }
         };
 
@@ -108,6 +154,8 @@ pub(super) fn index_with_parser(
             language: language.to_string(),
         });
     }
+
+    tracing::Span::current().record("functions_indexed", entries.len());
 
     Ok(entries)
 }
@@ -150,6 +198,14 @@ pub(super) fn extract_body_text_lines(source: &str, start_line: u32, end_line: u
 }
 
 /// Collect all supported source files from a directory
+#[instrument(
+    name = "function_index.collect_source_files",
+    skip(root),
+    fields(
+        root = %root.display(),
+        files_found = tracing::field::Empty,
+    )
+)]
 pub(super) fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     let supported_extensions = [
         "ts", "tsx", "js", "jsx", "mjs", "cjs",  // TypeScript/JavaScript
@@ -182,42 +238,70 @@ pub(super) fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> 
         }
     }
 
+    tracing::Span::current().record("files_found", files.len());
+
     Ok(files)
 }
 
 /// Create a parser for the given language name, index the given source, and return entries.
 /// Used for incremental updates (`update_file`) and on-the-fly queries (`find_similar_to_code`).
+#[instrument(
+    name = "function_index.index_file_with_language",
+    skip(source, config),
+    fields(
+        file = %file_path.display(),
+        language = %language,
+        functions_indexed = tracing::field::Empty,
+    )
+)]
 pub(super) fn index_file_with_language(
     file_path: &Path,
     source: &str,
     language: &str,
     config: &FunctionIndexConfig,
 ) -> Vec<IndexedFunctionEntry> {
-    match language {
+    let entries = match language {
         "typescript" => index_typescript_file(file_path, source, config).unwrap_or_default(),
-        "rust" => {
-            if let Ok(mut parser) = RustParser::new() {
-                index_with_parser(&mut parser, file_path, source, language, config)
-                    .unwrap_or_default()
-            } else {
+        "rust" => match RustParser::new() {
+            Ok(mut parser) => index_with_parser(&mut parser, file_path, source, language, config)
+                .unwrap_or_default(),
+            Err(e) => {
+                log::warn!(
+                    "index_file_with_language: failed to create RustParser for {:?}: {}",
+                    file_path,
+                    e
+                );
                 Vec::new()
             }
-        }
-        "python" => {
-            if let Ok(mut parser) = PythonParser::new() {
-                index_with_parser(&mut parser, file_path, source, language, config)
-                    .unwrap_or_default()
-            } else {
+        },
+        "python" => match PythonParser::new() {
+            Ok(mut parser) => index_with_parser(&mut parser, file_path, source, language, config)
+                .unwrap_or_default(),
+            Err(e) => {
+                log::warn!(
+                    "index_file_with_language: failed to create PythonParser for {:?}: {}",
+                    file_path,
+                    e
+                );
                 Vec::new()
             }
-        }
-        lang => {
-            if let Ok(mut parser) = GenericTreeSitterParser::from_language_name(lang) {
-                index_with_parser(&mut parser, file_path, source, language, config)
-                    .unwrap_or_default()
-            } else {
+        },
+        lang => match GenericTreeSitterParser::from_language_name(lang) {
+            Ok(mut parser) => index_with_parser(&mut parser, file_path, source, language, config)
+                .unwrap_or_default(),
+            Err(e) => {
+                log::warn!(
+                    "index_file_with_language: failed to create parser for language '{}' on {:?}: {}",
+                    lang,
+                    file_path,
+                    e
+                );
                 Vec::new()
             }
-        }
-    }
+        },
+    };
+
+    tracing::Span::current().record("functions_indexed", entries.len());
+
+    entries
 }

@@ -16,6 +16,7 @@ use kameo::message::{Context, Message};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
+use tracing::instrument;
 
 // ---------------------------------------------------------------------------
 // Error type (kept from old workspace.rs)
@@ -196,31 +197,57 @@ impl WorkspaceIndexActor {
 impl Message<FindSimilar> for WorkspaceIndexActor {
     type Reply = Vec<SimilarFunctionMatch>;
 
+    #[instrument(
+        name = "workspace_actor.find_similar",
+        skip(self, msg, _ctx),
+        fields(
+            function_name = %msg.entry.name,
+            matches = tracing::field::Empty,
+        )
+    )]
     async fn handle(
         &mut self,
         msg: FindSimilar,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.function_index.find_similar(&msg.entry)
+        let results = self.function_index.find_similar(&msg.entry);
+        tracing::Span::current().record("matches", results.len());
+        results
     }
 }
 
 impl Message<FindSimilarToCode> for WorkspaceIndexActor {
     type Reply = Vec<(IndexedFunctionEntry, Vec<SimilarFunctionMatch>)>;
 
+    #[instrument(
+        name = "workspace_actor.find_similar_to_code",
+        skip(self, msg, _ctx),
+        fields(
+            file = %msg.file_path.display(),
+            results = tracing::field::Empty,
+        )
+    )]
     async fn handle(
         &mut self,
         msg: FindSimilarToCode,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.function_index
-            .find_similar_to_code(&msg.file_path, &msg.source)
+        let results = self
+            .function_index
+            .find_similar_to_code(&msg.file_path, &msg.source);
+        tracing::Span::current().record("results", results.len());
+        results
     }
 }
 
 impl Message<UpdateFile> for WorkspaceIndexActor {
     type Reply = ();
 
+    #[instrument(
+        name = "workspace_actor.update_file",
+        skip(self, msg, _ctx),
+        fields(file = %msg.file_path.display())
+    )]
     async fn handle(
         &mut self,
         msg: UpdateFile,
@@ -233,6 +260,11 @@ impl Message<UpdateFile> for WorkspaceIndexActor {
 impl Message<RemoveFile> for WorkspaceIndexActor {
     type Reply = ();
 
+    #[instrument(
+        name = "workspace_actor.remove_file",
+        skip(self, msg, _ctx),
+        fields(file = %msg.file_path.display())
+    )]
     async fn handle(
         &mut self,
         msg: RemoveFile,
@@ -245,6 +277,14 @@ impl Message<RemoveFile> for WorkspaceIndexActor {
 impl Message<ApplyChanges> for WorkspaceIndexActor {
     type Reply = ();
 
+    #[instrument(
+        name = "workspace_actor.apply_changes",
+        skip(self, msg, _ctx),
+        fields(
+            files_removed = tracing::field::Empty,
+            files_reindexed = tracing::field::Empty,
+        )
+    )]
     async fn handle(
         &mut self,
         msg: ApplyChanges,
@@ -254,6 +294,9 @@ impl Message<ApplyChanges> for WorkspaceIndexActor {
 
         let remove_count = change_set.files_to_remove().count();
         let reindex_count = change_set.files_to_reindex().count();
+
+        tracing::Span::current().record("files_removed", remove_count);
+        tracing::Span::current().record("files_reindexed", reindex_count);
 
         if remove_count > 0 || reindex_count > 0 {
             log::debug!(
@@ -320,6 +363,7 @@ impl Message<GetStats> for WorkspaceIndexActor {
 impl Message<Rebuild> for WorkspaceIndexActor {
     type Reply = Result<(), String>;
 
+    #[instrument(name = "workspace_actor.rebuild", skip(self, _msg, _ctx))]
     async fn handle(
         &mut self,
         _msg: Rebuild,
