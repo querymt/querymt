@@ -46,8 +46,7 @@
           extensions = ["rust-src"];
         };
 
-        agentCargoToml = builtins.fromTOML (builtins.readFile ./crates/agent/Cargo.toml);
-        cliCargoToml = builtins.fromTOML (builtins.readFile ./crates/cli/Cargo.toml);
+        workspaceCargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
 
         commonInputs = with pkgs; [
           rustToolchain
@@ -67,9 +66,9 @@
 
         agentUi = pkgs.buildNpmPackage {
           pname = "querymt-agent-ui";
-          version = agentCargoToml.package.version;
+          version = workspaceCargoToml.workspace.package.version;
           src = ./crates/agent/ui;
-          npmDepsHash = "sha256-wmEuyYAKW4E/Wc0m94l4HLLmloYIqkeKcHkUJLT4/yg=";
+          npmDepsHash = "sha256-1K/k6jQXiBWacq1Ijkp6xbktQwgxXlFa07S9a5H26Gs=";
           npmBuildScript = "build";
           installPhase = ''
             runHook preInstall
@@ -84,7 +83,7 @@
 
           qmtcode = pkgs.rustPlatform.buildRustPackage {
             pname = "qmtcode";
-            version = agentCargoToml.package.version;
+            version = workspaceCargoToml.workspace.package.version;
             src = ./.;
             cargoLock = {
               lockFile = ./Cargo.lock;
@@ -126,7 +125,7 @@
 
           qmt = pkgs.rustPlatform.buildRustPackage {
             pname = "qmt";
-            version = cliCargoToml.package.version;
+            version = workspaceCargoToml.workspace.package.version;
             src = ./.;
             cargoLock = {
               lockFile = ./Cargo.lock;
