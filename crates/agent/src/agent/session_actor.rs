@@ -889,12 +889,23 @@ impl Message<crate::agent::messages::SetPlanningContext> for SessionActor {
             .map_err(|e| AgentError::Internal(e.to_string()))?;
 
         if let Some(current) = current_config {
-            let mut llm_params = querymt::LLMParams::new()
-                .provider(&current.provider)
-                .model(&current.model);
-            for part in &system_prompt {
-                llm_params = llm_params.system(part.clone());
-            }
+            // Reconstruct full LLMParams from the stored config JSON.
+            // This preserves provider-specific custom params (e.g. text_only,
+            // n_ctx, flash_attention for llama_cpp) that are stored via
+            // #[serde(flatten)] on LLMParams.custom.  Previously this built
+            // a fresh LLMParams with only provider/model/system, silently
+            // dropping all custom params — causing delegate sessions to lose
+            // their inference configuration.
+            let mut llm_params = if let Some(ref params_json) = current.params {
+                serde_json::from_value::<querymt::LLMParams>(params_json.clone())
+                    .unwrap_or_default()
+            } else {
+                querymt::LLMParams::new()
+            };
+            // Re-add provider/model (stored in separate columns, stripped from params JSON)
+            llm_params = llm_params.provider(&current.provider).model(&current.model);
+            // Replace system prompt with updated version (original + planning context)
+            llm_params.system = system_prompt;
 
             let new_config = self
                 .config
