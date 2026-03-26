@@ -133,7 +133,7 @@ jobs:
             --codecov --output-path ./coverage/codecov-izwi.json
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage/codecov-izwi.json
@@ -195,7 +195,7 @@ jobs:
             --codecov --output-path ./coverage/codecov-llama-cpp.json
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage/codecov-llama-cpp.json
@@ -251,7 +251,7 @@ jobs:
             --codecov --output-path ./coverage/codecov-mrs.json
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage/codecov-mrs.json

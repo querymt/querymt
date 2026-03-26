@@ -135,7 +135,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: ${{ matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true' }}
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage/codecov-${{ matrix.provider }}.json
