@@ -12,14 +12,15 @@
 
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
-import { Activity, Send, Loader, Plus, ChevronDown, Square } from 'lucide-react';
+import { ChevronDown } from 'lucide-react';
 import { useUiClientActions, useUiClientEvents, useUiClientSession } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
 import { useSessionManager } from '../hooks/useSessionManager';
 import { useFileMention } from '../hooks/useFileMention';
 import { useTodoState } from '../hooks/useTodoState';
-import { EventItem, EventRow, Turn, UiPromptBlock } from '../types';
-import { MentionInput } from './MentionInput';
+import { EventItem, EventRow, Turn } from '../types';
+import { ChatInputBar } from './ChatInputBar';
+import { ChatTabBar } from './ChatTabBar';
 import { ToolDetailModal } from './ToolDetailModal';
 import { TurnCard } from './TurnCard';
 import { DelegationsView } from './DelegationsView';
@@ -30,12 +31,10 @@ import { SessionPicker } from './SessionPicker';
 import { ThinkingIndicator } from './ThinkingIndicator';
 import { SystemLog } from './SystemLog';
 import { PinnedUserMessage } from './PinnedUserMessage';
-import { GlitchText } from './GlitchText';
-import { buildTurns, buildDelegationTurn, buildEventRowsWithDelegations, isRateLimitEvent, processRateLimitEvent } from '../logic/chatViewLogic';
+import { WelcomeScreen } from './WelcomeScreen';
+import { buildTurns, buildDelegationTurn, buildEventRowsWithDelegations, isRateLimitEvent, processRateLimitEvent, buildPromptBlocksFromInput } from '../logic/chatViewLogic';
 import { RateLimitIndicator } from './RateLimitIndicator';
 import { useIsMobile } from '../hooks/useIsMobile';
-
-const FILE_MENTION_MARKUP_RE = /@\{(file|dir):([^}]+)\}/g;
 
 /** Stable empty array shared across TurnCard instances to avoid new allocations. */
 const emptyRevertedFiles: string[] = [];
@@ -46,28 +45,6 @@ interface TurnUndoProps {
   isUndoPending: boolean;
   isStackedUndone: boolean;
   revertedFiles: string[];
-}
-
-function buildPromptBlocksFromInput(input: string): UiPromptBlock[] {
-  const links = new Map<string, UiPromptBlock>();
-  const normalizedText = input.replace(FILE_MENTION_MARKUP_RE, (_match, _kind: string, rawPath: string) => {
-    const path = String(rawPath).trim();
-    if (!path) {
-      return '';
-    }
-    if (!links.has(path)) {
-      links.set(path, {
-        type: 'resource_link',
-        data: { name: path, uri: path },
-      });
-    }
-    return `@${path}`;
-  });
-
-  return [
-    { type: 'text', data: { text: normalizedText } },
-    ...Array.from(links.values()),
-  ];
 }
 
 export function ChatView() {
@@ -104,7 +81,6 @@ export function ChatView() {
     sessionGroups,
     thinkingBySession,
     sessionParentMap,
-    isConversationComplete,
     workspaceIndexStatus,
     llmConfigCache,
     undoState,
@@ -166,9 +142,6 @@ export function ChatView() {
     if (!agentSet || agentSet.size === 0) return null;
     return Array.from(agentSet).pop()!;
   }, [sessionId, thinkingBySession]);
-
-  // Session-scoped conversation complete state (only for main session)
-  const sessionConversationComplete = sessionId === mainSessionId ? isConversationComplete : false;
 
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const chatTimelineRef = useRef<HTMLDivElement | null>(null);
@@ -839,46 +812,15 @@ export function ChatView() {
       <div className="flex-1 overflow-hidden flex flex-row relative">
         <div className="flex-1 overflow-hidden flex flex-col min-w-0 relative">
         {sessionId && hasDelegations && (
-          <div className="px-3 md:px-6 py-2 border-b border-surface-border/60 bg-surface-elevated/40 flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                setActiveTimelineView('chat');
-                setDelegationDrawerOpen(false);
-              }}
-              className={`text-xs uppercase tracking-wider px-3 py-1.5 rounded-full border transition-colors ${
-                activeTimelineView === 'chat'
-                  ? 'border-accent-primary text-accent-primary bg-accent-primary/10'
-                  : 'border-surface-border/60 text-ui-secondary hover:border-accent-primary/40 hover:text-ui-primary'
-              }`}
-            >
-              Chat
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setActiveTimelineView('delegations');
-                if (delegations.length > 0) {
-                  const currentValid = delegations.some(d => d.id === activeDelegationId);
-                  if (!activeDelegationId || !currentValid) {
-                    setActiveDelegationId(delegations[0].id);
-                  }
-                } else {
-                  setActiveDelegationId(null);
-                }
-              }}
-              className={`text-xs uppercase tracking-wider px-3 py-1.5 rounded-full border transition-colors ${
-                activeTimelineView === 'delegations'
-                  ? 'border-accent-tertiary text-accent-tertiary bg-accent-tertiary/10'
-                  : 'border-surface-border/60 text-ui-secondary hover:border-accent-tertiary/40 hover:text-ui-primary'
-              }`}
-            >
-              Delegations
-              {hasDelegations && (
-                <span className="ml-2 text-[10px] text-ui-muted">{delegations.length}</span>
-              )}
-            </button>
-          </div>
+          <ChatTabBar
+            activeTimelineView={activeTimelineView}
+            setActiveTimelineView={setActiveTimelineView}
+            setDelegationDrawerOpen={setDelegationDrawerOpen}
+            delegations={delegations}
+            activeDelegationId={activeDelegationId}
+            setActiveDelegationId={setActiveDelegationId}
+            hasDelegations={hasDelegations}
+          />
         )}
         <div ref={chatTimelineRef} className="flex-1 overflow-hidden relative">
           {activeTimelineView === 'delegations' ? (
@@ -894,45 +836,15 @@ export function ChatView() {
             />
           ) : !hasTurns ? (
             <div className="flex items-center justify-center h-full">
-              {!sessionId ? (
+               {!sessionId ? (
                 // No active session
                 sessionGroups.length === 0 ? (
                   // No sessions exist - show welcome + new session button
-                  <div className="text-center space-y-6 animate-fade-in">
-                    <div>
-                      <p className="text-lg text-ui-secondary mb-6">Welcome to QueryMT</p>
-                      <button
-                        onClick={handleNewSession}
-                        disabled={!connected || loading}
-                        className="
-                          px-8 py-4 rounded-lg font-medium text-base
-                          bg-accent-primary/10 border-2 border-accent-primary
-                          text-accent-primary
-                          hover:bg-accent-primary/20 hover:shadow-glow-primary
-                          disabled:opacity-30 disabled:cursor-not-allowed
-                          transition-all duration-200
-                          flex items-center justify-center gap-3 mx-auto
-                        "
-                      >
-                        {loading ? (
-                          <>
-                            <Loader className="w-6 h-6 animate-spin" />
-                            <span>Creating Session...</span>
-                          </>
-                        ) : (
-                          <>
-                            <Plus className="w-6 h-6" />
-                            <GlitchText text="Start New Session" variant="0" hoverOnly />
-                          </>
-                        )}
-                      </button>
-                      <p className="text-xs text-ui-muted mt-3">
-                        or press <kbd className="px-2 py-1 bg-surface-canvas border border-surface-border rounded text-accent-primary font-mono text-[10px]">
-                          {navigator.platform.includes('Mac') ? '⌘+X N' : 'Ctrl+X N'}
-                        </kbd> to create a session
-                      </p>
-                    </div>
-                  </div>
+                  <WelcomeScreen
+                    onNewSession={handleNewSession}
+                    disabled={!connected || loading}
+                    loading={loading}
+                  />
                 ) : (
                   // Sessions exist - show session picker
                   <SessionPicker
@@ -948,12 +860,8 @@ export function ChatView() {
                 )
               ) : (
                 // Active session but no events yet - ready to chat
-                <div className="text-center space-y-6 animate-fade-in text-ui-muted">
-                  <Activity className="w-16 h-16 mx-auto text-accent-primary opacity-30" />
-                  <div>
-                    <p className="text-lg text-ui-secondary">Session Ready</p>
-                    <p className="text-sm text-ui-muted mt-2">Start chatting below to begin</p>
-                  </div>
+                <div className="text-center animate-fade-in">
+                  <p className="text-sm text-ui-muted">Start chatting below</p>
                 </div>
               )}
             </div>
@@ -1031,11 +939,8 @@ export function ChatView() {
         )}
       </div>
 
-      {/* Thinking/Completion Indicator */}
+      {/* Thinking Indicator */}
       {sessionThinkingAgentId !== null && <ThinkingIndicator agentId={sessionThinkingAgentId} agents={agents} />}
-      {sessionThinkingAgentId === null && sessionConversationComplete && (
-        <ThinkingIndicator agentId={sessionThinkingAgentId} agents={agents} isComplete={true} />
-      )}
 
       {/* Rate Limit Indicator */}
       {rateLimitState?.isRateLimited && sessionId && (
@@ -1054,74 +959,23 @@ export function ChatView() {
       )}
 
       {/* Input Area */}
-      <div className="px-3 md:px-6 py-3 md:py-4 pb-safe bg-surface-elevated border-t border-surface-border shadow-[0_-4px_20px_rgba(var(--accent-primary-rgb),0.05)]">
-        <div
-          className="flex gap-2 md:gap-3 relative items-end p-0.5 rounded-lg transition-colors duration-200"
-          style={{
-            background: `linear-gradient(90deg, rgba(var(--mode-rgb), 0.08) 0%, transparent 100%)`
-          }}
-        >
-          <div className="flex gap-3 relative items-stretch flex-1">
-          <MentionInput
-            ref={mentionInputRef}
-            value={prompt}
-            onChange={setPrompt}
-            onSubmit={handleSendPrompt}
-            placeholder={
-              !sessionId
-                ? "Create a session to start chatting..."
-                : rateLimitState?.isRateLimited
-                  ? "Waiting for rate limit..."
-                  : isMobile ? "Enter your prompt..." : "Enter your prompt... (use @ to mention files)"
-            }
-            disabled={loading || !connected || !sessionId || rateLimitState?.isRateLimited}
-            files={fileMention.allFiles}
-            onRequestFiles={fileMention.requestIndex}
-            isLoadingFiles={fileMention.isLoading}
-            showIndexBuilding={activeIndexStatus === 'building'}
-          />
-          {sessionThinkingAgentId !== null ? (
-            <button
-              onClick={cancelSession}
-              className="
-                px-3 md:px-6 py-2.5 md:py-3 rounded-lg font-medium transition-all duration-200
-                bg-status-warning/10 border-2 border-status-warning text-status-warning
-                hover:bg-status-warning/20 hover:shadow-[0_0_15px_rgba(var(--status-warning-rgb),0.3)]
-                flex items-center justify-center gap-2 overflow-visible
-              "
-              title="Stop generation (Esc Esc)"
-            >
-              <Square className="w-5 h-5" />
-              <span className="hidden md:inline">Stop</span>
-            </button>
-          ) : (
-            <button
-              onClick={handleSendPrompt}
-              disabled={loading || !connected || !sessionId || !prompt.trim() || rateLimitState?.isRateLimited}
-              className="
-                px-3 md:px-6 py-2.5 md:py-3 rounded-lg font-medium transition-all duration-200
-                bg-accent-primary/10 border-2 border-accent-primary text-accent-primary
-                hover:bg-accent-primary/20 hover:shadow-glow-primary
-                disabled:opacity-30 disabled:cursor-not-allowed
-                flex items-center justify-center gap-2 overflow-visible
-              "
-            >
-              {loading ? (
-                <>
-                  <Loader className="w-5 h-5 animate-spin" />
-                  <span className="hidden md:inline">Sending...</span>
-                </>
-              ) : (
-                <>
-                  <Send className="w-5 h-5" />
-                  <span className="hidden md:inline"><GlitchText text="Send" variant="0" hoverOnly /></span>
-                </>
-              )}
-            </button>
-          )}
-          </div>
-        </div>
-      </div>
+      <ChatInputBar
+        mentionInputRef={mentionInputRef}
+        prompt={prompt}
+        setPrompt={setPrompt}
+        handleSendPrompt={handleSendPrompt}
+        cancelSession={cancelSession}
+        sessionId={sessionId}
+        connected={connected}
+        loading={loading}
+        isMobile={isMobile}
+        sessionThinkingAgentId={sessionThinkingAgentId}
+        rateLimitState={rateLimitState}
+        activeIndexStatus={activeIndexStatus}
+        allFiles={fileMention.allFiles}
+        requestIndex={fileMention.requestIndex}
+        isLoadingFiles={fileMention.isLoading}
+      />
 
       {/* Tool Detail Modal */}
       {selectedToolEvent && (

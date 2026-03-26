@@ -1,13 +1,14 @@
 import { useState } from 'react';
-import { Plus, Loader } from 'lucide-react';
+import { Loader } from 'lucide-react';
 import { useSessionManager } from '../hooks/useSessionManager';
 import { useUiClientActions, useUiClientSession } from '../context/UiClientContext';
 import { SessionPicker } from './SessionPicker';
-import { GlitchText } from './GlitchText';
+import { WelcomeScreen } from './WelcomeScreen';
 
 /**
  * HomePage component - displays when navigating to "/"
  * Shows either:
+ * - Loading spinner (while waiting for initial connection)
  * - Welcome screen with "New Session" button (if no sessions exist)
  * - SessionPicker (if sessions exist)
  */
@@ -36,8 +37,6 @@ export function HomePage() {
     }
   };
 
-  // Handle session selection - navigate to the session route
-  // The useSessionRoute hook in ChatView will then load the session from URL
   const handleSelectSession = (sessionId: string) => {
     selectSession(sessionId);
   };
@@ -49,7 +48,16 @@ export function HomePage() {
     }
   };
 
-  // If sessions exist, show the session picker
+  // Show a minimal spinner while waiting for the initial connection
+  // to avoid flashing the WelcomeScreen before sessions arrive.
+  if (!connected) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <Loader className="w-5 h-5 animate-spin text-ui-muted" />
+      </div>
+    );
+  }
+
   if (sessionGroups.length > 0) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -58,7 +66,7 @@ export function HomePage() {
           onSelectSession={handleSelectSession}
           onDeleteSession={handleDeleteSession}
           onNewSession={handleNewSession}
-          disabled={!connected || loading}
+          disabled={loading}
           activeSessionId={sessionId}
           thinkingBySession={thinkingBySession}
           sessionParentMap={sessionParentMap}
@@ -67,46 +75,13 @@ export function HomePage() {
     );
   }
 
-  // No sessions exist - show welcome screen
   return (
     <div className="flex items-center justify-center h-full">
-      <div className="text-center space-y-6 animate-fade-in">
-        <div>
-          <p className="text-lg text-ui-secondary mb-6">Welcome to QueryMT</p>
-          <button
-            onClick={handleNewSession}
-            disabled={!connected || loading}
-            className="
-              px-8 py-4 rounded-lg font-medium text-base
-              bg-accent-primary/10 border-2 border-accent-primary
-              text-accent-primary
-              hover:bg-accent-primary/20 hover:shadow-glow-primary
-              disabled:opacity-30 disabled:cursor-not-allowed
-              transition-all duration-200
-              flex items-center justify-center gap-3 mx-auto
-            "
-          >
-            {loading ? (
-              <>
-                <Loader className="w-6 h-6 animate-spin" />
-                <span>Creating Session...</span>
-              </>
-            ) : (
-              <>
-                <Plus className="w-6 h-6" />
-                <GlitchText text="Start New Session" variant="0" hoverOnly />
-              </>
-            )}
-          </button>
-          <p className="text-xs text-ui-muted mt-3">
-            or press{' '}
-            <kbd className="px-2 py-1 bg-surface-canvas border border-surface-border rounded text-accent-primary font-mono text-[10px]">
-              {navigator.platform.includes('Mac') ? '⌘+X N' : 'Ctrl+X N'}
-            </kbd>{' '}
-            to create a session
-          </p>
-        </div>
-      </div>
+      <WelcomeScreen
+        onNewSession={handleNewSession}
+        disabled={loading}
+        loading={loading}
+      />
     </div>
   );
 }
