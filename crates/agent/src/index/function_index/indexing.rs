@@ -14,6 +14,7 @@ use tracing::instrument;
 
 /// Index a TypeScript/JavaScript file using the oxc-based parser
 #[instrument(
+    level = "trace",
     name = "function_index.index_typescript_file",
     skip(source, config),
     fields(
@@ -81,6 +82,7 @@ pub(super) fn index_typescript_file(
 
 /// Index a file using a tree-sitter based parser
 #[instrument(
+    level = "trace",
     name = "function_index.index_with_parser",
     skip(parser, source, config),
     fields(
@@ -246,6 +248,7 @@ pub(super) fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> 
 /// Create a parser for the given language name, index the given source, and return entries.
 /// Used for incremental updates (`update_file`) and on-the-fly queries (`find_similar_to_code`).
 #[instrument(
+    level = "trace",
     name = "function_index.index_file_with_language",
     skip(source, config),
     fields(

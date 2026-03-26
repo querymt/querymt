@@ -352,6 +352,7 @@ impl FunctionIndex {
 
     /// Find functions similar to the given function entry
     #[instrument(
+        level = "debug",
         name = "function_index.find_similar",
         skip(self, func),
         fields(
@@ -480,6 +481,7 @@ impl FunctionIndex {
 
     /// Find functions similar to newly written/modified code
     #[instrument(
+        level = "debug",
         name = "function_index.find_similar_to_code",
         skip(self, source),
         fields(
@@ -574,7 +576,7 @@ impl FunctionIndex {
     /// `IndexedFunctionEntry`.  `find_similar` already guarantees that both entries
     /// share the same language, so we only need to check one of them.
     #[instrument(
-        level = "debug",
+        level = "trace",
         name = "function_index.calculate_similarity",
         skip(self, func1, func2),
         fields(
