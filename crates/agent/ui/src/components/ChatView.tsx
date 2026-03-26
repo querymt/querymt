@@ -291,9 +291,11 @@ export function ChatView() {
     const result = buildTurns(events, sessionThinkingAgentId);
 
     // Enrich delegations with child session events from eventsBySession
+    const claimedSessionIds = new Set<string>();
     for (const delegation of result.delegations) {
       // Use the childSessionId directly if available (set from session_forked event)
       if (delegation.childSessionId) {
+        claimedSessionIds.add(delegation.childSessionId);
         const sessionEvents = eventsBySession.get(delegation.childSessionId);
         if (sessionEvents) {
           const { rows } = buildEventRowsWithDelegations(sessionEvents);
@@ -303,8 +305,10 @@ export function ChatView() {
         // Fallback: scan for child session by matching target agent ID
         for (const [sessionId, sessionEvents] of eventsBySession.entries()) {
           if (sessionId === mainSessionId) continue; // Skip main session
+          if (claimedSessionIds.has(sessionId)) continue; // Skip already claimed sessions
           const hasMatchingAgent = sessionEvents.some((e: EventItem) => e.agentId === delegation.targetAgentId);
           if (hasMatchingAgent) {
+            claimedSessionIds.add(sessionId);
             delegation.childSessionId = sessionId;
             const { rows } = buildEventRowsWithDelegations(sessionEvents);
             delegation.events = rows;
