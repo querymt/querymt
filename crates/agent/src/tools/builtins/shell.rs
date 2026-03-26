@@ -297,10 +297,10 @@ mod tests {
         // Wait for the PID file to appear (process has started).
         let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Ok(contents) = tokio::fs::read_to_string(&pid_file).await {
-                    if let Ok(pid) = contents.trim().parse::<i32>() {
-                        return pid;
-                    }
+                if let Ok(contents) = tokio::fs::read_to_string(&pid_file).await
+                    && let Ok(pid) = contents.trim().parse::<i32>()
+                {
+                    return pid;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -321,9 +321,6 @@ mod tests {
         // Verify the process is no longer running.
         // kill(pid, 0) checks existence without sending a signal.
         let alive = unsafe { libc::kill(pid, 0) };
-        assert_eq!(
-            alive, -1,
-            "process {pid} should be dead after cancellation"
-        );
+        assert_eq!(alive, -1, "process {pid} should be dead after cancellation");
     }
 }
