@@ -1118,6 +1118,16 @@ pub struct DelegateConfig {
     #[serde(default)]
     pub execution: ExecutionPolicy,
 
+    /// Whether to treat unknown tools as mutating, requiring snapshot + permission confirmation.
+    /// Set to `false` and use `mutating_tools` for explicit control.
+    #[serde(default = "default_assume_mutating")]
+    pub assume_mutating: bool,
+
+    /// Explicit allowlist of tools that modify the filesystem or execute commands.
+    /// Common values: `["edit", "write_file", "delete_file", "shell", "apply_patch"]`.
+    #[serde(default)]
+    pub mutating_tools: Vec<String>,
+
     /// Optional mesh peer name (references a `[[mesh.peers]]` entry).
     ///
     /// When set, LLM calls for this delegate are routed to the remote peer via

@@ -17,6 +17,8 @@ pub(super) struct AgentConfig {
     pub required_capabilities: Vec<CapabilityRequirement>,
     pub middleware: Vec<MiddlewareEntry>,
     pub execution: ExecutionPolicy,
+    pub assume_mutating: Option<bool>,
+    pub mutating_tools: Option<Vec<String>>,
 }
 
 impl AgentConfig {
@@ -30,6 +32,8 @@ impl AgentConfig {
             required_capabilities: Vec::new(),
             middleware: Vec::new(),
             execution: ExecutionPolicy::default(),
+            assume_mutating: None,
+            mutating_tools: None,
         }
     }
 }
@@ -200,6 +204,20 @@ impl DelegateConfigBuilder {
         S: Into<String>,
     {
         self.config.tools = tools.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn assume_mutating(mut self, value: bool) -> Self {
+        self.config.assume_mutating = Some(value);
+        self
+    }
+
+    pub fn mutating_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.mutating_tools = Some(tools.into_iter().map(Into::into).collect());
         self
     }
 

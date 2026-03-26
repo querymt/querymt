@@ -251,6 +251,8 @@ impl QuorumBuilder {
             let tools = delegate.tools.clone();
             let middleware_entries = delegate.middleware.clone();
             let exec = delegate.execution.clone();
+            let assume_mutating = delegate.assume_mutating;
+            let mutating_tools = delegate.mutating_tools.clone().unwrap_or_default();
             let registry = registry.clone();
             let delegate_agent_id = delegate.id.clone();
             let snapshot_policy_for_delegate = self.snapshot_policy;
@@ -281,7 +283,11 @@ impl QuorumBuilder {
                     .with_snapshot_from_execution(&exec)
                     .with_delegation_wait_policy(delegation_wait_policy_for_delegate.clone())
                     .with_delegation_wait_timeout_secs(delegation_wait_timeout_for_delegate)
-                    .with_delegation_cancel_grace_secs(delegation_cancel_grace_for_delegate);
+                    .with_delegation_cancel_grace_secs(delegation_cancel_grace_for_delegate)
+                    .with_mutating_tools(mutating_tools.clone());
+                if let Some(am) = assume_mutating {
+                    b = b.with_assume_mutating(am);
+                }
                 apply_middleware_from_config(&mut b, &middleware_entries, auto_compact);
 
                 let config = Arc::new(b.build());
@@ -760,6 +766,8 @@ impl super::agent::Agent {
 
             delegate_config.middleware = delegate.middleware;
             delegate_config.execution = delegate.execution;
+            delegate_config.assume_mutating = Some(delegate.assume_mutating);
+            delegate_config.mutating_tools = Some(delegate.mutating_tools);
 
             // Register peer delegate for mesh routing resolution in build()
             #[cfg(feature = "remote")]
