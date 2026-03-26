@@ -50,7 +50,7 @@ export function MeshInvitePanel({
         <button
           type="button"
           title="Mesh invites"
-          className="relative h-8 inline-flex items-center gap-1.5 px-2.5 rounded-lg border border-surface-border bg-surface-canvas/60 hover:border-accent-secondary/40 hover:bg-surface-elevated/50 transition-colors"
+          className="relative inline-flex items-center gap-1.5 px-2 py-1 rounded-lg border border-surface-border/40 bg-surface-elevated/50 hover:border-accent-primary/60 hover:bg-surface-elevated/80 transition-colors"
         >
           <QrCode className="w-3.5 h-3.5 text-accent-secondary" />
           <span className="text-xs font-mono text-accent-secondary">{pendingInvites.length}</span>

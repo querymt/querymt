@@ -366,7 +366,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "remote")]
     let effective_mesh = cli.mesh.clone().or_else(|| {
-        if has_mesh_invite { Some(DEFAULT_MESH_ADDR.to_string()) } else { None }
+        if has_mesh_invite {
+            Some(DEFAULT_MESH_ADDR.to_string())
+        } else {
+            None
+        }
     });
 
     #[cfg(feature = "remote")]
