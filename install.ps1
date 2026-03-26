@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 
-$Repo = "querymt/querymt"
+$QuerymtRepo = "querymt/querymt"
+$QmtuiRepo = "querymt/qmtui"
 $Channel = if ($env:QMT_CHANNEL -eq "nightly") { "nightly" } else { "latest" }
 $InstallDir = if ($env:QMT_INSTALL_DIR) { $env:QMT_INSTALL_DIR } else { Join-Path $env:USERPROFILE ".local\bin" }
 
@@ -11,7 +12,16 @@ switch ($arch) {
     default { throw "Unsupported Windows architecture: $arch" }
 }
 
-function Get-ReleaseApiUrl {
+function Get-RepoForBinary([string]$Binary) {
+    switch ($Binary) {
+        "qmt" { return $QuerymtRepo }
+        "qmtcode" { return $QuerymtRepo }
+        "qmtui" { return $QmtuiRepo }
+        default { throw "Unsupported binary: $Binary" }
+    }
+}
+
+function Get-ReleaseApiUrl([string]$Repo) {
     if ($Channel -eq "nightly") {
         return "https://api.github.com/repos/$Repo/releases/tags/nightly"
     }
@@ -19,7 +29,8 @@ function Get-ReleaseApiUrl {
 }
 
 function Get-AssetUrl([string]$Binary) {
-    $release = Invoke-RestMethod -Uri (Get-ReleaseApiUrl)
+    $repo = Get-RepoForBinary -Binary $Binary
+    $release = Invoke-RestMethod -Uri (Get-ReleaseApiUrl -Repo $repo)
     if ($Channel -eq "nightly") {
         $regex = "^$Binary-nightly-.*-$Target\.zip$"
     } else {
@@ -28,7 +39,7 @@ function Get-AssetUrl([string]$Binary) {
 
     $asset = $release.assets | Where-Object { $_.name -match $regex } | Select-Object -First 1
     if (-not $asset) {
-        throw "Could not find asset for $Binary ($Target, $Channel)"
+        throw "Could not find asset for $Binary in $repo ($Target, $Channel)"
     }
 
     return $asset.browser_download_url
@@ -41,9 +52,10 @@ function Install-Binary([string]$Binary) {
     try {
         $zipPath = Join-Path $tmpRoot "$Binary.zip"
         $extractDir = Join-Path $tmpRoot "extract"
+        $repo = Get-RepoForBinary -Binary $Binary
 
         $url = Get-AssetUrl -Binary $Binary
-        Write-Host "Downloading $Binary ($Channel, $Target)..."
+        Write-Host "Downloading $Binary from $repo ($Channel, $Target)..."
         Invoke-WebRequest -Uri $url -OutFile $zipPath
 
         Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
@@ -61,8 +73,13 @@ function Install-Binary([string]$Binary) {
     }
 }
 
+function Show-Version([string]$Binary) {
+    & (Join-Path $InstallDir "$Binary.exe") --version
+}
+
 Install-Binary -Binary "qmt"
 Install-Binary -Binary "qmtcode"
+Install-Binary -Binary "qmtui"
 
 Write-Host "Installed to: $InstallDir"
 
@@ -77,5 +94,6 @@ if ($pathParts -notcontains $InstallDir) {
     Write-Host "Added $InstallDir to user PATH. Restart your shell to pick it up."
 }
 
-& (Join-Path $InstallDir "qmt.exe") --version
-& (Join-Path $InstallDir "qmtcode.exe") --version
+Show-Version -Binary "qmt"
+Show-Version -Binary "qmtcode"
+Show-Version -Binary "qmtui"
