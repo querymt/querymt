@@ -101,22 +101,30 @@ mod node_manager_extended_tests {
     async fn test_create_destroy_create_sequence_no_leak() {
         let f = NodeManagerFixture::new_with_mesh().await;
 
-        for _ in 0..10 {
-            let resp = f
-                .actor_ref
-                .ask(CreateRemoteSession { cwd: None })
-                .await
-                .expect("create");
+        let timeout = std::time::Duration::from_secs(3);
 
-            f.actor_ref
-                .ask(DestroyRemoteSession {
+        for i in 0..10 {
+            let resp =
+                tokio::time::timeout(timeout, f.actor_ref.ask(CreateRemoteSession { cwd: None }))
+                    .await
+                    .unwrap_or_else(|_| panic!("create timed out at iteration {i}"))
+                    .expect("create");
+
+            tokio::time::timeout(
+                timeout,
+                f.actor_ref.ask(DestroyRemoteSession {
                     session_id: resp.session_id,
-                })
-                .await
-                .expect("destroy");
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("destroy timed out at iteration {i}"))
+            .expect("destroy");
         }
 
-        let sessions = f.actor_ref.ask(ListRemoteSessions).await.expect("list");
+        let sessions = tokio::time::timeout(timeout, f.actor_ref.ask(ListRemoteSessions))
+            .await
+            .expect("list timed out")
+            .expect("list");
         assert!(
             sessions.is_empty(),
             "after 10 create+destroy cycles the registry should be empty, got {} sessions",
@@ -184,7 +192,17 @@ mod remote_session_lifecycle_integration_tests {
     };
     use crate::agent::remote::test_helpers::fixtures::{TwoNodeFixture, get_test_mesh};
     use crate::agent::session_actor::SessionActor;
+    use std::future::Future;
+    use std::time::Duration;
     use uuid::Uuid;
+
+    const STEP_TIMEOUT: Duration = Duration::from_secs(15);
+
+    async fn within_timeout<T>(label: &str, fut: impl Future<Output = T>) -> T {
+        tokio::time::timeout(STEP_TIMEOUT, fut)
+            .await
+            .unwrap_or_else(|_| panic!("{} timed out after {:?}", label, STEP_TIMEOUT))
+    }
 
     // ── G.1 ──────────────────────────────────────────────────────────────────
 
@@ -194,17 +212,20 @@ mod remote_session_lifecycle_integration_tests {
         let f = TwoNodeFixture::new(&test_id).await;
 
         // Alpha looks up Beta's node manager via DHT.
-        let beta_ref = f
-            .mesh
-            .lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name)
-            .await
-            .expect("DHT lookup")
-            .expect("beta not in DHT");
+        let beta_ref = within_timeout(
+            "lookup beta node manager",
+            f.mesh
+                .lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name),
+        )
+        .await
+        .expect("DHT lookup")
+        .expect("beta not in DHT");
 
-        let resp = beta_ref
-            .ask(&CreateRemoteSession { cwd: None })
-            .await
-            .expect("CreateRemoteSession on beta");
+        let resp = within_timeout("CreateRemoteSession on beta", async {
+            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+        })
+        .await
+        .expect("CreateRemoteSession on beta");
 
         assert!(
             !resp.session_id.is_empty(),
@@ -213,16 +234,25 @@ mod remote_session_lifecycle_integration_tests {
         assert!(resp.actor_id > 0, "actor_id should be positive");
 
         // Verify via Beta's local list.
-        let sessions = f
-            .beta
-            .actor_ref
-            .ask(ListRemoteSessions)
-            .await
-            .expect("ListRemoteSessions on beta");
+        let sessions = within_timeout("ListRemoteSessions on beta", async {
+            f.beta.actor_ref.ask(ListRemoteSessions).await
+        })
+        .await
+        .expect("ListRemoteSessions on beta");
         assert!(
             sessions.iter().any(|s| s.session_id == resp.session_id),
             "created session should appear in Beta's list"
         );
+
+        let _ = within_timeout("destroy created session", async {
+            beta_ref
+                .ask(&DestroyRemoteSession {
+                    session_id: resp.session_id,
+                })
+                .await
+        })
+        .await;
+        f.cleanup().await;
     }
 
     // ── G.2 ──────────────────────────────────────────────────────────────────
@@ -233,31 +263,46 @@ mod remote_session_lifecycle_integration_tests {
         let f = TwoNodeFixture::new(&test_id).await;
         let mesh = get_test_mesh().await;
 
-        let beta_ref = mesh
-            .lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name)
-            .await
-            .expect("lookup beta")
-            .expect("beta not found");
+        let beta_ref = within_timeout(
+            "lookup beta node manager",
+            mesh.lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name),
+        )
+        .await
+        .expect("lookup beta")
+        .expect("beta not found");
 
-        let resp = beta_ref
-            .ask(&CreateRemoteSession { cwd: None })
-            .await
-            .expect("create");
+        let resp = within_timeout("create session on beta", async {
+            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+        })
+        .await
+        .expect("create");
 
         // Give DHT a moment to propagate the session registration.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let dht_name = crate::agent::remote::dht_name::session(&resp.session_id);
-        let session_actor_ref = mesh
-            .lookup_actor::<SessionActor>(&dht_name)
-            .await
-            .expect("DHT lookup for session");
+        let session_actor_ref = within_timeout(
+            "lookup session in DHT",
+            mesh.lookup_actor::<SessionActor>(&dht_name),
+        )
+        .await
+        .expect("DHT lookup for session");
 
         assert!(
             session_actor_ref.is_some(),
             "session '{}' should be findable in DHT after creation",
             resp.session_id
         );
+
+        let _ = within_timeout("destroy created session", async {
+            beta_ref
+                .ask(&DestroyRemoteSession {
+                    session_id: resp.session_id,
+                })
+                .await
+        })
+        .await;
+        f.cleanup().await;
     }
 
     // ── G.3 ──────────────────────────────────────────────────────────────────
@@ -268,29 +313,54 @@ mod remote_session_lifecycle_integration_tests {
         let f = TwoNodeFixture::new(&test_id).await;
         let mesh = get_test_mesh().await;
 
-        let beta_ref = mesh
-            .lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name)
-            .await
-            .expect("lookup")
-            .expect("not found");
+        let beta_ref = within_timeout(
+            "lookup beta node manager",
+            mesh.lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name),
+        )
+        .await
+        .expect("lookup")
+        .expect("not found");
 
         // Create two sessions on beta.
-        let r1 = beta_ref
-            .ask(&CreateRemoteSession { cwd: None })
-            .await
-            .expect("create 1");
-        let r2 = beta_ref
-            .ask(&CreateRemoteSession { cwd: None })
-            .await
-            .expect("create 2");
+        let r1 = within_timeout("create 1", async {
+            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+        })
+        .await
+        .expect("create 1");
+        let r2 = within_timeout("create 2", async {
+            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+        })
+        .await
+        .expect("create 2");
 
         // Alpha lists beta's sessions.
-        let sessions: Vec<_> = beta_ref.ask(&ListRemoteSessions).await.expect("list");
+        let sessions: Vec<_> =
+            within_timeout("list", async { beta_ref.ask(&ListRemoteSessions).await })
+                .await
+                .expect("list");
 
         assert_eq!(sessions.len(), 2, "beta should have 2 sessions");
         let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
         assert!(ids.contains(&r1.session_id.as_str()));
         assert!(ids.contains(&r2.session_id.as_str()));
+
+        let _ = within_timeout("destroy 1", async {
+            beta_ref
+                .ask(&DestroyRemoteSession {
+                    session_id: r1.session_id,
+                })
+                .await
+        })
+        .await;
+        let _ = within_timeout("destroy 2", async {
+            beta_ref
+                .ask(&DestroyRemoteSession {
+                    session_id: r2.session_id,
+                })
+                .await
+        })
+        .await;
+        f.cleanup().await;
     }
 
     // ── G.4 ──────────────────────────────────────────────────────────────────
@@ -301,29 +371,38 @@ mod remote_session_lifecycle_integration_tests {
         let f = TwoNodeFixture::new(&test_id).await;
         let mesh = get_test_mesh().await;
 
-        let beta_ref = mesh
-            .lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name)
-            .await
-            .expect("lookup")
-            .expect("not found");
+        let beta_ref = within_timeout(
+            "lookup beta node manager",
+            mesh.lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name),
+        )
+        .await
+        .expect("lookup")
+        .expect("not found");
 
-        let resp = beta_ref
-            .ask(&CreateRemoteSession { cwd: None })
-            .await
-            .expect("create");
+        let resp = within_timeout("create", async {
+            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+        })
+        .await
+        .expect("create");
 
-        beta_ref
-            .ask(&DestroyRemoteSession {
-                session_id: resp.session_id.clone(),
-            })
-            .await
-            .expect("destroy");
+        within_timeout("destroy", async {
+            beta_ref
+                .ask(&DestroyRemoteSession {
+                    session_id: resp.session_id.clone(),
+                })
+                .await
+        })
+        .await
+        .expect("destroy");
 
-        let sessions = beta_ref.ask(&ListRemoteSessions).await.expect("list");
+        let sessions = within_timeout("list", async { beta_ref.ask(&ListRemoteSessions).await })
+            .await
+            .expect("list");
         assert!(
             sessions.iter().all(|s| s.session_id != resp.session_id),
             "destroyed session should be gone from beta's list"
         );
+        f.cleanup().await;
     }
 
     // ── G.5 ──────────────────────────────────────────────────────────────────
@@ -334,18 +413,21 @@ mod remote_session_lifecycle_integration_tests {
         let f = TwoNodeFixture::new(&test_id).await;
         let mesh = get_test_mesh().await;
 
-        let beta_ref = mesh
-            .lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name)
-            .await
-            .expect("lookup")
-            .expect("not found");
+        let beta_ref = within_timeout(
+            "lookup beta node manager",
+            mesh.lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name),
+        )
+        .await
+        .expect("lookup")
+        .expect("not found");
 
         let mut ids = Vec::new();
-        for _ in 0..3 {
-            let resp = beta_ref
-                .ask(&CreateRemoteSession { cwd: None })
-                .await
-                .expect("create");
+        for i in 0..3 {
+            let resp = within_timeout(&format!("create {i}"), async {
+                beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+            })
+            .await
+            .expect("create");
             ids.push(resp.session_id);
         }
 
@@ -355,8 +437,18 @@ mod remote_session_lifecycle_integration_tests {
         sorted.dedup();
         assert_eq!(sorted.len(), 3, "all session IDs should be unique");
 
-        let sessions = beta_ref.ask(&ListRemoteSessions).await.expect("list");
+        let sessions = within_timeout("list", async { beta_ref.ask(&ListRemoteSessions).await })
+            .await
+            .expect("list");
         assert_eq!(sessions.len(), 3);
+
+        for id in ids {
+            let _ = within_timeout("destroy created session", async {
+                beta_ref.ask(&DestroyRemoteSession { session_id: id }).await
+            })
+            .await;
+        }
+        f.cleanup().await;
     }
 
     // ── G.6 ──────────────────────────────────────────────────────────────────
@@ -367,26 +459,31 @@ mod remote_session_lifecycle_integration_tests {
         let f = TwoNodeFixture::new(&test_id).await;
         let mesh = get_test_mesh().await;
 
-        let beta_ref = mesh
-            .lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name)
-            .await
-            .expect("lookup")
-            .expect("not found");
+        let beta_ref = within_timeout(
+            "lookup beta node manager",
+            mesh.lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name),
+        )
+        .await
+        .expect("lookup")
+        .expect("not found");
 
-        let resp = beta_ref
-            .ask(&CreateRemoteSession { cwd: None })
-            .await
-            .expect("create");
+        let resp = within_timeout("create remote session", async {
+            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+        })
+        .await
+        .expect("create");
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Attach by resolving via DHT.
         let dht_name = crate::agent::remote::dht_name::session(&resp.session_id);
-        let remote_ref = mesh
-            .lookup_actor::<SessionActor>(&dht_name)
-            .await
-            .expect("session lookup")
-            .expect("session not in DHT");
+        let remote_ref = within_timeout(
+            "lookup session actor",
+            mesh.lookup_actor::<SessionActor>(&dht_name),
+        )
+        .await
+        .expect("session lookup")
+        .expect("session not in DHT");
 
         let session_ref = SessionActorRef::Remote {
             actor_ref: remote_ref,
@@ -395,6 +492,17 @@ mod remote_session_lifecycle_integration_tests {
 
         assert!(session_ref.is_remote());
         assert_eq!(session_ref.node_label(), "beta");
+
+        // Keep the shared test mesh clean to reduce cross-test interference.
+        let _ = within_timeout("destroy remote session", async {
+            beta_ref
+                .ask(&DestroyRemoteSession {
+                    session_id: resp.session_id,
+                })
+                .await
+        })
+        .await;
+        f.cleanup().await;
     }
 
     // ── G.7 ──────────────────────────────────────────────────────────────────
@@ -405,39 +513,55 @@ mod remote_session_lifecycle_integration_tests {
         let f = TwoNodeFixture::new(&test_id).await;
         let mesh = get_test_mesh().await;
 
-        let beta_ref = mesh
-            .lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name)
-            .await
-            .expect("lookup")
-            .expect("not found");
+        let beta_ref = within_timeout(
+            "lookup beta node manager",
+            mesh.lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name),
+        )
+        .await
+        .expect("lookup")
+        .expect("not found");
 
-        let resp = beta_ref
-            .ask(&CreateRemoteSession { cwd: None })
-            .await
-            .expect("create");
+        let resp = within_timeout("create remote session", async {
+            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+        })
+        .await
+        .expect("create");
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let dht_name = crate::agent::remote::dht_name::session(&resp.session_id);
-        let remote_ref = mesh
-            .lookup_actor::<SessionActor>(&dht_name)
-            .await
-            .expect("lookup")
-            .expect("not found");
+        let remote_ref = within_timeout(
+            "lookup session actor",
+            mesh.lookup_actor::<SessionActor>(&dht_name),
+        )
+        .await
+        .expect("lookup")
+        .expect("not found");
 
         let session_ref = SessionActorRef::Remote {
             actor_ref: remote_ref,
             peer_label: "beta".to_string(),
         };
 
-        session_ref
-            .set_mode(AgentMode::Plan)
+        within_timeout("set_mode", session_ref.set_mode(AgentMode::Plan))
             .await
             .expect("set_mode");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let mode = session_ref.get_mode().await.expect("get_mode");
+        let mode = within_timeout("get_mode", session_ref.get_mode())
+            .await
+            .expect("get_mode");
         assert_eq!(mode, AgentMode::Plan);
+
+        let _ = within_timeout("destroy created session", async {
+            beta_ref
+                .ask(&DestroyRemoteSession {
+                    session_id: resp.session_id,
+                })
+                .await
+        })
+        .await;
+        f.cleanup().await;
     }
 
     // ── G.8 — Bug #5 (documented) ────────────────────────────────────────────
@@ -525,6 +649,16 @@ mod remote_session_lifecycle_integration_tests {
         // We document expected behaviour without asserting strictly.
         // When fixed: assert alpha fanout has received at least one event.
         let _ = alpha_fanout.subscriber_count(); // just ensure no panic
+
+        let _ = within_timeout("destroy created session", async {
+            beta_ref
+                .ask(&DestroyRemoteSession {
+                    session_id: resp.session_id,
+                })
+                .await
+        })
+        .await;
+        f.cleanup().await;
     }
 
     // ── G.9 ──────────────────────────────────────────────────────────────────
@@ -565,6 +699,16 @@ mod remote_session_lifecycle_integration_tests {
             result.is_ok(),
             "cancel on idle remote session should return Ok"
         );
+
+        let _ = within_timeout("destroy created session", async {
+            beta_ref
+                .ask(&DestroyRemoteSession {
+                    session_id: resp.session_id,
+                })
+                .await
+        })
+        .await;
+        f.cleanup().await;
     }
 
     // ── G.10 ─────────────────────────────────────────────────────────────────
@@ -581,13 +725,16 @@ mod remote_session_lifecycle_integration_tests {
             .expect("lookup")
             .expect("not found");
 
-        let info = beta_ref.ask(&GetNodeInfo).await.expect("GetNodeInfo");
+        let info = within_timeout("GetNodeInfo", async { beta_ref.ask(&GetNodeInfo).await })
+            .await
+            .expect("GetNodeInfo");
 
         assert!(!info.hostname.is_empty(), "hostname should not be empty");
         assert!(
             !info.capabilities.is_empty(),
             "capabilities should not be empty"
         );
+        f.cleanup().await;
     }
 
     // ── G.11 — Concurrent session creation ───────────────────────────────────
@@ -598,11 +745,13 @@ mod remote_session_lifecycle_integration_tests {
         let f = TwoNodeFixture::new(&test_id).await;
         let mesh = get_test_mesh().await;
 
-        let beta_ref = mesh
-            .lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name)
-            .await
-            .expect("lookup")
-            .expect("not found");
+        let beta_ref = within_timeout(
+            "lookup beta node manager",
+            mesh.lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name),
+        )
+        .await
+        .expect("lookup")
+        .expect("not found");
 
         let (r1, r2, r3, r4, r5) = tokio::join!(
             beta_ref.ask(&CreateRemoteSession { cwd: None }),
@@ -626,5 +775,13 @@ mod remote_session_lifecycle_integration_tests {
             5,
             "all 5 concurrent sessions should have unique IDs"
         );
+
+        for id in ids {
+            let _ = within_timeout("destroy created session", async {
+                beta_ref.ask(&DestroyRemoteSession { session_id: id }).await
+            })
+            .await;
+        }
+        f.cleanup().await;
     }
 }

@@ -149,9 +149,16 @@ mod remote_impl {
         /// First join succeeded — here is the membership token for future reconnects.
         Admitted {
             membership_token: crate::agent::remote::invite::MembershipToken,
+            /// `PeerId` strings of all currently connected mesh peers (excluding
+            /// the joiner).  The joiner should dial each of these to form a full
+            /// mesh instead of staying in a star topology with only the inviter.
+            existing_peers: Vec<String>,
         },
         /// Reconnect accepted — token is still valid.
-        Readmitted,
+        Readmitted {
+            /// `PeerId` strings of all currently connected mesh peers.
+            existing_peers: Vec<String>,
+        },
         /// Admission denied.
         Rejected { reason: String },
     }
@@ -302,9 +309,24 @@ mod remote_impl {
                     session_id = %session_id,
                     dht_name = %dht_name,
                 );
-                mesh.register_actor(actor_ref.clone(), dht_name)
-                    .instrument(reg_span)
-                    .await;
+                let reg_timeout = std::time::Duration::from_secs(2);
+                match tokio::time::timeout(
+                    reg_timeout,
+                    mesh.register_actor(actor_ref.clone(), dht_name.clone())
+                        .instrument(reg_span),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(_) => {
+                        log::warn!(
+                            "RemoteNodeManager: timed out registering session {} as '{}' in DHT after {:?}; continuing with local registry",
+                            session_id,
+                            dht_name,
+                            reg_timeout
+                        );
+                    }
+                }
             } else {
                 log::debug!(
                     "RemoteNodeManager: no mesh, skipping DHT registration for session {}",
@@ -492,7 +514,35 @@ mod remote_impl {
 
             if let Some(session_ref) = session_ref {
                 tracing::Span::current().record("found", true);
-                let _ = session_ref.shutdown().await;
+
+                // Bound shutdown latency so destroy requests cannot hang forever
+                // if an actor is unresponsive.
+                let shutdown_timeout = std::time::Duration::from_secs(2);
+                match tokio::time::timeout(shutdown_timeout, session_ref.shutdown()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        log::warn!(
+                            "RemoteNodeManager: shutdown error for session {}: {}",
+                            msg.session_id,
+                            e
+                        );
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "RemoteNodeManager: shutdown timed out for session {} after {:?}",
+                            msg.session_id,
+                            shutdown_timeout
+                        );
+                    }
+                }
+
+                // Ensure this session's re-registration closure is removed from the
+                // mesh handle so repeated create/destroy cycles don't leak entries.
+                if let Some(ref mesh) = self.mesh {
+                    let dht_name = crate::agent::remote::dht_name::session(&msg.session_id);
+                    mesh.deregister_actor(&dht_name);
+                }
+
                 self.session_meta.remove(&msg.session_id);
                 log::info!("RemoteNodeManager: destroyed session {}", msg.session_id);
                 Ok(())
@@ -625,8 +675,15 @@ mod remote_impl {
                                 peer_id,
                                 invite_id
                             );
+                            let existing_peers: Vec<String> = mesh
+                                .known_peer_ids()
+                                .iter()
+                                .filter(|pid| pid.to_string() != peer_id)
+                                .map(|pid| pid.to_string())
+                                .collect();
                             Ok(AdmissionResponse::Admitted {
                                 membership_token: token,
+                                existing_peers,
                             })
                         }
                         Err(e) => {
@@ -670,7 +727,18 @@ mod remote_impl {
                                 peer_id,
                                 membership_token.admitted_by
                             );
-                            Ok(AdmissionResponse::Readmitted)
+                            let existing_peers: Vec<String> = self
+                                .mesh
+                                .as_ref()
+                                .map(|m| {
+                                    m.known_peer_ids()
+                                        .iter()
+                                        .filter(|pid| pid.to_string() != peer_id)
+                                        .map(|pid| pid.to_string())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            Ok(AdmissionResponse::Readmitted { existing_peers })
                         }
                         Err(e) => {
                             log::warn!(

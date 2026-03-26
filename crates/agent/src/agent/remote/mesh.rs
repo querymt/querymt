@@ -35,7 +35,22 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
+
+/// Commands sent from `MeshHandle` to the swarm event loop.
+///
+/// The event loop owns the `Swarm` and is the only place that can mutate it.
+/// Higher-level code uses `MeshHandle` methods (e.g. `dial_peer`) which
+/// translate intent into a `SwarmCommand` and send it over an `mpsc` channel.
+#[derive(Debug)]
+enum SwarmCommand {
+    /// Request the swarm to dial a peer by `PeerId`.
+    ///
+    /// The event loop converts this to a `/p2p/{peer_id}` multiaddr and calls
+    /// `swarm.dial()`.  For iroh transport the relay network resolves the
+    /// address; for LAN the peer must already have a known address (mDNS).
+    DialPeer(PeerId),
+}
 
 /// A peer lifecycle event emitted by the swarm event loop.
 ///
@@ -252,6 +267,12 @@ pub struct MeshHandle {
     membership_store: Option<Arc<RwLock<super::invite::MembershipStore>>>,
     /// Active transport mode used by this mesh handle.
     transport_mode: MeshTransportMode,
+    /// Channel for sending commands to the swarm event loop.
+    ///
+    /// Used by `dial_peer()` to form a full mesh in iroh mode, where peers
+    /// only connect to the inviter by default (star topology).  The event
+    /// loop polls the receiver and executes each `SwarmCommand`.
+    swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
 }
 
 impl std::fmt::Debug for MeshHandle {
@@ -279,6 +300,7 @@ impl MeshHandle {
         invite_store: Option<Arc<RwLock<super::invite::InviteStore>>>,
         membership_store: Option<Arc<RwLock<super::invite::MembershipStore>>>,
         transport_mode: MeshTransportMode,
+        swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
     ) -> Self {
         Self {
             peer_id,
@@ -290,6 +312,7 @@ impl MeshHandle {
             invite_store,
             membership_store,
             transport_mode,
+            swarm_cmd_tx,
         }
     }
 
@@ -646,6 +669,28 @@ impl MeshHandle {
     pub fn is_iroh_transport(&self) -> bool {
         matches!(self.transport_mode, MeshTransportMode::Iroh)
     }
+
+    /// Request the swarm event loop to dial a peer by `PeerId`.
+    ///
+    /// Used for iroh mesh fan-out after invite admission. On LAN, peer discovery
+    /// is mDNS-driven and explicit dialing is intentionally a no-op.
+    pub fn dial_peer(&self, peer_id: &PeerId) {
+        if peer_id == &self.peer_id {
+            return; // Don't dial ourselves.
+        }
+        if !self.is_iroh_transport() {
+            log::debug!("dial_peer ignored on LAN transport (mDNS handles discovery)");
+            return;
+        }
+
+        if self
+            .swarm_cmd_tx
+            .send(SwarmCommand::DialPeer(*peer_id))
+            .is_err()
+        {
+            log::warn!("dial_peer: swarm event loop has shut down");
+        }
+    }
 }
 
 /// Bootstrap the kameo mesh swarm.
@@ -787,6 +832,7 @@ fn finalize_bootstrap(
     ctx: MeshBootstrapContext,
     listen_label: &str,
     transport_mode: MeshTransportMode,
+    swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
 ) -> MeshHandle {
     log::info!(
         "Kameo mesh bootstrapped: peer_id={}, listen={}",
@@ -838,6 +884,7 @@ fn finalize_bootstrap(
         invite_store,
         membership_store,
         transport_mode,
+        swarm_cmd_tx,
     )
 }
 
@@ -940,6 +987,8 @@ async fn bootstrap_lan_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
     }
 
     let local_peer_id = *swarm.local_peer_id();
+
+    let (swarm_cmd_tx_lan, _swarm_cmd_rx_lan) = mpsc::unbounded_channel::<SwarmCommand>();
 
     // ── Swarm event loop ──────────────────────────────────────────────────────
     tokio::spawn(async move {
@@ -1120,6 +1169,7 @@ async fn bootstrap_lan_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         ctx,
         listen_addr,
         MeshTransportMode::Lan,
+        swarm_cmd_tx_lan,
     ))
 }
 
@@ -1239,14 +1289,43 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
         }
     }
 
+    let (swarm_cmd_tx_iroh, mut swarm_cmd_rx_iroh) = mpsc::unbounded_channel::<SwarmCommand>();
+
     // ── Swarm event loop ──────────────────────────────────────────────────────
     // Simpler than LAN: no mDNS events, just connection lifecycle + kameo.
     tokio::spawn(async move {
+        // Track pending dials to avoid redundant connection attempts.
+        let mut pending_dials: HashSet<PeerId> = HashSet::new();
+
         loop {
-            match swarm.select_next_some().await {
+            tokio::select! {
+                Some(cmd) = swarm_cmd_rx_iroh.recv() => {
+                    match cmd {
+                        SwarmCommand::DialPeer(peer_id) => {
+                            if pending_dials.contains(&peer_id) || known_peers_loop.read().contains_key(&peer_id) {
+                                log::debug!("Skipping dial for {} (already connected or pending)", peer_id);
+                                continue;
+                            }
+                            let addr: Multiaddr = format!("/p2p/{peer_id}")
+                                .parse()
+                                .expect("PeerId always produces a valid /p2p/ multiaddr");
+                            match swarm.dial(addr) {
+                                Ok(_) => {
+                                    log::info!("Dialing peer (iroh): {}", peer_id);
+                                    pending_dials.insert(peer_id);
+                                }
+                                Err(e) => log::warn!("Failed to dial peer {} (iroh): {}", peer_id, e),
+                            }
+                        }
+                    }
+                }
+                event = swarm.select_next_some() => {
+                match event {
                 SwarmEvent::ConnectionEstablished {
                     peer_id, endpoint, ..
                 } => {
+                    pending_dials.remove(&peer_id);
+
                     handle_connection_established(
                         &mut swarm,
                         peer_id,
@@ -1295,6 +1374,9 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
                     );
                 }
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    if let Some(pid) = peer_id {
+                        pending_dials.remove(&pid);
+                    }
                     log::warn!(
                         "Outgoing connection error (iroh, peer={:?}): {}",
                         peer_id,
@@ -1305,7 +1387,9 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
                     log::info!("ActorSwarm listening on {} (iroh)", address);
                 }
                 _ => {}
-            }
+            } // match event
+            } // select: event arm
+            } // tokio::select!
         }
     });
 
@@ -1314,6 +1398,7 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
         ctx,
         "iroh-relay",
         MeshTransportMode::Iroh,
+        swarm_cmd_tx_iroh,
     ))
 }
 
@@ -1443,19 +1528,46 @@ pub async fn join_mesh_via_invite(
 
     // ── 5. Handle response ────────────────────────────────────────────────────
     match response {
-        AdmissionResponse::Admitted { membership_token } => {
+        AdmissionResponse::Admitted {
+            membership_token,
+            existing_peers,
+        } => {
             log::info!(
-                "Admitted to mesh '{}' (admitted_by={})",
+                "Admitted to mesh '{}' (admitted_by={}, {} existing peers)",
                 mesh_id,
-                membership_token.admitted_by
+                membership_token.admitted_by,
+                existing_peers.len(),
             );
 
+            // Dial all existing mesh peers to form a full mesh.
+            // Without this, iroh nodes only connect to the inviter (star
+            // topology) and cannot route actor messages to each other.
+            for peer_str in &existing_peers {
+                if let Ok(pid) = peer_str.parse::<PeerId>() {
+                    log::info!("Dialing existing mesh peer: {}", pid);
+                    mesh.dial_peer(&pid);
+                } else {
+                    log::warn!("Ignoring invalid PeerId in existing_peers: {}", peer_str);
+                }
+            }
+
             // Snapshot current known peers for the membership record.
-            let known_peers: Vec<PeerEntry> = mesh
+            // Include both directly connected peers and the peers we just
+            // started dialing (they'll connect shortly).
+            let mut all_peer_strs: Vec<String> = mesh
                 .known_peer_ids()
                 .into_iter()
+                .map(|pid| pid.to_string())
+                .collect();
+            for p in &existing_peers {
+                if !all_peer_strs.contains(p) {
+                    all_peer_strs.push(p.clone());
+                }
+            }
+            let known_peers: Vec<PeerEntry> = all_peer_strs
+                .into_iter()
                 .map(|pid| PeerEntry {
-                    peer_id: pid.to_string(),
+                    peer_id: pid.clone(),
                     addrs: vec![format!("/p2p/{pid}")],
                 })
                 .collect();
@@ -1474,8 +1586,23 @@ pub async fn join_mesh_via_invite(
                 )
                 .map_err(|e| MeshError::SwarmError(format!("failed to persist membership: {e}")))?;
         }
-        AdmissionResponse::Readmitted => {
-            log::info!("Readmitted to mesh '{}' (token accepted)", mesh_id);
+        AdmissionResponse::Readmitted { existing_peers } => {
+            log::info!(
+                "Readmitted to mesh '{}' (token accepted, {} existing peers)",
+                mesh_id,
+                existing_peers.len(),
+            );
+
+            // Dial all existing mesh peers to form a full mesh.
+            for peer_str in &existing_peers {
+                if let Ok(pid) = peer_str.parse::<PeerId>() {
+                    log::info!("Dialing existing mesh peer (readmit): {}", pid);
+                    mesh.dial_peer(&pid);
+                } else {
+                    log::warn!("Ignoring invalid PeerId in existing_peers: {}", peer_str);
+                }
+            }
+
             membership_store
                 .touch_last_connected(&mesh_id)
                 .map_err(|e| {

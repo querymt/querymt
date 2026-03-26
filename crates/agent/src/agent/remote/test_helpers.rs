@@ -379,6 +379,15 @@ pub(crate) mod fixtures {
                 _tempdir: f._tempdir,
             }
         }
+
+        /// Best-effort teardown for tests sharing the process-wide mesh.
+        ///
+        /// Only deregisters the DHT name — does NOT stop the actor, because
+        /// `stop_gracefully()` poisons the process-global `ActorSwarm` and
+        /// causes all subsequent `register_actor` calls to time out.
+        pub async fn cleanup(&self) {
+            self._mesh.deregister_actor(&self.dht_name);
+        }
     }
 
     // ── TwoNodeFixture ────────────────────────────────────────────────────────
@@ -394,7 +403,7 @@ pub(crate) mod fixtures {
     /// // f.mesh            — &'static MeshHandle
     /// ```
     pub struct TwoNodeFixture {
-        pub _alpha: MeshNodeManagerFixture,
+        pub alpha: MeshNodeManagerFixture,
         pub beta: MeshNodeManagerFixture,
         pub mesh: &'static MeshHandle,
     }
@@ -404,11 +413,13 @@ pub(crate) mod fixtures {
             let mesh = get_test_mesh().await;
             let alpha = MeshNodeManagerFixture::new("alpha", test_id).await;
             let beta = MeshNodeManagerFixture::new("beta", test_id).await;
-            Self {
-                _alpha: alpha,
-                beta,
-                mesh,
-            }
+            Self { alpha, beta, mesh }
+        }
+
+        /// Best-effort teardown for both logical nodes.
+        pub async fn cleanup(&self) {
+            self.beta.cleanup().await;
+            self.alpha.cleanup().await;
         }
     }
 
