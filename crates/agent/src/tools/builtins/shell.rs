@@ -108,9 +108,23 @@ impl ToolTrait for ShellTool {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
+        // Place the child in its own process group so that on cancellation we
+        // can kill the entire tree (sh + any children it spawned) with a single
+        // signal rather than leaving orphaned processes behind.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        // Safety net: if the tokio `Child` is dropped (e.g. task abort) send
+        // SIGKILL to the direct child automatically.
+        cmd.kill_on_drop(true);
+
         let mut child = cmd
             .spawn()
             .map_err(|e| ToolError::ProviderError(format!("command failed to spawn: {}", e)))?;
+
+        // Capture the PID before moving `child` into the spawned task so we can
+        // kill the process group from the cancel branch.
+        let child_pid = child.id();
 
         let cancel = context.cancellation_token();
 
@@ -155,13 +169,23 @@ impl ToolTrait for ShellTool {
                     .map_err(|e| ToolError::ProviderError(format!("command failed: {}", e)))?
             }
             _ = cancel.cancelled() => {
-                // Abort the spawned task. On Unix, dropping the tokio `Child`
-                // does NOT send SIGKILL, but aborting the task causes the
-                // `Child` to be dropped which closes its stdin; the process
-                // will likely receive SIGPIPE and exit soon. This is best-effort
-                // — the primary goal is unblocking the agent, not guaranteed
-                // process termination.
+                // Abort the spawned task — `kill_on_drop(true)` ensures the
+                // direct child receives SIGKILL when the `Child` is dropped.
                 wait_handle.abort();
+
+                // Kill the entire process group so that any grandchildren
+                // (e.g. processes spawned by the shell command) are also
+                // terminated.  The negative PID targets the process group
+                // we created with `process_group(0)` above.
+                #[cfg(unix)]
+                if let Some(pid) = child_pid {
+                    // SAFETY: We send SIGKILL to the process group whose PGID
+                    // equals `pid`.  The group was created by us moments ago
+                    // via `process_group(0)`.  If the process already exited
+                    // the call harmlessly returns ESRCH.
+                    unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+                }
+
                 return Err(ToolError::ProviderError("Cancelled by user".to_string()));
             }
         };
@@ -199,6 +223,7 @@ mod tests {
     }
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn test_shell_echo() {
@@ -235,5 +260,70 @@ mod tests {
 
         assert_eq!(parsed["exit_code"], 0);
         assert!(parsed["stdout"].as_str().unwrap().contains("hello world"));
+    }
+
+    /// Verify that cancelling a running shell command actually kills the
+    /// spawned process (and its entire process group on Unix).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cancel_kills_process() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        let token = CancellationToken::new();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()))
+                .with_cancellation_token(token.clone());
+
+        let tool = ShellTool::new();
+
+        // Write a marker PID file so we can verify the process is gone.
+        // `sleep 300` will block for 5 minutes — long enough that it can
+        // only finish if we kill it.
+        let pid_file = temp_dir.path().join("shell.pid");
+        let args = json!({
+            "command": format!(
+                "echo $$ > {} && exec sleep 300",
+                pid_file.display()
+            )
+        });
+
+        // Spawn the tool call in a task so we can cancel from outside.
+        let handle = tokio::spawn({
+            let context = context;
+            async move { tool.call(args, &context).await }
+        });
+
+        // Wait for the PID file to appear (process has started).
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(&pid_file).await {
+                    if let Ok(pid) = contents.trim().parse::<i32>() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("shell process did not write its PID in time");
+
+        // Cancel the token — this should trigger kill.
+        token.cancel();
+
+        // The tool call should return an error.
+        let result = handle.await.expect("task panicked");
+        assert!(result.is_err(), "expected cancellation error");
+
+        // Give the OS a moment to reap the process.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Verify the process is no longer running.
+        // kill(pid, 0) checks existence without sending a signal.
+        let alive = unsafe { libc::kill(pid, 0) };
+        assert_eq!(
+            alive, -1,
+            "process {pid} should be dead after cancellation"
+        );
     }
 }

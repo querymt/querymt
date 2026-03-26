@@ -10092,6 +10092,7 @@ dependencies = [
  "indexmap 2.13.0",
  "infer",
  "kameo",
+ "libc",
  "libp2p",
  "log",
  "mdq",

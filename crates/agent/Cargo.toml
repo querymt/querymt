@@ -80,6 +80,10 @@ tokio-util = { version = "0.7", features = ["compat"] }
 base64.workspace = true
 infer = "0.19"
 rayon = "1.11"
+
+# Unix process-group cleanup on cancellation (shell tool)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 imagesize = "0.14"
 
 # NLP: multilingual stopwords, stemming, language detection
