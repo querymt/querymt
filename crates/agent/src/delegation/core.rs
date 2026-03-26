@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, instrument};
 
 // Type alias to simplify complex type signature
 type ActiveDelegations = Arc<Mutex<HashMap<String, (String, CancellationToken, JoinHandle<()>)>>>;
@@ -206,10 +207,19 @@ impl DelegationOrchestrator {
     }
 
     /// Process a single event envelope.
+    #[instrument(
+        name = "delegation.orchestrator.handle_event",
+        skip(self, envelope),
+        fields(
+            session_id = %envelope.session_id(),
+            event_kind = tracing::field::Empty,
+        )
+    )]
     async fn handle_envelope(&self, envelope: &EventEnvelope) {
         let session_id = envelope.session_id();
         match envelope.kind() {
             AgentEventKind::DelegationRequested { delegation } => {
+                tracing::Span::current().record("event_kind", "DelegationRequested");
                 let delegator = self.delegator.clone();
                 let event_sink = self.event_sink.clone();
                 let store = self.store.clone();
@@ -301,6 +311,7 @@ impl DelegationOrchestrator {
                 );
             }
             AgentEventKind::DelegationCancelRequested { delegation_id } => {
+                tracing::Span::current().record("event_kind", "DelegationCancelRequested");
                 let delegation_id_owned = delegation_id.clone();
                 let mut active = self.active_delegations.lock().await;
                 let entry = active.remove(&delegation_id_owned);
@@ -323,6 +334,7 @@ impl DelegationOrchestrator {
                 }
             }
             AgentEventKind::Cancelled => {
+                tracing::Span::current().record("event_kind", "Cancelled");
                 // Cancel all delegations for this session
                 let mut active = self.active_delegations.lock().await;
 
@@ -381,6 +393,19 @@ struct DelegationContext {
 /// This creates sessions via `AgentHandle::create_delegation_session()`. History and
 /// planning context are exchanged via kameo messages (`GetHistory`,
 /// `SetPlanningContext`), so this path works for both local and remote sessions.
+#[instrument(
+    name = "delegation.execute",
+    skip(ctx, target, cancel_token),
+    fields(
+        parent_session_id = %parent_session_id,
+        delegation_id = %delegation.public_id,
+        target_agent = %delegation.target_agent_id,
+        child_session_id = tracing::field::Empty,
+        is_remote = tracing::field::Empty,
+        has_summarizer = ctx.delegation_summarizer.is_some(),
+        has_routing = ctx.routing_snapshot.is_some(),
+    )
+)]
 async fn execute_delegation(
     ctx: DelegationContext,
     target: Arc<dyn crate::agent::handle::AgentHandle>,
@@ -400,9 +425,13 @@ async fn execute_delegation(
 
     // 1. Create session via AgentHandle trait
     let cwd_string = ctx.config.cwd.as_ref().map(|p| p.display().to_string());
-    let (child_session_id, session_ref) = match target
-        .create_delegation_session(cwd_string, parent_session_id.clone())
-        .await
+    let (child_session_id, session_ref) = match async {
+        target
+            .create_delegation_session(cwd_string, parent_session_id.clone())
+            .await
+    }
+    .instrument(tracing::info_span!("delegation.create_session"))
+    .await
     {
         Ok(result) => result,
         Err(e) => {
@@ -421,36 +450,50 @@ async fn execute_delegation(
         }
     };
 
+    // Record child session info on the parent span.
+    let span = tracing::Span::current();
+    span.record("child_session_id", child_session_id.as_str());
+    span.record("is_remote", session_ref.is_remote());
+
     // 1b. Apply routing policy from the routing table (if present).
     //     When provider_target = Peer(name) and the peer is resolved,
     //     write the node_id to the session's DB row so SessionProvider
     //     constructs a MeshChatProvider for this session.
     if let Some(ref snap_handle) = ctx.routing_snapshot {
-        let snap = snap_handle.load();
-        if let Some(policy) = snap.get(&delegation.target_agent_id) {
-            use crate::agent::remote::routing::RouteTarget;
-            if let RouteTarget::Peer(_) = &policy.provider_target
-                && let Some(ref node_id) = policy.resolved_provider_node_id
-            {
-                if let Err(e) = ctx
-                    .store
-                    .set_session_provider_node_id(&child_session_id, Some(node_id.as_str()))
-                    .await
+        let routing_span = tracing::info_span!(
+            "delegation.apply_routing",
+            provider_node_id = tracing::field::Empty,
+        );
+        async {
+            let snap = snap_handle.load();
+            if let Some(policy) = snap.get(&delegation.target_agent_id) {
+                use crate::agent::remote::routing::RouteTarget;
+                if let RouteTarget::Peer(_) = &policy.provider_target
+                    && let Some(ref node_id) = policy.resolved_provider_node_id
                 {
-                    warn!(
-                        "execute_delegation: failed to set provider_node_id='{}' \
-                             on session {} from routing table: {}",
-                        node_id, child_session_id, e
-                    );
-                } else {
-                    debug!(
-                        "execute_delegation: set provider_node_id='{}' on session {} \
-                             for agent '{}' from routing table",
-                        node_id, child_session_id, delegation.target_agent_id
-                    );
+                    tracing::Span::current().record("provider_node_id", node_id.as_str());
+                    if let Err(e) = ctx
+                        .store
+                        .set_session_provider_node_id(&child_session_id, Some(node_id.as_str()))
+                        .await
+                    {
+                        warn!(
+                            "execute_delegation: failed to set provider_node_id='{}' \
+                                 on session {} from routing table: {}",
+                            node_id, child_session_id, e
+                        );
+                    } else {
+                        debug!(
+                            "execute_delegation: set provider_node_id='{}' on session {} \
+                                 for agent '{}' from routing table",
+                            node_id, child_session_id, delegation.target_agent_id
+                        );
+                    }
                 }
             }
         }
+        .instrument(routing_span)
+        .await;
     }
 
     emit_delegation_event(
@@ -470,40 +513,76 @@ async fn execute_delegation(
 
     // 2. Generate and inject planning summary via kameo message
     if let Some(ref summarizer) = ctx.delegation_summarizer {
-        match ctx.store.get_effective_history(&parent_session_id).await {
-            Ok(history) => {
+        let history = async {
+            match ctx.store.get_effective_history(&parent_session_id).await {
+                Ok(history) => {
+                    tracing::Span::current().record("message_count", history.len() as u64);
+                    Some(history)
+                }
+                Err(e) => {
+                    warn!("Failed to load parent history for summary: {}", e);
+                    None
+                }
+            }
+        }
+        .instrument(tracing::info_span!(
+            "delegation.fetch_parent_history",
+            message_count = tracing::field::Empty,
+        ))
+        .await;
+
+        if let Some(history) = history {
+            let summary = async {
                 match summarizer.summarize(&history, &delegation.objective).await {
                     Ok(summary) => {
-                        // Persist to delegation record
-                        let mut updated_delegation = delegation.clone();
-                        updated_delegation.planning_summary = Some(summary.clone());
-                        if let Err(e) = ctx.store.update_delegation(updated_delegation).await {
-                            warn!("Failed to persist delegation summary: {}", e);
-                        }
-
-                        // Inject via SetPlanningContext kameo message
-                        let formatted_summary =
-                            format!("\n\n<planning-context>\n{}\n</planning-context>", summary);
-                        if let Err(e) = session_ref.set_planning_context(formatted_summary).await {
-                            warn!(
-                                "Failed to inject planning summary via SetPlanningContext: {}",
-                                e
-                            );
-                        } else {
-                            log::info!(
-                                "Injected planning summary into delegate session {} via kameo",
-                                child_session_id
-                            );
-                        }
+                        tracing::Span::current().record("summary_bytes", summary.len() as u64);
+                        Some(summary)
                     }
                     Err(e) => {
                         warn!("Delegation summary generation failed: {}", e);
                         // Proceed without summary — graceful degradation
+                        None
                     }
                 }
             }
-            Err(e) => {
-                warn!("Failed to load parent history for summary: {}", e);
+            .instrument(tracing::info_span!(
+                "delegation.summarize",
+                history_messages = history.len(),
+                summary_bytes = tracing::field::Empty,
+                strategy = tracing::field::Empty,
+            ))
+            .await;
+
+            if let Some(summary) = summary {
+                // Persist to delegation record
+                let mut updated_delegation = delegation.clone();
+                updated_delegation.planning_summary = Some(summary.clone());
+                if let Err(e) = ctx.store.update_delegation(updated_delegation).await {
+                    warn!("Failed to persist delegation summary: {}", e);
+                }
+
+                // Inject via SetPlanningContext kameo message
+                let formatted_summary =
+                    format!("\n\n<planning-context>\n{}\n</planning-context>", summary);
+                let summary_bytes = formatted_summary.len();
+                async {
+                    if let Err(e) = session_ref.set_planning_context(formatted_summary).await {
+                        warn!(
+                            "Failed to inject planning summary via SetPlanningContext: {}",
+                            e
+                        );
+                    } else {
+                        log::info!(
+                            "Injected planning summary into delegate session {} via kameo",
+                            child_session_id
+                        );
+                    }
+                }
+                .instrument(tracing::info_span!(
+                    "delegation.inject_planning_context",
+                    summary_bytes = summary_bytes,
+                ))
+                .await;
             }
         }
     }
@@ -570,34 +649,51 @@ async fn execute_delegation(
         }
         Some(Ok(_)) => {
             // 4. Verification (same as legacy path)
-            let verification_passed = if ctx.config.run_verification {
-                match VerificationSpecBuilder::from_delegation(&delegation) {
-                    Some(verification_spec) => {
-                        let agent_tool_registry = ctx.tool_registry.clone();
-                        let service = VerificationService::new(agent_tool_registry.clone());
-                        let verification_context = VerificationContext {
-                            session_id: parent_session_id.clone(),
-                            task_id: delegation.task_id.map(|id| id.to_string()),
-                            delegation_id: Some(delegation.public_id.clone()),
-                            cwd: ctx.config.cwd.clone(),
-                            tool_registry: agent_tool_registry.clone(),
-                        };
-                        match service
-                            .verify(&verification_spec, &verification_context)
-                            .await
-                        {
-                            Ok(()) => true,
-                            Err(err) => {
-                                warn!("Verification failed: {}", err);
-                                false
-                            }
+            let verification_passed = async {
+                if ctx.config.run_verification {
+                    match VerificationSpecBuilder::from_delegation(&delegation) {
+                        Some(verification_spec) => {
+                            tracing::Span::current().record("has_spec", true);
+                            let agent_tool_registry = ctx.tool_registry.clone();
+                            let service = VerificationService::new(agent_tool_registry.clone());
+                            let verification_context = VerificationContext {
+                                session_id: parent_session_id.clone(),
+                                task_id: delegation.task_id.map(|id| id.to_string()),
+                                delegation_id: Some(delegation.public_id.clone()),
+                                cwd: ctx.config.cwd.clone(),
+                                tool_registry: agent_tool_registry.clone(),
+                            };
+                            let result = match service
+                                .verify(&verification_spec, &verification_context)
+                                .await
+                            {
+                                Ok(()) => true,
+                                Err(err) => {
+                                    warn!("Verification failed: {}", err);
+                                    false
+                                }
+                            };
+                            tracing::Span::current().record("passed", result);
+                            result
+                        }
+                        None => {
+                            tracing::Span::current().record("has_spec", false);
+                            tracing::Span::current().record("passed", true);
+                            true
                         }
                     }
-                    None => true,
+                } else {
+                    tracing::Span::current().record("has_spec", false);
+                    tracing::Span::current().record("passed", true);
+                    true
                 }
-            } else {
-                true
-            };
+            }
+            .instrument(tracing::info_span!(
+                "delegation.verify",
+                has_spec = tracing::field::Empty,
+                passed = tracing::field::Empty,
+            ))
+            .await;
 
             if !verification_passed {
                 let error_message =
@@ -617,13 +713,22 @@ async fn execute_delegation(
             }
 
             // 5. Get history for summary via kameo (works for local and remote)
-            let summary = match session_ref.get_history().await {
-                Ok(history) => extract_session_summary_from_history(&history),
-                Err(err) => {
-                    warn!("Error extracting summary via GetHistory: {}", err);
-                    "Error extracting summary.".to_string()
-                }
-            };
+            let summary = async {
+                let s = match session_ref.get_history().await {
+                    Ok(history) => extract_session_summary_from_history(&history),
+                    Err(err) => {
+                        warn!("Error extracting summary via GetHistory: {}", err);
+                        "Error extracting summary.".to_string()
+                    }
+                };
+                tracing::Span::current().record("summary_bytes", s.len() as u64);
+                s
+            }
+            .instrument(tracing::info_span!(
+                "delegation.extract_summary",
+                summary_bytes = tracing::field::Empty,
+            ))
+            .await;
 
             if let Err(e) = ctx
                 .store
@@ -678,6 +783,11 @@ async fn execute_delegation(
     }
 }
 
+#[instrument(
+    name = "delegation.fail",
+    skip(event_sink, delegator, store, config),
+    fields(delegation_id = %delegation_id, parent_session_id = %parent_session_id)
+)]
 async fn fail_delegation(
     event_sink: &Arc<EventSink>,
     delegator: &Arc<dyn crate::agent::handle::AgentHandle>,

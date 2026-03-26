@@ -15,6 +15,7 @@ use querymt::LLMProvider;
 use querymt::chat::{ChatMessage, ChatRole};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::instrument;
 
 /// System prompt for the summarizer LLM
 const SUMMARIZER_SYSTEM_PROMPT: &str = r#"You are a technical brief writer for a software development team. Your job is to 
@@ -70,14 +71,30 @@ impl DelegationSummarizer {
     }
 
     /// Generate a structured Implementation Brief from parent session history
+    #[instrument(
+        name = "delegation.summarizer.summarize",
+        skip(self, parent_history),
+        fields(
+            objective = %delegation_objective,
+            history_messages = parent_history.len(),
+            estimated_tokens = tracing::field::Empty,
+            strategy = tracing::field::Empty,
+            llm_duration_ms = tracing::field::Empty,
+            output_bytes = tracing::field::Empty,
+        )
+    )]
     pub async fn summarize(
         &self,
         parent_history: &[AgentMessage],
         delegation_objective: &str,
     ) -> SessionResult<String> {
+        let span = tracing::Span::current();
+
         // If the last message in history is a compaction (no messages after it),
         // its summary is already adequate — skip the LLM call.
         if let Some(summary) = Self::compaction_as_summary(parent_history) {
+            span.record("strategy", "compaction");
+            span.record("output_bytes", summary.len() as u64);
             log::info!("Using existing compaction summary for delegation (skipping LLM call)");
             return Ok(summary);
         }
@@ -85,14 +102,20 @@ impl DelegationSummarizer {
         // Check token threshold — below threshold, inject raw formatted history
         // directly into the delegate context (no LLM summarization needed)
         let estimated_tokens = self.estimate_history_tokens(parent_history);
+        span.record("estimated_tokens", estimated_tokens as u64);
         if estimated_tokens < self.min_history_tokens {
+            span.record("strategy", "raw");
             log::debug!(
                 "Parent history below summarization threshold ({} tokens < {}), injecting raw history",
                 estimated_tokens,
                 self.min_history_tokens
             );
-            return Ok(self.format_conversation(parent_history, delegation_objective));
+            let result = self.format_conversation(parent_history, delegation_objective);
+            span.record("output_bytes", result.len() as u64);
+            return Ok(result);
         }
+
+        span.record("strategy", "llm");
 
         // 1. Prepare LLM prompt from parent history
         let input = self.prepare_llm_input(parent_history, delegation_objective);
@@ -107,6 +130,7 @@ impl DelegationSummarizer {
         let provider = self.provider.clone();
         let timeout = self.timeout;
 
+        let llm_start = std::time::Instant::now();
         let response = tokio::time::timeout(timeout, async move { provider.chat(&messages).await })
             .await
             .map_err(|_| {
@@ -118,12 +142,14 @@ impl DelegationSummarizer {
             .map_err(|e| {
                 SessionError::InvalidOperation(format!("Delegation summary LLM call failed: {}", e))
             })?;
+        span.record("llm_duration_ms", llm_start.elapsed().as_millis() as u64);
 
         // 3. Extract text response
         let summary = response
             .text()
             .unwrap_or_else(|| "No summary generated".to_string());
 
+        span.record("output_bytes", summary.len() as u64);
         Ok(summary)
     }
 
