@@ -116,13 +116,13 @@ const mentionsInputStyle: MentionsInputStyle = {
 };
 
 // Style for the mention badge in the highlighter overlay.
-// 
+//
 // CRITICAL: This style is applied to <strong> tags in the highlighter layer, which sits
 // BEHIND the input textarea. The highlighter has `color: transparent` by default, so
 // normally you only see background colors and decorations.
-// 
+//
 // The input textarea (which shows white text on top) must render identical text metrics
-// to the highlighter. Any property that changes text width/height (padding, border, 
+// to the highlighter. Any property that changes text width/height (padding, border,
 // fontSize, fontFamily, fontWeight) will cause the two layers to drift apart, creating
 // unreadable double text.
 //
@@ -163,98 +163,98 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
   const searchRef = useRef<string>('');
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const maxInputHeight = 180;
-  
+
   // Expose the textarea element via ref
   useImperativeHandle(ref, () => inputRef.current!, []);
-  
+
   // Advanced fuzzy matching with scoring and ranking
   const fuzzyMatchWithScore = useCallback((search: string, filePath: string): { match: boolean; score: number } => {
     if (!search) {
       return { match: true, score: 0 };
     }
-    
+
     const searchLower = search.toLowerCase();
     const pathLower = filePath.toLowerCase();
-    
+
     // Extract filename from path for bonus scoring
     const lastSlashIndex = filePath.lastIndexOf('/');
     const filename = lastSlashIndex >= 0 ? filePath.slice(lastSlashIndex + 1) : filePath;
     const filenameLower = filename.toLowerCase();
-    
+
     let score = 0;
-    
+
     // 1. Exact match (highest priority) - score 10000
     if (filePath === search) {
       return { match: true, score: 10000 };
     }
-    
+
     // 2. Case-insensitive exact match - score 9000
     if (pathLower === searchLower) {
       return { match: true, score: 9000 };
     }
-    
+
     // 3. Exact substring match in path - score 8000 + position bonus
     const exactIndex = pathLower.indexOf(searchLower);
     if (exactIndex >= 0) {
       // Bonus for earlier position in path
       const positionBonus = Math.max(0, 100 - exactIndex);
       score = 8000 + positionBonus;
-      
+
       // Extra bonus if match is in filename
       if (filenameLower.indexOf(searchLower) >= 0) {
         score += 500;
       }
-      
+
       // Extra bonus if match is at the start
       if (exactIndex === 0) {
         score += 200;
       }
-      
+
       return { match: true, score };
     }
-    
+
     // 4. Exact match in filename - score 7000
     const filenameExactIndex = filenameLower.indexOf(searchLower);
     if (filenameExactIndex >= 0) {
       score = 7000 + (filenameExactIndex === 0 ? 200 : 0);
       return { match: true, score };
     }
-    
+
     // 5. Fuzzy match with scoring based on match quality
     const searchChars = searchLower.split('');
     const pathChars = pathLower.split('');
-    
+
     let searchIndex = 0;
     let pathIndex = 0;
     let consecutiveMatches = 0;
     let matchPositions: number[] = [];
-    
+
     // Try to match all search characters
     while (searchIndex < searchChars.length && pathIndex < pathChars.length) {
       if (searchChars[searchIndex] === pathChars[pathIndex]) {
         matchPositions.push(pathIndex);
-        
+
         // Bonus for consecutive matches
         if (searchIndex > 0 && matchPositions[searchIndex] === matchPositions[searchIndex - 1] + 1) {
           consecutiveMatches++;
         }
-        
+
         searchIndex++;
       }
       pathIndex++;
     }
-    
+
     // If we didn't match all characters, it's not a match
     if (searchIndex < searchChars.length) {
       return { match: false, score: 0 };
     }
-    
+
     // Base score for fuzzy match - 5000
     score = 5000;
-    
+
     // Bonus for consecutive character matches (up to +1000)
     score += consecutiveMatches * 50;
-    
+
     // Bonus for matches at word boundaries (/, -, _, .)
     let boundaryMatches = 0;
     for (let i = 0; i < matchPositions.length; i++) {
@@ -269,7 +269,7 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
       }
     }
     score += boundaryMatches * 100;
-    
+
     // Bonus for matches in filename vs directory path
     let filenameMatches = 0;
     const filenameStartIndex = lastSlashIndex + 1;
@@ -280,18 +280,18 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
     }
     const filenameMatchRatio = filenameMatches / matchPositions.length;
     score += filenameMatchRatio * 300;
-    
+
     // Penalty for longer paths (prefer shorter paths)
     const pathLengthPenalty = Math.min(100, filePath.length / 2);
     score -= pathLengthPenalty;
-    
+
     // Bonus for match density (how close together the matches are)
     if (matchPositions.length > 0) {
       const matchSpan = matchPositions[matchPositions.length - 1] - matchPositions[0] + 1;
       const density = searchChars.length / matchSpan;
       score += density * 200;
     }
-    
+
     // Case-sensitive exact character matches bonus
     let caseSensitiveMatches = 0;
     for (let i = 0; i < matchPositions.length; i++) {
@@ -304,16 +304,16 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
     if (caseSensitiveMatches > 0) {
       score += caseSensitiveMatches * 20;
     }
-    
+
     return { match: true, score };
   }, []);
-  
+
   // When files change from empty to populated, re-trigger the callback
   useEffect(() => {
     if (files.length > 0 && callbackRef.current) {
       // Re-call with the updated file list
       const search = searchRef.current;
-      
+
       // Score and filter files
       const scoredFiles = files
         .map(file => {
@@ -325,17 +325,17 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
           };
         })
         .filter(item => item.match);
-      
+
       // Sort by score (highest first) and limit to top 50
       scoredFiles.sort((a, b) => b.score - a.score);
       const topFiles = scoredFiles.slice(0, 50);
-      
+
       const data: SuggestionDataItem[] = topFiles.map(item => ({
         id: `${item.file.is_dir ? 'dir' : 'file'}:${item.file.path}`,
         display: item.file.path,
         isDir: item.file.is_dir,
       }));
-      
+
       callbackRef.current(data);
     }
   }, [files, fuzzyMatchWithScore]);
@@ -358,7 +358,7 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
     if (files.length === 0 && !isLoadingFiles) {
       onRequestFiles();
     }
-    
+
     // If loading or no files yet, show loading indicator
     if (files.length === 0) {
       callback([{
@@ -367,7 +367,7 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
       }]);
       return;
     }
-    
+
     // Score and filter files with fuzzy matching
     const scoredFiles = files
       .map(file => {
@@ -379,18 +379,18 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
         };
       })
       .filter(item => item.match);
-    
+
     // Sort by score (highest first) and limit to top 50 results
     scoredFiles.sort((a, b) => b.score - a.score);
     const topFiles = scoredFiles.slice(0, 50);
-    
+
     // Convert to react-mentions format
     const data: SuggestionDataItem[] = topFiles.map(item => ({
       id: `${item.file.is_dir ? 'dir' : 'file'}:${item.file.path}`,
       display: item.file.path,
       isDir: item.file.is_dir,
     }));
-    
+
     callback(data);
   }, [files, isLoadingFiles, onRequestFiles, fuzzyMatchWithScore]);
 
@@ -415,9 +415,9 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
     // Handle loading state
     if (suggestion.id === '__loading__') {
       return (
-        <div style={{ 
-          display: 'flex', 
-          alignItems: 'center', 
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
           justifyContent: 'center',
           gap: '8px',
           opacity: 0.6,
@@ -433,9 +433,9 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
         </div>
       );
     }
-    
+
     const isDir = (suggestion as any).isDir;
-    
+
     return (
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%' }}>
         {isDir ? (
@@ -473,8 +473,8 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
           ...mentionsInputStyle,
           control: {
             ...mentionsInputStyle.control,
-            borderColor: isFocused ? 'rgba(var(--mode-rgb), 0.6)' : undefined,
-            boxShadow: isFocused ? '0 0 0 2px rgba(var(--mode-rgb), 0.15)' : 'none',
+            borderColor: isFocused ? 'rgba(var(--mode-rgb), 0.6)' : 'rgba(var(--mode-rgb), 0.2)',
+            boxShadow: isFocused ? '0 0 0 2px rgba(var(--mode-rgb), 0.15)' : '0 0 0 1px rgba(var(--mode-rgb), 0.15)',
           },
         }}
         suggestionsPortalHost={document.body}
@@ -491,7 +491,7 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
             if (id === '__loading__') {
               return '';
             }
-            
+
             // id is like "file:path" or "dir:path"
             // Extract the type and path
             const colonIndex = id.indexOf(':');
@@ -513,7 +513,7 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
           }}
         />
       </MentionsInput>
-      
+
       {/* Action button — positioned inside the input, bottom-right */}
       {actionButton && (
         <div style={{
