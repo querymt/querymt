@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, forwardRef, useImperativeHandle } from 'react';
+import { useState, useCallback, useRef, useEffect, forwardRef, useImperativeHandle, type ReactNode } from 'react';
 import { MentionsInput, Mention, SuggestionDataItem, type MentionsInputStyle } from 'react-mentions';
 import { Loader, File, Folder } from 'lucide-react';
 import { FileIndexEntry } from '../types';
@@ -13,47 +13,48 @@ interface MentionInputProps {
   onRequestFiles: () => void;
   isLoadingFiles?: boolean;
   showIndexBuilding?: boolean;
+  /** Action button rendered inside the input, bottom-right corner */
+  actionButton?: ReactNode;
 }
 
-// Cyberpunk theme styles for MentionsInput
+// Clean input styles — the outer container in ChatInputBar owns the visual
+// border.  The MentionsInput control is transparent and borderless.
 const mentionsInputStyle: MentionsInputStyle = {
   control: {
-    backgroundColor: 'rgb(var(--surface-elevated-rgb))',
-    fontSize: 16,
+    backgroundColor: 'transparent',
+    fontSize: 15,
     fontWeight: 'normal',
     width: '100%',
     maxHeight: '180px',
     overflow: 'hidden',
-    borderRadius: '8px',
-    border: '2px solid transparent',
+    borderRadius: '12px',
+    border: '1px solid rgba(var(--surface-border-rgb), 0.6)',
     transition: 'border-color 0.2s, box-shadow 0.2s',
     boxSizing: 'border-box',
   },
   '&singleLine': {
     display: 'flex',
     highlighter: {
-      padding: '12px 40px 12px 16px',
-      // Match react-mentions' default border to prevent 1px offset
+      padding: '10px 48px 10px 16px',
       border: '1px solid transparent',
-      minHeight: '48px',
+      minHeight: '42px',
     },
     input: {
-      padding: '12px 40px 12px 16px',
+      padding: '10px 48px 10px 16px',
       border: 'none',
       borderRadius: '0',
       backgroundColor: 'transparent',
       color: 'rgb(var(--ui-text-primary-rgb))',
-      minHeight: '48px',
+      minHeight: '42px',
       outline: 'none',
     },
   },
   '&multiLine': {
     display: 'block',
     highlighter: {
-      padding: '12px 40px 12px 16px',
-      // Match react-mentions' default border to prevent 1px offset
+      padding: '10px 48px 10px 16px',
       border: '1px solid transparent',
-      minHeight: '48px',
+      minHeight: '42px',
       whiteSpace: 'pre-wrap',
       wordBreak: 'break-word',
       boxSizing: 'border-box',
@@ -62,12 +63,12 @@ const mentionsInputStyle: MentionsInputStyle = {
       overflow: 'hidden',
     },
     input: {
-      padding: '12px 40px 12px 16px',
+      padding: '10px 48px 10px 16px',
       border: 'none',
       borderRadius: '0',
       backgroundColor: 'transparent',
       color: 'rgb(var(--ui-text-primary-rgb))',
-      minHeight: '48px',
+      minHeight: '42px',
       outline: 'none',
       resize: 'none',
       boxSizing: 'border-box',
@@ -155,6 +156,7 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
     onRequestFiles,
     isLoadingFiles = false,
     showIndexBuilding = false,
+    actionButton,
   }, ref) {
   const [isFocused, setIsFocused] = useState(false);
   const callbackRef = useRef<((data: SuggestionDataItem[]) => void) | null>(null);
@@ -471,8 +473,8 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
           ...mentionsInputStyle,
           control: {
             ...mentionsInputStyle.control,
-            borderColor: isFocused ? 'rgba(var(--mode-rgb), 0.8)' : 'rgba(var(--mode-rgb), 0.2)',
-            boxShadow: isFocused ? '0 0 20px rgba(var(--mode-rgb), 0.3)' : 'none',
+            borderColor: isFocused ? 'rgba(var(--mode-rgb), 0.6)' : undefined,
+            boxShadow: isFocused ? '0 0 0 2px rgba(var(--mode-rgb), 0.15)' : 'none',
           },
         }}
         suggestionsPortalHost={document.body}
@@ -512,8 +514,20 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
         />
       </MentionsInput>
       
-      {/* Index building indicator */}
-      {showIndexBuilding && (
+      {/* Action button — positioned inside the input, bottom-right */}
+      {actionButton && (
+        <div style={{
+          position: 'absolute',
+          right: '6px',
+          bottom: '6px',
+          zIndex: 1,
+        }}>
+          {actionButton}
+        </div>
+      )}
+
+      {/* Index building indicator (shown when no action button) */}
+      {showIndexBuilding && !actionButton && (
         <div style={{
           position: 'absolute',
           right: '12px',

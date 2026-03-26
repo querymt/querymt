@@ -5,7 +5,35 @@
  * These functions are pure, side-effect free, and fully testable.
  */
 
-import { EventItem, EventRow, DelegationGroupInfo, Turn, RateLimitState, TurnCompaction } from '../types';
+import { EventItem, EventRow, DelegationGroupInfo, Turn, RateLimitState, TurnCompaction, UiPromptBlock } from '../types';
+
+const FILE_MENTION_MARKUP_RE = /@\{(file|dir):([^}]+)\}/g;
+
+/**
+ * Parse user input text into prompt blocks, extracting file mention markup
+ * into resource_link blocks.
+ */
+export function buildPromptBlocksFromInput(input: string): UiPromptBlock[] {
+  const links = new Map<string, UiPromptBlock>();
+  const normalizedText = input.replace(FILE_MENTION_MARKUP_RE, (_match, _kind: string, rawPath: string) => {
+    const path = String(rawPath).trim();
+    if (!path) {
+      return '';
+    }
+    if (!links.has(path)) {
+      links.set(path, {
+        type: 'resource_link',
+        data: { name: path, uri: path },
+      });
+    }
+    return `@${path}`;
+  });
+
+  return [
+    { type: 'text', data: { text: normalizedText } },
+    ...Array.from(links.values()),
+  ];
+}
 
 // Model timeline entry
 export interface ModelTimelineEntry {

@@ -1,7 +1,6 @@
 import { useState, useMemo } from 'react';
 import * as Collapsible from '@radix-ui/react-collapsible';
 import { SessionGroup, SessionSummary } from '../types';
-import { GlitchText } from './GlitchText';
 import { ChevronDown, ChevronRight, Search, Plus, Clock, GitBranch, Globe, Trash2, Plug } from 'lucide-react';
 import { useThinkingSessionIds } from '../hooks/useThinkingSessionIds';
 
@@ -317,25 +316,23 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
         </div>
         
         {/* New session button */}
-        <div className="text-center">
+        <div className="text-center space-y-3">
           <button
             onClick={onNewSession}
             disabled={disabled}
-            className="px-8 py-4 rounded-lg font-medium text-base bg-accent-primary/10 border-2 border-accent-primary text-accent-primary hover:bg-accent-primary/20 hover:shadow-glow-primary disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-200 flex items-center justify-center gap-3 mx-auto overflow-visible"
+            className="px-6 py-3 rounded-full font-medium text-sm bg-accent-primary text-surface-canvas hover:opacity-90 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-150 flex items-center justify-center gap-2 mx-auto"
           >
-            <Plus className="w-6 h-6" />
-            <GlitchText text="Start New Session" variant="0" hoverOnly />
+            <Plus className="w-4 h-4" />
+            <span>New Session</span>
           </button>
-          <p className="text-xs text-ui-muted mt-6">
-            or press{' '}
-            <kbd className="px-2 py-1 bg-surface-canvas border border-surface-border rounded text-accent-primary font-mono text-[10px]">
-              {navigator.platform.includes('Mac') ? '⌘+X N' : 'Ctrl+X N'}
-            </kbd>{' '}
-            to create a session, or{' '}
-            <kbd className="px-2 py-1 bg-surface-canvas border border-surface-border rounded text-accent-primary font-mono text-[10px]">
-              {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+/
-            </kbd>{' '}
-            to open quick switcher
+          <p className="text-[11px] text-ui-muted">
+            <kbd className="px-1.5 py-0.5 bg-surface-canvas border border-surface-border/60 rounded font-mono text-[10px]">
+              {navigator.platform.includes('Mac') ? '\u2318+X N' : 'Ctrl+X N'}
+            </kbd>
+            {' '}<span className="text-ui-muted/60">or</span>{' '}
+            <kbd className="px-1.5 py-0.5 bg-surface-canvas border border-surface-border/60 rounded font-mono text-[10px]">
+              {navigator.platform.includes('Mac') ? '\u2318' : 'Ctrl'}+/
+            </kbd>
           </p>
         </div>
       </div>

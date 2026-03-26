@@ -6,8 +6,10 @@
 @plugin "@tailwindcss/typography";
 
 /* ===== Tailwind v4 Theme Configuration ===== */
-/* Migrated from tailwind.config.js — all custom design tokens */
 @theme {
+  /* Font families */
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, 'SFMono-Regular', 'Cascadia Code', 'Fira Code', Menlo, Consolas, monospace;
+
   /* Colors: surface */
   --color-surface-canvas: rgb(var(--surface-canvas-rgb));
   --color-surface-elevated: rgb(var(--surface-elevated-rgb));
@@ -44,6 +46,7 @@
   --animate-slide-up: slide-up 0.2s ease-in;
   --animate-fade-in: fade-in 0.5s ease-out;
   --animate-fade-in-up: fade-in-up 0.5s ease-out;
+  --animate-scale-in: scale-in 0.15s ease-out;
 
   /* Keyframes */
   @keyframes accent-pulse {
@@ -74,6 +77,10 @@
     0% { opacity: 0; transform: translateY(20px); }
     100% { opacity: 1; transform: translateY(0); }
   }
+  @keyframes scale-in {
+    from { transform: scale(0.95); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+  }
 }
 
 /* ===== Root CSS Variables ===== */
@@ -93,7 +100,9 @@
 
   body {
     @apply bg-surface-canvas text-ui-primary;
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+    font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     background-image:
       radial-gradient(circle at 20% 50%, rgba(var(--accent-primary-rgb), 0.03) 0%, transparent 50%),
       radial-gradient(circle at 80% 80%, rgba(var(--accent-secondary-rgb), 0.03) 0%, transparent 50%);
@@ -102,6 +111,11 @@
   body.modal-open {
     overscroll-behavior: contain;
     overflow: hidden;
+  }
+
+  /* Monospace elements use JetBrains Mono */
+  code, kbd, pre, samp {
+    font-family: var(--font-mono);
   }
 }
 
@@ -112,61 +126,14 @@
     padding-bottom: env(safe-area-inset-bottom, 0px);
   }
 
-  .grid-background {
-    background-size: 50px 50px;
-    background-image:
-      linear-gradient(rgba(var(--accent-primary-rgb), 0.05) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(var(--accent-primary-rgb), 0.05) 1px, transparent 1px);
-  }
-
   .glow-border-primary {
     border: 1px solid rgba(var(--accent-primary-rgb), 0.3);
     box-shadow: 0 0 10px rgba(var(--accent-primary-rgb), 0.2);
   }
 
-  .glow-border-secondary {
-    border: 1px solid rgba(var(--accent-secondary-rgb), 0.3);
-    box-shadow: 0 0 10px rgba(var(--accent-secondary-rgb), 0.2);
-  }
-
-  .glow-border-tertiary {
-    border: 1px solid rgba(var(--accent-tertiary-rgb), 0.3);
-    box-shadow: 0 0 10px rgba(var(--accent-tertiary-rgb), 0.2);
-  }
-
   .glow-text-primary {
     color: rgb(var(--accent-primary-rgb));
     text-shadow: 0 0 10px rgba(var(--accent-primary-rgb), 0.5);
-  }
-
-  .glow-text-secondary {
-    color: rgb(var(--accent-secondary-rgb));
-    text-shadow: 0 0 10px rgba(var(--accent-secondary-rgb), 0.5);
-  }
-
-  .glow-text-success {
-    color: rgb(var(--status-success-rgb));
-    text-shadow: 0 0 10px rgba(var(--status-success-rgb), 0.5);
-  }
-
-  .scanline {
-    position: relative;
-    overflow: hidden;
-  }
-
-  .scanline::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 100%;
-    background: linear-gradient(
-      transparent 50%,
-      rgba(var(--accent-primary-rgb), 0.03) 50%
-    );
-    background-size: 100% 4px;
-    pointer-events: none;
   }
 
   /* Mode-aware utilities */
@@ -187,7 +154,8 @@
   }
 }
 
-/* Custom diff container styling for @pierre/diffs */
+/* ===== Diff Container (@pierre/diffs) ===== */
+
 .event-diff-container {
   @apply rounded-md overflow-hidden;
   background: rgba(var(--surface-elevated-rgb), 0.8);
@@ -200,31 +168,28 @@
   --diffs-line-height: 16px;
 }
 
-/* Add glow to diff headers */
-.event-diff-container :global(.diff-header) {
+.event-diff-container .diff-header {
   background: rgba(var(--accent-primary-rgb), 0.1);
   border-bottom: 1px solid rgba(var(--accent-primary-rgb), 0.3);
 }
 
-/* Style added lines with lime green glow */
-.event-diff-container :global(.diff-line-added) {
+.event-diff-container .diff-line-added {
   background: rgba(var(--status-success-rgb), 0.1);
   border-left: 2px solid rgb(var(--status-success-rgb));
 }
 
-/* Style removed lines with magenta glow */
-.event-diff-container :global(.diff-line-removed) {
+.event-diff-container .diff-line-removed {
   background: rgba(var(--accent-secondary-rgb), 0.1);
   border-left: 2px solid rgb(var(--accent-secondary-rgb));
 }
 
-/* Selected lines get cyan glow */
-.event-diff-container :global(.diff-line-selected) {
+.event-diff-container .diff-line-selected {
   background: rgba(var(--accent-primary-rgb), 0.2);
   box-shadow: inset 0 0 10px rgba(var(--accent-primary-rgb), 0.3);
 }
 
-/* File mention link styles (for messages) */
+/* ===== File Mention Links ===== */
+
 .file-mention {
   @apply text-accent-primary transition-all duration-200;
   text-shadow: 0 0 5px rgba(var(--accent-primary-rgb), 0.3);
@@ -243,53 +208,13 @@
   @apply decoration-accent-primary underline-offset-2;
 }
 
-/* Ensure react-mentions uses our font */
-* {
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
+/* ===== Delegation Connector ===== */
 
-/* ===== Tool Summary & Modal Styles ===== */
-
-/* Fade in animation */
-@keyframes fade-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
-.animate-fade-in {
-  animation: fade-in 0.2s ease-out;
-}
-
-/* Fade in and slide up animation */
-@keyframes fade-in-up {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.animate-fade-in-up {
-  animation: fade-in-up 0.25s ease-out;
-}
-
-/* ===== Delegation Connector Styles ===== */
-
-/* Container for delegation accordion with connector line */
 .delegation-container {
   position: relative;
   padding-left: 16px;
 }
 
-/* Vertical connector line from delegate tool to accordion */
 .delegation-connector {
   position: absolute;
   left: 0;
@@ -302,7 +227,6 @@
   transition: opacity 0.3s ease;
 }
 
-/* Active connector with pulsing animation */
 .delegation-connector.active {
   opacity: 1;
   animation: connector-pulse 1.5s ease-in-out infinite;
@@ -319,35 +243,27 @@
   }
 }
 
-/* Connector appears on hover over delegation container */
 .delegation-container:hover .delegation-connector {
   opacity: 0.8;
 }
 
-/* SVG connector animation for active state */
 .delegation-connector-active {
   animation: dash-flow 0.5s linear infinite;
 }
 
 @keyframes dash-flow {
-  from {
-    stroke-dashoffset: 8;
-  }
-  to {
-    stroke-dashoffset: 0;
-  }
+  from { stroke-dashoffset: 8; }
+  to { stroke-dashoffset: 0; }
 }
 
-/* ===== Modal Styles ===== */
+/* ===== Modal ===== */
 
-/* Modal backdrop */
 .modal-backdrop {
   @apply fixed inset-0 z-50 flex items-center justify-center;
   background: rgba(var(--surface-canvas-rgb), 0.8);
   backdrop-filter: blur(4px);
 }
 
-/* Modal content container */
 .modal-content {
   @apply relative bg-surface-elevated border border-surface-border rounded-lg;
   box-shadow: 0 0 40px rgba(var(--accent-primary-rgb), 0.2);
@@ -355,9 +271,8 @@
   max-width: 90vw;
 }
 
-/* ===== Accordion Styles ===== */
+/* ===== Accordion ===== */
 
-/* Accordion header */
 .accordion-header {
   @apply flex items-center gap-3 px-4 py-2.5 text-left w-full;
   @apply transition-colors duration-200;
@@ -368,7 +283,6 @@
   @apply bg-surface-elevated/80;
 }
 
-/* Accordion content with slide animation */
 .accordion-content {
   @apply overflow-hidden;
   max-height: 0;
@@ -379,9 +293,8 @@
   max-height: 500px;
 }
 
-/* ===== Tool Summary Card Styles ===== */
+/* ===== Tool Summary Card ===== */
 
-/* Compact tool card hover effect */
 .tool-summary-card {
   @apply flex items-center gap-2 px-3 py-1.5 rounded-md cursor-pointer;
   @apply transition-all duration-200;
@@ -393,21 +306,18 @@
   box-shadow: 0 0 10px rgba(var(--accent-primary-rgb), 0.15);
 }
 
-/* Delegate tool card with left accent */
 .tool-summary-card.delegate {
   border-left-width: 2px;
   border-left-color: rgb(var(--accent-tertiary-rgb));
 }
 
-/* Failed tool card with orange accent */
 .tool-summary-card.failed {
   border-left-width: 2px;
   border-left-color: rgb(var(--status-warning-rgb));
 }
 
-/* ===== Scrollbar Styling ===== */
+/* ===== Scrollbar ===== */
 
-/* Custom scrollbar for modal and accordion content */
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px;
 }
@@ -426,7 +336,7 @@
   background: rgba(var(--accent-primary-rgb), 0.5);
 }
 
-/* ===== Turn Card Styles ===== */
+/* ===== Turn Card & Message Content ===== */
 
 .turn-card {
   @apply mb-6;
@@ -436,28 +346,13 @@
   @apply mb-3;
 }
 
-.agent-response {
-  /* Additional styling handled inline in component */
-}
-
-.activity-section {
-  /* Styling handled in ActivitySection component */
-}
-
-/* Message content - remove prose bloat, use custom styles */
 .message-content {
   @apply text-sm leading-relaxed;
 }
 
-.message-content p:first-child {
-  margin-top: 0;
-}
+.message-content p:first-child { margin-top: 0; }
+.message-content p:last-child { margin-bottom: 0; }
 
-.message-content p:last-child {
-  margin-bottom: 0;
-}
-
-/* Better spacing for lists */
 .message-content ul,
 .message-content ol {
   @apply my-2;
@@ -467,17 +362,14 @@
   @apply leading-relaxed;
 }
 
-/* Code blocks */
 .message-content pre {
   @apply my-3;
 }
 
-/* Inline code */
 .message-content code {
   font-size: 0.9em;
 }
 
-/* Headings */
 .message-content h1,
 .message-content h2,
 .message-content h3 {
@@ -490,9 +382,8 @@
   margin-top: 0;
 }
 
-/* ===== Session Timeline Styles ===== */
+/* ===== Session Timeline ===== */
 
-/* Timeline container */
 .session-timeline {
   @apply sticky top-0 z-40 bg-surface-canvas/95;
   @apply border-b border-surface-border/50;
@@ -500,20 +391,17 @@
   box-shadow: 0 2px 12px rgba(var(--surface-canvas-rgb), 0.6);
 }
 
-/* Horizontal track for timeline dots */
 .timeline-track {
   @apply flex items-center gap-1 overflow-x-auto pb-2;
   scrollbar-width: thin;
   scrollbar-color: rgba(var(--accent-primary-rgb), 0.3) transparent;
 }
 
-/* Spacing between turns */
 .timeline-turn-spacer {
   width: 12px;
   flex-shrink: 0;
 }
 
-/* Base timeline dot */
 .timeline-dot {
   @apply relative rounded-full flex-shrink-0;
   @apply transition-all duration-200;
@@ -522,84 +410,44 @@
   outline: none;
 }
 
-/* Dot sizes */
-.timeline-dot-large {
-  width: 8px;
-  height: 8px;
-}
+.timeline-dot-large  { width: 8px; height: 8px; }
+.timeline-dot-medium { width: 6px; height: 6px; }
+.timeline-dot-small  { width: 5px; height: 5px; }
+.timeline-dot-tiny   { width: 3px; height: 3px; }
 
-.timeline-dot-medium {
-  width: 6px;
-  height: 6px;
-}
+.timeline-dot-accent-primary   { color: rgb(var(--accent-primary-rgb)); }
+.timeline-dot-accent-secondary { color: rgb(var(--accent-secondary-rgb)); }
+.timeline-dot-accent-tertiary  { color: rgb(var(--accent-tertiary-rgb)); }
+.timeline-dot-status-warning   { color: rgb(var(--status-warning-rgb)); }
+.timeline-dot-status-success   { color: rgb(var(--status-success-rgb)); }
 
-.timeline-dot-small {
-  width: 5px;
-  height: 5px;
-}
-
-.timeline-dot-tiny {
-  width: 3px;
-  height: 3px;
-}
-
-/* Dot colors */
-.timeline-dot-accent-primary {
-  color: rgb(var(--accent-primary-rgb));
-}
-
-.timeline-dot-accent-secondary {
-  color: rgb(var(--accent-secondary-rgb));
-}
-
-.timeline-dot-accent-tertiary {
-  color: rgb(var(--accent-tertiary-rgb));
-}
-
-.timeline-dot-status-warning {
-  color: rgb(var(--status-warning-rgb));
-}
-
-.timeline-dot-status-success {
-  color: rgb(var(--status-success-rgb));
-}
-
-/* Hover effect - scale up and add glow */
 .timeline-dot:hover {
   transform: scale(1.4);
   filter: drop-shadow(0 0 4px currentColor);
 }
 
-/* Active turn highlight - larger with pulsing glow */
 .timeline-dot.active {
   transform: scale(1.5);
   animation: timeline-pulse 2s ease-in-out infinite;
 }
 
 @keyframes timeline-pulse {
-  0%, 100% {
-    filter: drop-shadow(0 0 3px currentColor);
-  }
-  50% {
-    filter: drop-shadow(0 0 8px currentColor);
-  }
+  0%, 100% { filter: drop-shadow(0 0 3px currentColor); }
+  50% { filter: drop-shadow(0 0 8px currentColor); }
 }
 
-/* Hovered turn - all dots in turn get subtle highlight */
 .timeline-dot.hovered {
   transform: scale(1.2);
   filter: drop-shadow(0 0 3px currentColor);
 }
 
-/* Focus visible for accessibility */
 .timeline-dot:focus-visible {
   outline: 2px solid currentColor;
   outline-offset: 2px;
 }
 
-/* ===== Syntax Highlighter Overrides ===== */
+/* ===== Syntax Highlighter (Shiki) ===== */
 
-/* Override shiki background with true black */
 .highlighted-code-container {
   background: rgb(var(--code-bg-rgb)) !important;
 }
@@ -614,7 +462,7 @@
   background: transparent !important;
 }
 
-/* ===== Pinned User Message - Top Bar ===== */
+/* ===== Pinned User Message ===== */
 
 .pinned-user-bar-container {
   position: absolute;
@@ -625,7 +473,6 @@
   padding: 0 8px;
   display: flex;
   justify-content: center;
-
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.15s ease-out;
@@ -636,18 +483,13 @@
   pointer-events: auto;
 }
 
-/* Inner bar handles background and content */
 .pinned-user-bar {
   width: 100%;
-  max-width: 72rem; /* Same as max-w-6xl */
+  max-width: 72rem;
   min-height: 44px;
-
-  /* Ghost-like styling */
   background: rgba(var(--surface-elevated-rgb), 0.85);
   backdrop-filter: blur(8px);
   border-bottom: 1px solid rgba(var(--accent-secondary-rgb), 0.2);
-
-  /* Layout */
   display: flex;
   align-items: center;
   padding: 8px 16px;
@@ -657,11 +499,9 @@
 .pinned-user-bar-text {
   flex: 1;
   font-size: 13px;
-  font-weight: 600; /* Bold text */
+  font-weight: 600;
   color: rgb(var(--ui-text-secondary-rgb));
   line-height: 1.4;
-
-  /* 2-line clamp */
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
@@ -685,38 +525,18 @@
   color: rgb(var(--accent-primary-rgb));
 }
 
-/* ===== Animations ===== */
+/* ===== cmdk (Model Picker) ===== */
 
-@keyframes scale-in {
-  from {
-    transform: scale(0.95);
-    opacity: 0;
-  }
-  to {
-    transform: scale(1);
-    opacity: 1;
-  }
-}
-
-.animate-scale-in {
-  animation: scale-in 0.15s ease-out;
-}
-
-/* ===== cmdk Model Picker Styles ===== */
-
-/* Hide cmdk groups when they have no matching items */
 [cmdk-group][hidden] {
   display: none;
 }
 
-/* Chevron indicator visibility on selected cmdk item */
 [cmdk-item][data-selected="true"] .cmdk-chevron {
   opacity: 1;
 }
 
-/* ===== Session Picker Styles ===== */
+/* ===== Session Picker ===== */
 
-/* Filter input glow */
 .session-filter-input {
   position: relative;
 }
@@ -725,7 +545,6 @@
   box-shadow: 0 0 20px rgba(var(--accent-primary-rgb), 0.3);
 }
 
-/* Group header pulse */
 .session-group-header {
   position: relative;
 }
@@ -734,16 +553,9 @@
   box-shadow: 0 0 5px rgba(var(--accent-primary-rgb), 0.1);
 }
 
-/* Session card entrance animation */
 @keyframes session-card-entrance {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .session-card {
@@ -751,12 +563,10 @@
   overflow: hidden;
 }
 
-/* Hover glow effect */
 .session-card:hover {
   box-shadow: 0 0 5px rgba(var(--accent-primary-rgb), 0.12);
 }
 
-/* Border trace animation on hover */
 .session-card::before {
   content: '';
   position: absolute;
@@ -775,10 +585,6 @@
 }
 
 @keyframes border-trace {
-  0% {
-    left: -100%;
-  }
-  100% {
-    left: 100%;
-  }
+  0% { left: -100%; }
+  100% { left: 100%; }
 }

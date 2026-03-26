@@ -3,7 +3,7 @@ import { render, screen, act } from '@testing-library/react';
 import { HighlightedCode, clearHighlightCache } from './HighlightedCode';
 
 // Stub shiki — returns a deterministic HTML string based on inputs.
-vi.mock('shiki', () => ({
+vi.mock('shiki/bundle/web', () => ({
   codeToHtml: vi.fn(async (code: string, opts: { lang: string; theme: string }) =>
     `<pre class="shiki"><code>${opts.lang}:${code}</code></pre>`
   ),
@@ -19,7 +19,7 @@ vi.mock('../utils/dashboardThemes', () => ({
 }));
 
 // Pull in the mock so we can inspect call counts.
-import { codeToHtml } from 'shiki';
+import { codeToHtml } from 'shiki/bundle/web';
 const mockCodeToHtml = vi.mocked(codeToHtml);
 
 beforeEach(() => {

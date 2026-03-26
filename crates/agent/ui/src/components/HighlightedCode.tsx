@@ -8,7 +8,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import { codeToHtml } from 'shiki';
+import { codeToHtml } from 'shiki/bundle/web';
 import { detectLanguage } from '../utils/languageDetection';
 import { useUiStore } from '../store/uiStore';
 import { getShikiThemeForDashboard } from '../utils/dashboardThemes';
