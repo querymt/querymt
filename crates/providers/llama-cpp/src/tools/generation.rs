@@ -162,6 +162,25 @@ pub(crate) fn parse_tool_response(
         LLMError::ProviderError(format!("Failed to deserialize parsed response: {}", e))
     })?;
 
+    extract_parsed_response(&parsed)
+}
+
+/// Extract content, thinking, tool calls and finish reason from a parsed
+/// OAI-compat JSON value.
+///
+/// Separated from [`parse_tool_response`] so the JSON-processing logic can be
+/// unit-tested without requiring a live `ChatTemplateResult` / FFI context.
+fn extract_parsed_response(
+    parsed: &Value,
+) -> Result<
+    (
+        String,
+        Option<String>,
+        Option<Vec<querymt::ToolCall>>,
+        querymt::chat::FinishReason,
+    ),
+    LLMError,
+> {
     let raw_content = parsed
         .get("content")
         .and_then(|v| v.as_str())
@@ -182,15 +201,43 @@ pub(crate) fn parse_tool_response(
         querymt::chat::extract_thinking(&raw_content)
     };
 
-    let tool_calls = parsed
+    // The llama.cpp C++ parser (chat.cpp) returns `arguments` as a parsed JSON
+    // object (via `json::parse()`), but `querymt::FunctionCall::arguments` is a
+    // `String`.  A plain `serde_json::from_value` would silently fail on the
+    // type mismatch.  Instead we manually extract each field and stringify
+    // `arguments` when it is not already a string — matching what every other
+    // provider (anthropic, openai, google, ollama, …) does.
+    let tool_calls: Option<Vec<querymt::ToolCall>> = parsed
         .get("tool_calls")
         .and_then(|v| v.as_array())
         .and_then(|arr| {
             if arr.is_empty() {
-                None
-            } else {
-                serde_json::from_value(Value::Array(arr.clone())).ok()
+                return None;
             }
+            let calls: Vec<querymt::ToolCall> = arr
+                .iter()
+                .filter_map(|tc| {
+                    let id = tc.get("id")?.as_str()?.to_string();
+                    let call_type = tc
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("function")
+                        .to_string();
+                    let func = tc.get("function")?;
+                    let name = func.get("name")?.as_str()?.to_string();
+                    let arguments = match func.get("arguments") {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(v) => serde_json::to_string(v).unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    Some(querymt::ToolCall {
+                        id,
+                        call_type,
+                        function: querymt::FunctionCall { name, arguments },
+                    })
+                })
+                .collect();
+            if calls.is_empty() { None } else { Some(calls) }
         });
 
     let finish_reason = if tool_calls.is_some() {
@@ -211,4 +258,213 @@ pub(crate) fn parse_tool_response(
     );
 
     Ok((content, thinking, tool_calls, finish_reason))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use querymt::chat::FinishReason;
+    use serde_json::json;
+
+    /// Regression test: llama.cpp's C++ parser returns `arguments` as a JSON
+    /// object (via `json::parse()`).  Before the fix, `serde_json::from_value`
+    /// silently failed because `FunctionCall::arguments` is a `String`, and
+    /// `.ok()` swallowed the error — dropping tool calls entirely.
+    #[test]
+    fn tool_calls_with_object_arguments() {
+        let parsed = json!({
+            "role": "assistant",
+            "content": "Let me search for files.",
+            "tool_calls": [{
+                "type": "function",
+                "function": {
+                    "name": "glob",
+                    "arguments": {
+                        "pattern": "**/*delegat*",
+                        "path": "/some/path"
+                    }
+                },
+                "id": "call_abc123"
+            }]
+        });
+
+        let (content, thinking, tool_calls, finish_reason) =
+            extract_parsed_response(&parsed).unwrap();
+
+        assert_eq!(content, "Let me search for files.");
+        assert!(thinking.is_none());
+        assert_eq!(finish_reason, FinishReason::ToolCalls);
+
+        let calls = tool_calls.expect("tool_calls should be Some");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_abc123");
+        assert_eq!(calls[0].call_type, "function");
+        assert_eq!(calls[0].function.name, "glob");
+
+        // Arguments should be a JSON string representation of the object
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["pattern"], "**/*delegat*");
+        assert_eq!(args["path"], "/some/path");
+    }
+
+    /// When `arguments` is already a JSON string (e.g. from providers that
+    /// conform to the OpenAI convention), it must be preserved as-is.
+    #[test]
+    fn tool_calls_with_string_arguments() {
+        let parsed = json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"/tmp/test.txt\"}"
+                },
+                "id": "call_def456"
+            }]
+        });
+
+        let (_, _, tool_calls, finish_reason) = extract_parsed_response(&parsed).unwrap();
+
+        assert_eq!(finish_reason, FinishReason::ToolCalls);
+        let calls = tool_calls.expect("tool_calls should be Some");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, "{\"path\":\"/tmp/test.txt\"}");
+    }
+
+    /// Tool call with empty/missing arguments (e.g. a no-argument tool).
+    #[test]
+    fn tool_calls_with_empty_object_arguments() {
+        let parsed = json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "type": "function",
+                "function": {
+                    "name": "get_time",
+                    "arguments": {}
+                },
+                "id": "call_empty"
+            }]
+        });
+
+        let (_, _, tool_calls, finish_reason) = extract_parsed_response(&parsed).unwrap();
+
+        assert_eq!(finish_reason, FinishReason::ToolCalls);
+        let calls = tool_calls.expect("tool_calls should be Some");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_time");
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    /// Tool call with no `arguments` key at all.
+    #[test]
+    fn tool_calls_with_missing_arguments() {
+        let parsed = json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "type": "function",
+                "function": {
+                    "name": "get_time"
+                },
+                "id": "call_noargs"
+            }]
+        });
+
+        let (_, _, tool_calls, finish_reason) = extract_parsed_response(&parsed).unwrap();
+
+        assert_eq!(finish_reason, FinishReason::ToolCalls);
+        let calls = tool_calls.expect("tool_calls should be Some");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.arguments, "");
+    }
+
+    /// Multiple tool calls in a single response.
+    #[test]
+    fn multiple_tool_calls() {
+        let parsed = json!({
+            "role": "assistant",
+            "content": "I'll search in parallel.",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "glob",
+                        "arguments": {"pattern": "**/*.rs"}
+                    },
+                    "id": "call_1"
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search_text",
+                        "arguments": {"pattern": "TODO", "path": "/src"}
+                    },
+                    "id": "call_2"
+                }
+            ]
+        });
+
+        let (content, _, tool_calls, finish_reason) = extract_parsed_response(&parsed).unwrap();
+
+        assert_eq!(content, "I'll search in parallel.");
+        assert_eq!(finish_reason, FinishReason::ToolCalls);
+        let calls = tool_calls.expect("tool_calls should be Some");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "glob");
+        assert_eq!(calls[1].function.name, "search_text");
+    }
+
+    /// No tool calls → finish_reason should be Stop.
+    #[test]
+    fn no_tool_calls() {
+        let parsed = json!({
+            "role": "assistant",
+            "content": "Here is my answer."
+        });
+
+        let (content, _, tool_calls, finish_reason) = extract_parsed_response(&parsed).unwrap();
+
+        assert_eq!(content, "Here is my answer.");
+        assert!(tool_calls.is_none());
+        assert_eq!(finish_reason, FinishReason::Stop);
+    }
+
+    /// Empty tool_calls array → treated as no tool calls.
+    #[test]
+    fn empty_tool_calls_array() {
+        let parsed = json!({
+            "role": "assistant",
+            "content": "Done.",
+            "tool_calls": []
+        });
+
+        let (_, _, tool_calls, finish_reason) = extract_parsed_response(&parsed).unwrap();
+
+        assert!(tool_calls.is_none());
+        assert_eq!(finish_reason, FinishReason::Stop);
+    }
+
+    /// reasoning_content is used when present.
+    #[test]
+    fn reasoning_content_extracted() {
+        let parsed = json!({
+            "role": "assistant",
+            "content": "The answer is 42.",
+            "reasoning_content": "Let me think about this step by step..."
+        });
+
+        let (content, thinking, tool_calls, finish_reason) =
+            extract_parsed_response(&parsed).unwrap();
+
+        assert_eq!(content, "The answer is 42.");
+        assert_eq!(
+            thinking.as_deref(),
+            Some("Let me think about this step by step...")
+        );
+        assert!(tool_calls.is_none());
+        assert_eq!(finish_reason, FinishReason::Stop);
+    }
 }
