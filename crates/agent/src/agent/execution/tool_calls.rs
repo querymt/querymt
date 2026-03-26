@@ -677,37 +677,50 @@ pub(super) async fn store_all_tool_results(
     let mut messages = (*context.messages).to_vec();
     let mut wait_conditions = Vec::new();
 
+    // Collect all tool results into a single User message so that the LLM API
+    // sees every tool_result block immediately after the assistant's tool_use
+    // blocks.  Splitting them across multiple consecutive User messages violates
+    // the Anthropic API contract (and potentially other providers').
+    let mut all_parts = Vec::with_capacity(results.len() * 2);
+    let mut snapshot_parts = Vec::new();
     for result in results.iter() {
-        let mut parts = vec![MessagePart::ToolResult {
+        all_parts.push(MessagePart::ToolResult {
             call_id: result.call_id.clone(),
             content: result.content.clone(),
             is_error: result.is_error,
             tool_name: result.tool_name.clone(),
             tool_arguments: result.tool_arguments.clone(),
             compacted_at: None,
-        }];
+        });
         if let Some(ref snapshot) = result.snapshot_part {
-            parts.push(snapshot.clone());
+            snapshot_parts.push(snapshot.clone());
         }
+    }
+    // Snapshots after all ToolResult parts — interleaving them causes the
+    // Anthropic API to miss subsequent tool_result content blocks.
+    all_parts.extend(snapshot_parts);
 
-        let result_msg = AgentMessage {
-            id: Uuid::new_v4().to_string(),
-            session_id: exec_ctx.session_id.clone(),
-            role: ChatRole::User,
-            parts,
-            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
-            parent_message_id: None,
-            source_provider: None,
-            source_model: None,
-        };
+    let result_msg = AgentMessage {
+        id: Uuid::new_v4().to_string(),
+        session_id: exec_ctx.session_id.clone(),
+        role: ChatRole::User,
+        parts: all_parts,
+        created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+        parent_message_id: None,
+        source_provider: None,
+        source_model: None,
+    };
 
-        exec_ctx
-            .add_message(result_msg.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to store tool result: {}", e))?;
+    exec_ctx
+        .add_message(result_msg.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to store tool results: {}", e))?;
 
-        messages.push(result_msg.to_chat_message());
+    messages.push(result_msg.to_chat_message());
 
+    // Record per-result side effects (delegations, artifacts, etc.) after
+    // the combined message has been persisted.
+    for result in results.iter() {
         if let Some(wait_condition) = record_tool_side_effects(config, result, exec_ctx).await {
             wait_conditions.push(wait_condition);
         }

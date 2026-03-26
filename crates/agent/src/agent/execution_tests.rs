@@ -266,6 +266,100 @@ async fn test_provider_tools_passed_to_llm() {
     assert_eq!(outcome, CycleOutcome::Completed);
 }
 
+/// Parallel tool calls must produce a single User message with all tool_result
+/// blocks rather than separate messages per result. The Anthropic API requires
+/// every `tool_use` id in an assistant message to have a matching `tool_result`
+/// in the *immediately following* user message; splitting results across
+/// multiple consecutive user messages violates this constraint.
+#[tokio::test]
+async fn test_parallel_tool_results_in_single_user_message() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let tool_calls = vec![
+        mock_querymt_tool_call("call-1", "remote_tool", r#"{"a":1}"#),
+        mock_querymt_tool_call("call-2", "remote_tool", r#"{"b":2}"#),
+        mock_querymt_tool_call("call-3", "remote_tool", r#"{"c":3}"#),
+    ];
+
+    let seen_history = Arc::new(StdMutex::new(None::<Vec<querymt::chat::ChatMessage>>));
+    let seen_history_clone = seen_history.clone();
+    let mut seq = Sequence::new();
+
+    // First LLM call returns 3 parallel tool calls.
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_| {
+            Ok(Box::new(MockChatResponse::with_tools(
+                "thinking",
+                tool_calls.clone(),
+            )))
+        });
+    // Second LLM call — capture the history to assert on message structure.
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |messages| {
+            *seen_history_clone.lock().unwrap() = Some(messages.to_vec());
+            Ok(Box::new(MockChatResponse::text_only("done")))
+        });
+    harness
+        .provider_mut()
+        .await
+        .expect_call_tool()
+        .returning(|_, _| Ok(vec![Content::text("tool output")]))
+        .times(3);
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+    assert_eq!(outcome, CycleOutcome::Completed);
+
+    let history = seen_history
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("second chat should capture history");
+
+    // Count User messages that contain at least one ToolResult block.
+    let user_tool_result_messages: Vec<_> = history
+        .iter()
+        .filter(|msg| {
+            msg.role == querymt::chat::ChatRole::User
+                && msg.content.iter().any(|b| b.is_tool_result())
+        })
+        .collect();
+
+    // All 3 tool results must be in a SINGLE user message, not 3 separate ones.
+    assert_eq!(
+        user_tool_result_messages.len(),
+        1,
+        "expected 1 user message with all tool results, got {}",
+        user_tool_result_messages.len()
+    );
+
+    // That single message should contain exactly 3 ToolResult blocks.
+    let tool_result_count = user_tool_result_messages[0]
+        .content
+        .iter()
+        .filter(|b| b.is_tool_result())
+        .count();
+    assert_eq!(
+        tool_result_count, 3,
+        "expected 3 tool results in the single user message, got {}",
+        tool_result_count
+    );
+}
+
 #[tokio::test]
 async fn test_single_tool_call_cycle() {
     let mut harness = TestHarness::new(vec![], None).await;

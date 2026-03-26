@@ -240,6 +240,14 @@ impl AgentMessage {
             }
         }
 
+        // For User messages with tool results, ensure all ToolResult blocks
+        // appear before any Text blocks.  The Anthropic API fails to match
+        // tool_result blocks to their tool_use counterparts when non-tool_result
+        // content blocks (e.g. Snapshot-derived Text) are interleaved between them.
+        if self.role == ChatRole::User && blocks.iter().any(|b| b.is_tool_result()) {
+            blocks.sort_by_key(|b| if b.is_tool_result() { 0 } else { 1 });
+        }
+
         ChatMessage {
             role: self.role.clone(),
             content: blocks,
@@ -481,6 +489,87 @@ mod tests {
                 signature: None, ..
             } => {}
             _ => panic!("expected thinking block without signature"),
+        }
+    }
+
+    /// When a single User message contains multiple ToolResult parts
+    /// interleaved with Snapshot parts (as produced by batched parallel
+    /// tool calls that modify files), all ToolResult content blocks must
+    /// appear before any Text blocks in the resulting ChatMessage.
+    ///
+    /// The Anthropic API fails to match tool_result blocks to their
+    /// tool_use counterparts when non-tool_result content blocks are
+    /// interleaved between them.
+    #[test]
+    fn to_chat_message_tool_results_before_snapshot_text() {
+        use crate::hash::RapidHash;
+        use crate::index::merkle::DiffPaths;
+
+        let msg = AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::User,
+            parts: vec![
+                MessagePart::ToolResult {
+                    call_id: "call-a".to_string(),
+                    content: vec![Content::text("result a")],
+                    is_error: false,
+                    tool_name: Some("edit".to_string()),
+                    tool_arguments: None,
+                    compacted_at: None,
+                },
+                MessagePart::Snapshot {
+                    root_hash: RapidHash::new(b"h1"),
+                    changed_paths: DiffPaths {
+                        added: vec![],
+                        modified: vec!["src/a.rs".into()],
+                        removed: vec![],
+                    },
+                },
+                MessagePart::ToolResult {
+                    call_id: "call-b".to_string(),
+                    content: vec![Content::text("result b")],
+                    is_error: false,
+                    tool_name: Some("edit".to_string()),
+                    tool_arguments: None,
+                    compacted_at: None,
+                },
+                MessagePart::Snapshot {
+                    root_hash: RapidHash::new(b"h2"),
+                    changed_paths: DiffPaths {
+                        added: vec![],
+                        modified: vec!["src/b.rs".into()],
+                        removed: vec![],
+                    },
+                },
+            ],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+
+        let chat = msg.to_chat_message();
+
+        // Must have 2 ToolResult + at least 1 Text (from snapshots).
+        let tool_result_count = chat.content.iter().filter(|b| b.is_tool_result()).count();
+        assert_eq!(tool_result_count, 2);
+
+        // All ToolResult blocks must appear before any Text block.
+        let first_text_idx = chat
+            .content
+            .iter()
+            .position(|b| matches!(b, Content::Text { .. }));
+        let last_tool_result_idx = chat.content.iter().rposition(|b| b.is_tool_result());
+
+        if let (Some(first_text), Some(last_tr)) = (first_text_idx, last_tool_result_idx) {
+            assert!(
+                last_tr < first_text,
+                "all ToolResult blocks must come before any Text block, \
+                 but last ToolResult is at index {} and first Text at index {}",
+                last_tr,
+                first_text
+            );
         }
     }
 }
