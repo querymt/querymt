@@ -162,6 +162,7 @@ impl AgentHandle for RemoteAgentHandle {
     async fn create_delegation_session(
         &self,
         cwd: Option<String>,
+        _parent_session_id: String,
     ) -> Result<(String, SessionActorRef), Error> {
         self.create_remote_session_inner(cwd).await
     }

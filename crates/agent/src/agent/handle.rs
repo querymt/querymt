@@ -69,6 +69,7 @@ pub trait AgentHandle: Send + Sync {
     async fn create_delegation_session(
         &self,
         cwd: Option<String>,
+        parent_session_id: String,
     ) -> std::result::Result<(String, SessionActorRef), Error>;
 
     // --- Event system ---
@@ -1388,9 +1389,15 @@ impl AgentHandle for LocalAgentHandle {
     async fn create_delegation_session(
         &self,
         cwd: Option<String>,
+        parent_session_id: String,
     ) -> std::result::Result<(String, SessionActorRef), Error> {
         let cwd_path = cwd.map(std::path::PathBuf::from).unwrap_or_default();
-        let req = NewSessionRequest::new(cwd_path);
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "parent_session_id".to_string(),
+            serde_json::Value::String(parent_session_id),
+        );
+        let req = NewSessionRequest::new(cwd_path).meta(meta);
         let mut reg = self.registry.lock().await;
         let resp = reg.new_session(req).await?;
         let session_id = resp.session_id.to_string();

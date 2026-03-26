@@ -96,13 +96,20 @@ impl SessionRepository for SqliteSessionRepository {
         let cwd_for_insert = cwd.as_ref().map(|p| p.to_string_lossy().to_string());
         let cwd_clone = cwd.clone();
 
-        // Resolve parent public ID to internal ID if provided
+        // Resolve parent public ID to internal ID if provided.
+        // If the parent is not found (e.g. deleted, or cross-store in tests),
+        // proceed without the FK — fork_origin is still preserved.
         let parent_internal_id = if let Some(parent_id) = &parent_session_id {
-            let parent_session = self
-                .get_session(parent_id)
-                .await?
-                .ok_or_else(|| SessionError::SessionNotFound(parent_id.to_string()))?;
-            Some(parent_session.id)
+            match self.get_session(parent_id).await {
+                Ok(Some(parent_session)) => Some(parent_session.id),
+                _ => {
+                    tracing::debug!(
+                        parent_session_id = %parent_id,
+                        "Parent session not found in store; storing fork_origin without parent FK"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };

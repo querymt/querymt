@@ -400,7 +400,10 @@ async fn execute_delegation(
 
     // 1. Create session via AgentHandle trait
     let cwd_string = ctx.config.cwd.as_ref().map(|p| p.display().to_string());
-    let (child_session_id, session_ref) = match target.create_delegation_session(cwd_string).await {
+    let (child_session_id, session_ref) = match target
+        .create_delegation_session(cwd_string, parent_session_id.clone())
+        .await
+    {
         Ok(result) => result,
         Err(e) => {
             let error_message = format!("Failed to create session via kameo: {}", e);
@@ -1063,6 +1066,7 @@ mod tests {
         async fn create_delegation_session(
             &self,
             _cwd: Option<String>,
+            _parent_session_id: String,
         ) -> std::result::Result<(String, SessionActorRef), Error> {
             Err(Error::internal_error().data("stub: not implemented"))
         }

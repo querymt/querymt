@@ -12,12 +12,12 @@ use crate::model::{AgentMessage, MessagePart};
 
 use crate::session::backend::StorageBackend;
 use crate::session::domain::{Delegation, DelegationStatus};
-use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
-use crate::session::store::SessionStore;
+use crate::session::sqlite_storage::SqliteStorage;
+use crate::session::store::{SessionExecutionConfig, SessionStore};
 use crate::test_utils::{
     MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, TestPluginLoader,
-    TestProviderFactory, mock_llm_config, mock_querymt_tool_call, mock_session,
+    TestProviderFactory, mock_querymt_tool_call,
 };
 use mockall::Sequence;
 use querymt::LLMParams;
@@ -135,7 +135,6 @@ struct TestHarness {
 
 impl TestHarness {
     async fn new(history: Vec<AgentMessage>, behavior: DelegateBehavior) -> Self {
-        let session_id = "sess-test".to_string();
         let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
         let shared_provider = SharedLlmProvider {
             inner: provider.clone(),
@@ -161,79 +160,12 @@ impl TestHarness {
         registry.register_loader(Box::new(TestPluginLoader { factory }));
         let registry = Arc::new(registry);
 
-        let mut store = MockSessionStore::new();
-        let session = mock_session(&session_id);
-        let session_for_context = session.clone();
-        let session_for_expectation = session.clone();
-        let llm_config = mock_llm_config();
-        let history = Arc::new(history);
+        // Use a single shared in-memory SQLite store for orchestrator and delegates.
+        let shared_storage = SqliteStorage::connect(":memory:".into())
+            .await
+            .expect("shared sqlite storage");
+        let store: Arc<dyn SessionStore> = Arc::new(shared_storage.clone());
 
-        store
-            .expect_get_session()
-            .returning(move |_| Ok(Some(session_for_expectation.clone())))
-            .times(0..);
-        let history_for_effective = history.clone();
-        store
-            .expect_get_history()
-            .returning(move |_| Ok((*history).clone()))
-            .times(0..);
-        store
-            .expect_get_effective_history()
-            .returning(move |_| Ok((*history_for_effective).clone()))
-            .times(0..);
-        store
-            .expect_get_session_llm_config()
-            .returning(move |_| Ok(Some(llm_config.clone())))
-            .times(0..);
-        let llm_config_for_handle = mock_llm_config();
-        store
-            .expect_get_llm_config()
-            .returning(move |_| Ok(Some(llm_config_for_handle.clone())))
-            .times(0..);
-        store
-            .expect_get_session_execution_config()
-            .returning(|_| Ok(None))
-            .times(0..);
-        store
-            .expect_get_session_provider_node_id()
-            .returning(|_| Ok(None))
-            .times(0..);
-        store
-            .expect_add_message()
-            .returning(|_, _| Ok(()))
-            .times(0..);
-        store
-            .expect_append_progress_entry()
-            .returning(|_| Ok(()))
-            .times(0..);
-        store
-            .expect_get_current_intent_snapshot()
-            .returning(|_| Ok(None))
-            .times(0..);
-        store
-            .expect_list_delegations()
-            .returning(|_| Ok(vec![]))
-            .times(0..);
-        store
-            .expect_mark_tool_results_compacted()
-            .returning(|_, _| Ok(0))
-            .times(0..);
-        store
-            .expect_create_delegation()
-            .returning(|mut delegation| {
-                // Assign a DB ID if not set
-                if delegation.id == 0 {
-                    delegation.id = 1;
-                }
-                Ok(delegation)
-            })
-            .times(0..);
-        store
-            .expect_update_delegation_status()
-            .returning(|_, _| Ok(()))
-            .times(0..);
-
-        let store: Arc<dyn SessionStore> = Arc::new(store);
         let provider_context = crate::session::provider::SessionProvider::new(
             registry,
             store.clone(),
@@ -241,9 +173,20 @@ impl TestHarness {
         );
         let provider_context = Arc::new(provider_context);
 
-        let context = SessionHandle::new(provider_context.clone(), session_for_context)
+        // Create the parent session via SessionProvider so LLM config is set up.
+        let context = provider_context
+            .create_session(None, None, &SessionExecutionConfig::default())
             .await
-            .expect("context");
+            .expect("create parent session");
+        let session_id = context.session().public_id.clone();
+
+        // Seed any initial history into the real store.
+        for msg in &history {
+            store
+                .add_message(&session_id, msg.clone())
+                .await
+                .expect("seed history message");
+        }
 
         let mut runtime_context = RuntimeContext::new(store.clone(), session_id.clone())
             .await
@@ -254,11 +197,11 @@ impl TestHarness {
             .expect("load context");
 
         // Create delegate agents as real LocalAgentHandles.
-        // Each delegate gets its own in-memory SQLite store and mock LLM provider
-        // configured for the desired behavior (success/failure).
+        // All delegates share the same in-memory SQLite store so parent_session_id
+        // resolves correctly when creating delegation sessions.
         let mut agent_registry = DefaultAgentRegistry::new();
         for id in ["agent", "agent1", "agent2"] {
-            let delegate_handle = build_delegate_handle(behavior.clone()).await;
+            let delegate_handle = build_delegate_handle(behavior.clone(), store.clone()).await;
             agent_registry.register_handle(
                 agent_info(id),
                 delegate_handle as Arc<dyn crate::agent::handle::AgentHandle>,
@@ -266,16 +209,10 @@ impl TestHarness {
         }
         let agent_registry: Arc<DefaultAgentRegistry> = Arc::new(agent_registry);
 
-        let event_journal_storage = Arc::new(
-            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
-                .await
-                .expect("create event journal storage"),
-        );
-
         let config = Arc::new(
             crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
                 provider_context,
-                event_journal_storage.event_journal(),
+                shared_storage.event_journal(),
             )
             .with_tool_policy(ToolPolicy::ProviderOnly)
             .with_agent_registry_only(agent_registry.clone())
@@ -303,7 +240,6 @@ impl TestHarness {
             crate::agent::core::McpToolState::empty(),
         );
 
-        let session_id = "sess-test".to_string();
         let exec_ctx = ExecutionContext::new(
             session_id,
             session_runtime,
@@ -336,14 +272,12 @@ impl TestHarness {
     }
 }
 
-/// Build a delegate `AgentHandle` with its own in-memory SQLite store and
-/// mock LLM provider configured for the desired behavior.
-async fn build_delegate_handle(behavior: DelegateBehavior) -> Arc<crate::agent::LocalAgentHandle> {
-    use crate::session::sqlite_storage::SqliteStorage;
-
-    let delegate_store: Arc<dyn SessionStore> =
-        Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
-
+/// Build a delegate `AgentHandle` that shares the given store with the
+/// orchestrator, ensuring parent_session_id resolves correctly.
+async fn build_delegate_handle(
+    behavior: DelegateBehavior,
+    shared_store: Arc<dyn SessionStore>,
+) -> Arc<crate::agent::LocalAgentHandle> {
     let delegate_provider = Arc::new(Mutex::new(MockLlmProvider::new()));
     {
         let mut mock = delegate_provider.lock().await;
@@ -434,18 +368,18 @@ async fn build_delegate_handle(behavior: DelegateBehavior) -> Arc<crate::agent::
 
     let delegate_session_provider = Arc::new(crate::session::provider::SessionProvider::new(
         delegate_plugin_registry,
-        delegate_store,
+        shared_store,
         LLMParams::new().provider("mock").model("mock-model"),
     ));
-    let event_journal_storage = Arc::new(
-        crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+    let delegate_event_storage = Arc::new(
+        SqliteStorage::connect(":memory:".into())
             .await
-            .expect("create event journal storage"),
+            .expect("create delegate event journal storage"),
     );
 
     let mut builder = crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
         delegate_session_provider,
-        event_journal_storage.event_journal(),
+        delegate_event_storage.event_journal(),
     )
     .with_tool_policy(ToolPolicy::ProviderOnly)
     .with_max_steps(1)

@@ -1235,7 +1235,7 @@ mod peer_delegate_routing_tests {
         let handle = LocalAgentHandle::from_config(config.clone());
 
         let (session_id, _ref) = handle
-            .create_delegation_session(None)
+            .create_delegation_session(None, "dummy-parent".to_string())
             .await
             .expect("create_delegation_session");
 
