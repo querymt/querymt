@@ -44,7 +44,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tracing::instrument;
 use typeshare::typeshare;
@@ -66,6 +65,13 @@ struct WarningOffset {
     line: usize,
     /// Number of lines this record occupies (including trailing blank line)
     length: usize,
+}
+
+/// Turn-identity token used to prevent duplicate review in the same prompt generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewToken {
+    session_id: String,
+    generation: u64,
 }
 
 /// Location of a function in source code
@@ -138,8 +144,9 @@ pub struct DedupCheckMiddleware {
     pending_results: Arc<Mutex<Vec<ToolResult>>>,
     /// Optional event sink for emitting duplicate detection events
     event_sink: Option<Arc<EventSink>>,
-    /// Guard to prevent multiple reviews in the same turn
-    already_reviewed_this_turn: AtomicBool,
+    /// Guard to prevent multiple reviews within the same prompt generation.
+    /// If reset() is not called, this provides fallback robustness via generation scoping.
+    last_reviewed: Arc<Mutex<Option<ReviewToken>>>,
     /// Last context seen, used for building BeforeLlmCall state in on_turn_end
     last_context: Arc<Mutex<Option<Arc<ConversationContext>>>>,
 }
@@ -164,7 +171,7 @@ impl DedupCheckMiddleware {
             min_lines: 5,
             pending_results: Arc::new(Mutex::new(Vec::new())),
             event_sink: None,
-            already_reviewed_this_turn: AtomicBool::new(false),
+            last_reviewed: Arc::new(Mutex::new(None)),
             last_context: Arc::new(Mutex::new(None)),
         }
     }
@@ -699,13 +706,6 @@ impl MiddlewareDriver for DedupCheckMiddleware {
             return Ok(state);
         }
 
-        // Guard: only review once per turn
-        if self.already_reviewed_this_turn.swap(true, Ordering::SeqCst) {
-            log::debug!("DedupCheckMiddleware: skipping — already reviewed this turn");
-            tracing::Span::current().record("output_state", "Complete");
-            return Ok(state);
-        }
-
         // Get the last context for building BeforeLlmCall state
         let last_context = self.last_context.lock().await.clone();
         let Some(context) = last_context else {
@@ -720,6 +720,27 @@ impl MiddlewareDriver for DedupCheckMiddleware {
             tracing::Span::current().record("output_state", "Complete");
             return Ok(state);
         };
+
+        // Guard: only review once per prompt generation.
+        let current_token = ReviewToken {
+            session_id: context.session_id.to_string(),
+            generation: runtime
+                .turn_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+        };
+        {
+            let mut guard = self.last_reviewed.lock().await;
+            if let Some(last) = guard.as_ref()
+                && last == &current_token
+            {
+                log::debug!(
+                    "DedupCheckMiddleware: skipping — already reviewed this prompt generation"
+                );
+                tracing::Span::current().record("output_state", "Complete");
+                return Ok(state);
+            }
+            *guard = Some(current_token);
+        }
 
         let workspace = runtime.workspace_handle.get().cloned();
         let Some(workspace) = workspace else {
@@ -834,8 +855,9 @@ impl MiddlewareDriver for DedupCheckMiddleware {
 
     fn reset(&self) {
         // Reset review guard and clear accumulated results
-        self.already_reviewed_this_turn
-            .store(false, Ordering::SeqCst);
+        if let Ok(mut guard) = self.last_reviewed.try_lock() {
+            *guard = None;
+        }
         if let Ok(mut pending) = self.pending_results.try_lock() {
             pending.clear();
         }
@@ -1097,5 +1119,840 @@ mod tests {
         let paths = DedupCheckMiddleware::extract_changed_paths(&results);
         assert_eq!(paths.added.len(), 1);
         assert!(paths.added.contains(&PathBuf::from("new.ts")));
+    }
+
+    // =========================================================================
+    // Obvious Duplicate Detection Tests
+    // =========================================================================
+    //
+    // These tests verify that the DedupCheckMiddleware correctly detects
+    // obvious cases of code duplication that should never be missed.
+
+    use crate::index::function_index::{FunctionIndex, FunctionIndexConfig};
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    /// Test configuration for duplicate detection tests
+    struct DedupTestConfig {
+        threshold: f64,
+        min_lines: u32,
+        description: &'static str,
+    }
+
+    const TEST_CONFIGS: &[DedupTestConfig] = &[
+        DedupTestConfig {
+            threshold: 0.70,
+            min_lines: 5,
+            description: "low_threshold",
+        },
+        DedupTestConfig {
+            threshold: 0.85,
+            min_lines: 10,
+            description: "default_single_coder",
+        },
+        DedupTestConfig {
+            threshold: 0.90,
+            min_lines: 5,
+            description: "high_threshold",
+        },
+    ];
+
+    /// Helper to create a FunctionIndex from a temp directory
+    async fn build_index(temp_dir: &TempDir, config: &DedupTestConfig) -> FunctionIndex {
+        let index_config = FunctionIndexConfig::default()
+            .with_min_lines(config.min_lines)
+            .with_threshold(config.threshold);
+        FunctionIndex::build(temp_dir.path(), index_config)
+            .await
+            .expect("should build index")
+    }
+
+    /// Test: Exact copy-paste of a function MUST be detected
+    #[tokio::test]
+    async fn test_exact_copy_paste_detected() {
+        // Function must be at least 10 lines to pass all config variants
+        let original_fn = r#"
+pub fn calculate_total(items: &[Item]) -> f64 {
+    let mut total = 0.0;
+    for item in items {
+        let price = item.price;
+        let quantity = item.quantity as f64;
+        let subtotal = price * quantity;
+        if subtotal > 0.0 {
+            total += subtotal;
+        }
+    }
+    total
+}
+"#;
+
+        for config in TEST_CONFIGS {
+            let temp_dir = TempDir::new().unwrap();
+
+            // Create original file
+            fs::write(temp_dir.path().join("utils.rs"), original_fn).unwrap();
+
+            let index = build_index(&temp_dir, config).await;
+
+            // Probe with exact same function in a "new" file
+            let results = index.find_similar_to_code(Path::new("new_file.rs"), original_fn);
+
+            assert!(
+                !results.is_empty(),
+                "[{}] Exact copy-paste should be detected (threshold={}, min_lines={})",
+                config.description,
+                config.threshold,
+                config.min_lines
+            );
+
+            if !results.is_empty() {
+                let similarity = results[0].1[0].similarity;
+                assert!(
+                    similarity >= 0.95,
+                    "[{}] Exact copy should have similarity >= 0.95, got {:.4}",
+                    config.description,
+                    similarity
+                );
+            }
+        }
+    }
+
+    /// Test: Function with renamed variables but identical structure MUST be detected
+    #[tokio::test]
+    async fn test_renamed_variables_detected() {
+        let original_fn = r#"
+pub fn process_data(input: &[Record]) -> Vec<Output> {
+    let mut results = Vec::new();
+    for record in input {
+        if record.is_valid() {
+            let transformed = record.transform();
+            results.push(transformed);
+        }
+    }
+    results
+}
+"#;
+
+        let renamed_fn = r#"
+pub fn handle_items(data: &[Record]) -> Vec<Output> {
+    let mut outputs = Vec::new();
+    for item in data {
+        if item.is_valid() {
+            let converted = item.transform();
+            outputs.push(converted);
+        }
+    }
+    outputs
+}
+"#;
+
+        for config in TEST_CONFIGS {
+            let temp_dir = TempDir::new().unwrap();
+
+            fs::write(temp_dir.path().join("processor.rs"), original_fn).unwrap();
+
+            let index = build_index(&temp_dir, config).await;
+
+            let results = index.find_similar_to_code(Path::new("handler.rs"), renamed_fn);
+
+            assert!(
+                !results.is_empty(),
+                "[{}] Renamed variables should still be detected as duplicate",
+                config.description
+            );
+
+            if !results.is_empty() {
+                let similarity = results[0].1[0].similarity;
+                assert!(
+                    similarity >= 0.80,
+                    "[{}] Renamed variables should have high similarity, got {:.4}",
+                    config.description,
+                    similarity
+                );
+            }
+        }
+    }
+
+    /// Test: Multiple copies of the same function in different files MUST all be detected
+    /// This replicates the bug scenario where a function was copy-pasted 10 times.
+    #[tokio::test]
+    async fn test_multiple_copies_all_detected() {
+        let original_fn = r#"
+pub fn validate_input(value: &str, max_len: usize) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("Input cannot be empty".to_string());
+    }
+    if value.len() > max_len {
+        return Err(format!("Input exceeds max length of {}", max_len));
+    }
+    if !value.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return Err("Input contains invalid characters".to_string());
+    }
+    Ok(())
+}
+"#;
+
+        let config = &TEST_CONFIGS[0]; // Use low threshold config
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create original file
+        fs::write(temp_dir.path().join("validation.rs"), original_fn).unwrap();
+
+        let index = build_index(&temp_dir, config).await;
+
+        // Create 10 "new" files with copies
+        let mut detected_count = 0;
+        for i in 0..10 {
+            let new_file = format!("module_{}.rs", i);
+            let results = index.find_similar_to_code(Path::new(&new_file), original_fn);
+            if !results.is_empty() {
+                detected_count += 1;
+            }
+        }
+
+        assert_eq!(
+            detected_count, 10,
+            "All 10 copies should be detected as duplicates, got {}",
+            detected_count
+        );
+    }
+
+    /// Test: Specific regression test for the u32_from_usize scenario
+    /// This was the actual function that was copy-pasted multiple times without detection.
+    #[tokio::test]
+    async fn test_u32_from_usize_scenario() {
+        let original_fn = r#"
+pub fn u32_from_usize(value: usize, field_name: &str, session_id: Option<&str>) -> u32 {
+    u32::try_from(value).unwrap_or_else(|_| {
+        log::warn!(
+            "{}={} exceeds u32 max (session: {:?})",
+            field_name,
+            value,
+            session_id
+        );
+        u32::MAX
+    })
+}
+"#;
+
+        // Variants with minor changes that should still be detected
+        let variants = [
+            // Exact copy
+            r#"
+pub fn u32_from_usize(value: usize, field_name: &str, session_id: Option<&str>) -> u32 {
+    u32::try_from(value).unwrap_or_else(|_| {
+        log::warn!(
+            "{}={} exceeds u32 max (session: {:?})",
+            field_name,
+            value,
+            session_id
+        );
+        u32::MAX
+    })
+}
+"#,
+            // Renamed function
+            r#"
+pub fn convert_to_u32(val: usize, name: &str, sess_id: Option<&str>) -> u32 {
+    u32::try_from(val).unwrap_or_else(|_| {
+        log::warn!(
+            "{}={} exceeds u32 max (session: {:?})",
+            name,
+            val,
+            sess_id
+        );
+        u32::MAX
+    })
+}
+"#,
+            // Slightly different log message
+            r#"
+pub fn safe_u32_convert(value: usize, field: &str, session: Option<&str>) -> u32 {
+    u32::try_from(value).unwrap_or_else(|_| {
+        log::warn!(
+            "Field {}={} too large for u32 (session: {:?})",
+            field,
+            value,
+            session
+        );
+        u32::MAX
+    })
+}
+"#,
+        ];
+
+        let config = DedupTestConfig {
+            threshold: 0.75,
+            min_lines: 5u32,
+            description: "u32_from_usize_test",
+        };
+        let temp_dir = TempDir::new().unwrap();
+
+        fs::write(temp_dir.path().join("utils.rs"), original_fn).unwrap();
+
+        let index = build_index(&temp_dir, &config).await;
+
+        assert!(
+            index.function_count() >= 1,
+            "Should index at least one function"
+        );
+
+        for (i, variant) in variants.iter().enumerate() {
+            let new_file = format!("copy_{}.rs", i);
+            let results = index.find_similar_to_code(Path::new(&new_file), variant);
+
+            assert!(
+                !results.is_empty(),
+                "Variant {} should be detected as duplicate of u32_from_usize",
+                i
+            );
+
+            if !results.is_empty() {
+                let similarity = results[0].1[0].similarity;
+                assert!(
+                    similarity >= 0.70,
+                    "Variant {} should have similarity >= 0.70, got {:.4}",
+                    i,
+                    similarity
+                );
+            }
+        }
+    }
+
+    /// Test: filter_moved_functions correctly filters out functions that were moved
+    #[tokio::test]
+    async fn test_filter_moved_functions_works() {
+        let mw = DedupCheckMiddleware::new();
+
+        // Create a warning where the match is in a file that was removed (moved scenario)
+        let warnings = vec![DuplicateWarning {
+            new_function: FunctionLocation {
+                file_path: PathBuf::from("src/new_location.rs"),
+                function_name: "my_function".to_string(),
+                start_line: 1,
+                end_line: 10,
+            },
+            matches: vec![SimilarMatch {
+                file_path: PathBuf::from("src/old_location.rs"),
+                function_name: "my_function".to_string(),
+                start_line: 1,
+                end_line: 10,
+                similarity: 0.99,
+                body_text: "fn my_function() {}".to_string(),
+            }],
+        }];
+
+        // Simulate move: old_location.rs was removed, new_location.rs was added
+        let changed_paths = DiffPaths {
+            added: vec![PathBuf::from("src/new_location.rs")],
+            modified: vec![],
+            removed: vec![PathBuf::from("src/old_location.rs")],
+        };
+
+        let filtered = mw.filter_moved_functions(warnings, &changed_paths);
+
+        assert!(
+            filtered.is_empty(),
+            "Moved functions should be filtered out, got {} warnings",
+            filtered.len()
+        );
+    }
+
+    /// Test: filter_moved_functions keeps warnings for actual duplicates (not moves)
+    #[tokio::test]
+    async fn test_filter_moved_functions_keeps_real_duplicates() {
+        let mw = DedupCheckMiddleware::new();
+
+        // Create a warning where the match is in a file that was NOT removed
+        let warnings = vec![DuplicateWarning {
+            new_function: FunctionLocation {
+                file_path: PathBuf::from("src/new_file.rs"),
+                function_name: "my_function".to_string(),
+                start_line: 1,
+                end_line: 10,
+            },
+            matches: vec![SimilarMatch {
+                file_path: PathBuf::from("src/existing_file.rs"),
+                function_name: "similar_function".to_string(),
+                start_line: 1,
+                end_line: 10,
+                similarity: 0.95,
+                body_text: "fn similar_function() {}".to_string(),
+            }],
+        }];
+
+        // Only new_file.rs was added, existing_file.rs was not touched
+        let changed_paths = DiffPaths {
+            added: vec![PathBuf::from("src/new_file.rs")],
+            modified: vec![],
+            removed: vec![],
+        };
+
+        let filtered = mw.filter_moved_functions(warnings, &changed_paths);
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "Real duplicates should not be filtered out"
+        );
+    }
+
+    /// Test: TypeScript/JavaScript duplicate detection works
+    #[tokio::test]
+    async fn test_typescript_duplicate_detection() {
+        let original_ts = r#"
+function calculateDiscount(price: number, percentage: number): number {
+    const discount = price * (percentage / 100);
+    const finalPrice = price - discount;
+    if (finalPrice < 0) {
+        return 0;
+    }
+    return finalPrice;
+}
+"#;
+
+        let copy_ts = r#"
+function computeDiscount(amount: number, percent: number): number {
+    const reduction = amount * (percent / 100);
+    const result = amount - reduction;
+    if (result < 0) {
+        return 0;
+    }
+    return result;
+}
+"#;
+
+        let config = &TEST_CONFIGS[0];
+        let temp_dir = TempDir::new().unwrap();
+
+        fs::write(temp_dir.path().join("pricing.ts"), original_ts).unwrap();
+
+        let index = build_index(&temp_dir, config).await;
+
+        let results = index.find_similar_to_code(Path::new("discounts.ts"), copy_ts);
+
+        assert!(
+            !results.is_empty(),
+            "TypeScript duplicate should be detected"
+        );
+    }
+
+    /// Test: Python duplicate detection works
+    #[tokio::test]
+    async fn test_python_duplicate_detection() {
+        let original_py = r#"
+def process_items(items):
+    results = []
+    for item in items:
+        if item.is_valid():
+            processed = item.transform()
+            results.append(processed)
+    return results
+"#;
+
+        let copy_py = r#"
+def handle_records(records):
+    output = []
+    for record in records:
+        if record.is_valid():
+            converted = record.transform()
+            output.append(converted)
+    return output
+"#;
+
+        let config = &TEST_CONFIGS[0];
+        let temp_dir = TempDir::new().unwrap();
+
+        fs::write(temp_dir.path().join("processor.py"), original_py).unwrap();
+
+        let index = build_index(&temp_dir, config).await;
+
+        let results = index.find_similar_to_code(Path::new("handler.py"), copy_py);
+
+        assert!(!results.is_empty(), "Python duplicate should be detected");
+    }
+
+    /// Test: Different functions should NOT be flagged as duplicates
+    #[tokio::test]
+    async fn test_different_functions_not_flagged() {
+        let fn_a = r#"
+pub fn serialize_to_json(data: &Data) -> String {
+    let mut result = String::from("{");
+    result.push_str(&format!("\"name\": \"{}\",", data.name));
+    result.push_str(&format!("\"value\": {}", data.value));
+    result.push('}');
+    result
+}
+"#;
+
+        let fn_b = r#"
+pub fn connect_database(url: &str) -> Result<Connection, Error> {
+    let config = parse_connection_string(url)?;
+    let pool = create_pool(&config)?;
+    let conn = pool.get_connection()?;
+    conn.ping()?;
+    Ok(conn)
+}
+"#;
+
+        let config = &TEST_CONFIGS[1]; // Default threshold
+        let temp_dir = TempDir::new().unwrap();
+
+        fs::write(temp_dir.path().join("serializer.rs"), fn_a).unwrap();
+
+        let index = build_index(&temp_dir, config).await;
+
+        let results = index.find_similar_to_code(Path::new("database.rs"), fn_b);
+
+        assert!(
+            results.is_empty(),
+            "Completely different functions should not be flagged as duplicates"
+        );
+    }
+
+    // =========================================================================
+    // Middleware Integration Tests (Seeded turn_diffs)
+    // =========================================================================
+    //
+    // NOTE: These tests seed `runtime.turn_diffs` directly and validate middleware
+    // behavior once diffs already exist. They do NOT validate the execution engine
+    // path that populates turn_diffs from tool-result snapshots.
+    //
+    // A true end-to-end producer+consumer contract test lives in
+    // `agent/execution_tests.rs` (ignored test: `test_e2e_tool_call_populates_turn_diffs_for_turn_end_middleware`).
+    //
+    // Marked #[ignore] because they are slow and require real workspace indexing.
+
+    use crate::agent::core::{AgentMode, McpToolState, SessionRuntime};
+    use crate::index::file_index::FileIndexConfig;
+    use crate::index::workspace_actor::WorkspaceIndexActor;
+    use crate::middleware::{AgentStats, ConversationContext, ExecutionState, LlmResponse};
+    use std::sync::Arc;
+
+    /// Full integration test: verify the entire dedup detection stack works
+    #[tokio::test]
+    #[ignore] // Slow test - run with `cargo test -- --ignored`
+    async fn test_integration_full_stack_duplicate_detection() {
+        for config in TEST_CONFIGS {
+            run_full_stack_test(config).await;
+        }
+    }
+
+    async fn run_full_stack_test(config: &DedupTestConfig) {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().to_path_buf();
+
+        // Create an original function in the workspace (12 lines to pass min_lines=10)
+        let original_fn = r#"
+pub fn calculate_sum(numbers: &[i32]) -> i32 {
+    let mut sum = 0;
+    for num in numbers {
+        let value = *num;
+        if value > 0 {
+            sum += value;
+        } else {
+            sum -= value.abs();
+        }
+    }
+    sum
+}
+"#;
+        fs::write(root.join("math_utils.rs"), original_fn).unwrap();
+
+        // Build the workspace index
+        let index_config = FunctionIndexConfig::default()
+            .with_min_lines(config.min_lines)
+            .with_threshold(config.threshold);
+
+        let workspace_handle =
+            WorkspaceIndexActor::create(root.clone(), FileIndexConfig::default(), index_config)
+                .await
+                .expect("should create workspace handle");
+
+        // Create SessionRuntime and set workspace_handle
+        let runtime = SessionRuntime::new(
+            Some(root.clone()),
+            std::collections::HashMap::new(),
+            McpToolState::empty(),
+        );
+
+        // Set the workspace handle (ignore error if already set)
+        let _ = runtime.workspace_handle.set(workspace_handle);
+
+        // Create a new file with a copy of the function (same structure, different names)
+        let copy_fn = r#"
+pub fn compute_total(values: &[i32]) -> i32 {
+    let mut total = 0;
+    for val in values {
+        let amount = *val;
+        if amount > 0 {
+            total += amount;
+        } else {
+            total -= amount.abs();
+        }
+    }
+    total
+}
+"#;
+        let new_file_path = root.join("new_module.rs");
+        fs::write(&new_file_path, copy_fn).unwrap();
+
+        // Populate turn_diffs as if a tool wrote this file
+        {
+            let mut diffs = runtime.turn_diffs.lock();
+            diffs.added.push(new_file_path);
+        }
+
+        // Create middleware
+        let mw = DedupCheckMiddleware::new()
+            .threshold(config.threshold)
+            .min_lines(config.min_lines as usize);
+
+        // Create a conversation context
+        let context = Arc::new(ConversationContext {
+            session_id: "test-integration-session".into(),
+            messages: Arc::from([]),
+            stats: Arc::new(AgentStats::default()),
+            provider: "test".into(),
+            model: "test-model".into(),
+            session_mode: AgentMode::Build,
+        });
+
+        // First, capture the context via on_after_llm
+        let llm_response = LlmResponse::new(String::new(), vec![], None, None);
+        let state = ExecutionState::AfterLlm {
+            context: context.clone(),
+            response: Arc::new(llm_response),
+        };
+
+        let _ = mw.on_after_llm(state, Some(&runtime)).await;
+
+        // Now call on_turn_end with Complete state
+        let complete_state = ExecutionState::Complete;
+        let result = mw.on_turn_end(complete_state, Some(&runtime)).await;
+
+        match result {
+            Ok(ExecutionState::BeforeLlmCall { context: new_ctx }) => {
+                // Verify the injected message contains duplicate warning
+                let last_message = new_ctx.messages.last();
+                assert!(
+                    last_message.is_some(),
+                    "[{}] Should have injected a message",
+                    config.description
+                );
+
+                if let Some(msg) = last_message {
+                    let content_str: String = msg
+                        .content
+                        .iter()
+                        .filter_map(|c| c.as_text())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let has_dedup_content =
+                        content_str.contains("CODE REVIEW") || content_str.contains("duplicate");
+                    assert!(
+                        has_dedup_content,
+                        "[{}] Injected message should contain duplicate warning, got: {:?}",
+                        config.description,
+                        &content_str[..content_str.len().min(200)]
+                    );
+                }
+            }
+            Ok(ExecutionState::Complete) => {
+                // This might happen if similarity is below threshold
+                // Check if we expected detection
+                panic!(
+                    "[{}] Expected BeforeLlmCall with duplicate warning, got Complete. \
+                    This may indicate the duplicate detection failed.",
+                    config.description
+                );
+            }
+            Ok(other) => {
+                panic!(
+                    "[{}] Unexpected state: {:?}",
+                    config.description,
+                    other.name()
+                );
+            }
+            Err(e) => {
+                panic!("[{}] on_turn_end failed: {:?}", config.description, e);
+            }
+        }
+    }
+
+    /// Integration test: verify turn_diffs is cleared after processing
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_turn_diffs_cleared_after_processing() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().to_path_buf();
+
+        // Create a simple file
+        fs::write(root.join("test.rs"), "fn main() {}").unwrap();
+
+        let workspace_handle = WorkspaceIndexActor::create(
+            root.clone(),
+            FileIndexConfig::default(),
+            FunctionIndexConfig::default(),
+        )
+        .await
+        .expect("should create workspace handle");
+
+        let runtime = SessionRuntime::new(
+            Some(root.clone()),
+            std::collections::HashMap::new(),
+            McpToolState::empty(),
+        );
+
+        let _ = runtime.workspace_handle.set(workspace_handle);
+
+        // Populate turn_diffs
+        {
+            let mut diffs = runtime.turn_diffs.lock();
+            diffs.added.push(root.join("new_file.rs"));
+        }
+
+        // Verify diffs are populated
+        {
+            let diffs = runtime.turn_diffs.lock();
+            assert!(!diffs.is_empty(), "turn_diffs should be populated");
+        }
+
+        let mw = DedupCheckMiddleware::new();
+
+        // Capture context
+        let context = Arc::new(ConversationContext {
+            session_id: "test-clear-session".into(),
+            messages: Arc::from([]),
+            stats: Arc::new(AgentStats::default()),
+            provider: "test".into(),
+            model: "test-model".into(),
+            session_mode: AgentMode::Build,
+        });
+
+        let llm_response = LlmResponse::new(String::new(), vec![], None, None);
+        let state = ExecutionState::AfterLlm {
+            context: context.clone(),
+            response: Arc::new(llm_response),
+        };
+        let _ = mw.on_after_llm(state, Some(&runtime)).await;
+
+        // Call on_turn_end
+        let _ = mw
+            .on_turn_end(ExecutionState::Complete, Some(&runtime))
+            .await;
+
+        // Verify turn_diffs is cleared
+        {
+            let diffs = runtime.turn_diffs.lock();
+            assert!(
+                diffs.is_empty(),
+                "turn_diffs should be cleared after on_turn_end"
+            );
+        }
+    }
+
+    /// Integration test: verify middleware skips when workspace_handle not set
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_skips_without_workspace_handle() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().to_path_buf();
+
+        // Create runtime WITHOUT setting workspace_handle
+        let runtime = SessionRuntime::new(
+            Some(root),
+            std::collections::HashMap::new(),
+            McpToolState::empty(),
+        );
+
+        let mw = DedupCheckMiddleware::new();
+
+        let context = Arc::new(ConversationContext {
+            session_id: "test-no-workspace".into(),
+            messages: Arc::from([]),
+            stats: Arc::new(AgentStats::default()),
+            provider: "test".into(),
+            model: "test-model".into(),
+            session_mode: AgentMode::Build,
+        });
+
+        // Capture context
+        let llm_response = LlmResponse::new(String::new(), vec![], None, None);
+        let state = ExecutionState::AfterLlm {
+            context: context.clone(),
+            response: Arc::new(llm_response),
+        };
+        let _ = mw.on_after_llm(state, Some(&runtime)).await;
+
+        // Should return Complete unchanged (skipped)
+        let result = mw
+            .on_turn_end(ExecutionState::Complete, Some(&runtime))
+            .await;
+
+        assert!(
+            matches!(result, Ok(ExecutionState::Complete)),
+            "Should return Complete when workspace_handle not set"
+        );
+    }
+
+    /// Integration test: verify middleware skips when disabled
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_skips_when_disabled() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().to_path_buf();
+
+        fs::write(root.join("test.rs"), "fn foo() { 1 + 1 }").unwrap();
+
+        let workspace_handle = WorkspaceIndexActor::create(
+            root.clone(),
+            FileIndexConfig::default(),
+            FunctionIndexConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let runtime = SessionRuntime::new(
+            Some(root.clone()),
+            std::collections::HashMap::new(),
+            McpToolState::empty(),
+        );
+        let _ = runtime.workspace_handle.set(workspace_handle);
+
+        // Populate turn_diffs
+        {
+            let mut diffs = runtime.turn_diffs.lock();
+            diffs.added.push(root.join("new.rs"));
+        }
+
+        // Create DISABLED middleware
+        let mw = DedupCheckMiddleware::new().enabled(false);
+
+        let context = Arc::new(ConversationContext {
+            session_id: "test-disabled".into(),
+            messages: Arc::from([]),
+            stats: Arc::new(AgentStats::default()),
+            provider: "test".into(),
+            model: "test-model".into(),
+            session_mode: AgentMode::Build,
+        });
+
+        let llm_response = LlmResponse::new(String::new(), vec![], None, None);
+        let state = ExecutionState::AfterLlm {
+            context,
+            response: Arc::new(llm_response),
+        };
+        let _ = mw.on_after_llm(state, Some(&runtime)).await;
+
+        let result = mw
+            .on_turn_end(ExecutionState::Complete, Some(&runtime))
+            .await;
+
+        assert!(
+            matches!(result, Ok(ExecutionState::Complete)),
+            "Should return Complete when middleware is disabled"
+        );
     }
 }
