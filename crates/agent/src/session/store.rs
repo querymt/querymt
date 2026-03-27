@@ -311,6 +311,10 @@ pub trait SessionStore: Send + Sync {
     async fn get_intent_snapshot(&self, snapshot_id: &str)
     -> SessionResult<Option<IntentSnapshot>>;
     async fn list_intent_snapshots(&self, session_id: &str) -> SessionResult<Vec<IntentSnapshot>>;
+    async fn get_initial_intent_snapshot(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<IntentSnapshot>>;
     async fn get_current_intent_snapshot(
         &self,
         session_id: &str,

@@ -11,6 +11,7 @@ use crate::agent::execution_context::ExecutionContext;
 use crate::agent::messages::*;
 use crate::agent::undo::{RedoResult, UndoError, UndoResult};
 use crate::agent::utils::{format_prompt_user_text_only, render_prompt_for_display};
+use crate::elicitation::ElicitationAction;
 use crate::error::AgentError;
 use crate::events::{AgentEventKind, SessionLimits};
 use crate::model::{AgentMessage, MessagePart};
@@ -24,8 +25,9 @@ use kameo::message::{Context, Message};
 use kameo::reply::DelegatedReply;
 use log::{debug, info, warn};
 use querymt::chat::{ChatRole, ReasoningEffort};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, instrument};
 use uuid::Uuid;
@@ -39,6 +41,251 @@ fn parse_transport_model_id(model_id: &str, fallback_provider: &str) -> (String,
     } else {
         // Backward compatibility for legacy clients that still send a bare model id.
         (fallback_provider.to_string(), model_id.to_string())
+    }
+}
+
+const ATTACHMENTS_PLACEHOLDER: &str = "(attachments included)";
+const INTENT_CONFIRMATION_TIMEOUT_SECS: u64 = 45;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntentUpdateDecision {
+    NoChange,
+    Update,
+    AskUser,
+}
+
+fn summarize_intent_candidate(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed == ATTACHMENTS_PLACEHOLDER {
+        return None;
+    }
+
+    let single_line = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.is_empty() {
+        return None;
+    }
+
+    let max_len = 240;
+    if single_line.len() > max_len {
+        Some(format!("{}...", &single_line[..max_len - 3]))
+    } else {
+        Some(single_line)
+    }
+}
+
+fn normalize_intent_text(text: &str) -> String {
+    text.trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn decide_intent_update(current_intent: &str, candidate: &str) -> IntentUpdateDecision {
+    let candidate_trimmed = candidate.trim();
+    if candidate_trimmed.is_empty() {
+        return IntentUpdateDecision::NoChange;
+    }
+
+    let normalized_current = normalize_intent_text(current_intent);
+    let normalized_candidate = normalize_intent_text(candidate_trimmed);
+
+    if normalized_current == normalized_candidate {
+        return IntentUpdateDecision::NoChange;
+    }
+
+    let low_signal_prefixes = [
+        "do this",
+        "do that",
+        "i want that",
+        "i want this",
+        "can you",
+        "could you",
+        "please",
+    ];
+    if low_signal_prefixes
+        .iter()
+        .any(|prefix| normalized_candidate.starts_with(prefix))
+        && normalized_candidate.split_whitespace().count() <= 10
+    {
+        return IntentUpdateDecision::NoChange;
+    }
+
+    let current_words: HashSet<&str> = normalized_current.split_whitespace().collect();
+    let candidate_words: HashSet<&str> = normalized_candidate.split_whitespace().collect();
+    let overlap = candidate_words.intersection(&current_words).count();
+
+    let explicit_shift_markers = [
+        "new goal",
+        "change of plan",
+        "instead",
+        "let's switch",
+        "let us switch",
+        "different objective",
+        "pivot",
+    ];
+    if explicit_shift_markers
+        .iter()
+        .any(|marker| normalized_candidate.contains(marker))
+    {
+        return IntentUpdateDecision::AskUser;
+    }
+
+    let explicit_update_markers = [
+        "session objective:",
+        "objective:",
+        "intent:",
+        "my goal is",
+        "the goal is",
+    ];
+    if explicit_update_markers
+        .iter()
+        .any(|marker| normalized_candidate.contains(marker))
+    {
+        return IntentUpdateDecision::Update;
+    }
+
+    if overlap == 0 && candidate_words.len() >= 6 {
+        return IntentUpdateDecision::AskUser;
+    }
+
+    if candidate_words.len() >= 16 {
+        return IntentUpdateDecision::AskUser;
+    }
+
+    IntentUpdateDecision::NoChange
+}
+
+async fn request_intent_update_confirmation(
+    config: &AgentConfig,
+    session_id: &str,
+    current_intent: &str,
+    proposed_intent: &str,
+) -> Result<bool, AgentError> {
+    let elicitation_id = Uuid::new_v4().to_string();
+    let (response_tx, response_rx) = oneshot::channel();
+
+    {
+        let mut pending = config.pending_elicitations.lock().await;
+        pending.insert(elicitation_id.clone(), response_tx);
+    }
+
+    let requested_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "selection": {
+                "type": "string",
+                "title": "Intent",
+                "description": "Choose whether to update the session objective.",
+                "oneOf": [
+                    {
+                        "const": "update",
+                        "title": "Update objective"
+                    },
+                    {
+                        "const": "keep",
+                        "title": "Keep current objective"
+                    }
+                ]
+            }
+        },
+        "required": ["selection"]
+    });
+
+    config
+        .event_sink
+        .emit_durable(
+            session_id,
+            AgentEventKind::ElicitationRequested {
+                elicitation_id: elicitation_id.clone(),
+                session_id: session_id.to_string(),
+                message: format!(
+                    "This prompt may change the session objective.\n\nCurrent objective:\n{}\n\nProposed objective:\n{}",
+                    current_intent, proposed_intent
+                ),
+                requested_schema,
+                source: "builtin:intent_update".to_string(),
+            },
+        )
+        .await
+        .map_err(|e| AgentError::Internal(e.to_string()))?;
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(INTENT_CONFIRMATION_TIMEOUT_SECS),
+        response_rx,
+    )
+    .await;
+
+    if response.is_err() {
+        let mut pending = config.pending_elicitations.lock().await;
+        pending.remove(&elicitation_id);
+    }
+
+    let Some(response) = response.ok().and_then(|received| received.ok()) else {
+        return Ok(false);
+    };
+
+    if response.action != ElicitationAction::Accept {
+        return Ok(false);
+    }
+
+    let selection = response
+        .content
+        .as_ref()
+        .and_then(|content| content.get("selection"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("keep");
+
+    Ok(selection == "update")
+}
+
+async fn maybe_update_session_intent(
+    config: &AgentConfig,
+    session_id: &str,
+    exec_ctx: &mut ExecutionContext,
+    user_text: &str,
+) -> Result<(), AgentError> {
+    let Some(candidate) = summarize_intent_candidate(user_text) else {
+        return Ok(());
+    };
+
+    let Some(current_intent) = exec_ctx
+        .state
+        .current_intent
+        .as_ref()
+        .map(|intent| intent.summary.clone())
+    else {
+        exec_ctx
+            .state
+            .update_intent_snapshot(candidate, None, None)
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
+        return Ok(());
+    };
+
+    match decide_intent_update(&current_intent, &candidate) {
+        IntentUpdateDecision::NoChange => Ok(()),
+        IntentUpdateDecision::Update => {
+            exec_ctx
+                .state
+                .update_intent_snapshot(candidate, None, None)
+                .await
+                .map_err(|e| AgentError::Internal(e.to_string()))?;
+            Ok(())
+        }
+        IntentUpdateDecision::AskUser => {
+            let should_update =
+                request_intent_update_confirmation(config, session_id, &current_intent, &candidate)
+                    .await?;
+            if should_update {
+                exec_ctx
+                    .state
+                    .update_intent_snapshot(candidate, None, None)
+                    .await
+                    .map_err(|e| AgentError::Internal(e.to_string()))?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1396,11 +1643,7 @@ async fn execute_prompt_detached(
         },
     );
 
-    exec_ctx
-        .state
-        .update_intent_snapshot(user_text, None, None)
-        .await
-        .map_err(|e| AgentError::Internal(e.to_string()))?;
+    maybe_update_session_intent(&config, &session_id, &mut exec_ctx, &user_text).await?;
 
     let agent_msg = AgentMessage {
         id: message_id,
@@ -2161,5 +2404,43 @@ mod tests {
             !cancel_token.is_cancelled(),
             "Token reset after PromptFinished"
         );
+    }
+
+    #[test]
+    fn summarize_intent_candidate_ignores_empty_and_attachment_placeholder() {
+        assert_eq!(summarize_intent_candidate("   \n  "), None);
+        assert_eq!(
+            summarize_intent_candidate(ATTACHMENTS_PLACEHOLDER),
+            None,
+            "attachment-only prompts should not become intent"
+        );
+    }
+
+    #[test]
+    fn decide_intent_update_respects_low_signal_clarifications() {
+        let decision = decide_intent_update("Build a Rust CLI to parse logs", "can you fix this?");
+        assert_eq!(
+            decision,
+            IntentUpdateDecision::NoChange,
+            "short clarification prompts should not rewrite session objective"
+        );
+    }
+
+    #[test]
+    fn decide_intent_update_auto_updates_on_explicit_objective_marker() {
+        let decision = decide_intent_update(
+            "Build a Rust CLI to parse logs",
+            "objective: migrate this to a TypeScript dashboard",
+        );
+        assert_eq!(decision, IntentUpdateDecision::Update);
+    }
+
+    #[test]
+    fn decide_intent_update_asks_on_explicit_shift_language() {
+        let decision = decide_intent_update(
+            "Build a Rust CLI to parse logs",
+            "Instead, let's switch to building a web UI for analytics.",
+        );
+        assert_eq!(decision, IntentUpdateDecision::AskUser);
     }
 }

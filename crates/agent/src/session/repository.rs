@@ -93,7 +93,13 @@ pub trait IntentRepository: Send + Sync {
     /// List intent snapshots for a session
     async fn list_intent_snapshots(&self, session_id: &str) -> SessionResult<Vec<IntentSnapshot>>;
 
-    /// Get the most recent intent snapshot for a session
+    /// Get the first intent snapshot recorded for a session.
+    async fn get_initial_intent_snapshot(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<IntentSnapshot>>;
+
+    /// Get the most recent intent snapshot for a session.
     async fn get_current_intent_snapshot(
         &self,
         session_id: &str,

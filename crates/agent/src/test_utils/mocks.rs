@@ -94,6 +94,7 @@ mock! {
         async fn create_intent_snapshot(&self, snapshot: IntentSnapshot) -> SessionResult<()>;
         async fn get_intent_snapshot(&self, snapshot_id: &str) -> SessionResult<Option<IntentSnapshot>>;
         async fn list_intent_snapshots(&self, session_id: &str) -> SessionResult<Vec<IntentSnapshot>>;
+        async fn get_initial_intent_snapshot(&self, session_id: &str) -> SessionResult<Option<IntentSnapshot>>;
         async fn get_current_intent_snapshot(&self, session_id: &str) -> SessionResult<Option<IntentSnapshot>>;
         async fn record_decision(&self, decision: Decision) -> SessionResult<()>;
         async fn record_alternative(&self, alternative: Alternative) -> SessionResult<()>;

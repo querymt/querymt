@@ -1028,6 +1028,14 @@ impl SessionStore for SqliteStorage {
         repo.list_intent_snapshots(session_id).await
     }
 
+    async fn get_initial_intent_snapshot(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<IntentSnapshot>> {
+        let repo = SqliteIntentRepository::new(self.conn.clone());
+        repo.get_initial_intent_snapshot(session_id).await
+    }
+
     async fn get_current_intent_snapshot(
         &self,
         session_id: &str,
@@ -1723,10 +1731,9 @@ impl ViewStore for SqliteStorage {
         let mut items = Vec::with_capacity(sessions.len());
 
         for session in sessions {
-            // Get latest intent snapshot for title
-            // Intent snapshots now contain clean user text (no attachments)
+            // Keep session titles stable by using the initial objective snapshot.
             let title = intent_repo
-                .get_current_intent_snapshot(&session.public_id)
+                .get_initial_intent_snapshot(&session.public_id)
                 .await
                 .ok()
                 .flatten()

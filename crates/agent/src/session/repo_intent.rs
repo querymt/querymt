@@ -127,6 +127,22 @@ impl IntentRepository for SqliteIntentRepository {
         .await
     }
 
+    async fn get_initial_intent_snapshot(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<IntentSnapshot>> {
+        let internal_session_id = self.resolve_session_internal_id(session_id).await?;
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT id, session_id, task_id, summary, constraints, next_step_hint, created_at FROM intent_snapshots WHERE session_id = ? ORDER BY created_at ASC LIMIT 1",
+                params![internal_session_id],
+                map_row_to_snapshot,
+            )
+            .optional()
+        })
+        .await
+    }
+
     async fn get_current_intent_snapshot(
         &self,
         session_id: &str,
