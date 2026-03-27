@@ -1892,6 +1892,160 @@ impl SendAgent for LocalAgentHandle {
                 ext_json_response(&result)
             }
 
+            // ── querymt/mesh extensions ────────────────────────────────
+            "querymt/mesh/createInvite" => {
+                #[derive(serde::Deserialize, Default)]
+                struct CreateInviteReq {
+                    #[serde(default)]
+                    #[serde(alias = "meshName")]
+                    mesh_name: Option<String>,
+                    #[serde(default)]
+                    ttl: Option<String>,
+                    #[serde(default)]
+                    #[serde(alias = "maxUses")]
+                    max_uses: Option<u32>,
+                }
+
+                let parsed: CreateInviteReq =
+                    serde_json::from_str(req.params.get()).map_err(|e| {
+                        Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+                    })?;
+
+                #[cfg(feature = "remote")]
+                {
+                    let Some(mesh) = self.mesh() else {
+                        return Err(Error::invalid_request().data(
+                            serde_json::json!({"error": "mesh not bootstrapped - start with --mesh"}),
+                        ));
+                    };
+
+                    if !mesh.is_iroh_transport() {
+                        return ext_json_response(&serde_json::json!({
+                            "error": "mesh invites require iroh transport; restart host with --mesh --mesh-invite (or set transport=iroh)"
+                        }));
+                    }
+
+                    let ttl_secs = parsed
+                        .ttl
+                        .as_deref()
+                        .and_then(crate::agent::remote::invite::parse_duration_secs)
+                        .or(Some(24 * 3600));
+
+                    let invite = mesh
+                        .create_invite(parsed.mesh_name.clone(), ttl_secs, parsed.max_uses, false)
+                        .map_err(|e| {
+                            Error::internal_error()
+                                .data(serde_json::json!({"error": format!("{e}")}))
+                        })?;
+
+                    #[cfg(feature = "remote-internet")]
+                    let qr_code = crate::agent::remote::qr::render_to_terminal(&invite.to_url());
+                    #[cfg(not(feature = "remote-internet"))]
+                    let qr_code: Option<String> = None;
+
+                    return ext_json_response(&serde_json::json!({
+                        "inviteId": invite.grant.invite_id,
+                        "url": invite.to_url(),
+                        "qrCode": qr_code,
+                        "expiresAt": invite.grant.expires_at,
+                        "maxUses": invite.grant.max_uses,
+                        "meshName": parsed.mesh_name,
+                    }));
+                }
+
+                #[cfg(not(feature = "remote"))]
+                {
+                    Err(Error::method_not_found())
+                }
+            }
+            "querymt/mesh/listInvites" => {
+                #[cfg(feature = "remote")]
+                {
+                    let Some(mesh) = self.mesh() else {
+                        return ext_json_response(&serde_json::json!({"invites": []}));
+                    };
+
+                    let invites: Vec<serde_json::Value> = if let Some(store) = mesh.invite_store() {
+                        let store = store.read();
+                        store
+                            .list_pending()
+                            .into_iter()
+                            .map(|r| {
+                                serde_json::json!({
+                                    "inviteId": r.invite_id,
+                                    "meshName": r.grant.mesh_name,
+                                    "expiresAt": r.grant.expires_at,
+                                    "maxUses": r.grant.max_uses,
+                                    "usesRemaining": r.uses_remaining,
+                                    "status": match r.status {
+                                        crate::agent::remote::invite::InviteStatus::Pending => "pending",
+                                        crate::agent::remote::invite::InviteStatus::Consumed => "consumed",
+                                        crate::agent::remote::invite::InviteStatus::Revoked => "revoked",
+                                    },
+                                    "usedBy": r.used_by,
+                                    "createdAt": r.created_at,
+                                })
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    return ext_json_response(&serde_json::json!({"invites": invites}));
+                }
+
+                #[cfg(not(feature = "remote"))]
+                {
+                    Err(Error::method_not_found())
+                }
+            }
+            "querymt/mesh/revokeInvite" => {
+                #[derive(serde::Deserialize)]
+                struct RevokeInviteReq {
+                    #[serde(alias = "inviteId")]
+                    invite_id: String,
+                }
+
+                let parsed: RevokeInviteReq =
+                    serde_json::from_str(req.params.get()).map_err(|e| {
+                        Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+                    })?;
+
+                #[cfg(feature = "remote")]
+                {
+                    let Some(mesh) = self.mesh() else {
+                        return ext_json_response(&serde_json::json!({
+                            "success": false,
+                            "message": "mesh not bootstrapped - start with --mesh"
+                        }));
+                    };
+
+                    let result = if let Some(store) = mesh.invite_store() {
+                        store.write().revoke(&parsed.invite_id)
+                    } else {
+                        Err(crate::agent::remote::invite::InviteError::StoreError(
+                            "invite store not available".to_string(),
+                        ))
+                    };
+
+                    return match result {
+                        Ok(()) => ext_json_response(&serde_json::json!({
+                            "success": true,
+                            "message": null,
+                        })),
+                        Err(e) => ext_json_response(&serde_json::json!({
+                            "success": false,
+                            "message": e.to_string(),
+                        })),
+                    };
+                }
+
+                #[cfg(not(feature = "remote"))]
+                {
+                    Err(Error::method_not_found())
+                }
+            }
+
             // ── _querymt/updatePlugins ─────────────────────────────────
             "querymt/updatePlugins" => {
                 let registry = self.config.provider.plugin_registry();

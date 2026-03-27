@@ -10,9 +10,11 @@
 //!
 //! All functionality is feature-gated behind `#[cfg(feature = "remote")]`.
 
-use crate::agent::remote::mesh::{MeshConfig, MeshDiscovery, MeshHandle, bootstrap_mesh};
+use crate::agent::remote::mesh::{
+    MeshConfig, MeshDiscovery, MeshHandle, MeshTransportMode, bootstrap_mesh,
+};
 use crate::agent::remote::provider_host::ProviderHostActor;
-use crate::config::{MeshDiscoveryConfig, MeshTomlConfig, RemoteAgentConfig};
+use crate::config::{MeshDiscoveryConfig, MeshTomlConfig, MeshTransportConfig, RemoteAgentConfig};
 use crate::delegation::{AgentInfo, DefaultAgentRegistry};
 use anyhow::Result;
 use std::sync::Arc;
@@ -80,6 +82,31 @@ pub async fn setup_mesh_from_config(
         },
     };
 
+    // ── 1b. Parse invite token (if provided) ─────────────────────────────────
+    let invite = if let Some(ref invite_str) = mesh_cfg.invite {
+        let parsed = crate::agent::remote::invite::SignedInviteGrant::decode(invite_str)
+            .map_err(|e| anyhow::anyhow!("invalid mesh invite token: {e}"))?;
+        log::info!(
+            "Parsed mesh invite: inviter={}, name={:?}",
+            parsed.grant.inviter_peer_id,
+            parsed.grant.mesh_name
+        );
+        Some(parsed)
+    } else {
+        None
+    };
+
+    // When an invite is present, force iroh transport regardless of the
+    // explicit `transport` setting — invites only work over iroh.
+    let transport = if invite.is_some() {
+        MeshTransportMode::Iroh
+    } else {
+        match &mesh_cfg.transport {
+            MeshTransportConfig::Lan => MeshTransportMode::Lan,
+            MeshTransportConfig::Iroh => MeshTransportMode::Iroh,
+        }
+    };
+
     let config = MeshConfig {
         listen: mesh_cfg.listen.clone(),
         discovery,
@@ -91,6 +118,12 @@ pub async fn setup_mesh_from_config(
         },
         directory: crate::agent::remote::mesh::DirectoryMode::default(),
         request_timeout: std::time::Duration::from_secs(mesh_cfg.request_timeout_secs),
+        transport,
+        identity_file: mesh_cfg
+            .identity_file
+            .as_ref()
+            .map(std::path::PathBuf::from),
+        invite,
     };
     let listen_addr_str = config.listen.as_deref().unwrap_or("<auto>").to_string();
 

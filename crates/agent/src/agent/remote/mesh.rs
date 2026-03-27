@@ -35,7 +35,23 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
+
+/// Commands sent from `MeshHandle` to the swarm event loop.
+///
+/// The event loop owns the `Swarm` and is the only place that can mutate it.
+/// Higher-level code uses `MeshHandle` methods (e.g. `dial_peer`) which
+/// translate intent into a `SwarmCommand` and send it over an `mpsc` channel.
+#[derive(Debug)]
+#[cfg_attr(not(feature = "remote-internet"), allow(dead_code))]
+enum SwarmCommand {
+    /// Request the swarm to dial a peer by `PeerId`.
+    ///
+    /// The event loop converts this to a `/p2p/{peer_id}` multiaddr and calls
+    /// `swarm.dial()`.  For iroh transport the relay network resolves the
+    /// address; for LAN the peer must already have a known address (mDNS).
+    DialPeer(PeerId),
+}
 
 /// A peer lifecycle event emitted by the swarm event loop.
 ///
@@ -68,6 +84,16 @@ pub enum MeshDiscovery {
     /// No automatic discovery — peers must be added manually via
     /// `bootstrap_peers` in `MeshConfig`.
     None,
+}
+
+/// Transport layer for the mesh.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum MeshTransportMode {
+    /// Traditional libp2p TCP + QUIC + Noise + Yamux (LAN-optimised).
+    #[default]
+    Lan,
+    /// iroh-backed QUIC transport with relay and NAT traversal (internet-capable).
+    Iroh,
 }
 
 /// How actor lookups are performed in the mesh.
@@ -123,6 +149,27 @@ pub struct MeshConfig {
     ///
     /// Defaults to 300 seconds (5 minutes).
     pub request_timeout: std::time::Duration,
+
+    /// Transport layer to use.
+    ///
+    /// `Lan` (default) uses the traditional TCP + QUIC + Noise + Yamux stack
+    /// with mDNS discovery.  `Iroh` uses `libp2p-iroh` for NAT traversal and
+    /// relay-based connectivity across the internet.
+    pub transport: MeshTransportMode,
+
+    /// Path to the persistent ed25519 identity file.
+    ///
+    /// When `None`, defaults to `~/.qmt/mesh_identity.key`.
+    /// The keypair is generated on first use and reused on subsequent starts
+    /// so the node's `PeerId` is stable across restarts.
+    pub identity_file: Option<std::path::PathBuf>,
+
+    /// Pre-parsed signed invite grant (v2.5).
+    ///
+    /// When set, the mesh bootstraps in "join" mode: it dials the inviter
+    /// (from the grant) instead of waiting for mDNS or explicit peers.
+    /// Takes priority over `bootstrap_peers`.
+    pub invite: Option<super::invite::SignedInviteGrant>,
 }
 
 impl Default for MeshConfig {
@@ -134,6 +181,9 @@ impl Default for MeshConfig {
             bootstrap_peers: vec![],
             directory: DirectoryMode::default(),
             request_timeout: std::time::Duration::from_secs(300),
+            transport: MeshTransportMode::default(),
+            identity_file: None,
+            invite: None,
         }
     }
 }
@@ -200,6 +250,30 @@ pub struct MeshHandle {
     /// discovers a new peer so the new peer's Kademlia routing table is
     /// populated immediately rather than waiting for the next republish cycle.
     re_register_fns: Arc<RwLock<HashMap<String, ReRegisterFn>>>,
+    /// The node's ed25519 identity keypair, cloned from bootstrap context.
+    ///
+    /// Used to sign invite grants.  The keypair is the same one used by
+    /// the libp2p swarm — its public key derives this node's `PeerId`.
+    keypair: Arc<libp2p::identity::Keypair>,
+    /// Host-side invite store for tracking issued invites.
+    ///
+    /// `None` when the node is a joiner (not a host).  Wrapped in
+    /// `Arc<RwLock<..>>` for shared access from the mesh handle and
+    /// the admission handler in `RemoteNodeManager`.
+    invite_store: Option<Arc<RwLock<super::invite::InviteStore>>>,
+    /// Joiner-side membership store: persists tokens + cached peer addresses.
+    ///
+    /// `None` when the node never joined via an invite, or when the store
+    /// could not be loaded from disk.
+    membership_store: Option<Arc<RwLock<super::invite::MembershipStore>>>,
+    /// Active transport mode used by this mesh handle.
+    transport_mode: MeshTransportMode,
+    /// Channel for sending commands to the swarm event loop.
+    ///
+    /// Used by `dial_peer()` to form a full mesh in iroh mode, where peers
+    /// only connect to the inviter by default (star topology).  The event
+    /// loop polls the receiver and executes each `SwarmCommand`.
+    swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
 }
 
 impl std::fmt::Debug for MeshHandle {
@@ -208,17 +282,26 @@ impl std::fmt::Debug for MeshHandle {
             .field("peer_id", &self.peer_id)
             .field("local_hostname", &self.local_hostname)
             .field("re_register_fns_count", &self.re_register_fns.read().len())
+            .field("has_invite_store", &self.invite_store.is_some())
+            .field("has_membership_store", &self.membership_store.is_some())
+            .field("transport_mode", &self.transport_mode)
             .finish_non_exhaustive()
     }
 }
 
 impl MeshHandle {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         peer_id: PeerId,
         peer_events_tx: broadcast::Sender<PeerEvent>,
         known_peers: Arc<RwLock<HashMap<PeerId, HashSet<Multiaddr>>>>,
         local_hostname: String,
         re_register_fns: Arc<RwLock<HashMap<String, ReRegisterFn>>>,
+        keypair: libp2p::identity::Keypair,
+        invite_store: Option<Arc<RwLock<super::invite::InviteStore>>>,
+        membership_store: Option<Arc<RwLock<super::invite::MembershipStore>>>,
+        transport_mode: MeshTransportMode,
+        swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
     ) -> Self {
         Self {
             peer_id,
@@ -226,6 +309,11 @@ impl MeshHandle {
             known_peers,
             local_hostname: Arc::new(local_hostname),
             re_register_fns,
+            keypair: Arc::new(keypair),
+            invite_store,
+            membership_store,
+            transport_mode,
+            swarm_cmd_tx,
         }
     }
 
@@ -481,6 +569,129 @@ impl MeshHandle {
     pub fn known_peer_ids(&self) -> Vec<PeerId> {
         self.known_peers.read().keys().copied().collect()
     }
+
+    /// Create a signed invite grant for this mesh (v2.5).
+    ///
+    /// The invite contains this node's `PeerId` (as the entry point) and is
+    /// signed with this node's ed25519 identity keypair.  Share the resulting
+    /// token (via QR code, URL, or clipboard) with the joining node.
+    ///
+    /// If an `InviteStore` is attached, the invite is recorded for tracking.
+    ///
+    /// # Arguments
+    /// - `mesh_name` — optional human-readable label (e.g. "Dev Mesh")
+    /// - `ttl_secs` — optional time-to-live in seconds; `None` = no expiry
+    /// - `max_uses` — max number of times this invite can be used; `None` = 1
+    /// - `can_invite` — whether the joiner can create their own invites
+    pub fn create_invite(
+        &self,
+        mesh_name: Option<String>,
+        ttl_secs: Option<u64>,
+        max_uses: Option<u32>,
+        can_invite: bool,
+    ) -> Result<super::invite::SignedInviteGrant, super::invite::InviteError> {
+        let max_uses = max_uses.unwrap_or(1);
+        let permissions = super::invite::InvitePermissions {
+            can_invite,
+            role: "member".to_string(),
+        };
+
+        if let Some(ref store) = self.invite_store {
+            store.write().create_invite(
+                &self.keypair,
+                &self.peer_id.to_string(),
+                mesh_name,
+                ttl_secs,
+                max_uses,
+                permissions,
+            )
+        } else {
+            // No store — just sign and return without tracking.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let expires_at = ttl_secs.map(|ttl| now + ttl).unwrap_or(0);
+
+            let grant = super::invite::InviteGrant {
+                version: 3,
+                invite_id: uuid::Uuid::now_v7().to_string(),
+                inviter_peer_id: self.peer_id.to_string(),
+                mesh_name,
+                expires_at,
+                max_uses,
+                permissions,
+            };
+            grant.sign(&self.keypair)
+        }
+    }
+
+    /// Return a reference to the node's identity keypair.
+    ///
+    /// Useful for callers that need to sign additional data (e.g. custom
+    /// auth handshakes in future versions).
+    pub fn keypair(&self) -> &libp2p::identity::Keypair {
+        &self.keypair
+    }
+
+    /// Return a reference to the invite store (if any).
+    pub fn invite_store(&self) -> Option<&Arc<RwLock<super::invite::InviteStore>>> {
+        self.invite_store.as_ref()
+    }
+
+    /// Return a reference to the membership store (if any).
+    pub fn membership_store(&self) -> Option<&Arc<RwLock<super::invite::MembershipStore>>> {
+        self.membership_store.as_ref()
+    }
+
+    /// Update the cached peer list for a mesh membership entry.
+    ///
+    /// Called from the swarm event loop whenever peers are discovered, so that
+    /// the joiner always has a fresh list for reconnection without the original
+    /// inviter.
+    pub fn update_membership_peers(&self, mesh_id: &str, peers: Vec<super::invite::PeerEntry>) {
+        if let Some(ref store) = self.membership_store
+            && let Err(e) = store.write().update_known_peers(mesh_id, peers)
+        {
+            log::warn!(
+                "Failed to update membership peer cache for {}: {}",
+                mesh_id,
+                e
+            );
+        }
+    }
+
+    /// Return the active transport mode for this mesh handle.
+    pub fn transport_mode(&self) -> MeshTransportMode {
+        self.transport_mode.clone()
+    }
+
+    /// Return true when the mesh is internet-capable iroh transport.
+    pub fn is_iroh_transport(&self) -> bool {
+        matches!(self.transport_mode, MeshTransportMode::Iroh)
+    }
+
+    /// Request the swarm event loop to dial a peer by `PeerId`.
+    ///
+    /// Used for iroh mesh fan-out after invite admission. On LAN, peer discovery
+    /// is mDNS-driven and explicit dialing is intentionally a no-op.
+    pub fn dial_peer(&self, peer_id: &PeerId) {
+        if peer_id == &self.peer_id {
+            return; // Don't dial ourselves.
+        }
+        if !self.is_iroh_transport() {
+            log::debug!("dial_peer ignored on LAN transport (mDNS handles discovery)");
+            return;
+        }
+
+        if self
+            .swarm_cmd_tx
+            .send(SwarmCommand::DialPeer(*peer_id))
+            .is_err()
+        {
+            log::warn!("dial_peer: swarm event loop has shut down");
+        }
+    }
 }
 
 /// Bootstrap the kameo mesh swarm.
@@ -489,9 +700,8 @@ impl MeshHandle {
 /// `ActorSwarm::get()` returns `Some(...)` and actors can be registered /
 /// looked up across the network.
 ///
-/// Unlike kameo's built-in `bootstrap_on()`, this builds the swarm directly
-/// using `kameo::remote::Behaviour` so we own the event loop and can emit
-/// [`PeerEvent`]s whenever mDNS discovers or loses a peer.
+/// Dispatches to the LAN (TCP+QUIC+mDNS) or iroh transport based on
+/// `config.transport`.
 ///
 /// # One-shot
 ///
@@ -502,17 +712,99 @@ impl MeshHandle {
 /// A [`MeshHandle`] — proof the swarm is up, a capability object for all
 /// DHT operations, and a source of [`PeerEvent`] broadcasts.
 pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError> {
-    use futures_util::StreamExt as _;
-    use kameo::remote;
-    use libp2p::{
-        SwarmBuilder, mdns, noise,
-        swarm::{NetworkBehaviour, SwarmEvent},
-        tcp, yamux,
+    match config.transport {
+        MeshTransportMode::Lan => bootstrap_lan_mesh(config).await,
+        MeshTransportMode::Iroh => {
+            #[cfg(feature = "remote-internet")]
+            {
+                bootstrap_iroh_mesh(config).await
+            }
+            #[cfg(not(feature = "remote-internet"))]
+            {
+                Err(MeshError::SwarmError(
+                    "iroh transport requires the 'remote-internet' cargo feature".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+// ── Shared event-loop helpers ──────────────────────────────────────────────────
+
+/// Handle a `ConnectionEstablished` swarm event.
+///
+/// Populates Kademlia's routing table, updates `known_peers`, fires
+/// `PeerEvent::Discovered` for genuinely new peers, and triggers the
+/// re-registration cascade so the new peer's DHT is populated immediately.
+fn handle_connection_established<B: libp2p::swarm::NetworkBehaviour>(
+    swarm: &mut libp2p::Swarm<B>,
+    peer_id: PeerId,
+    remote_addr: Multiaddr,
+    known_peers: &RwLock<HashMap<PeerId, HashSet<Multiaddr>>>,
+    peer_events_tx: &broadcast::Sender<PeerEvent>,
+    re_register_fns: &RwLock<HashMap<String, ReRegisterFn>>,
+) {
+    swarm.add_peer_address(peer_id, remote_addr.clone());
+    let is_new = {
+        let mut peers = known_peers.write();
+        let entry = peers.entry(peer_id).or_default();
+        let was_empty = entry.is_empty();
+        entry.insert(remote_addr.clone());
+        was_empty
     };
 
-    let listen_addr = config.listen.as_deref().unwrap_or("/ip4/0.0.0.0/tcp/0");
+    if is_new {
+        log::info!("Connected to peer: {peer_id} at {remote_addr}");
+        let _ = peer_events_tx.send(PeerEvent::Discovered(peer_id));
 
-    // Validate bootstrap_peers addresses up-front so we fail fast.
+        let fns: Vec<ReRegisterFn> = re_register_fns.read().values().cloned().collect();
+        if !fns.is_empty() {
+            tokio::spawn(async move {
+                for f in &fns {
+                    f().await;
+                }
+            });
+        }
+    } else {
+        log::debug!("Additional connection to already-known peer {peer_id} at {remote_addr}");
+    }
+}
+
+/// Handle a `ConnectionClosed` swarm event.
+///
+/// When the last connection to a peer closes, removes it from `known_peers`
+/// and fires `PeerEvent::Expired`.
+fn handle_connection_closed(
+    peer_id: PeerId,
+    num_established: u32,
+    known_peers: &RwLock<HashMap<PeerId, HashSet<Multiaddr>>>,
+    peer_events_tx: &broadcast::Sender<PeerEvent>,
+) {
+    if num_established == 0 {
+        let was_known = {
+            let mut peers = known_peers.write();
+            peers.remove(&peer_id).is_some()
+        };
+        if was_known {
+            log::info!("Peer disconnected (no remaining connections): {peer_id}");
+            let _ = peer_events_tx.send(PeerEvent::Expired(peer_id));
+        }
+    }
+}
+
+/// Shared pre-bootstrap setup: load identity, validate peers, create channels.
+struct MeshBootstrapContext {
+    keypair: libp2p::identity::Keypair,
+    peer_events_tx: broadcast::Sender<PeerEvent>,
+    known_peers: Arc<RwLock<HashMap<PeerId, HashSet<Multiaddr>>>>,
+    re_register_fns: Arc<RwLock<HashMap<String, ReRegisterFn>>>,
+    local_hostname: String,
+}
+
+fn prepare_bootstrap(config: &MeshConfig) -> Result<MeshBootstrapContext, MeshError> {
+    let keypair = super::identity::load_or_generate_keypair(config.identity_file.as_deref())
+        .map_err(|e| MeshError::SwarmError(format!("failed to load mesh identity: {e}")))?;
+
     for peer_addr in &config.bootstrap_peers {
         peer_addr
             .parse::<libp2p::Multiaddr>()
@@ -522,25 +814,98 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
             })?;
     }
 
-    // Broadcast channel for peer lifecycle events.
-    // Capacity 32 — enough for any realistic mesh churn burst.
     let (peer_events_tx, _) = broadcast::channel::<PeerEvent>(32);
-    let peer_events_tx_loop = peer_events_tx.clone();
-
-    // Shared set of currently-alive peers, maintained by the event loop.
-    let known_peers: Arc<RwLock<HashMap<PeerId, HashSet<Multiaddr>>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-    let known_peers_loop = Arc::clone(&known_peers);
-
-    // Re-registration closures — populated by register_actor, consumed by the
-    // event loop on mDNS Discovered to re-publish all local actors into the
-    // new peer's Kademlia routing table immediately (Phase 1c).
-    let re_register_fns: Arc<RwLock<HashMap<String, ReRegisterFn>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-    let re_register_fns_loop = Arc::clone(&re_register_fns);
-
-    // Cache hostname once at bootstrap time (same logic as RemoteNodeManager).
+    let known_peers = Arc::new(RwLock::new(HashMap::new()));
+    let re_register_fns = Arc::new(RwLock::new(HashMap::new()));
     let local_hostname = resolve_local_hostname();
+
+    Ok(MeshBootstrapContext {
+        keypair,
+        peer_events_tx,
+        known_peers,
+        re_register_fns,
+        local_hostname,
+    })
+}
+
+fn finalize_bootstrap(
+    local_peer_id: PeerId,
+    ctx: MeshBootstrapContext,
+    listen_label: &str,
+    transport_mode: MeshTransportMode,
+    swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
+) -> MeshHandle {
+    log::info!(
+        "Kameo mesh bootstrapped: peer_id={}, listen={}",
+        local_peer_id,
+        listen_label,
+    );
+
+    // Try to load or create the invite store at the default path.
+    let invite_store = match super::invite::default_invite_store_path() {
+        Ok(path) => match super::invite::InviteStore::load_or_create(&path) {
+            Ok(store) => Some(Arc::new(RwLock::new(store))),
+            Err(e) => {
+                log::warn!("Failed to load invite store: {e}; invites will not be persisted");
+                None
+            }
+        },
+        Err(e) => {
+            log::warn!("Cannot determine invite store path: {e}; invites will not be persisted");
+            None
+        }
+    };
+
+    // Try to load or create the membership store at the default path.
+    let membership_store = match super::invite::default_membership_store_path() {
+        Ok(path) => match super::invite::MembershipStore::load_or_create(&path) {
+            Ok(store) => Some(Arc::new(RwLock::new(store))),
+            Err(e) => {
+                log::warn!(
+                    "Failed to load membership store: {e}; reconnection tokens will not be persisted"
+                );
+                None
+            }
+        },
+        Err(e) => {
+            log::warn!(
+                "Cannot determine membership store path: {e}; reconnection tokens will not be persisted"
+            );
+            None
+        }
+    };
+
+    MeshHandle::new(
+        local_peer_id,
+        ctx.peer_events_tx,
+        ctx.known_peers,
+        ctx.local_hostname,
+        ctx.re_register_fns,
+        ctx.keypair,
+        invite_store,
+        membership_store,
+        transport_mode,
+        swarm_cmd_tx,
+    )
+}
+
+// ── LAN mesh (TCP + QUIC + mDNS) ──────────────────────────────────────────────
+
+async fn bootstrap_lan_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError> {
+    use futures_util::StreamExt as _;
+    use kameo::remote;
+    use libp2p::{
+        SwarmBuilder, mdns, noise,
+        swarm::{NetworkBehaviour, SwarmEvent},
+        tcp, yamux,
+    };
+
+    let ctx = prepare_bootstrap(config)?;
+    let listen_addr = config.listen.as_deref().unwrap_or("/ip4/0.0.0.0/tcp/0");
+
+    let peer_events_tx_loop = ctx.peer_events_tx.clone();
+    let known_peers_loop = Arc::clone(&ctx.known_peers);
+    let re_register_fns_loop = Arc::clone(&ctx.re_register_fns);
 
     // ── Build the libp2p swarm ────────────────────────────────────────────────
     // We replicate exactly what kameo's bootstrap_on() does, but own the event
@@ -552,7 +917,7 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         mdns: mdns::tokio::Behaviour,
     }
 
-    let mut swarm = SwarmBuilder::with_new_identity()
+    let mut swarm = SwarmBuilder::with_existing_identity(ctx.keypair.clone())
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -623,6 +988,8 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
     }
 
     let local_peer_id = *swarm.local_peer_id();
+
+    let (swarm_cmd_tx_lan, _swarm_cmd_rx_lan) = mpsc::unbounded_channel::<SwarmCommand>();
 
     // ── Swarm event loop ──────────────────────────────────────────────────────
     tokio::spawn(async move {
@@ -758,72 +1125,26 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                 SwarmEvent::ConnectionEstablished {
                     peer_id, endpoint, ..
                 } => {
-                    // Fired for both inbound and outbound connections, including
-                    // explicitly-dialled bootstrap peers (when discovery = "none")
-                    // and peers that dial us first.
-                    //
-                    // We only emit PeerEvent::Discovered and run the re-registration
-                    // cascade when the peer is genuinely new (not already tracked via
-                    // mDNS).  This makes the handler safe to run alongside mDNS —
-                    // whichever fires first wins; the second is a no-op.
-                    let remote_addr = endpoint.get_remote_address().clone();
-
-                    // Populate Kademlia's routing table with the peer's address.
-                    // mDNS does this via the Discovered handler calling
-                    // swarm.add_peer_address(), which emits NewExternalAddrOfPeer,
-                    // which kameo's Behaviour routes to kademlia.add_address().
-                    // Without this call the routing table stays empty and
-                    // GET_PROVIDERS queries ("Failed to trigger bootstrap: No known
-                    // peers") fail even though we have a live TCP connection.
-                    swarm.add_peer_address(peer_id, remote_addr.clone());
-                    let is_new = {
-                        let mut peers = known_peers_loop.write();
-                        let entry = peers.entry(peer_id).or_default();
-                        let was_empty = entry.is_empty();
-                        entry.insert(remote_addr.clone());
-                        was_empty
-                    };
-
-                    if is_new {
-                        log::info!("Connected to peer: {peer_id} at {remote_addr}");
-                        let _ = peer_events_tx_loop.send(PeerEvent::Discovered(peer_id));
-
-                        // Re-registration cascade: publish all local actors into
-                        // the new peer's Kademlia routing table immediately so
-                        // DHT lookups from that peer succeed right away.
-                        let fns: Vec<ReRegisterFn> =
-                            re_register_fns_loop.read().values().cloned().collect();
-                        if !fns.is_empty() {
-                            tokio::spawn(async move {
-                                for f in &fns {
-                                    f().await;
-                                }
-                            });
-                        }
-                    } else {
-                        log::debug!(
-                            "Additional connection to already-known peer {peer_id} at {remote_addr}"
-                        );
-                    }
+                    handle_connection_established(
+                        &mut swarm,
+                        peer_id,
+                        endpoint.get_remote_address().clone(),
+                        &known_peers_loop,
+                        &peer_events_tx_loop,
+                        &re_register_fns_loop,
+                    );
                 }
                 SwarmEvent::ConnectionClosed {
                     peer_id,
                     num_established,
                     ..
                 } => {
-                    // Only consider the peer fully gone when its last connection
-                    // closes.  Multiple simultaneous connections (TCP + QUIC, or
-                    // inbound + outbound) are normal; we must not evict early.
-                    if num_established == 0 {
-                        let was_known = {
-                            let mut peers = known_peers_loop.write();
-                            peers.remove(&peer_id).is_some()
-                        };
-                        if was_known {
-                            log::info!("Peer disconnected (no remaining connections): {peer_id}");
-                            let _ = peer_events_tx_loop.send(PeerEvent::Expired(peer_id));
-                        }
-                    }
+                    handle_connection_closed(
+                        peer_id,
+                        num_established,
+                        &known_peers_loop,
+                        &peer_events_tx_loop,
+                    );
                 }
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     log::warn!("Outgoing connection error (peer={:?}): {}", peer_id, error);
@@ -844,18 +1165,241 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         }
     }
 
-    log::info!(
-        "Kameo mesh bootstrapped: peer_id={}, listen={}",
+    Ok(finalize_bootstrap(
         local_peer_id,
-        listen_addr
+        ctx,
+        listen_addr,
+        MeshTransportMode::Lan,
+        swarm_cmd_tx_lan,
+    ))
+}
+
+// ── Iroh mesh (QUIC + relay, NAT traversal) ────────────────────────────────────
+
+#[cfg(feature = "remote-internet")]
+async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError> {
+    use futures_util::StreamExt as _;
+    use kameo::remote;
+    use libp2p::swarm::{NetworkBehaviour, Swarm, SwarmEvent};
+
+    let ctx = prepare_bootstrap(config)?;
+
+    let peer_events_tx_loop = ctx.peer_events_tx.clone();
+    let known_peers_loop = Arc::clone(&ctx.known_peers);
+    let re_register_fns_loop = Arc::clone(&ctx.re_register_fns);
+
+    // Load the membership store now so the event loop can update cached peers
+    // whenever new peers are discovered.  Failures are non-fatal.
+    let membership_store_loop: Option<Arc<RwLock<super::invite::MembershipStore>>> =
+        super::invite::default_membership_store_path()
+            .ok()
+            .and_then(|p| super::invite::MembershipStore::load_or_create(&p).ok())
+            .map(|s| Arc::new(RwLock::new(s)));
+
+    // ── Build the iroh-backed libp2p transport ─────────────────────────────────
+
+    // v2.5: no transport-level peer_filter.
+    //
+    // Signed invite grants (v2.5) verify the inviter's identity client-side
+    // via ed25519 signature.  iroh already provides TLS-authenticated,
+    // encrypted connections — each peer's identity is verified via its
+    // ed25519 key.
+    //
+    // Post-connect grant verification (challenge-response handshake) is a
+    // future v3 enhancement.
+    let iroh_config = libp2p_iroh::TransportConfig {
+        timeout: config.request_timeout,
+        ..Default::default()
+    };
+
+    let transport = libp2p_iroh::Transport::with_config(Some(&ctx.keypair), iroh_config)
+        .await
+        .map_err(|e| MeshError::SwarmError(format!("iroh transport init failed: {e}")))?;
+
+    let local_peer_id = transport.peer_id;
+
+    // ── Build behaviour (kameo only — no mDNS, iroh handles connectivity) ──────
+
+    #[derive(NetworkBehaviour)]
+    struct IrohMeshBehaviour {
+        kameo: remote::Behaviour,
+    }
+
+    let kameo_behaviour = remote::Behaviour::new(
+        local_peer_id,
+        remote::messaging::Config::default()
+            .with_request_timeout(config.request_timeout)
+            .with_response_size_maximum(50 * 1024 * 1024),
     );
 
-    Ok(MeshHandle::new(
+    let behaviour = IrohMeshBehaviour {
+        kameo: kameo_behaviour,
+    };
+
+    let mut swarm = Swarm::new(
+        libp2p::Transport::boxed(transport),
+        behaviour,
         local_peer_id,
-        peer_events_tx,
-        known_peers,
-        local_hostname,
-        re_register_fns,
+        libp2p::swarm::Config::with_executor(Box::new(|fut| {
+            tokio::spawn(fut);
+        }))
+        .with_idle_connection_timeout(std::time::Duration::from_secs(300)),
+    );
+
+    // Register the kameo behaviour as the global ActorSwarm.
+    swarm
+        .behaviour()
+        .kameo
+        .try_init_global()
+        .map_err(|e| MeshError::SwarmError(e.to_string()))?;
+
+    // For iroh, listen on Multiaddr::empty() — iroh manages its own listener.
+    swarm
+        .listen_on(Multiaddr::empty())
+        .map_err(|e| MeshError::SwarmError(e.to_string()))?;
+
+    // ── Dial the inviter or explicit bootstrap peers ──────────────────────────
+
+    // If we have an invite, dial the inviter first — this is the entry point
+    // into the mesh.  The inviter's PeerId is resolved by iroh's relay.
+    if let Some(ref invite) = config.invite {
+        let inviter_addr: Multiaddr = format!("/p2p/{}", invite.grant.inviter_peer_id)
+            .parse()
+            .map_err(|e: libp2p::multiaddr::Error| {
+                MeshError::SwarmError(format!(
+                    "invalid inviter PeerId '{}': {}",
+                    invite.grant.inviter_peer_id, e
+                ))
+            })?;
+        match swarm.dial(inviter_addr.clone()) {
+            Ok(_) => log::info!(
+                "Dialing inviter via iroh relay: {} (mesh: {:?})",
+                inviter_addr,
+                invite.grant.mesh_name
+            ),
+            Err(e) => log::warn!("Failed to dial inviter {}: {}", inviter_addr, e),
+        }
+    }
+
+    // Also dial any explicitly configured bootstrap peers.
+    for peer_addr in &config.bootstrap_peers {
+        let addr: Multiaddr = peer_addr.parse().expect("validated in prepare_bootstrap");
+        match swarm.dial(addr.clone()) {
+            Ok(_) => log::info!("Dialing bootstrap peer (iroh): {}", addr),
+            Err(e) => log::warn!("Failed to dial bootstrap peer {}: {}", addr, e),
+        }
+    }
+
+    let (swarm_cmd_tx_iroh, mut swarm_cmd_rx_iroh) = mpsc::unbounded_channel::<SwarmCommand>();
+
+    // ── Swarm event loop ──────────────────────────────────────────────────────
+    // Simpler than LAN: no mDNS events, just connection lifecycle + kameo.
+    tokio::spawn(async move {
+        // Track pending dials to avoid redundant connection attempts.
+        let mut pending_dials: HashSet<PeerId> = HashSet::new();
+
+        loop {
+            tokio::select! {
+                Some(cmd) = swarm_cmd_rx_iroh.recv() => {
+                    match cmd {
+                        SwarmCommand::DialPeer(peer_id) => {
+                            if pending_dials.contains(&peer_id) || known_peers_loop.read().contains_key(&peer_id) {
+                                log::debug!("Skipping dial for {} (already connected or pending)", peer_id);
+                                continue;
+                            }
+                            let addr: Multiaddr = format!("/p2p/{peer_id}")
+                                .parse()
+                                .expect("PeerId always produces a valid /p2p/ multiaddr");
+                            match swarm.dial(addr) {
+                                Ok(_) => {
+                                    log::info!("Dialing peer (iroh): {}", peer_id);
+                                    pending_dials.insert(peer_id);
+                                }
+                                Err(e) => log::warn!("Failed to dial peer {} (iroh): {}", peer_id, e),
+                            }
+                        }
+                    }
+                }
+                event = swarm.select_next_some() => {
+                match event {
+                SwarmEvent::ConnectionEstablished {
+                    peer_id, endpoint, ..
+                } => {
+                    pending_dials.remove(&peer_id);
+
+                    handle_connection_established(
+                        &mut swarm,
+                        peer_id,
+                        endpoint.get_remote_address().clone(),
+                        &known_peers_loop,
+                        &peer_events_tx_loop,
+                        &re_register_fns_loop,
+                    );
+
+                    // Refresh the membership store's cached peer list whenever
+                    // a new peer joins.  This keeps the reconnection fallback
+                    // list up-to-date even if the original inviter goes offline.
+                    if let Some(ref ms) = membership_store_loop {
+                        let current_peers: Vec<super::invite::PeerEntry> = known_peers_loop
+                            .read()
+                            .keys()
+                            .map(|pid| super::invite::PeerEntry {
+                                peer_id: pid.to_string(),
+                                addrs: vec![format!("/p2p/{pid}")],
+                            })
+                            .collect();
+                        let ms = Arc::clone(ms);
+                        let peers = current_peers;
+                        tokio::spawn(async move {
+                            let mut store = ms.write();
+                            for (mid, _) in store
+                                .all()
+                                .map(|(k, _)| (k.to_string(), ()))
+                                .collect::<Vec<_>>()
+                            {
+                                let _ = store.update_known_peers(&mid, peers.clone());
+                            }
+                        });
+                    }
+                }
+                SwarmEvent::ConnectionClosed {
+                    peer_id,
+                    num_established,
+                    ..
+                } => {
+                    handle_connection_closed(
+                        peer_id,
+                        num_established,
+                        &known_peers_loop,
+                        &peer_events_tx_loop,
+                    );
+                }
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    if let Some(pid) = peer_id {
+                        pending_dials.remove(&pid);
+                    }
+                    log::warn!(
+                        "Outgoing connection error (iroh, peer={:?}): {}",
+                        peer_id,
+                        error
+                    );
+                }
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    log::info!("ActorSwarm listening on {} (iroh)", address);
+                }
+                _ => {}
+            } // match event
+            } // select: event arm
+            } // tokio::select!
+        }
+    });
+
+    Ok(finalize_bootstrap(
+        local_peer_id,
+        ctx,
+        "iroh-relay",
+        MeshTransportMode::Iroh,
+        swarm_cmd_tx_iroh,
     ))
 }
 
@@ -864,6 +1408,262 @@ pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
 /// Convenience wrapper around `bootstrap_mesh(&MeshConfig::default())`.
 pub async fn bootstrap_mesh_default() -> Result<MeshHandle, MeshError> {
     bootstrap_mesh(&MeshConfig::default()).await
+}
+
+/// Join an existing mesh using a signed invite grant.
+///
+/// Steps:
+/// 1. Verify the invite grant signature and check expiry.
+/// 2. Check `~/.qmt/memberships.json` for an existing token for this mesh —
+///    if found, use `AdmissionRequest::Token` (reconnect path); otherwise use
+///    `AdmissionRequest::Invite` (first join, consumes one invite use).
+/// 3. Bootstrap the iroh swarm and dial the inviter (or cached peers if the
+///    inviter is offline).
+/// 4. Send the admission request to the target peer's `RemoteNodeManager`.
+/// 5. On `Admitted` — persist the returned `MembershipToken` and known peers.
+/// 6. On `Rejected` — disconnect and return an error.
+///
+/// After this call the local node is a full mesh member and can discover other
+/// members via Kademlia / iroh relay.
+///
+/// # Arguments
+/// - `invite` — a decoded `SignedInviteGrant` (signature verified offline)
+/// - `identity_file` — optional path to the persistent ed25519 identity file
+#[cfg(feature = "remote-internet")]
+pub async fn join_mesh_via_invite(
+    invite: &super::invite::SignedInviteGrant,
+    identity_file: Option<std::path::PathBuf>,
+) -> Result<MeshHandle, MeshError> {
+    use super::invite::{
+        MembershipStore, MeshMembership, PeerEntry, default_membership_store_path, mesh_id_for,
+    };
+    use crate::agent::remote::node_manager::{AdmissionRequest, AdmissionResponse};
+
+    // ── 1. Verify invite offline ──────────────────────────────────────────────
+    invite
+        .verify()
+        .map_err(|e| MeshError::SwarmError(e.to_string()))?;
+
+    let mesh_id = mesh_id_for(
+        &invite.grant.inviter_peer_id,
+        invite.grant.mesh_name.as_deref(),
+    );
+
+    // ── 2. Check for existing membership (reconnect vs first join) ────────────
+    let membership_path =
+        default_membership_store_path().map_err(|e| MeshError::SwarmError(e.to_string()))?;
+    let mut membership_store = MembershipStore::load_or_create(&membership_path)
+        .map_err(|e| MeshError::SwarmError(e.to_string()))?;
+
+    let (existing_token, fallback_peers) = match membership_store.get_membership(&mesh_id) {
+        Some(m) if !m.token.is_expired() => {
+            log::info!(
+                "Found existing membership for mesh '{}', attempting reconnect",
+                mesh_id
+            );
+            (Some(m.token.clone()), m.known_peers.clone())
+        }
+        _ => (None, vec![]),
+    };
+
+    // ── 3. Bootstrap swarm ────────────────────────────────────────────────────
+    // Primary: dial the inviter.  Fallback: cached peers (inviter may be offline).
+    let mut bootstrap_peers: Vec<String> = vec![];
+    if existing_token.is_some() && !fallback_peers.is_empty() {
+        // On reconnect, prefer cached peers in case the inviter is offline.
+        for p in &fallback_peers {
+            bootstrap_peers.push(format!("/p2p/{}", p.peer_id));
+        }
+        log::info!(
+            "Reconnect: will dial {} cached peer(s) as fallback",
+            bootstrap_peers.len()
+        );
+    }
+
+    let config = MeshConfig {
+        listen: None,
+        discovery: MeshDiscovery::None,
+        bootstrap_peers,
+        directory: DirectoryMode::default(),
+        request_timeout: std::time::Duration::from_secs(300),
+        transport: MeshTransportMode::Iroh,
+        identity_file,
+        // Always include the invite so the swarm dials the inviter first.
+        invite: Some(invite.clone()),
+    };
+
+    log::info!(
+        "Joining mesh via invite (inviter={}, name={:?})",
+        invite.grant.inviter_peer_id,
+        invite.grant.mesh_name
+    );
+
+    let mesh = bootstrap_mesh(&config).await?;
+    let my_peer_id = mesh.peer_id().to_string();
+
+    // ── 4. Admission handshake ────────────────────────────────────────────────
+    // Build the request: reconnect (Token) or first join (Invite).
+    let request = match existing_token {
+        Some(token) => AdmissionRequest::Token {
+            membership_token: token,
+            peer_id: my_peer_id.clone(),
+        },
+        None => AdmissionRequest::Invite {
+            invite_id: invite.grant.invite_id.clone(),
+            peer_id: my_peer_id.clone(),
+        },
+    };
+
+    // Look up the admission target — prefer the original inviter, fall back to
+    // any cached peer that is reachable.
+    let target_nm = find_admission_target(&mesh, &invite.grant.inviter_peer_id, &fallback_peers)
+        .await
+        .ok_or_else(|| {
+            MeshError::SwarmError("no reachable peer found for admission handshake".to_string())
+        })?;
+
+    let response = target_nm
+        .ask::<AdmissionRequest>(&request)
+        .await
+        .map_err(|e| MeshError::SwarmError(format!("admission handshake failed: {e}")))?;
+
+    // ── 5. Handle response ────────────────────────────────────────────────────
+    match response {
+        AdmissionResponse::Admitted {
+            membership_token,
+            existing_peers,
+        } => {
+            log::info!(
+                "Admitted to mesh '{}' (admitted_by={}, {} existing peers)",
+                mesh_id,
+                membership_token.admitted_by,
+                existing_peers.len(),
+            );
+
+            // Dial all existing mesh peers to form a full mesh.
+            // Without this, iroh nodes only connect to the inviter (star
+            // topology) and cannot route actor messages to each other.
+            for peer_str in &existing_peers {
+                if let Ok(pid) = peer_str.parse::<PeerId>() {
+                    log::info!("Dialing existing mesh peer: {}", pid);
+                    mesh.dial_peer(&pid);
+                } else {
+                    log::warn!("Ignoring invalid PeerId in existing_peers: {}", peer_str);
+                }
+            }
+
+            // Snapshot current known peers for the membership record.
+            // Include both directly connected peers and the peers we just
+            // started dialing (they'll connect shortly).
+            let mut all_peer_strs: Vec<String> = mesh
+                .known_peer_ids()
+                .into_iter()
+                .map(|pid| pid.to_string())
+                .collect();
+            for p in &existing_peers {
+                if !all_peer_strs.contains(p) {
+                    all_peer_strs.push(p.clone());
+                }
+            }
+            let known_peers: Vec<PeerEntry> = all_peer_strs
+                .into_iter()
+                .map(|pid| PeerEntry {
+                    peer_id: pid.clone(),
+                    addrs: vec![format!("/p2p/{pid}")],
+                })
+                .collect();
+
+            membership_store
+                .store_membership(
+                    mesh_id.clone(),
+                    MeshMembership {
+                        token: membership_token,
+                        known_peers,
+                        last_connected: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    },
+                )
+                .map_err(|e| MeshError::SwarmError(format!("failed to persist membership: {e}")))?;
+        }
+        AdmissionResponse::Readmitted { existing_peers } => {
+            log::info!(
+                "Readmitted to mesh '{}' (token accepted, {} existing peers)",
+                mesh_id,
+                existing_peers.len(),
+            );
+
+            // Dial all existing mesh peers to form a full mesh.
+            for peer_str in &existing_peers {
+                if let Ok(pid) = peer_str.parse::<PeerId>() {
+                    log::info!("Dialing existing mesh peer (readmit): {}", pid);
+                    mesh.dial_peer(&pid);
+                } else {
+                    log::warn!("Ignoring invalid PeerId in existing_peers: {}", peer_str);
+                }
+            }
+
+            membership_store
+                .touch_last_connected(&mesh_id)
+                .map_err(|e| {
+                    MeshError::SwarmError(format!("failed to update membership timestamp: {e}"))
+                })?;
+        }
+        AdmissionResponse::Rejected { reason } => {
+            log::warn!("Mesh admission rejected: {}", reason);
+            return Err(MeshError::SwarmError(format!(
+                "admission rejected: {reason}"
+            )));
+        }
+    }
+
+    // ── 6. Seed the membership store into the mesh handle ─────────────────────
+    // The handle's membership_store was loaded from disk during finalize_bootstrap.
+    // Overwrite it with the now-updated in-memory store so future
+    // update_membership_peers() calls see the right mesh_id entry.
+    if let Some(ref store_arc) = mesh.membership_store {
+        let fresh = MembershipStore::load_or_create(&membership_path)
+            .map_err(|e| MeshError::SwarmError(e.to_string()))?;
+        *store_arc.write() = fresh;
+    }
+
+    Ok(mesh)
+}
+
+/// Find a reachable `RemoteNodeManager` for the admission handshake.
+///
+/// Tries the original inviter first (per-peer DHT name), then falls back to
+/// cached peers in order.  Returns the first one that responds.
+#[cfg(feature = "remote-internet")]
+async fn find_admission_target(
+    mesh: &MeshHandle,
+    inviter_peer_id: &str,
+    fallback_peers: &[super::invite::PeerEntry],
+) -> Option<kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>> {
+    use crate::agent::remote::RemoteNodeManager;
+    use crate::agent::remote::dht_name;
+
+    // Give the swarm a moment to complete the connection before querying the DHT.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Try the inviter first.
+    let inviter_dht = dht_name::node_manager_for_peer(&inviter_peer_id.to_string());
+    if let Ok(Some(nm)) = mesh.lookup_actor::<RemoteNodeManager>(&inviter_dht).await {
+        log::debug!("Admission target: inviter ({})", inviter_peer_id);
+        return Some(nm);
+    }
+
+    // Fall back to cached peers.
+    for peer in fallback_peers {
+        let dht = dht_name::node_manager_for_peer(&peer.peer_id);
+        if let Ok(Some(nm)) = mesh.lookup_actor::<RemoteNodeManager>(&dht).await {
+            log::debug!("Admission target: cached peer ({})", peer.peer_id);
+            return Some(nm);
+        }
+    }
+
+    None
 }
 
 /// Resolve the local hostname (same logic as `RemoteNodeManager::get_hostname`

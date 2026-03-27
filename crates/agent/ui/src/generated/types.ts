@@ -622,6 +622,19 @@ export interface McpServerInfo {
 	endpoint: string;
 }
 
+/** Mesh invite DTO for the UI. */
+export interface MeshInviteInfo {
+	invite_id: string;
+	mesh_name?: string;
+	expires_at: number;
+	max_uses: number;
+	uses_remaining: number;
+	/** pending | consumed | revoked */
+	status: string;
+	used_by: string[];
+	created_at: number;
+}
+
 /** Cached model list entry with canonical identity. */
 export interface ModelEntry {
 	/** Canonical internal identifier (e.g., "hf:repo:file.gguf", "file:/path/to/model.gguf", or provider-specific ID) */
@@ -1084,6 +1097,21 @@ export type UiClientMessage =
 	| { type: "delete_schedule", data: {
 	schedule_public_id: string;
 }}
+	/** Create a new mesh invite token */
+	| { type: "create_mesh_invite", data: {
+	/** Optional human-readable mesh name */
+	mesh_name?: string;
+	/** TTL as human string: "24h", "7d", "none". Default: "24h". */
+	ttl?: string;
+	/** Max uses (0 = unlimited, default 1) */
+	max_uses?: number;
+}}
+	/** List active (pending) mesh invites */
+	| { type: "list_mesh_invites", data?: undefined }
+	/** Revoke a mesh invite by ID */
+	| { type: "revoke_mesh_invite", data: {
+	invite_id: string;
+}}
 	/** Query the knowledge store */
 	| { type: "query_knowledge", data: {
 	scope: string;
@@ -1242,6 +1270,25 @@ export type UiServerMessage =
 	node_id: string;
 	/** Sessions on that node */
 	sessions: RemoteSessionInfo[];
+}}
+	/** Newly created mesh invite */
+	| { type: "mesh_invite_created", data: {
+	invite_id: string;
+	url: string;
+	qr_code?: string;
+	expires_at: number;
+	max_uses: number;
+	mesh_name?: string;
+}}
+	/** List of mesh invites */
+	| { type: "mesh_invite_list", data: {
+	invites: MeshInviteInfo[];
+}}
+	/** Invite revocation result */
+	| { type: "mesh_invite_revoked", data: {
+	invite_id: string;
+	success: boolean;
+	message?: string;
 }}
 	| { type: "model_download_status", data: {
 	provider: string;

@@ -6,6 +6,7 @@
 import { Keyboard } from 'lucide-react';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { RemoteNodeIndicator } from './RemoteNodeIndicator';
+import type { ReactNode } from 'react';
 import type { UiAgentInfo, RoutingMode } from '../types';
 
 interface MobileDropdownMenuProps {
@@ -38,6 +39,9 @@ interface MobileDropdownMenuProps {
   // Actions
   setShortcutGatewayOpen: (open: boolean) => void;
   setMobileMenuOpen: (open: boolean) => void;
+
+  // Render slots
+  mobileExtras?: ReactNode;
 }
 
 export function MobileDropdownMenu(props: MobileDropdownMenuProps) {
@@ -84,7 +88,10 @@ export function MobileDropdownMenu(props: MobileDropdownMenuProps) {
           <span className="text-ui-secondary">Shortcuts</span>
         </button>
       </div>
-      <RemoteNodeIndicator remoteNodes={props.remoteNodes} />
+      <div className="flex items-center gap-2">
+        <RemoteNodeIndicator remoteNodes={props.remoteNodes} />
+        {props.mobileExtras}
+      </div>
     </div>
   );
 }

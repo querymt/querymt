@@ -28,6 +28,8 @@ import {
   ScheduleInfo,
   KnowledgeEntryInfo,
   ConsolidationInfo,
+  MeshInviteInfo,
+  MeshInviteCreated,
 } from '../types';
 import { debugLog, debugTrace } from '../utils/debugLog';
 
@@ -171,6 +173,8 @@ export function useUiClient() {
   const [undoState, setUndoState] = useState<UndoState>(null);
   const undoStateRef = useRef<UndoState>(null);
   const [remoteNodes, setRemoteNodes] = useState<RemoteNodeInfo[]>([]);
+  const [meshInvites, setMeshInvites] = useState<MeshInviteInfo[]>([]);
+  const [lastCreatedMeshInvite, setLastCreatedMeshInvite] = useState<MeshInviteCreated | null>(null);
   const [connectionErrors, setConnectionErrors] = useState<{ id: number; message: string }[]>([]);
   const [sessionActionNotices, setSessionActionNotices] = useState<
     { id: number; kind: 'success' | 'error'; message: string }[]
@@ -233,6 +237,7 @@ export function useUiClient() {
       sendMessage({ type: 'list_all_models', data: { refresh: false } });
       sendMessage({ type: 'get_recent_models', data: { limit_per_workspace: 10 } });
       sendMessage({ type: 'list_remote_nodes' });
+      sendMessage({ type: 'list_mesh_invites' } as UiClientMessage);
     };
 
     socket.onclose = () => {
@@ -995,6 +1000,27 @@ export function useUiClient() {
         debugLog('[useUiClient] remote_sessions for node:', () => ({ node_id: d.node_id, sessions: d.sessions }));
         break;
       }
+      case 'mesh_invite_created': {
+        const d = (msg as unknown as { data: MeshInviteCreated }).data;
+        setLastCreatedMeshInvite(d);
+        // Refresh list after create.
+        sendMessage({ type: 'list_mesh_invites' } as UiClientMessage);
+        break;
+      }
+      case 'mesh_invite_list': {
+        const d = (msg as unknown as { data: { invites: MeshInviteInfo[] } }).data;
+        setMeshInvites(d.invites);
+        break;
+      }
+      case 'mesh_invite_revoked': {
+        const d = (msg as unknown as { data: { invite_id: string; success: boolean; message?: string | null } }).data;
+        if (!d.success) {
+          pushSessionActionNotice('error', d.message ?? `Failed to revoke invite ${d.invite_id}`);
+        }
+        // Refresh list after revoke result.
+        sendMessage({ type: 'list_mesh_invites' } as UiClientMessage);
+        break;
+      }
       case 'model_download_status': {
         const d = msg.data;
         const key = `${d.provider}:${d.model_id}`;
@@ -1317,6 +1343,25 @@ export function useUiClient() {
     sendMessage({ type: 'list_remote_nodes' });
   }, []);
 
+  const createMeshInvite = useCallback((opts?: { meshName?: string; ttl?: string; maxUses?: number }) => {
+    sendMessage({
+      type: 'create_mesh_invite',
+      data: {
+        mesh_name: opts?.meshName,
+        ttl: opts?.ttl,
+        max_uses: opts?.maxUses,
+      },
+    } as UiClientMessage);
+  }, []);
+
+  const listMeshInvites = useCallback(() => {
+    sendMessage({ type: 'list_mesh_invites' } as UiClientMessage);
+  }, []);
+
+  const revokeMeshInvite = useCallback((inviteId: string) => {
+    sendMessage({ type: 'revoke_mesh_invite', data: { invite_id: inviteId } } as UiClientMessage);
+  }, []);
+
   // Dismiss a connection error by id
   const dismissConnectionError = useCallback((errorId: number) => {
     setConnectionErrors((prev) => prev.filter((e) => e.id !== errorId));
@@ -1575,6 +1620,11 @@ export function useUiClient() {
     cycleReasoningEffort,
     remoteNodes,
     listRemoteNodes,
+    meshInvites,
+    lastCreatedMeshInvite,
+    createMeshInvite,
+    listMeshInvites,
+    revokeMeshInvite,
     connectionErrors,
     dismissConnectionError,
     sessionActionNotices,

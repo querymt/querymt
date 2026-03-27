@@ -15,8 +15,14 @@ pub mod actor_ref;
 pub mod dht_name;
 pub mod event_forwarder;
 pub mod event_relay;
+#[cfg(feature = "remote")]
+pub mod identity;
+#[cfg(feature = "remote")]
+pub mod invite;
 pub mod node_id;
 pub mod node_manager;
+#[cfg(feature = "remote-internet")]
+pub mod qr;
 pub mod routing;
 
 #[cfg(feature = "remote")]
@@ -80,10 +86,12 @@ pub use actor_ref::SessionActorRef;
 pub use cached_transport::{CachedDynMeshTransport, CachedMeshTransport};
 pub use event_forwarder::EventForwarder;
 pub use event_relay::{EventRelayActor, RelayedEvent};
+#[cfg(feature = "remote-internet")]
+pub use mesh::join_mesh_via_invite;
 #[cfg(feature = "remote")]
 pub use mesh::{
-    DirectoryMode, MeshConfig, MeshDiscovery, MeshError, MeshHandle, PeerEvent, bootstrap_mesh,
-    bootstrap_mesh_default,
+    DirectoryMode, MeshConfig, MeshDiscovery, MeshError, MeshHandle, MeshTransportMode, PeerEvent,
+    bootstrap_mesh, bootstrap_mesh_default,
 };
 #[cfg(feature = "remote")]
 pub use mesh_provider::MeshChatProvider;

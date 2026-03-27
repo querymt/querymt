@@ -760,7 +760,7 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
         <Dialog.Trigger asChild>
           <button
             type="button"
-            className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-surface-border bg-surface-canvas/60 text-xs text-ui-secondary hover:border-accent-primary/60 hover:text-accent-primary transition-colors w-full"
+            className="flex items-center gap-2 px-2.5 py-1 rounded-lg border border-surface-border/40 bg-surface-elevated/50 text-xs text-ui-secondary hover:border-accent-primary/60 hover:text-accent-primary transition-colors w-full"
             title={triggerTitle}
           >
             <span className="truncate">{triggerLabel}</span>
@@ -800,7 +800,7 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
       <Popover.Trigger asChild>
         <button
           type="button"
-          className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-surface-border bg-surface-canvas/60 text-xs text-ui-secondary hover:border-accent-primary/60 hover:text-accent-primary transition-colors max-w-[20rem] flex-shrink min-w-0"
+          className="flex items-center gap-2 px-2.5 py-1 rounded-lg border border-surface-border/40 bg-surface-elevated/50 text-xs text-ui-secondary hover:border-accent-primary/60 hover:text-accent-primary transition-colors max-w-[20rem] flex-shrink min-w-0"
           title={triggerTitle}
         >
           <span className="truncate">{triggerLabel}</span>

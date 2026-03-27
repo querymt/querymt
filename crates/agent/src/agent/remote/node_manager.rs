@@ -56,8 +56,8 @@ pub struct AvailableModel {
 
 #[cfg(feature = "remote")]
 pub use remote_impl::{
-    CreateRemoteSession, CreateRemoteSessionResponse, DestroyRemoteSession, GetNodeInfo,
-    ListAvailableModels, ListRemoteSessions, RemoteNodeManager,
+    AdmissionRequest, AdmissionResponse, CreateRemoteSession, CreateRemoteSessionResponse,
+    DestroyRemoteSession, GetNodeInfo, ListAvailableModels, ListRemoteSessions, RemoteNodeManager,
 };
 
 #[cfg(feature = "remote")]
@@ -117,6 +117,51 @@ mod remote_impl {
     /// Get metadata about this node.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct GetNodeInfo;
+
+    /// Admission request sent by a joining peer immediately after connection.
+    ///
+    /// Two variants:
+    /// - `Invite` — first join: presents the `invite_id` from the signed grant.
+    ///   The host calls `InviteStore::admit_peer`, consumes one use, and returns
+    ///   a signed `MembershipToken`.
+    /// - `Token` — reconnect: presents a previously-issued `MembershipToken`.
+    ///   Any mesh node can verify this — no invite store access required.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub enum AdmissionRequest {
+        /// First join via an invite grant.
+        Invite {
+            /// The `invite_id` field from the `SignedInviteGrant`.
+            invite_id: String,
+            /// The joiner's own PeerId (self-declared; baked into the token on success).
+            peer_id: String,
+        },
+        /// Reconnect using a previously issued membership token.
+        Token {
+            membership_token: crate::agent::remote::invite::MembershipToken,
+            /// The reconnecting peer's PeerId — must match `membership_token.peer_id`.
+            peer_id: String,
+        },
+    }
+
+    /// Response to an `AdmissionRequest`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub enum AdmissionResponse {
+        /// First join succeeded — here is the membership token for future reconnects.
+        Admitted {
+            membership_token: crate::agent::remote::invite::MembershipToken,
+            /// `PeerId` strings of all currently connected mesh peers (excluding
+            /// the joiner).  The joiner should dial each of these to form a full
+            /// mesh instead of staying in a star topology with only the inviter.
+            existing_peers: Vec<String>,
+        },
+        /// Reconnect accepted — token is still valid.
+        Readmitted {
+            /// `PeerId` strings of all currently connected mesh peers.
+            existing_peers: Vec<String>,
+        },
+        /// Admission denied.
+        Rejected { reason: String },
+    }
 
     // ── Actor ─────────────────────────────────────────────────────────────────
 
@@ -264,9 +309,24 @@ mod remote_impl {
                     session_id = %session_id,
                     dht_name = %dht_name,
                 );
-                mesh.register_actor(actor_ref.clone(), dht_name)
-                    .instrument(reg_span)
-                    .await;
+                let reg_timeout = std::time::Duration::from_secs(2);
+                match tokio::time::timeout(
+                    reg_timeout,
+                    mesh.register_actor(actor_ref.clone(), dht_name.clone())
+                        .instrument(reg_span),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(_) => {
+                        log::warn!(
+                            "RemoteNodeManager: timed out registering session {} as '{}' in DHT after {:?}; continuing with local registry",
+                            session_id,
+                            dht_name,
+                            reg_timeout
+                        );
+                    }
+                }
             } else {
                 log::debug!(
                     "RemoteNodeManager: no mesh, skipping DHT registration for session {}",
@@ -454,7 +514,35 @@ mod remote_impl {
 
             if let Some(session_ref) = session_ref {
                 tracing::Span::current().record("found", true);
-                let _ = session_ref.shutdown().await;
+
+                // Bound shutdown latency so destroy requests cannot hang forever
+                // if an actor is unresponsive.
+                let shutdown_timeout = std::time::Duration::from_secs(2);
+                match tokio::time::timeout(shutdown_timeout, session_ref.shutdown()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        log::warn!(
+                            "RemoteNodeManager: shutdown error for session {}: {}",
+                            msg.session_id,
+                            e
+                        );
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "RemoteNodeManager: shutdown timed out for session {} after {:?}",
+                            msg.session_id,
+                            shutdown_timeout
+                        );
+                    }
+                }
+
+                // Ensure this session's re-registration closure is removed from the
+                // mesh handle so repeated create/destroy cycles don't leak entries.
+                if let Some(ref mesh) = self.mesh {
+                    let dht_name = crate::agent::remote::dht_name::session(&msg.session_id);
+                    mesh.deregister_actor(&dht_name);
+                }
+
                 self.session_meta.remove(&msg.session_id);
                 log::info!("RemoteNodeManager: destroyed session {}", msg.session_id);
                 Ok(())
@@ -533,6 +621,138 @@ mod remote_impl {
 
             tracing::Span::current().record("model_count", models.len());
             Ok(models)
+        }
+    }
+
+    impl Message<AdmissionRequest> for RemoteNodeManager {
+        type Reply = Result<AdmissionResponse, String>;
+
+        #[tracing::instrument(
+            name = "remote.node_manager.admission",
+            skip(self, _ctx),
+            fields(variant = tracing::field::Empty, peer_id = tracing::field::Empty)
+        )]
+        async fn handle(
+            &mut self,
+            msg: AdmissionRequest,
+            _ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            use crate::agent::remote::invite::InviteStore;
+
+            match msg {
+                // ── First join: consume the invite, issue a membership token ──
+                AdmissionRequest::Invite { invite_id, peer_id } => {
+                    tracing::Span::current()
+                        .record("variant", "Invite")
+                        .record("peer_id", &peer_id);
+
+                    let Some(ref mesh) = self.mesh else {
+                        return Ok(AdmissionResponse::Rejected {
+                            reason: "host has no mesh handle".to_string(),
+                        });
+                    };
+
+                    let Some(store_arc) = mesh.invite_store() else {
+                        return Ok(AdmissionResponse::Rejected {
+                            reason: "host has no invite store".to_string(),
+                        });
+                    };
+
+                    let keypair = mesh.keypair().clone();
+                    let mesh_name: Option<String> = None;
+
+                    let result = store_arc.write().admit_peer(
+                        &invite_id,
+                        &peer_id,
+                        &keypair,
+                        mesh_name.as_deref(),
+                    );
+
+                    match result {
+                        Ok(token) => {
+                            log::info!(
+                                "AdmissionRequest::Invite: admitted peer {} via invite {}",
+                                peer_id,
+                                invite_id
+                            );
+                            let existing_peers: Vec<String> = mesh
+                                .known_peer_ids()
+                                .iter()
+                                .filter(|pid| pid.to_string() != peer_id)
+                                .map(|pid| pid.to_string())
+                                .collect();
+                            Ok(AdmissionResponse::Admitted {
+                                membership_token: token,
+                                existing_peers,
+                            })
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "AdmissionRequest::Invite: rejected peer {} ({})",
+                                peer_id,
+                                e
+                            );
+                            Ok(AdmissionResponse::Rejected {
+                                reason: e.to_string(),
+                            })
+                        }
+                    }
+                }
+
+                // ── Reconnect: verify the self-contained membership token ──────
+                AdmissionRequest::Token {
+                    membership_token,
+                    peer_id,
+                } => {
+                    tracing::Span::current()
+                        .record("variant", "Token")
+                        .record("peer_id", &peer_id);
+
+                    if membership_token.peer_id != peer_id {
+                        log::warn!(
+                            "AdmissionRequest::Token: peer_id mismatch: token={} request={}",
+                            membership_token.peer_id,
+                            peer_id
+                        );
+                        return Ok(AdmissionResponse::Rejected {
+                            reason: "peer_id does not match membership token".to_string(),
+                        });
+                    }
+
+                    // Pure crypto — any mesh node can verify, no store access needed.
+                    match InviteStore::verify_membership_token(&membership_token) {
+                        Ok(()) => {
+                            log::info!(
+                                "AdmissionRequest::Token: readmitted peer {} (admitted_by={})",
+                                peer_id,
+                                membership_token.admitted_by
+                            );
+                            let existing_peers: Vec<String> = self
+                                .mesh
+                                .as_ref()
+                                .map(|m| {
+                                    m.known_peer_ids()
+                                        .iter()
+                                        .filter(|pid| pid.to_string() != peer_id)
+                                        .map(|pid| pid.to_string())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            Ok(AdmissionResponse::Readmitted { existing_peers })
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "AdmissionRequest::Token: rejected peer {} ({})",
+                                peer_id,
+                                e
+                            );
+                            Ok(AdmissionResponse::Rejected {
+                                reason: e.to_string(),
+                            })
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -638,5 +858,10 @@ mod remote_impl {
         ListAvailableModels,
         "querymt::ListAvailableModels",
         REG_LIST_AVAILABLE_MODELS
+    );
+    remote_node_msg_impl!(
+        AdmissionRequest,
+        "querymt::AdmissionRequest",
+        REG_ADMISSION_REQUEST
     );
 }

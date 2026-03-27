@@ -579,6 +579,20 @@ pub enum MeshDiscoveryConfig {
     None,
 }
 
+/// Transport layer for the libp2p swarm.
+///
+/// In TOML: `transport = "lan"` | `"iroh"`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshTransportConfig {
+    /// Traditional TCP + QUIC + Noise + Yamux (LAN-optimised, default).
+    #[default]
+    Lan,
+    /// iroh-backed QUIC transport with relay and NAT traversal (internet-capable).
+    /// Requires the `remote-internet` feature.
+    Iroh,
+}
+
 fn default_mesh_listen() -> Option<String> {
     Some("/ip4/0.0.0.0/tcp/9000".to_string())
 }
@@ -615,6 +629,13 @@ pub struct MeshTomlConfig {
     #[serde(default)]
     pub discovery: MeshDiscoveryConfig,
 
+    /// Transport layer.  Default: `"lan"`.
+    ///
+    /// Set to `"iroh"` for internet-capable mesh with NAT traversal and relay.
+    /// Requires the `remote-internet` feature.
+    #[serde(default)]
+    pub transport: MeshTransportConfig,
+
     /// Whether `provider_node_id = None` may fall back to mesh provider discovery.
     ///
     /// Default: `false` (local-only unless an explicit `provider_node_id` is set).
@@ -630,6 +651,30 @@ pub struct MeshTomlConfig {
     /// Increase for very slow models or large context windows.
     #[serde(default = "default_mesh_request_timeout_secs")]
     pub request_timeout_secs: u64,
+
+    /// Path to the persistent ed25519 identity file.
+    ///
+    /// When absent, defaults to `~/.qmt/mesh_identity.key`.  The node's
+    /// `PeerId` is derived from this keypair and stays stable across restarts.
+    #[serde(default)]
+    pub identity_file: Option<String>,
+
+    /// Invite token to join an existing mesh.
+    ///
+    /// When set, the node bootstraps in "join" mode: it dials the inviter
+    /// from the token using the iroh transport.  Overrides `transport` to
+    /// `"iroh"` automatically.
+    ///
+    /// Supports `${VAR}` interpolation, e.g. `"${QMT_MESH_INVITE}"`.
+    ///
+    /// Example:
+    /// ```toml
+    /// [mesh]
+    /// enabled = true
+    /// invite = "${QMT_MESH_INVITE}"
+    /// ```
+    #[serde(default)]
+    pub invite: Option<String>,
 }
 
 impl Default for MeshTomlConfig {
@@ -638,9 +683,12 @@ impl Default for MeshTomlConfig {
             enabled: false,
             listen: default_mesh_listen(),
             discovery: MeshDiscoveryConfig::default(),
+            transport: MeshTransportConfig::default(),
             auto_fallback: false,
             peers: Vec::new(),
             request_timeout_secs: default_mesh_request_timeout_secs(),
+            identity_file: None,
+            invite: None,
         }
     }
 }

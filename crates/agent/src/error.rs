@@ -75,6 +75,9 @@ pub enum AgentError {
     #[error("remote session not found: {details}")]
     RemoteSessionNotFound { details: String },
 
+    #[error("mesh admission rejected: {reason}")]
+    AdmissionRejected { reason: String },
+
     // --- Serialization ---
     #[error("serialization error: {0}")]
     Serialization(String),

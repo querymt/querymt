@@ -29,9 +29,12 @@ pub use oauth::handle_start_oauth_login;
 pub(crate) use oauth::stop_oauth_callback_listener_for_connection;
 pub use plugins::handle_update_plugins;
 pub use remote::handle_attach_remote_session;
+pub use remote::handle_create_mesh_invite;
 pub use remote::handle_create_remote_session;
+pub use remote::handle_list_mesh_invites;
 pub use remote::handle_list_remote_nodes;
 pub use remote::handle_list_remote_sessions;
+pub use remote::handle_revoke_mesh_invite;
 pub use schedules::handle_create_schedule;
 pub use schedules::handle_delete_schedule;
 pub use schedules::handle_list_schedules;
@@ -270,6 +273,19 @@ pub async fn handle_ui_message(
             session_id,
         } => {
             handle_attach_remote_session(state, conn_id, &node_id, &session_id, tx).await;
+        }
+        UiClientMessage::CreateMeshInvite {
+            mesh_name,
+            ttl,
+            max_uses,
+        } => {
+            handle_create_mesh_invite(state, mesh_name, ttl, max_uses, tx).await;
+        }
+        UiClientMessage::ListMeshInvites => {
+            handle_list_mesh_invites(state, tx).await;
+        }
+        UiClientMessage::RevokeMeshInvite { invite_id } => {
+            handle_revoke_mesh_invite(state, &invite_id, tx).await;
         }
         UiClientMessage::AddCustomModelFromHf {
             provider,

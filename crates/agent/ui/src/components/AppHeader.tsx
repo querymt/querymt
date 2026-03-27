@@ -13,6 +13,7 @@ import { ModelPickerPopover } from './ModelPickerPopover';
 import { HeaderStatsBar } from './HeaderStatsBar';
 import { RemoteNodeIndicator } from './RemoteNodeIndicator';
 import { getModeDisplayName } from '../utils/modeColors';
+import type { ReactNode } from 'react';
 import type { UiAgentInfo, SessionLimits, RoutingMode } from '../types';
 
 interface AppHeaderProps {
@@ -58,6 +59,9 @@ interface AppHeaderProps {
   // Mobile menu
   mobileMenuOpen: boolean;
   setMobileMenuOpen: (open: boolean) => void;
+
+  // Render slots
+  desktopActions?: ReactNode;
 }
 
 export function AppHeader(props: AppHeaderProps) {
@@ -104,7 +108,7 @@ export function AppHeader(props: AppHeaderProps) {
 
         {/* Session mode chip — click status to switch sessions, click mode to cycle */}
         {sessionId && (
-          <div className="h-8 flex items-center gap-px rounded-full bg-surface-canvas border border-surface-border/60 overflow-hidden min-w-0">
+          <div className="h-8 flex items-center gap-px rounded-full bg-surface-elevated/50 border border-surface-border/40 overflow-hidden min-w-0">
             <button
               type="button"
               onClick={() => setSessionSwitcherOpen(true)}
@@ -189,6 +193,7 @@ export function AppHeader(props: AppHeaderProps) {
             />
 
             <RemoteNodeIndicator remoteNodes={remoteNodes} />
+            {props.desktopActions}
           </div>
         )}
 
@@ -196,7 +201,7 @@ export function AppHeader(props: AppHeaderProps) {
         <button
           type="button"
           onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-          className="md:hidden p-1.5 rounded-lg transition-colors hover:bg-surface-canvas"
+          className="md:hidden p-1.5 rounded-lg transition-colors hover:bg-surface-elevated/80"
           aria-label="Toggle mobile menu"
         >
           {mobileMenuOpen ? (
