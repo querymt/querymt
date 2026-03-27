@@ -1,6 +1,4 @@
 use anyhow::Result;
-use http::{HeaderValue, header::AUTHORIZATION};
-use reqwest::header::HeaderMap;
 use rmcp::{
     RoleClient, ServiceExt,
     model::{ClientCapabilities, ClientInfo, Implementation},
@@ -49,28 +47,12 @@ impl McpServerTransportConfig {
         let client_info = ClientInfo::new(ClientCapabilities::default(), client_impl.clone());
         let client = match self {
             McpServerTransportConfig::Http { url, token } => {
-                let transport = match token {
-                    Some(t) => {
-                        let mut default_headers = HeaderMap::new();
-                        default_headers.insert(
-                            AUTHORIZATION,
-                            HeaderValue::from_str(&format!("Bearer {t}"))?,
-                        );
-
-                        let client = reqwest::ClientBuilder::new()
-                            .default_headers(default_headers)
-                            .build()?;
-
-                        StreamableHttpClientTransport::with_client(
-                            client,
-                            StreamableHttpClientTransportConfig {
-                                uri: url.clone().into(),
-                                ..Default::default()
-                            },
-                        )
-                    }
-                    None => StreamableHttpClientTransport::from_uri(url.clone()),
+                let config = match token {
+                    Some(t) => StreamableHttpClientTransportConfig::with_uri(url.clone())
+                        .auth_header(format!("Bearer {t}")),
+                    None => StreamableHttpClientTransportConfig::with_uri(url.clone()),
                 };
+                let transport = StreamableHttpClientTransport::from_config(config);
                 client_info.clone().into_dyn().serve(transport).await?
             }
             McpServerTransportConfig::Stdio { command, .. }
