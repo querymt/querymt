@@ -945,6 +945,13 @@ impl InviteStore {
         self.admitted_peers.get(peer_id)
     }
 
+    /// Iterate all admitted peers and their membership tokens.
+    pub fn admitted_memberships(&self) -> impl Iterator<Item = (&str, &MembershipToken)> {
+        self.admitted_peers
+            .iter()
+            .map(|(peer_id, token)| (peer_id.as_str(), token))
+    }
+
     /// Verify a membership token presented by a reconnecting peer.
     ///
     /// Pure cryptographic check — no store state required.  Any mesh node can
@@ -1712,6 +1719,45 @@ mod tests {
 
         // Sidecar file exists on disk.
         assert!(dir.path().join("admitted_peers.json").exists());
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn admitted_memberships_lists_all_admitted_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invites.json");
+        let mut store = InviteStore::load_or_create(&path).unwrap();
+
+        let host_kp = libp2p::identity::Keypair::generate_ed25519();
+        let host_peer_id = host_kp.public().to_peer_id().to_string();
+
+        let signed = store
+            .create_invite(
+                &host_kp,
+                &host_peer_id,
+                Some("Mesh".to_string()),
+                None,
+                2,
+                InvitePermissions::default(),
+            )
+            .unwrap();
+        let invite_id = signed.grant.invite_id.clone();
+
+        store
+            .admit_peer(&invite_id, "peer-A", &host_kp, Some("Mesh"))
+            .unwrap();
+        store
+            .admit_peer(&invite_id, "peer-B", &host_kp, Some("Mesh"))
+            .unwrap();
+
+        let admitted: std::collections::HashSet<String> = store
+            .admitted_memberships()
+            .map(|(peer_id, _)| peer_id.to_string())
+            .collect();
+
+        assert_eq!(admitted.len(), 2);
+        assert!(admitted.contains("peer-A"));
+        assert!(admitted.contains("peer-B"));
     }
 
     #[cfg(feature = "remote")]

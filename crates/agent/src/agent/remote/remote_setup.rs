@@ -129,7 +129,26 @@ pub async fn setup_mesh_from_config(
 
     // ── 2. Bootstrap the libp2p swarm ─────────────────────────────────────────
 
-    let mesh = {
+    let mesh = if let Some(ref invite) = config.invite {
+        #[cfg(feature = "remote-internet")]
+        {
+            let bootstrap_span = tracing::info_span!(
+                "remote.setup.join_mesh_via_invite",
+                inviter = %invite.grant.inviter_peer_id,
+                mesh_name = ?invite.grant.mesh_name,
+            );
+            super::mesh::join_mesh_via_invite(invite, config.identity_file.clone())
+                .instrument(bootstrap_span)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        }
+        #[cfg(not(feature = "remote-internet"))]
+        {
+            return Err(anyhow::anyhow!(
+                "mesh invite requires the 'remote-internet' feature"
+            ));
+        }
+    } else {
         let bootstrap_span = tracing::info_span!(
             "remote.setup.bootstrap_mesh",
             listen = %listen_addr_str,

@@ -792,6 +792,49 @@ fn handle_connection_closed(
     }
 }
 
+#[cfg(feature = "remote-internet")]
+fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
+    use libp2p::multiaddr::Protocol;
+
+    addr.iter().find_map(|p| match p {
+        Protocol::P2p(peer_id) => Some(peer_id),
+        _ => None,
+    })
+}
+
+#[cfg(feature = "remote-internet")]
+fn admitted_peer_ids_for_local_mesh(
+    store: &super::invite::InviteStore,
+    local_peer_id: &PeerId,
+    local_mesh_id: Option<&str>,
+) -> Vec<PeerId> {
+    let local_peer = local_peer_id.to_string();
+    let local_mesh_prefix = format!("{}:", local_peer);
+
+    store
+        .admitted_memberships()
+        .filter_map(|(_peer_id, token)| {
+            if token.admitted_by != local_peer {
+                return None;
+            }
+            if let Some(mesh_id) = local_mesh_id {
+                if token.mesh_id != mesh_id {
+                    return None;
+                }
+            } else if !token.mesh_id.starts_with(&local_mesh_prefix) {
+                return None;
+            }
+            token.peer_id.parse::<PeerId>().ok()
+        })
+        .collect()
+}
+
+#[cfg(feature = "remote-internet")]
+fn reconnect_backoff_duration(attempt: u32) -> std::time::Duration {
+    let secs = (1u64 << attempt.min(5)).min(30);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Shared pre-bootstrap setup: load identity, validate peers, create channels.
 struct MeshBootstrapContext {
     keypair: libp2p::identity::Keypair,
@@ -1188,12 +1231,24 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
     let known_peers_loop = Arc::clone(&ctx.known_peers);
     let re_register_fns_loop = Arc::clone(&ctx.re_register_fns);
 
+    let local_mesh_id = config.invite.as_ref().map(|invite| {
+        super::invite::mesh_id_for(
+            &invite.grant.inviter_peer_id,
+            invite.grant.mesh_name.as_deref(),
+        )
+    });
+
     // Load the membership store now so the event loop can update cached peers
     // whenever new peers are discovered.  Failures are non-fatal.
     let membership_store_loop: Option<Arc<RwLock<super::invite::MembershipStore>>> =
         super::invite::default_membership_store_path()
             .ok()
             .and_then(|p| super::invite::MembershipStore::load_or_create(&p).ok())
+            .map(|s| Arc::new(RwLock::new(s)));
+    let invite_store_loop: Option<Arc<RwLock<super::invite::InviteStore>>> =
+        super::invite::default_invite_store_path()
+            .ok()
+            .and_then(|p| super::invite::InviteStore::load_or_create(&p).ok())
             .map(|s| Arc::new(RwLock::new(s)));
 
     // ── Build the iroh-backed libp2p transport ─────────────────────────────────
@@ -1290,6 +1345,54 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
         }
     }
 
+    let mut reconnect_targets: HashSet<PeerId> = HashSet::new();
+
+    if let Some(ref invite) = config.invite
+        && let Ok(inviter_pid) = invite.grant.inviter_peer_id.parse::<PeerId>()
+    {
+        reconnect_targets.insert(inviter_pid);
+    }
+
+    for peer_addr in &config.bootstrap_peers {
+        if let Ok(addr) = peer_addr.parse::<Multiaddr>()
+            && let Some(peer_id) = peer_id_from_multiaddr(&addr)
+        {
+            reconnect_targets.insert(peer_id);
+        }
+    }
+
+    if let Some(ref ms) = membership_store_loop {
+        let store = ms.read();
+        if let Some(mesh_id) = local_mesh_id.as_deref() {
+            if let Some(membership) = store.get_membership(mesh_id) {
+                for peer in &membership.known_peers {
+                    if let Ok(pid) = peer.peer_id.parse::<PeerId>() {
+                        reconnect_targets.insert(pid);
+                    }
+                }
+            }
+        } else {
+            for (_, membership) in store.all() {
+                for peer in &membership.known_peers {
+                    if let Ok(pid) = peer.peer_id.parse::<PeerId>() {
+                        reconnect_targets.insert(pid);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(ref is) = invite_store_loop {
+        let store = is.read();
+        for pid in
+            admitted_peer_ids_for_local_mesh(&store, &local_peer_id, local_mesh_id.as_deref())
+        {
+            reconnect_targets.insert(pid);
+        }
+    }
+
+    reconnect_targets.remove(&local_peer_id);
+
     let (swarm_cmd_tx_iroh, mut swarm_cmd_rx_iroh) = mpsc::unbounded_channel::<SwarmCommand>();
 
     // ── Swarm event loop ──────────────────────────────────────────────────────
@@ -1297,12 +1400,56 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
     tokio::spawn(async move {
         // Track pending dials to avoid redundant connection attempts.
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
+        let mut reconnect_attempts: HashMap<PeerId, u32> = HashMap::new();
+        let mut reconnect_next_due: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
+        let mut reconnect_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        reconnect_tick.tick().await;
 
         loop {
             tokio::select! {
+                _ = reconnect_tick.tick() => {
+                    let now = tokio::time::Instant::now();
+                    for peer_id in reconnect_targets.iter().copied().collect::<Vec<_>>() {
+                        if peer_id == local_peer_id {
+                            continue;
+                        }
+                        if known_peers_loop.read().contains_key(&peer_id) || pending_dials.contains(&peer_id) {
+                            continue;
+                        }
+                        if reconnect_next_due
+                            .get(&peer_id)
+                            .is_some_and(|due| *due > now)
+                        {
+                            continue;
+                        }
+
+                        let addr: Multiaddr = format!("/p2p/{peer_id}")
+                            .parse()
+                            .expect("PeerId always produces a valid /p2p/ multiaddr");
+                        match swarm.dial(addr) {
+                            Ok(_) => {
+                                log::debug!("Reconnect dial (iroh): {}", peer_id);
+                                pending_dials.insert(peer_id);
+                            }
+                            Err(e) => {
+                                let attempt = reconnect_attempts.entry(peer_id).or_insert(0);
+                                *attempt = attempt.saturating_add(1);
+                                let delay = reconnect_backoff_duration(*attempt);
+                                reconnect_next_due.insert(peer_id, now + delay);
+                                log::warn!(
+                                    "Reconnect dial failed (iroh, peer={}, attempt={}): {}",
+                                    peer_id,
+                                    *attempt,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
                 Some(cmd) = swarm_cmd_rx_iroh.recv() => {
                     match cmd {
                         SwarmCommand::DialPeer(peer_id) => {
+                            reconnect_targets.insert(peer_id);
                             if pending_dials.contains(&peer_id) || known_peers_loop.read().contains_key(&peer_id) {
                                 log::debug!("Skipping dial for {} (already connected or pending)", peer_id);
                                 continue;
@@ -1315,7 +1462,15 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
                                     log::info!("Dialing peer (iroh): {}", peer_id);
                                     pending_dials.insert(peer_id);
                                 }
-                                Err(e) => log::warn!("Failed to dial peer {} (iroh): {}", peer_id, e),
+                                Err(e) => {
+                                    let attempt = reconnect_attempts.entry(peer_id).or_insert(0);
+                                    *attempt = attempt.saturating_add(1);
+                                    reconnect_next_due.insert(
+                                        peer_id,
+                                        tokio::time::Instant::now() + reconnect_backoff_duration(*attempt),
+                                    );
+                                    log::warn!("Failed to dial peer {} (iroh): {}", peer_id, e);
+                                }
                             }
                         }
                     }
@@ -1326,6 +1481,9 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
                     peer_id, endpoint, ..
                 } => {
                     pending_dials.remove(&peer_id);
+                    reconnect_targets.insert(peer_id);
+                    reconnect_attempts.remove(&peer_id);
+                    reconnect_next_due.remove(&peer_id);
 
                     handle_connection_established(
                         &mut swarm,
@@ -1367,6 +1525,8 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
                     num_established,
                     ..
                 } => {
+                    reconnect_targets.insert(peer_id);
+                    reconnect_next_due.remove(&peer_id);
                     handle_connection_closed(
                         peer_id,
                         num_established,
@@ -1377,6 +1537,13 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     if let Some(pid) = peer_id {
                         pending_dials.remove(&pid);
+                        reconnect_targets.insert(pid);
+                        let attempt = reconnect_attempts.entry(pid).or_insert(0);
+                        *attempt = attempt.saturating_add(1);
+                        reconnect_next_due.insert(
+                            pid,
+                            tokio::time::Instant::now() + reconnect_backoff_duration(*attempt),
+                        );
                     }
                     log::warn!(
                         "Outgoing connection error (iroh, peer={:?}): {}",
@@ -1685,6 +1852,84 @@ fn resolve_local_hostname() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "remote-internet")]
+    use super::{admitted_peer_ids_for_local_mesh, peer_id_from_multiaddr};
+
+    #[cfg(feature = "remote-internet")]
+    #[test]
+    fn admitted_peer_ids_filters_to_specific_local_mesh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invites.json");
+        let mut store = crate::agent::remote::invite::InviteStore::load_or_create(&path).unwrap();
+
+        let host_kp = libp2p::identity::Keypair::generate_ed25519();
+        let host_peer_id = host_kp.public().to_peer_id().to_string();
+
+        let mesh_a = store
+            .create_invite(
+                &host_kp,
+                &host_peer_id,
+                Some("mesh-a".to_string()),
+                None,
+                1,
+                crate::agent::remote::invite::InvitePermissions::default(),
+            )
+            .unwrap();
+        let peer_a_kp = libp2p::identity::Keypair::generate_ed25519();
+        let peer_a_id = peer_a_kp.public().to_peer_id().to_string();
+        store
+            .admit_peer(
+                &mesh_a.grant.invite_id,
+                &peer_a_id,
+                &host_kp,
+                Some("mesh-a"),
+            )
+            .unwrap();
+
+        let mesh_b = store
+            .create_invite(
+                &host_kp,
+                &host_peer_id,
+                Some("mesh-b".to_string()),
+                None,
+                1,
+                crate::agent::remote::invite::InvitePermissions::default(),
+            )
+            .unwrap();
+        let peer_b_kp = libp2p::identity::Keypair::generate_ed25519();
+        let peer_b_id = peer_b_kp.public().to_peer_id().to_string();
+        store
+            .admit_peer(
+                &mesh_b.grant.invite_id,
+                &peer_b_id,
+                &host_kp,
+                Some("mesh-b"),
+            )
+            .unwrap();
+
+        let host_pid: libp2p::PeerId = host_peer_id.parse().unwrap();
+        let local_mesh_id =
+            crate::agent::remote::invite::mesh_id_for(&host_peer_id, Some("mesh-a"));
+        let local = admitted_peer_ids_for_local_mesh(&store, &host_pid, Some(&local_mesh_id));
+
+        assert_eq!(
+            local.len(),
+            1,
+            "should include only local mesh admitted peers"
+        );
+        assert_eq!(local[0].to_string(), peer_a_id);
+    }
+
+    #[cfg(feature = "remote-internet")]
+    #[test]
+    fn peer_id_from_multiaddr_extracts_p2p_component() {
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = kp.public().to_peer_id();
+        let addr: libp2p::Multiaddr = format!("/ip4/127.0.0.1/tcp/1/p2p/{peer_id}")
+            .parse()
+            .unwrap();
+        assert_eq!(peer_id_from_multiaddr(&addr), Some(peer_id));
+    }
 
     /// `resolve_peer_node_id` with no known peers returns `None`.
     ///
