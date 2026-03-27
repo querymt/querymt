@@ -1405,7 +1405,7 @@ checksum = "d38f2da7a0a2c4ccf0065be06397cc26a81f4e528be095826eee9d4adbb8c60f"
 dependencies = [
  "byteorder",
  "fnv",
- "uuid 1.22.0",
+ "uuid 1.23.0",
 ]
 
 [[package]]
@@ -2520,7 +2520,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
 dependencies = [
- "uuid 1.22.0",
+ "uuid 1.23.0",
 ]
 
 [[package]]
@@ -3189,7 +3189,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq 3.2.0",
  "url",
- "uuid 1.22.0",
+ "uuid 1.23.0",
  "wasi-common",
  "wasmtime",
  "wiggle",
@@ -6077,7 +6077,7 @@ dependencies = [
  "tokio-stream",
  "toml 0.8.23",
  "tracing",
- "uuid 1.22.0",
+ "uuid 1.23.0",
  "zip",
 ]
 
@@ -6366,7 +6366,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "url",
- "uuid 1.22.0",
+ "uuid 1.23.0",
 ]
 
 [[package]]
@@ -7592,7 +7592,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
- "uuid 1.22.0",
+ "uuid 1.23.0",
  "variantly",
  "vob",
 ]
@@ -7627,7 +7627,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "utoipa",
- "uuid 1.22.0",
+ "uuid 1.23.0",
 ]
 
 [[package]]
@@ -7731,7 +7731,7 @@ dependencies = [
  "portable-atomic",
  "smallvec 1.15.1",
  "tagptr",
- "uuid 1.22.0",
+ "uuid 1.23.0",
 ]
 
 [[package]]
@@ -8373,7 +8373,7 @@ dependencies = [
  "toml 0.8.23",
  "ureq 2.12.1",
  "url",
- "uuid 1.22.0",
+ "uuid 1.23.0",
  "walkdir",
 ]
 
@@ -10058,7 +10058,7 @@ dependencies = [
  "toml 1.1.0+spec-1.1.0",
  "tracing",
  "url",
- "uuid 1.22.0",
+ "uuid 1.23.0",
  "which",
 ]
 
@@ -10139,7 +10139,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "typeshare",
- "uuid 1.22.0",
+ "uuid 1.23.0",
  "whatlang",
 ]
 
@@ -11013,7 +11013,7 @@ dependencies = [
  "libsqlite3-sys",
  "smallvec 1.15.1",
  "time",
- "uuid 1.22.0",
+ "uuid 1.23.0",
 ]
 
 [[package]]
@@ -12881,7 +12881,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -14199,9 +14199,9 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.22.0"
+version = "1.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a68d3c8f01c0cfa54a75291d83601161799e4a89a39e0929f4b0354d88757a37"
+checksum = "5ac8b6f42ead25368cf5b098aeb3dc8a1a2c05a3eee8a9a1a68c640edbfc79d9"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
