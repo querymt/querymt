@@ -45,6 +45,8 @@ fn parse_transport_model_id(model_id: &str, fallback_provider: &str) -> (String,
 }
 
 const ATTACHMENTS_PLACEHOLDER: &str = "(attachments included)";
+// TODO: use it once figured out intent updates
+#[allow(dead_code)]
 const INTENT_CONFIRMATION_TIMEOUT_SECS: u64 = 45;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +158,8 @@ fn decide_intent_update(current_intent: &str, candidate: &str) -> IntentUpdateDe
     IntentUpdateDecision::NoChange
 }
 
+// TODO: use it once figured out intent updates
+#[allow(dead_code)]
 async fn request_intent_update_confirmation(
     config: &AgentConfig,
     session_id: &str,
@@ -274,16 +278,9 @@ async fn maybe_update_session_intent(
             Ok(())
         }
         IntentUpdateDecision::AskUser => {
-            let should_update =
-                request_intent_update_confirmation(config, session_id, &current_intent, &candidate)
-                    .await?;
-            if should_update {
-                exec_ctx
-                    .state
-                    .update_intent_snapshot(candidate, None, None)
-                    .await
-                    .map_err(|e| AgentError::Internal(e.to_string()))?;
-            }
+            // TODO(intent): Re-enable explicit user confirmation for intent shifts
+            // once we have a better UX/policy for ambiguous objective changes.
+            let _ = (config, session_id, current_intent);
             Ok(())
         }
     }
