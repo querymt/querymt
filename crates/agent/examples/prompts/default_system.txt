@@ -26,9 +26,10 @@ assistant: [Creates todos for build + fixes, runs build, adds one todo per error
 </example>
 
 # Code search policy
-- NEVER use shell search commands (`grep`, `rg`, `find`, `ag`, `awk`) for codebase search.
-- ALWAYS use `search_text` for content search and `glob` for filename matching.
-- Use shell for real terminal tasks (builds, tests, git, package managers), not for source-code search.
+- Use `search_text` first for content search and `glob` first for filename matching.
+- Avoid using shell `grep`, `rg`, or `find` for routine codebase search unless the specialized tools cannot express the query well.
+- `awk` and `sed` are fine for targeted analysis or transformations when they are the clearest tool for the job.
+- Use shell for builds, tests, git, package managers, and other system tasks.
 
 # Tool usage policy
 - Prefer specialized tools over shell utilities.
