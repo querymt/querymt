@@ -9,7 +9,6 @@ use grep_searcher::{
 use ignore::{WalkBuilder, types::TypesBuilder};
 use indexmap::IndexMap;
 use querymt::chat::{Content, FunctionTool, Tool};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,31 +22,17 @@ const MAX_MATCH_TEXT_BYTES: usize = 500;
 
 /// A single match result (internal-only, used during collection)
 #[derive(Debug)]
-#[allow(dead_code)]
 struct Match {
     file: String,
     line: u64,
-    column: Option<u64>,
     text: String,
     context: bool,
 }
 
 /// Internal search results (before formatting)
 #[derive(Debug)]
-#[allow(dead_code)]
 struct InternalSearchResults {
     matches: Vec<Match>,
-    total_files: usize,
-    total_matches: usize,
-    truncated: bool,
-}
-
-/// Compact grep-style output format
-#[derive(Debug, Serialize, Deserialize)]
-struct CompactResults {
-    results: IndexMap<String, String>, // relative file path -> formatted lines
-    total_files: usize,                // files searched (not files with matches)
-    total_matches: usize,              // actual match lines only (non-context)
     truncated: bool,
 }
 
@@ -100,7 +85,6 @@ impl<'a> ContextSink<'a> {
         self.matches.push(Match {
             file: self.path.display().to_string(),
             line: line_num,
-            column: None,
             text: text_str,
             context: is_context,
         });
@@ -150,7 +134,6 @@ impl SearchTextTool {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
 
         let mut matches = Vec::new();
-        let mut files_searched = 0;
 
         // Parse include pattern
         let include_pattern = if let Some(p) = opts.include {
@@ -218,8 +201,6 @@ impl SearchTextTool {
                 continue;
             }
 
-            files_searched += 1;
-
             // Build searcher with context settings
             let mut searcher = SearcherBuilder::new()
                 .binary_detection(BinaryDetection::quit(b'\0'))
@@ -255,7 +236,6 @@ impl SearchTextTool {
                             matches.push(Match {
                                 file: path.display().to_string(),
                                 line: lnum,
-                                column: None,
                                 text,
                                 context: false,
                             });
@@ -287,23 +267,17 @@ impl SearchTextTool {
             b_time.cmp(&a_time) // Reverse for most recent first
         });
 
-        let total_matches = matches.len();
-        let truncated = total_matches >= opts.max_results;
+        let truncated = matches.len() >= opts.max_results;
 
-        Ok(InternalSearchResults {
-            matches,
-            total_files: files_searched,
-            total_matches,
-            truncated,
-        })
+        Ok(InternalSearchResults { matches, truncated })
     }
 
-    /// Format internal search results into compact grep-style output
-    fn format_compact(
+    /// Format internal search results into compact plain-text output.
+    fn format_compact_text(
         results: &InternalSearchResults,
         root: &Path,
         has_context: bool,
-    ) -> CompactResults {
+    ) -> String {
         let mut file_results: IndexMap<String, Vec<String>> = IndexMap::new();
         let mut actual_match_count = 0;
 
@@ -328,8 +302,8 @@ impl SearchTextTool {
             // Get or create the lines vector for this file
             let lines = file_results.entry(rel_path.clone()).or_default();
 
-            // Check if we need a separator (only when context is enabled and lines aren't contiguous)
-            if has_context && prev_line.is_some() && prev_line != Some(m.line - 1) {
+            // Separate non-contiguous context groups in the same file.
+            if has_context && prev_line.is_some_and(|prev| prev.checked_add(1) != Some(m.line)) {
                 lines.push("--".to_string());
             }
 
@@ -345,18 +319,36 @@ impl SearchTextTool {
             prev_line = Some(m.line);
         }
 
-        // Join all lines for each file with newlines
-        let results_map: IndexMap<String, String> = file_results
-            .into_iter()
-            .map(|(file, lines)| (file, lines.join("\n")))
-            .collect();
+        let mut output = String::new();
+        let matched_files = file_results.len();
 
-        CompactResults {
-            results: results_map,
-            total_files: results.total_files,
-            total_matches: actual_match_count,
-            truncated: results.truncated,
+        for (idx, (file, lines)) in file_results.into_iter().enumerate() {
+            if idx > 0 {
+                output.push('\n');
+            }
+            output.push_str(&file);
+            output.push('\n');
+            output.push_str(&lines.join("\n"));
+            output.push('\n');
         }
+
+        if results.truncated {
+            output.push_str(&format!(
+                "({} {}, {} matches, truncated)",
+                matched_files,
+                if matched_files == 1 { "file" } else { "files" },
+                actual_match_count
+            ));
+        } else {
+            output.push_str(&format!(
+                "({} {}, {} matches)",
+                matched_files,
+                if matched_files == 1 { "file" } else { "files" },
+                actual_match_count
+            ));
+        }
+
+        output
     }
 }
 
@@ -376,7 +368,7 @@ impl ToolTrait for SearchTextTool {
                     - Supports full regex syntax (eg. \"log.*Error\", \"function\\s+\\w+\", etc.)\n\
                     - Supports case-insensitive search, word boundary matching, and context lines\n\
                     - Filter files by pattern (include/exclude) or by file type (e.g. \"rust\", \"js\")\n\
-                    - Returns file paths and line numbers with at least one match sorted by modification time\n\
+                    - Returns compact grep-style text grouped by file, sorted by modification time\n\
                     - Use this tool when you need to find files containing specific patterns\n\
                     - When you are doing an open-ended search that may require multiple rounds of globbing and grepping, use the Task tool instead"
                     .to_string(),
@@ -542,12 +534,10 @@ impl ToolTrait for SearchTextTool {
             .map_err(|e| ToolError::ProviderError(format!("search task failed: {}", e)))?
             .map_err(|e| ToolError::ProviderError(format!("search failed: {}", e)))?;
 
-        let compact_results =
-            Self::format_compact(&internal_results, &root_for_format, has_context);
+        let compact_output =
+            Self::format_compact_text(&internal_results, &root_for_format, has_context);
 
-        serde_json::to_string_pretty(&compact_results)
-            .map(|s| vec![Content::text(s)])
-            .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
+        Ok(vec![Content::text(compact_output)])
     }
 }
 
@@ -564,6 +554,31 @@ mod tests {
             })
             .unwrap_or_default()
     }
+
+    fn file_count(output: &str) -> usize {
+        let footer = output.lines().last().unwrap_or_default();
+        let file_segment = footer.split(',').next().unwrap_or_default();
+        file_segment
+            .trim_start_matches('(')
+            .split_whitespace()
+            .next()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0)
+    }
+
+    fn match_count(output: &str) -> usize {
+        let footer = output.lines().last().unwrap_or_default();
+        let (_, tail) = footer.split_once(", ").unwrap_or(("", "0 matches"));
+        let match_segment = tail.split(',').next().unwrap_or_default();
+        match_segment
+            .split_whitespace()
+            .next()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0)
+    }
+
     use crate::tools::AgentToolContext;
     use std::fs;
     use tempfile::TempDir;
@@ -587,12 +602,10 @@ rust is great",
         });
 
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        let parsed: CompactResults = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(parsed.results.len(), 1);
-        let file_content = parsed.results.values().next().unwrap();
-        assert!(file_content.contains("2:rust is great"));
-        assert_eq!(parsed.total_matches, 1);
+        assert!(result.contains("test.txt\n2:rust is great\n"));
+        assert_eq!(file_count(&result), 1);
+        assert_eq!(match_count(&result), 1);
     }
 
     #[tokio::test]
@@ -611,12 +624,11 @@ rust is great",
         });
 
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        let parsed: CompactResults = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(parsed.results.len(), 1);
-        let file_path = parsed.results.keys().next().unwrap();
-        assert!(file_path.ends_with(".rs"));
-        assert_eq!(parsed.total_matches, 1);
+        assert!(result.contains("test.rs\n1:hello world\n"));
+        assert!(!result.contains("test.txt\n1:hello world\n"));
+        assert_eq!(file_count(&result), 1);
+        assert_eq!(match_count(&result), 1);
     }
 
     #[tokio::test]
@@ -639,8 +651,7 @@ hello world",
             "pattern": "hello"
         });
         let result = first_text_block(tool.call(args.clone(), &context).await.unwrap());
-        let parsed: CompactResults = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.total_matches, 1);
+        assert_eq!(match_count(&result), 1);
 
         // Case-insensitive - should match all variations
         let args = json!({
@@ -648,8 +659,7 @@ hello world",
             "case_insensitive": true
         });
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        let parsed: CompactResults = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.total_matches, 3);
+        assert_eq!(match_count(&result), 3);
     }
 
     #[tokio::test]
@@ -672,8 +682,7 @@ foo*bar",
             "pattern": "foo.bar"
         });
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        let parsed: CompactResults = serde_json::from_str(&result).unwrap();
-        assert!(parsed.total_matches >= 2); // Matches foo.bar and fooXbar
+        assert!(match_count(&result) >= 2); // Matches foo.bar and fooXbar
 
         // With fixed strings - only matches literal "foo.bar"
         let args = json!({
@@ -681,10 +690,8 @@ foo*bar",
             "fixed_strings": true
         });
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        let parsed: CompactResults = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.total_matches, 1);
-        let file_content = parsed.results.values().next().unwrap();
-        assert!(file_content.contains("foo.bar()"));
+        assert_eq!(match_count(&result), 1);
+        assert!(result.contains("1:foo.bar()"));
     }
 
     #[tokio::test]
@@ -700,25 +707,21 @@ foo*bar",
         )
         .unwrap();
 
-        // Without word match - matches all occurrences
+        // Without word match - line should match
         let args = json!({
             "pattern": "foo"
         });
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        let parsed: CompactResults = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.total_matches, 1);
+        assert_eq!(match_count(&result), 1);
 
-        // With word match - only matches whole word "foo"
+        // With word match - only standalone "foo" triggers the line match
         let args = json!({
             "pattern": "foo",
             "word_match": true
         });
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        let parsed: CompactResults = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.total_matches, 1);
-        // The line still contains foobar, etc., but only standalone "foo" triggered the match
-        let file_content = parsed.results.values().next().unwrap();
-        assert!(file_content.contains("foo"));
+        assert_eq!(match_count(&result), 1);
+        assert!(result.contains("foo"));
     }
 
     #[tokio::test]
@@ -743,10 +746,8 @@ line 5",
             "pattern": "MATCH"
         });
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        let parsed: CompactResults = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.total_matches, 1);
-        let file_content = parsed.results.values().next().unwrap();
-        assert_eq!(file_content, "3:MATCH HERE");
+        assert!(result.contains("test.txt\n3:MATCH HERE\n"));
+        assert_eq!(match_count(&result), 1);
 
         // With before and after context
         let args = json!({
@@ -755,17 +756,15 @@ line 5",
             "after_context": 2
         });
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        let parsed: CompactResults = serde_json::from_str(&result).unwrap();
 
         // Should have only 1 actual match (context lines don't count)
-        assert_eq!(parsed.total_matches, 1);
+        assert_eq!(match_count(&result), 1);
 
         // Verify the formatted output contains all lines with correct separators
-        let file_content = parsed.results.values().next().unwrap();
-        assert!(file_content.contains("2-line 2"));
-        assert!(file_content.contains("3:MATCH HERE"));
-        assert!(file_content.contains("4-line 4"));
-        assert!(file_content.contains("5-line 5"));
+        assert!(result.contains("2-line 2"));
+        assert!(result.contains("3:MATCH HERE"));
+        assert!(result.contains("4-line 4"));
+        assert!(result.contains("5-line 5"));
     }
 
     #[tokio::test]
@@ -784,9 +783,8 @@ line 5",
             "pattern": "main"
         });
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        let parsed: CompactResults = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.total_matches, 3);
-        assert_eq!(parsed.results.len(), 3);
+        assert_eq!(match_count(&result), 3);
+        assert_eq!(file_count(&result), 3);
 
         // Search only Rust files
         let args = json!({
@@ -794,10 +792,31 @@ line 5",
             "file_type": "rust"
         });
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        let parsed: CompactResults = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed.total_matches, 1);
-        assert_eq!(parsed.results.len(), 1);
-        let file_path = parsed.results.keys().next().unwrap();
-        assert!(file_path.ends_with(".rs"));
+        assert_eq!(match_count(&result), 1);
+        assert_eq!(file_count(&result), 1);
+        assert!(result.contains("test.rs\n1:fn main() {}\n"));
+    }
+
+    #[tokio::test]
+    async fn test_truncated_footer() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = SearchTextTool::new();
+
+        fs::write(
+            temp_dir.path().join("test.txt"),
+            "match
+match again",
+        )
+        .unwrap();
+
+        let args = json!({
+            "pattern": "match",
+            "max_results": 1
+        });
+
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
+        assert!(result.ends_with(", truncated)"));
     }
 }
