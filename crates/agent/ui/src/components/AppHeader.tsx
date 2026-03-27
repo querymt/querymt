@@ -13,6 +13,7 @@ import { ModelPickerPopover } from './ModelPickerPopover';
 import { HeaderStatsBar } from './HeaderStatsBar';
 import { RemoteNodeIndicator } from './RemoteNodeIndicator';
 import { getModeDisplayName } from '../utils/modeColors';
+import { copyToClipboard } from '../utils/clipboard';
 import type { ReactNode } from 'react';
 import type { UiAgentInfo, SessionLimits, RoutingMode } from '../types';
 
@@ -85,6 +86,7 @@ export function AppHeader(props: AppHeaderProps) {
     remoteNodes,
     mobileMenuOpen,
     setMobileMenuOpen,
+    currentWorkspace,
   } = props;
 
   return (
@@ -136,6 +138,19 @@ export function AppHeader(props: AppHeaderProps) {
                 }
               />
             </button>
+            {currentWorkspace && (
+              <button
+                type="button"
+                onClick={() => {
+                  void copyToClipboard(currentWorkspace);
+                }}
+                className="hidden md:flex h-full items-center px-2.5 min-w-0 max-w-64 text-xs text-ui-muted hover:bg-surface-elevated/60 transition-colors"
+                title={`Copy workspace path: ${currentWorkspace}`}
+                aria-label="Copy current workspace path"
+              >
+                <span className="truncate font-mono">{currentWorkspace}</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={cycleAgentMode}
