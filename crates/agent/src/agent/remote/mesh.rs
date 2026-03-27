@@ -43,6 +43,7 @@ use tokio::sync::{broadcast, mpsc};
 /// Higher-level code uses `MeshHandle` methods (e.g. `dial_peer`) which
 /// translate intent into a `SwarmCommand` and send it over an `mpsc` channel.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "remote-internet"), allow(dead_code))]
 enum SwarmCommand {
     /// Request the swarm to dial a peer by `PeerId`.
     ///
