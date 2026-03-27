@@ -30,10 +30,11 @@ vi.mock('../context/UiClientContext', async (importOriginal) => {
     }),
   };
 });
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { TodoRail } from './TodoRail';
 import { HeaderStatsBar } from './HeaderStatsBar';
 import { TurnCard } from './TurnCard';
+import { MentionInput } from './MentionInput';
 import type { TodoItem, EventItem, SessionLimits, Turn, UiAgentInfo, EventRow } from '../types';
 import type { TodoStats } from '../hooks/useTodoState';
 
@@ -165,6 +166,51 @@ describe('Mobile Responsive Audit', () => {
       expect(turnCard).not.toBeNull();
       expect(turnCard.className).toContain('px-2');
       expect(turnCard.className).toContain('md:px-4');
+    });
+  });
+
+  describe('composer styling', () => {
+    it('shows a subtle mode-colored border and ring when idle', () => {
+      const { container } = render(
+        <MentionInput
+          value=""
+          onChange={vi.fn()}
+          onSubmit={vi.fn()}
+          files={[]}
+          onRequestFiles={vi.fn()}
+        />
+      );
+
+      const control = Array.from(container.querySelectorAll('div')).find((element) => {
+        const style = element.getAttribute('style') ?? '';
+        return style.includes('border-radius: 12px') && style.includes('max-height: 180px') && style.includes('font-size: 15px');
+      }) as HTMLElement | undefined;
+      expect(control).toBeDefined();
+      const style = control?.getAttribute('style') ?? '';
+      expect(style).toContain('rgba(var(--mode-rgb), 0.2)');
+      expect(style).toContain('0 0 0 1px rgba(var(--mode-rgb), 0.15)');
+    });
+
+    it('shows the stronger mode-colored highlight when the composer is focused', () => {
+      const { container } = render(
+        <MentionInput
+          value=""
+          onChange={vi.fn()}
+          onSubmit={vi.fn()}
+          files={[]}
+          onRequestFiles={vi.fn()}
+        />
+      );
+
+      const input = container.querySelector('textarea') as HTMLTextAreaElement | null;
+      expect(input).not.toBeNull();
+      fireEvent.focus(input!);
+
+      const control = container.querySelector('div[style*="box-shadow"]') as HTMLElement | null;
+      expect(control).not.toBeNull();
+      const style = control?.getAttribute('style') ?? '';
+      expect(style).toContain('rgba(var(--mode-rgb), 0.6)');
+      expect(style).toContain('0 0 0 2px rgba(var(--mode-rgb), 0.15)');
     });
   });
 
