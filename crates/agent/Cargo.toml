@@ -82,8 +82,6 @@ infer = "0.19"
 rayon = "1.11"
 
 # Unix process-group cleanup on cancellation (shell tool)
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 imagesize = "0.14"
 
 # NLP: multilingual stopwords, stemming, language detection
@@ -110,6 +108,9 @@ similarity-py = { git = "https://github.com/querymt/similarity.git", branch = "t
 
 # Rust AST parsing for rich structural fingerprinting during function indexing
 syn = { version = "2", features = ["full", "visit"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lib]
 name = "querymt_agent"
